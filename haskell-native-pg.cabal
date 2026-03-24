@@ -59,16 +59,26 @@ library
     import:           warnings
 
     -- Modules exported by the library.
-    exposed-modules:  MyLib
+    exposed-modules:
+        Database.PostgreSQL.Protocol
+        Database.PostgreSQL.Protocol.Codec
+        Database.PostgreSQL.Protocol.Codec.Copy
+        Database.PostgreSQL.Protocol.Messages
+        Database.PostgreSQL.Protocol.Messages.MessageType
+        Database.PostgreSQL.Protocol.Messages.Types
 
     -- Modules included in this library but not exported.
-    -- other-modules:
+    other-modules:
+        Database.PostgreSQL.Protocol.Codec.Payload
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
 
     -- Other library packages from which modules are imported.
-    build-depends:    base ^>=4.21.0.0
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring ^>=0.12.1.0,
+        text ^>=2.1.2
 
     -- Directories containing source files.
     hs-source-dirs:   src
@@ -101,4 +111,6 @@ test-suite haskell-native-pg-test
     -- Test dependencies.
     build-depends:
         base ^>=4.21.0.0,
-        haskell-native-pg
+        bytestring ^>=0.12.1.0,
+        haskell-native-pg,
+        text ^>=2.1.2
