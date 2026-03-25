@@ -1,33 +1,48 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE StandaloneKindSignatures #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE UndecidableInstances #-}
 
 module Database.PostgreSQL.Protocol.Messages.Types
-  ( Scalar (..),
-    ValueType
-      ( OidType,
-        ProcessIdType,
-        SecretKeyType,
-        ProtocolVersionType,
-        StartupParameterType,
-        FormatCodeType,
-        CopyFormatType,
-        NamedObjectType,
-        ErrorNoticeFieldType,
-        ParameterStatusValueType,
-        TransactionStatusType
-      ),
-    StructuredValueType
-      ( BackendKeyType,
-        BindBodyType,
-        CopyResponseType,
-        NotificationType,
-        RowFieldType
-      ),
+  ( Envelope (..),
+    SomeEnvelope,
+    Scalar (..),
+    OidType (OidType),
+    ProcessIdType (ProcessIdType),
+    SecretKeyType (SecretKeyType),
+    BackendKeyType (BackendKeyType),
+    ProtocolVersionType (ProtocolVersionType),
+    StartupParameterType (StartupParameterType),
+    FormatCodeType (FormatCodeType),
+    CopyFormatType (CopyFormatType),
+    NamedObjectType (NamedObjectType),
+    BindBodyType (BindBodyType),
+    CopyResponseType (CopyResponseType),
+    ErrorNoticeFieldType (ErrorNoticeFieldType),
+    NotificationType (NotificationType),
+    ParameterStatusValueType (ParameterStatusValueType),
+    TransactionStatusType (TransactionStatusType),
+    RowFieldType (RowFieldType),
+    OidEnvelope,
+    ProcessIdEnvelope,
+    SecretKeyEnvelope,
+    BackendKeyEnvelope,
+    ProtocolVersionEnvelope,
+    StartupParameterEnvelope,
+    FormatCodeEnvelope,
+    CopyFormatEnvelope,
+    NamedObjectEnvelope,
+    BindBodyEnvelope,
+    CopyResponseEnvelope,
+    ErrorNoticeFieldEnvelope,
+    NotificationEnvelope,
+    ParameterStatusValueEnvelope,
+    TransactionStatusEnvelope,
+    RowFieldEnvelope,
     Oid,
     ProcessId,
     SecretKey,
@@ -49,124 +64,194 @@ module Database.PostgreSQL.Protocol.Messages.Types
     protocolVersion3_2,
     protocolVersionCode,
     sslRequestCode,
+    toSomeEnvelope,
+    withSomeEnvelope,
   )
 where
 
-import Data.Bits ((.|.), shiftL)
-import Data.ByteString (ByteString)
+import Data.Bits ((.|.), shiftL, shiftR)
 import Data.Int (Int16, Int32)
 import Data.Kind (Type)
-import Data.Text (Text)
-import Data.Word (Word16, Word32)
+import Data.Word (Word16, Word32, Word8)
+import Database.PostgreSQL.Protocol.Codec
+  ( HasConstructor (..) )
 import Database.PostgreSQL.Protocol.Codec.Payload
-  ( Atom (..),
-    DenotationOf,
-    Payload (..),
-    PayloadValue,
+  ( Payload (..),
   )
+import GHC.Exts (Any)
+import Unsafe.Coerce (unsafeCoerce)
 
-type ScalarValue :: k -> Type
-type family ScalarValue (t :: k) :: Type where
-  ScalarValue (singleton :: sing (payload :: Payload)) = PayloadValue payload
+newtype Envelope a (s :: k) = Envelope {unEnvelope :: a}
 
-type Scalar :: k -> Type
-newtype Scalar (t :: k) = Scalar {unScalar :: ScalarValue t}
+deriving instance Eq a => Eq (Envelope a s)
+deriving instance Ord a => Ord (Envelope a s)
+deriving instance Show a => Show (Envelope a s)
 
-deriving instance Eq (ScalarValue t) => Eq (Scalar t)
-deriving instance Ord (ScalarValue t) => Ord (Scalar t)
-deriving instance Show (ScalarValue t) => Show (Scalar t)
+newtype SomeEnvelope k = SomeEnvelope Any
 
-type ValueType :: Payload -> Type
-data ValueType payload where
-  OidType :: ValueType (PayloadField 'Word32Atom)
-  ProcessIdType :: ValueType (PayloadField 'Int32Atom)
-  SecretKeyType :: ValueType (PayloadField ('FixedBytesAtom 4))
-  ProtocolVersionType :: ValueType (PayloadField 'Word32Atom)
-  StartupParameterType ::
-    ValueType
-      (PayloadStruct '[PayloadField 'CStringAtom, PayloadField 'CStringAtom])
-  FormatCodeType :: ValueType (PayloadField 'Int16Atom)
-  CopyFormatType :: ValueType (PayloadField 'ByteAtom)
-  NamedObjectType :: ValueType (PayloadField 'ByteAtom)
-  ErrorNoticeFieldType ::
-    ValueType
-      (PayloadStruct '[PayloadField 'ByteAtom, PayloadField 'CStringAtom])
-  ParameterStatusValueType ::
-    ValueType
-      (PayloadStruct '[PayloadField 'CStringAtom, PayloadField 'CStringAtom])
-  TransactionStatusType :: ValueType (PayloadField 'ByteAtom)
+toSomeEnvelope :: Envelope a s -> SomeEnvelope k
+toSomeEnvelope = SomeEnvelope . unsafeCoerce
 
-type StructuredValueType :: Payload -> Type
-data StructuredValueType payload where
+withSomeEnvelope :: SomeEnvelope f -> (forall k (a :: Type) (s :: k). Envelope a s -> r) -> r
+withSomeEnvelope (SomeEnvelope x) k = k (unsafeCoerce x)
+
+newtype Scalar a = Scalar {unScalar :: a}
+
+deriving instance Eq a => Eq (Scalar a)
+deriving instance Ord a => Ord (Scalar a)
+deriving instance Show a => Show (Scalar a)
+
+data OidType (payload :: Payload) where
+  OidType :: OidType ('FixedBytesAtom 4)
+
+data ProcessIdType (payload :: Payload) where
+  ProcessIdType :: ProcessIdType ('FixedBytesAtom 4)
+
+data SecretKeyType (payload :: Payload) where
+  SecretKeyType :: SecretKeyType ('FixedBytesAtom 4)
+
+data BackendKeyType (payload :: Payload) where
   BackendKeyType ::
-    StructuredValueType
+    BackendKeyType
       (PayloadStruct '[PayloadField 'ProcessIdType, PayloadField 'SecretKeyType])
+
+data ProtocolVersionType (payload :: Payload) where
+  ProtocolVersionType :: ProtocolVersionType ('FixedBytesAtom 4)
+
+data StartupParameterType (payload :: Payload) where
+  StartupParameterType ::
+    StartupParameterType
+      (PayloadStruct '[ 'CStringAtom, 'CStringAtom])
+
+data FormatCodeType (payload :: Payload) where
+  FormatCodeType :: FormatCodeType ('FixedBytesAtom 2)
+
+data CopyFormatType (payload :: Payload) where
+  CopyFormatType :: CopyFormatType ('FixedBytesAtom 1)
+
+data NamedObjectType (payload :: Payload) where
+  NamedObjectType :: NamedObjectType ('FixedBytesAtom 1)
+
+data BindBodyType (payload :: Payload) where
   BindBodyType ::
-    StructuredValueType
+    BindBodyType
       ( PayloadStruct
-          '[ PayloadField 'CStringAtom,
-             PayloadField 'CStringAtom,
+          '[ 'CStringAtom,
+             'CStringAtom,
              PayloadCounted16 ('PayloadField 'FormatCodeType),
-             PayloadCounted16 ('PayloadField 'MaybeBytes32Atom),
+             PayloadCounted16 'MaybeBytes32Atom,
              PayloadCounted16 ('PayloadField 'FormatCodeType)
            ]
       )
+
+data CopyResponseType (payload :: Payload) where
   CopyResponseType ::
-    StructuredValueType
+    CopyResponseType
       (PayloadStruct '[PayloadField 'CopyFormatType, PayloadCounted16 ('PayloadField 'FormatCodeType)])
+
+data ErrorNoticeFieldType (payload :: Payload) where
+  ErrorNoticeFieldType ::
+    ErrorNoticeFieldType
+      (PayloadStruct '[ 'FixedBytesAtom 1, 'CStringAtom])
+
+data NotificationType (payload :: Payload) where
   NotificationType ::
-    StructuredValueType
-      (PayloadStruct '[PayloadField 'ProcessIdType, PayloadField 'CStringAtom, PayloadField 'CStringAtom])
+    NotificationType
+      (PayloadStruct '[PayloadField 'ProcessIdType, 'CStringAtom, 'CStringAtom])
+
+data ParameterStatusValueType (payload :: Payload) where
+  ParameterStatusValueType ::
+    ParameterStatusValueType
+      (PayloadStruct '[ 'CStringAtom, 'CStringAtom])
+
+data TransactionStatusType (payload :: Payload) where
+  TransactionStatusType :: TransactionStatusType ('FixedBytesAtom 1)
+
+data RowFieldType (payload :: Payload) where
   RowFieldType ::
-    StructuredValueType
+    RowFieldType
       ( PayloadStruct
-          '[ PayloadField 'CStringAtom,
-             PayloadField 'Word32Atom,
-             PayloadField 'Int16Atom,
+          '[ 'CStringAtom,
+             'FixedBytesAtom 4,
+             'FixedBytesAtom 2,
              PayloadField 'OidType,
-             PayloadField 'Int16Atom,
-             PayloadField 'Int32Atom,
+             'FixedBytesAtom 2,
+             'FixedBytesAtom 4,
              PayloadField 'FormatCodeType
            ]
       )
 
-type Oid :: Type
-type Oid = Scalar 'OidType
+type Oid = Scalar Word32
 
-type instance DenotationOf ('OidType :: ValueType (PayloadField 'Word32Atom)) = Oid
+type OidEnvelope =
+  Envelope
+    Oid
+    'OidType
 
-type ProcessId :: Type
-type ProcessId = Scalar 'ProcessIdType
+type ProcessId = Scalar Int32
 
-type instance DenotationOf ('ProcessIdType :: ValueType (PayloadField 'Int32Atom)) = ProcessId
+type ProcessIdEnvelope =
+  Envelope
+    ProcessId
+    'ProcessIdType
 
-type SecretKey :: Type
-type SecretKey = Scalar 'SecretKeyType
+type SecretKey bytes = Scalar bytes
 
-type instance DenotationOf ('SecretKeyType :: ValueType (PayloadField ('FixedBytesAtom 4))) = SecretKey
+type SecretKeyEnvelope bytes =
+  Envelope
+    (SecretKey bytes)
+    'SecretKeyType
 
-type BackendKey :: Type
-type BackendKey = Scalar 'BackendKeyType
+type BackendKey bytes = Scalar (ProcessId, SecretKey bytes)
 
-type instance DenotationOf ('BackendKeyType :: StructuredValueType (PayloadStruct '[PayloadField 'ProcessIdType, PayloadField 'SecretKeyType])) = BackendKey
+type BackendKeyEnvelope bytes =
+  Envelope
+    (BackendKey bytes)
+    'BackendKeyType
 
-data ProtocolVersion (t :: ValueType payload) = ProtocolVersion
+instance HasConstructor 'ProcessIdType ProcessId where
+  type ConstructorOf 'ProcessIdType ProcessId = Int32 -> ProcessId
+  constructorOf = Scalar
+
+instance HasConstructor 'SecretKeyType (SecretKey bytes) where
+  type ConstructorOf 'SecretKeyType (SecretKey bytes) = bytes -> SecretKey bytes
+  constructorOf = Scalar
+
+instance HasConstructor 'BackendKeyType (BackendKey bytes) where
+  type ConstructorOf 'BackendKeyType (BackendKey bytes) = ProcessId -> SecretKey bytes -> BackendKey bytes
+  constructorOf processId = Scalar . (processId,)
+
+instance HasConstructor 'ProtocolVersionType ProtocolVersion where
+  type ConstructorOf 'ProtocolVersionType ProtocolVersion = Word32 -> ProtocolVersion
+  constructorOf code =
+    ProtocolVersion
+      (fromIntegral (shiftR code 16))
+      (fromIntegral code)
+
+instance HasConstructor 'StartupParameterType (StartupParameter bytes) where
+  type ConstructorOf 'StartupParameterType (StartupParameter bytes) = bytes -> bytes -> StartupParameter bytes
+  constructorOf name value = Scalar (name, value)
+
+data ProtocolVersion = ProtocolVersion
   { protocolVersionMajor :: Word16,
     protocolVersionMinor :: Word16
   }
 
-deriving instance Eq (ProtocolVersion valueType)
-deriving instance Ord (ProtocolVersion valueType)
-deriving instance Show (ProtocolVersion valueType)
+deriving instance Eq ProtocolVersion
+deriving instance Ord ProtocolVersion
+deriving instance Show ProtocolVersion
 
-type instance DenotationOf ('ProtocolVersionType :: ValueType (PayloadField 'Word32Atom)) = ProtocolVersion 'ProtocolVersionType
+type ProtocolVersionEnvelope =
+  Envelope
+    ProtocolVersion
+    'ProtocolVersionType
 
-protocolVersionCode :: ProtocolVersion 'ProtocolVersionType -> Word32
+protocolVersionCode :: ProtocolVersion -> Word32
 protocolVersionCode version =
   shiftL (fromIntegral (protocolVersionMajor version)) 16
     .|. fromIntegral (protocolVersionMinor version)
 
-protocolVersion3_2 :: ProtocolVersion 'ProtocolVersionType
+protocolVersion3_2 :: ProtocolVersion
 protocolVersion3_2 = ProtocolVersion 3 2
 
 cancelRequestCode :: Word32
@@ -178,105 +263,134 @@ sslRequestCode = 80877103
 gssEncRequestCode :: Word32
 gssEncRequestCode = 80877104
 
-type StartupParameter :: Type
-type StartupParameter = Scalar 'StartupParameterType
+type StartupParameter bytes = Scalar (bytes, bytes)
 
-type instance DenotationOf ('StartupParameterType :: ValueType (PayloadStruct '[PayloadField 'CStringAtom, PayloadField 'CStringAtom])) = StartupParameter
+type StartupParameterEnvelope bytes =
+  Envelope
+    (StartupParameter bytes)
+    'StartupParameterType
 
-data FormatCode (t :: ValueType payload)
+data FormatCode
   = TextFormat
   | BinaryFormat
 
-deriving instance Eq (FormatCode valueType)
-deriving instance Ord (FormatCode valueType)
-deriving instance Show (FormatCode valueType)
+deriving instance Eq FormatCode
+deriving instance Ord FormatCode
+deriving instance Show FormatCode
 
-type instance DenotationOf ('FormatCodeType :: ValueType (PayloadField 'Int16Atom)) = FormatCode 'FormatCodeType
+type FormatCodeEnvelope =
+  Envelope
+    FormatCode
+    'FormatCodeType
 
-data CopyFormat (t :: ValueType payload)
+data CopyFormat
   = CopyText
   | CopyBinary
 
-deriving instance Eq (CopyFormat valueType)
-deriving instance Ord (CopyFormat valueType)
-deriving instance Show (CopyFormat valueType)
+deriving instance Eq CopyFormat
+deriving instance Ord CopyFormat
+deriving instance Show CopyFormat
 
-type instance DenotationOf ('CopyFormatType :: ValueType (PayloadField 'ByteAtom)) = CopyFormat 'CopyFormatType
+type CopyFormatEnvelope =
+  Envelope
+    CopyFormat
+    'CopyFormatType
 
-data NamedObject (t :: ValueType payload)
+data NamedObject
   = PreparedStatement
   | Portal
 
-deriving instance Eq (NamedObject valueType)
-deriving instance Ord (NamedObject valueType)
-deriving instance Show (NamedObject valueType)
+deriving instance Eq NamedObject
+deriving instance Ord NamedObject
+deriving instance Show NamedObject
 
-type instance DenotationOf ('NamedObjectType :: ValueType (PayloadField 'ByteAtom)) = NamedObject 'NamedObjectType
+type NamedObjectEnvelope =
+  Envelope
+    NamedObject
+    'NamedObjectType
 
-data BindBody (t :: StructuredValueType payload) = BindBody
-  { bindPortalName :: Text,
-    bindStatementName :: Text,
-    bindParameterFormats :: [FormatCode 'FormatCodeType],
-    bindParameterValues :: [Maybe ByteString],
-    bindResultFormats :: [FormatCode 'FormatCodeType]
+data BindBody bytes = BindBody
+  { bindPortalName :: bytes,
+    bindStatementName :: bytes,
+    bindParameterFormats :: [FormatCode],
+    bindParameterValues :: [Maybe bytes],
+    bindResultFormats :: [FormatCode]
   }
 
-deriving instance Show (BindBody valueType)
-deriving instance Eq (BindBody valueType)
-deriving instance Ord (BindBody valueType)
+deriving instance Show bytes => Show (BindBody bytes)
+deriving instance Eq bytes => Eq (BindBody bytes)
+deriving instance Ord bytes => Ord (BindBody bytes)
 
-type instance DenotationOf ('BindBodyType :: StructuredValueType (PayloadStruct '[PayloadField 'CStringAtom, PayloadField 'CStringAtom, PayloadCounted16 ('PayloadField 'FormatCodeType), PayloadCounted16 ('PayloadField 'MaybeBytes32Atom), PayloadCounted16 ('PayloadField 'FormatCodeType)])) = BindBody 'BindBodyType
+type BindBodyEnvelope bytes =
+  Envelope
+    (BindBody bytes)
+    'BindBodyType
 
-type CopyResponse :: Type
-type CopyResponse = Scalar 'CopyResponseType
+type CopyResponse = Scalar (CopyFormat, [FormatCode])
 
-type instance DenotationOf ('CopyResponseType :: StructuredValueType (PayloadStruct '[PayloadField 'CopyFormatType, PayloadCounted16 ('PayloadField 'FormatCodeType)])) = CopyResponse
+type CopyResponseEnvelope =
+  Envelope
+    CopyResponse
+    'CopyResponseType
 
-type ErrorNoticeField :: Type
-type ErrorNoticeField = Scalar 'ErrorNoticeFieldType
+type ErrorNoticeField bytes = Scalar (Word8, bytes)
 
-type instance DenotationOf ('ErrorNoticeFieldType :: ValueType (PayloadStruct '[PayloadField 'ByteAtom, PayloadField 'CStringAtom])) = ErrorNoticeField
+type ErrorNoticeFieldEnvelope bytes =
+  Envelope
+    (ErrorNoticeField bytes)
+    'ErrorNoticeFieldType
 
-data Notification (t :: StructuredValueType payload) = Notification
+data Notification bytes = Notification
   { notificationProcessId :: ProcessId,
-    notificationChannel :: Text,
-    notificationPayload :: Text
+    notificationChannel :: bytes,
+    notificationPayload :: bytes
   }
 
-deriving instance Eq (Notification valueType)
-deriving instance Ord (Notification valueType)
-deriving instance Show (Notification valueType)
+deriving instance Eq bytes => Eq (Notification bytes)
+deriving instance Ord bytes => Ord (Notification bytes)
+deriving instance Show bytes => Show (Notification bytes)
 
-type instance DenotationOf ('NotificationType :: StructuredValueType (PayloadStruct '[PayloadField 'ProcessIdType, PayloadField 'CStringAtom, PayloadField 'CStringAtom])) = Notification 'NotificationType
+type NotificationEnvelope bytes =
+  Envelope
+    (Notification bytes)
+    'NotificationType
 
-type ParameterStatusValue :: Type
-type ParameterStatusValue = Scalar 'ParameterStatusValueType
+type ParameterStatusValue bytes = Scalar (bytes, bytes)
 
-type instance DenotationOf ('ParameterStatusValueType :: ValueType (PayloadStruct '[PayloadField 'CStringAtom, PayloadField 'CStringAtom])) = ParameterStatusValue
+type ParameterStatusValueEnvelope bytes =
+  Envelope
+    (ParameterStatusValue bytes)
+    'ParameterStatusValueType
 
-data TransactionStatus (t :: ValueType payload)
+data TransactionStatus
   = TxIdle
   | TxInTransaction
   | TxFailedTransaction
 
-deriving instance Eq (TransactionStatus valueType)
-deriving instance Ord (TransactionStatus valueType)
-deriving instance Show (TransactionStatus valueType)
+deriving instance Eq TransactionStatus
+deriving instance Ord TransactionStatus
+deriving instance Show TransactionStatus
 
-type instance DenotationOf ('TransactionStatusType :: ValueType (PayloadField 'ByteAtom)) = TransactionStatus 'TransactionStatusType
+type TransactionStatusEnvelope =
+  Envelope
+    TransactionStatus
+    'TransactionStatusType
 
-data RowField (t :: StructuredValueType payload) = RowField
-  { rowFieldName :: Text,
+data RowField bytes = RowField
+  { rowFieldName :: bytes,
     rowFieldTableOid :: Maybe Oid,
     rowFieldColumnAttributeNumber :: Maybe Int16,
     rowFieldTypeOid :: Oid,
     rowFieldTypeSize :: Int16,
     rowFieldTypeModifier :: Int32,
-    rowFieldFormat :: FormatCode 'FormatCodeType
+    rowFieldFormat :: FormatCode
   }
 
-deriving instance Eq (RowField valueType)
-deriving instance Ord (RowField valueType)
-deriving instance Show (RowField valueType)
+deriving instance Eq bytes => Eq (RowField bytes)
+deriving instance Ord bytes => Ord (RowField bytes)
+deriving instance Show bytes => Show (RowField bytes)
 
-type instance DenotationOf ('RowFieldType :: StructuredValueType (PayloadStruct '[PayloadField 'CStringAtom, PayloadField 'Word32Atom, PayloadField 'Int16Atom, PayloadField 'OidType, PayloadField 'Int16Atom, PayloadField 'Int32Atom, PayloadField 'FormatCodeType])) = RowField 'RowFieldType
+type RowFieldEnvelope bytes =
+  Envelope
+    (RowField bytes)
+    'RowFieldType

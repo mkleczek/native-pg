@@ -62,13 +62,21 @@ library
     exposed-modules:
         Database.PostgreSQL.Protocol
         Database.PostgreSQL.Protocol.Codec
-        Database.PostgreSQL.Protocol.Codec.Copy
         Database.PostgreSQL.Protocol.Messages
+        Database.PostgreSQL.Protocol.Messages.AuthBackend
+        Database.PostgreSQL.Protocol.Messages.AuthFrontend
+        Database.PostgreSQL.Protocol.Messages.BackendSession
+        Database.PostgreSQL.Protocol.Messages.Copy
+        Database.PostgreSQL.Protocol.Messages.FrontendSession
         Database.PostgreSQL.Protocol.Messages.MessageType
+        Database.PostgreSQL.Protocol.Messages.Parse
+        Database.PostgreSQL.Protocol.Messages.Startup
         Database.PostgreSQL.Protocol.Messages.Types
 
     -- Modules included in this library but not exported.
     other-modules:
+        Data.Some
+        Database.PostgreSQL.Protocol.Codec.Input
         Database.PostgreSQL.Protocol.Codec.Payload
 
     -- LANGUAGE extensions used by modules in this package.
@@ -78,6 +86,7 @@ library
     build-depends:
         base ^>=4.21.0.0,
         bytestring ^>=0.12.1.0,
+        mtl ^>=2.3.1,
         text ^>=2.1.2
 
     -- Directories containing source files.
@@ -85,6 +94,7 @@ library
 
     -- Base language which the package is written in.
     default-language: GHC2021
+
 
 test-suite haskell-native-pg-test
     -- Import common warning flags.
@@ -113,4 +123,5 @@ test-suite haskell-native-pg-test
         base ^>=4.21.0.0,
         bytestring ^>=0.12.1.0,
         haskell-native-pg,
+        mtl ^>=2.3.1,
         text ^>=2.1.2
