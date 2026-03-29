@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 module Database.PostgreSQL.Protocol.Messages
   ( module Database.PostgreSQL.Protocol.Messages.Startup,
     module Database.PostgreSQL.Protocol.Messages.AuthFrontend,

@@ -7,39 +7,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE LambdaCase #-}
 
-module Database.PostgreSQL.Protocol.Messages.AuthBackend
-  ( AuthenticationOkType (AuthenticationOkType),
-    AuthenticationKerberosV5Type (AuthenticationKerberosV5Type),
-    AuthenticationCleartextPasswordType (AuthenticationCleartextPasswordType),
-    AuthenticationMD5PasswordType (AuthenticationMD5PasswordType),
-    AuthenticationGSSType (AuthenticationGSSType),
-    AuthenticationGSSContinueType (AuthenticationGSSContinueType),
-    AuthenticationSSPIType (AuthenticationSSPIType),
-    AuthenticationSASLType (AuthenticationSASLType),
-    AuthenticationSASLContinueType (AuthenticationSASLContinueType),
-    AuthenticationSASLFinalType (AuthenticationSASLFinalType),
-    AuthenticationOkEnvelope,
-    AuthenticationKerberosV5Envelope,
-    AuthenticationCleartextPasswordEnvelope,
-    AuthenticationMD5PasswordEnvelope,
-    AuthenticationGSSEnvelope,
-    AuthenticationGSSContinueEnvelope,
-    AuthenticationSSPIEnvelope,
-    AuthenticationSASLEnvelope,
-    AuthenticationSASLContinueEnvelope,
-    AuthenticationSASLFinalEnvelope,
-    AuthenticationOk (AuthenticationOk),
-    AuthenticationKerberosV5 (AuthenticationKerberosV5),
-    AuthenticationCleartextPassword (AuthenticationCleartextPassword),
-    AuthenticationMD5Password (AuthenticationMD5Password),
-    AuthenticationGSS (AuthenticationGSS),
-    AuthenticationGSSContinue (AuthenticationGSSContinue),
-    AuthenticationSSPI (AuthenticationSSPI),
-    AuthenticationSASL (AuthenticationSASL),
-    AuthenticationSASLContinue (AuthenticationSASLContinue),
-    AuthenticationSASLFinal (AuthenticationSASLFinal),
-  )
-where
+module Database.PostgreSQL.Protocol.Messages.AuthBackend where
 
 import Database.PostgreSQL.Protocol.Codec
   ( HasConstructor (..),
