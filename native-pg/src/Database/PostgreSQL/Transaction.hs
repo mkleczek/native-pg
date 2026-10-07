@@ -17,6 +17,8 @@ module Database.PostgreSQL.Transaction
     IsolationLevel (..),
     Mode (..),
     transactionNoRetry,
+    Prepare,
+    transactionNoRetryWith,
     statement,
     sql,
     condemn,
@@ -75,6 +77,7 @@ newtype Transaction a = Transaction (Context -> IO (Either QueryError a))
 
 data Context = Context
   { contextSession :: Session 'Ready,
+    contextPrepare :: Maybe Prepare,
     -- | Whether the transaction commits.
     contextCommits :: IORef Bool
   }
@@ -110,9 +113,22 @@ data Mode
 -- then @COMMIT@, or @ABORT@ if it was condemned or a statement failed. If it
 -- throws, the transaction is aborted when the session is still usable.
 transactionNoRetry :: IsolationLevel -> Mode -> Transaction a -> Session 'Ready -> IO (Either QueryError a)
-transactionNoRetry isolation mode (Transaction body) session = do
+transactionNoRetry = runTransaction Nothing
+
+-- | Gives the name a statement is prepared under on the session, from its
+-- SQL and its parameters' types, preparing it first if needed, e.g. from a
+-- statement cache. Or the server's error, if preparing failed.
+type Prepare = ByteString -> [OptionalOid] -> IO (Either ServerError ByteString)
+
+-- | Like 'transactionNoRetry', but the statements that may be prepared run as
+-- prepared statements, under the names 'Prepare' gives.
+transactionNoRetryWith :: Prepare -> IsolationLevel -> Mode -> Transaction a -> Session 'Ready -> IO (Either QueryError a)
+transactionNoRetryWith = runTransaction . Just
+
+runTransaction :: Maybe Prepare -> IsolationLevel -> Mode -> Transaction a -> Session 'Ready -> IO (Either QueryError a)
+runTransaction prepare isolation mode (Transaction body) session = do
   commits <- newIORef True
-  let context = Context session commits
+  let context = Context session prepare commits
       run (Transaction action) = action context
       -- An exception may have broken the session; then there's nothing to
       -- abort, and the pool closes it.
@@ -150,11 +166,12 @@ sql query = statement () (Statement query (const []) noResult False)
 
 -- | Runs the statement with the parameters, and reads its result.
 statement :: params -> Statement params result -> Transaction result
-statement params (Statement query encode (Result initial step finish) _) = Transaction $ \context -> do
+statement params (Statement query encode (Result initial step finish) preparable) = Transaction $ \context -> do
   let parameters = encode params
-      execution =
+      types = paramType <$> parameters
+      execution executed =
         Execution
-          { executionStatement = Session.Unprepared query (paramType <$> parameters),
+          { executionStatement = executed,
             executionParameterFormats = paramFormat <$> parameters,
             executionParameters = paramValue <$> parameters,
             -- The decoders read the binary formats.
@@ -162,19 +179,25 @@ statement params (Statement query encode (Result initial step finish) _) = Trans
           }
       folding (Left failure) _ = pure (Left failure)
       folding (Right accumulated) current = step accumulated current
-  (outcome, _) <- execute (contextSession context) execution folding (Right initial)
-  pure . first (QueryError query) $ case outcome of
-    Left failure -> Left (ServerFailed failure)
-    Right (Left failure, _) -> Left (RowFailed failure)
-    Right (Right accumulated, _) -> finish accumulated
+  prepared <- case contextPrepare context of
+    Just prepare | preparable -> fmap Session.Prepared <$> prepare query types
+    _ -> pure (Right (Session.Unprepared query types))
+  case prepared of
+    Left failure -> pure (Left (QueryError query (ServerFailed failure)))
+    Right executed -> do
+      (outcome, _) <- execute (contextSession context) (execution executed) folding (Right initial)
+      pure . first (QueryError query) $ case outcome of
+        Left failure -> Left (ServerFailed failure)
+        Right (Left failure, _) -> Left (RowFailed failure)
+        Right (Right accumulated, _) -> finish accumulated
 
 -- | A statement: its SQL, its parameters, and how its result is read.
 data Statement params result = Statement
   { statementSql :: ByteString,
     statementParams :: params -> [Param],
     statementResult :: Result result,
-    -- | Whether a statement cache may prepare it. Without one, statements
-    -- run unnamed.
+    -- | Whether it may run as a prepared statement, with
+    -- 'transactionNoRetryWith'. Otherwise it runs unnamed.
     statementPreparable :: Bool
   }
 

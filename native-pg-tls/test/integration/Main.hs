@@ -16,7 +16,7 @@ import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int16, Int32, Int64)
 import Data.List (intercalate, isPrefixOf)
 import Data.Maybe (isJust)
@@ -327,6 +327,19 @@ main = withCluster $ \socketPath -> hspec $ do
         (Tx.statement () (Tx.Statement "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')" (const []) (Tx.singleRow (Tx.row @'[Text, Text] (,))) False))
         session
         `shouldReturn` Right ("repeatable read", "on")
+    it "runs a preparable statement under the name its Prepare gives, and the others unnamed" $ \session -> do
+      prepared <- newIORef []
+      let prepareAs name query types = do
+            modifyIORef prepared (query :)
+            (result, _) <- prepare session name query types
+            pure (name <$ result)
+          named = Tx.Statement "SELECT count(*) FROM pg_prepared_statements WHERE name = 'answer'" (const []) (Tx.singleRow (Tx.row @'[Int64] id)) False
+          answer = Tx.Statement "SELECT $1::int4 + 1" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) (Tx.singleRow (Tx.row @'[Int32] id)) True
+      Tx.transactionNoRetryWith (prepareAs "answer") Tx.ReadCommitted Tx.Read ((,) <$> Tx.statement "41" answer <*> Tx.statement () named) session
+        `shouldReturn` Right (42, 1)
+      readIORef prepared `shouldReturn` ["SELECT $1::int4 + 1"]
+      result <- Tx.transactionNoRetryWith (prepareAs "broken") Tx.ReadCommitted Tx.Read (Tx.statement () (Tx.Statement "SELEC 1" (const []) Tx.noResult True)) session
+      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELEC 1" && failure `servedCode` "42601") (const False)
     it "reports a failure at commit" $ \session -> do
       void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
       let insertTwice = Tx.sql "INSERT INTO tx_unique VALUES (1)" *> Tx.sql "INSERT INTO tx_unique VALUES (1)"
