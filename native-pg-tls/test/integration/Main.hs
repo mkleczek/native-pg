@@ -9,8 +9,9 @@
 module Main (main) where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (bracket, bracket_, displayException, try)
+import Control.Exception (ErrorCall (..), bracket, bracket_, displayException, throwIO, try)
 import Control.Monad (unless, void)
+import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -40,6 +41,7 @@ import Database.PostgreSQL.Protocol
   )
 import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
 import Database.PostgreSQL.Session
+import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Transport (Address (..), StreamLengthError)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
@@ -287,6 +289,71 @@ main = withCluster $ \socketPath -> hspec $ do
           _ <- query administrator "SELECT pg_terminate_backend($1::int)" [Just (Char8.pack (show pid))]
           awaitNotification listener `shouldThrow` connectionTerminated
 
+  describe "transactions" $ around withSession $ do
+    let createItems session = void (query session "CREATE TEMP TABLE tx_items (n int)" [])
+        countItems = Tx.Statement "SELECT count(*) FROM tx_items" (const []) (Tx.singleRow (Tx.row @'[Int64] id)) False
+        insertItem = Tx.Statement "INSERT INTO tx_items VALUES ($1)" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) Tx.noResult False
+        items = Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.statement () countItems)
+        failsWith check = either (\(Tx.QueryError _ failure) -> check failure) (const False)
+    it "commits" $ \session -> do
+      createItems session
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem) session `shouldReturn` Right ()
+      items session `shouldReturn` Right 1
+    it "rolls back when condemned" $ \session -> do
+      createItems session
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> Tx.condemn) session `shouldReturn` Right ()
+      items session `shouldReturn` Right 0
+    it "rolls back after a failing statement, and reports it with its SQL" $ \session -> do
+      createItems session
+      result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> Tx.sql "SELECT 1 / 0") session
+      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
+      items session `shouldReturn` Right 0
+    it "begins with the isolation level and the mode" $ \session ->
+      Tx.transactionNoRetry
+        Tx.RepeatableRead
+        Tx.Read
+        (Tx.statement () (Tx.Statement "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')" (const []) (Tx.singleRow (Tx.row @'[Text, Text] (,))) False))
+        session
+        `shouldReturn` Right ("repeatable read", "on")
+    it "reports a failure at commit" $ \session -> do
+      void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
+      let insertTwice = Tx.sql "INSERT INTO tx_unique VALUES (1)" *> Tx.sql "INSERT INTO tx_unique VALUES (1)"
+      result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write insertTwice session
+      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "COMMIT" && failure `servedCode` "23505") (const False)
+    it "checks how many rows a result has" $ \session -> do
+      let numbers :: Tx.Result a -> Int -> Tx.Transaction a
+          numbers shape count = Tx.statement () (Tx.Statement ("SELECT n FROM generate_series(1, " <> Char8.pack (show count) <> ") n") (const []) shape False)
+          number = Tx.row @'[Int32] id
+          run transaction = Tx.transactionNoRetry Tx.ReadCommitted Tx.Read transaction session
+      run (numbers (Tx.singleRow number) 0) >>= (`shouldSatisfy` failsWith (== Tx.UnexpectedAmountOfRows 0))
+      run (numbers (Tx.singleRow number) 2) >>= (`shouldSatisfy` failsWith (== Tx.UnexpectedAmountOfRows 2))
+      run (numbers (Tx.rowMaybe number) 0) `shouldReturn` Right Nothing
+      run (numbers (Tx.rowMaybe number) 1) `shouldReturn` Right (Just 1)
+      run (numbers (Tx.rowList number) 3) `shouldReturn` Right [1, 2, 3]
+      run (numbers Tx.noResult 3) `shouldReturn` Right ()
+    it "reports a row that doesn't decode" $ \session -> do
+      result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.statement () (Tx.Statement "SELECT 'abc'::text" (const []) (Tx.singleRow (Tx.row @'[Int32] id)) False)) session
+      result `shouldSatisfy` failsWith (\case Tx.RowFailed _ -> True; _ -> False)
+    it "streams a column larger than the read buffer within the transaction" $ \session -> do
+      let streamed accumulated current =
+            case accumulated of
+              Nothing -> Just <$> Tx.decodeScopedStreaming @'[Int32] current (\number stream -> (number,Tx.streamLength stream,) <$> drain stream 0)
+              Just _ -> pure accumulated
+          drain stream received =
+            Tx.streamChunk stream >>= \chunk ->
+              if BS.null chunk then pure received else drain stream (received + BS.length chunk)
+      Tx.transactionNoRetry
+        Tx.ReadCommitted
+        Tx.Read
+        (Tx.statement () (Tx.Statement "SELECT 7::int4, repeat('x', 1000000)" (const []) (Tx.foldRows streamed Nothing) False))
+        session
+        `shouldReturn` Right (Just (Right (7, 1000000, 1000000)))
+    it "aborts when the transaction throws between statements, and leaves the session usable" $ \session -> do
+      createItems session
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> liftIO (throwIO (ErrorCall "boom"))) session
+        `shouldThrow` errorCall "boom"
+      items session `shouldReturn` Right 0
+
   describe "execute (failures)" $ around withSession $ do
     it "breaks the session when a parameter stream is shorter than declared" $ \session -> do
       source <- chunkSource ["short"]
@@ -404,6 +471,11 @@ connectAndClose settings = do
 
 errorCode :: ServerError -> Maybe ByteString
 errorCode (ServerError fields) = Just (diagnosticCode fields)
+
+-- | Whether the statement failed on the server with the SQLSTATE.
+servedCode :: Tx.StatementError -> ByteString -> Bool
+servedCode (Tx.ServerFailed failure) code = errorCode failure == Just code
+servedCode _ _ = False
 
 -- | The diagnostics of a failed statement.
 failed :: Either ServerError a -> Maybe Diagnostics

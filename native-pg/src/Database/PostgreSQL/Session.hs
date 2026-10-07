@@ -34,7 +34,7 @@ module Database.PostgreSQL.Session
 
     -- * Rows
     Column (..),
-    DecodeRow (RowFunction),
+    DecodeRow (RowFunction, mapRowFunction),
     Row,
     columnBytes,
     columnStream,
@@ -718,17 +718,25 @@ class DecodeRow (columns :: [Type]) where
   -- function to them.
   applyColumns :: Int -> RowFunction columns final -> Input (Either DecodingError final)
 
+  -- | Applies a function to what the row function finally gives, e.g. to
+  -- make a pure constructor of the columns' values give an action.
+  mapRowFunction :: (final -> final') -> RowFunction columns final -> RowFunction columns final'
+
 instance DecodeRow '[] where
   type RowFunction '[] final = final
   rowArity = 0
   {-# INLINE rowArity #-}
   applyColumns _ final = pure (Right final)
   {-# INLINE applyColumns #-}
+  mapRowFunction f = f
+  {-# INLINE mapRowFunction #-}
 
 instance (DecodeField a, DecodeRow columns) => DecodeRow (a ': columns) where
   type RowFunction (a ': columns) final = a -> RowFunction columns final
   rowArity = 1 + rowArity @columns
   {-# INLINE rowArity #-}
+  mapRowFunction f function = mapRowFunction @columns f . function
+  {-# INLINE mapRowFunction #-}
   applyColumns column function = do
     value <- parser @(Maybe ByteString) @'MaybeBytes32Atom
     case decodeField value of
