@@ -20,6 +20,7 @@ module Database.PostgreSQL.Session
     close,
     connect,
     connectSettings,
+    isUsable,
 
     -- * Statements
     Execution (..),
@@ -357,6 +358,16 @@ close :: Session phase -> IO ()
 close session@(Session connection) =
   (send @'TerminateType session Terminate `catch` \(_ :: IOException) -> pure ())
     `finally` Socket.close (connectionSocket connection)
+
+-- | Whether the session can run an operation: none is running, and none
+-- broke it. An operation that an exception interrupts leaves the session
+-- broken, e.g. when its thread is killed.
+isUsable :: Session phase -> IO Bool
+isUsable (Session connection) = do
+  state <- readIORef (connectionState connection)
+  pure $ case state of
+    Idle -> True
+    _ -> False
 
 startupMessage :: ConnectSettings -> StartupMessage ByteString
 startupMessage settings =

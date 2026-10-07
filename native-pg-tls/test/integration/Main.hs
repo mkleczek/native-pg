@@ -202,6 +202,16 @@ main = withCluster $ \socketPath -> hspec $ do
       let nested () _ = void (execute session (statement "SELECT 2" []) (\() _ -> pure ()) ())
       execute session (statement "SELECT 1" []) nested () `shouldThrow` sessionUnusable
       query session "SELECT 1" [] `shouldThrow` sessionUnusable
+    it "tells whether it's usable" $ \session -> do
+      isUsable session `shouldReturn` True
+      _ <- query session "SELECT 1" []
+      isUsable session `shouldReturn` True
+      let interrupted () _ = do
+            usableMeanwhile <- isUsable session
+            usableMeanwhile `shouldBe` False
+            throwIO (ErrorCall "interrupted")
+      execute session (statement "SELECT 1" []) interrupted () `shouldThrow` errorCall "interrupted"
+      isUsable session `shouldReturn` False
   describe "decodeRow" $ around withSession $ do
     it "decodes integers, booleans, floats and numerics" $ \session ->
       decodeSingle @'[Int16, Int32, Int64, Bool, Float, Double, Scientific] session "SELECT 1::int2, -2::int4, 3::int8, true, 1.5::float4, 2.5::float8, 3.25::numeric" (\a b c d e f g -> pure (a, b, c, d, e, f, g))

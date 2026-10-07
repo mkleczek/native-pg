@@ -47,7 +47,7 @@ module Database.PostgreSQL.Transaction
   )
 where
 
-import Control.Exception (SomeException, onException, try)
+import Control.Exception (Exception, SomeException, onException, try)
 import Control.Monad (ap, liftM, void)
 import Control.Monad.IO.Class (MonadIO (..))
 import Data.Bifunctor (first)
@@ -190,6 +190,8 @@ data Param = Param
 -- | A statement failed: its SQL, and why.
 data QueryError = QueryError ByteString StatementError
   deriving (Eq, Show)
+
+instance Exception QueryError
 
 data StatementError
   = -- | The server reported an error.
