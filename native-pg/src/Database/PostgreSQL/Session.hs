@@ -45,7 +45,7 @@ module Database.PostgreSQL.Session
   )
 where
 
-import Control.Exception (Exception, IOException, bracket, bracketOnError, catch, finally, onException, throwIO)
+import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, finally, onException, throwIO)
 import Control.Monad (unless, when, (<=<))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -85,7 +85,9 @@ import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Protocol.Messages
 import Database.PostgreSQL.Transport
   ( Address,
+    TcpOptions,
     connectSocket,
+    defaultTcpOptions,
     sendOutput,
     socketInputSource,
   )
@@ -277,11 +279,12 @@ data ConnectSettings = ConnectSettings
     -- some connection poolers reject it.
     connectProtocolVersion :: ProtocolVersion,
     -- | The size of a read buffer.
-    connectReadSize :: Int
+    connectReadSize :: Int,
+    connectTcpOptions :: TcpOptions
   }
 
--- | No password, database or extra parameters, protocol 3.0 and 16 KiB read
--- buffers.
+-- | No password, database or extra parameters, protocol 3.0, 16 KiB read
+-- buffers and TCP keepalives.
 connectSettings :: Address -> ByteString -> ConnectSettings
 connectSettings address user =
   ConnectSettings
@@ -291,7 +294,8 @@ connectSettings address user =
       connectDatabase = Nothing,
       connectParameters = [],
       connectProtocolVersion = protocolVersion3_0,
-      connectReadSize = 16384
+      connectReadSize = 16384,
+      connectTcpOptions = defaultTcpOptions
     }
 
 data ServerInfo = ServerInfo
@@ -324,12 +328,22 @@ data ConnectionError
     RowMisuse String
   deriving (Eq, Show)
 
-instance Exception ConnectionError
+instance Exception ConnectionError where
+  displayException failure = case failure of
+    ConnectionRejected rejection -> displayException rejection
+    ConnectionTerminated termination -> displayException termination
+    ProtocolError reason -> "protocol error: " <> reason
+    UnsupportedAuthentication method -> "the server asks for authentication with " <> method <> ", which isn't supported"
+    AuthenticationError reason -> reason
+    SessionUnusable reason -> reason
+    RowMisuse reason -> reason
 
 -- | Connects, authenticates and waits until the server is ready for a query.
+-- Throws 'Database.PostgreSQL.Transport.ConnectError' when the socket doesn't
+-- connect, and 'ConnectionError' when the server rejects the connection.
 connect :: ConnectSettings -> IO (Session 'Ready, ServerInfo)
 connect settings =
-  bracketOnError (connectSocket (connectAddress settings)) Socket.close $ \sock -> do
+  bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock -> do
     buffer <- newIORef emptyInputBuffer
     state <- newIORef Idle
     notifications <- newIORef []
@@ -521,7 +535,7 @@ awaitNotification session@(Session connection) = operation session $ do
 -- 57014, and a request that comes too late does nothing.
 cancel :: Address -> BackendKey ByteString -> IO ()
 cancel address key =
-  bracket (connectSocket address) Socket.close $ \sock -> do
+  bracket (connectSocket defaultTcpOptions address) Socket.close $ \sock -> do
     sendOutput sock (serialize @(CancelRequest ByteString) @'CancelRequestType (CancelRequest key))
     -- The server closes the connection once it has handled the request.
     let waitForClose = do

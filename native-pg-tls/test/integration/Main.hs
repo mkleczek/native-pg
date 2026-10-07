@@ -9,7 +9,7 @@
 module Main (main) where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (bracket, bracket_, try)
+import Control.Exception (bracket, bracket_, displayException, try)
 import Control.Monad (unless, void)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
@@ -17,6 +17,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int16, Int32, Int64)
+import Data.List (intercalate, isPrefixOf)
 import Data.Maybe (isJust)
 import Data.Scientific (Scientific)
 import Data.Text (Text)
@@ -24,6 +25,7 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Time (Day, DiffTime, UTCTime (..), fromGregorian)
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
+import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Decoding
 import Database.PostgreSQL.Diagnostics
 import Database.PostgreSQL.Protocol
@@ -41,9 +43,10 @@ import Database.PostgreSQL.Session
 import Database.PostgreSQL.Transport (Address (..), StreamLengthError)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
+import qualified Network.Socket as Socket
 import System.Directory (getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.Mem (performMajorGC)
 import System.Posix.Temp (mkdtemp)
 import System.Process (readProcessWithExitCode)
@@ -85,6 +88,59 @@ main = withCluster $ \socketPath -> hspec $ do
       let major = fmap fst . Char8.readInt =<< lookup "server_version" (serverParameters info)
       serverProtocolVersion info
         `shouldBe` (if maybe False (>= 18) major then protocolVersion3_2 else protocolVersion3_0)
+
+  describe "connection strings" $ do
+    let directory = takeDirectory socketPath
+        -- Without the environment, so that the PG* variables of the shell
+        -- running the tests don't change them.
+        connectWith string =
+          either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") string)
+        withConnection string = bracket (connectWith string) (\(session, _, _) -> close session)
+        connectFailure string = do
+          result <- try (connectWith string)
+          case result of
+            Left failure -> pure (displayException (failure :: ConnectFailure))
+            Right (session, _, _) -> close session *> fail "connected"
+        local extra = "host=" <> Char8.pack directory <> " dbname=postgres " <> extra
+        value session sql = fst <$> query session sql []
+    it "connects with a URI that names the socket directory" $
+      withConnection ("postgresql:///postgres?host=" <> Char8.pack directory) $ \(session, _, host) -> do
+        hostName host `shouldBe` directory
+        value session "SELECT 1" `shouldReturn` Right ([[Just "1"]], "SELECT 1")
+    it "tries the hosts in order" $
+      withConnection ("host=/nonexistent," <> Char8.pack directory <> " dbname=postgres") $ \(_, _, host) ->
+        hostName host `shouldBe` directory
+    it "words each host's failure as libpq does" $
+      connectFailure "host=/nonexistent-1,/nonexistent-2"
+        `shouldReturn` intercalate
+          "\n"
+          [ "connection to server on socket \"" <> path <> "/.s.PGSQL.5432\" failed: No such file or directory\n\tIs the server running locally and accepting connections on that socket?"
+          | path <- ["/nonexistent-1", "/nonexistent-2"]
+          ]
+    it "words a host name that doesn't resolve as libpq does" $ do
+      failure <- connectFailure "host=no-such-host.invalid"
+      failure `shouldSatisfy` isPrefixOf "could not translate host name \"no-such-host.invalid\" to address: "
+    it "names the application, with the fallback name if none is given" $ do
+      withConnection (local "fallback_application_name=fallback") $ \(session, _, _) ->
+        value session "SELECT current_setting('application_name')" `shouldReturn` Right ([[Just "fallback"]], "SELECT 1")
+      withConnection (local "fallback_application_name=fallback application_name=app") $ \(session, _, _) ->
+        value session "SELECT current_setting('application_name')" `shouldReturn` Right ([[Just "app"]], "SELECT 1")
+    it "connects only to a server with the session attributes asked for" $ do
+      let readOnly = "options='-c default_transaction_read_only=on' "
+      withConnection (local (readOnly <> "target_session_attrs=read-only")) (\_ -> pure ())
+      connectFailure (local (readOnly <> "target_session_attrs=read-write"))
+        `shouldReturn` ("connection to server on socket \"" <> socketPath <> "\" failed: session is read-only")
+      withConnection (local "target_session_attrs=primary") (\_ -> pure ())
+      connectFailure (local "target_session_attrs=standby")
+        `shouldReturn` ("connection to server on socket \"" <> socketPath <> "\" failed: server is not in hot standby mode")
+      withConnection (local "target_session_attrs=prefer-standby") (\_ -> pure ())
+    it "gives up on a host after connect_timeout" $
+      withSilentServer $ \silent -> do
+        started <- getMonotonicTime
+        connectFailure ("host=" <> Char8.pack silent <> " connect_timeout=2")
+          `shouldReturn` ("connection to server on socket \"" <> silent <> "/.s.PGSQL.5432\" failed: timeout expired")
+        elapsed <- subtract started <$> getMonotonicTime
+        elapsed `shouldSatisfy` (\seconds -> seconds >= 2 && seconds < 5)
 
   describe "execute" $ around withSession $ do
     it "runs an unprepared statement with parameters" $ \session ->
@@ -375,6 +431,17 @@ sessionUnusable _ = False
 rowMisuse :: ConnectionError -> Bool
 rowMisuse (RowMisuse _) = True
 rowMisuse _ = False
+
+-- | Runs the action with the directory of a Unix-domain socket that accepts
+-- connections but never answers.
+withSilentServer :: (FilePath -> IO a) -> IO a
+withSilentServer action = do
+  temporary <- getTemporaryDirectory
+  bracket (mkdtemp (temporary </> "native-pg-silent-")) removeDirectoryRecursive $ \directory ->
+    bracket (Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
+      Socket.bind sock (Socket.SockAddrUnix (directory </> ".s.PGSQL.5432"))
+      Socket.listen sock 4
+      action directory
 
 -- | Runs the action with the socket path of a new cluster, which has a role
 -- for each password method.

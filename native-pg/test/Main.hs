@@ -4,17 +4,22 @@
 
 module Main (main) where
 
-import Control.Exception (evaluate)
+import Control.Exception (displayException, evaluate)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.Foldable (toList)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
+import Data.List (isInfixOf)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Word (Word8)
 import Database.PostgreSQL.Authentication
+import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Diagnostics
 import Database.PostgreSQL.Protocol
 import Database.PostgreSQL.Protocol.Codec
 import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
+import Database.PostgreSQL.Transport (Address (..), ConnectError (..), TcpOptions (..), defaultTcpOptions)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import Test.Hspec
@@ -194,6 +199,114 @@ main = hspec $ do
       let (_, client) = scramClientFirst "user" "rOprNGfwEbeRWgbNEkqO"
       fmap fst (scramClientFinal "pencil" client "r=other,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096") `shouldSatisfy` isLeft
 
+  describe "connection strings" $ do
+    it "fills in libpq's defaults" $
+      parse ""
+        `shouldBe` Right
+          ConnectionString
+            { connectionHosts = Host "/tmp" Nothing 5432 :| [],
+              connectionUser = "local",
+              connectionPassword = Nothing,
+              connectionDatabase = "local",
+              connectionParameters = [],
+              connectionTimeout = Nothing,
+              connectionTargetSessionAttrs = AnySession,
+              connectionProtocolVersion = protocolVersion3_0,
+              connectionMinProtocolVersion = protocolVersion3_0,
+              connectionTcpOptions = defaultTcpOptions
+            }
+    it "reads a URI" $ do
+      let parsed = parse "postgresql://alice:p%40ss@db.example.com:6543/app?application_name=api&connect_timeout=10"
+      hosts parsed `shouldBe` Right [Host "db.example.com" Nothing 6543]
+      fmap connectionUser parsed `shouldBe` Right "alice"
+      fmap connectionPassword parsed `shouldBe` Right (Just "p@ss")
+      fmap connectionDatabase parsed `shouldBe` Right "app"
+      fmap connectionParameters parsed `shouldBe` Right [("application_name", "api")]
+      fmap connectionTimeout parsed `shouldBe` Right (Just 10)
+    it "reads a key/value string, with quoted and escaped values" $ do
+      let parsed = parse "host=db port = 5433 user='o\\'brien' password='a b' dbname=x\\ y"
+      hosts parsed `shouldBe` Right [Host "db" Nothing 5433]
+      fmap connectionUser parsed `shouldBe` Right "o'brien"
+      fmap connectionPassword parsed `shouldBe` Right (Just "a b")
+      fmap connectionDatabase parsed `shouldBe` Right "x y"
+    it "reads several hosts, each with its port or the default" $
+      hosts (parse "postgresql://h1:5432,h2:5433,[::1]/db")
+        `shouldBe` Right [Host "h1" Nothing 5432, Host "h2" Nothing 5433, Host "::1" Nothing 5432]
+    it "gives a single port to every host" $
+      hosts (parse "host=h1,h2 port=5433") `shouldBe` Right [Host "h1" Nothing 5433, Host "h2" Nothing 5433]
+    it "connects to a socket in a directory host" $ do
+      fmap (fmap hostSocketAddress) (hosts (parse "host=/var/run/postgresql port=5433"))
+        `shouldBe` Right [UnixAddress "/var/run/postgresql/.s.PGSQL.5433"]
+      hosts (parse "postgresql://%2Fvar%2Frun%2Fpostgresql/db") `shouldBe` Right [Host "/var/run/postgresql" Nothing 5432]
+    it "connects to hostaddr instead of looking up the host" $ do
+      let parsed = hosts (parse "host=db hostaddr=10.0.0.1 port=5433")
+      parsed `shouldBe` Right [Host "db" (Just "10.0.0.1") 5433]
+      fmap (fmap hostSocketAddress) parsed `shouldBe` Right [TcpAddress "10.0.0.1" 5433]
+    it "takes defaults from the environment" $ do
+      let parsed =
+            parseWith
+              [ ("PGHOST", "envhost"),
+                ("PGPORT", "5555"),
+                ("PGUSER", "envuser"),
+                ("PGDATABASE", "envdb"),
+                ("PGPASSWORD", "secret"),
+                ("PGAPPNAME", "envapp")
+              ]
+              "user=given"
+      hosts parsed `shouldBe` Right [Host "envhost" Nothing 5555]
+      fmap connectionUser parsed `shouldBe` Right "given"
+      fmap connectionDatabase parsed `shouldBe` Right "envdb"
+      fmap connectionPassword parsed `shouldBe` Right (Just "secret")
+      fmap connectionParameters parsed `shouldBe` Right [("application_name", "envapp")]
+    it "takes the last value given for an option" $ do
+      fmap connectionTargetSessionAttrs (parse "postgresql://h/db?target_session_attrs=read-only&target_session_attrs=read-write")
+        `shouldBe` Right ReadWriteSession
+      hosts (parse "postgresql://h1/db?host=h2") `shouldBe` Right [Host "h2" Nothing 5432]
+    it "names the application with fallback_application_name when application_name is missing" $ do
+      fmap connectionParameters (parse "fallback_application_name=fallback")
+        `shouldBe` Right [("application_name", "fallback")]
+      fmap connectionParameters (parse "fallback_application_name=fallback application_name=app")
+        `shouldBe` Right [("application_name", "app")]
+    it "rejects strings that require TLS" $ do
+      mapM_
+        (\string -> parse string `shouldSatisfy` failsWith "requires TLS, which isn't supported")
+        ["sslmode=require", "sslmode=verify-ca", "sslmode=verify-full", "requiressl=1", "postgresql://h/db?ssl=true"]
+      parseWith [("PGSSLMODE", "verify-full")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-full requires TLS"
+      parse "gssencmode=require" `shouldSatisfy` failsWith "requires GSSAPI encryption, which isn't supported"
+      mapM_ (\string -> parse string `shouldSatisfy` isRight) ["sslmode=disable", "sslmode=allow", "sslmode=prefer"]
+    it "rejects options it doesn't know or implement" $ do
+      parse "foo=bar" `shouldSatisfy` failsWith "invalid connection option \"foo\""
+      parse "postgresql://h/db?foo=bar" `shouldSatisfy` failsWith "invalid URI query parameter: \"foo\""
+      parse "service=x" `shouldSatisfy` failsWith "service isn't supported"
+      parse "require_auth=password" `shouldSatisfy` failsWith "require_auth isn't supported"
+      parse "load_balance_hosts=random" `shouldSatisfy` failsWith "requires random load balancing"
+      parse "passfile=/pgpass" `shouldSatisfy` failsWith "password files aren't supported"
+      parse "passfile=/pgpass password=x" `shouldSatisfy` isRight
+    it "reports malformed strings as libpq does" $ do
+      parse "host" `shouldSatisfy` failsWith "missing \"=\" after \"host\" in connection info string"
+      parse "password='abc" `shouldSatisfy` failsWith "unterminated quoted string"
+      parse "postgresql://[::1/db" `shouldSatisfy` failsWith "end of string reached when looking for matching \"]\""
+      parse "postgresql://%zz@h" `shouldSatisfy` failsWith "invalid percent-encoded token"
+      parse "port=abc" `shouldSatisfy` failsWith "invalid port number: \"abc\""
+      parse "host=h1,h2 port=1,2,3" `shouldSatisfy` failsWith "could not match 3 port numbers to 2 hosts"
+      parse "target_session_attrs=master" `shouldSatisfy` failsWith "invalid target_session_attrs value: \"master\""
+    it "waits at least two seconds for a host, as libpq does" $ do
+      fmap connectionTimeout (parse "connect_timeout=1") `shouldBe` Right (Just 2)
+      fmap connectionTimeout (parse "connect_timeout=0") `shouldBe` Right Nothing
+    it "reads keepalive and protocol version options" $ do
+      fmap (tcpKeepalives . connectionTcpOptions) (parse "keepalives=0") `shouldBe` Right False
+      fmap (tcpKeepalivesIdle . connectionTcpOptions) (parse "keepalives_idle=30") `shouldBe` Right (Just 30)
+      fmap connectionProtocolVersion (parse "max_protocol_version=3.2") `shouldBe` Right protocolVersion3_2
+      parse "min_protocol_version=3.2" `shouldSatisfy` failsWith "min_protocol_version is greater than max_protocol_version"
+    it "needs a user when the local one can't be looked up" $ do
+      parseConnectionString (const Nothing) Nothing "" `shouldSatisfy` failsWith "a user has to be given"
+      parseConnectionString (const Nothing) Nothing "user=u" `shouldSatisfy` isRight
+    it "words failures as libpq does" $ do
+      displayException (UnresolvedHost "no_host" "nodename nor servname provided, or not known")
+        `shouldBe` "could not translate host name \"no_host\" to address: nodename nor servname provided, or not known"
+      displayException (ConnectFailure [(Host "/tmp" Nothing 5432, TimedOut), (Host "db" Nothing 5433, Unsuitable "session is read-only")])
+        `shouldBe` "connection to server on socket \"/tmp/.s.PGSQL.5432\" failed: timeout expired\nconnection to server at \"db\", port 5433 failed: session is read-only"
+
 rfc7677ServerFirst :: ByteString
 rfc7677ServerFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
 
@@ -321,6 +434,21 @@ int16 value = BS.drop 2 (int32 value)
 
 byte :: Char -> Word8
 byte = fromIntegral . fromEnum
+
+parse :: ByteString -> Either String ConnectionString
+parse = parseWith []
+
+parseWith :: [(String, String)] -> ByteString -> Either String ConnectionString
+parseWith environment = parseConnectionString (`lookup` environment) (Just "local")
+
+hosts :: Either String ConnectionString -> Either String [Host]
+hosts = fmap (toList . connectionHosts)
+
+failsWith :: String -> Either String a -> Bool
+failsWith message = either (message `isInfixOf`) (const False)
+
+isRight :: Either a b -> Bool
+isRight = not . isLeft
 
 isLeft :: Either a b -> Bool
 isLeft = either (const True) (const False)

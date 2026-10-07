@@ -11,9 +11,15 @@ module Database.PostgreSQL.Diagnostics
 where
 
 import Control.Applicative ((<|>))
+import Control.Exception (Exception (..))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
+import Data.List (intercalate)
+import Data.Maybe (catMaybes)
+import qualified Data.Text as Text
+import Data.Text.Encoding (decodeUtf8With)
+import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word8)
 import Database.PostgreSQL.Protocol.Messages.Types (ErrorNoticeField, Scalar (..))
 
@@ -64,6 +70,29 @@ data Severity
 -- | An error the server reported.
 newtype ServerError = ServerError Diagnostics
   deriving (Eq, Show)
+
+-- | Worded as libpq words it: the severity and the message, then the detail
+-- and the hint on lines of their own.
+instance Exception ServerError where
+  displayException (ServerError fields) =
+    intercalate "\n" $
+      (severityName (diagnosticSeverity fields) <> ":  " <> text (diagnosticMessage fields))
+        : catMaybes
+          [ ("DETAIL:  " <>) . text <$> diagnosticDetail fields,
+            ("HINT:  " <>) . text <$> diagnosticHint fields
+          ]
+    where
+      text = Text.unpack . decodeUtf8With lenientDecode
+      severityName severity = case severity of
+        SeverityError -> "ERROR"
+        SeverityFatal -> "FATAL"
+        SeverityPanic -> "PANIC"
+        SeverityWarning -> "WARNING"
+        SeverityNotice -> "NOTICE"
+        SeverityDebug -> "DEBUG"
+        SeverityInfo -> "INFO"
+        SeverityLog -> "LOG"
+        SeverityOther other -> text other
 
 -- | Decodes the fields, which have to include the severity, the SQLSTATE
 -- and the message. Of a repeated field the first occurrence counts, and
