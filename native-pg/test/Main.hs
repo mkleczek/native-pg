@@ -12,13 +12,17 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List (isInfixOf)
 import Data.List.NonEmpty (NonEmpty (..))
+import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word8)
 import Database.PostgreSQL.Authentication
 import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Diagnostics
+import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Protocol
 import Database.PostgreSQL.Protocol.Codec
 import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
+import qualified Database.PostgreSQL.Snippet as Snippet
+import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Transport (Address (..), ConnectError (..), TcpOptions (..), defaultTcpOptions)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
@@ -307,6 +311,35 @@ main = hspec $ do
       displayException (ConnectFailure [(Host "/tmp" Nothing 5432, TimedOut), (Host "db" Nothing 5433, Unsuitable "session is read-only")])
         `shouldBe` "connection to server on socket \"/tmp/.s.PGSQL.5432\" failed: timeout expired\nconnection to server at \"db\", port 5433 failed: session is read-only"
 
+  describe "snippets" $ do
+    let snippet =
+          "SELECT "
+            <> Snippet.encoderAndParam (Encoders.nonNullable Encoders.unknown) "1"
+            <> ", "
+            <> Snippet.encoderAndParam (Encoders.nullable Encoders.bytea) Nothing
+            <> Snippet.sql " WHERE true"
+    it "numbers the placeholders in the order of the parameters" $
+      fmap (map paramView) (Snippet.render snippet)
+        `shouldBe` ("SELECT $1, $2 WHERE true", [(Just (Scalar 705), TextFormat, Just "1"), (Just (Scalar 17), BinaryFormat, Nothing)])
+    it "makes a statement of the SQL and the parameters" $ do
+      let statement = Snippet.dynamicallyParameterized snippet Tx.noResult True
+      Tx.statementSql statement `shouldBe` "SELECT $1, $2 WHERE true"
+      map paramView (Tx.statementParams statement ()) `shouldBe` [(Just (Scalar 705), TextFormat, Just "1"), (Just (Scalar 17), BinaryFormat, Nothing)]
+      Tx.statementPreparable statement `shouldBe` True
+
+  describe "encoders" $ do
+    it "sends the type OIDs, formats and bytes of hasql's encoders" $ do
+      paramView (Encoders.param (Encoders.nonNullable Encoders.text) "zażółć") `shouldBe` (Just (Scalar 25), BinaryFormat, Just (encodeUtf8 "zażółć"))
+      paramView (Encoders.param (Encoders.nonNullable Encoders.jsonLazyBytes) "{}") `shouldBe` (Just (Scalar 114), BinaryFormat, Just "{}")
+      paramView (Encoders.param (Encoders.nonNullable Encoders.jsonbLazyBytes) "{}") `shouldBe` (Just (Scalar 3802), BinaryFormat, Just "\1{}")
+      paramView (Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes) Nothing) `shouldBe` (Just (Scalar 3802), BinaryFormat, Nothing)
+    it "sends a one-dimensional array of the elements' type" $
+      paramView (Encoders.param (Encoders.nonNullable (Encoders.foldableArray (Encoders.nonNullable Encoders.text))) ["a", "bc"])
+        `shouldBe` ( Just (Scalar 1009),
+                     BinaryFormat,
+                     Just (int32 1 <> int32 0 <> int32 25 <> int32 2 <> int32 1 <> int32 1 <> "a" <> int32 2 <> "bc")
+                   )
+
 rfc7677ServerFirst :: ByteString
 rfc7677ServerFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
 
@@ -443,6 +476,13 @@ parseWith environment = parseConnectionString (`lookup` environment) (Just "loca
 
 hosts :: Either String ConnectionString -> Either String [Host]
 hosts = fmap (toList . connectionHosts)
+
+-- | A parameter's type, format and bytes, which can be compared.
+paramView :: Tx.Param -> (OptionalOid, FormatCode, Maybe ByteString)
+paramView (Tx.Param oid format value) = (oid, format, bytes <$> value)
+  where
+    bytes (ParameterBytes strict) = strict
+    bytes (ParameterStream _) = error "a streamed parameter"
 
 failsWith :: String -> Either String a -> Bool
 failsWith message = either (message `isInfixOf`) (const False)

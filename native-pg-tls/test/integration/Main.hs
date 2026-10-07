@@ -29,6 +29,7 @@ import qualified Data.UUID as UUID
 import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Decoding
 import Database.PostgreSQL.Diagnostics
+import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Protocol
   ( FormatCode (..),
     Notification (..),
@@ -41,6 +42,7 @@ import Database.PostgreSQL.Protocol
   )
 import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
 import Database.PostgreSQL.Session
+import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Transport (Address (..), StreamLengthError)
 import GHC.Clock (getMonotonicTime)
@@ -353,6 +355,24 @@ main = withCluster $ \socketPath -> hspec $ do
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> liftIO (throwIO (ErrorCall "boom"))) session
         `shouldThrow` errorCall "boom"
       items session `shouldReturn` Right 0
+
+  describe "snippets" $ around withSession $ do
+    it "sends parameters the server reads as their types" $ \session -> do
+      let snippet =
+            "SELECT "
+              <> Snippet.encoderAndParam (Encoders.nonNullable Encoders.unknown) "41"
+              <> "::int + 1, array_to_string("
+              <> Snippet.encoderAndParam (Encoders.nonNullable (Encoders.foldableArray (Encoders.nonNullable Encoders.text))) ["a", "zażółć"]
+              <> ", ','), "
+              <> Snippet.encoderAndParam (Encoders.nonNullable Encoders.jsonbLazyBytes) "{\"a\": 1}"
+              <> " ->> 'a', "
+              <> Snippet.encoderAndParam (Encoders.nonNullable Encoders.jsonLazyBytes) "[1, 2]"
+              <> "::text, "
+              <> Snippet.encoderAndParam (Encoders.nullable Encoders.bytea) Nothing
+              <> " IS NULL"
+          statement = Snippet.dynamicallyParameterized snippet (Tx.singleRow (Tx.row @'[Int32, Text, Text, Text, Bool] (,,,,))) False
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.statement () statement) session
+        `shouldReturn` Right (42, "a,zażółć", "1", "[1, 2]", True)
 
   describe "execute (failures)" $ around withSession $ do
     it "breaks the session when a parameter stream is shorter than declared" $ \session -> do
