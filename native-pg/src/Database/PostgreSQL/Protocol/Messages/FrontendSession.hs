@@ -1,6 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Database.PostgreSQL.Protocol.Messages.FrontendSession
   ( BindType (BindType),
@@ -37,6 +37,9 @@ module Database.PostgreSQL.Protocol.Messages.FrontendSession
 where
 
 import Data.Int (Int32)
+import Database.PostgreSQL.Protocol.Codec
+  ( HasConstructor (..),
+  )
 import Database.PostgreSQL.Protocol.Codec.Payload
   ( Empty,
     Payload (..),
@@ -51,6 +54,8 @@ import Database.PostgreSQL.Protocol.Messages.Types
     NamedObjectType (NamedObjectType),
     Oid,
     OidType (OidType),
+    OptionalOid,
+    OptionalOidType (OptionalOidType),
   )
 
 type FrontendSessionMessage tag payload =
@@ -106,7 +111,7 @@ data ParseType (payload :: Payload) where
           ( PayloadStruct
               '[ 'CStringAtom,
                  'CStringAtom,
-                 PayloadCounted16 ('FixedBytesAtom 4)
+                 PayloadCounted16 ('PayloadField 'OptionalOidType)
                ]
           )
       )
@@ -136,6 +141,11 @@ type BindEnvelope bytes =
     (Bind bytes)
     'BindType
 
+instance HasConstructor 'BindType (Bind bytes) where
+  type ConstructorOf 'BindType (Bind bytes) r = BindBody bytes -> r
+  constructorOf = Bind
+  destructorOf (Bind body) k = k body
+
 data Close bytes = Close
   NamedObject
   bytes
@@ -147,6 +157,11 @@ type CloseEnvelope bytes =
   Envelope
     (Close bytes)
     'CloseType
+
+instance HasConstructor 'CloseType (Close bytes) where
+  type ConstructorOf 'CloseType (Close bytes) r = NamedObject -> bytes -> r
+  constructorOf = Close
+  destructorOf (Close object name) k = k object name
 
 data Describe bytes = Describe
   NamedObject
@@ -160,6 +175,11 @@ type DescribeEnvelope bytes =
     (Describe bytes)
     'DescribeType
 
+instance HasConstructor 'DescribeType (Describe bytes) where
+  type ConstructorOf 'DescribeType (Describe bytes) r = NamedObject -> bytes -> r
+  constructorOf = Describe
+  destructorOf (Describe object name) k = k object name
+
 data Execute bytes = Execute bytes Int32
 
 deriving instance Eq bytes => Eq (Execute bytes)
@@ -170,6 +190,11 @@ type ExecuteEnvelope bytes =
     (Execute bytes)
     'ExecuteType
 
+instance HasConstructor 'ExecuteType (Execute bytes) where
+  type ConstructorOf 'ExecuteType (Execute bytes) r = bytes -> Int32 -> r
+  constructorOf = Execute
+  destructorOf (Execute portalName maxRows) k = k portalName maxRows
+
 data Flush = Flush
 
 deriving instance Eq Flush
@@ -179,6 +204,11 @@ type FlushEnvelope =
   Envelope
     Flush
     'FlushType
+
+instance HasConstructor 'FlushType Flush where
+  type ConstructorOf 'FlushType Flush r = r
+  constructorOf = Flush
+  destructorOf Flush k = k
 
 data FunctionCall bytes = FunctionCall
   Oid
@@ -194,7 +224,13 @@ type FunctionCallEnvelope bytes =
     (FunctionCall bytes)
     'FunctionCallType
 
-data Parse bytes = Parse bytes bytes [Maybe Oid]
+instance HasConstructor 'FunctionCallType (FunctionCall bytes) where
+  type ConstructorOf 'FunctionCallType (FunctionCall bytes) r = Oid -> [FormatCode] -> [Maybe bytes] -> FormatCode -> r
+  constructorOf = FunctionCall
+  destructorOf (FunctionCall function argumentFormats arguments resultFormat) k =
+    k function argumentFormats arguments resultFormat
+
+data Parse bytes = Parse bytes bytes [OptionalOid]
 
 deriving instance Eq bytes => Eq (Parse bytes)
 deriving instance Show bytes => Show (Parse bytes)
@@ -203,6 +239,11 @@ type ParseEnvelope bytes =
   Envelope
     (Parse bytes)
     'ParseType
+
+instance HasConstructor 'ParseType (Parse bytes) where
+  type ConstructorOf 'ParseType (Parse bytes) r = bytes -> bytes -> [OptionalOid] -> r
+  constructorOf = Parse
+  destructorOf (Parse statementName query parameterTypes) k = k statementName query parameterTypes
 
 newtype Query bytes = Query bytes
 
@@ -214,6 +255,11 @@ type QueryEnvelope bytes =
     (Query bytes)
     'QueryType
 
+instance HasConstructor 'QueryType (Query bytes) where
+  type ConstructorOf 'QueryType (Query bytes) r = bytes -> r
+  constructorOf = Query
+  destructorOf (Query query) k = k query
+
 data Sync = Sync
 
 deriving instance Eq Sync
@@ -224,6 +270,11 @@ type SyncEnvelope =
     Sync
     'SyncType
 
+instance HasConstructor 'SyncType Sync where
+  type ConstructorOf 'SyncType Sync r = r
+  constructorOf = Sync
+  destructorOf Sync k = k
+
 data Terminate = Terminate
 
 deriving instance Eq Terminate
@@ -233,3 +284,8 @@ type TerminateEnvelope =
   Envelope
     Terminate
     'TerminateType
+
+instance HasConstructor 'TerminateType Terminate where
+  type ConstructorOf 'TerminateType Terminate r = r
+  constructorOf = Terminate
+  destructorOf Terminate k = k

@@ -1,6 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Database.PostgreSQL.Protocol.Messages.Copy
   ( CopyDataType (CopyDataType),
@@ -15,6 +15,9 @@ module Database.PostgreSQL.Protocol.Messages.Copy
   )
 where
 
+import Database.PostgreSQL.Protocol.Codec
+  ( HasConstructor (..),
+  )
 import Database.PostgreSQL.Protocol.Codec.Payload
   ( Empty,
     Payload (..),
@@ -52,6 +55,11 @@ type CopyDataEnvelope bytes =
     (CopyData bytes)
     'CopyDataType
 
+instance HasConstructor 'CopyDataType (CopyData bytes) where
+  type ConstructorOf 'CopyDataType (CopyData bytes) r = bytes -> r
+  constructorOf = CopyData
+  destructorOf (CopyData chunk) k = k chunk
+
 data CopyDone = CopyDone
 
 deriving instance Eq CopyDone
@@ -62,6 +70,11 @@ type CopyDoneEnvelope =
     CopyDone
     'CopyDoneType
 
+instance HasConstructor 'CopyDoneType CopyDone where
+  type ConstructorOf 'CopyDoneType CopyDone r = r
+  constructorOf = CopyDone
+  destructorOf CopyDone k = k
+
 newtype CopyFail bytes = CopyFail bytes
 
 deriving instance Eq bytes => Eq (CopyFail bytes)
@@ -71,3 +84,8 @@ type CopyFailEnvelope bytes =
   Envelope
     (CopyFail bytes)
     'CopyFailType
+
+instance HasConstructor 'CopyFailType (CopyFail bytes) where
+  type ConstructorOf 'CopyFailType (CopyFail bytes) r = bytes -> r
+  constructorOf = CopyFail
+  destructorOf (CopyFail reason) k = k reason

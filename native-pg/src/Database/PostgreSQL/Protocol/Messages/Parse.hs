@@ -1,21 +1,19 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
-
 module Database.PostgreSQL.Protocol.Messages.Parse
   ( parseEnvelope,
+    serializeEnvelope,
   )
 where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Database.PostgreSQL.Protocol.Codec
-  ( Parsable (..)
-  )
-import Database.PostgreSQL.Protocol.Codec.Input
-  ( runBodyParser
+  ( Output,
+    Parsable (..),
+    Serializable (..),
+    runBodyParser,
   )
 import Database.PostgreSQL.Protocol.Messages.Types
-  ( Envelope (Envelope)
+  ( Envelope (Envelope),
   )
 
 parseEnvelope :: forall a s. Parsable a s => ByteString -> Either String (Envelope a s)
@@ -28,3 +26,6 @@ parseEnvelope input = do
         "parser left "
           <> show (BS.length rest)
           <> " unconsumed bytes"
+
+serializeEnvelope :: forall a s. Serializable a s => Envelope a s -> Output
+serializeEnvelope (Envelope message) = serialize @a @s message

@@ -1,10 +1,5 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE PolyKinds #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Database.PostgreSQL.Protocol.Messages.Types
@@ -12,6 +7,7 @@ module Database.PostgreSQL.Protocol.Messages.Types
     SomeEnvelope,
     Scalar (..),
     OidType (OidType),
+    OptionalOidType (OptionalOidType),
     ProcessIdType (ProcessIdType),
     SecretKeyType (SecretKeyType),
     BackendKeyType (BackendKeyType),
@@ -28,6 +24,7 @@ module Database.PostgreSQL.Protocol.Messages.Types
     TransactionStatusType (TransactionStatusType),
     RowFieldType (RowFieldType),
     OidEnvelope,
+    OptionalOidEnvelope,
     ProcessIdEnvelope,
     SecretKeyEnvelope,
     BackendKeyEnvelope,
@@ -44,6 +41,7 @@ module Database.PostgreSQL.Protocol.Messages.Types
     TransactionStatusEnvelope,
     RowFieldEnvelope,
     Oid,
+    OptionalOid,
     ProcessId,
     SecretKey,
     BackendKey,
@@ -53,6 +51,7 @@ module Database.PostgreSQL.Protocol.Messages.Types
     CopyFormat (..),
     NamedObject (..),
     BindBody (..),
+    Parameter (..),
     CopyResponse,
     ErrorNoticeField,
     Notification (..),
@@ -61,6 +60,7 @@ module Database.PostgreSQL.Protocol.Messages.Types
     RowField (..),
     cancelRequestCode,
     gssEncRequestCode,
+    protocolVersion3_0,
     protocolVersion3_2,
     protocolVersionCode,
     sslRequestCode,
@@ -70,11 +70,23 @@ module Database.PostgreSQL.Protocol.Messages.Types
 where
 
 import Data.Bits ((.|.), shiftL, shiftR)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Data.Int (Int16, Int32)
 import Data.Kind (Type)
+import Data.Maybe (fromMaybe)
 import Data.Word (Word16, Word32, Word8)
 import Database.PostgreSQL.Protocol.Codec
-  ( HasConstructor (..) )
+  ( Alternatives (..),
+    ByteStream (..),
+    HasConstructor (..),
+    Serializable (..),
+  )
+import Database.PostgreSQL.Protocol.Codec.Output
+  ( bytes,
+    int32,
+    stream,
+  )
 import Database.PostgreSQL.Protocol.Codec.Payload
   ( Payload (..),
   )
@@ -104,11 +116,17 @@ deriving instance Show a => Show (Scalar a)
 data OidType (payload :: Payload) where
   OidType :: OidType ('FixedBytesAtom 4)
 
+-- | An OID where zero means none.
+data OptionalOidType (payload :: Payload) where
+  OptionalOidType :: OptionalOidType ('FixedBytesAtom 4)
+
 data ProcessIdType (payload :: Payload) where
   ProcessIdType :: ProcessIdType ('FixedBytesAtom 4)
 
+-- | Four bytes in protocol 3.0 and up to 256 in 3.2. It always ends its
+-- message, so its length is whatever the message has left.
 data SecretKeyType (payload :: Payload) where
-  SecretKeyType :: SecretKeyType ('FixedBytesAtom 4)
+  SecretKeyType :: SecretKeyType 'RemainingBytesAtom
 
 data BackendKeyType (payload :: Payload) where
   BackendKeyType ::
@@ -124,13 +142,19 @@ data StartupParameterType (payload :: Payload) where
       (PayloadStruct '[ 'CStringAtom, 'CStringAtom])
 
 data FormatCodeType (payload :: Payload) where
-  FormatCodeType :: FormatCodeType ('FixedBytesAtom 2)
+  FormatCodeType ::
+    FormatCodeType
+      ('PayloadChoice '[ 'PayloadConst 2 0, 'PayloadConst 2 1])
 
 data CopyFormatType (payload :: Payload) where
-  CopyFormatType :: CopyFormatType ('FixedBytesAtom 1)
+  CopyFormatType ::
+    CopyFormatType
+      ('PayloadChoice '[ 'PayloadConst 1 0, 'PayloadConst 1 1])
 
 data NamedObjectType (payload :: Payload) where
-  NamedObjectType :: NamedObjectType ('FixedBytesAtom 1)
+  NamedObjectType ::
+    NamedObjectType
+      ('PayloadChoice '[ 'PayloadConst 1 'S', 'PayloadConst 1 'P'])
 
 data BindBodyType (payload :: Payload) where
   BindBodyType ::
@@ -165,14 +189,16 @@ data ParameterStatusValueType (payload :: Payload) where
       (PayloadStruct '[ 'CStringAtom, 'CStringAtom])
 
 data TransactionStatusType (payload :: Payload) where
-  TransactionStatusType :: TransactionStatusType ('FixedBytesAtom 1)
+  TransactionStatusType ::
+    TransactionStatusType
+      ('PayloadChoice '[ 'PayloadConst 1 'I', 'PayloadConst 1 'T', 'PayloadConst 1 'E'])
 
 data RowFieldType (payload :: Payload) where
   RowFieldType ::
     RowFieldType
       ( PayloadStruct
           '[ 'CStringAtom,
-             'FixedBytesAtom 4,
+             PayloadField 'OptionalOidType,
              'FixedBytesAtom 2,
              PayloadField 'OidType,
              'FixedBytesAtom 2,
@@ -188,12 +214,35 @@ type OidEnvelope =
     Oid
     'OidType
 
+instance HasConstructor 'OidType Oid where
+  type ConstructorOf 'OidType Oid r = Word32 -> r
+  constructorOf = Scalar
+  destructorOf (Scalar oid) k = k oid
+
+type OptionalOid = Maybe Oid
+
+type OptionalOidEnvelope =
+  Envelope
+    OptionalOid
+    'OptionalOidType
+
+instance HasConstructor 'OptionalOidType OptionalOid where
+  type ConstructorOf 'OptionalOidType OptionalOid r = Word32 -> r
+  constructorOf 0 = Nothing
+  constructorOf oid = Just (Scalar oid)
+  destructorOf oid k = k (maybe 0 unScalar oid)
+
 type ProcessId = Scalar Int32
 
 type ProcessIdEnvelope =
   Envelope
     ProcessId
     'ProcessIdType
+
+instance HasConstructor 'ProcessIdType ProcessId where
+  type ConstructorOf 'ProcessIdType ProcessId r = Int32 -> r
+  constructorOf = Scalar
+  destructorOf (Scalar processId) k = k processId
 
 type SecretKey bytes = Scalar bytes
 
@@ -202,6 +251,11 @@ type SecretKeyEnvelope bytes =
     (SecretKey bytes)
     'SecretKeyType
 
+instance HasConstructor 'SecretKeyType (SecretKey bytes) where
+  type ConstructorOf 'SecretKeyType (SecretKey bytes) r = bytes -> r
+  constructorOf = Scalar
+  destructorOf (Scalar secretKey) k = k secretKey
+
 type BackendKey bytes = Scalar (ProcessId, SecretKey bytes)
 
 type BackendKeyEnvelope bytes =
@@ -209,28 +263,10 @@ type BackendKeyEnvelope bytes =
     (BackendKey bytes)
     'BackendKeyType
 
-instance HasConstructor 'ProcessIdType ProcessId where
-  type ConstructorOf 'ProcessIdType ProcessId = Int32 -> ProcessId
-  constructorOf = Scalar
-
-instance HasConstructor 'SecretKeyType (SecretKey bytes) where
-  type ConstructorOf 'SecretKeyType (SecretKey bytes) = bytes -> SecretKey bytes
-  constructorOf = Scalar
-
 instance HasConstructor 'BackendKeyType (BackendKey bytes) where
-  type ConstructorOf 'BackendKeyType (BackendKey bytes) = ProcessId -> SecretKey bytes -> BackendKey bytes
+  type ConstructorOf 'BackendKeyType (BackendKey bytes) r = ProcessId -> SecretKey bytes -> r
   constructorOf processId = Scalar . (processId,)
-
-instance HasConstructor 'ProtocolVersionType ProtocolVersion where
-  type ConstructorOf 'ProtocolVersionType ProtocolVersion = Word32 -> ProtocolVersion
-  constructorOf code =
-    ProtocolVersion
-      (fromIntegral (shiftR code 16))
-      (fromIntegral code)
-
-instance HasConstructor 'StartupParameterType (StartupParameter bytes) where
-  type ConstructorOf 'StartupParameterType (StartupParameter bytes) = bytes -> bytes -> StartupParameter bytes
-  constructorOf name value = Scalar (name, value)
+  destructorOf (Scalar (processId, secretKey)) k = k processId secretKey
 
 data ProtocolVersion = ProtocolVersion
   { protocolVersionMajor :: Word16,
@@ -246,10 +282,21 @@ type ProtocolVersionEnvelope =
     ProtocolVersion
     'ProtocolVersionType
 
+instance HasConstructor 'ProtocolVersionType ProtocolVersion where
+  type ConstructorOf 'ProtocolVersionType ProtocolVersion r = Word32 -> r
+  constructorOf code =
+    ProtocolVersion
+      (fromIntegral (shiftR code 16))
+      (fromIntegral code)
+  destructorOf version k = k (protocolVersionCode version)
+
 protocolVersionCode :: ProtocolVersion -> Word32
 protocolVersionCode version =
   shiftL (fromIntegral (protocolVersionMajor version)) 16
     .|. fromIntegral (protocolVersionMinor version)
+
+protocolVersion3_0 :: ProtocolVersion
+protocolVersion3_0 = ProtocolVersion 3 0
 
 protocolVersion3_2 :: ProtocolVersion
 protocolVersion3_2 = ProtocolVersion 3 2
@@ -270,6 +317,11 @@ type StartupParameterEnvelope bytes =
     (StartupParameter bytes)
     'StartupParameterType
 
+instance HasConstructor 'StartupParameterType (StartupParameter bytes) where
+  type ConstructorOf 'StartupParameterType (StartupParameter bytes) r = bytes -> bytes -> r
+  constructorOf name value = Scalar (name, value)
+  destructorOf (Scalar (name, value)) k = k name value
+
 data FormatCode
   = TextFormat
   | BinaryFormat
@@ -282,6 +334,14 @@ type FormatCodeEnvelope =
   Envelope
     FormatCode
     'FormatCodeType
+
+instance HasConstructor 'FormatCodeType FormatCode where
+  type ConstructorOf 'FormatCodeType FormatCode r = Alternatives '[r, r] r
+  constructorOf = TextFormat :|: BinaryFormat :|: NoAlternatives
+  destructorOf format (text :|: binary :|: NoAlternatives) =
+    case format of
+      TextFormat -> text
+      BinaryFormat -> binary
 
 data CopyFormat
   = CopyText
@@ -296,6 +356,14 @@ type CopyFormatEnvelope =
     CopyFormat
     'CopyFormatType
 
+instance HasConstructor 'CopyFormatType CopyFormat where
+  type ConstructorOf 'CopyFormatType CopyFormat r = Alternatives '[r, r] r
+  constructorOf = CopyText :|: CopyBinary :|: NoAlternatives
+  destructorOf format (text :|: binary :|: NoAlternatives) =
+    case format of
+      CopyText -> text
+      CopyBinary -> binary
+
 data NamedObject
   = PreparedStatement
   | Portal
@@ -309,22 +377,57 @@ type NamedObjectEnvelope =
     NamedObject
     'NamedObjectType
 
-data BindBody bytes = BindBody
-  { bindPortalName :: bytes,
-    bindStatementName :: bytes,
+instance HasConstructor 'NamedObjectType NamedObject where
+  type ConstructorOf 'NamedObjectType NamedObject r = Alternatives '[r, r] r
+  constructorOf = PreparedStatement :|: Portal :|: NoAlternatives
+  destructorOf object (preparedStatement :|: portal :|: NoAlternatives) =
+    case object of
+      PreparedStatement -> preparedStatement
+      Portal -> portal
+
+-- | Parameter values are 'ByteString's when parsed, and 'Parameter's, which
+-- can be streams, when sent.
+data BindBody value = BindBody
+  { bindPortalName :: ByteString,
+    bindStatementName :: ByteString,
     bindParameterFormats :: [FormatCode],
-    bindParameterValues :: [Maybe bytes],
+    bindParameterValues :: [Maybe value],
     bindResultFormats :: [FormatCode]
   }
 
-deriving instance Show bytes => Show (BindBody bytes)
-deriving instance Eq bytes => Eq (BindBody bytes)
-deriving instance Ord bytes => Ord (BindBody bytes)
+deriving instance Show value => Show (BindBody value)
+deriving instance Eq value => Eq (BindBody value)
+deriving instance Ord value => Ord (BindBody value)
 
-type BindBodyEnvelope bytes =
+type BindBodyEnvelope value =
   Envelope
-    (BindBody bytes)
+    (BindBody value)
     'BindBodyType
+
+instance HasConstructor 'BindBodyType (BindBody value) where
+  type
+    ConstructorOf 'BindBodyType (BindBody value) r =
+      ByteString -> ByteString -> [FormatCode] -> [Maybe value] -> [FormatCode] -> r
+  constructorOf = BindBody
+  destructorOf (BindBody portalName statementName parameterFormats parameterValues resultFormats) k =
+    k portalName statementName parameterFormats parameterValues resultFormats
+
+-- | A parameter value the client sends: bytes at hand, or a stream it
+-- supplies while the value is sent.
+data Parameter
+  = ParameterBytes ByteString
+  | ParameterStream ByteStream
+
+instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
+  serialize Nothing = int32 (-1)
+  serialize (Just (ParameterBytes value)) = int32 (lengthAsInt32 (BS.length value)) <> bytes value
+  serialize (Just (ParameterStream source)) = int32 (lengthAsInt32 (byteStreamLength source)) <> stream source
+  {-# INLINE serialize #-}
+
+lengthAsInt32 :: Int -> Int32
+lengthAsInt32 count
+  | count <= fromIntegral (maxBound @Int32) = fromIntegral count
+  | otherwise = error ("a parameter of " <> show count <> " bytes doesn't fit in an Int32 length")
 
 type CopyResponse = Scalar (CopyFormat, [FormatCode])
 
@@ -333,12 +436,22 @@ type CopyResponseEnvelope =
     CopyResponse
     'CopyResponseType
 
+instance HasConstructor 'CopyResponseType CopyResponse where
+  type ConstructorOf 'CopyResponseType CopyResponse r = CopyFormat -> [FormatCode] -> r
+  constructorOf format columnFormats = Scalar (format, columnFormats)
+  destructorOf (Scalar (format, columnFormats)) k = k format columnFormats
+
 type ErrorNoticeField bytes = Scalar (Word8, bytes)
 
 type ErrorNoticeFieldEnvelope bytes =
   Envelope
     (ErrorNoticeField bytes)
     'ErrorNoticeFieldType
+
+instance HasConstructor 'ErrorNoticeFieldType (ErrorNoticeField bytes) where
+  type ConstructorOf 'ErrorNoticeFieldType (ErrorNoticeField bytes) r = Word8 -> bytes -> r
+  constructorOf code value = Scalar (code, value)
+  destructorOf (Scalar (code, value)) k = k code value
 
 data Notification bytes = Notification
   { notificationProcessId :: ProcessId,
@@ -355,12 +468,22 @@ type NotificationEnvelope bytes =
     (Notification bytes)
     'NotificationType
 
+instance HasConstructor 'NotificationType (Notification bytes) where
+  type ConstructorOf 'NotificationType (Notification bytes) r = ProcessId -> bytes -> bytes -> r
+  constructorOf = Notification
+  destructorOf (Notification processId channel payload) k = k processId channel payload
+
 type ParameterStatusValue bytes = Scalar (bytes, bytes)
 
 type ParameterStatusValueEnvelope bytes =
   Envelope
     (ParameterStatusValue bytes)
     'ParameterStatusValueType
+
+instance HasConstructor 'ParameterStatusValueType (ParameterStatusValue bytes) where
+  type ConstructorOf 'ParameterStatusValueType (ParameterStatusValue bytes) r = bytes -> bytes -> r
+  constructorOf name value = Scalar (name, value)
+  destructorOf (Scalar (name, value)) k = k name value
 
 data TransactionStatus
   = TxIdle
@@ -376,9 +499,18 @@ type TransactionStatusEnvelope =
     TransactionStatus
     'TransactionStatusType
 
+instance HasConstructor 'TransactionStatusType TransactionStatus where
+  type ConstructorOf 'TransactionStatusType TransactionStatus r = Alternatives '[r, r, r] r
+  constructorOf = TxIdle :|: TxInTransaction :|: TxFailedTransaction :|: NoAlternatives
+  destructorOf status (idle :|: inTransaction :|: failedTransaction :|: NoAlternatives) =
+    case status of
+      TxIdle -> idle
+      TxInTransaction -> inTransaction
+      TxFailedTransaction -> failedTransaction
+
 data RowField bytes = RowField
   { rowFieldName :: bytes,
-    rowFieldTableOid :: Maybe Oid,
+    rowFieldTableOid :: OptionalOid,
     rowFieldColumnAttributeNumber :: Maybe Int16,
     rowFieldTypeOid :: Oid,
     rowFieldTypeSize :: Int16,
@@ -394,3 +526,15 @@ type RowFieldEnvelope bytes =
   Envelope
     (RowField bytes)
     'RowFieldType
+
+instance HasConstructor 'RowFieldType (RowField bytes) where
+  type
+    ConstructorOf 'RowFieldType (RowField bytes) r =
+      bytes -> OptionalOid -> Int16 -> Oid -> Int16 -> Int32 -> FormatCode -> r
+  constructorOf name tableOid attributeNumber =
+    RowField
+      name
+      tableOid
+      (if attributeNumber == 0 then Nothing else Just attributeNumber)
+  destructorOf (RowField name tableOid attributeNumber typeOid typeSize typeModifier format) k =
+    k name tableOid (fromMaybe 0 attributeNumber) typeOid typeSize typeModifier format

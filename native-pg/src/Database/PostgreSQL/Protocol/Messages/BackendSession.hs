@@ -1,6 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Database.PostgreSQL.Protocol.Messages.BackendSession
   ( BackendKeyDataType (BackendKeyDataType),
@@ -11,6 +11,7 @@ module Database.PostgreSQL.Protocol.Messages.BackendSession
     CopyOutResponseType (CopyOutResponseType),
     CopyBothResponseType (CopyBothResponseType),
     DataRowType (DataRowType),
+    DataRowHeaderType (DataRowHeaderType),
     EmptyQueryResponseType (EmptyQueryResponseType),
     ErrorResponseType (ErrorResponseType),
     FunctionCallResponseType (FunctionCallResponseType),
@@ -32,6 +33,7 @@ module Database.PostgreSQL.Protocol.Messages.BackendSession
     CopyOutResponseEnvelope,
     CopyBothResponseEnvelope,
     DataRowEnvelope,
+    DataRowHeaderEnvelope,
     EmptyQueryResponseEnvelope,
     ErrorResponseEnvelope,
     FunctionCallResponseEnvelope,
@@ -53,6 +55,7 @@ module Database.PostgreSQL.Protocol.Messages.BackendSession
     CopyOutResponse (CopyOutResponse),
     CopyBothResponse (CopyBothResponse),
     DataRow (DataRow),
+    DataRowHeader (..),
     EmptyQueryResponse (EmptyQueryResponse),
     ErrorResponse (ErrorResponse),
     FunctionCallResponse (FunctionCallResponse),
@@ -69,6 +72,10 @@ module Database.PostgreSQL.Protocol.Messages.BackendSession
   )
 where
 
+import Data.Int (Int16, Int32)
+import Database.PostgreSQL.Protocol.Codec
+  ( HasConstructor (..),
+  )
 import Database.PostgreSQL.Protocol.Codec.Payload
   ( Empty,
     Payload (..),
@@ -141,6 +148,13 @@ data DataRowType (payload :: Payload) where
     DataRowType
       (BackendSessionMessage 'D' (PayloadCounted16 'MaybeBytes32Atom))
 
+-- | Only the start of a DataRow, so that its columns can be pulled one at a
+-- time after it.
+data DataRowHeaderType (payload :: Payload) where
+  DataRowHeaderType ::
+    DataRowHeaderType
+      ('PayloadStruct '[ 'PayloadConst 1 'D', 'FixedBytesAtom 4, 'FixedBytesAtom 2])
+
 data EmptyQueryResponseType (payload :: Payload) where
   EmptyQueryResponseType ::
     EmptyQueryResponseType
@@ -159,7 +173,7 @@ data FunctionCallResponseType (payload :: Payload) where
 data NegotiateProtocolVersionType (payload :: Payload) where
   NegotiateProtocolVersionType ::
     NegotiateProtocolVersionType
-      (BackendSessionMessage 'v' ('PayloadStruct '[PayloadField 'ProtocolVersionType, PayloadZeroTerminated 'CStringAtom]))
+      (BackendSessionMessage 'v' ('PayloadStruct '[PayloadField 'ProtocolVersionType, PayloadCounted32 'CStringAtom]))
 
 data NoDataType (payload :: Payload) where
   NoDataType ::
@@ -216,6 +230,11 @@ type BackendKeyDataEnvelope bytes =
     (BackendKeyData bytes)
     'BackendKeyDataType
 
+instance HasConstructor 'BackendKeyDataType (BackendKeyData bytes) where
+  type ConstructorOf 'BackendKeyDataType (BackendKeyData bytes) r = BackendKey bytes -> r
+  constructorOf = BackendKeyData
+  destructorOf (BackendKeyData key) k = k key
+
 data BindComplete = BindComplete
 
 deriving instance Eq BindComplete
@@ -225,6 +244,11 @@ type BindCompleteEnvelope =
   Envelope
     BindComplete
     'BindCompleteType
+
+instance HasConstructor 'BindCompleteType BindComplete where
+  type ConstructorOf 'BindCompleteType BindComplete r = r
+  constructorOf = BindComplete
+  destructorOf BindComplete k = k
 
 data CloseComplete = CloseComplete
 
@@ -236,6 +260,11 @@ type CloseCompleteEnvelope =
     CloseComplete
     'CloseCompleteType
 
+instance HasConstructor 'CloseCompleteType CloseComplete where
+  type ConstructorOf 'CloseCompleteType CloseComplete r = r
+  constructorOf = CloseComplete
+  destructorOf CloseComplete k = k
+
 newtype CommandComplete bytes = CommandComplete bytes
 
 deriving instance Eq bytes => Eq (CommandComplete bytes)
@@ -245,6 +274,11 @@ type CommandCompleteEnvelope bytes =
   Envelope
     (CommandComplete bytes)
     'CommandCompleteType
+
+instance HasConstructor 'CommandCompleteType (CommandComplete bytes) where
+  type ConstructorOf 'CommandCompleteType (CommandComplete bytes) r = bytes -> r
+  constructorOf = CommandComplete
+  destructorOf (CommandComplete tag) k = k tag
 
 newtype CopyInResponse = CopyInResponse CopyResponse
 
@@ -256,6 +290,11 @@ type CopyInResponseEnvelope =
     CopyInResponse
     'CopyInResponseType
 
+instance HasConstructor 'CopyInResponseType CopyInResponse where
+  type ConstructorOf 'CopyInResponseType CopyInResponse r = CopyResponse -> r
+  constructorOf = CopyInResponse
+  destructorOf (CopyInResponse response) k = k response
+
 newtype CopyOutResponse = CopyOutResponse CopyResponse
 
 deriving instance Eq CopyOutResponse
@@ -265,6 +304,11 @@ type CopyOutResponseEnvelope =
   Envelope
     CopyOutResponse
     'CopyOutResponseType
+
+instance HasConstructor 'CopyOutResponseType CopyOutResponse where
+  type ConstructorOf 'CopyOutResponseType CopyOutResponse r = CopyResponse -> r
+  constructorOf = CopyOutResponse
+  destructorOf (CopyOutResponse response) k = k response
 
 newtype CopyBothResponse = CopyBothResponse CopyResponse
 
@@ -276,6 +320,11 @@ type CopyBothResponseEnvelope =
     CopyBothResponse
     'CopyBothResponseType
 
+instance HasConstructor 'CopyBothResponseType CopyBothResponse where
+  type ConstructorOf 'CopyBothResponseType CopyBothResponse r = CopyResponse -> r
+  constructorOf = CopyBothResponse
+  destructorOf (CopyBothResponse response) k = k response
+
 newtype DataRow bytes = DataRow [Maybe bytes]
 
 deriving instance Eq bytes => Eq (DataRow bytes)
@@ -285,6 +334,30 @@ type DataRowEnvelope bytes =
   Envelope
     (DataRow bytes)
     'DataRowType
+
+instance HasConstructor 'DataRowType (DataRow bytes) where
+  type ConstructorOf 'DataRowType (DataRow bytes) r = [Maybe bytes] -> r
+  constructorOf = DataRow
+  destructorOf (DataRow values) k = k values
+
+data DataRowHeader = DataRowHeader
+  { -- | Counts itself, the column count and the columns.
+    dataRowLength :: Int32,
+    dataRowColumnCount :: Int16
+  }
+
+deriving instance Eq DataRowHeader
+deriving instance Show DataRowHeader
+
+type DataRowHeaderEnvelope =
+  Envelope
+    DataRowHeader
+    'DataRowHeaderType
+
+instance HasConstructor 'DataRowHeaderType DataRowHeader where
+  type ConstructorOf 'DataRowHeaderType DataRowHeader r = Int32 -> Int16 -> r
+  constructorOf = DataRowHeader
+  destructorOf (DataRowHeader rowLength columnCount) k = k rowLength columnCount
 
 data EmptyQueryResponse = EmptyQueryResponse
 
@@ -296,6 +369,11 @@ type EmptyQueryResponseEnvelope =
     EmptyQueryResponse
     'EmptyQueryResponseType
 
+instance HasConstructor 'EmptyQueryResponseType EmptyQueryResponse where
+  type ConstructorOf 'EmptyQueryResponseType EmptyQueryResponse r = r
+  constructorOf = EmptyQueryResponse
+  destructorOf EmptyQueryResponse k = k
+
 newtype ErrorResponse bytes = ErrorResponse [ErrorNoticeField bytes]
 
 deriving instance Eq bytes => Eq (ErrorResponse bytes)
@@ -305,6 +383,11 @@ type ErrorResponseEnvelope bytes =
   Envelope
     (ErrorResponse bytes)
     'ErrorResponseType
+
+instance HasConstructor 'ErrorResponseType (ErrorResponse bytes) where
+  type ConstructorOf 'ErrorResponseType (ErrorResponse bytes) r = [ErrorNoticeField bytes] -> r
+  constructorOf = ErrorResponse
+  destructorOf (ErrorResponse fields) k = k fields
 
 newtype FunctionCallResponse bytes =
   FunctionCallResponse (Maybe bytes)
@@ -316,6 +399,11 @@ type FunctionCallResponseEnvelope bytes =
   Envelope
     (FunctionCallResponse bytes)
     'FunctionCallResponseType
+
+instance HasConstructor 'FunctionCallResponseType (FunctionCallResponse bytes) where
+  type ConstructorOf 'FunctionCallResponseType (FunctionCallResponse bytes) r = Maybe bytes -> r
+  constructorOf = FunctionCallResponse
+  destructorOf (FunctionCallResponse result) k = k result
 
 data NegotiateProtocolVersion bytes =
   NegotiateProtocolVersion
@@ -330,6 +418,11 @@ type NegotiateProtocolVersionEnvelope bytes =
     (NegotiateProtocolVersion bytes)
     'NegotiateProtocolVersionType
 
+instance HasConstructor 'NegotiateProtocolVersionType (NegotiateProtocolVersion bytes) where
+  type ConstructorOf 'NegotiateProtocolVersionType (NegotiateProtocolVersion bytes) r = ProtocolVersion -> [bytes] -> r
+  constructorOf = NegotiateProtocolVersion
+  destructorOf (NegotiateProtocolVersion version unrecognizedOptions) k = k version unrecognizedOptions
+
 data NoData = NoData
 
 deriving instance Eq NoData
@@ -340,6 +433,11 @@ type NoDataEnvelope =
     NoData
     'NoDataType
 
+instance HasConstructor 'NoDataType NoData where
+  type ConstructorOf 'NoDataType NoData r = r
+  constructorOf = NoData
+  destructorOf NoData k = k
+
 newtype NoticeResponse bytes = NoticeResponse [ErrorNoticeField bytes]
 
 deriving instance Eq bytes => Eq (NoticeResponse bytes)
@@ -349,6 +447,11 @@ type NoticeResponseEnvelope bytes =
   Envelope
     (NoticeResponse bytes)
     'NoticeResponseType
+
+instance HasConstructor 'NoticeResponseType (NoticeResponse bytes) where
+  type ConstructorOf 'NoticeResponseType (NoticeResponse bytes) r = [ErrorNoticeField bytes] -> r
+  constructorOf = NoticeResponse
+  destructorOf (NoticeResponse fields) k = k fields
 
 newtype NotificationResponse bytes =
   NotificationResponse (Notification bytes)
@@ -361,6 +464,11 @@ type NotificationResponseEnvelope bytes =
     (NotificationResponse bytes)
     'NotificationResponseType
 
+instance HasConstructor 'NotificationResponseType (NotificationResponse bytes) where
+  type ConstructorOf 'NotificationResponseType (NotificationResponse bytes) r = Notification bytes -> r
+  constructorOf = NotificationResponse
+  destructorOf (NotificationResponse notification) k = k notification
+
 newtype ParameterDescription = ParameterDescription [Oid]
 
 deriving instance Eq ParameterDescription
@@ -370,6 +478,11 @@ type ParameterDescriptionEnvelope =
   Envelope
     ParameterDescription
     'ParameterDescriptionType
+
+instance HasConstructor 'ParameterDescriptionType ParameterDescription where
+  type ConstructorOf 'ParameterDescriptionType ParameterDescription r = [Oid] -> r
+  constructorOf = ParameterDescription
+  destructorOf (ParameterDescription types) k = k types
 
 newtype ParameterStatus bytes = ParameterStatus (ParameterStatusValue bytes)
 
@@ -381,6 +494,11 @@ type ParameterStatusEnvelope bytes =
     (ParameterStatus bytes)
     'ParameterStatusType
 
+instance HasConstructor 'ParameterStatusType (ParameterStatus bytes) where
+  type ConstructorOf 'ParameterStatusType (ParameterStatus bytes) r = ParameterStatusValue bytes -> r
+  constructorOf = ParameterStatus
+  destructorOf (ParameterStatus status) k = k status
+
 data ParseComplete = ParseComplete
 
 deriving instance Eq ParseComplete
@@ -391,6 +509,11 @@ type ParseCompleteEnvelope =
     ParseComplete
     'ParseCompleteType
 
+instance HasConstructor 'ParseCompleteType ParseComplete where
+  type ConstructorOf 'ParseCompleteType ParseComplete r = r
+  constructorOf = ParseComplete
+  destructorOf ParseComplete k = k
+
 data PortalSuspended = PortalSuspended
 
 deriving instance Eq PortalSuspended
@@ -400,6 +523,11 @@ type PortalSuspendedEnvelope =
   Envelope
     PortalSuspended
     'PortalSuspendedType
+
+instance HasConstructor 'PortalSuspendedType PortalSuspended where
+  type ConstructorOf 'PortalSuspendedType PortalSuspended r = r
+  constructorOf = PortalSuspended
+  destructorOf PortalSuspended k = k
 
 newtype ReadyForQuery =
   ReadyForQuery TransactionStatus
@@ -412,6 +540,11 @@ type ReadyForQueryEnvelope =
     ReadyForQuery
     'ReadyForQueryType
 
+instance HasConstructor 'ReadyForQueryType ReadyForQuery where
+  type ConstructorOf 'ReadyForQueryType ReadyForQuery r = TransactionStatus -> r
+  constructorOf = ReadyForQuery
+  destructorOf (ReadyForQuery status) k = k status
+
 newtype RowDescription bytes = RowDescription [RowField bytes]
 
 deriving instance Eq bytes => Eq (RowDescription bytes)
@@ -421,3 +554,8 @@ type RowDescriptionEnvelope bytes =
   Envelope
     (RowDescription bytes)
     'RowDescriptionType
+
+instance HasConstructor 'RowDescriptionType (RowDescription bytes) where
+  type ConstructorOf 'RowDescriptionType (RowDescription bytes) r = [RowField bytes] -> r
+  constructorOf = RowDescription
+  destructorOf (RowDescription fields) k = k fields

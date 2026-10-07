@@ -23,7 +23,11 @@ data Payload where
   PayloadField :: k -> Payload
   PayloadZeroTerminated :: Payload -> Payload
   PayloadCounted16 :: Payload -> Payload
+  PayloadCounted32 :: Payload -> Payload
   PayloadStruct :: [Payload] -> Payload
+  -- | Exactly one of the alternatives, told apart by their leading constants.
+  -- The first alternative whose constants match the input is used.
+  PayloadChoice :: [Payload] -> Payload
   PayloadConst :: Nat -> k -> Payload
   PayloadBounded :: Payload -> Payload
 

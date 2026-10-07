@@ -1,11 +1,6 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE LambdaCase #-}
 
 module Database.PostgreSQL.Protocol.Messages.AuthBackend where
 
@@ -88,8 +83,9 @@ type AuthenticationOkEnvelope =
     'AuthenticationOkType
 
 instance HasConstructor 'AuthenticationOkType AuthenticationOk where
-  type ConstructorOf 'AuthenticationOkType AuthenticationOk = AuthenticationOk
+  type ConstructorOf 'AuthenticationOkType AuthenticationOk r = r
   constructorOf = AuthenticationOk
+  destructorOf AuthenticationOk k = k
 
 data AuthenticationKerberosV5 = AuthenticationKerberosV5
 
@@ -102,8 +98,9 @@ type AuthenticationKerberosV5Envelope =
     'AuthenticationKerberosV5Type
 
 instance HasConstructor 'AuthenticationKerberosV5Type AuthenticationKerberosV5 where
-  type ConstructorOf 'AuthenticationKerberosV5Type AuthenticationKerberosV5 = AuthenticationKerberosV5
+  type ConstructorOf 'AuthenticationKerberosV5Type AuthenticationKerberosV5 r = r
   constructorOf = AuthenticationKerberosV5
+  destructorOf AuthenticationKerberosV5 k = k
 
 data AuthenticationCleartextPassword = AuthenticationCleartextPassword
 
@@ -116,8 +113,9 @@ type AuthenticationCleartextPasswordEnvelope =
     'AuthenticationCleartextPasswordType
 
 instance HasConstructor 'AuthenticationCleartextPasswordType AuthenticationCleartextPassword where
-  type ConstructorOf 'AuthenticationCleartextPasswordType AuthenticationCleartextPassword = AuthenticationCleartextPassword
+  type ConstructorOf 'AuthenticationCleartextPasswordType AuthenticationCleartextPassword r = r
   constructorOf = AuthenticationCleartextPassword
+  destructorOf AuthenticationCleartextPassword k = k
 
 newtype AuthenticationMD5Password bytes = AuthenticationMD5Password bytes
 
@@ -130,8 +128,9 @@ type AuthenticationMD5PasswordEnvelope bytes =
     'AuthenticationMD5PasswordType
 
 instance HasConstructor 'AuthenticationMD5PasswordType (AuthenticationMD5Password bytes) where
-  type ConstructorOf 'AuthenticationMD5PasswordType (AuthenticationMD5Password bytes) = bytes -> AuthenticationMD5Password bytes
+  type ConstructorOf 'AuthenticationMD5PasswordType (AuthenticationMD5Password bytes) r = bytes -> r
   constructorOf = AuthenticationMD5Password
+  destructorOf (AuthenticationMD5Password salt) k = k salt
 
 data AuthenticationGSS = AuthenticationGSS
 
@@ -144,8 +143,9 @@ type AuthenticationGSSEnvelope =
     'AuthenticationGSSType
 
 instance HasConstructor 'AuthenticationGSSType AuthenticationGSS where
-  type ConstructorOf 'AuthenticationGSSType AuthenticationGSS = AuthenticationGSS
+  type ConstructorOf 'AuthenticationGSSType AuthenticationGSS r = r
   constructorOf = AuthenticationGSS
+  destructorOf AuthenticationGSS k = k
 
 newtype AuthenticationGSSContinue bytes = AuthenticationGSSContinue bytes
 
@@ -158,8 +158,9 @@ type AuthenticationGSSContinueEnvelope bytes =
     'AuthenticationGSSContinueType
 
 instance HasConstructor 'AuthenticationGSSContinueType (AuthenticationGSSContinue bytes) where
-  type ConstructorOf 'AuthenticationGSSContinueType (AuthenticationGSSContinue bytes) = bytes -> AuthenticationGSSContinue bytes
+  type ConstructorOf 'AuthenticationGSSContinueType (AuthenticationGSSContinue bytes) r = bytes -> r
   constructorOf = AuthenticationGSSContinue
+  destructorOf (AuthenticationGSSContinue token) k = k token
 
 data AuthenticationSSPI = AuthenticationSSPI
 
@@ -172,8 +173,9 @@ type AuthenticationSSPIEnvelope =
     'AuthenticationSSPIType
 
 instance HasConstructor 'AuthenticationSSPIType AuthenticationSSPI where
-  type ConstructorOf 'AuthenticationSSPIType AuthenticationSSPI = AuthenticationSSPI
+  type ConstructorOf 'AuthenticationSSPIType AuthenticationSSPI r = r
   constructorOf = AuthenticationSSPI
+  destructorOf AuthenticationSSPI k = k
 
 newtype AuthenticationSASL bytes = AuthenticationSASL [bytes]
 
@@ -186,8 +188,9 @@ type AuthenticationSASLEnvelope bytes =
     'AuthenticationSASLType
 
 instance HasConstructor 'AuthenticationSASLType (AuthenticationSASL bytes) where
-  type ConstructorOf 'AuthenticationSASLType (AuthenticationSASL bytes) = [bytes] -> AuthenticationSASL bytes
+  type ConstructorOf 'AuthenticationSASLType (AuthenticationSASL bytes) r = [bytes] -> r
   constructorOf = AuthenticationSASL
+  destructorOf (AuthenticationSASL mechanisms) k = k mechanisms
 
 newtype AuthenticationSASLContinue bytes = AuthenticationSASLContinue bytes
 
@@ -200,8 +203,9 @@ type AuthenticationSASLContinueEnvelope bytes =
     'AuthenticationSASLContinueType
 
 instance HasConstructor 'AuthenticationSASLContinueType (AuthenticationSASLContinue bytes) where
-  type ConstructorOf 'AuthenticationSASLContinueType (AuthenticationSASLContinue bytes) = bytes -> AuthenticationSASLContinue bytes
+  type ConstructorOf 'AuthenticationSASLContinueType (AuthenticationSASLContinue bytes) r = bytes -> r
   constructorOf = AuthenticationSASLContinue
+  destructorOf (AuthenticationSASLContinue challenge) k = k challenge
 
 newtype AuthenticationSASLFinal bytes = AuthenticationSASLFinal bytes
 
@@ -214,5 +218,6 @@ type AuthenticationSASLFinalEnvelope bytes =
     'AuthenticationSASLFinalType
 
 instance HasConstructor 'AuthenticationSASLFinalType (AuthenticationSASLFinal bytes) where
-  type ConstructorOf 'AuthenticationSASLFinalType (AuthenticationSASLFinal bytes) = bytes -> AuthenticationSASLFinal bytes
+  type ConstructorOf 'AuthenticationSASLFinalType (AuthenticationSASLFinal bytes) r = bytes -> r
   constructorOf = AuthenticationSASLFinal
+  destructorOf (AuthenticationSASLFinal outcome) k = k outcome
