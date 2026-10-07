@@ -29,6 +29,11 @@ module Database.PostgreSQL.Session
     execute,
     prepare,
 
+    -- * Batches
+    Batch,
+    batched,
+    runBatch,
+
     -- * Cancelling and notifications
     awaitNotification,
     cancel,
@@ -48,6 +53,8 @@ where
 
 import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, finally, onException, throwIO)
 import Control.Monad (unless, when, (<=<))
+import Data.Bifunctor (first)
+import Data.Foldable (for_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -471,6 +478,10 @@ data Statement
     Unprepared ByteString [OptionalOid]
   | -- | A statement prepared earlier under this name.
     Prepared ByteString
+  | -- | SQL parsed and prepared under the name, with its parameters' types,
+    -- and run. The action runs once the server has parsed it, e.g. to
+    -- remember that the statement is prepared, even if running it fails.
+    Preparing ByteString ByteString [OptionalOid] (IO ())
 
 data Execution = Execution
   { executionStatement :: Statement,
@@ -488,7 +499,7 @@ prepare :: Session 'Ready -> ByteString -> ByteString -> [OptionalOid] -> IO (Ei
 prepare session name query parameterTypes = operation session $ do
   sendOutputs session (serialize @(Parse ByteString) @'ParseType (Parse name query parameterTypes) <> sync)
   parsed <- pullEither (continueIn session :: Session 'ParseResult) ((\ParseComplete -> Reply ()) :|: sessionTail)
-  awaitReady session parsed
+  awaitReady session id parsed
 
 -- | Closes a named statement. Closing one that doesn't exist isn't an
 -- error.
@@ -496,7 +507,7 @@ closeStatement :: Session 'Ready -> ByteString -> IO (Either ServerError (), Tra
 closeStatement session name = operation session $ do
   sendOutputs session (serialize @(Close ByteString) @'CloseType (Close PreparedStatement name) <> sync)
   closed <- pullEither (continueIn session :: Session 'CloseResult) ((\CloseComplete -> Reply ()) :|: sessionTail)
-  awaitReady session closed
+  awaitReady session id closed
 
 -- | Runs a statement and folds its rows; the step pulls each row's columns.
 -- Returns the fold's result and the command tag, e.g. @SELECT 3@, or the
@@ -504,19 +515,59 @@ closeStatement session name = operation session $ do
 --
 -- If the step throws, the session is broken.
 execute :: Session 'Ready -> Execution -> (acc -> Row -> IO acc) -> acc -> IO (Either ServerError (acc, ByteString), TransactionStatus)
-execute session execution step initial = operation session $ do
-  sendOutputs session (executionMessages execution)
+execute session execution step initial = runBatch session id (batched id execution step initial)
+
+-- | Statements sent together, before one Sync, whose results are read in
+-- order. After a statement fails on the server, the server skips the
+-- statements after it, so their results aren't read. A server error is
+-- given as an @e@.
+data Batch e a = Batch Output (Session 'Ready -> IO (Either e a))
+
+instance Functor (Batch e) where
+  fmap f (Batch output reading) = Batch output (fmap (fmap f) . reading)
+
+instance Applicative (Batch e) where
+  pure value = Batch mempty (\_ -> pure (Right value))
+  Batch left readLeft <*> Batch right readRight =
+    Batch (left <> right) $ \session ->
+      readLeft session >>= either (pure . Left) (\f -> fmap f <$> readRight session)
+
+-- | A statement of a batch, whose rows are folded as 'execute' folds them,
+-- and whose server error is given by the function.
+batched :: (ServerError -> e) -> Execution -> (acc -> Row -> IO acc) -> acc -> Batch e (acc, ByteString)
+batched failed execution step initial =
+  Batch (executionMessages execution) (\session -> first failed <$> readExecution session execution step initial)
+
+-- | Sends the batch's statements and a Sync, and reads their results, with
+-- the transaction status after them. An error the server reports after the
+-- statements replaces the result, given by the function.
+--
+-- If a step throws, the session is broken.
+runBatch :: Session 'Ready -> (ServerError -> e) -> Batch e a -> IO (Either e a, TransactionStatus)
+runBatch session failed (Batch output reading) = operation session $ do
+  sendOutputs session (output <> sync)
+  result <- reading session
+  awaitReady session failed result
+
+-- | Reads the results of a statement that has been sent.
+readExecution :: Session 'Ready -> Execution -> (acc -> Row -> IO acc) -> acc -> IO (Either ServerError (acc, ByteString))
+readExecution session execution step initial = do
   parsed <- case executionStatement execution of
-    Unprepared _ _ -> pullEither (continueIn session :: Session 'ParseResult) ((\ParseComplete -> Reply ()) :|: sessionTail)
+    Unprepared _ _ -> parseComplete
     Prepared _ -> pure (Right ())
-  result <- case parsed of
+    Preparing _ _ _ onParsed -> do
+      parsed <- parseComplete
+      for_ parsed (const onParsed)
+      pure parsed
+  case parsed of
     Left failure -> pure (Left failure)
     Right () -> do
       bound <- pullEither (continueIn session :: Session 'BindResult) ((\BindComplete -> Reply ()) :|: sessionTail)
       case bound of
         Left failure -> pure (Left failure)
         Right () -> readRows (continueIn session) step initial
-  awaitReady session result
+  where
+    parseComplete = pullEither (continueIn session :: Session 'ParseResult) ((\ParseComplete -> Reply ()) :|: sessionTail)
 
 -- | Waits for a notification on a channel the session listens on (with
 -- @LISTEN@). Notifications that arrived during earlier operations come
@@ -554,8 +605,7 @@ cancel address key =
           unless (BS.null received) waitForClose
     waitForClose `catch` \(_ :: IOException) -> pure ()
 
--- | Parse (for an unprepared statement), Bind, Execute and Sync, sent
--- together.
+-- | Parse (unless the statement is prepared already), Bind and Execute.
 executionMessages :: Execution -> Output
 executionMessages execution =
   parse
@@ -570,11 +620,11 @@ executionMessages execution =
             }
       )
     <> serialize @(Execute ByteString) @'ExecuteType (Execute "" 0)
-    <> sync
   where
     (parse, statementName) = case executionStatement execution of
       Unprepared query parameterTypes -> (serialize @(Parse ByteString) @'ParseType (Parse "" query parameterTypes), "")
       Prepared name -> (mempty, name)
+      Preparing name query parameterTypes _ -> (serialize @(Parse ByteString) @'ParseType (Parse name query parameterTypes), name)
 
 sync :: Output
 sync = serialize @Sync @'SyncType Sync
@@ -605,22 +655,22 @@ readRows session@(Session connection) step = go
 
 -- | Pulls the ReadyForQuery that ends a Sync. An error before it, e.g. a
 -- deferred constraint failing at the implicit commit, replaces a successful
--- result.
-awaitReady :: Session phase -> Either ServerError a -> IO (Either ServerError a, TransactionStatus)
-awaitReady session result = do
+-- result, given by the function.
+awaitReady :: Session phase -> (ServerError -> e) -> Either e a -> IO (Either e a, TransactionStatus)
+awaitReady session failed result = do
   let syncing = continueIn session :: Session 'SyncResult
   reply <-
     receive syncing $
       (\(ReadyForQuery status) -> Reply status) :|: sessionTail
   case reply of
     Reply status -> pure (result, status)
-    Skip -> awaitReady session result
+    Skip -> awaitReady session failed result
     Notified notification -> do
       keepNotification session notification
-      awaitReady session result
+      awaitReady session failed result
     Rejected fields -> do
       failure <- sessionError fields
-      awaitReady session (result >>= const (Left failure))
+      awaitReady session failed (result >>= const (Left (failed failure)))
 
 -- | A row, whose columns are pulled in order. It's valid only during the step
 -- it's given to.

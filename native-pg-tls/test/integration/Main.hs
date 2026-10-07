@@ -41,6 +41,7 @@ import Database.PostgreSQL.Protocol
     protocolVersion3_2,
   )
 import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
+import qualified Database.PostgreSQL.Pipeline as Pipeline
 import Database.PostgreSQL.Session
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
@@ -327,19 +328,49 @@ main = withCluster $ \socketPath -> hspec $ do
         (Tx.statement () (Tx.Statement "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')" (const []) (Tx.singleRow (Tx.row @'[Text, Text] (,))) False))
         session
         `shouldReturn` Right ("repeatable read", "on")
-    it "runs a preparable statement under the name its Prepare gives, and the others unnamed" $ \session -> do
-      prepared <- newIORef []
-      let prepareAs name query types = do
-            modifyIORef prepared (query :)
-            (result, _) <- prepare session name query types
-            pure (name <$ result)
+    it "prepares a preparable statement as its Prepare says, and runs the others unnamed" $ \session -> do
+      asked <- newIORef []
+      parsed <- newIORef []
+      let prepareAs name query' _ = do
+            modifyIORef asked (query' :)
+            pure (Tx.PrepareAs name (modifyIORef parsed (name :)))
           named = Tx.Statement "SELECT count(*) FROM pg_prepared_statements WHERE name = 'answer'" (const []) (Tx.singleRow (Tx.row @'[Int64] id)) False
           answer = Tx.Statement "SELECT $1::int4 + 1" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) (Tx.singleRow (Tx.row @'[Int32] id)) True
       Tx.transactionNoRetryWith (prepareAs "answer") Tx.ReadCommitted Tx.Read ((,) <$> Tx.statement "41" answer <*> Tx.statement () named) session
         `shouldReturn` Right (42, 1)
-      readIORef prepared `shouldReturn` ["SELECT $1::int4 + 1"]
+      readIORef asked `shouldReturn` ["SELECT $1::int4 + 1"]
+      readIORef parsed `shouldReturn` ["answer"]
+      Tx.transactionNoRetryWith (\_ _ -> pure (Tx.PreparedAs "answer")) Tx.ReadCommitted Tx.Read (Tx.statement "1" answer) session
+        `shouldReturn` Right 2
       result <- Tx.transactionNoRetryWith (prepareAs "broken") Tx.ReadCommitted Tx.Read (Tx.statement () (Tx.Statement "SELEC 1" (const []) Tx.noResult True)) session
       result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELEC 1" && failure `servedCode` "42601") (const False)
+      readIORef parsed `shouldReturn` ["answer"]
+      let divided = Tx.Statement "SELECT 1 / $1::int4" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) Tx.noResult True
+      failing <- Tx.transactionNoRetryWith (prepareAs "divided") Tx.ReadCommitted Tx.Read (Tx.statement "0" divided) session
+      failing `shouldSatisfy` either (\(Tx.QueryError _ failure) -> failure `servedCode` "22012") (const False)
+      -- parsed, so prepared, even though it failed to run
+      readIORef parsed `shouldReturn` ["divided", "answer"]
+    it "runs a pipeline's statements in order, and gives their results" $ \session -> do
+      createItems session
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.pipeline ((,) <$> Pipeline.statement "1" insertItem <*> Pipeline.statement () countItems)) session
+        `shouldReturn` Right ((), 1)
+    it "skips a pipeline's statements after one that fails on the server, and reports that one" $ \session -> do
+      createItems session
+      result <-
+        Tx.transactionNoRetry
+          Tx.ReadCommitted
+          Tx.Write
+          (Tx.pipeline (Pipeline.statement "1" insertItem *> Pipeline.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult False) *> Pipeline.statement "2" insertItem))
+          session
+      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
+      items session `shouldReturn` Right 0
+    it "reads a pipeline's results after one that doesn't decode, and stays usable" $ \session -> do
+      let number sql' = Pipeline.statement () (Tx.Statement sql' (const []) (Tx.singleRow (Tx.row @'[Int32] id)) False)
+      result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.pipeline ((,) <$> number "SELECT 'abc'::text" <*> number "SELECT 2::int4")) session
+      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 'abc'::text" && (case failure of Tx.RowFailed _ -> True; _ -> False)) (const False)
+      query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
+    it "sends nothing for a transaction without statements" $ \session ->
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (pure (5 :: Int)) session `shouldReturn` Right 5
     it "reports a failure at commit" $ \session -> do
       void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
       let insertTwice = Tx.sql "INSERT INTO tx_unique VALUES (1)" *> Tx.sql "INSERT INTO tx_unique VALUES (1)"

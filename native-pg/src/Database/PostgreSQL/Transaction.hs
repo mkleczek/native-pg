@@ -6,8 +6,10 @@
 -- of statements whose results are read into values, run between @BEGIN@ and
 -- @COMMIT@, or @ABORT@ when it's condemned or a statement fails.
 --
--- Nothing is retried, since a streamed result or parameter can't be
--- replayed. The statements, and their results, are those of
+-- @BEGIN@ waits to be sent with the first statements, in one round trip.
+-- Statements whose results the others don't depend on can also go together,
+-- in a 'pipeline'. Nothing is retried, since a streamed result or parameter
+-- can't be replayed. The statements, and their results, are those of
 -- "Database.PostgreSQL.Statement".
 module Database.PostgreSQL.Transaction
   ( -- * Transactions
@@ -16,9 +18,11 @@ module Database.PostgreSQL.Transaction
     Mode (..),
     transactionNoRetry,
     Prepare,
+    Prepared (..),
     transactionNoRetryWith,
     statement,
     sql,
+    pipeline,
     condemn,
 
     -- * Statements
@@ -48,20 +52,14 @@ module Database.PostgreSQL.Transaction
 where
 
 import Control.Exception (SomeException, onException, try)
-import Control.Monad (ap, liftM, void)
+import Control.Monad (ap, liftM, void, when)
 import Control.Monad.IO.Class (MonadIO (..))
-import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Database.PostgreSQL.Protocol (FormatCode (..), OptionalOid)
-import Database.PostgreSQL.Session
-  ( Execution (..),
-    Phase (Ready),
-    ServerError,
-    Session,
-    execute,
-  )
-import qualified Database.PostgreSQL.Session as Session
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Maybe (isNothing)
+import Database.PostgreSQL.Pipeline (Pipeline, Prepare, Prepared (..), runPipeline)
+import qualified Database.PostgreSQL.Pipeline as Pipeline
+import Database.PostgreSQL.Session (Phase (Ready), Session)
 import Database.PostgreSQL.Statement
 
 -- | Statements run in one transaction, which can be condemned to end in a
@@ -71,6 +69,8 @@ newtype Transaction a = Transaction (Context -> IO (Either QueryError a))
 data Context = Context
   { contextSession :: Session 'Ready,
     contextPrepare :: Maybe Prepare,
+    -- | The @BEGIN@ to send with the first statements, until they're sent.
+    contextBegin :: IORef (Maybe ByteString),
     -- | Whether the transaction commits.
     contextCommits :: IORef Bool
   }
@@ -104,38 +104,35 @@ data Mode
 
 -- | Runs the transaction: @BEGIN@ with the isolation level and the mode,
 -- then @COMMIT@, or @ABORT@ if it was condemned or a statement failed. If it
--- throws, the transaction is aborted when the session is still usable.
+-- throws, the transaction is aborted when the session is still usable. A
+-- transaction that runs no statement sends nothing.
 transactionNoRetry :: IsolationLevel -> Mode -> Transaction a -> Session 'Ready -> IO (Either QueryError a)
 transactionNoRetry = runTransaction Nothing
 
--- | Gives the name a statement is prepared under on the session, from its
--- SQL and its parameters' types, preparing it first if needed, e.g. from a
--- statement cache. Or the server's error, if preparing failed.
-type Prepare = ByteString -> [OptionalOid] -> IO (Either ServerError ByteString)
-
 -- | Like 'transactionNoRetry', but the statements that may be prepared run as
--- prepared statements, under the names 'Prepare' gives.
+-- prepared statements, as 'Prepare' gives.
 transactionNoRetryWith :: Prepare -> IsolationLevel -> Mode -> Transaction a -> Session 'Ready -> IO (Either QueryError a)
 transactionNoRetryWith = runTransaction . Just
 
 runTransaction :: Maybe Prepare -> IsolationLevel -> Mode -> Transaction a -> Session 'Ready -> IO (Either QueryError a)
 runTransaction prepare isolation mode (Transaction body) session = do
+  begin <- newIORef (Just (beginning isolation mode))
   commits <- newIORef True
-  let context = Context session prepare commits
+  let context = Context session prepare begin commits
       run (Transaction action) = action context
+      begun = isNothing <$> readIORef begin
       -- An exception may have broken the session; then there's nothing to
       -- abort, and the pool closes it.
-      abortQuietly = void (try @SomeException (run (sql "ABORT")))
-  begun <- run (sql (beginning isolation mode))
-  case begun of
-    Left failure -> pure (Left failure)
-    Right () -> do
-      result <- body context `onException` abortQuietly
-      case result of
-        Left failure -> run (sql "ABORT") >> pure (Left failure)
-        Right value -> do
-          committing <- readIORef commits
-          fmap (const value) <$> run (sql (if committing then "COMMIT" else "ABORT"))
+      abortQuietly = begun >>= \sent -> when sent (void (try @SomeException (run (sql "ABORT"))))
+  result <- body context `onException` abortQuietly
+  sent <- begun
+  if not sent
+    then pure result
+    else case result of
+      Left failure -> run (sql "ABORT") >> pure (Left failure)
+      Right value -> do
+        committing <- readIORef commits
+        fmap (const value) <$> run (sql (if committing then "COMMIT" else "ABORT"))
 
 -- | The same text hasql-transaction sends.
 beginning :: IsolationLevel -> Mode -> ByteString
@@ -159,27 +156,12 @@ sql query = statement () (Statement query (const []) noResult False)
 
 -- | Runs the statement with the parameters, and reads its result.
 statement :: params -> Statement params result -> Transaction result
-statement params (Statement query encode (Result initial step finish) preparable) = Transaction $ \context -> do
-  let parameters = encode params
-      types = paramType <$> parameters
-      execution executed =
-        Execution
-          { executionStatement = executed,
-            executionParameterFormats = paramFormat <$> parameters,
-            executionParameters = paramValue <$> parameters,
-            -- The decoders read the binary formats.
-            executionResultFormats = [BinaryFormat]
-          }
-      folding (Left failure) _ = pure (Left failure)
-      folding (Right accumulated) current = step accumulated current
-  prepared <- case contextPrepare context of
-    Just prepare | preparable -> fmap Session.Prepared <$> prepare query types
-    _ -> pure (Right (Session.Unprepared query types))
-  case prepared of
-    Left failure -> pure (Left (QueryError query (ServerFailed failure)))
-    Right executed -> do
-      (outcome, _) <- execute (contextSession context) (execution executed) folding (Right initial)
-      pure . first (QueryError query) $ case outcome of
-        Left failure -> Left (ServerFailed failure)
-        Right (Left failure, _) -> Left (RowFailed failure)
-        Right (Right accumulated, _) -> finish accumulated
+statement params = pipeline . Pipeline.statement params
+
+-- | Sends the pipeline's statements together, and reads their results. The
+-- first statements go with @BEGIN@.
+pipeline :: Pipeline a -> Transaction a
+pipeline statements = Transaction $ \context -> do
+  pending <- atomicModifyIORef' (contextBegin context) (Nothing,)
+  let withBegin = maybe statements (\begin -> Pipeline.statement () (Statement begin (const []) noResult False) *> statements) pending
+  runPipeline (contextPrepare context) withBegin (contextSession context)
