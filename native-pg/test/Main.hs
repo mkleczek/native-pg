@@ -167,6 +167,11 @@ main = hspec $ do
       source <- chunkedSource [BS.take 20 conversation, BS.drop 20 conversation] 16
       replies <- pullAll source emptyInputBuffer
       concatMap snd replies `shouldBe` [Just "42", Nothing, Just "a longer value", Just "SELECT 1"]
+    it "reads some bytes until they're all there, or the buffer is full, without copying" $ do
+      pendingWith "it gives what the buffer holds, or else what one read brings"
+      source <- chunkedSource (replicate 40 (BS.replicate 1000 0x78)) 16384
+      (chunks, _) <- runInput source emptyInputBuffer (sequence [readInputSome 5000, readInputSome 20000, readInputSome 20000])
+      map BS.length chunks `shouldBe` [5000, 11384, 16384]
 
   describe "diagnostics" $ do
     it "decodes an error's fields, preferring the untranslated severity" $
