@@ -4,6 +4,8 @@
 -- type OID and the format hasql's does, with bytes from the same
 -- postgresql-binary encoding, so a parameter goes on the wire as hasql sends
 -- it.
+--
+-- Bytes can also be sent as they are, which lets them stream.
 module Database.PostgreSQL.Encoders
   ( -- * Values
     Value,
@@ -19,6 +21,14 @@ module Database.PostgreSQL.Encoders
     jsonLazyBytes,
     jsonbLazyBytes,
     foldableArray,
+
+    -- * Bytes as they are
+    Raw,
+    rawParam,
+    rawJson,
+    rawJsonb,
+    rawBytea,
+    rawUnknown,
   )
 where
 
@@ -74,3 +84,32 @@ foldableArray :: Foldable foldable => NullableOrNot element -> Value (foldable e
 foldableArray (NullableOrNot oid arrayOid _ encode) =
   Value arrayOid arrayOid BinaryFormat $
     Binary.array oid . Binary.dimensionArray foldl' (maybe Binary.nullArray Binary.encodingArray . encode)
+
+-- | Bytes sent as a value of a type as they are, in the format in which they
+-- are its encoding. Their parameter can stream.
+data Raw = Raw Word32 FormatCode
+
+-- | The parameter of the bytes, at hand or streamed, or NULL.
+rawParam :: Raw -> Maybe Parameter -> Param
+rawParam (Raw oid format) value =
+  Param
+    { paramType = Just (Scalar oid),
+      paramFormat = format,
+      paramValue = value
+    }
+
+-- | JSON text, in json's binary format, which is the text.
+rawJson :: Raw
+rawJson = Raw 114 BinaryFormat
+
+-- | JSON text, in jsonb's text format. Its binary format begins with a
+-- version.
+rawJsonb :: Raw
+rawJsonb = Raw 3802 TextFormat
+
+rawBytea :: Raw
+rawBytea = Raw 17 BinaryFormat
+
+-- | Bytes of PostgreSQL's @unknown@ type, as 'unknown' sends them.
+rawUnknown :: Raw
+rawUnknown = Raw 705 TextFormat

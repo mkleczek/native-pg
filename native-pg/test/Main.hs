@@ -333,6 +333,14 @@ main = hspec $ do
       paramView (Encoders.param (Encoders.nonNullable Encoders.jsonLazyBytes) "{}") `shouldBe` (Just (Scalar 114), BinaryFormat, Just "{}")
       paramView (Encoders.param (Encoders.nonNullable Encoders.jsonbLazyBytes) "{}") `shouldBe` (Just (Scalar 3802), BinaryFormat, Just "\1{}")
       paramView (Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes) Nothing) `shouldBe` (Just (Scalar 3802), BinaryFormat, Nothing)
+    it "sends bytes as they are, at hand or streamed" $ do
+      paramView (Encoders.rawParam Encoders.rawJson (Just (ParameterBytes "{}"))) `shouldBe` (Just (Scalar 114), BinaryFormat, Just "{}")
+      paramView (Encoders.rawParam Encoders.rawJsonb (Just (ParameterBytes "{}"))) `shouldBe` (Just (Scalar 3802), TextFormat, Just "{}")
+      paramView (Encoders.rawParam Encoders.rawBytea (Just (ParameterBytes "\0"))) `shouldBe` (Just (Scalar 17), BinaryFormat, Just "\0")
+      paramView (Encoders.rawParam Encoders.rawUnknown Nothing) `shouldBe` (Just (Scalar 705), TextFormat, Nothing)
+      case Encoders.rawParam Encoders.rawJsonb (Just (ParameterStream (ByteStream 2 (pure "{}")))) of
+        Tx.Param oid format (Just (ParameterStream stream)) -> (oid, format, byteStreamLength stream) `shouldBe` (Just (Scalar 3802), TextFormat, 2)
+        _ -> expectationFailure "the parameter isn't streamed"
     it "sends a one-dimensional array of the elements' type" $
       paramView (Encoders.param (Encoders.nonNullable (Encoders.foldableArray (Encoders.nonNullable Encoders.text))) ["a", "bc"])
         `shouldBe` ( Just (Scalar 1009),
