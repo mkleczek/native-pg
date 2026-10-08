@@ -186,6 +186,27 @@ main = withCluster $ \socketPath -> hspec $ do
           (\rows row -> (: rows) <$> columns row)
           []
       result `shouldBe` Right ([[Just "t"]], "SELECT 1")
+    it "streams a parameter to a prepared statement, whether it returns rows or not" $ \session -> do
+      _ <- query session "CREATE TEMPORARY TABLE streamed (value text)" []
+      prepare session "insert_streamed" "INSERT INTO streamed VALUES ($1)" [] `shouldReturn` (Right (), TxIdle)
+      prepare session "length_of" "SELECT length($1::text)" [] `shouldReturn` (Right (), TxIdle)
+      let streamed name = do
+            source <- chunkSource ["abc", "def"]
+            collectRows session (Execution (Prepared name) [] [Just (ParameterStream (ByteStream 6 source))] [])
+      streamed "insert_streamed" `shouldReturn` (Right ([], "INSERT 0 1"), TxIdle)
+      streamed "length_of" `shouldReturn` (Right ([[Just "6"]], "SELECT 1"), TxIdle)
+    it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $ \session -> do
+      pendingWith "a prepared statement's timer starts once its Bind is read"
+      _ <- query session "SET statement_timeout = '200ms'" []
+      prepare session "slow_length" "SELECT length($1::text)" [] `shouldReturn` (Right (), TxIdle)
+      let slowly target = do
+            source <- chunkSource (replicate 4 (Char8.replicate 1000 'y'))
+            let delayed = threadDelay 150000 *> source
+            (result, _) <- execute session (Execution target [] [Just (ParameterStream (ByteStream 4000 delayed))] []) (\() _ -> pure ()) ()
+            pure (either errorCode (const Nothing) result)
+      slowly (Unprepared "SELECT length($1::text)" []) `shouldReturn` Just "57014"
+      slowly (Prepared "slow_length") `shouldReturn` Just "57014"
+      query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
     it "sends a batch while reading its results, as the server answers before reading all of it" $ \session -> do
       let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
           large = collect (statement "SELECT repeat('x', 1000000)" [])
