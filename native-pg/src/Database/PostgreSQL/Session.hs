@@ -130,6 +130,11 @@ data Phase
     BindResult
   | -- | The result of a Close.
     CloseResult
+  | -- | The parameters' types, which a Describe of a statement answers
+    -- first.
+    DescribeResult
+  | -- | The columns of the statement's rows, or NoData, which follow them.
+    RowDescriptionResult
   | -- | The rows of an Execute, until the command completes.
     Rows
   | -- | The ReadyForQuery that answers a Sync.
@@ -223,6 +228,27 @@ instance Accepts 'CloseResult where
   type
     Accepted 'CloseResult =
       '[ 'PayloadField 'CloseCompleteType,
+         'PayloadField 'ErrorResponseType,
+         'PayloadField 'NoticeResponseType,
+         'PayloadField 'ParameterStatusType,
+         'PayloadField 'NotificationResponseType
+       ]
+
+instance Accepts 'DescribeResult where
+  type
+    Accepted 'DescribeResult =
+      '[ 'PayloadField 'ParameterDescriptionType,
+         'PayloadField 'ErrorResponseType,
+         'PayloadField 'NoticeResponseType,
+         'PayloadField 'ParameterStatusType,
+         'PayloadField 'NotificationResponseType
+       ]
+
+instance Accepts 'RowDescriptionResult where
+  type
+    Accepted 'RowDescriptionResult =
+      '[ 'PayloadField 'RowDescriptionType,
+         'PayloadField 'NoDataType,
          'PayloadField 'ErrorResponseType,
          'PayloadField 'NoticeResponseType,
          'PayloadField 'ParameterStatusType,
@@ -571,7 +597,9 @@ readExecution :: Session 'Ready -> Execution -> (acc -> Row -> IO acc) -> acc ->
 readExecution session execution step initial = do
   parsed <- case executionStatement execution of
     Unprepared _ _ -> parseComplete
-    Prepared _ -> pure (Right ())
+    Prepared _
+      | streamsParameter execution -> described
+      | otherwise -> pure (Right ())
     Preparing _ _ _ onParsed -> do
       parsed <- parseComplete
       for_ parsed (const onParsed)
@@ -585,6 +613,11 @@ readExecution session execution step initial = do
         Right () -> readRows (continueIn session) step initial
   where
     parseComplete = pullEither (continueIn session :: Session 'ParseResult) ((\ParseComplete -> Reply ()) :|: sessionTail)
+    described = do
+      parameters <- pullEither (continueIn session :: Session 'DescribeResult) ((\(ParameterDescription _) -> Reply ()) :|: sessionTail)
+      case parameters of
+        Left failure -> pure (Left failure)
+        Right () -> pullEither (continueIn session :: Session 'RowDescriptionResult) ((\(_ :: RowDescription ByteString) -> Reply ()) :|: (\NoData -> Reply ()) :|: sessionTail)
 
 -- | Waits for a notification on a channel the session listens on (with
 -- @LISTEN@). Notifications that arrived during earlier operations come
@@ -622,10 +655,13 @@ cancel address key =
           unless (BS.null received) waitForClose
     waitForClose `catch` \(_ :: IOException) -> pure ()
 
--- | Parse (unless the statement is prepared already), Bind and Execute.
+-- | Parse (unless the statement is prepared already), Bind and Execute. A
+-- prepared statement is described instead if a parameter streams: the server
+-- starts @statement_timeout@ at a Parse or a Describe, and reads a Bind whole
+-- before it runs it, so a slow stream counts either way.
 executionMessages :: Execution -> Output
 executionMessages execution =
-  parse
+  preamble
     <> serialize @(Bind Parameter) @'BindType
       ( Bind
           BindBody
@@ -638,10 +674,19 @@ executionMessages execution =
       )
     <> serialize @(Execute ByteString) @'ExecuteType (Execute "" 0)
   where
-    (parse, statementName) = case executionStatement execution of
+    (preamble, statementName) = case executionStatement execution of
       Unprepared query parameterTypes -> (serialize @(Parse ByteString) @'ParseType (Parse "" query parameterTypes), "")
-      Prepared name -> (mempty, name)
+      Prepared name
+        | streamsParameter execution -> (serialize @(Describe ByteString) @'DescribeType (Describe PreparedStatement name), name)
+        | otherwise -> (mempty, name)
       Preparing name query parameterTypes _ -> (serialize @(Parse ByteString) @'ParseType (Parse name query parameterTypes), name)
+
+-- | Whether a parameter of the execution streams.
+streamsParameter :: Execution -> Bool
+streamsParameter = any streamed . executionParameters
+  where
+    streamed (Just (ParameterStream _)) = True
+    streamed _ = False
 
 sync :: Output
 sync = serialize @Sync @'SyncType Sync

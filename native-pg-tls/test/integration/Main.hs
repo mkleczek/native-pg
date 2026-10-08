@@ -196,7 +196,6 @@ main = withCluster $ \socketPath -> hspec $ do
       streamed "insert_streamed" `shouldReturn` (Right ([], "INSERT 0 1"), TxIdle)
       streamed "length_of" `shouldReturn` (Right ([[Just "6"]], "SELECT 1"), TxIdle)
     it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $ \session -> do
-      pendingWith "a prepared statement's timer starts once its Bind is read"
       _ <- query session "SET statement_timeout = '200ms'" []
       prepare session "slow_length" "SELECT length($1::text)" [] `shouldReturn` (Right (), TxIdle)
       let slowly target = do
