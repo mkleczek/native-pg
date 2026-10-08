@@ -389,6 +389,30 @@ main = withCluster $ \socketPath -> hspec $ do
       let insertTwice = Tx.sql "INSERT INTO tx_unique VALUES (1)" *> Tx.sql "INSERT INTO tx_unique VALUES (1)"
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write insertTwice session
       result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "COMMIT" && failure `servedCode` "23505") (const False)
+    it "commits with the final pipeline" $ \session -> do
+      createItems session
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (Pipeline.statement "1" insertItem)) session `shouldReturn` Right ()
+      items session `shouldReturn` Right 1
+    it "aborts with the final pipeline when condemned before it" $ \session -> do
+      createItems session
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.condemn *> Tx.finalPipeline (Pipeline.statement "1" insertItem)) session `shouldReturn` Right ()
+      items session `shouldReturn` Right 0
+    it "rolls back after a statement in the final pipeline fails" $ \session -> do
+      createItems session
+      let failing = Pipeline.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult False)
+      result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (Pipeline.statement "1" insertItem *> failing)) session
+      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
+      items session `shouldReturn` Right 0
+      query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
+    it "reports a failure at commit in the final pipeline, after which the transaction is over" $ \session -> do
+      void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
+      let insert = Pipeline.statement () (Tx.Statement "INSERT INTO tx_unique VALUES (1)" (const []) Tx.noResult False)
+      result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (insert *> insert)) session
+      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "COMMIT" && failure `servedCode` "23505") (const False)
+      query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
+    it "rejects a statement after the final pipeline" $ \session ->
+      Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.finalPipeline (pure ()) *> Tx.sql "SELECT 1") session
+        `shouldThrow` errorCall "a statement after the transaction's final pipeline"
     it "checks how many rows a result has" $ \session -> do
       let numbers :: Tx.Result a -> Int -> Tx.Transaction a
           numbers shape count = Tx.statement () (Tx.Statement ("SELECT n FROM generate_series(1, " <> Char8.pack (show count) <> ") n") (const []) shape False)

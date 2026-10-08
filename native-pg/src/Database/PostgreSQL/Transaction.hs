@@ -8,7 +8,8 @@
 --
 -- @BEGIN@ waits to be sent with the first statements, in one round trip.
 -- Statements whose results the others don't depend on can also go together,
--- in a 'pipeline'. Nothing is retried, since a streamed result or parameter
+-- in a 'pipeline', and the last ones can go with @COMMIT@, in a
+-- 'finalPipeline'. Nothing is retried, since a streamed result or parameter
 -- can't be replayed. The statements, and their results, are those of
 -- "Database.PostgreSQL.Statement".
 module Database.PostgreSQL.Transaction
@@ -23,6 +24,7 @@ module Database.PostgreSQL.Transaction
     statement,
     sql,
     pipeline,
+    finalPipeline,
     condemn,
 
     -- * Statements
@@ -53,14 +55,15 @@ module Database.PostgreSQL.Transaction
   )
 where
 
-import Control.Exception (SomeException, onException, try)
+import Control.Exception (ErrorCall (..), SomeException, onException, throwIO, try)
 import Control.Monad (ap, liftM, void, when)
 import Control.Monad.IO.Class (MonadIO (..))
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
-import Database.PostgreSQL.Pipeline (Pipeline, Prepare, Prepared (..), runPipeline)
+import Database.PostgreSQL.Pipeline (Pipeline, Prepare, Prepared (..), runPipelineWithStatus)
 import qualified Database.PostgreSQL.Pipeline as Pipeline
+import Database.PostgreSQL.Protocol (TransactionStatus (..))
 import Database.PostgreSQL.Session (Phase (Ready), Session)
 import Database.PostgreSQL.Statement
 
@@ -74,7 +77,9 @@ data Context = Context
     -- | The @BEGIN@ to send with the first statements, until they're sent.
     contextBegin :: IORef (Maybe ByteString),
     -- | Whether the transaction commits.
-    contextCommits :: IORef Bool
+    contextCommits :: IORef Bool,
+    -- | Whether the transaction ended with its final pipeline.
+    contextEnded :: IORef Bool
   }
 
 instance Functor Transaction where
@@ -120,14 +125,16 @@ runTransaction :: Maybe Prepare -> IsolationLevel -> Mode -> Transaction a -> Se
 runTransaction prepare isolation mode (Transaction body) session = do
   begin <- newIORef (Just (beginning isolation mode))
   commits <- newIORef True
-  let context = Context session prepare begin commits
+  ended <- newIORef False
+  let context = Context session prepare begin commits ended
       run (Transaction action) = action context
-      begun = isNothing <$> readIORef begin
+      -- Whether the transaction is open on the server: begun and not ended.
+      open = (&&) . isNothing <$> readIORef begin <*> (not <$> readIORef ended)
       -- An exception may have broken the session; then there's nothing to
       -- abort, and the pool closes it.
-      abortQuietly = begun >>= \sent -> when sent (void (try @SomeException (run (sql "ABORT"))))
+      abortQuietly = open >>= \sent -> when sent (void (try @SomeException (run (sql "ABORT"))))
   result <- body context `onException` abortQuietly
-  sent <- begun
+  sent <- open
   if not sent
     then pure result
     else case result of
@@ -163,7 +170,32 @@ statement params = pipeline . Pipeline.statement params
 -- | Sends the pipeline's statements together, and reads their results. The
 -- first statements go with @BEGIN@.
 pipeline :: Pipeline a -> Transaction a
-pipeline statements = Transaction $ \context -> do
+pipeline statements = Transaction (\context -> fst <$> send context statements)
+
+-- | Like 'pipeline', but ends the transaction with the statements: @COMMIT@,
+-- or @ABORT@ if it's condemned already. That saves the round trip it would
+-- take after them, but their results can't condemn the transaction, and no
+-- statement can follow them.
+--
+-- After a statement fails, the server skips the end, and the transaction is
+-- aborted as usual. A failure at @COMMIT@ is reported as the statement's.
+-- A result that doesn't decode is reported too, but the transaction has
+-- ended as it would have.
+finalPipeline :: Pipeline a -> Transaction a
+finalPipeline statements = Transaction $ \context -> do
+  committing <- readIORef (contextCommits context)
+  let ending = Pipeline.statement () (Statement (if committing then "COMMIT" else "ABORT") (const []) noResult False)
+  (result, status) <- send context (statements <* ending)
+  -- Unless a statement failed before the end, the transaction is over.
+  writeIORef (contextEnded context) (status == TxIdle)
+  pure result
+
+-- | Sends the statements, with @BEGIN@ if they're the first, and reads their
+-- results, with the transaction status after them.
+send :: Context -> Pipeline a -> IO (Either QueryError a, TransactionStatus)
+send context statements = do
+  ended <- readIORef (contextEnded context)
+  when ended (throwIO (ErrorCall "a statement after the transaction's final pipeline"))
   pending <- atomicModifyIORef' (contextBegin context) (Nothing,)
   let withBegin = maybe statements (\begin -> Pipeline.statement () (Statement begin (const []) noResult False) *> statements) pending
-  runPipeline (contextPrepare context) withBegin (contextSession context)
+  runPipelineWithStatus (contextPrepare context) withBegin (contextSession context)

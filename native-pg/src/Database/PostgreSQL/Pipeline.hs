@@ -15,6 +15,7 @@ module Database.PostgreSQL.Pipeline
   ( Pipeline,
     statement,
     runPipeline,
+    runPipelineWithStatus,
 
     -- * Prepared statements
     Prepare,
@@ -28,7 +29,7 @@ import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.Functor ((<&>))
 import Data.Maybe (fromMaybe)
-import Database.PostgreSQL.Protocol (FormatCode (..), OptionalOid)
+import Database.PostgreSQL.Protocol (FormatCode (..), OptionalOid, TransactionStatus)
 import Database.PostgreSQL.Session
   ( Batch,
     Execution (..),
@@ -101,7 +102,10 @@ statement params (Statement query encode (Result initial step finish) preparable
 -- | Runs the pipeline on the session. Statements that may be prepared run as
 -- the function gives, if there's one, and otherwise unnamed.
 runPipeline :: Maybe Prepare -> Pipeline a -> Session 'Ready -> IO (Either QueryError a)
-runPipeline prepare (Pipeline plan) session = do
+runPipeline prepare statements session = fst <$> runPipelineWithStatus prepare statements session
+
+-- | Like 'runPipeline', with the transaction status after the statements.
+runPipelineWithStatus :: Maybe Prepare -> Pipeline a -> Session 'Ready -> IO (Either QueryError a, TransactionStatus)
+runPipelineWithStatus prepare (Pipeline plan) session = do
   Planned final batch <- plan prepare
-  (result, _) <- runBatch session (QueryError (fromMaybe "" final) . ServerFailed) batch
-  pure (join result)
+  first join <$> runBatch session (QueryError (fromMaybe "" final) . ServerFailed) batch
