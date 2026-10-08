@@ -112,14 +112,17 @@ data Alternatives (functions :: [Type]) (r :: Type) where
 
 infixr 5 :|:
 
+-- Parsers run in 'Input' itself, rather than in any 'MonadInput', so that
+-- their binds are inlined instead of called through the class's dictionary,
+-- which allocates closures for every message.
 class Parsable (a :: Type) s where
-  parser :: forall m. MonadInput m => m a
+  parser :: Input a
 
 class Serializable (a :: Type) s where
   serialize :: a -> Output
 
 class ParseConstructor (payload :: Payload) f a | payload f -> a where
-  parseWithConstructor :: forall m. MonadInput m => f -> m a
+  parseWithConstructor :: f -> Input a
 
 -- | The mirror of 'ParseConstructor': builds the function that takes the
 -- payload's fields and passes their serialization on.
@@ -131,27 +134,24 @@ class SerializeConstructor (payload :: Payload) k r | payload k -> r where
 -- last one, and it stops at the first part whose size isn't fixed.
 class PayloadPrefix (payload :: Payload) where
   matchPrefix ::
-    forall m r.
-    MonadInput m =>
+    forall r.
     -- | Offset of the payload in the input.
     Int ->
     -- | A constant differs.
-    m r ->
+    Input r ->
     -- | The constants match up to a part whose size isn't fixed.
-    m r ->
+    Input r ->
     -- | The whole payload has a fixed size and matches; it ends at this offset.
-    (Int -> m r) ->
-    m r
+    (Int -> Input r) ->
+    Input r
 
 -- | Parses whichever alternative the input matches and passes it to that
 -- alternative's function.
 parseChoice ::
-  forall alternatives functions r m.
-  ( ParseConstructor ('PayloadChoice alternatives) (Alternatives functions r) r,
-    MonadInput m
-  ) =>
+  forall alternatives functions r.
+  ParseConstructor ('PayloadChoice alternatives) (Alternatives functions r) r =>
   Alternatives functions r ->
-  m r
+  Input r
 parseChoice = parseWithConstructor @('PayloadChoice alternatives)
 {-# INLINE parseChoice #-}
 
@@ -571,7 +571,7 @@ instance PayloadPrefix payload => PayloadPrefix ('PayloadBounded payload) where
   {-# INLINE matchPrefix #-}
 
 -- | The length prefix counts its own four bytes.
-withBoundedInput :: MonadInput m => m a -> m a
+withBoundedInput :: Input a -> Input a
 withBoundedInput inner = do
   totalLength <- parser @Int32 @('FixedBytesAtom 4)
   unless
@@ -591,14 +591,14 @@ expectConstant expected actual =
     (throwError ("unexpected constant " <> show actual <> ", expected " <> show expected))
 {-# INLINE expectConstant #-}
 
-peekBigEndianWord16At :: MonadInput m => Int -> m Word16
+peekBigEndianWord16At :: Int -> Input Word16
 peekBigEndianWord16At offset = do
   low <- peekInputByteAt (offset + 1)
   high <- peekInputByteAt offset
   pure (shiftL (fromIntegral high) 8 .|. fromIntegral low)
 {-# INLINE peekBigEndianWord16At #-}
 
-peekBigEndianWord32At :: MonadInput m => Int -> m Word32
+peekBigEndianWord32At :: Int -> Input Word32
 peekBigEndianWord32At offset = do
   byte3 <- peekInputByteAt (offset + 3)
   byte0 <- peekInputByteAt offset
