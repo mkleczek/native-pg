@@ -9,11 +9,12 @@
 module Main (main) where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (ErrorCall (..), bracket, bracket_, displayException, throwIO, try)
+import Control.Exception (ErrorCall (..), IOException, bracket, bracket_, displayException, throwIO, try)
 import Control.Monad (unless, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import Data.Functor (($>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
@@ -55,6 +56,7 @@ import System.FilePath (takeDirectory, (</>))
 import System.Mem (performMajorGC)
 import System.Posix.Temp (mkdtemp)
 import System.Process (readProcessWithExitCode)
+import System.Timeout (timeout)
 import Test.Hspec
 
 main :: IO ()
@@ -184,6 +186,19 @@ main = withCluster $ \socketPath -> hspec $ do
           (\rows row -> (: rows) <$> columns row)
           []
       result `shouldBe` Right ([[Just "t"]], "SELECT 1")
+    it "sends a batch while reading its results, as the server answers before reading all of it" $ \session -> do
+      pendingWith "the server stops reading the batch until its answers are read"
+      let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
+          large = collect (statement "SELECT repeat('x', 1000000)" [])
+          long = collect (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')])
+      outcome <- timeout 10000000 (runBatch session id ((\_ (rows, _) -> rows) <$> large <*> long))
+      fmap fst outcome `shouldBe` Just (Right [[Just "2000000"]])
+    it "closes a session broken while sending, without waiting for the server to read" $ \session -> do
+      pendingWith "the server stops reading the batch until its answers are read"
+      let slowly = batched id (statement "SELECT repeat('x', 1000000)" []) (\() _ -> threadDelay 60000000) ()
+          long = batched id (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')]) (\() _ -> pure ()) ()
+      void $ timeout 1000000 (runBatch session id (slowly *> long))
+      timeout 5000000 (close session) `shouldReturn` Just ()
     it "takes a value larger than the read buffer whole" $ \session -> do
       (result, _) <- query session "SELECT repeat('y', 100000)" []
       result `shouldBe` Right ([[Just (Char8.replicate 100000 'y')]], "SELECT 1")
@@ -435,6 +450,14 @@ main = withCluster $ \socketPath -> hspec $ do
       try (execute session short (\() _ -> pure ()) ()) >>= \case
         Left (_ :: StreamLengthError) -> pure ()
         Right _ -> expectationFailure "expected a StreamLengthError"
+      query session "SELECT 1" [] `shouldThrow` sessionUnusable
+    it "throws a parameter stream's failure, and breaks the session" $ \session -> do
+      sent <- newIORef False
+      let source = readIORef sent >>= \done -> if done then throwIO (userError "the client went away") else writeIORef sent True $> Char8.replicate 1000000 'y'
+          failing = Execution (Unprepared "SELECT length($1::text)" []) [] [Just (ParameterStream (ByteStream 2000000 source))] []
+      try (execute session failing (\() _ -> pure ()) ()) >>= \case
+        Left (_ :: IOException) -> pure ()
+        Right _ -> expectationFailure "expected the stream's failure"
       query session "SELECT 1" [] `shouldThrow` sessionUnusable
   where
     -- Streams the single column slowly, checking its bytes and that no chunk
