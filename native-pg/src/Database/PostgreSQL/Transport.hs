@@ -26,8 +26,6 @@ import Control.Exception (Exception (..), IOException, bracketOnError, catch, fi
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Builder.Extra as Builder
-import qualified Data.ByteString.Lazy as LBS
 import Data.Foldable (for_)
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.List (intercalate)
@@ -36,12 +34,13 @@ import Database.PostgreSQL.Protocol.Codec
   ( ByteStream (..),
     InputSource (..),
     Output,
-    outputBuilder,
-    outputLength,
-    outputStreams,
+    Uncopied (..),
+    outputCopied,
+    writeOutput,
   )
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
 import GHC.Conc (atomically, orElse)
+import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import GHC.IO.Exception (IOException (..))
 import Network.Socket
   ( AddrInfo (..),
@@ -231,7 +230,7 @@ instance Exception StreamLengthError
 
 -- | Sends the output, waiting for room in the socket as needed.
 sendOutput :: Socket -> Output -> IO ()
-sendOutput sock = go . unsent
+sendOutput sock output = go =<< unsent output
   where
     go left =
       sendSome sock left >>= \case
@@ -248,14 +247,18 @@ data Part
   = PartBytes ByteString
   | PartStream ByteStream Int
 
--- | All of the output. Large byte strings in it, and the chunks of its
--- streams, are sent from where they are, without being copied.
-unsent :: Output -> Unsent
-unsent output =
-  Unsent (chunks (outputBuilder output) <> concatMap (\(source, after) -> PartStream source 0 : chunks after) (outputStreams output))
+-- | All of the output. Its copied bytes are written to one new buffer of
+-- their size. Long byte strings, and the chunks of its streams, are sent from
+-- where they are, without being copied.
+unsent :: Output -> IO Unsent
+unsent output = do
+  memory <- mallocPlainForeignPtrBytes (outputCopied output)
+  parts <- writeOutput memory output
+  pure (Unsent (map part parts))
   where
-    chunks = map PartBytes . LBS.toChunks . Builder.toLazyByteStringWith strategy LBS.empty
-    strategy = Builder.untrimmedStrategy (max 1 (min (outputLength output) Builder.smallChunkSize)) Builder.defaultChunkSize
+    part (Left copied) = PartBytes copied
+    part (Right (UncopiedBytes value)) = PartBytes value
+    part (Right (UncopiedStream source)) = PartStream source 0
 
 -- | Sends what the socket takes without waiting for room in it, pulling
 -- streams as it goes, and gives what's left.

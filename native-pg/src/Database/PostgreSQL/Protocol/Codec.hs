@@ -26,18 +26,19 @@ module Database.PostgreSQL.Protocol.Codec
     PayloadPrefix (..),
     Serializable (..),
     SerializeConstructor (..),
+    Uncopied (..),
     emptyInputBuffer,
     inputPosition,
-    outputBuilder,
     outputByteString,
+    outputCopied,
     outputLength,
-    outputStreams,
     parseChoice,
     readInputSome,
     runBodyParser,
     runInput,
     runInputUntil,
     skipInput,
+    writeOutput,
   )
 where
 
@@ -70,17 +71,19 @@ import Database.PostgreSQL.Protocol.Codec.Input
 import Database.PostgreSQL.Protocol.Codec.Output
   ( ByteStream (..),
     Output,
+    Uncopied (..),
     bytes,
     cstring,
     int16,
     int32,
-    outputBuilder,
     outputByteString,
+    outputCopied,
     outputLength,
-    outputStreams,
+    outputs,
     word16,
     word32,
     word8,
+    writeOutput,
   )
 import Database.PostgreSQL.Protocol.Codec.Payload
   ( Payload (..),
@@ -402,15 +405,15 @@ instance Serializable a field => Serializable a ('PayloadField field) where
   {-# INLINE serialize #-}
 
 instance forall a (payload :: Payload). Serializable a payload => Serializable [a] ('PayloadZeroTerminated payload) where
-  serialize values = foldMap (serialize @a @payload) values <> word8 0
+  serialize values = outputs (serialize @a @payload) values <> word8 0
   {-# INLINE serialize #-}
 
 instance forall a (payload :: Payload). Serializable a payload => Serializable [a] ('PayloadCounted16 payload) where
-  serialize values = int16 (countAsInt16 values) <> foldMap (serialize @a @payload) values
+  serialize values = int16 (countAsInt16 values) <> outputs (serialize @a @payload) values
   {-# INLINE serialize #-}
 
 instance forall a (payload :: Payload). Serializable a payload => Serializable [a] ('PayloadCounted32 payload) where
-  serialize values = int32 (lengthAsInt32 (length values)) <> foldMap (serialize @a @payload) values
+  serialize values = int32 (lengthAsInt32 (length values)) <> outputs (serialize @a @payload) values
   {-# INLINE serialize #-}
 
 instance {-# OVERLAPPABLE #-}
