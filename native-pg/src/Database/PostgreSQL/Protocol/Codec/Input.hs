@@ -177,15 +177,17 @@ runInputUntil source limit buffer (Input parser) = IO $ \s ->
 inputPosition :: InputBuffer -> Int
 inputPosition = bufferPosition
 
--- | Between one and the given number of bytes, without copying: what the
--- buffer holds, or else what one read brings.
+-- | Between one and the given number of bytes, without copying. It reads
+-- until they're all there, or the buffer has no room for more, so that a
+-- consumer that passes them on, e.g. to a socket, gets them in large chunks.
 readInputSome :: Int -> Input ByteString
 readInputSome count = do
   buffer <- ensureAvailable 1
   limit <- getLimit
-  let size = minimum [count, bufferEnd buffer - bufferStart buffer, limit - bufferPosition buffer]
-  putBuffer (consume size buffer)
-  pure (slice size buffer)
+  let size = minimum [count, bufferCapacity buffer - bufferStart buffer, limit - bufferPosition buffer]
+  filled <- ensureAvailable size
+  putBuffer (consume size filled)
+  pure (slice size filled)
 {-# INLINE readInputSome #-}
 
 -- | Consumes the given number of bytes, reading as needed, without keeping
