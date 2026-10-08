@@ -187,14 +187,12 @@ main = withCluster $ \socketPath -> hspec $ do
           []
       result `shouldBe` Right ([[Just "t"]], "SELECT 1")
     it "sends a batch while reading its results, as the server answers before reading all of it" $ \session -> do
-      pendingWith "the server stops reading the batch until its answers are read"
       let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
           large = collect (statement "SELECT repeat('x', 1000000)" [])
           long = collect (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')])
       outcome <- timeout 10000000 (runBatch session id ((\_ (rows, _) -> rows) <$> large <*> long))
       fmap fst outcome `shouldBe` Just (Right [[Just "2000000"]])
     it "closes a session broken while sending, without waiting for the server to read" $ \session -> do
-      pendingWith "the server stops reading the batch until its answers are read"
       let slowly = batched id (statement "SELECT repeat('x', 1000000)" []) (\() _ -> threadDelay 60000000) ()
           long = batched id (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')]) (\() _ -> pure ()) ()
       void $ timeout 1000000 (runBatch session id (slowly *> long))

@@ -94,10 +94,13 @@ import Database.PostgreSQL.Protocol.Messages
 import Database.PostgreSQL.Transport
   ( Address,
     TcpOptions,
+    Unsent,
     connectSocket,
     defaultTcpOptions,
     sendOutput,
+    sendSome,
     socketInputSource,
+    unsent,
   )
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
@@ -256,6 +259,9 @@ data Connection = Connection
     connectionSource :: InputSource,
     -- | Bytes read but not consumed yet; the only buffer the library keeps.
     connectionBuffer :: IORef InputBuffer,
+    -- | Output of the running batch that the socket hasn't taken yet. Reads
+    -- send it as they wait.
+    connectionUnsent :: IORef Unsent,
     connectionState :: IORef SessionState,
     -- | Notifications that arrived during operations, newest first, until
     -- 'awaitNotification' takes them.
@@ -353,17 +359,24 @@ connect :: ConnectSettings -> IO (Session 'Ready, ServerInfo)
 connect settings =
   bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock -> do
     buffer <- newIORef emptyInputBuffer
+    pending <- newIORef (unsent mempty)
     state <- newIORef Idle
     notifications <- newIORef []
-    let session = Session (Connection sock (socketInputSource sock (connectReadSize settings)) buffer state notifications)
+    let session = Session (Connection sock (socketInputSource sock pending (connectReadSize settings)) buffer pending state notifications)
     send @'StartupMessageType session (startupMessage settings)
     (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
     initialize version initializing
 
 -- | Ends the session and closes its socket, in whatever state it is.
 close :: Session phase -> IO ()
-close session@(Session connection) =
-  (send @'TerminateType session Terminate `catch` \(_ :: IOException) -> pure ())
+close session@(Session connection) = do
+  state <- readIORef (connectionState connection)
+  -- A broken session may have stopped in the middle of a message, and the
+  -- server may not be reading, so it isn't told to terminate.
+  ( case state of
+      Idle -> send @'TerminateType session Terminate `catch` \(_ :: IOException) -> pure ()
+      _ -> pure ()
+    )
     `finally` Socket.close (connectionSocket connection)
 
 -- | Whether the session can run an operation: none is running, and none
@@ -544,8 +557,11 @@ batched failed execution step initial =
 --
 -- If a step throws, the session is broken.
 runBatch :: Session 'Ready -> (ServerError -> e) -> Batch e a -> IO (Either e a, TransactionStatus)
-runBatch session failed (Batch output reading) = operation session $ do
-  sendOutputs session (output <> sync)
+runBatch session@(Session connection) failed (Batch output reading) = operation session $ do
+  -- The server may answer the first statements before it has read the last,
+  -- and stop reading until its answers are read. So what the socket doesn't
+  -- take at once is sent as the answers are waited for.
+  writeIORef (connectionUnsent connection) =<< sendSome (connectionSocket connection) (unsent (output <> sync))
   result <- reading session
   awaitReady session failed result
 

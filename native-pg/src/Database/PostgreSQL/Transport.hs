@@ -13,15 +13,23 @@ module Database.PostgreSQL.Transport
     defaultTcpOptions,
     sendOutput,
     socketInputSource,
+
+    -- * Output sent as answers are read
+    Unsent,
+    unsent,
+    sendSome,
   )
 where
 
-import Control.Exception (Exception (..), IOException, bracketOnError, catch, throwIO, try)
+import Control.Concurrent (threadWaitReadSTM, threadWaitWrite, threadWaitWriteSTM)
+import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, throwIO, try)
 import Control.Monad (unless, when)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder.Extra as Builder
 import qualified Data.ByteString.Lazy as LBS
 import Data.Foldable (for_)
+import Data.IORef (IORef, readIORef, writeIORef)
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
 import Database.PostgreSQL.Protocol.Codec
@@ -33,6 +41,7 @@ import Database.PostgreSQL.Protocol.Codec
     outputStreams,
   )
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
+import GHC.Conc (atomically, orElse)
 import GHC.IO.Exception (IOException (..))
 import Network.Socket
   ( AddrInfo (..),
@@ -55,8 +64,18 @@ import Network.Socket
     recvBuf,
     setSocketOption,
     socket,
+    withFdSocket,
   )
-import Network.Socket.ByteString (sendAll, sendMany)
+import System.Posix.Types (Fd (..))
+#if defined(mingw32_HOST_OS)
+import Network.Socket.ByteString (sendAll)
+#else
+import qualified Data.ByteString.Unsafe as BS
+import qualified Foreign.C.Error as Errno
+import Foreign.C.Types (CChar, CInt (..), CSize (..))
+import Foreign.Ptr (Ptr)
+import qualified System.Posix.Types as Posix
+#endif
 
 data Address
   = -- | A host name or IP address, and a port.
@@ -181,13 +200,23 @@ keepalivesCount = SockOpt (-1) (-1)
 #endif
 
 -- | Reads from the socket into the parser's buffer, which a new allocation
--- makes the given size.
-socketInputSource :: Socket -> Int -> InputSource
-socketInputSource sock readSize =
+-- makes the given size. While output is unsent, waiting for input also sends
+-- it as the socket takes it.
+socketInputSource :: Socket -> IORef Unsent -> Int -> InputSource
+socketInputSource sock pending readSize =
   InputSource
-    { readInputInto = recvBuf sock,
+    { readInputInto = \pointer size -> sendWhileWaiting *> recvBuf sock pointer size,
       inputReadSize = readSize
     }
+  where
+    sendWhileWaiting =
+      readIORef pending >>= \case
+        Unsent [] -> pure ()
+        left -> do
+          readable <- awaitReadableOrWritable sock
+          unless readable $ do
+            writeIORef pending =<< sendSome sock left
+            sendWhileWaiting
 
 -- | A parameter stream gave a different number of bytes than it declared.
 -- The message it belongs to is incomplete, so the connection is unusable.
@@ -200,29 +229,86 @@ data StreamLengthError = StreamLengthError
 
 instance Exception StreamLengthError
 
--- | Sends the output with a gathering write per run of bytes between streams.
--- Large byte strings in it, and the chunks of its streams, are sent from
--- where they are, without being copied.
+-- | Sends the output, waiting for room in the socket as needed.
 sendOutput :: Socket -> Output -> IO ()
-sendOutput sock output = do
-  sendBuilder (outputBuilder output)
-  for_ (outputStreams output) $ \(source, after) -> do
-    sendStream source
-    sendBuilder after
+sendOutput sock = go . unsent
   where
-    sendBuilder builder =
-      case LBS.toChunks (Builder.toLazyByteStringWith strategy LBS.empty builder) of
-        [] -> pure ()
-        chunks -> sendMany sock chunks
+    go left =
+      sendSome sock left >>= \case
+        Unsent [] -> pure ()
+        rest -> withFdSocket sock (threadWaitWrite . Fd) *> go rest
+
+-- | What's left of an output to send. The server may answer the first
+-- messages of an output before it has read the rest, and stop reading until
+-- its answers are read. So output can be sent as the answers are read.
+newtype Unsent = Unsent [Part]
+
+-- | Bytes, or a stream with how many bytes it has given.
+data Part
+  = PartBytes ByteString
+  | PartStream ByteStream Int
+
+-- | All of the output. Large byte strings in it, and the chunks of its
+-- streams, are sent from where they are, without being copied.
+unsent :: Output -> Unsent
+unsent output =
+  Unsent (chunks (outputBuilder output) <> concatMap (\(source, after) -> PartStream source 0 : chunks after) (outputStreams output))
+  where
+    chunks = map PartBytes . LBS.toChunks . Builder.toLazyByteStringWith strategy LBS.empty
     strategy = Builder.untrimmedStrategy (max 1 (min (outputLength output) Builder.smallChunkSize)) Builder.defaultChunkSize
-    sendStream source = go 0
-      where
-        go sent = do
-          chunk <- byteStreamNext source
-          let delivered = sent + BS.length chunk
-          if
-            | BS.null chunk ->
-                unless (sent == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) sent))
-            | delivered > byteStreamLength source ->
-                throwIO (StreamLengthError (byteStreamLength source) delivered)
-            | otherwise -> sendAll sock chunk *> go delivered
+
+-- | Sends what the socket takes without waiting for room in it, pulling
+-- streams as it goes, and gives what's left.
+sendSome :: Socket -> Unsent -> IO Unsent
+sendSome sock (Unsent parts) = Unsent <$> go parts
+  where
+    go = \case
+      [] -> pure []
+      PartBytes chunk : others -> do
+        sent <- trySend sock chunk
+        if sent == BS.length chunk then go others else pure (PartBytes (BS.drop sent chunk) : others)
+      PartStream source given : others -> do
+        chunk <- byteStreamNext source
+        let delivered = given + BS.length chunk
+        if
+          | BS.null chunk -> do
+              unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
+              go others
+          | delivered > byteStreamLength source ->
+              throwIO (StreamLengthError (byteStreamLength source) delivered)
+          | otherwise -> go (PartBytes chunk : PartStream source delivered : others)
+
+-- | Waits until the socket has input, or room for output. True if it has
+-- input.
+awaitReadableOrWritable :: Socket -> IO Bool
+awaitReadableOrWritable sock = withFdSocket sock $ \fd -> do
+  (readable, stopReadable) <- threadWaitReadSTM (Fd fd)
+  (writable, stopWritable) <- threadWaitWriteSTM (Fd fd)
+  atomically ((True <$ readable) `orElse` (False <$ writable)) `finally` (stopReadable *> stopWritable)
+
+-- | Sends what the socket takes of the bytes without waiting for room in it,
+-- and gives how many it took.
+trySend :: Socket -> ByteString -> IO Int
+#if defined(mingw32_HOST_OS)
+-- Sockets block on Windows, so it waits until all are sent, and the answers
+-- are read only after the whole output is sent.
+trySend sock bytes = BS.length bytes <$ sendAll sock bytes
+#else
+trySend sock bytes =
+  withFdSocket sock $ \fd ->
+    BS.unsafeUseAsCStringLen bytes $ \(pointer, size) ->
+      let attempt =
+            c_send fd pointer (fromIntegral size) 0 >>= \case
+              -1 ->
+                Errno.getErrno >>= \errno ->
+                  if
+                    | errno == Errno.eINTR -> attempt
+                    | errno == Errno.eAGAIN || errno == Errno.eWOULDBLOCK -> pure 0
+                    | otherwise -> Errno.throwErrno "send"
+              sent -> pure (fromIntegral sent)
+       in attempt
+
+-- network's sockets don't block, so a full socket fails with EAGAIN.
+foreign import ccall unsafe "send"
+  c_send :: CInt -> Ptr CChar -> CSize -> CInt -> IO Posix.CSsize
+#endif
