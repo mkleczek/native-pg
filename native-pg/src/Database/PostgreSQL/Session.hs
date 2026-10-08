@@ -46,13 +46,14 @@ module Database.PostgreSQL.Session
     columnStream,
     decodeRow,
     decodeRowStreaming,
+    decodeRowStreamingNullable,
     nextColumn,
     rowColumnCount,
   )
 where
 
 import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, finally, onException, throwIO)
-import Control.Monad (unless, when, (<=<))
+import Control.Monad (join, unless, when, (<=<))
 import Data.Bifunctor (first)
 import Data.Foldable (for_)
 import Data.ByteString (ByteString)
@@ -842,7 +843,16 @@ decodeRow row function = do
 -- the function gets it last, as a 'ByteStream' that is valid during the
 -- action.
 decodeRowStreaming :: forall columns r. DecodeRow columns => Row -> RowFunction columns (ByteStream -> IO r) -> IO (Either DecodingError r)
-decodeRowStreaming row function = do
+decodeRowStreaming row function =
+  join <$> decodeRowStreamingNullable @columns row (mapRowFunction @columns @(ByteStream -> IO r) @(Maybe ByteStream -> IO (Either DecodingError r)) streamOrFail function)
+  where
+    streamOrFail continue = maybe (pure (Left (ColumnDecodingFailed (rowArity @columns + 1) "unexpected NULL in a streamed column"))) (fmap Right . continue)
+{-# INLINE decodeRowStreaming #-}
+
+-- | Like 'decodeRowStreaming', but the streamed column may be NULL, which the
+-- function gets as 'Nothing'.
+decodeRowStreamingNullable :: forall columns r. DecodeRow columns => Row -> RowFunction columns (Maybe ByteStream -> IO r) -> IO (Either DecodingError r)
+decodeRowStreamingNullable row function = do
   let streamed = rowArity @columns + 1
   started <- startDecoding row streamed
   case started of
@@ -854,19 +864,20 @@ decodeRowStreaming row function = do
           Left failure -> pure (Left failure)
           Right continue -> do
             size <- parser @Int32 @('FixedBytesAtom 4)
-            pure $
-              if size < 0
-                then Left (ColumnDecodingFailed streamed "unexpected NULL in a streamed column")
-                else Right (fromIntegral size, continue)
+            pure (Right (fromIntegral size, continue))
       case decoded of
         Left failure -> do
           writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True)
           pure (Left failure)
-        Right (size, continue) -> do
-          writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) size False)
-          stream <- columnStream row
-          Right <$> continue stream
-{-# INLINE decodeRowStreaming #-}
+        Right (size, continue)
+          | size < 0 -> do
+              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True)
+              Right <$> continue Nothing
+          | otherwise -> do
+              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) size False)
+              stream <- columnStream row
+              Right <$> continue (Just stream)
+{-# INLINE decodeRowStreamingNullable #-}
 
 -- | Checks that no column of the row has been pulled yet, and that it has
 -- the expected number of columns.

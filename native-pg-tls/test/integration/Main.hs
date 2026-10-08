@@ -417,6 +417,23 @@ main = withCluster $ \socketPath -> hspec $ do
         (Tx.statement () (Tx.Statement "SELECT 7::int4, repeat('x', 1000000)" (const []) (Tx.foldRows streamed Nothing) False))
         session
         `shouldReturn` Right (Just (Right (7, 1000000, 1000000)))
+    it "streams a column that may be NULL within a single row's scope" $ \session -> do
+      let drain stream received =
+            Tx.streamChunk stream >>= \chunk ->
+              if BS.null chunk then pure received else drain stream (received + BS.length chunk)
+          lengths current =
+            Tx.decodeScopedStreamingNullable @'[Int32] current $ \number ->
+              maybe (pure (number, Nothing)) (\stream -> (number,) . Just <$> drain stream 0)
+          streamed query' = Tx.statement () (Tx.Statement query' (const []) (Tx.singleRow (Tx.scopedRow lengths)) False)
+      Tx.transactionNoRetry
+        Tx.ReadCommitted
+        Tx.Read
+        ((,) <$> streamed "SELECT 7::int4, repeat('x', 1000000)" <*> streamed "SELECT 8::int4, NULL::text")
+        session
+        `shouldReturn` Right ((7, Just 1000000), (8, Nothing))
+    it "rejects NULL in a column streamed as one that can't be NULL" $ \session ->
+      decodeSingleStreaming @'[Int32] session "SELECT 7::int4, NULL::text" (\_ _ -> pure ())
+        `shouldReturn` Left (ColumnDecodingFailed 2 "unexpected NULL in a streamed column")
     it "aborts when the transaction throws between statements, and leaves the session usable" $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> liftIO (throwIO (ErrorCall "boom"))) session

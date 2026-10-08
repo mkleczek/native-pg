@@ -28,8 +28,10 @@ module Database.PostgreSQL.Statement
     ScopedRow,
     ScopedStream,
     foldRows,
+    scopedRow,
     decodeScoped,
     decodeScopedStreaming,
+    decodeScopedStreamingNullable,
     streamLength,
     streamChunk,
   )
@@ -46,6 +48,7 @@ import Database.PostgreSQL.Session
     ServerError,
     decodeRow,
     decodeRowStreaming,
+    decodeRowStreamingNullable,
   )
 
 -- | A statement: its SQL, its parameters, and how its result is read.
@@ -140,6 +143,11 @@ newtype ScopedStream s = ScopedStream ByteStream
 foldRows :: (forall s. accumulated -> ScopedRow s -> IO accumulated) -> accumulated -> Result accumulated
 foldRows step initial = Result initial (\accumulated current -> Right <$> step accumulated (ScopedRow current)) Right
 
+-- | A row decoder from a step within the row's scope, e.g. to stream a column
+-- of a 'singleRow'. The result can't mention the scope.
+scopedRow :: (forall s. ScopedRow s -> IO (Either DecodingError a)) -> RowDecoder a
+scopedRow decode = RowDecoder (decode . ScopedRow)
+
 -- | Like 'row', within a step.
 decodeScoped :: forall columns s r. DecodeRow columns => ScopedRow s -> RowFunction columns (IO r) -> IO (Either DecodingError r)
 decodeScoped (ScopedRow current) = decodeRow @columns current
@@ -151,6 +159,13 @@ decodeScopedStreaming :: forall columns s r. DecodeRow columns => ScopedRow s ->
 decodeScopedStreaming (ScopedRow current) function =
   decodeRowStreaming @columns current (mapRowFunction @columns @(ScopedStream s -> IO r) @(ByteStream -> IO r) (. ScopedStream) function)
 {-# INLINE decodeScopedStreaming #-}
+
+-- | Like 'decodeScopedStreaming', but the streamed column may be NULL, which
+-- the function gets as 'Nothing'.
+decodeScopedStreamingNullable :: forall columns s r. DecodeRow columns => ScopedRow s -> RowFunction columns (Maybe (ScopedStream s) -> IO r) -> IO (Either DecodingError r)
+decodeScopedStreamingNullable (ScopedRow current) function =
+  decodeRowStreamingNullable @columns current (mapRowFunction @columns @(Maybe (ScopedStream s) -> IO r) @(Maybe ByteStream -> IO r) (. fmap ScopedStream) function)
+{-# INLINE decodeScopedStreamingNullable #-}
 
 -- | The stream's length in bytes.
 streamLength :: ScopedStream s -> Int

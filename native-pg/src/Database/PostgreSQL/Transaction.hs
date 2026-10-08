@@ -44,8 +44,10 @@ module Database.PostgreSQL.Transaction
     ScopedRow,
     ScopedStream,
     foldRows,
+    scopedRow,
     decodeScoped,
     decodeScopedStreaming,
+    decodeScopedStreamingNullable,
     streamLength,
     streamChunk,
   )
