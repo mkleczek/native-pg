@@ -94,10 +94,12 @@ import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Protocol.Messages
 import Database.PostgreSQL.Transport
   ( Address,
+    OutputBuffer,
     TcpOptions,
     Unsent,
     connectSocket,
     defaultTcpOptions,
+    newOutputBuffer,
     sendOutput,
     sendSome,
     socketInputSource,
@@ -289,6 +291,9 @@ data Connection = Connection
     -- | Output of the running batch that the socket hasn't taken yet. Reads
     -- send it as they wait.
     connectionUnsent :: IORef Unsent,
+    -- | Where batches are written. The next batch reuses it, since a batch
+    -- has been sent whole by the time its results are read.
+    connectionOutput :: OutputBuffer,
     connectionState :: IORef SessionState,
     -- | Notifications that arrived during operations, newest first, until
     -- 'awaitNotification' takes them.
@@ -379,6 +384,11 @@ instance Exception ConnectionError where
     SessionUnusable reason -> reason
     RowMisuse reason -> reason
 
+-- | The size of the buffer a connection writes its batches to. A batch that
+-- copies more bytes gets a buffer of its own.
+outputBufferSize :: Int
+outputBufferSize = 16384
+
 -- | Connects, authenticates and waits until the server is ready for a query.
 -- Throws 'Database.PostgreSQL.Transport.ConnectError' when the socket doesn't
 -- connect, and 'ConnectionError' when the server rejects the connection.
@@ -386,10 +396,11 @@ connect :: ConnectSettings -> IO (Session 'Ready, ServerInfo)
 connect settings =
   bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock -> do
     buffer <- newIORef emptyInputBuffer
-    pending <- newIORef =<< unsent mempty
+    pending <- newIORef =<< unsent Nothing mempty
+    output <- newOutputBuffer outputBufferSize
     state <- newIORef Idle
     notifications <- newIORef []
-    let session = Session (Connection sock (socketInputSource sock pending (connectReadSize settings)) buffer pending state notifications)
+    let session = Session (Connection sock (socketInputSource sock pending (connectReadSize settings)) buffer pending output state notifications)
     send @'StartupMessageType session (startupMessage settings)
     (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
     initialize version initializing
@@ -588,7 +599,7 @@ runBatch session@(Session connection) failed (Batch output reading) = operation 
   -- The server may answer the first statements before it has read the last,
   -- and stop reading until its answers are read. So what the socket doesn't
   -- take at once is sent as the answers are waited for.
-  writeIORef (connectionUnsent connection) =<< sendSome (connectionSocket connection) =<< unsent (output <> sync)
+  writeIORef (connectionUnsent connection) =<< sendSome (connectionSocket connection) =<< unsent (Just (connectionOutput connection)) (output <> sync)
   result <- reading session
   awaitReady session failed result
 

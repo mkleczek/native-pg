@@ -16,6 +16,8 @@ module Database.PostgreSQL.Transport
 
     -- * Output sent as answers are read
     Unsent,
+    OutputBuffer,
+    newOutputBuffer,
     unsent,
     sendSome,
   )
@@ -30,6 +32,7 @@ import Data.Foldable (for_)
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
+import Data.Word (Word8)
 import Database.PostgreSQL.Protocol.Codec
   ( ByteStream (..),
     InputSource (..),
@@ -39,6 +42,7 @@ import Database.PostgreSQL.Protocol.Codec
     writeOutput,
   )
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
+import Foreign.ForeignPtr (ForeignPtr)
 import GHC.Conc (atomically, orElse)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import GHC.IO.Exception (IOException (..))
@@ -230,7 +234,7 @@ instance Exception StreamLengthError
 
 -- | Sends the output, waiting for room in the socket as needed.
 sendOutput :: Socket -> Output -> IO ()
-sendOutput sock output = go =<< unsent output
+sendOutput sock output = go =<< unsent Nothing output
   where
     go left =
       sendSome sock left >>= \case
@@ -247,12 +251,22 @@ data Part
   = PartBytes ByteString
   | PartStream ByteStream Int
 
--- | All of the output. Its copied bytes are written to one new buffer of
--- their size. Long byte strings, and the chunks of its streams, are sent from
--- where they are, without being copied.
-unsent :: Output -> IO Unsent
-unsent output = do
-  memory <- mallocPlainForeignPtrBytes (outputCopied output)
+-- | Memory that outputs are written to, reused once what was written to it
+-- is sent.
+data OutputBuffer = OutputBuffer (ForeignPtr Word8) Int
+
+newOutputBuffer :: Int -> IO OutputBuffer
+newOutputBuffer size = (`OutputBuffer` size) <$> mallocPlainForeignPtrBytes size
+
+-- | All of the output. Its copied bytes are written to the buffer if there's
+-- one and they fit, and to a new one of their size otherwise. The buffer
+-- mustn't be written to again until they're sent. Long byte strings, and the
+-- chunks of its streams, are sent from where they are, without being copied.
+unsent :: Maybe OutputBuffer -> Output -> IO Unsent
+unsent reused output = do
+  memory <- case reused of
+    Just (OutputBuffer memory size) | outputCopied output <= size -> pure memory
+    _ -> mallocPlainForeignPtrBytes (outputCopied output)
   parts <- writeOutput memory output
   pure (Unsent (map part parts))
   where
