@@ -71,12 +71,14 @@ import Network.Socket
   )
 import System.Posix.Types (Fd (..))
 #if defined(mingw32_HOST_OS)
-import Network.Socket.ByteString (sendAll)
+import Network.Socket.ByteString (sendMany)
 #else
 import qualified Data.ByteString.Unsafe as BS
 import qualified Foreign.C.Error as Errno
 import Foreign.C.Types (CChar, CInt (..), CSize (..))
-import Foreign.Ptr (Ptr)
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.Storable (pokeByteOff, sizeOf)
 import qualified System.Posix.Types as Posix
 #endif
 
@@ -274,26 +276,53 @@ unsent reused output = do
     part (Right (UncopiedBytes value)) = PartBytes value
     part (Right (UncopiedStream source)) = PartStream source 0
 
+-- | Bytes gathered for one send, and how many pieces at most. A client's
+-- stream comes in chunks of up to 16 KiB from warp, and sending each on its
+-- own wakes the server once per chunk.
+gatherSize, gatherPieces :: Int
+gatherSize = 262144
+gatherPieces = 16
+
 -- | Sends what the socket takes without waiting for room in it, pulling
--- streams as it goes, and gives what's left.
+-- streams as it goes, and gives what's left. Each send gathers the parts up
+-- front, pulling a stream's chunks, up to 'gatherSize' bytes or
+-- 'gatherPieces' pieces. Pulling may wait for the stream's client, so the
+-- bytes before a stream are sent before it's pulled: the server starts on
+-- its statement, and its statement_timeout, as it would without the stream.
 sendSome :: Socket -> Unsent -> IO Unsent
 sendSome sock (Unsent parts) = Unsent <$> go parts
   where
-    go = \case
-      [] -> pure []
-      PartBytes chunk : others -> do
-        sent <- trySend sock chunk
-        if sent == BS.length chunk then go others else pure (PartBytes (BS.drop sent chunk) : others)
-      PartStream source given : others -> do
-        chunk <- byteStreamNext source
-        let delivered = given + BS.length chunk
-        if
-          | BS.null chunk -> do
-              unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
-              go others
-          | delivered > byteStreamLength source ->
-              throwIO (StreamLengthError (byteStreamLength source) delivered)
-          | otherwise -> go (PartBytes chunk : PartStream source delivered : others)
+    go remaining = do
+      (gathered, rest) <- gather 0 [] remaining
+      if null gathered
+        then pure rest
+        else do
+          sent <- trySend sock gathered
+          case dropSent sent gathered of
+            [] -> go rest
+            left -> pure (map PartBytes left <> rest)
+    -- the pieces so far, last first, and their size
+    gather size pieces remaining
+      | size >= gatherSize || length pieces >= gatherPieces = pure (reverse pieces, remaining)
+      | otherwise = case remaining of
+          [] -> pure (reverse pieces, [])
+          PartBytes chunk : others -> gather (size + BS.length chunk) (chunk : pieces) others
+          PartStream _ 0 : _ | not (null pieces) -> pure (reverse pieces, remaining)
+          PartStream source given : others -> do
+            chunk <- byteStreamNext source
+            let delivered = given + BS.length chunk
+            if
+              | BS.null chunk -> do
+                  unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
+                  gather size pieces others
+              | delivered > byteStreamLength source ->
+                  throwIO (StreamLengthError (byteStreamLength source) delivered)
+              | otherwise -> gather (size + BS.length chunk) (chunk : pieces) (PartStream source delivered : others)
+    dropSent sent = \case
+      chunk : others
+        | sent >= BS.length chunk -> dropSent (sent - BS.length chunk) others
+        | otherwise -> BS.drop sent chunk : others
+      [] -> []
 
 -- | Waits until the socket has input, or room for output. True if it has
 -- input.
@@ -303,29 +332,38 @@ awaitReadableOrWritable sock = withFdSocket sock $ \fd -> do
   (writable, stopWritable) <- threadWaitWriteSTM (Fd fd)
   atomically ((True <$ readable) `orElse` (False <$ writable)) `finally` (stopReadable *> stopWritable)
 
--- | Sends what the socket takes of the bytes without waiting for room in it,
--- and gives how many it took.
-trySend :: Socket -> ByteString -> IO Int
+-- | Sends what the socket takes of the pieces, in one call, without waiting
+-- for room in it, and gives how many bytes it took.
+trySend :: Socket -> [ByteString] -> IO Int
 #if defined(mingw32_HOST_OS)
 -- Sockets block on Windows, so it waits until all are sent, and the answers
 -- are read only after the whole output is sent.
-trySend sock bytes = BS.length bytes <$ sendAll sock bytes
+trySend sock pieces = sum (map BS.length pieces) <$ sendMany sock pieces
 #else
-trySend sock bytes =
+trySend sock pieces =
   withFdSocket sock $ \fd ->
-    BS.unsafeUseAsCStringLen bytes $ \(pointer, size) ->
-      let attempt =
-            c_send fd pointer (fromIntegral size) 0 >>= \case
+    allocaBytes (length pieces * iovecSize) $ \iovecs ->
+      let -- each piece's struct iovec: where it is, and its length
+          describe _ [] = attempt
+          describe offset (piece : others) =
+            BS.unsafeUseAsCStringLen piece $ \(pointer, size) -> do
+              pokeByteOff iovecs offset pointer
+              pokeByteOff iovecs (offset + sizeOf pointer) (fromIntegral size :: CSize)
+              describe (offset + iovecSize) others
+          attempt =
+            c_writev fd iovecs (fromIntegral (length pieces)) >>= \case
               -1 ->
                 Errno.getErrno >>= \errno ->
                   if
                     | errno == Errno.eINTR -> attempt
                     | errno == Errno.eAGAIN || errno == Errno.eWOULDBLOCK -> pure 0
-                    | otherwise -> Errno.throwErrno "send"
+                    | otherwise -> Errno.throwErrno "writev"
               sent -> pure (fromIntegral sent)
-       in attempt
+       in describe 0 pieces
+  where
+    iovecSize = sizeOf (nullPtr :: Ptr CChar) + sizeOf (0 :: CSize)
 
 -- network's sockets don't block, so a full socket fails with EAGAIN.
-foreign import ccall unsafe "send"
-  c_send :: CInt -> Ptr CChar -> CSize -> CInt -> IO Posix.CSsize
+foreign import ccall unsafe "writev"
+  c_writev :: CInt -> Ptr () -> CInt -> IO Posix.CSsize
 #endif
