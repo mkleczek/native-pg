@@ -85,6 +85,7 @@ import Database.PostgreSQL.Protocol.Codec
 import Database.PostgreSQL.Protocol.Codec.Output
   ( bytes,
     int32,
+    outputs,
     stream,
   )
 import Database.PostgreSQL.Protocol.Codec.Payload
@@ -412,15 +413,19 @@ instance HasConstructor 'BindBodyType (BindBody value) where
   destructorOf (BindBody portalName statementName parameterFormats parameterValues resultFormats) k =
     k portalName statementName parameterFormats parameterValues resultFormats
 
--- | A parameter value the client sends: bytes at hand, or a stream it
--- supplies while the value is sent.
+-- | A parameter value the client sends: bytes at hand, whole or in chunks,
+-- or a stream it supplies while the value is sent.
 data Parameter
   = ParameterBytes ByteString
+  | -- | Sent one after another, each from where it is, as 'bytes' sends a
+    -- long one, so that they aren't copied into one first.
+    ParameterChunks [ByteString]
   | ParameterStream ByteStream
 
 instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
   serialize Nothing = int32 (-1)
   serialize (Just (ParameterBytes value)) = int32 (lengthAsInt32 (BS.length value)) <> bytes value
+  serialize (Just (ParameterChunks chunks)) = int32 (lengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
   serialize (Just (ParameterStream source)) = int32 (lengthAsInt32 (byteStreamLength source)) <> stream source
   {-# INLINE serialize #-}
 

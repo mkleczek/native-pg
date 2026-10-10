@@ -47,6 +47,13 @@ main = hspec $ do
         @'BindType
         (Bind (BindBody "" "statement" [BinaryFormat] [Just "1", Nothing] [TextFormat]))
         ("B" <> int32 34 <> "\0statement\0" <> int16 1 <> int16 1 <> int16 2 <> int32 1 <> "1" <> int32 (-1) <> int16 1 <> int16 0)
+    it "encodes Bind with a parameter in chunks, short and long, as one value" $
+      let long = BS.replicate 10000 (byte 'x')
+       in encodes
+            @(Bind Parameter)
+            @'BindType
+            (Bind (BindBody "" "s" [BinaryFormat] [Just (ParameterChunks ["ab", long, "", "cd"])] [TextFormat]))
+            ("B" <> int32 10025 <> "\0s\0" <> int16 1 <> int16 1 <> int16 1 <> int32 10004 <> "ab" <> long <> "cd" <> int16 1 <> int16 0)
     it "encodes Execute" $
       encodes @(Execute ByteString) @'ExecuteType (Execute "" 0) ("E" <> int32 9 <> "\0" <> int32 0)
     it "encodes Describe of a portal" $

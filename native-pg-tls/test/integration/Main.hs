@@ -186,6 +186,16 @@ main = withCluster $ \socketPath -> hspec $ do
           (\rows row -> (: rows) <$> columns row)
           []
       result `shouldBe` Right ([[Just "t"]], "SELECT 1")
+    it "sends a parameter in chunks, short and long, larger than the socket's buffers" $ \session -> do
+      let pattern = BS.concat (replicate 4096 "0123456789abcdef")
+          chunks = concatMap (\chunk -> [BS.take 100 chunk, BS.drop 100 chunk]) (replicate 128 pattern)
+      (result, _) <-
+        execute
+          session
+          (Execution (Unprepared "SELECT $1::text = repeat('0123456789abcdef', 524288)" []) [] [Just (ParameterChunks chunks)] [])
+          (\rows row -> (: rows) <$> columns row)
+          []
+      result `shouldBe` Right ([[Just "t"]], "SELECT 1")
     it "streams a parameter to a prepared statement, whether it returns rows or not" $ \session -> do
       _ <- query session "CREATE TEMPORARY TABLE streamed (value text)" []
       prepare session "insert_streamed" "INSERT INTO streamed VALUES ($1)" [] `shouldReturn` (Right (), TxIdle)
