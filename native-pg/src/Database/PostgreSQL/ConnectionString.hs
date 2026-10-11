@@ -50,7 +50,7 @@ import Data.Word (Word8)
 import Database.PostgreSQL.Protocol (ProtocolVersion (..), protocolVersion3_0, protocolVersion3_2)
 import Database.PostgreSQL.Protocol.Codec (InputError (..))
 import Database.PostgreSQL.Session
-import Database.PostgreSQL.Transport (Address (..), ConnectError, TcpOptions (..))
+import Database.PostgreSQL.Transport (Address (..), ConnectError, RootCertificates (..), TcpOptions (..))
 import Network.Socket (PortNumber)
 import System.Directory (doesFileExist)
 import System.Environment (getEnvironment)
@@ -384,25 +384,33 @@ setting environment given keyword =
 -- local user's name for defaults.
 resolve :: (ByteString -> Maybe Setting) -> Maybe String -> Maybe String -> Either String ConnectionString
 resolve option home localUser = do
-  sslMode <- case option "sslmode" of
-    Just (Setting value source) -> case value of
-      "require" -> maybe (Right SslRequire) (Left . requireWithRoots . text) (given "sslrootcert")
-      "verify-full" -> case given "sslrootcert" of
-        Just "system" -> Left "sslrootcert=system isn't supported"
-        Just roots -> Right (SslVerifyFull (text roots))
+  let systemRoots = given "sslrootcert" == Just "system"
+      rootCertificates = case given "sslrootcert" of
+        Just "system" -> Right SystemRootCertificates
+        Just roots -> Right (RootCertificateFile (text roots))
         Nothing ->
           maybe
             (Left "could not get home directory to locate root certificate file\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.")
-            (Right . SslVerifyFull . defaultRootCertificate)
+            (Right . RootCertificateFile . defaultRootCertificate)
             home
-      "verify-ca" -> Left (source <> "=verify-ca verifies the server's certificate but not its name, which isn't supported: use verify-full")
-      _
-        | value `elem` ["disable", "allow", "prefer"] -> Right SslDisable
-        | otherwise -> Left ("invalid sslmode value: " <> quote value)
-    -- PGREQUIRESSL counts only if no sslmode is given.
-    Nothing -> Right $ case option "requiressl" of
-      Just (Setting value _) | "1" `BS.isPrefixOf` value -> SslRequire
-      _ -> SslDisable
+  sslMode <- case option "sslmode" of
+    Just (Setting value source)
+      | systemRoots && value /= "verify-full" ->
+          Left ("weak sslmode " <> quote value <> " may not be used with sslrootcert=system (use \"verify-full\")")
+      | otherwise -> case value of
+          "require" -> maybe (Right SslRequire) (Left . requireWithRoots . text) (given "sslrootcert")
+          "verify-full" -> SslVerifyFull <$> rootCertificates
+          "verify-ca" -> Left (source <> "=verify-ca verifies the server's certificate but not its name, which isn't supported: use verify-full")
+          _
+            | value `elem` ["disable", "allow", "prefer"] -> Right SslDisable
+            | otherwise -> Left ("invalid sslmode value: " <> quote value)
+    -- As in libpq, the system's root certificates make verify-full the
+    -- default, and PGREQUIRESSL counts only if no sslmode is given.
+    Nothing
+      | systemRoots -> Right (SslVerifyFull SystemRootCertificates)
+      | otherwise -> Right $ case option "requiressl" of
+          Just (Setting value _) | "1" `BS.isPrefixOf` value -> SslRequire
+          _ -> SslDisable
   choice "sslnegotiation" ["postgres"] ["direct"] "TLS"
   choice "sslcertmode" ["disable", "allow"] ["require"] "TLS"
   choice "channel_binding" ["disable", "prefer"] ["require"] "TLS"

@@ -174,7 +174,6 @@ main = withCluster $ \socketPath port -> hspec $ do
         connectFailure (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=other.example hostaddr=127.0.0.1"))
           `shouldReturn` (at "other.example" <> "SSL error: invalid peer certificate: NotValidForName")
       it "verifies against the system's root certificates with sslrootcert=system" $ do
-        pendingWith "the system's root certificates aren't supported"
         failure <- connectFailure (tcp "sslmode=verify-full sslrootcert=system host=localhost hostaddr=127.0.0.1")
         -- The platforms' verifiers word it differently.
         failure `shouldSatisfy` isPrefixOf ("connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: ")

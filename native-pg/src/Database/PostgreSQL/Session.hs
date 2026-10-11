@@ -99,6 +99,7 @@ import Database.PostgreSQL.Transport
   ( Address (..),
     Channel (..),
     OutputBuffer,
+    RootCertificates (..),
     ServerVerification (..),
     TcpOptions,
     TlsClient (..),
@@ -352,8 +353,8 @@ data SslMode
   | -- | With TLS, without verifying the server.
     SslRequire
   | -- | With TLS, verifying the server's certificate against the root
-    -- certificates in the file, and its name.
-    SslVerifyFull FilePath
+    -- certificates, and its name.
+    SslVerifyFull RootCertificates
   deriving (Eq, Show)
 
 -- | No password, database or extra parameters, protocol 3.0, 16 KiB read
@@ -437,11 +438,14 @@ connect settings =
         unless accepted $ throwIO (TlsFailure "server does not support SSL, but SSL was required")
         verification <- case mode of
           SslVerifyFull roots -> do
-            exists <- doesFileExist roots
-            unless exists . throwIO . TlsFailure $
-              "root certificate file \""
-                <> roots
-                <> "\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
+            case roots of
+              RootCertificateFile file -> do
+                exists <- doesFileExist file
+                unless exists . throwIO . TlsFailure $
+                  "root certificate file \""
+                    <> file
+                    <> "\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
+              SystemRootCertificates -> pure ()
             pure (VerifyFull roots)
           _ -> pure NoVerification
         channel <-

@@ -24,7 +24,7 @@ import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session (ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
-import Database.PostgreSQL.Transport (Address (..), ConnectError (..), TcpOptions (..), defaultTcpOptions)
+import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), defaultTcpOptions)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import Test.Hspec
@@ -298,15 +298,20 @@ main = hspec $ do
         `shouldBe` Right (Just "db")
     it "reads sslmode=verify-full with its root certificate file, or libpq's default one" $ do
       let sslMode = fmap connectionSslMode
-      sslMode (parse "sslmode=verify-full sslrootcert=/roots.crt") `shouldBe` Right (SslVerifyFull "/roots.crt")
-      sslMode (parseWith [("PGSSLROOTCERT", "/roots.crt")] "sslmode=verify-full") `shouldBe` Right (SslVerifyFull "/roots.crt")
-      sslMode (parseWith [("HOME", "/home/u")] "sslmode=verify-full") `shouldBe` Right (SslVerifyFull "/home/u/.postgresql/root.crt")
+      sslMode (parse "sslmode=verify-full sslrootcert=/roots.crt") `shouldBe` Right (SslVerifyFull (RootCertificateFile "/roots.crt"))
+      sslMode (parseWith [("PGSSLROOTCERT", "/roots.crt")] "sslmode=verify-full") `shouldBe` Right (SslVerifyFull (RootCertificateFile "/roots.crt"))
+      sslMode (parseWith [("HOME", "/home/u")] "sslmode=verify-full") `shouldBe` Right (SslVerifyFull (RootCertificateFile "/home/u/.postgresql/root.crt"))
       parse "sslmode=verify-full" `shouldSatisfy` failsWith "could not get home directory to locate root certificate file"
+    it "takes the system's root certificates with sslrootcert=system, only with verify-full, as libpq does" $ do
+      let sslMode = fmap connectionSslMode
+      sslMode (parse "sslrootcert=system") `shouldBe` Right (SslVerifyFull SystemRootCertificates)
+      sslMode (parse "sslmode=verify-full sslrootcert=system") `shouldBe` Right (SslVerifyFull SystemRootCertificates)
+      parse "sslmode=require sslrootcert=system"
+        `shouldSatisfy` failsWith "weak sslmode \"require\" may not be used with sslrootcert=system (use \"verify-full\")"
     it "rejects what verifies the server's certificate but not its name" $ do
       parse "sslmode=verify-ca" `shouldSatisfy` failsWith "sslmode=verify-ca verifies the server's certificate but not its name, which isn't supported"
       parseWith [("PGSSLMODE", "verify-ca")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-ca verifies"
       parse "sslmode=require sslrootcert=/roots.crt" `shouldSatisfy` failsWith "verifies the server's certificate as verify-ca does, which isn't supported"
-      parse "sslmode=verify-full sslrootcert=system" `shouldSatisfy` failsWith "sslrootcert=system isn't supported"
       parse "sslmode=maybe" `shouldSatisfy` failsWith "invalid sslmode value: \"maybe\""
       parse "gssencmode=require" `shouldSatisfy` failsWith "requires GSSAPI encryption, which isn't supported"
     it "rejects options it doesn't know or implement" $ do

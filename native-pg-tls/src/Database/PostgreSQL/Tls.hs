@@ -32,13 +32,14 @@ module Database.PostgreSQL.Tls
 where
 
 import Control.Concurrent (threadWaitRead, threadWaitWrite)
+import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
 import Control.Exception (IOException, bracket, catch, finally, onException, throwIO)
 import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import Data.Word (Word32, Word8)
-import Database.PostgreSQL.Transport (Link (..), ServerVerification (..), TlsClient (..), TlsError (..), TlsSettings (..), newChannel)
+import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsClient (..), TlsError (..), TlsSettings (..), newChannel)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString)
@@ -48,6 +49,7 @@ import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (Storable, peek)
 import Network.Socket (Socket, close, withFdSocket)
+import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Types (Fd (..))
 
 -- | Starts TLS for native-pg's connections, with a new configuration each
@@ -69,7 +71,8 @@ newTlsConfig settings = do
   ( do
       case tlsVerification settings of
         NoVerification -> check "could not configure the certificate verifier" =<< c_accept_any_certificate builder
-        VerifyFull roots -> withVerifier roots (c_client_config_builder_set_server_verifier builder)
+        VerifyFull (RootCertificateFile roots) -> withVerifier roots (c_client_config_builder_set_server_verifier builder)
+        VerifyFull SystemRootCertificates -> c_client_config_builder_set_server_verifier builder . ConstPtr =<< systemVerifier
       check "could not configure ALPN" =<< c_offer_postgresql builder
     )
     `onException` c_client_config_builder_free builder
@@ -88,6 +91,19 @@ newTlsConfig settings = do
               (built "could not create the certificate verifier" (c_web_pki_server_cert_verifier_builder_build verifierBuilder))
               c_server_cert_verifier_free
               (useVerifier . ConstPtr)
+
+-- | The verifier against the system's root certificates, the same each time,
+-- since it loads all of them, and never freed.
+systemVerifier :: IO (Ptr ServerCertVerifier)
+systemVerifier = modifyMVar systemVerifierMade $ \made -> case made of
+  Just verifier -> pure (made, verifier)
+  Nothing -> do
+    verifier <- built "could not load the system's root certificates" c_platform_server_cert_verifier
+    pure (Just verifier, verifier)
+
+systemVerifierMade :: MVar (Maybe (Ptr ServerCertVerifier))
+systemVerifierMade = unsafePerformIO (newMVar Nothing)
+{-# NOINLINE systemVerifierMade #-}
 
 -- | A TLS connection over a socket.
 data TlsConnection = TlsConnection
@@ -325,6 +341,9 @@ foreign import capi unsafe "rustls.h rustls_web_pki_server_cert_verifier_builder
 
 foreign import capi unsafe "rustls.h rustls_web_pki_server_cert_verifier_builder_free"
   c_web_pki_server_cert_verifier_builder_free :: Ptr ServerCertVerifierBuilder -> IO ()
+
+foreign import capi unsafe "rustls.h rustls_platform_server_cert_verifier"
+  c_platform_server_cert_verifier :: Ptr () -> IO Word32
 
 foreign import capi unsafe "rustls.h rustls_server_cert_verifier_free"
   c_server_cert_verifier_free :: Ptr ServerCertVerifier -> IO ()

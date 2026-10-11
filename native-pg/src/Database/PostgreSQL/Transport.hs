@@ -21,6 +21,7 @@ module Database.PostgreSQL.Transport
     TlsClient (..),
     TlsSettings (..),
     ServerVerification (..),
+    RootCertificates (..),
     TlsError (..),
 
     -- * Output sent as answers are read
@@ -266,9 +267,18 @@ data ServerVerification
   = -- | Not at all: the connection is encrypted, but the server may not be
     -- the one asked for, as with libpq's @sslmode=require@.
     NoVerification
-  | -- | Against the root certificates in a PEM file, and the server's name, as
-    -- with libpq's @sslmode=verify-full@.
-    VerifyFull FilePath
+  | -- | Against root certificates, and the server's name, as with libpq's
+    -- @sslmode=verify-full@.
+    VerifyFull RootCertificates
+  deriving (Eq, Show)
+
+-- | The certificates of the authorities a server's certificate has to come
+-- from.
+data RootCertificates
+  = -- | In a PEM file.
+    RootCertificateFile FilePath
+  | -- | The system's, as with libpq's @sslrootcert=system@.
+    SystemRootCertificates
   deriving (Eq, Show)
 
 -- | TLS failed: the handshake, the server's certificate, or a record.
