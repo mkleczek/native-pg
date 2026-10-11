@@ -4,7 +4,9 @@
 {-# LANGUAGE MultiWayIf #-}
 
 -- | TLS over a connected socket, through rustls-ffi: the only part of the
--- client in C.
+-- client in C. Only the handshake waits for the socket. Reads and writes take
+-- what's ready, and give 'Nothing', or less than they're given, when it isn't,
+-- so the transport waits on the socket as it does without TLS.
 module Database.PostgreSQL.Tls
   ( -- * Configurations
     TlsConfig,
@@ -14,6 +16,10 @@ module Database.PostgreSQL.Tls
     TlsConnection,
     startTls,
     tlsSocket,
+    receiveTls,
+    sendTls,
+    flushTls,
+    closeTls,
 
     -- * Connections rustls made elsewhere, e.g. a test's server
     RustlsConnection,
@@ -23,19 +29,22 @@ module Database.PostgreSQL.Tls
 where
 
 import Control.Concurrent (threadWaitRead, threadWaitWrite)
-import Control.Exception (IOException, bracket, catch, onException, throwIO)
+import Control.Exception (IOException, bracket, catch, finally, onException, throwIO)
 import Control.Monad (unless, void, when)
-import Data.Word (Word32)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BS
+import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Transport (ServerVerification (..), TlsError (..), TlsSettings (..))
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString)
 import Foreign.C.Types (CBool (..), CChar, CInt (..), CSize (..), CUInt (..))
-import Foreign.ForeignPtr (FinalizerPtr, ForeignPtr, newForeignPtr, withForeignPtr)
+import Foreign.ForeignPtr (FinalizerPtr, ForeignPtr, finalizeForeignPtr, newForeignPtr, withForeignPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (Storable, peek)
-import Network.Socket (Socket, withFdSocket)
+import Network.Socket (Socket, close, withFdSocket)
 import System.Posix.Types (Fd (..))
 
 -- | A configuration for TLS connections, which any number of them share.
@@ -91,7 +100,7 @@ startTls (TlsConfig config) serverName sock = do
   pure tls
 
 -- | Takes over a connection rustls made, to read and write it over the
--- socket. It's freed when it's no longer used.
+-- socket. It's freed when it's closed, or when it's no longer used.
 newTlsConnection :: Socket -> Ptr RustlsConnection -> IO TlsConnection
 newTlsConnection sock connection = do
   -- Records wait in the connection until the socket takes them, up to this
@@ -115,6 +124,52 @@ handshake tls = do
   where
     waitFor wait = withFdSocket (tlsSocket tls) (wait . Fd)
 
+-- | Reads what's ready into the buffer, up to its size, without waiting:
+-- 'Nothing' if nothing is, and 0 at the end of the stream.
+receiveTls :: TlsConnection -> Ptr Word8 -> Int -> IO (Maybe Int)
+receiveTls tls pointer size = go False
+  where
+    -- rustls asks for initialized memory, for reasons internal to Rust, but
+    -- only writes to it.
+    go ended = do
+      (result, received) <- withConnection tls $ \connection ->
+        alloca $ \out -> (,) <$> c_connection_read connection pointer (fromIntegral size) out <*> peek out
+      if
+        | result == resultOk -> pure (Just (fromIntegral received))
+        | result == resultUnexpectedEof -> pure (Just 0)
+        | result == resultPlaintextEmpty && ended -> pure (Just 0)
+        | result == resultPlaintextEmpty ->
+            readRecords tls >>= \case
+              Read -> go False
+              WouldBlock -> pure Nothing
+              Ended -> go True
+        | otherwise -> throwIO . TlsError =<< describe result
+
+-- | Encrypts what it can of the pieces, and writes what the socket takes,
+-- without waiting. Gives how many bytes of the pieces it took: those not
+-- written yet wait in the connection, for 'flushTls'.
+sendTls :: TlsConnection -> [ByteString] -> IO Int
+sendTls tls = go 0
+  where
+    go taken pieces = do
+      (accepted, rest) <- encrypt 0 pieces
+      flushed <- flushTls tls
+      if flushed && accepted > 0 && not (null rest)
+        then go (taken + accepted) rest
+        else pure (taken + accepted)
+    encrypt accepted = \case
+      [] -> pure (accepted, [])
+      piece : others -> do
+        written <- withConnection tls $ \connection ->
+          BS.unsafeUseAsCStringLen piece $ \(bytes, len) ->
+            alloca $ \out -> do
+              result <- c_connection_write connection (castPtr bytes) (fromIntegral len) out
+              unless (result == resultOk) (throwIO . TlsError =<< describe result)
+              fromIntegral <$> peek out
+        if written < BS.length piece
+          then pure (accepted + written, BS.drop written piece : others)
+          else encrypt (accepted + written) others
+
 -- | Writes what the socket takes of the records waiting in the connection,
 -- without waiting. True if none is left.
 flushTls :: TlsConnection -> IO Bool
@@ -130,6 +185,17 @@ flushTls tls = do
         | errno == 0 || Errno errno == eINTR -> flushTls tls
         | Errno errno == eAGAIN || Errno errno == eWOULDBLOCK -> pure False
         | otherwise -> throwIO (errnoToIOError "writev" (Errno errno) Nothing Nothing)
+
+-- | Tells the server the connection ends, if the socket takes it at once,
+-- closes the socket, and frees the connection. It mustn't run while another
+-- thread uses the connection.
+closeTls :: TlsConnection -> IO ()
+closeTls tls =
+  ( (withConnection tls c_connection_send_close_notify *> void (flushTls tls))
+      `catch` \(_ :: IOException) -> pure ()
+  )
+    `finally` close (tlsSocket tls)
+    `finally` finalizeForeignPtr (tlsConnection tls)
 
 -- | What reading records did.
 data Records = Read | WouldBlock | Ended
@@ -179,8 +245,10 @@ describe result =
       len <- peek out
       peekCStringLen (buffer, fromIntegral len)
 
-resultOk :: Word32
+resultOk, resultUnexpectedEof, resultPlaintextEmpty :: Word32
 resultOk = 7000
+resultUnexpectedEof = 7010
+resultPlaintextEmpty = 7011
 
 data ClientConfigBuilder
 
@@ -253,6 +321,15 @@ foreign import capi unsafe "rustls.h rustls_connection_wants_write"
 
 foreign import capi unsafe "rustls.h rustls_connection_process_new_packets"
   c_connection_process_new_packets :: Ptr RustlsConnection -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_connection_read"
+  c_connection_read :: Ptr RustlsConnection -> Ptr Word8 -> CSize -> Ptr CSize -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_connection_write"
+  c_connection_write :: Ptr RustlsConnection -> Ptr Word8 -> CSize -> Ptr CSize -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_connection_send_close_notify"
+  c_connection_send_close_notify :: Ptr RustlsConnection -> IO ()
 
 foreign import capi unsafe "rustls.h &rustls_connection_free"
   p_connection_free :: FinalizerPtr RustlsConnection

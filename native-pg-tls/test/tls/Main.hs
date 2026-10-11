@@ -1,10 +1,12 @@
 {-# LANGUAGE CApiFFI #-}
+{-# LANGUAGE LambdaCase #-}
 
 -- | TLS connections against a server in the same process, over a pair of
 -- Unix-domain sockets. The server is rustls too, through its server API, and
 -- its side of a connection runs on the same functions as the client's.
 module Main (main) where
 
+import Control.Concurrent (threadWaitRead, threadWaitWrite)
 import Control.Concurrent.Async (concurrently)
 import Control.Exception (bracket, displayException, throwIO, try)
 import Control.Monad (unless, void)
@@ -16,11 +18,12 @@ import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Tls
 import Database.PostgreSQL.Transport (ServerVerification (..), TlsError (..), TlsSettings (..))
 import Foreign.C.Types (CSize (..))
-import Foreign.Marshal.Alloc (alloca)
+import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (withArray)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peek)
 import qualified Network.Socket as Socket
+import System.Posix.Types (Fd (..))
 import Test.Hspec
 
 main :: IO ()
@@ -46,10 +49,64 @@ main = hspec $ do
         config <- newTlsConfig (TlsSettings (VerifyFull (certificate "ca.crt")))
         refusal config sock server `shouldReturn` "SSL error: invalid peer certificate: NotValidForName"
 
+  describe "a connection" $ do
+    it "carries more bytes both ways than the sockets hold" $
+      withServer "server" $ \sock server -> do
+        config <- newTlsConfig (TlsSettings (VerifyFull (certificate "ca.crt")))
+        let payload = BS.pack (take 1000000 (cycle [0 .. 250]))
+            client = do
+              tls <- startTls config "localhost" sock
+              snd <$> concurrently (sendAll tls [BS.take 300000 payload, BS.drop 300000 payload]) (receiveExactly tls (BS.length payload))
+            echo = do
+              handshake server
+              sendAll server . pure =<< receiveExactly server (BS.length payload)
+        fst <$> concurrently client echo `shouldReturn` payload
+
+    it "ends the server's stream when it closes" $
+      withServer "server" $ \sock server -> do
+        config <- newTlsConfig (TlsSettings (VerifyFull (certificate "ca.crt")))
+        (client, ()) <- concurrently (startTls config "localhost" sock) (handshake server)
+        closeTls client
+        receiveExactly server 1 `shouldReturn` BS.empty
+
   describe "a configuration" $
     it "needs its root certificate file" $
       newTlsConfig (TlsSettings (VerifyFull (certificate "missing.crt")))
         `shouldThrow` \(TlsError reason) -> "could not read root certificate file" `isInfixOf` reason
+
+-- | Sends the pieces, waiting for room in the socket as needed.
+sendAll :: TlsConnection -> [ByteString] -> IO ()
+sendAll tls pieces = do
+  taken <- sendTls tls pieces
+  flushed <- flushTls tls
+  let rest = dropBytes taken pieces
+  unless (null rest && flushed) $ do
+    Socket.withFdSocket (tlsSocket tls) (threadWaitWrite . Fd)
+    sendAll tls rest
+  where
+    dropBytes taken = \case
+      piece : others
+        | taken >= BS.length piece -> dropBytes (taken - BS.length piece) others
+        | otherwise -> BS.drop taken piece : others
+      [] -> []
+
+-- | Reads the given number of bytes, waiting for them as needed, or fewer at
+-- the end of the stream.
+receiveExactly :: TlsConnection -> Int -> IO ByteString
+receiveExactly tls count = BS.concat . reverse <$> go 0 []
+  where
+    go got chunks
+      | got >= count = pure chunks
+      | otherwise =
+          allocaBytes 16384 $ \buffer ->
+            receiveTls tls buffer 16384 >>= \case
+              Just 0 -> pure chunks
+              Just received -> do
+                chunk <- BS.packCStringLen (castPtr buffer, received)
+                go (got + received) (chunk : chunks)
+              Nothing -> do
+                Socket.withFdSocket (tlsSocket tls) (threadWaitRead . Fd)
+                go got chunks
 
 certificate :: FilePath -> FilePath
 certificate name = "test/native-pg-tls/certificates/" <> name
