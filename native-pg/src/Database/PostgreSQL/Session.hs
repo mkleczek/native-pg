@@ -350,6 +350,12 @@ data ConnectSettings = ConnectSettings
 data SslMode
   = -- | Without TLS.
     SslDisable
+  | -- | Without TLS, and if the server rejects the connection, with TLS,
+    -- without verifying the server.
+    SslAllow
+  | -- | With TLS if the server takes it, without verifying the server, and if
+    -- it then fails or the server rejects the connection, without TLS.
+    SslPrefer
   | -- | With TLS, without verifying the server.
     SslRequire
   | -- | With TLS, verifying the server's certificate against the root
@@ -427,36 +433,56 @@ outputBufferSize = 16384
 -- Throws 'Database.PostgreSQL.Transport.ConnectError' when the socket doesn't
 -- connect, and 'ConnectionError' when the server rejects the connection.
 connect :: ConnectSettings -> IO (Session 'Ready, ServerInfo)
-connect settings =
-  bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock ->
-    case (connectSslMode settings, connectAddress settings) of
-      (SslDisable, _) -> start (newChannel sock)
-      (_, UnixAddress _) -> start (newChannel sock)
-      (mode, TcpAddress host _) -> do
-        client <- maybe (throwIO (TlsFailure ("sslmode value \"" <> sslModeName mode <> "\" invalid when SSL support is not compiled in"))) pure (connectTlsClient settings)
-        accepted <- requestTls sock
-        unless accepted $ throwIO (TlsFailure "server does not support SSL, but SSL was required")
-        verification <- case mode of
-          SslVerifyFull roots -> do
-            case roots of
-              RootCertificateFile file -> do
-                exists <- doesFileExist file
-                unless exists . throwIO . TlsFailure $
-                  "root certificate file \""
-                    <> file
-                    <> "\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
-              SystemRootCertificates -> pure ()
-            pure (VerifyFull roots)
-          _ -> pure NoVerification
-        channel <-
-          startTlsChannel client (TlsSettings verification) (fromMaybe host (connectServerName settings)) sock
-            `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
-        start channel
+connect settings = case (connectSslMode settings, connectAddress settings, connectTlsClient settings) of
+  (SslDisable, _, _) -> attempt Nothing
+  (_, UnixAddress _, _) -> attempt Nothing
+  -- As libpq without TLS does.
+  (SslAllow, _, Nothing) -> attempt Nothing
+  (SslPrefer, _, Nothing) -> attempt Nothing
+  (mode, _, Nothing) -> throwIO (TlsFailure ("sslmode value \"" <> sslModeName mode <> "\" invalid when SSL support is not compiled in"))
+  (SslAllow, TcpAddress {}, Just client) ->
+    attempt Nothing `catch` \failure -> case failure of
+      ConnectionRejected _ -> attempt (Just (client, NoVerification, True))
+      _ -> throwIO failure
+  (SslPrefer, TcpAddress {}, Just client) ->
+    attempt (Just (client, NoVerification, False)) `catch` \(FailedWithTls _) -> attempt Nothing
+  (SslRequire, TcpAddress {}, Just client) -> attempt (Just (client, NoVerification, True))
+  (SslVerifyFull roots, TcpAddress {}, Just client) -> do
+    case roots of
+      RootCertificateFile file -> do
+        exists <- doesFileExist file
+        unless exists . throwIO . TlsFailure $
+          "root certificate file \""
+            <> file
+            <> "\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
+      SystemRootCertificates -> pure ()
+    attempt (Just (client, VerifyFull roots, True))
   where
     sslModeName mode = case mode of
       SslDisable -> "disable"
+      SslAllow -> "allow"
+      SslPrefer -> "prefer"
       SslRequire -> "require"
       SslVerifyFull _ -> "verify-full"
+    -- Over a new socket, with TLS if a client, the verification, and whether
+    -- it's required are given. A failure after TLS started, when it isn't
+    -- required, is thrown as 'FailedWithTls'.
+    attempt tls =
+      bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock ->
+        case (tls, connectAddress settings) of
+          (Just (client, verification, required), TcpAddress host _) -> do
+            accepted <- requestTls sock
+            case accepted of
+              False
+                | required -> throwIO (TlsFailure "server does not support SSL, but SSL was required")
+                | otherwise -> start (newChannel sock)
+              True -> do
+                let started =
+                      start
+                        =<< startTlsChannel client (TlsSettings verification) (fromMaybe host (connectServerName settings)) sock
+                          `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
+                if required then started else started `catch` (throwIO . FailedWithTls)
+          _ -> start (newChannel sock)
     -- Given how to make the channel, once there's somewhere for its unsent
     -- output.
     start channel = do
@@ -469,6 +495,12 @@ connect settings =
       send @'StartupMessageType session (startupMessage settings)
       (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
       initialize version initializing
+
+-- | A connection with TLS that wasn't required failed, so it's tried without.
+newtype FailedWithTls = FailedWithTls ConnectionError
+  deriving (Show)
+
+instance Exception FailedWithTls
 
 -- | Asks the server for TLS, and reads its answer, a single byte, so that no
 -- unencrypted byte after it is taken for TLS's: whether it takes TLS.

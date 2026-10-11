@@ -8,11 +8,9 @@
 -- libpq takes from the environment, and connecting to the first suitable host
 -- one names.
 --
--- TLS is used with @sslmode@ @require@, which doesn't verify the server, and
--- @verify-full@. @verify-ca@ isn't supported, nor is @require@ with a root
--- certificate file, which libpq verifies as @verify-ca@. @sslmode@
--- @prefer@, libpq's default, connects without TLS. Options this client
--- doesn't implement are rejected too, unless they only matter with TLS or
+-- TLS is used as @sslmode@ asks, except for @verify-ca@, and @require@ with a
+-- root certificate file, which libpq verifies as @verify-ca@. Options this
+-- client doesn't implement are rejected, unless they only matter with TLS or
 -- GSSAPI. Password and service files aren't read.
 module Database.PostgreSQL.ConnectionString
   ( -- * Connection strings
@@ -401,16 +399,17 @@ resolve option home localUser = do
           "require" -> maybe (Right SslRequire) (Left . requireWithRoots . text) (given "sslrootcert")
           "verify-full" -> SslVerifyFull <$> rootCertificates
           "verify-ca" -> Left (source <> "=verify-ca verifies the server's certificate but not its name, which isn't supported: use verify-full")
-          _
-            | value `elem` ["disable", "allow", "prefer"] -> Right SslDisable
-            | otherwise -> Left ("invalid sslmode value: " <> quote value)
+          "disable" -> Right SslDisable
+          "allow" -> Right SslAllow
+          "prefer" -> Right SslPrefer
+          _ -> Left ("invalid sslmode value: " <> quote value)
     -- As in libpq, the system's root certificates make verify-full the
     -- default, and PGREQUIRESSL counts only if no sslmode is given.
     Nothing
       | systemRoots -> Right (SslVerifyFull SystemRootCertificates)
       | otherwise -> Right $ case option "requiressl" of
           Just (Setting value _) | "1" `BS.isPrefixOf` value -> SslRequire
-          _ -> SslDisable
+          _ -> SslPrefer
   choice "sslnegotiation" ["postgres"] ["direct"] "TLS"
   choice "sslcertmode" ["disable", "allow"] ["require"] "TLS"
   choice "channel_binding" ["disable", "prefer"] ["require"] "TLS"

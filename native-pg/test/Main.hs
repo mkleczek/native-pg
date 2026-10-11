@@ -230,7 +230,7 @@ main = hspec $ do
               connectionProtocolVersion = protocolVersion3_0,
               connectionMinProtocolVersion = protocolVersion3_0,
               connectionTcpOptions = defaultTcpOptions,
-              connectionSslMode = SslDisable
+              connectionSslMode = SslPrefer
             }
     it "reads a URI" $ do
       let parsed = parse "postgresql://alice:p%40ss@db.example.com:6543/app?application_name=api&connect_timeout=10"
@@ -289,9 +289,9 @@ main = hspec $ do
       mapM_
         (\string -> sslMode (parse string) `shouldBe` Right SslRequire)
         ["sslmode=require", "requiressl=1", "sslmode=disable requiressl=1", "postgresql://h/db?ssl=true"]
-      mapM_
-        (\string -> sslMode (parse string) `shouldBe` Right SslDisable)
-        ["", "sslmode=disable", "sslmode=allow", "sslmode=prefer", "requiressl=1 sslmode=disable", "requiressl=0"]
+      mapM_ (\string -> sslMode (parse string) `shouldBe` Right SslPrefer) ["", "sslmode=prefer", "requiressl=0"]
+      sslMode (parse "sslmode=allow") `shouldBe` Right SslAllow
+      sslMode (parse "requiressl=1 sslmode=disable") `shouldBe` Right SslDisable
       sslMode (parseWith [("PGREQUIRESSL", "1")] "") `shouldBe` Right SslRequire
       sslMode (parseWith [("PGREQUIRESSL", "1")] "sslmode=disable") `shouldBe` Right SslDisable
       fmap (connectServerName . (`hostConnectSettings` Host "db" (Just "10.0.0.1") 5432)) (parse "sslmode=require")
