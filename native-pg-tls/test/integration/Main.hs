@@ -201,6 +201,20 @@ main = withCluster $ \socketPath port -> hspec $ do
       it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $ do
         withConnection (tcp "sslnegotiation=direct sslmode=require") $ \(session, _, _) ->
           encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
+      it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
+        let tlsSettings host connectionString =
+              either fail (\parsed -> pure ((hostConnectSettings parsed host) {connectTlsClient = Just tlsClient})) $
+                parseConnectionString (const Nothing) (Just "postgres") connectionString
+        withConnection (tcp "sslmode=require") $ \(session, info, host) -> do
+          Just key <- pure (serverBackendKey info)
+          cancelling <- tlsSettings host (tcp "sslmode=require")
+          _ <- forkIO (threadDelay 300000 *> cancel cancelling key)
+          (result, _) <- query session "SELECT pg_sleep(30)" []
+          either errorCode (const Nothing) result `shouldBe` Just "57014"
+          withPlaintextServer $ \plaintext -> do
+            let refused = "host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require"
+            refusing <- tlsSettings (Host "127.0.0.1" Nothing plaintext) refused
+            cancel refusing key `shouldThrow` (== TlsFailure "server does not support SSL, but SSL was required")
       it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do
         let version extra = withConnection (tcp ("sslmode=require " <> extra)) $ \(session, _, _) ->
               value session "SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
@@ -414,7 +428,7 @@ main = withCluster $ \socketPath port -> hspec $ do
     it "cancels a running statement, and the session stays usable" $
       withSessionInfo $ \session info -> do
         Just key <- pure (serverBackendKey info)
-        _ <- forkIO (threadDelay 300000 *> cancel (UnixAddress socketPath) key)
+        _ <- forkIO (threadDelay 300000 *> cancel (settings "postgres" Nothing) key)
         started <- getMonotonicTime
         (result, status) <- query session "SELECT pg_sleep(30)" []
         finished <- getMonotonicTime

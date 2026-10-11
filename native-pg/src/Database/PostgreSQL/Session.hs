@@ -55,7 +55,7 @@ module Database.PostgreSQL.Session
   )
 where
 
-import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, finally, onException, throwIO, try)
+import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, onException, throwIO, try)
 import Control.Monad (filterM, join, unless, when, (<=<))
 import Data.Bifunctor (first)
 import Data.Foldable (for_, toList)
@@ -467,7 +467,26 @@ outputBufferSize = 16384
 -- Throws 'Database.PostgreSQL.Transport.ConnectError' when the socket doesn't
 -- connect, and 'ConnectionError' when the server rejects the connection.
 connect :: ConnectSettings -> IO (Session 'Ready, ServerInfo)
-connect settings = case (connectSslMode settings, connectAddress settings, connectTlsClient settings) of
+connect settings = withChannel settings start
+  where
+    -- Given how to make the channel, once there's somewhere for its unsent
+    -- output.
+    start channel = do
+      buffer <- newIORef emptyInputBuffer
+      pending <- newIORef =<< unsent Nothing mempty
+      output <- newOutputBuffer outputBufferSize
+      state <- newIORef Idle
+      notifications <- newIORef []
+      let session = Session (Connection (channel pending (connectReadSize settings)) buffer pending output state notifications)
+      send @'StartupMessageType session (startupMessage settings)
+      (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
+      initialize version initializing
+
+-- | Connects a socket to the server, starts TLS over it as the settings ask,
+-- and runs the action with how to make the channel over it. The socket is
+-- closed if the action fails.
+withChannel :: ConnectSettings -> ((IORef Unsent -> Int -> Channel) -> IO a) -> IO a
+withChannel settings use = case (connectSslMode settings, connectAddress settings, connectTlsClient settings) of
   (SslDisable, _, _) -> attempt Nothing
   (_, UnixAddress _, _) -> attempt Nothing
   -- As libpq without TLS does.
@@ -509,12 +528,12 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
             case accepted of
               False
                 | required -> throwIO (TlsFailure "server does not support SSL, but SSL was required")
-                | otherwise -> start (newChannel sock)
+                | otherwise -> use (newChannel sock)
               True -> do
                 let started = do
                       certificate <- clientCertificate
                       lists <- revocationLists
-                      start
+                      use
                         =<< startTlsChannel
                           client
                           ( TlsSettings
@@ -529,7 +548,7 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
                           sock
                           `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
                 if required then started else started `catch` (throwIO . FailedWithTls)
-          _ -> start (newChannel sock)
+          _ -> use (newChannel sock)
     -- The client certificate, if its file exists, with its private key,
     -- which has to exist and be readable only by its owner, as with libpq.
     clientCertificate = case connectSslCertificate settings of
@@ -559,18 +578,6 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
     rehashed name = case break (== '.') name of
       (_, '.' : 'r' : number) -> not (null number) && all isDigit number
       _ -> False
-    -- Given how to make the channel, once there's somewhere for its unsent
-    -- output.
-    start channel = do
-      buffer <- newIORef emptyInputBuffer
-      pending <- newIORef =<< unsent Nothing mempty
-      output <- newOutputBuffer outputBufferSize
-      state <- newIORef Idle
-      notifications <- newIORef []
-      let session = Session (Connection (channel pending (connectReadSize settings)) buffer pending output state notifications)
-      send @'StartupMessageType session (startupMessage settings)
-      (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
-      initialize version initializing
 
 -- | What's wrong with a private key file, as libpq checks it, if anything.
 privateKeyFile :: FilePath -> IO (Maybe String)
@@ -866,20 +873,24 @@ awaitNotification session@(Session connection) = operation session $ do
       either (\failure -> throwIO (ProtocolError ("an error while idle: " <> show failure))) pure reply
 
 -- | Asks the server to cancel what the session with this backend key is
--- running, over a new connection to the given address. The server doesn't
--- answer: a cancelled statement fails in its own session with SQLSTATE
--- 57014, and a request that comes too late does nothing.
-cancel :: Address -> BackendKey ByteString -> IO ()
-cancel address key =
-  bracket (connectSocket defaultTcpOptions address) Socket.close $ \sock -> do
+-- running, over a new connection made as the settings ask, TLS included, as
+-- libpq's does since PostgreSQL 17. The server doesn't answer: a cancelled
+-- statement fails in its own session with SQLSTATE 57014, and a request that
+-- comes too late does nothing.
+cancel :: ConnectSettings -> BackendKey ByteString -> IO ()
+cancel settings key =
+  withChannel settings $ \opened -> do
     pending <- newIORef =<< unsent Nothing mempty
-    let channel = newChannel sock pending 64
-    channelSend channel (serialize @(CancelRequest ByteString) @'CancelRequestType (CancelRequest key))
-    -- The server closes the connection once it has handled the request.
-    let waitForClose = do
-          received <- allocaBytes 64 $ \buffer -> readInputInto (channelInput channel) buffer 64
-          unless (received == 0) waitForClose
-    waitForClose `catch` \(_ :: IOException) -> pure ()
+    let channel = opened pending 64
+    ( do
+        channelSend channel (serialize @(CancelRequest ByteString) @'CancelRequestType (CancelRequest key))
+        -- The server closes the connection once it has handled the request.
+        let waitForClose = do
+              received <- allocaBytes 64 $ \buffer -> readInputInto (channelInput channel) buffer 64
+              unless (received == 0) waitForClose
+        waitForClose `catch` \(_ :: IOException) -> pure ()
+      )
+      `finally` channelClose channel
 
 -- | Parse (unless the statement is prepared already), Bind and Execute. A
 -- prepared statement is described instead if a parameter streams: the server
