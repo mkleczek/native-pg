@@ -162,6 +162,26 @@ main = withCluster $ \socketPath port -> hspec $ do
         result <- try (either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") (tcp "sslmode=require")))
         either (pure . displayException @ConnectFailure) (\(session, _, _) -> close session *> fail "connected") result
           `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in")
+      it "verifies the server's certificate and name with sslmode=verify-full" $ do
+        pendingWith "verifying the server isn't supported"
+        withConnection (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1")) $ \(session, _, _) ->
+          encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
+        withConnection (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt"))) $ \(session, _, _) ->
+          encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
+      it "refuses a server whose certificate no root signed, or that has another name" $ do
+        pendingWith "verifying the server isn't supported"
+        let at host = "connection to server at \"" <> host <> "\" (127.0.0.1), port " <> show port <> " failed: "
+        connectFailure (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "other-ca.crt") <> " host=localhost hostaddr=127.0.0.1"))
+          `shouldReturn` (at "localhost" <> "SSL error: invalid peer certificate: UnknownIssuer")
+        connectFailure (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=other.example hostaddr=127.0.0.1"))
+          `shouldReturn` (at "other.example" <> "SSL error: invalid peer certificate: NotValidForName")
+      it "needs the root certificate file, as libpq does" $ do
+        pendingWith "verifying the server isn't supported"
+        connectFailure (tcp "sslmode=verify-full sslrootcert=/nonexistent/root.crt host=localhost hostaddr=127.0.0.1")
+          `shouldReturn` ( "connection to server at \"localhost\" (127.0.0.1), port "
+                             <> show port
+                             <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
+                         )
       it "sends a batch larger than the sockets hold while reading its results" $ do
         withConnection (tcp "sslmode=require") $ \(session, _, _) -> do
           let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
