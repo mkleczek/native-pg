@@ -199,7 +199,6 @@ main = withCluster $ \socketPath port -> hspec $ do
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
       it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do
-        pendingWith "TLS's versions aren't configurable"
         let version extra = withConnection (tcp ("sslmode=require " <> extra)) $ \(session, _, _) ->
               value session "SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
         version "" `shouldReturn` Right ([[Just "TLSv1.3"]], "SELECT 1")

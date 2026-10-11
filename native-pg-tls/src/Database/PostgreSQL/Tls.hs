@@ -39,20 +39,27 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import Data.Foldable (for_)
-import Data.Word (Word32, Word8)
-import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsClient (..), TlsError (..), TlsSettings (..), newChannel)
+import Data.Word (Word16, Word32, Word8)
+import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString)
 import Foreign.C.Types (CBool (..), CChar, CInt (..), CSize (..), CUInt (..))
 import Foreign.ForeignPtr (FinalizerPtr, ForeignPtr, finalizeForeignPtr, newForeignPtr, withForeignPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
-import Foreign.Marshal.Utils (with)
+import Foreign.Marshal.Array (withArrayLen)
+import Foreign.Marshal.Utils (fromBool, with)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (Storable, peek)
 import Network.Socket (Socket, close, withFdSocket)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Types (Fd (..))
+
+-- | A version's number in TLS.
+version :: TlsVersion -> Word16
+version = \case
+  Tls12 -> 0x0303
+  Tls13 -> 0x0304
 
 -- | Starts TLS for native-pg's connections, with a new configuration each
 -- time, so that changed certificate files count, as with libpq.
@@ -65,12 +72,17 @@ tlsClient = TlsClient $ \settings serverName sock -> do
 newtype TlsConfig = TlsConfig (ForeignPtr ClientConfig)
 
 -- | A configuration with the settings. Its connections offer ALPN's
--- @postgresql@, and send the server's name with SNI unless it's an IP
--- address. Throws 'TlsError' if a certificate file can't be used.
+-- @postgresql@. Throws 'TlsError' if a certificate file can't be used.
 newTlsConfig :: TlsSettings -> IO TlsConfig
 newTlsConfig settings = do
-  builder <- c_client_config_builder_new
+  builder <-
+    -- The default provider, rustls-ffi's from its build, made the process's.
+    bracket (built "rustls has no crypto provider" c_crypto_provider_builder_new_from_default) c_crypto_provider_builder_free $ \providerBuilder ->
+      bracket (built "could not make the crypto provider" (c_crypto_provider_builder_build providerBuilder)) c_crypto_provider_free $ \provider ->
+        withArrayLen (map version (tlsVersions settings)) $ \count versions ->
+          built "could not configure TLS's versions" (c_client_config_builder_new_custom provider versions (fromIntegral count))
   ( do
+      c_client_config_builder_set_enable_sni builder (fromBool (tlsServerNameIndication settings))
       case tlsVerification settings of
         NoVerification -> check "could not configure the certificate verifier" =<< c_accept_any_certificate builder
         VerifyFull (RootCertificateFile roots) -> withVerifier roots (c_client_config_builder_set_server_verifier builder)
@@ -311,6 +323,10 @@ resultPlaintextEmpty = 7011
 
 data ClientConfigBuilder
 
+data CryptoProvider
+
+data CryptoProviderBuilder
+
 data CertifiedKey
 
 data ClientConfig
@@ -326,8 +342,23 @@ data ServerCertVerifier
 -- | rustls's state of a connection.
 data RustlsConnection
 
-foreign import capi unsafe "rustls.h rustls_client_config_builder_new"
-  c_client_config_builder_new :: IO (Ptr ClientConfigBuilder)
+foreign import capi unsafe "rustls.h rustls_crypto_provider_builder_new_from_default"
+  c_crypto_provider_builder_new_from_default :: Ptr () -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_crypto_provider_builder_build"
+  c_crypto_provider_builder_build :: Ptr CryptoProviderBuilder -> Ptr () -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_crypto_provider_builder_free"
+  c_crypto_provider_builder_free :: Ptr CryptoProviderBuilder -> IO ()
+
+foreign import capi unsafe "rustls.h rustls_crypto_provider_free"
+  c_crypto_provider_free :: ConstPtr CryptoProvider -> IO ()
+
+foreign import capi unsafe "rustls.h rustls_client_config_builder_new_custom"
+  c_client_config_builder_new_custom :: ConstPtr CryptoProvider -> Ptr Word16 -> CSize -> Ptr () -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_client_config_builder_set_enable_sni"
+  c_client_config_builder_set_enable_sni :: Ptr ClientConfigBuilder -> CBool -> IO ()
 
 foreign import capi unsafe "rustls.h rustls_client_config_builder_free"
   c_client_config_builder_free :: Ptr ClientConfigBuilder -> IO ()

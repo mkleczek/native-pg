@@ -48,7 +48,7 @@ import Data.Word (Word8)
 import Database.PostgreSQL.Protocol (ProtocolVersion (..), protocolVersion3_0, protocolVersion3_2)
 import Database.PostgreSQL.Protocol.Codec (InputError (..))
 import Database.PostgreSQL.Session
-import Database.PostgreSQL.Transport (Address (..), ConnectError, RootCertificates (..), TcpOptions (..))
+import Database.PostgreSQL.Transport (Address (..), ConnectError, RootCertificates (..), TcpOptions (..), TlsVersion (..))
 import Network.Socket (PortNumber)
 import System.Directory (doesFileExist)
 import System.Environment (getEnvironment)
@@ -87,7 +87,11 @@ data ConnectionString = ConnectionString
     -- @sslcrldir@ is given, libpq's default file in the home directory, and
     -- from @sslcrldir@.
     connectionSslRevocationList :: Maybe FilePath,
-    connectionSslRevocationListDirectory :: Maybe FilePath
+    connectionSslRevocationListDirectory :: Maybe FilePath,
+    -- | The versions of TLS from @ssl_min_protocol_version@, @TLSv1.2@ by
+    -- default, to @ssl_max_protocol_version@, that rustls has.
+    connectionSslVersions :: [TlsVersion],
+    connectionSslServerNameIndication :: Bool
   }
   deriving (Eq, Show)
 
@@ -456,6 +460,14 @@ resolve option home localUser = do
   maxVersion <- protocolVersion "max_protocol_version"
   when (minVersion > maxVersion) $
     Left "min_protocol_version is greater than max_protocol_version"
+  -- rustls has no version below 1.2, so a lower minimum is 1.2's.
+  minTls <- maybe (Right Tls12) (fmap (max Tls12 . fromMaybe Tls12) . tlsVersion "ssl_min_protocol_version") (given "ssl_min_protocol_version")
+  maxTls <- maybe (Right (Just maxBound)) (tlsVersion "ssl_max_protocol_version") (given "ssl_max_protocol_version")
+  sslVersions <- case maxTls of
+    Nothing -> Left "ssl_max_protocol_version is lower than TLSv1.2, the lowest version supported"
+    Just highest
+      | minTls > highest -> Left "invalid SSL protocol version range"
+      | otherwise -> Right [minTls .. highest]
   keepalives <- maybe (Right True) (fmap (/= 0) . integer "keepalives") (given "keepalives")
   tcp <-
     TcpOptions keepalives
@@ -486,7 +498,9 @@ resolve option home localUser = do
           (Just file, _) -> Just (text file)
           (Nothing, Nothing) -> (<> "/.postgresql/root.crl") <$> home
           (Nothing, Just _) -> Nothing,
-        connectionSslRevocationListDirectory = text <$> given "sslcrldir"
+        connectionSslRevocationListDirectory = text <$> given "sslcrldir",
+        connectionSslVersions = sslVersions,
+        connectionSslServerNameIndication = given "sslsni" /= Just "0"
       }
   where
     -- An empty value counts as none, as it does in libpq.
@@ -509,6 +523,13 @@ resolve option home localUser = do
     positive keyword = do
       parsed <- traverse (integer keyword) (given keyword)
       Right (parsed >>= \value -> if value <= 0 then Nothing else Just value)
+    -- A version of TLS rustls has, or Nothing for one lower.
+    tlsVersion keyword value = case value of
+      "TLSv1" -> Right Nothing
+      "TLSv1.1" -> Right Nothing
+      "TLSv1.2" -> Right (Just Tls12)
+      "TLSv1.3" -> Right (Just Tls13)
+      _ -> Left ("invalid " <> text keyword <> " value: " <> quote value)
     protocolVersion keyword = case given keyword of
       Nothing -> Right protocolVersion3_0
       Just "3.0" -> Right protocolVersion3_0
@@ -568,6 +589,8 @@ hostConnectSettings string host =
       connectSslCertificate = connectionSslCertificate string,
       connectSslRevocationList = connectionSslRevocationList string,
       connectSslRevocationListDirectory = connectionSslRevocationListDirectory string,
+      connectSslVersions = connectionSslVersions string,
+      connectSslServerNameIndication = connectionSslServerNameIndication string,
       -- With hostaddr, the address is the IP address the name resolved to.
       connectServerName = Just (hostName host)
     }

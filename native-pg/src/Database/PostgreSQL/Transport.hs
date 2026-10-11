@@ -22,6 +22,7 @@ module Database.PostgreSQL.Transport
     TlsSettings (..),
     ServerVerification (..),
     RootCertificates (..),
+    TlsVersion (..),
     TlsError (..),
 
     -- * Output sent as answers are read
@@ -264,9 +265,18 @@ data TlsSettings = TlsSettings
     tlsClientCertificate :: Maybe (FilePath, FilePath),
     -- | Certificate revocation lists, in PEM files, which every certificate
     -- of the server's chain is checked against when it's verified.
-    tlsRevocationLists :: [FilePath]
+    tlsRevocationLists :: [FilePath],
+    -- | The versions of TLS the connection may use.
+    tlsVersions :: [TlsVersion],
+    -- | Whether to send the server's name, unless it's an IP address, as
+    -- libpq's @sslsni@ asks.
+    tlsServerNameIndication :: Bool
   }
   deriving (Eq, Show)
+
+-- | The versions of TLS rustls has.
+data TlsVersion = Tls12 | Tls13
+  deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | How the server's certificate is checked.
 data ServerVerification

@@ -24,7 +24,7 @@ import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session (ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
-import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), defaultTcpOptions)
+import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import Test.Hspec
@@ -233,7 +233,9 @@ main = hspec $ do
               connectionSslMode = SslPrefer,
               connectionSslCertificate = Nothing,
               connectionSslRevocationList = Nothing,
-              connectionSslRevocationListDirectory = Nothing
+              connectionSslRevocationListDirectory = Nothing,
+              connectionSslVersions = [Tls12, Tls13],
+              connectionSslServerNameIndication = True
             }
     it "reads a URI" $ do
       let parsed = parse "postgresql://alice:p%40ss@db.example.com:6543/app?application_name=api&connect_timeout=10"
@@ -328,6 +330,15 @@ main = hspec $ do
       lists (parse "sslcrl=/a.crl sslcrldir=/crls") `shouldBe` Right (Just "/a.crl", Just "/crls")
       lists (parseWith [("HOME", "/home/u")] "") `shouldBe` Right (Just "/home/u/.postgresql/root.crl", Nothing)
       lists (parseWith [("HOME", "/home/u")] "sslcrldir=/crls") `shouldBe` Right (Nothing, Just "/crls")
+    it "reads TLS's versions, of those rustls has, and sslsni" $ do
+      let versions = fmap connectionSslVersions
+      versions (parse "ssl_min_protocol_version=TLSv1.3") `shouldBe` Right [Tls13]
+      versions (parse "ssl_max_protocol_version=TLSv1.2") `shouldBe` Right [Tls12]
+      versions (parse "ssl_min_protocol_version=TLSv1") `shouldBe` Right [Tls12, Tls13]
+      parse "ssl_max_protocol_version=TLSv1.1" `shouldSatisfy` failsWith "lower than TLSv1.2, the lowest version supported"
+      parse "ssl_min_protocol_version=TLSv1.3 ssl_max_protocol_version=TLSv1.2" `shouldSatisfy` failsWith "invalid SSL protocol version range"
+      parse "ssl_min_protocol_version=SSLv3" `shouldSatisfy` failsWith "invalid ssl_min_protocol_version value: \"SSLv3\""
+      fmap connectionSslServerNameIndication (parse "sslsni=0") `shouldBe` Right False
     it "rejects what verifies the server's certificate but not its name" $ do
       parse "sslmode=verify-ca" `shouldSatisfy` failsWith "sslmode=verify-ca verifies the server's certificate but not its name, which isn't supported"
       parseWith [("PGSSLMODE", "verify-ca")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-ca verifies"

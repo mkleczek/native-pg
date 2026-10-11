@@ -115,6 +115,7 @@ import Database.PostgreSQL.Transport
     TlsClient (..),
     TlsError,
     TlsSettings (..),
+    TlsVersion,
     Unsent,
     connectSocket,
     defaultTcpOptions,
@@ -361,7 +362,12 @@ data ConnectSettings = ConnectSettings
     -- directory of them, named as OpenSSL's c_rehash names them, as with
     -- libpq.
     connectSslRevocationList :: Maybe FilePath,
-    connectSslRevocationListDirectory :: Maybe FilePath
+    connectSslRevocationListDirectory :: Maybe FilePath,
+    -- | The versions of TLS the connection may use.
+    connectSslVersions :: [TlsVersion],
+    -- | Whether to send the server's name with TLS, unless it's an IP
+    -- address.
+    connectSslServerNameIndication :: Bool
   }
 
 -- | Whether to encrypt with TLS, from libpq's sslmode.
@@ -382,7 +388,8 @@ data SslMode
   deriving (Eq, Show)
 
 -- | No password, database or extra parameters, protocol 3.0, 16 KiB read
--- buffers, TCP keepalives and no TLS.
+-- buffers, TCP keepalives and no TLS, but TLS's versions and server name
+-- indication should it be asked for.
 connectSettings :: Address -> ByteString -> ConnectSettings
 connectSettings address user =
   ConnectSettings
@@ -399,7 +406,9 @@ connectSettings address user =
       connectTlsClient = Nothing,
       connectSslCertificate = Nothing,
       connectSslRevocationList = Nothing,
-      connectSslRevocationListDirectory = Nothing
+      connectSslRevocationListDirectory = Nothing,
+      connectSslVersions = [minBound .. maxBound],
+      connectSslServerNameIndication = True
     }
 
 data ServerInfo = ServerInfo
@@ -502,7 +511,11 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
                       certificate <- clientCertificate
                       lists <- revocationLists
                       start
-                        =<< startTlsChannel client (TlsSettings verification certificate lists) (fromMaybe host (connectServerName settings)) sock
+                        =<< startTlsChannel
+                          client
+                          (TlsSettings verification certificate lists (connectSslVersions settings) (connectSslServerNameIndication settings))
+                          (fromMaybe host (connectServerName settings))
+                          sock
                           `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
                 if required then started else started `catch` (throwIO . FailedWithTls)
           _ -> start (newChannel sock)
