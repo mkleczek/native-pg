@@ -13,15 +13,16 @@ module Database.PostgreSQL.Authentication
     scramClientFirst,
     scramMechanism,
     scramVerifyServerFinal,
+    serverEndPoint,
   )
 where
 
 import Control.Monad (unless)
-import Crypto.Hash (MD5 (..), SHA256 (..), hashWith)
+import Crypto.Hash (HashAlgorithm, MD5 (..), SHA224 (..), SHA256 (..), SHA384 (..), SHA512 (..), hashWith)
 import Crypto.KDF.PBKDF2 (Parameters (..), fastPBKDF2_SHA256)
 import Crypto.MAC.HMAC (HMAC, hmac)
 import Crypto.Random (getRandomBytes)
-import Data.Bits (xor)
+import Data.Bits (shiftL, testBit, xor, (.&.), (.|.))
 import qualified Data.ByteArray as ByteArray
 import Data.ByteArray.Encoding (Base (Base16), convertToBase)
 import Data.ByteString (ByteString)
@@ -93,6 +94,61 @@ scramVerifyServerFinal expected serverFinal =
       Left _ -> Left ("invalid server-final-message " <> show serverFinal)
   where
     attributes = BS.split comma serverFinal
+
+-- | Channel binding's data for tls-server-end-point (RFC 5929): the hash of
+-- the server's certificate, given in DER, with the hash its signature
+-- algorithm uses, or SHA-256 for MD5 and SHA-1. Fails for a certificate
+-- whose signature algorithm has no hash, e.g. Ed25519, as PostgreSQL does.
+serverEndPoint :: ByteString -> Either String ByteString
+serverEndPoint certificate = do
+  (_, body, _) <- element 0x30 certificate
+  -- The certificate's signed part, then its signature's algorithm.
+  (_, _, afterSigned) <- element 0x30 body
+  (_, algorithm, _) <- element 0x30 afterSigned
+  (_, identifier, _) <- element 0x06 algorithm
+  case lookup identifier hashes of
+    Just hash -> Right (hash certificate)
+    Nothing -> Left "could not determine the hash of the server certificate's signature algorithm"
+  where
+    hashes =
+      [ (rsa 4, digest SHA256), -- MD5
+        (rsa 5, digest SHA256), -- SHA-1
+        (rsa 14, digest SHA224),
+        (rsa 11, digest SHA256),
+        (rsa 12, digest SHA384),
+        (rsa 13, digest SHA512),
+        (ecdsa [1], digest SHA256), -- SHA-1
+        (ecdsa [3, 1], digest SHA224),
+        (ecdsa [3, 2], digest SHA256),
+        (ecdsa [3, 3], digest SHA384),
+        (ecdsa [3, 4], digest SHA512)
+      ]
+    -- 1.2.840.113549.1.1.n and 1.2.840.10045.4.n
+    rsa n = BS.pack [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, n]
+    ecdsa ns = BS.pack ([0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04] <> ns)
+    digest :: HashAlgorithm algorithm => algorithm -> ByteString -> ByteString
+    digest algorithm = ByteArray.convert . hashWith algorithm
+
+-- | A DER element with the tag: its header, its content, and what follows.
+element :: Word8 -> ByteString -> Either String (ByteString, ByteString, ByteString)
+element tag bytes = case BS.unpack (BS.take 2 bytes) of
+  [actual, first]
+    | actual /= tag -> Left "malformed certificate"
+    | not (testBit first 7) -> split 2 (fromIntegral first)
+    | otherwise -> do
+        let count = fromIntegral (first .&. 0x7f)
+            lengthBytes = BS.take count (BS.drop 2 bytes)
+        if count == 0 || count > 4 || BS.length lengthBytes < count
+          then Left "malformed certificate"
+          else split (2 + count) (BS.foldl' (\total byte -> total `shiftL` 8 .|. fromIntegral byte) 0 lengthBytes)
+  _ -> Left "malformed certificate"
+  where
+    split headerLength contentLength
+      | BS.length bytes < headerLength + contentLength = Left "malformed certificate"
+      | otherwise =
+          let (header, rest) = BS.splitAt headerLength bytes
+              (content, after) = BS.splitAt contentLength rest
+           in Right (header, content, after)
 
 -- | No channel binding: it needs TLS.
 gs2Header :: ByteString

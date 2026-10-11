@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Generates the certificates the TLS tests use: a CA, and certificates it
 # signs for a server on localhost, a server with another name, and a client;
-# another CA, which signs nothing the tests trust; and the CA's revocation
-# lists, one empty and one revoking the server's certificate. They're valid
-# for a century, so they're generated once and committed.
+# another CA, which signs nothing the tests trust; the CA's revocation lists,
+# one empty and one revoking the server's certificate; and certificates with
+# other signature algorithms, for channel binding's hashes. They're valid for
+# a century, so they're generated once and committed.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -57,4 +58,17 @@ signed client native_pg_certificate \
   "$(printf '%s\n' "keyUsage=critical,digitalSignature" "extendedKeyUsage=clientAuth")"
 crl empty
 crl revoked server.crt
+
+# A self-signed certificate with the key type and the digest given.
+self_signed() {
+  local name=$1 algorithm=$2
+  shift 2
+  openssl req -x509 -newkey "$algorithm" -nodes -keyout "$name.key" -days "$days" -subj "/CN=$name" "$@" -out "$name.crt"
+  rm "$name.key"
+}
+
+self_signed rsa-sha256 rsa:2048 -sha256
+self_signed ecdsa-sha384 ec -pkeyopt ec_paramgen_curve:P-384 -sha384
+self_signed rsa-sha1 rsa:2048 -sha1
+self_signed ed25519 ed25519
 rm -f ca.srl other-ca.key

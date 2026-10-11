@@ -5,8 +5,11 @@
 module Main (main) where
 
 import Control.Exception (displayException, evaluate)
+import Data.ByteArray.Encoding (Base (Base16), convertToBase)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base64 as Base64
+import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (toList)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
@@ -214,6 +217,17 @@ main = hspec $ do
     it "rejects a server nonce that doesn't extend the client's" $ do
       let (_, client) = scramClientFirst "user" "rOprNGfwEbeRWgbNEkqO"
       fmap fst (scramClientFinal "pencil" client "r=other,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096") `shouldSatisfy` isLeft
+
+  describe "channel binding" $
+    it "hashes the server's certificate as its signature algorithm does, or with SHA-256 for SHA-1" $ do
+      let endPoint name = do
+            pem <- BS.readFile ("test/native-pg-tls/certificates/" <> name <> ".crt")
+            pure (fmap (convertToBase Base16) (serverEndPoint (der pem)) :: Either String ByteString)
+      endPoint "server" `shouldReturn` Right "ffc8c8c206fee834bde27d211994f9a8b5bc449c0ecddb35df387572b0295188"
+      endPoint "rsa-sha256" `shouldReturn` Right "5bd80d76dc3cbc6a0ce8e34397aac96c63bf28bd7603ff11d7cba416cf91c843"
+      endPoint "ecdsa-sha384" `shouldReturn` Right "f4ed9060c9b5745a184ce7dcfbcd3eb9bc27b017b160f88e83bcc1f7dc4533f2141c9989f70d1d6455e2ba4f21ef449e"
+      endPoint "rsa-sha1" `shouldReturn` Right "04e295792fb92a45b2638401c53c622a51408d206ba236d6eda070d55718e01c"
+      endPoint "ed25519" `shouldReturn` Left "could not determine the hash of the server certificate's signature algorithm"
 
   describe "connection strings" $ do
     it "fills in libpq's defaults" $
@@ -548,6 +562,12 @@ int16 value = BS.drop 2 (int32 value)
 
 byte :: Char -> Word8
 byte = fromIntegral . fromEnum
+
+-- | The DER of a PEM certificate.
+der :: ByteString -> ByteString
+der pem =
+  either error id . Base64.decode . BS.concat . takeWhile (not . BS.isPrefixOf "-----END") . drop 1 $
+    dropWhile (not . BS.isPrefixOf "-----BEGIN") (Char8.lines pem)
 
 parse :: ByteString -> Either String ConnectionString
 parse = parseWith []
