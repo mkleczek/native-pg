@@ -38,6 +38,7 @@ import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
+import Data.Foldable (for_)
 import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsClient (..), TlsError (..), TlsSettings (..), newChannel)
 import Foreign.C.ConstPtr (ConstPtr (..))
@@ -46,6 +47,7 @@ import Foreign.C.String (CString, peekCStringLen, withCString)
 import Foreign.C.Types (CBool (..), CChar, CInt (..), CSize (..), CUInt (..))
 import Foreign.ForeignPtr (FinalizerPtr, ForeignPtr, finalizeForeignPtr, newForeignPtr, withForeignPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Marshal.Utils (with)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (Storable, peek)
 import Network.Socket (Socket, close, withFdSocket)
@@ -73,6 +75,18 @@ newTlsConfig settings = do
         NoVerification -> check "could not configure the certificate verifier" =<< c_accept_any_certificate builder
         VerifyFull (RootCertificateFile roots) -> withVerifier roots (c_client_config_builder_set_server_verifier builder)
         VerifyFull SystemRootCertificates -> c_client_config_builder_set_server_verifier builder . ConstPtr =<< systemVerifier
+      for_ (tlsClientCertificate settings) $ \(chainFile, keyFile) -> do
+        chain <- BS.readFile chainFile
+        key <- BS.readFile keyFile
+        certified <-
+          BS.unsafeUseAsCStringLen chain $ \(chainBytes, chainLength) ->
+            BS.unsafeUseAsCStringLen key $ \(keyBytes, keyLength) ->
+              built
+                ("could not load client certificate file " <> show chainFile <> " with its key")
+                (c_certified_key_build (castPtr chainBytes) (fromIntegral chainLength) (castPtr keyBytes) (fromIntegral keyLength))
+        -- The configuration keeps a reference of its own to the key.
+        with certified (\keys -> check "could not use the client certificate" =<< c_client_config_builder_set_certified_key builder (castPtr keys) 1)
+          `finally` c_certified_key_free certified
       check "could not configure ALPN" =<< c_offer_postgresql builder
     )
     `onException` c_client_config_builder_free builder
@@ -290,6 +304,8 @@ resultPlaintextEmpty = 7011
 
 data ClientConfigBuilder
 
+data CertifiedKey
+
 data ClientConfig
 
 data RootCertStoreBuilder
@@ -311,6 +327,15 @@ foreign import capi unsafe "rustls.h rustls_client_config_builder_free"
 
 foreign import capi unsafe "rustls.h rustls_client_config_builder_set_server_verifier"
   c_client_config_builder_set_server_verifier :: Ptr ClientConfigBuilder -> ConstPtr ServerCertVerifier -> IO ()
+
+foreign import capi unsafe "rustls.h rustls_certified_key_build"
+  c_certified_key_build :: Ptr Word8 -> CSize -> Ptr Word8 -> CSize -> Ptr () -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_certified_key_free"
+  c_certified_key_free :: ConstPtr CertifiedKey -> IO ()
+
+foreign import capi unsafe "rustls.h rustls_client_config_builder_set_certified_key"
+  c_client_config_builder_set_certified_key :: Ptr ClientConfigBuilder -> Ptr () -> CSize -> IO Word32
 
 foreign import capi unsafe "rustls.h rustls_client_config_builder_build"
   c_client_config_builder_build :: Ptr ClientConfigBuilder -> Ptr () -> IO Word32

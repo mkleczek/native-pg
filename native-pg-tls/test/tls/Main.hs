@@ -31,28 +31,28 @@ main = hspec $ do
   describe "the handshake" $ do
     it "verifies the server's certificate against the roots, and its name" $
       withServer "server" $ \sock server -> do
-        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "ca.crt"))))
+        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "ca.crt"))) Nothing)
         void $ concurrently (startTls config "localhost" sock) (handshake server)
 
     it "connects to any server without verification" $
       withServer "server-other-name" $ \sock server -> do
-        config <- newTlsConfig (TlsSettings NoVerification)
+        config <- newTlsConfig (TlsSettings NoVerification Nothing)
         void $ concurrently (startTls config "localhost" sock) (handshake server)
 
     it "refuses a certificate that no root signed" $
       withServer "server" $ \sock server -> do
-        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "other-ca.crt"))))
+        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "other-ca.crt"))) Nothing)
         refusal config sock server `shouldReturn` "SSL error: invalid peer certificate: UnknownIssuer"
 
     it "refuses a certificate for another name" $
       withServer "server-other-name" $ \sock server -> do
-        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "ca.crt"))))
+        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "ca.crt"))) Nothing)
         refusal config sock server `shouldReturn` "SSL error: invalid peer certificate: NotValidForName"
 
   describe "a connection" $ do
     it "carries more bytes both ways than the sockets hold" $
       withServer "server" $ \sock server -> do
-        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "ca.crt"))))
+        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "ca.crt"))) Nothing)
         let payload = BS.pack (take 1000000 (cycle [0 .. 250]))
             client = do
               tls <- startTls config "localhost" sock
@@ -64,14 +64,14 @@ main = hspec $ do
 
     it "ends the server's stream when it closes" $
       withServer "server" $ \sock server -> do
-        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "ca.crt"))))
+        config <- newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "ca.crt"))) Nothing)
         (client, ()) <- concurrently (startTls config "localhost" sock) (handshake server)
         closeTls client
         receiveExactly server 1 `shouldReturn` BS.empty
 
   describe "a configuration" $
     it "needs its root certificate file" $
-      newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "missing.crt"))))
+      newTlsConfig (TlsSettings (VerifyFull (RootCertificateFile (certificate "missing.crt"))) Nothing)
         `shouldThrow` \(TlsError reason) -> "could not read root certificate file" `isInfixOf` reason
 
 -- | Sends the pieces, waiting for room in the socket as needed.

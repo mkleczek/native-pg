@@ -199,7 +199,6 @@ main = withCluster $ \socketPath port -> hspec $ do
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
       it "authenticates with a client certificate" $ do
-        pendingWith "client certificates aren't supported"
         withKeyCopy ownerReadMode $ \key -> do
           let certified = "user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key
           withConnection (tcp certified) $ \(session, _, _) ->
@@ -207,7 +206,6 @@ main = withCluster $ \socketPath port -> hspec $ do
         failure <- connectFailure (tcp "user=native_pg_certificate sslmode=require sslcert=/nonexistent/client.crt sslkey=/nonexistent/client.key")
         failure `shouldSatisfy` isInfixOf "connection requires a valid client certificate"
       it "needs a client certificate's key, readable only by its owner, as libpq does" $ do
-        pendingWith "client certificates aren't supported"
         let certified key = tcp ("user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key)
             at = "connection to server at \"127.0.0.1\", port " <> show port <> " failed: "
         connectFailure (certified "/nonexistent/client.key")

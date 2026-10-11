@@ -78,7 +78,11 @@ data ConnectionString = ConnectionString
     connectionProtocolVersion :: ProtocolVersion,
     connectionMinProtocolVersion :: ProtocolVersion,
     connectionTcpOptions :: TcpOptions,
-    connectionSslMode :: SslMode
+    connectionSslMode :: SslMode,
+    -- | The client certificate and its private key, from @sslcert@ and
+    -- @sslkey@, or libpq's default files in the home directory, unless
+    -- @sslcertmode@ is @disable@.
+    connectionSslCertificate :: Maybe (FilePath, FilePath)
   }
   deriving (Eq, Show)
 
@@ -411,14 +415,22 @@ resolve option home localUser = do
           Just (Setting value _) | "1" `BS.isPrefixOf` value -> SslRequire
           _ -> SslPrefer
   choice "sslnegotiation" ["postgres"] ["direct"] "TLS"
-  choice "sslcertmode" ["disable", "allow"] ["require"] "TLS"
+  choice "sslcertmode" ["disable", "allow"] ["require"] "knowing whether the server asked for the certificate"
   choice "channel_binding" ["disable", "prefer"] ["require"] "TLS"
   choice "gssencmode" ["disable", "prefer"] ["require"] "GSSAPI encryption"
   choice "load_balance_hosts" ["disable"] ["random"] "random load balancing"
   for_ (option "replication") $ \(Setting value source) ->
     unless (value `elem` ["0", "false", "off", "no"]) $
       Left (source <> "=" <> text value <> " asks for a replication connection, which isn't supported")
-  mapM_ unsupported ["service", "require_auth", "requirepeer", "scram_client_key", "scram_server_key"]
+  -- rustls takes keys only in plaintext, and logs no keys through it.
+  mapM_ unsupported ["service", "require_auth", "requirepeer", "scram_client_key", "scram_server_key", "sslpassword", "sslkeylogfile"]
+  certificate <- case (given "sslcertmode", given "sslcert", given "sslkey", home) of
+    (Just "disable", _, _, _) -> Right Nothing
+    (_, Just chain, Just key, _) -> Right (Just (text chain, text key))
+    (_, chain, key, Just directory) ->
+      Right (Just (maybe (directory <> "/.postgresql/postgresql.crt") text chain, maybe (directory <> "/.postgresql/postgresql.key") text key))
+    (_, Nothing, _, Nothing) -> Right Nothing
+    (_, Just _, Nothing, Nothing) -> Left "could not get home directory to locate client certificate files"
   hosts <- hostList
   user <- case given "user" of
     Just user -> Right user
@@ -463,7 +475,8 @@ resolve option home localUser = do
         connectionProtocolVersion = maxVersion,
         connectionMinProtocolVersion = minVersion,
         connectionTcpOptions = tcp,
-        connectionSslMode = sslMode
+        connectionSslMode = sslMode,
+        connectionSslCertificate = certificate
       }
   where
     -- An empty value counts as none, as it does in libpq.
@@ -542,6 +555,7 @@ hostConnectSettings string host =
       connectProtocolVersion = connectionProtocolVersion string,
       connectTcpOptions = connectionTcpOptions string,
       connectSslMode = connectionSslMode string,
+      connectSslCertificate = connectionSslCertificate string,
       -- With hostaddr, the address is the IP address the name resolved to.
       connectServerName = Just (hostName host)
     }

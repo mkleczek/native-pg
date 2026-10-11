@@ -257,8 +257,11 @@ newtype TlsClient = TlsClient
   }
 
 -- | How a TLS link is configured.
-newtype TlsSettings = TlsSettings
-  { tlsVerification :: ServerVerification
+data TlsSettings = TlsSettings
+  { tlsVerification :: ServerVerification,
+    -- | A certificate chain and its private key, in PEM files, for the
+    -- server to authenticate the client with, if it asks.
+    tlsClientCertificate :: Maybe (FilePath, FilePath)
   }
   deriving (Eq, Show)
 

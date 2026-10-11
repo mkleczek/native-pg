@@ -1,6 +1,8 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -53,7 +55,7 @@ module Database.PostgreSQL.Session
   )
 where
 
-import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, finally, onException, throwIO)
+import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, finally, onException, throwIO, try)
 import Control.Monad (join, unless, when, (<=<))
 import Data.Bifunctor (first)
 import Data.Foldable (for_)
@@ -63,7 +65,13 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.Kind (Type)
 import Data.Maybe (fromMaybe)
+#if defined(mingw32_HOST_OS)
+import System.Directory (doesFileExist, getPermissions)
+#else
 import System.Directory (doesFileExist)
+import qualified System.Posix.Files as Posix
+import qualified System.Posix.User as Posix
+#endif
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..))
 import Database.PostgreSQL.Diagnostics (ServerError (..), diagnostics, isConnectionFatal)
 import Database.PostgreSQL.Authentication
@@ -343,7 +351,10 @@ data ConnectSettings = ConnectSettings
     connectServerName :: Maybe HostName,
     -- | What starts TLS: native-pg-tls's, which this library doesn't depend
     -- on. Without it, a connection that requires TLS fails.
-    connectTlsClient :: Maybe TlsClient
+    connectTlsClient :: Maybe TlsClient,
+    -- | A client certificate and its private key, in PEM files, used if the
+    -- certificate file exists, as with libpq.
+    connectSslCertificate :: Maybe (FilePath, FilePath)
   }
 
 -- | Whether to encrypt with TLS, from libpq's sslmode.
@@ -378,7 +389,8 @@ connectSettings address user =
       connectTcpOptions = defaultTcpOptions,
       connectSslMode = SslDisable,
       connectServerName = Nothing,
-      connectTlsClient = Nothing
+      connectTlsClient = Nothing,
+      connectSslCertificate = Nothing
     }
 
 data ServerInfo = ServerInfo
@@ -477,12 +489,27 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
                 | required -> throwIO (TlsFailure "server does not support SSL, but SSL was required")
                 | otherwise -> start (newChannel sock)
               True -> do
-                let started =
+                let started = do
+                      certificate <- clientCertificate
                       start
-                        =<< startTlsChannel client (TlsSettings verification) (fromMaybe host (connectServerName settings)) sock
+                        =<< startTlsChannel client (TlsSettings verification certificate) (fromMaybe host (connectServerName settings)) sock
                           `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
                 if required then started else started `catch` (throwIO . FailedWithTls)
           _ -> start (newChannel sock)
+    -- The client certificate, if its file exists, with its private key,
+    -- which has to exist and be readable only by its owner, as with libpq.
+    clientCertificate = case connectSslCertificate settings of
+      Nothing -> pure Nothing
+      Just (chain, key) -> do
+        present <- doesFileExist chain
+        if not present
+          then pure Nothing
+          else do
+            usable <- try (privateKeyFile key)
+            case usable of
+              Left (_ :: IOException) -> throwIO (TlsFailure ("certificate present, but not private key file \"" <> key <> "\""))
+              Right (Just problem) -> throwIO (TlsFailure ("private key file \"" <> key <> "\" " <> problem))
+              Right Nothing -> pure (Just (chain, key))
     -- Given how to make the channel, once there's somewhere for its unsent
     -- output.
     start channel = do
@@ -495,6 +522,28 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
       send @'StartupMessageType session (startupMessage settings)
       (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
       initialize version initializing
+
+-- | What's wrong with a private key file, as libpq checks it, if anything.
+privateKeyFile :: FilePath -> IO (Maybe String)
+#if defined(mingw32_HOST_OS)
+privateKeyFile key = Nothing <$ getPermissions key
+#else
+privateKeyFile key = do
+  status <- Posix.getFileStatus key
+  user <- Posix.getEffectiveUserID
+  let mode = Posix.fileMode status
+      open bits = Posix.intersectFileModes mode bits /= Posix.nullFileMode
+      groupOrWorld = foldr Posix.unionFileModes Posix.nullFileMode [Posix.groupModes, Posix.otherModes]
+      groupWriteOrWorld = foldr Posix.unionFileModes Posix.nullFileMode [Posix.groupWriteMode, Posix.groupExecuteMode, Posix.otherModes]
+  pure $
+    if
+      | not (Posix.isRegularFile status) -> Just "is not a regular file"
+      | Posix.fileOwner status == user && open groupOrWorld -> Just tooOpen
+      | Posix.fileOwner status == 0 && open groupWriteOrWorld -> Just tooOpen
+      | otherwise -> Nothing
+  where
+    tooOpen = "has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root"
+#endif
 
 -- | A connection with TLS that wasn't required failed, so it's tried without.
 newtype FailedWithTls = FailedWithTls ConnectionError
