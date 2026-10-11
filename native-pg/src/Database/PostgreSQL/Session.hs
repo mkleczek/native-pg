@@ -77,7 +77,8 @@ import qualified System.Posix.User as Posix
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..))
 import Database.PostgreSQL.Diagnostics (ServerError (..), diagnostics, isConnectionFatal)
 import Database.PostgreSQL.Authentication
-  ( md5Password,
+  ( ChannelBinding (..),
+    md5Password,
     newScramNonce,
     scramClientFinal,
     scramClientFirst,
@@ -699,7 +700,7 @@ authenticate settings version session = do
 
 authenticateScram :: ByteString -> Session 'Authentication -> IO (Session 'Initialization)
 authenticateScram password session = do
-  (clientFirst, client) <- scramClientFirst "" <$> newScramNonce
+  (clientFirst, client) <- scramClientFirst WithoutChannelBinding "" <$> newScramNonce
   send @'SASLInitialResponseType session (SASLInitialResponse scramMechanism (Just clientFirst))
   let continuing = continueIn session :: Session 'SaslContinue
   serverFirst <-

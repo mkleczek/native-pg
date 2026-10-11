@@ -6,12 +6,14 @@
 -- form differs from its bytes (only possible with non-ASCII characters)
 -- fails to authenticate.
 module Database.PostgreSQL.Authentication
-  ( ScramClient,
+  ( ChannelBinding (..),
+    ScramClient,
     md5Password,
     newScramNonce,
     scramClientFinal,
     scramClientFirst,
     scramMechanism,
+    scramPlusMechanism,
     scramVerifyServerFinal,
     serverEndPoint,
   )
@@ -41,22 +43,47 @@ md5Password user password salt = "md5" <> md5Hex (md5Hex (password <> user) <> s
 scramMechanism :: ByteString
 scramMechanism = "SCRAM-SHA-256"
 
+-- | With channel binding.
+scramPlusMechanism :: ByteString
+scramPlusMechanism = "SCRAM-SHA-256-PLUS"
+
+-- | How SCRAM is bound to the channel, which the client's first message
+-- says (RFC 5802).
+data ChannelBinding
+  = -- | Not at all: the client can't, without TLS.
+    WithoutChannelBinding
+  | -- | Not at all, though the client could: the server doesn't offer it, or
+    -- the client doesn't want it. A server that does offer it then fails the
+    -- authentication, which protects against downgrades.
+    ChannelBindingUnused
+  | -- | To the server's certificate, with 'serverEndPoint''s data.
+    BoundToServerEndPoint ByteString
+  deriving (Eq, Show)
+
 -- | What the client remembers between its first and its final message.
 data ScramClient = ScramClient
   { scramNonce :: ByteString,
-    scramClientFirstBare :: ByteString
+    scramClientFirstBare :: ByteString,
+    -- | The GS2 header and the channel binding's data, which the final
+    -- message repeats.
+    scramChannelBinding :: ByteString
   }
 
 -- | A nonce of 24 printable characters, none of them a comma.
 newScramNonce :: IO ByteString
 newScramNonce = Base64.encode <$> getRandomBytes 18
 
--- | The client-first-message for a user name and a nonce. PostgreSQL ignores
--- the user name in it and uses the one from the startup message.
-scramClientFirst :: ByteString -> ByteString -> (ByteString, ScramClient)
-scramClientFirst user nonce = (gs2Header <> bare, ScramClient nonce bare)
+-- | The client-first-message for its channel binding, a user name and a
+-- nonce. PostgreSQL ignores the user name in it and uses the one from the
+-- startup message.
+scramClientFirst :: ChannelBinding -> ByteString -> ByteString -> (ByteString, ScramClient)
+scramClientFirst binding user nonce = (gs2Header <> bare, ScramClient nonce bare (gs2Header <> bindingData))
   where
     bare = "n=" <> user <> ",r=" <> nonce
+    (gs2Header, bindingData) = case binding of
+      WithoutChannelBinding -> ("n,,", "")
+      ChannelBindingUnused -> ("y,,", "")
+      BoundToServerEndPoint endPoint -> ("p=tls-server-end-point,,", endPoint)
 
 -- | Answers the server-first-message with the client-final-message, and
 -- returns the server signature the server-final-message has to carry.
@@ -72,7 +99,7 @@ scramClientFinal password client serverFirst = do
   let saltedPassword = fastPBKDF2_SHA256 (Parameters iterations 32) password salt :: ByteString
       clientKey = hmacSha256 saltedPassword "Client Key"
       storedKey = ByteArray.convert (hashWith SHA256 clientKey)
-      withoutProof = "c=" <> Base64.encode gs2Header <> ",r=" <> serverNonce
+      withoutProof = "c=" <> Base64.encode (scramChannelBinding client) <> ",r=" <> serverNonce
       authMessage = BS.intercalate "," [scramClientFirstBare client, serverFirst, withoutProof]
       proof = BS.pack (BS.zipWith xor clientKey (hmacSha256 storedKey authMessage))
       serverSignature = hmacSha256 (hmacSha256 saltedPassword "Server Key") authMessage
@@ -149,10 +176,6 @@ element tag bytes = case BS.unpack (BS.take 2 bytes) of
           let (header, rest) = BS.splitAt headerLength bytes
               (content, after) = BS.splitAt contentLength rest
            in Right (header, content, after)
-
--- | No channel binding: it needs TLS.
-gs2Header :: ByteString
-gs2Header = "n,,"
 
 attribute :: Char -> [ByteString] -> Either String ByteString
 attribute name attributes =

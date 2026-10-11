@@ -204,7 +204,7 @@ main = hspec $ do
     it "answers an MD5 password request" $
       md5Password "user" "pencil" "salt" `shouldBe` "md5d3d9bcccbaa2fb5234570d4d0f22b055"
     it "computes SCRAM-SHA-256 as in RFC 7677" $ do
-      let (clientFirst, client) = scramClientFirst "user" "rOprNGfwEbeRWgbNEkqO"
+      let (clientFirst, client) = scramClientFirst WithoutChannelBinding "user" "rOprNGfwEbeRWgbNEkqO"
       clientFirst `shouldBe` "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
       case scramClientFinal "pencil" client rfc7677ServerFirst of
         Left err -> expectationFailure err
@@ -215,10 +215,19 @@ main = hspec $ do
           scramVerifyServerFinal serverSignature "v=AAAA" `shouldSatisfy` isLeft
           scramVerifyServerFinal serverSignature "e=invalid-proof" `shouldSatisfy` isLeft
     it "rejects a server nonce that doesn't extend the client's" $ do
-      let (_, client) = scramClientFirst "user" "rOprNGfwEbeRWgbNEkqO"
+      let (_, client) = scramClientFirst WithoutChannelBinding "user" "rOprNGfwEbeRWgbNEkqO"
       fmap fst (scramClientFinal "pencil" client "r=other,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096") `shouldSatisfy` isLeft
 
-  describe "channel binding" $
+  describe "channel binding" $ do
+    it "says in SCRAM's messages how it binds to the channel" $ do
+      let messages binding = do
+            let (clientFirst, client) = scramClientFirst binding "" "rOprNGfwEbeRWgbNEkqO"
+            clientFinal <- fst <$> scramClientFinal "pencil" client rfc7677ServerFirst
+            pure (clientFirst, BS.takeWhile (/= 44) clientFinal)
+      messages WithoutChannelBinding `shouldBe` Right ("n,,n=,r=rOprNGfwEbeRWgbNEkqO", "c=biws")
+      messages ChannelBindingUnused `shouldBe` Right ("y,,n=,r=rOprNGfwEbeRWgbNEkqO", "c=eSws")
+      messages (BoundToServerEndPoint "hash")
+        `shouldBe` Right ("p=tls-server-end-point,,n=,r=rOprNGfwEbeRWgbNEkqO", "c=" <> Base64.encode "p=tls-server-end-point,,hash")
     it "hashes the server's certificate as its signature algorithm does, or with SHA-256 for SHA-1" $ do
       let endPoint name = do
             pem <- BS.readFile ("test/native-pg-tls/certificates/" <> name <> ".crt")
