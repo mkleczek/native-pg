@@ -110,7 +110,7 @@ receiveExactly tls count = BS.concat . reverse <$> go 0 []
 
 -- | The settings with the verification, and rustls's defaults otherwise.
 settings :: ServerVerification -> TlsSettings
-settings verification = TlsSettings verification Nothing [] [minBound .. maxBound] True
+settings verification = TlsSettings verification Nothing [] [minBound .. maxBound] True False
 
 certificate :: FilePath -> FilePath
 certificate name = "test/native-pg-tls/certificates/" <> name

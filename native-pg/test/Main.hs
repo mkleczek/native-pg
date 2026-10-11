@@ -235,7 +235,8 @@ main = hspec $ do
               connectionSslRevocationList = Nothing,
               connectionSslRevocationListDirectory = Nothing,
               connectionSslVersions = [Tls12, Tls13],
-              connectionSslServerNameIndication = True
+              connectionSslServerNameIndication = True,
+              connectionSslDirect = False
             }
     it "reads a URI" $ do
       let parsed = parse "postgresql://alice:p%40ss@db.example.com:6543/app?application_name=api&connect_timeout=10"
@@ -339,6 +340,11 @@ main = hspec $ do
       parse "ssl_min_protocol_version=TLSv1.3 ssl_max_protocol_version=TLSv1.2" `shouldSatisfy` failsWith "invalid SSL protocol version range"
       parse "ssl_min_protocol_version=SSLv3" `shouldSatisfy` failsWith "invalid ssl_min_protocol_version value: \"SSLv3\""
       fmap connectionSslServerNameIndication (parse "sslsni=0") `shouldBe` Right False
+    it "starts TLS directly with sslnegotiation=direct, only with an sslmode that requires TLS" $ do
+      fmap connectionSslDirect (parse "sslnegotiation=direct sslmode=require") `shouldBe` Right True
+      fmap connectionSslDirect (parse "sslnegotiation=postgres") `shouldBe` Right False
+      parse "sslnegotiation=direct"
+        `shouldSatisfy` failsWith "weak sslmode \"prefer\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")"
     it "rejects what verifies the server's certificate but not its name" $ do
       parse "sslmode=verify-ca" `shouldSatisfy` failsWith "sslmode=verify-ca verifies the server's certificate but not its name, which isn't supported"
       parseWith [("PGSSLMODE", "verify-ca")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-ca verifies"

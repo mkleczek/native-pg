@@ -270,7 +270,10 @@ data TlsSettings = TlsSettings
     tlsVersions :: [TlsVersion],
     -- | Whether to send the server's name, unless it's an IP address, as
     -- libpq's @sslsni@ asks.
-    tlsServerNameIndication :: Bool
+    tlsServerNameIndication :: Bool,
+    -- | Whether the server has to choose ALPN's @postgresql@, as it does
+    -- when TLS starts directly.
+    tlsAlpnRequired :: Bool
   }
   deriving (Eq, Show)
 

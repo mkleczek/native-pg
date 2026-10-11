@@ -199,7 +199,6 @@ main = withCluster $ \socketPath port -> hspec $ do
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
       it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $ do
-        pendingWith "direct TLS isn't supported"
         withConnection (tcp "sslnegotiation=direct sslmode=require") $ \(session, _, _) ->
           encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
       it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do

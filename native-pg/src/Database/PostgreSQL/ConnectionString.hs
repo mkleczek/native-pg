@@ -91,7 +91,10 @@ data ConnectionString = ConnectionString
     -- | The versions of TLS from @ssl_min_protocol_version@, @TLSv1.2@ by
     -- default, to @ssl_max_protocol_version@, that rustls has.
     connectionSslVersions :: [TlsVersion],
-    connectionSslServerNameIndication :: Bool
+    connectionSslServerNameIndication :: Bool,
+    -- | From @sslnegotiation@: whether TLS starts without asking the server
+    -- first, which needs an sslmode that requires TLS.
+    connectionSslDirect :: Bool
   }
   deriving (Eq, Show)
 
@@ -423,7 +426,13 @@ resolve option home localUser = do
       | otherwise -> Right $ case option "requiressl" of
           Just (Setting value _) | "1" `BS.isPrefixOf` value -> SslRequire
           _ -> SslPrefer
-  choice "sslnegotiation" ["postgres"] ["direct"] "TLS"
+  sslDirect <- case given "sslnegotiation" of
+    Nothing -> Right False
+    Just "postgres" -> Right False
+    Just "direct"
+      | sslModeRequired sslMode -> Right True
+      | otherwise -> Left ("weak sslmode \"" <> sslModeName sslMode <> "\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")")
+    Just other -> Left ("invalid sslnegotiation value: " <> quote other)
   choice "sslcertmode" ["disable", "allow"] ["require"] "knowing whether the server asked for the certificate"
   choice "channel_binding" ["disable", "prefer"] ["require"] "TLS"
   choice "gssencmode" ["disable", "prefer"] ["require"] "GSSAPI encryption"
@@ -500,7 +509,8 @@ resolve option home localUser = do
           (Nothing, Just _) -> Nothing,
         connectionSslRevocationListDirectory = text <$> given "sslcrldir",
         connectionSslVersions = sslVersions,
-        connectionSslServerNameIndication = given "sslsni" /= Just "0"
+        connectionSslServerNameIndication = given "sslsni" /= Just "0",
+        connectionSslDirect = sslDirect
       }
   where
     -- An empty value counts as none, as it does in libpq.
@@ -523,6 +533,16 @@ resolve option home localUser = do
     positive keyword = do
       parsed <- traverse (integer keyword) (given keyword)
       Right (parsed >>= \value -> if value <= 0 then Nothing else Just value)
+    sslModeRequired = \case
+      SslRequire -> True
+      SslVerifyFull _ -> True
+      _ -> False
+    sslModeName = \case
+      SslDisable -> "disable"
+      SslAllow -> "allow"
+      SslPrefer -> "prefer"
+      SslRequire -> "require"
+      SslVerifyFull _ -> "verify-full"
     -- A version of TLS rustls has, or Nothing for one lower.
     tlsVersion keyword value = case value of
       "TLSv1" -> Right Nothing
@@ -591,6 +611,7 @@ hostConnectSettings string host =
       connectSslRevocationListDirectory = connectionSslRevocationListDirectory string,
       connectSslVersions = connectionSslVersions string,
       connectSslServerNameIndication = connectionSslServerNameIndication string,
+      connectSslDirect = connectionSslDirect string,
       -- With hostaddr, the address is the IP address the name resolved to.
       connectServerName = Just (hostName host)
     }

@@ -2,6 +2,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- | TLS over a connected socket, through rustls-ffi: the only part of the
 -- client in C. Only the handshake waits for the socket. Reads and writes take
@@ -66,7 +67,16 @@ version = \case
 tlsClient :: TlsClient
 tlsClient = TlsClient $ \settings serverName sock -> do
   config <- newTlsConfig settings
-  newChannel <$> startTls config serverName sock
+  tls <- startTls config serverName sock
+  when (tlsAlpnRequired settings) $ do
+    protocol <- withConnection tls $ \connection ->
+      alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
+        c_connection_get_alpn_protocol connection (castPtr bytes) len
+        BS.packCStringLen =<< ((,) . castPtr <$> peek bytes <*> (fromIntegral <$> peek len))
+    unless (protocol == "postgresql") $ do
+      closeTls tls
+      throwIO (TlsError "direct SSL connection was established without ALPN protocol negotiation extension")
+  pure (newChannel tls)
 
 -- | A configuration for TLS connections, which any number of them share.
 newtype TlsConfig = TlsConfig (ForeignPtr ClientConfig)
@@ -434,6 +444,9 @@ foreign import capi unsafe "rustls.h rustls_connection_read"
 
 foreign import capi unsafe "rustls.h rustls_connection_write"
   c_connection_write :: Ptr RustlsConnection -> Ptr Word8 -> CSize -> Ptr CSize -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_connection_get_alpn_protocol"
+  c_connection_get_alpn_protocol :: Ptr RustlsConnection -> Ptr () -> Ptr CSize -> IO ()
 
 foreign import capi unsafe "rustls.h rustls_connection_send_close_notify"
   c_connection_send_close_notify :: Ptr RustlsConnection -> IO ()

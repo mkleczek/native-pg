@@ -367,7 +367,10 @@ data ConnectSettings = ConnectSettings
     connectSslVersions :: [TlsVersion],
     -- | Whether to send the server's name with TLS, unless it's an IP
     -- address.
-    connectSslServerNameIndication :: Bool
+    connectSslServerNameIndication :: Bool,
+    -- | Whether to start TLS without asking the server first, as
+    -- PostgreSQL 17 takes it.
+    connectSslDirect :: Bool
   }
 
 -- | Whether to encrypt with TLS, from libpq's sslmode.
@@ -408,7 +411,8 @@ connectSettings address user =
       connectSslRevocationList = Nothing,
       connectSslRevocationListDirectory = Nothing,
       connectSslVersions = [minBound .. maxBound],
-      connectSslServerNameIndication = True
+      connectSslServerNameIndication = True,
+      connectSslDirect = False
     }
 
 data ServerInfo = ServerInfo
@@ -501,7 +505,7 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
       bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock ->
         case (tls, connectAddress settings) of
           (Just (client, verification, required), TcpAddress host _) -> do
-            accepted <- requestTls sock
+            accepted <- if connectSslDirect settings then pure True else requestTls sock
             case accepted of
               False
                 | required -> throwIO (TlsFailure "server does not support SSL, but SSL was required")
@@ -513,7 +517,14 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
                       start
                         =<< startTlsChannel
                           client
-                          (TlsSettings verification certificate lists (connectSslVersions settings) (connectSslServerNameIndication settings))
+                          ( TlsSettings
+                              verification
+                              certificate
+                              lists
+                              (connectSslVersions settings)
+                              (connectSslServerNameIndication settings)
+                              (connectSslDirect settings)
+                          )
                           (fromMaybe host (connectServerName settings))
                           sock
                           `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
