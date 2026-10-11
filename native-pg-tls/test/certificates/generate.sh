@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Generates the certificates the TLS tests use: a CA, and certificates it
 # signs for a server on localhost, a server with another name, and a client;
-# and another CA, which signs nothing the tests trust. They're valid for a
-# century, so they're generated once and committed.
+# another CA, which signs nothing the tests trust; and the CA's revocation
+# lists, one empty and one revoking the server's certificate. They're valid
+# for a century, so they're generated once and committed.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -30,6 +31,22 @@ signed() {
   rm "$name.csr"
 }
 
+# A revocation list, revoking the certificates given.
+crl() {
+  local name=$1 directory
+  shift
+  directory=$(mktemp -d)
+  touch "$directory/index.txt"
+  echo 1000 > "$directory/crlnumber"
+  printf '%s\n' "[ca]" "default_ca = test" "[test]" "database = $directory/index.txt" \
+    "crlnumber = $directory/crlnumber" "default_md = sha256" "default_crl_days = $days" > "$directory/ca.cnf"
+  for revoked in "$@"; do
+    openssl ca -config "$directory/ca.cnf" -keyfile ca.key -cert ca.crt -revoke "$revoked"
+  done
+  openssl ca -config "$directory/ca.cnf" -keyfile ca.key -cert ca.crt -gencrl -out "$name.crl"
+  rm -r "$directory"
+}
+
 ca ca "native-pg test CA"
 ca other-ca "native-pg other test CA"
 signed server localhost \
@@ -38,4 +55,6 @@ signed server-other-name other.example \
   "$(printf '%s\n' "keyUsage=critical,digitalSignature" "extendedKeyUsage=serverAuth" "subjectAltName=DNS:other.example")"
 signed client native_pg_certificate \
   "$(printf '%s\n' "keyUsage=critical,digitalSignature" "extendedKeyUsage=clientAuth")"
+crl empty
+crl revoked server.crt
 rm -f ca.srl other-ca.key

@@ -198,6 +198,19 @@ main = withCluster $ \socketPath port -> hspec $ do
                              <> show port
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
+      it "checks revocation lists, from sslcrl or sslcrldir" $ do
+        pendingWith "revocation lists aren't supported"
+        let verified extra = tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1 " <> extra)
+            revoked = "connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: invalid peer certificate: Revoked"
+        withConnection (verified ("sslcrl=" <> Char8.pack (certificate "empty.crl"))) (\_ -> pure ())
+        connectFailure (verified ("sslcrl=" <> Char8.pack (certificate "revoked.crl"))) `shouldReturn` revoked
+        temporary <- getTemporaryDirectory
+        bracket (mkdtemp (temporary </> "native-pg-crl-")) removeDirectoryRecursive $ \lists -> do
+          -- As OpenSSL's c_rehash names them.
+          copyFile (certificate "revoked.crl") (lists </> "0123abcd.r0")
+          connectFailure (verified ("sslcrldir=" <> Char8.pack lists)) `shouldReturn` revoked
+        -- As libpq, a missing file is no list.
+        withConnection (verified "sslcrl=/nonexistent/root.crl") (\_ -> pure ())
       it "authenticates with a client certificate" $ do
         withKeyCopy ownerReadMode $ \key -> do
           let certified = "user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key
