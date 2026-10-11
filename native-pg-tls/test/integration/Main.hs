@@ -14,6 +14,7 @@ import Control.Monad (unless, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import Data.Foldable (for_)
 import Data.Functor (($>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
@@ -50,17 +51,18 @@ import Database.PostgreSQL.Transport (Address (..), StreamLengthError)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import qualified Network.Socket as Socket
-import System.Directory (getTemporaryDirectory, removeDirectoryRecursive)
+import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.Mem (performMajorGC)
+import System.Posix.Files (ownerReadMode, setFileMode)
 import System.Posix.Temp (mkdtemp)
 import System.Process (readProcessWithExitCode)
 import System.Timeout (timeout)
 import Test.Hspec
 
 main :: IO ()
-main = withCluster $ \socketPath -> hspec $ do
+main = withCluster $ \socketPath port -> hspec $ do
   let settings user password =
         (connectSettings (UnixAddress socketPath) user)
           { connectPassword = password,
@@ -108,14 +110,14 @@ main = withCluster $ \socketPath -> hspec $ do
           case result of
             Left failure -> pure (displayException (failure :: ConnectFailure))
             Right (session, _, _) -> close session *> fail "connected"
-        local extra = "host=" <> Char8.pack directory <> " dbname=postgres " <> extra
+        local extra = "host=" <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres " <> extra
         value session sql = fst <$> query session sql []
     it "connects with a URI that names the socket directory" $
-      withConnection ("postgresql:///postgres?host=" <> Char8.pack directory) $ \(session, _, host) -> do
+      withConnection ("postgresql:///postgres?host=" <> Char8.pack directory <> "&port=" <> Char8.pack (show port)) $ \(session, _, host) -> do
         hostName host `shouldBe` directory
         value session "SELECT 1" `shouldReturn` Right ([[Just "1"]], "SELECT 1")
     it "tries the hosts in order" $
-      withConnection ("host=/nonexistent," <> Char8.pack directory <> " dbname=postgres") $ \(_, _, host) ->
+      withConnection ("host=/nonexistent," <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres") $ \(_, _, host) ->
         hostName host `shouldBe` directory
     it "words each host's failure as libpq does" $
       connectFailure "host=/nonexistent-1,/nonexistent-2"
@@ -666,6 +668,10 @@ sessionUnusable :: ConnectionError -> Bool
 sessionUnusable (SessionUnusable _) = True
 sessionUnusable _ = False
 
+-- | One of the test certificates and keys, which native-pg-tls's tests share.
+certificate :: FilePath -> FilePath
+certificate name = "test/native-pg-tls/certificates/" <> name
+
 rowMisuse :: ConnectionError -> Bool
 rowMisuse (RowMisuse _) = True
 rowMisuse _ = False
@@ -681,36 +687,62 @@ withSilentServer action = do
       Socket.listen sock 4
       action directory
 
--- | Runs the action with the socket path of a new cluster, which has a role
--- for each password method.
-withCluster :: (FilePath -> IO a) -> IO a
+-- | Runs the action with the socket path and the port of a new cluster, which
+-- has a role for each password method. On its port, at 127.0.0.1, it takes
+-- TLS with the test certificates: a client certificate for one role, plaintext
+-- only for another, and TLS only for the others.
+withCluster :: (FilePath -> Socket.PortNumber -> IO a) -> IO a
 withCluster action = do
   temporary <- getTemporaryDirectory
   bracket (mkdtemp (temporary </> "native-pg-")) removeDirectoryRecursive $ \directory -> do
     let dataDirectory = directory </> "data"
     run "initdb" ["--pgdata", dataDirectory, "--username", "postgres", "--auth", "trust", "--no-sync", "--no-locale", "--encoding", "UTF8"]
     writeFile (dataDirectory </> "pg_hba.conf") hbaRules
+    for_ ["server.crt", "server.key", "ca.crt"] $ \file -> do
+      copyFile (certificate file) (dataDirectory </> file)
+      setFileMode (dataDirectory </> file) ownerReadMode
+    port <- freePort
     appendFile (dataDirectory </> "postgresql.conf") $
-      unlines ["listen_addresses = ''", "unix_socket_directories = '" <> directory <> "'"]
+      unlines
+        [ "listen_addresses = '127.0.0.1'",
+          "port = " <> show port,
+          "unix_socket_directories = '" <> directory <> "'",
+          "ssl = on",
+          "ssl_cert_file = 'server.crt'",
+          "ssl_key_file = 'server.key'",
+          "ssl_ca_file = 'ca.crt'"
+        ]
     bracket_
       (run "pg_ctl" ["--pgdata", dataDirectory, "--log", directory </> "postgres.log", "--wait", "start"])
       (run "pg_ctl" ["--pgdata", dataDirectory, "--mode", "immediate", "stop"])
       $ do
-        run "psql" ["--host", directory, "--username", "postgres", "--dbname", "postgres", "--quiet", "--set", "ON_ERROR_STOP=1", "--command", rolesSql]
-        action (directory </> ".s.PGSQL.5432")
+        run "psql" ["--host", directory, "--port", show port, "--username", "postgres", "--dbname", "postgres", "--quiet", "--set", "ON_ERROR_STOP=1", "--command", rolesSql]
+        action (directory </> ".s.PGSQL." <> show port) port
   where
     hbaRules =
       unlines
         [ "local all native_pg_scram scram-sha-256",
           "local all native_pg_md5 md5",
           "local all native_pg_cleartext password",
-          "local all all trust"
+          "local all all trust",
+          "hostssl all native_pg_certificate 127.0.0.1/32 cert",
+          "hostssl all native_pg_scram 127.0.0.1/32 scram-sha-256",
+          "hostssl all native_pg_plaintext 127.0.0.1/32 reject",
+          "hostnossl all native_pg_plaintext 127.0.0.1/32 trust",
+          "hostssl all all 127.0.0.1/32 trust"
         ]
+    -- A port nothing listens on now, at least.
+    freePort =
+      bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
+        Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+        Socket.socketPort sock
     rolesSql =
       unlines
         [ "SET password_encryption = 'scram-sha-256';",
           "CREATE ROLE native_pg_scram LOGIN PASSWORD 'scram secret';",
           "CREATE ROLE native_pg_cleartext LOGIN PASSWORD 'cleartext secret';",
+          "CREATE ROLE native_pg_certificate LOGIN;",
+          "CREATE ROLE native_pg_plaintext LOGIN;",
           "SET client_min_messages = error;",
           "SET password_encryption = 'md5';",
           "CREATE ROLE native_pg_md5 LOGIN PASSWORD 'md5 secret';"
