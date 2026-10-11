@@ -40,7 +40,7 @@ import Data.Foldable (for_, toList)
 import Data.Functor (($>), (<&>))
 import Data.List (intercalate)
 import Data.List.NonEmpty (NonEmpty (..))
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
@@ -51,11 +51,9 @@ import Database.PostgreSQL.Session
 import Database.PostgreSQL.Transport (Address (..), ConnectError, RootCertificates (..), TcpOptions (..), TlsVersion (..))
 import Network.Socket (PortNumber)
 import System.Directory (doesFileExist)
-import System.Environment (getEnvironment)
-import System.Timeout (timeout)
-#if defined(mingw32_HOST_OS)
 import System.Environment (lookupEnv)
-#else
+import System.Timeout (timeout)
+#if !defined(mingw32_HOST_OS)
 import System.Posix.User (getEffectiveUserName)
 #endif
 
@@ -134,7 +132,10 @@ instance Exception InvalidConnectionString where
 -- environment as libpq does.
 readConnectionString :: ByteString -> IO (Either String ConnectionString)
 readConnectionString string = do
-  environment <- getEnvironment
+  -- Only the variables it reads: what it leaves unread keeps them, and a
+  -- connection that keeps its string to cancel with would keep a copy of the
+  -- whole environment.
+  environment <- catMaybes <$> traverse (\name -> fmap (name,) <$> lookupEnv name) ("HOME" : mapMaybe snd optionTable)
   user <- localUserName
   case parseConnectionString (`lookup` environment) user string of
     -- libpq verifies the server's certificate with sslmode=require too if
