@@ -8,7 +8,10 @@
 -- what's ready, and give 'Nothing', or less than they're given, when it isn't,
 -- so the transport waits on the socket as it does without TLS.
 module Database.PostgreSQL.Tls
-  ( -- * Configurations
+  ( -- * For native-pg's connections
+    tlsClient,
+
+    -- * Configurations
     TlsConfig,
     newTlsConfig,
 
@@ -35,7 +38,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import Data.Word (Word32, Word8)
-import Database.PostgreSQL.Transport (ServerVerification (..), TlsError (..), TlsSettings (..))
+import Database.PostgreSQL.Transport (Link (..), ServerVerification (..), TlsClient (..), TlsError (..), TlsSettings (..), newChannel)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString)
@@ -46,6 +49,13 @@ import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (Storable, peek)
 import Network.Socket (Socket, close, withFdSocket)
 import System.Posix.Types (Fd (..))
+
+-- | Starts TLS for native-pg's connections, with a new configuration each
+-- time, so that changed certificate files count, as with libpq.
+tlsClient :: TlsClient
+tlsClient = TlsClient $ \settings serverName sock -> do
+  config <- newTlsConfig settings
+  newChannel <$> startTls config serverName sock
 
 -- | A configuration for TLS connections, which any number of them share.
 newtype TlsConfig = TlsConfig (ForeignPtr ClientConfig)
@@ -85,6 +95,18 @@ data TlsConnection = TlsConnection
     tlsSocket :: Socket,
     tlsConnection :: ForeignPtr RustlsConnection
   }
+
+instance Link TlsConnection where
+  linkSocket = tlsSocket
+  {-# INLINE linkSocket #-}
+  receiveReady = receiveTls
+  {-# INLINE receiveReady #-}
+  sendReady = sendTls
+  {-# INLINE sendReady #-}
+  flushReady = flushTls
+  {-# INLINE flushReady #-}
+  closeLink = closeTls
+  {-# INLINE closeLink #-}
 
 -- | Starts TLS over the socket, as a client of the named server, and waits
 -- for the handshake to finish. The name is a host name, which the server's

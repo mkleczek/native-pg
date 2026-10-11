@@ -18,6 +18,7 @@ module Database.PostgreSQL.Transport
     newChannel,
 
     -- * TLS links
+    TlsClient (..),
     TlsSettings (..),
     ServerVerification (..),
     TlsError (..),
@@ -246,8 +247,15 @@ instance Link Socket where
   closeLink = close
   {-# INLINE closeLink #-}
 
--- | How a TLS link is configured, which a library apart, native-pg-tls,
--- does: this one has no C.
+-- | Starts TLS over a connected socket, as a client of the named server, and
+-- gives the channel over it, made as 'newChannel' makes one. A library apart,
+-- native-pg-tls, has one, so that this one has no C. Throws 'TlsError' if
+-- TLS fails.
+newtype TlsClient = TlsClient
+  { startTlsChannel :: TlsSettings -> HostName -> Socket -> IO (IORef Unsent -> Int -> Channel)
+  }
+
+-- | How a TLS link is configured.
 newtype TlsSettings = TlsSettings
   { tlsVerification :: ServerVerification
   }
