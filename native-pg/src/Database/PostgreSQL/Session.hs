@@ -63,6 +63,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.Kind (Type)
 import Data.Maybe (fromMaybe)
+import System.Directory (doesFileExist)
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..))
 import Database.PostgreSQL.Diagnostics (ServerError (..), diagnostics, isConnectionFatal)
 import Database.PostgreSQL.Authentication
@@ -350,6 +351,9 @@ data SslMode
     SslDisable
   | -- | With TLS, without verifying the server.
     SslRequire
+  | -- | With TLS, verifying the server's certificate against the root
+    -- certificates in the file, and its name.
+    SslVerifyFull FilePath
   deriving (Eq, Show)
 
 -- | No password, database or extra parameters, protocol 3.0, 16 KiB read
@@ -425,16 +429,30 @@ connect :: ConnectSettings -> IO (Session 'Ready, ServerInfo)
 connect settings =
   bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock ->
     case (connectSslMode settings, connectAddress settings) of
-      (SslRequire, TcpAddress host _) -> do
-        client <- maybe (throwIO (TlsFailure "sslmode value \"require\" invalid when SSL support is not compiled in")) pure (connectTlsClient settings)
+      (SslDisable, _) -> start (newChannel sock)
+      (_, UnixAddress _) -> start (newChannel sock)
+      (mode, TcpAddress host _) -> do
+        client <- maybe (throwIO (TlsFailure ("sslmode value \"" <> sslModeName mode <> "\" invalid when SSL support is not compiled in"))) pure (connectTlsClient settings)
         accepted <- requestTls sock
         unless accepted $ throwIO (TlsFailure "server does not support SSL, but SSL was required")
+        verification <- case mode of
+          SslVerifyFull roots -> do
+            exists <- doesFileExist roots
+            unless exists . throwIO . TlsFailure $
+              "root certificate file \""
+                <> roots
+                <> "\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
+            pure (VerifyFull roots)
+          _ -> pure NoVerification
         channel <-
-          startTlsChannel client (TlsSettings NoVerification) (fromMaybe host (connectServerName settings)) sock
+          startTlsChannel client (TlsSettings verification) (fromMaybe host (connectServerName settings)) sock
             `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
         start channel
-      _ -> start (newChannel sock)
   where
+    sslModeName mode = case mode of
+      SslDisable -> "disable"
+      SslRequire -> "require"
+      SslVerifyFull _ -> "verify-full"
     -- Given how to make the channel, once there's somewhere for its unsent
     -- output.
     start channel = do

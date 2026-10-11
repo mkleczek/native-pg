@@ -296,11 +296,17 @@ main = hspec $ do
       sslMode (parseWith [("PGREQUIRESSL", "1")] "sslmode=disable") `shouldBe` Right SslDisable
       fmap (connectServerName . (`hostConnectSettings` Host "db" (Just "10.0.0.1") 5432)) (parse "sslmode=require")
         `shouldBe` Right (Just "db")
-    it "rejects strings that require verifying the server's certificate" $ do
-      mapM_
-        (\string -> parse string `shouldSatisfy` failsWith "requires verifying the server's certificate, which isn't supported")
-        ["sslmode=verify-ca", "sslmode=verify-full"]
-      parseWith [("PGSSLMODE", "verify-full")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-full requires verifying"
+    it "reads sslmode=verify-full with its root certificate file, or libpq's default one" $ do
+      let sslMode = fmap connectionSslMode
+      sslMode (parse "sslmode=verify-full sslrootcert=/roots.crt") `shouldBe` Right (SslVerifyFull "/roots.crt")
+      sslMode (parseWith [("PGSSLROOTCERT", "/roots.crt")] "sslmode=verify-full") `shouldBe` Right (SslVerifyFull "/roots.crt")
+      sslMode (parseWith [("HOME", "/home/u")] "sslmode=verify-full") `shouldBe` Right (SslVerifyFull "/home/u/.postgresql/root.crt")
+      parse "sslmode=verify-full" `shouldSatisfy` failsWith "could not get home directory to locate root certificate file"
+    it "rejects what verifies the server's certificate but not its name" $ do
+      parse "sslmode=verify-ca" `shouldSatisfy` failsWith "sslmode=verify-ca verifies the server's certificate but not its name, which isn't supported"
+      parseWith [("PGSSLMODE", "verify-ca")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-ca verifies"
+      parse "sslmode=require sslrootcert=/roots.crt" `shouldSatisfy` failsWith "verifies the server's certificate as verify-ca does, which isn't supported"
+      parse "sslmode=verify-full sslrootcert=system" `shouldSatisfy` failsWith "sslrootcert=system isn't supported"
       parse "sslmode=maybe" `shouldSatisfy` failsWith "invalid sslmode value: \"maybe\""
       parse "gssencmode=require" `shouldSatisfy` failsWith "requires GSSAPI encryption, which isn't supported"
     it "rejects options it doesn't know or implement" $ do

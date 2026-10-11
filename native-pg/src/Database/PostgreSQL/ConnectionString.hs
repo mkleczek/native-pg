@@ -8,11 +8,12 @@
 -- libpq takes from the environment, and connecting to the first suitable host
 -- one names.
 --
--- TLS is used with @sslmode@ @require@, which doesn't verify the server. A
--- string that requires verifying it is rejected, and @sslmode@ @prefer@,
--- libpq's default, connects without TLS. Options this client doesn't
--- implement are rejected too, unless they only matter with TLS or GSSAPI.
--- Password and service files aren't read.
+-- TLS is used with @sslmode@ @require@, which doesn't verify the server, and
+-- @verify-full@. @verify-ca@ isn't supported, nor is @require@ with a root
+-- certificate file, which libpq verifies as @verify-ca@. @sslmode@
+-- @prefer@, libpq's default, connects without TLS. Options this client
+-- doesn't implement are rejected too, unless they only matter with TLS or
+-- GSSAPI. Password and service files aren't read.
 module Database.PostgreSQL.ConnectionString
   ( -- * Connection strings
     ConnectionString (..),
@@ -38,7 +39,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_, toList)
-import Data.Functor (($>))
+import Data.Functor (($>), (<&>))
 import Data.List (intercalate)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe (fromMaybe, isJust)
@@ -51,6 +52,7 @@ import Database.PostgreSQL.Protocol.Codec (InputError (..))
 import Database.PostgreSQL.Session
 import Database.PostgreSQL.Transport (Address (..), ConnectError, TcpOptions (..))
 import Network.Socket (PortNumber)
+import System.Directory (doesFileExist)
 import System.Environment (getEnvironment)
 import System.Timeout (timeout)
 #if defined(mingw32_HOST_OS)
@@ -120,14 +122,22 @@ readConnectionString :: ByteString -> IO (Either String ConnectionString)
 readConnectionString string = do
   environment <- getEnvironment
   user <- localUserName
-  pure (parseConnectionString (`lookup` environment) user string)
+  case parseConnectionString (`lookup` environment) user string of
+    -- libpq verifies the server's certificate with sslmode=require too if
+    -- the default root certificate file exists.
+    Right parsed
+      | connectionSslMode parsed == SslRequire,
+        Just roots <- defaultRootCertificate <$> lookup "HOME" environment ->
+          doesFileExist roots <&> \verifying ->
+            if verifying then Left (requireWithRoots roots) else Right parsed
+    parsed -> pure parsed
 
 -- | Like 'readConnectionString', with the environment variables and the local
 -- user's name, if it could be looked up, given.
 parseConnectionString :: (String -> Maybe String) -> Maybe String -> ByteString -> Either String ConnectionString
 parseConnectionString environment localUser string = do
   given <- options string
-  resolve (setting environment given) localUser
+  resolve (setting environment given) (environment "HOME") localUser
 
 -- | The operating system's name of the user, which libpq uses when none is
 -- given. The lookup can fail, e.g. for a container user without a passwd
@@ -140,6 +150,17 @@ localUserName = either (\(_ :: IOException) -> Nothing) Just <$> try lookUpUserN
 #else
     lookUpUserName = getEffectiveUserName
 #endif
+
+-- | The root certificate file libpq verifies the server's certificate
+-- against unless another is given, in the home directory.
+defaultRootCertificate :: FilePath -> FilePath
+defaultRootCertificate home = home <> "/.postgresql/root.crt"
+
+-- | sslmode=require with root certificates verifies the server's certificate
+-- as verify-ca does.
+requireWithRoots :: FilePath -> String
+requireWithRoots roots =
+  "sslmode=require with the root certificate file \"" <> roots <> "\" verifies the server's certificate as verify-ca does, which isn't supported: use sslmode=verify-full"
 
 -- | Where libpq connects when no host is given.
 defaultHost :: String
@@ -359,15 +380,24 @@ setting environment given keyword =
       value <- environment variable
       Just (Setting (encodeUtf8 (Text.pack value)) variable)
 
-resolve :: (ByteString -> Maybe Setting) -> Maybe String -> Either String ConnectionString
-resolve option localUser = do
+-- | The connection string the options give, with the home directory and the
+-- local user's name for defaults.
+resolve :: (ByteString -> Maybe Setting) -> Maybe String -> Maybe String -> Either String ConnectionString
+resolve option home localUser = do
   sslMode <- case option "sslmode" of
     Just (Setting value source) -> case value of
-      "require" -> Right SslRequire
+      "require" -> maybe (Right SslRequire) (Left . requireWithRoots . text) (given "sslrootcert")
+      "verify-full" -> case given "sslrootcert" of
+        Just "system" -> Left "sslrootcert=system isn't supported"
+        Just roots -> Right (SslVerifyFull (text roots))
+        Nothing ->
+          maybe
+            (Left "could not get home directory to locate root certificate file\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.")
+            (Right . SslVerifyFull . defaultRootCertificate)
+            home
+      "verify-ca" -> Left (source <> "=verify-ca verifies the server's certificate but not its name, which isn't supported: use verify-full")
       _
         | value `elem` ["disable", "allow", "prefer"] -> Right SslDisable
-        | value `elem` ["verify-ca", "verify-full"] ->
-            Left (source <> "=" <> text value <> " requires verifying the server's certificate, which isn't supported")
         | otherwise -> Left ("invalid sslmode value: " <> quote value)
     -- PGREQUIRESSL counts only if no sslmode is given.
     Nothing -> Right $ case option "requiressl" of
