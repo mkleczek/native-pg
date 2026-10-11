@@ -17,6 +17,11 @@ module Database.PostgreSQL.Transport
     Channel (..),
     newChannel,
 
+    -- * TLS links
+    TlsSettings (..),
+    ServerVerification (..),
+    TlsError (..),
+
     -- * Output sent as answers are read
     Unsent,
     OutputBuffer,
@@ -240,6 +245,31 @@ instance Link Socket where
   {-# INLINE flushReady #-}
   closeLink = close
   {-# INLINE closeLink #-}
+
+-- | How a TLS link is configured, which a library apart, native-pg-tls,
+-- does: this one has no C.
+newtype TlsSettings = TlsSettings
+  { tlsVerification :: ServerVerification
+  }
+  deriving (Eq, Show)
+
+-- | How the server's certificate is checked.
+data ServerVerification
+  = -- | Not at all: the connection is encrypted, but the server may not be
+    -- the one asked for, as with libpq's @sslmode=require@.
+    NoVerification
+  | -- | Against the root certificates in a PEM file, and the server's name, as
+    -- with libpq's @sslmode=verify-full@.
+    VerifyFull FilePath
+  deriving (Eq, Show)
+
+-- | TLS failed: the handshake, the server's certificate, or a record.
+-- 'displayException' words it as libpq does.
+newtype TlsError = TlsError String
+  deriving (Show)
+
+instance Exception TlsError where
+  displayException (TlsError reason) = "SSL error: " <> reason
 
 -- | A connection's input and output over its link. It's made with the
 -- connection, from code specialized to the link, so that using it passes no

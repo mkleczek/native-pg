@@ -1,0 +1,112 @@
+{-# LANGUAGE CApiFFI #-}
+
+-- | TLS connections against a server in the same process, over a pair of
+-- Unix-domain sockets. The server is rustls too, through its server API, and
+-- its side of a connection runs on the same functions as the client's.
+module Main (main) where
+
+import Control.Concurrent.Async (concurrently)
+import Control.Exception (bracket, displayException, throwIO, try)
+import Control.Monad (unless, void)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BS
+import Data.List (isInfixOf)
+import Data.Word (Word32, Word8)
+import Database.PostgreSQL.Tls
+import Database.PostgreSQL.Transport (ServerVerification (..), TlsError (..), TlsSettings (..))
+import Foreign.C.Types (CSize (..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Marshal.Array (withArray)
+import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Storable (peek)
+import qualified Network.Socket as Socket
+import Test.Hspec
+
+main :: IO ()
+main = hspec $ do
+  describe "the handshake" $ do
+    it "verifies the server's certificate against the roots, and its name" $
+      withServer "server" $ \sock server -> do
+        config <- newTlsConfig (TlsSettings (VerifyFull (certificate "ca.crt")))
+        void $ concurrently (startTls config "localhost" sock) (handshake server)
+
+    it "connects to any server without verification" $
+      withServer "server-other-name" $ \sock server -> do
+        config <- newTlsConfig (TlsSettings NoVerification)
+        void $ concurrently (startTls config "localhost" sock) (handshake server)
+
+    it "refuses a certificate that no root signed" $
+      withServer "server" $ \sock server -> do
+        config <- newTlsConfig (TlsSettings (VerifyFull (certificate "other-ca.crt")))
+        refusal config sock server `shouldReturn` "SSL error: invalid peer certificate: UnknownIssuer"
+
+    it "refuses a certificate for another name" $
+      withServer "server-other-name" $ \sock server -> do
+        config <- newTlsConfig (TlsSettings (VerifyFull (certificate "ca.crt")))
+        refusal config sock server `shouldReturn` "SSL error: invalid peer certificate: NotValidForName"
+
+  describe "a configuration" $
+    it "needs its root certificate file" $
+      newTlsConfig (TlsSettings (VerifyFull (certificate "missing.crt")))
+        `shouldThrow` \(TlsError reason) -> "could not read root certificate file" `isInfixOf` reason
+
+certificate :: FilePath -> FilePath
+certificate name = "test/native-pg-tls/certificates/" <> name
+
+-- | How the client's handshake with the server fails.
+refusal :: TlsConfig -> Socket.Socket -> TlsConnection -> IO String
+refusal config sock server = do
+  (client, _) <- concurrently (try (startTls config "localhost" sock)) (try @TlsError (handshake server))
+  either (pure . displayException @TlsError) (\_ -> fail "the handshake succeeded") client
+
+-- | A connected pair of sockets: the client's, and the server's TLS
+-- connection with the named certificate, before its handshake.
+withServer :: String -> (Socket.Socket -> TlsConnection -> IO a) -> IO a
+withServer name action =
+  bracket (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) closeBoth $ \(clientSocket, serverSocket) -> do
+    chain <- BS.readFile (certificate (name <> ".crt"))
+    key <- BS.readFile (certificate (name <> ".key"))
+    server <- newTlsConnection serverSocket =<< serverConnection chain key
+    action clientSocket server
+  where
+    closeBoth (a, b) = Socket.close a *> Socket.close b
+
+-- | A server's connection with the certificate chain and key.
+serverConnection :: ByteString -> ByteString -> IO (Ptr RustlsConnection)
+serverConnection chain key = do
+  certified :: Ptr CertifiedKey <-
+    BS.unsafeUseAsCStringLen chain $ \(chainBytes, chainLength) ->
+      BS.unsafeUseAsCStringLen key $ \(keyBytes, keyLength) ->
+        built (c_certified_key_build (castPtr chainBytes) (fromIntegral chainLength) (castPtr keyBytes) (fromIntegral keyLength))
+  builder <- c_server_config_builder_new
+  withArray [certified] $ \keys -> succeeds (c_server_config_builder_set_certified_keys builder (castPtr keys) 1)
+  config <- built (c_server_config_builder_build builder)
+  built (c_server_connection_new config)
+  where
+    built :: (Ptr () -> IO Word32) -> IO (Ptr a)
+    built function = alloca $ \out -> succeeds (function (castPtr out)) *> peek out
+    succeeds function = do
+      result <- function
+      unless (result == 7000) (throwIO (TlsError ("the test server's configuration failed with " <> show result)))
+
+data CertifiedKey
+
+data ServerConfigBuilder
+
+data ServerConfig
+
+foreign import capi unsafe "rustls.h rustls_certified_key_build"
+  c_certified_key_build :: Ptr Word8 -> CSize -> Ptr Word8 -> CSize -> Ptr () -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_server_config_builder_new"
+  c_server_config_builder_new :: IO (Ptr ServerConfigBuilder)
+
+foreign import capi unsafe "rustls.h rustls_server_config_builder_set_certified_keys"
+  c_server_config_builder_set_certified_keys :: Ptr ServerConfigBuilder -> Ptr () -> CSize -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_server_config_builder_build"
+  c_server_config_builder_build :: Ptr ServerConfigBuilder -> Ptr () -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_server_connection_new"
+  c_server_connection_new :: Ptr ServerConfig -> Ptr () -> IO Word32
