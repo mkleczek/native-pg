@@ -8,9 +8,9 @@
 -- @postgrest-with-pg-17@ to test against PostgreSQL 17.
 module Main (main) where
 
-import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (ErrorCall (..), IOException, bracket, bracket_, displayException, throwIO, try)
-import Control.Monad (unless, void)
+import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Exception (ErrorCall (..), IOException, bracket, bracket_, displayException, finally, throwIO, try)
+import Control.Monad (forever, unless, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
@@ -51,6 +51,7 @@ import Database.PostgreSQL.Transport (Address (..), StreamLengthError)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import qualified Network.Socket as Socket
+import qualified Network.Socket.ByteString as SocketBytes
 import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
@@ -143,6 +144,35 @@ main = withCluster $ \socketPath port -> hspec $ do
       connectFailure (local "target_session_attrs=standby")
         `shouldReturn` ("connection to server on socket \"" <> socketPath <> "\" failed: server is not in hot standby mode")
       withConnection (local "target_session_attrs=prefer-standby") (\_ -> pure ())
+    describe "with TLS" $ do
+      let tcp extra = "host=127.0.0.1 port=" <> Char8.pack (show port) <> " dbname=postgres " <> extra
+          encrypted session = value session "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+      it "encrypts with sslmode=require, without verifying the server" $ do
+        pendingWith "TLS isn't supported"
+        withConnection (tcp "sslmode=require") $ \(session, _, _) ->
+          encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
+      it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $ do
+        pendingWith "TLS isn't supported"
+        withConnection (local "sslmode=require") $ \(session, _, _) ->
+          encrypted session `shouldReturn` Right ([[Just "f"]], "SELECT 1")
+      it "fails if the server doesn't take TLS" $ do
+        pendingWith "TLS isn't supported"
+        withPlaintextServer $ \plaintext ->
+          connectFailure ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
+            `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show plaintext <> " failed: server does not support SSL, but SSL was required")
+      it "fails as libpq without TLS does, without a TLS client" $ do
+        pendingWith "TLS isn't supported"
+        result <- try (either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") (tcp "sslmode=require")))
+        either (pure . displayException @ConnectFailure) (\(session, _, _) -> close session *> fail "connected") result
+          `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in")
+      it "sends a batch larger than the sockets hold while reading its results" $ do
+        pendingWith "TLS isn't supported"
+        withConnection (tcp "sslmode=require") $ \(session, _, _) -> do
+          let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
+              large = collect (statement "SELECT repeat('x', 1000000)" [])
+              long = collect (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')])
+          outcome <- timeout 10000000 (runBatch session id ((\(rows, _) _ -> rows) <$> large <*> long))
+          fmap fst outcome `shouldBe` Just (Right [[Just (Char8.replicate 1000000 'x')]])
     it "gives up on a host after connect_timeout" $
       withSilentServer $ \silent -> do
         started <- getMonotonicTime
@@ -686,6 +716,21 @@ withSilentServer action = do
       Socket.bind sock (Socket.SockAddrUnix (directory </> ".s.PGSQL.5432"))
       Socket.listen sock 4
       action directory
+
+-- | Runs the action with a port at 127.0.0.1 where a server answers that it
+-- doesn't take TLS.
+withPlaintextServer :: (Socket.PortNumber -> IO a) -> IO a
+withPlaintextServer action =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
+    Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen sock 4
+    let answer = forever $ do
+          (client, _) <- Socket.accept sock
+          forkIO $ (`finally` Socket.close client) $ do
+            _ <- SocketBytes.recv client 8
+            SocketBytes.sendAll client "N"
+            void (SocketBytes.recv client 1)
+    bracket (forkIO answer) killThread $ \_ -> action =<< Socket.socketPort sock
 
 -- | Runs the action with the socket path and the port of a new cluster, which
 -- has a role for each password method. On its port, at 127.0.0.1, it takes
