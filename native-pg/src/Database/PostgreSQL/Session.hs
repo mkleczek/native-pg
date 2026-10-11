@@ -15,6 +15,7 @@ module Database.PostgreSQL.Session
     -- * Connecting
     ConnectSettings (..),
     ConnectionError (..),
+    SslMode (..),
     ServerError (..),
     ServerInfo (..),
     close,
@@ -61,6 +62,7 @@ import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.Kind (Type)
+import Data.Maybe (fromMaybe)
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..))
 import Database.PostgreSQL.Diagnostics (ServerError (..), diagnostics, isConnectionFatal)
 import Database.PostgreSQL.Authentication
@@ -93,10 +95,14 @@ import Database.PostgreSQL.Protocol.Codec
 import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Protocol.Messages
 import Database.PostgreSQL.Transport
-  ( Address,
+  ( Address (..),
     Channel (..),
     OutputBuffer,
+    ServerVerification (..),
     TcpOptions,
+    TlsClient (..),
+    TlsError,
+    TlsSettings (..),
     Unsent,
     connectSocket,
     defaultTcpOptions,
@@ -105,6 +111,8 @@ import Database.PostgreSQL.Transport
     unsent,
   )
 import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Storable (peek)
+import Network.Socket (HostName, Socket)
 import qualified Network.Socket as Socket
 
 -- | The phases of a connection, each named after what the client waits for in
@@ -324,11 +332,28 @@ data ConnectSettings = ConnectSettings
     connectProtocolVersion :: ProtocolVersion,
     -- | The size of a read buffer.
     connectReadSize :: Int,
-    connectTcpOptions :: TcpOptions
+    connectTcpOptions :: TcpOptions,
+    -- | Whether to encrypt with TLS, which isn't used over Unix-domain
+    -- sockets, as with libpq.
+    connectSslMode :: SslMode,
+    -- | The server's name for TLS, if the address's host isn't, e.g. because
+    -- it's an IP address the name resolved to.
+    connectServerName :: Maybe HostName,
+    -- | What starts TLS: native-pg-tls's, which this library doesn't depend
+    -- on. Without it, a connection that requires TLS fails.
+    connectTlsClient :: Maybe TlsClient
   }
 
+-- | Whether to encrypt with TLS, from libpq's sslmode.
+data SslMode
+  = -- | Without TLS.
+    SslDisable
+  | -- | With TLS, without verifying the server.
+    SslRequire
+  deriving (Eq, Show)
+
 -- | No password, database or extra parameters, protocol 3.0, 16 KiB read
--- buffers and TCP keepalives.
+-- buffers, TCP keepalives and no TLS.
 connectSettings :: Address -> ByteString -> ConnectSettings
 connectSettings address user =
   ConnectSettings
@@ -339,7 +364,10 @@ connectSettings address user =
       connectParameters = [],
       connectProtocolVersion = protocolVersion3_0,
       connectReadSize = 16384,
-      connectTcpOptions = defaultTcpOptions
+      connectTcpOptions = defaultTcpOptions,
+      connectSslMode = SslDisable,
+      connectServerName = Nothing,
+      connectTlsClient = Nothing
     }
 
 data ServerInfo = ServerInfo
@@ -370,6 +398,8 @@ data ConnectionError
     SessionUnusable String
   | -- | A row or a column stream was used out of turn.
     RowMisuse String
+  | -- | TLS couldn't be started, e.g. because the server doesn't take it.
+    TlsFailure String
   deriving (Eq, Show)
 
 instance Exception ConnectionError where
@@ -381,6 +411,7 @@ instance Exception ConnectionError where
     AuthenticationError reason -> reason
     SessionUnusable reason -> reason
     RowMisuse reason -> reason
+    TlsFailure reason -> reason
 
 -- | The size of the buffer a connection writes its batches to. A batch that
 -- copies more bytes gets a buffer of its own.
@@ -392,16 +423,48 @@ outputBufferSize = 16384
 -- connect, and 'ConnectionError' when the server rejects the connection.
 connect :: ConnectSettings -> IO (Session 'Ready, ServerInfo)
 connect settings =
-  bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock -> do
-    buffer <- newIORef emptyInputBuffer
-    pending <- newIORef =<< unsent Nothing mempty
-    output <- newOutputBuffer outputBufferSize
-    state <- newIORef Idle
-    notifications <- newIORef []
-    let session = Session (Connection (newChannel sock pending (connectReadSize settings)) buffer pending output state notifications)
-    send @'StartupMessageType session (startupMessage settings)
-    (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
-    initialize version initializing
+  bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock ->
+    case (connectSslMode settings, connectAddress settings) of
+      (SslRequire, TcpAddress host _) -> do
+        client <- maybe (throwIO (TlsFailure "sslmode value \"require\" invalid when SSL support is not compiled in")) pure (connectTlsClient settings)
+        accepted <- requestTls sock
+        unless accepted $ throwIO (TlsFailure "server does not support SSL, but SSL was required")
+        channel <-
+          startTlsChannel client (TlsSettings NoVerification) (fromMaybe host (connectServerName settings)) sock
+            `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
+        start channel
+      _ -> start (newChannel sock)
+  where
+    -- Given how to make the channel, once there's somewhere for its unsent
+    -- output.
+    start channel = do
+      buffer <- newIORef emptyInputBuffer
+      pending <- newIORef =<< unsent Nothing mempty
+      output <- newOutputBuffer outputBufferSize
+      state <- newIORef Idle
+      notifications <- newIORef []
+      let session = Session (Connection (channel pending (connectReadSize settings)) buffer pending output state notifications)
+      send @'StartupMessageType session (startupMessage settings)
+      (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
+      initialize version initializing
+
+-- | Asks the server for TLS, and reads its answer, a single byte, so that no
+-- unencrypted byte after it is taken for TLS's: whether it takes TLS.
+requestTls :: Socket -> IO Bool
+requestTls sock = do
+  pending <- newIORef =<< unsent Nothing mempty
+  let channel = newChannel sock pending 1
+  channelSend channel (serialize @SSLRequest @'SSLRequestType SSLRequest)
+  answer <- allocaBytes 1 $ \byte -> do
+    received <- readInputInto (channelInput channel) byte 1
+    if received == 0 then pure Nothing else Just <$> peek byte
+  case answer of
+    Just 83 -> pure True
+    Just 78 -> pure False
+    -- The server isn't authenticated yet, so its error isn't read.
+    Just 69 -> throwIO (TlsFailure "server sent an error response during SSL exchange")
+    Just other -> throwIO (TlsFailure ("received invalid response to SSL negotiation: " <> [toEnum (fromIntegral other)]))
+    Nothing -> throwIO (TlsFailure "server closed the connection unexpectedly")
 
 -- | Ends the session and closes its socket, in whatever state it is.
 close :: Session phase -> IO ()

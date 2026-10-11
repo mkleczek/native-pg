@@ -47,6 +47,7 @@ import qualified Database.PostgreSQL.Pipeline as Pipeline
 import Database.PostgreSQL.Session
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
+import Database.PostgreSQL.Tls (tlsClient)
 import Database.PostgreSQL.Transport (Address (..), StreamLengthError)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
@@ -104,7 +105,7 @@ main = withCluster $ \socketPath port -> hspec $ do
         -- Without the environment, so that the PG* variables of the shell
         -- running the tests don't change them.
         connectWith string =
-          either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") string)
+          either fail (connectFirst (\connecting -> connecting {connectTlsClient = Just tlsClient})) (parseConnectionString (const Nothing) (Just "postgres") string)
         withConnection string = bracket (connectWith string) (\(session, _, _) -> close session)
         connectFailure string = do
           result <- try (connectWith string)
@@ -148,25 +149,20 @@ main = withCluster $ \socketPath port -> hspec $ do
       let tcp extra = "host=127.0.0.1 port=" <> Char8.pack (show port) <> " dbname=postgres " <> extra
           encrypted session = value session "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
       it "encrypts with sslmode=require, without verifying the server" $ do
-        pendingWith "TLS isn't supported"
         withConnection (tcp "sslmode=require") $ \(session, _, _) ->
           encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
       it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $ do
-        pendingWith "TLS isn't supported"
         withConnection (local "sslmode=require") $ \(session, _, _) ->
           encrypted session `shouldReturn` Right ([[Just "f"]], "SELECT 1")
       it "fails if the server doesn't take TLS" $ do
-        pendingWith "TLS isn't supported"
         withPlaintextServer $ \plaintext ->
           connectFailure ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
             `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show plaintext <> " failed: server does not support SSL, but SSL was required")
       it "fails as libpq without TLS does, without a TLS client" $ do
-        pendingWith "TLS isn't supported"
         result <- try (either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") (tcp "sslmode=require")))
         either (pure . displayException @ConnectFailure) (\(session, _, _) -> close session *> fail "connected") result
           `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in")
       it "sends a batch larger than the sockets hold while reading its results" $ do
-        pendingWith "TLS isn't supported"
         withConnection (tcp "sslmode=require") $ \(session, _, _) -> do
           let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
               large = collect (statement "SELECT repeat('x', 1000000)" [])

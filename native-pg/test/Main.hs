@@ -21,6 +21,7 @@ import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Protocol
 import Database.PostgreSQL.Protocol.Codec
 import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
+import Database.PostgreSQL.Session (ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Transport (Address (..), ConnectError (..), TcpOptions (..), defaultTcpOptions)
@@ -228,7 +229,8 @@ main = hspec $ do
               connectionTargetSessionAttrs = AnySession,
               connectionProtocolVersion = protocolVersion3_0,
               connectionMinProtocolVersion = protocolVersion3_0,
-              connectionTcpOptions = defaultTcpOptions
+              connectionTcpOptions = defaultTcpOptions,
+              connectionSslMode = SslDisable
             }
     it "reads a URI" $ do
       let parsed = parse "postgresql://alice:p%40ss@db.example.com:6543/app?application_name=api&connect_timeout=10"
@@ -282,13 +284,25 @@ main = hspec $ do
         `shouldBe` Right [("application_name", "fallback")]
       fmap connectionParameters (parse "fallback_application_name=fallback application_name=app")
         `shouldBe` Right [("application_name", "app")]
-    it "rejects strings that require TLS" $ do
+    it "reads sslmode, and requiressl as libpq does" $ do
+      let sslMode = fmap connectionSslMode
       mapM_
-        (\string -> parse string `shouldSatisfy` failsWith "requires TLS, which isn't supported")
-        ["sslmode=require", "sslmode=verify-ca", "sslmode=verify-full", "requiressl=1", "postgresql://h/db?ssl=true"]
-      parseWith [("PGSSLMODE", "verify-full")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-full requires TLS"
+        (\string -> sslMode (parse string) `shouldBe` Right SslRequire)
+        ["sslmode=require", "requiressl=1", "sslmode=disable requiressl=1", "postgresql://h/db?ssl=true"]
+      mapM_
+        (\string -> sslMode (parse string) `shouldBe` Right SslDisable)
+        ["", "sslmode=disable", "sslmode=allow", "sslmode=prefer", "requiressl=1 sslmode=disable", "requiressl=0"]
+      sslMode (parseWith [("PGREQUIRESSL", "1")] "") `shouldBe` Right SslRequire
+      sslMode (parseWith [("PGREQUIRESSL", "1")] "sslmode=disable") `shouldBe` Right SslDisable
+      fmap (connectServerName . (`hostConnectSettings` Host "db" (Just "10.0.0.1") 5432)) (parse "sslmode=require")
+        `shouldBe` Right (Just "db")
+    it "rejects strings that require verifying the server's certificate" $ do
+      mapM_
+        (\string -> parse string `shouldSatisfy` failsWith "requires verifying the server's certificate, which isn't supported")
+        ["sslmode=verify-ca", "sslmode=verify-full"]
+      parseWith [("PGSSLMODE", "verify-full")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-full requires verifying"
+      parse "sslmode=maybe" `shouldSatisfy` failsWith "invalid sslmode value: \"maybe\""
       parse "gssencmode=require" `shouldSatisfy` failsWith "requires GSSAPI encryption, which isn't supported"
-      mapM_ (\string -> parse string `shouldSatisfy` isRight) ["sslmode=disable", "sslmode=allow", "sslmode=prefer"]
     it "rejects options it doesn't know or implement" $ do
       parse "foo=bar" `shouldSatisfy` failsWith "invalid connection option \"foo\""
       parse "postgresql://h/db?foo=bar" `shouldSatisfy` failsWith "invalid URI query parameter: \"foo\""

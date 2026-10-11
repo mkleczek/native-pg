@@ -8,8 +8,9 @@
 -- libpq takes from the environment, and connecting to the first suitable host
 -- one names.
 --
--- TLS isn't supported. A string that requires it is rejected, and @sslmode@
--- @prefer@, libpq's default, connects without it. Options this client doesn't
+-- TLS is used with @sslmode@ @require@, which doesn't verify the server. A
+-- string that requires verifying it is rejected, and @sslmode@ @prefer@,
+-- libpq's default, connects without TLS. Options this client doesn't
 -- implement are rejected too, unless they only matter with TLS or GSSAPI.
 -- Password and service files aren't read.
 module Database.PostgreSQL.ConnectionString
@@ -76,7 +77,8 @@ data ConnectionString = ConnectionString
     -- accepted, from @min_protocol_version@.
     connectionProtocolVersion :: ProtocolVersion,
     connectionMinProtocolVersion :: ProtocolVersion,
-    connectionTcpOptions :: TcpOptions
+    connectionTcpOptions :: TcpOptions,
+    connectionSslMode :: SslMode
   }
   deriving (Eq, Show)
 
@@ -204,11 +206,15 @@ optionTable =
     ("oauth_scope", Nothing)
   ]
 
--- | The keywords and values a connection string gives, in order.
+-- | The keywords and values a connection string gives, in order. Like libpq,
+-- it takes @requiressl@ as @sslmode@, @require@ for 1 and @prefer@ otherwise.
 options :: ByteString -> Either String [(ByteString, ByteString)]
 options string =
-  maybe (keyValueOptions string) (uriOptions string) $
+  fmap (map asSslMode) . maybe (keyValueOptions string) (uriOptions string) $
     BS.stripPrefix "postgresql://" string <|> BS.stripPrefix "postgres://" string
+  where
+    asSslMode ("requiressl", value) = ("sslmode", if "1" `BS.isPrefixOf` value then "require" else "prefer")
+    asSslMode option = option
 
 -- | @keyword = value@ pairs separated by whitespace. A value can be quoted
 -- with @'@, and a backslash escapes the next character.
@@ -355,8 +361,18 @@ setting environment given keyword =
 
 resolve :: (ByteString -> Maybe Setting) -> Maybe String -> Either String ConnectionString
 resolve option localUser = do
-  choice "sslmode" ["disable", "allow", "prefer"] ["require", "verify-ca", "verify-full"] "TLS"
-  choice "requiressl" ["0"] ["1"] "TLS"
+  sslMode <- case option "sslmode" of
+    Just (Setting value source) -> case value of
+      "require" -> Right SslRequire
+      _
+        | value `elem` ["disable", "allow", "prefer"] -> Right SslDisable
+        | value `elem` ["verify-ca", "verify-full"] ->
+            Left (source <> "=" <> text value <> " requires verifying the server's certificate, which isn't supported")
+        | otherwise -> Left ("invalid sslmode value: " <> quote value)
+    -- PGREQUIRESSL counts only if no sslmode is given.
+    Nothing -> Right $ case option "requiressl" of
+      Just (Setting value _) | "1" `BS.isPrefixOf` value -> SslRequire
+      _ -> SslDisable
   choice "sslnegotiation" ["postgres"] ["direct"] "TLS"
   choice "sslcertmode" ["disable", "allow"] ["require"] "TLS"
   choice "channel_binding" ["disable", "prefer"] ["require"] "TLS"
@@ -409,7 +425,8 @@ resolve option localUser = do
         connectionTargetSessionAttrs = target,
         connectionProtocolVersion = maxVersion,
         connectionMinProtocolVersion = minVersion,
-        connectionTcpOptions = tcp
+        connectionTcpOptions = tcp,
+        connectionSslMode = sslMode
       }
   where
     -- An empty value counts as none, as it does in libpq.
@@ -486,7 +503,10 @@ hostConnectSettings string host =
       connectDatabase = Just (connectionDatabase string),
       connectParameters = connectionParameters string,
       connectProtocolVersion = connectionProtocolVersion string,
-      connectTcpOptions = connectionTcpOptions string
+      connectTcpOptions = connectionTcpOptions string,
+      connectSslMode = connectionSslMode string,
+      -- With hostaddr, the address is the IP address the name resolved to.
+      connectServerName = Just (hostName host)
     }
 
 -- | Where to connect. A socket directory names the Unix-domain socket for the
