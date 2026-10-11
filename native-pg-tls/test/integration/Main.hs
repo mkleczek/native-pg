@@ -162,6 +162,24 @@ main = withCluster $ \socketPath port -> hspec $ do
         result <- try (either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") (tcp "sslmode=require")))
         either (pure . displayException @ConnectFailure) (\(session, _, _) -> close session *> fail "connected") result
           `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in")
+      it "encrypts by default, with sslmode=prefer, as libpq does" $ do
+        pendingWith "sslmode=prefer and allow don't use TLS"
+        withConnection (tcp "") $ \(session, _, _) ->
+          encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
+      it "falls back to plaintext with sslmode=prefer when the server rejects TLS" $ do
+        pendingWith "sslmode=prefer and allow don't use TLS"
+        withConnection (tcp "user=native_pg_plaintext") $ \(session, _, _) ->
+          encrypted session `shouldReturn` Right ([[Just "f"]], "SELECT 1")
+      it "tries plaintext first with sslmode=allow, then TLS" $ do
+        pendingWith "sslmode=prefer and allow don't use TLS"
+        withConnection (tcp "sslmode=allow user=native_pg_plaintext") $ \(session, _, _) ->
+          encrypted session `shouldReturn` Right ([[Just "f"]], "SELECT 1")
+        withConnection (tcp "sslmode=allow") $ \(session, _, _) ->
+          encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
+      it "connects in plaintext with sslmode=prefer without a TLS client, as libpq without TLS does" $ do
+        pendingWith "sslmode=prefer and allow don't use TLS"
+        connected <- either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") (tcp "user=native_pg_plaintext"))
+        (\(session, _, _) -> encrypted session <* close session) connected `shouldReturn` Right ([[Just "f"]], "SELECT 1")
       it "verifies the server's certificate and name with sslmode=verify-full" $ do
         withConnection (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1")) $ \(session, _, _) ->
           encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
