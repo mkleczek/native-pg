@@ -198,6 +198,13 @@ main = withCluster $ \socketPath port -> hspec $ do
                              <> show port
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
+      it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do
+        pendingWith "TLS's versions aren't configurable"
+        let version extra = withConnection (tcp ("sslmode=require " <> extra)) $ \(session, _, _) ->
+              value session "SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+        version "" `shouldReturn` Right ([[Just "TLSv1.3"]], "SELECT 1")
+        version "ssl_max_protocol_version=TLSv1.2" `shouldReturn` Right ([[Just "TLSv1.2"]], "SELECT 1")
+        version "ssl_min_protocol_version=TLSv1 ssl_max_protocol_version=TLSv1.2" `shouldReturn` Right ([[Just "TLSv1.2"]], "SELECT 1")
       it "checks revocation lists, from sslcrl or sslcrldir" $ do
         let verified extra = tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1 " <> extra)
             revoked = "connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: invalid peer certificate: Revoked"
