@@ -261,7 +261,10 @@ data TlsSettings = TlsSettings
   { tlsVerification :: ServerVerification,
     -- | A certificate chain and its private key, in PEM files, for the
     -- server to authenticate the client with, if it asks.
-    tlsClientCertificate :: Maybe (FilePath, FilePath)
+    tlsClientCertificate :: Maybe (FilePath, FilePath),
+    -- | Certificate revocation lists, in PEM files, which every certificate
+    -- of the server's chain is checked against when it's verified.
+    tlsRevocationLists :: [FilePath]
   }
   deriving (Eq, Show)
 

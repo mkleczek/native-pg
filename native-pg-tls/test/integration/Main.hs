@@ -199,7 +199,6 @@ main = withCluster $ \socketPath port -> hspec $ do
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
       it "checks revocation lists, from sslcrl or sslcrldir" $ do
-        pendingWith "revocation lists aren't supported"
         let verified extra = tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1 " <> extra)
             revoked = "connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: invalid peer certificate: Revoked"
         withConnection (verified ("sslcrl=" <> Char8.pack (certificate "empty.crl"))) (\_ -> pure ())

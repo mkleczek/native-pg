@@ -74,7 +74,9 @@ newTlsConfig settings = do
       case tlsVerification settings of
         NoVerification -> check "could not configure the certificate verifier" =<< c_accept_any_certificate builder
         VerifyFull (RootCertificateFile roots) -> withVerifier roots (c_client_config_builder_set_server_verifier builder)
-        VerifyFull SystemRootCertificates -> c_client_config_builder_set_server_verifier builder . ConstPtr =<< systemVerifier
+        VerifyFull SystemRootCertificates
+          | null (tlsRevocationLists settings) -> c_client_config_builder_set_server_verifier builder . ConstPtr =<< systemVerifier
+          | otherwise -> throwIO (TlsError "revocation lists with the system's root certificates aren't supported")
       for_ (tlsClientCertificate settings) $ \(chainFile, keyFile) -> do
         chain <- BS.readFile chainFile
         key <- BS.readFile keyFile
@@ -99,7 +101,12 @@ newTlsConfig settings = do
         check ("could not read root certificate file " <> show roots)
           =<< withCString roots (\path -> c_root_cert_store_builder_load_roots_from_file storeBuilder path (CBool 1))
         bracket (built "could not create the root certificate store" (c_root_cert_store_builder_build storeBuilder)) c_root_cert_store_free $ \store ->
-          bracket (c_web_pki_server_cert_verifier_builder_new store) c_web_pki_server_cert_verifier_builder_free $ \verifierBuilder ->
+          bracket (c_web_pki_server_cert_verifier_builder_new store) c_web_pki_server_cert_verifier_builder_free $ \verifierBuilder -> do
+            for_ (tlsRevocationLists settings) $ \file -> do
+              lists <- BS.readFile file
+              BS.unsafeUseAsCStringLen lists $ \(bytes, len) ->
+                check ("could not load revocation list file " <> show file)
+                  =<< c_web_pki_server_cert_verifier_builder_add_crl verifierBuilder (castPtr bytes) (fromIntegral len)
             -- The configuration keeps a reference of its own to the verifier.
             bracket
               (built "could not create the certificate verifier" (c_web_pki_server_cert_verifier_builder_build verifierBuilder))
@@ -360,6 +367,9 @@ foreign import capi unsafe "rustls.h rustls_root_cert_store_free"
 
 foreign import capi unsafe "rustls.h rustls_web_pki_server_cert_verifier_builder_new"
   c_web_pki_server_cert_verifier_builder_new :: ConstPtr RootCertStore -> IO (Ptr ServerCertVerifierBuilder)
+
+foreign import capi unsafe "rustls.h rustls_web_pki_server_cert_verifier_builder_add_crl"
+  c_web_pki_server_cert_verifier_builder_add_crl :: Ptr ServerCertVerifierBuilder -> Ptr Word8 -> CSize -> IO Word32
 
 foreign import capi unsafe "rustls.h rustls_web_pki_server_cert_verifier_builder_build"
   c_web_pki_server_cert_verifier_builder_build :: Ptr ServerCertVerifierBuilder -> Ptr () -> IO Word32

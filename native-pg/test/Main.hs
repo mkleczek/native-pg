@@ -231,7 +231,9 @@ main = hspec $ do
               connectionMinProtocolVersion = protocolVersion3_0,
               connectionTcpOptions = defaultTcpOptions,
               connectionSslMode = SslPrefer,
-              connectionSslCertificate = Nothing
+              connectionSslCertificate = Nothing,
+              connectionSslRevocationList = Nothing,
+              connectionSslRevocationListDirectory = Nothing
             }
     it "reads a URI" $ do
       let parsed = parse "postgresql://alice:p%40ss@db.example.com:6543/app?application_name=api&connect_timeout=10"
@@ -321,6 +323,11 @@ main = hspec $ do
       parse "sslpassword=secret" `shouldSatisfy` failsWith "sslpassword isn't supported"
       parse "sslcertmode=require" `shouldSatisfy` failsWith "sslcertmode=require requires knowing whether the server asked for the certificate"
       parse "sslkeylogfile=/keys" `shouldSatisfy` failsWith "sslkeylogfile isn't supported"
+    it "reads revocation lists, or libpq's default file" $ do
+      let lists = fmap (\string -> (connectionSslRevocationList string, connectionSslRevocationListDirectory string))
+      lists (parse "sslcrl=/a.crl sslcrldir=/crls") `shouldBe` Right (Just "/a.crl", Just "/crls")
+      lists (parseWith [("HOME", "/home/u")] "") `shouldBe` Right (Just "/home/u/.postgresql/root.crl", Nothing)
+      lists (parseWith [("HOME", "/home/u")] "sslcrldir=/crls") `shouldBe` Right (Nothing, Just "/crls")
     it "rejects what verifies the server's certificate but not its name" $ do
       parse "sslmode=verify-ca" `shouldSatisfy` failsWith "sslmode=verify-ca verifies the server's certificate but not its name, which isn't supported"
       parseWith [("PGSSLMODE", "verify-ca")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-ca verifies"

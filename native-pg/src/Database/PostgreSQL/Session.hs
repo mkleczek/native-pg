@@ -56,19 +56,21 @@ module Database.PostgreSQL.Session
 where
 
 import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, finally, onException, throwIO, try)
-import Control.Monad (join, unless, when, (<=<))
+import Control.Monad (filterM, join, unless, when, (<=<))
 import Data.Bifunctor (first)
-import Data.Foldable (for_)
+import Data.Foldable (for_, toList)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.Char (isDigit)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.Kind (Type)
+import Data.List (sort)
 import Data.Maybe (fromMaybe)
 #if defined(mingw32_HOST_OS)
-import System.Directory (doesFileExist, getPermissions)
+import System.Directory (doesDirectoryExist, doesFileExist, getPermissions, listDirectory)
 #else
-import System.Directory (doesFileExist)
+import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import qualified System.Posix.Files as Posix
 import qualified System.Posix.User as Posix
 #endif
@@ -354,7 +356,12 @@ data ConnectSettings = ConnectSettings
     connectTlsClient :: Maybe TlsClient,
     -- | A client certificate and its private key, in PEM files, used if the
     -- certificate file exists, as with libpq.
-    connectSslCertificate :: Maybe (FilePath, FilePath)
+    connectSslCertificate :: Maybe (FilePath, FilePath),
+    -- | A file of certificate revocation lists, used if it exists, and a
+    -- directory of them, named as OpenSSL's c_rehash names them, as with
+    -- libpq.
+    connectSslRevocationList :: Maybe FilePath,
+    connectSslRevocationListDirectory :: Maybe FilePath
   }
 
 -- | Whether to encrypt with TLS, from libpq's sslmode.
@@ -390,7 +397,9 @@ connectSettings address user =
       connectSslMode = SslDisable,
       connectServerName = Nothing,
       connectTlsClient = Nothing,
-      connectSslCertificate = Nothing
+      connectSslCertificate = Nothing,
+      connectSslRevocationList = Nothing,
+      connectSslRevocationListDirectory = Nothing
     }
 
 data ServerInfo = ServerInfo
@@ -491,8 +500,9 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
               True -> do
                 let started = do
                       certificate <- clientCertificate
+                      lists <- revocationLists
                       start
-                        =<< startTlsChannel client (TlsSettings verification certificate) (fromMaybe host (connectServerName settings)) sock
+                        =<< startTlsChannel client (TlsSettings verification certificate lists) (fromMaybe host (connectServerName settings)) sock
                           `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
                 if required then started else started `catch` (throwIO . FailedWithTls)
           _ -> start (newChannel sock)
@@ -510,6 +520,21 @@ connect settings = case (connectSslMode settings, connectAddress settings, conne
               Left (_ :: IOException) -> throwIO (TlsFailure ("certificate present, but not private key file \"" <> key <> "\""))
               Right (Just problem) -> throwIO (TlsFailure ("private key file \"" <> key <> "\" " <> problem))
               Right Nothing -> pure (Just (chain, key))
+    revocationLists = do
+      file <- filterM doesFileExist (toList (connectSslRevocationList settings))
+      directory <- case connectSslRevocationListDirectory settings of
+        Nothing -> pure []
+        Just directory -> do
+          exists <- doesDirectoryExist directory
+          if exists
+            then map ((directory <> "/") <>) . sort . filter rehashed <$> listDirectory directory
+            else pure []
+      pure (file <> directory)
+    -- c_rehash's names of revocation lists: their issuer's hash, .r and a
+    -- number.
+    rehashed name = case break (== '.') name of
+      (_, '.' : 'r' : number) -> not (null number) && all isDigit number
+      _ -> False
     -- Given how to make the channel, once there's somewhere for its unsent
     -- output.
     start channel = do

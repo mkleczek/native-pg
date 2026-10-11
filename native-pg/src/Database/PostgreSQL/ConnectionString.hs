@@ -82,7 +82,12 @@ data ConnectionString = ConnectionString
     -- | The client certificate and its private key, from @sslcert@ and
     -- @sslkey@, or libpq's default files in the home directory, unless
     -- @sslcertmode@ is @disable@.
-    connectionSslCertificate :: Maybe (FilePath, FilePath)
+    connectionSslCertificate :: Maybe (FilePath, FilePath),
+    -- | Certificate revocation lists: from @sslcrl@, or, if neither it nor
+    -- @sslcrldir@ is given, libpq's default file in the home directory, and
+    -- from @sslcrldir@.
+    connectionSslRevocationList :: Maybe FilePath,
+    connectionSslRevocationListDirectory :: Maybe FilePath
   }
   deriving (Eq, Show)
 
@@ -476,7 +481,12 @@ resolve option home localUser = do
         connectionMinProtocolVersion = minVersion,
         connectionTcpOptions = tcp,
         connectionSslMode = sslMode,
-        connectionSslCertificate = certificate
+        connectionSslCertificate = certificate,
+        connectionSslRevocationList = case (given "sslcrl", given "sslcrldir") of
+          (Just file, _) -> Just (text file)
+          (Nothing, Nothing) -> (<> "/.postgresql/root.crl") <$> home
+          (Nothing, Just _) -> Nothing,
+        connectionSslRevocationListDirectory = text <$> given "sslcrldir"
       }
   where
     -- An empty value counts as none, as it does in libpq.
@@ -556,6 +566,8 @@ hostConnectSettings string host =
       connectTcpOptions = connectionTcpOptions string,
       connectSslMode = connectionSslMode string,
       connectSslCertificate = connectionSslCertificate string,
+      connectSslRevocationList = connectionSslRevocationList string,
+      connectSslRevocationListDirectory = connectionSslRevocationListDirectory string,
       -- With hostaddr, the address is the IP address the name resolved to.
       connectServerName = Just (hostName host)
     }
