@@ -215,6 +215,21 @@ main = withCluster $ \socketPath port -> hspec $ do
             let refused = "host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require"
             refusing <- tlsSettings (Host "127.0.0.1" Nothing plaintext) refused
             cancel refusing key `shouldThrow` (== TlsFailure "server does not support SSL, but SSL was required")
+      it "binds SCRAM to TLS with channel_binding=require" $ do
+        pendingWith "channel binding isn't supported"
+        withConnection (tcp "user=native_pg_scram password='scram secret' sslmode=require channel_binding=require") $ \(session, _, _) ->
+          value session "SELECT current_user" `shouldReturn` Right ([[Just "native_pg_scram"]], "SELECT 1")
+      it "fails as libpq does with channel_binding=require when the server doesn't bind SCRAM to TLS" $ do
+        pendingWith "channel binding isn't supported"
+        let failure at reason = "connection to server " <> at <> " failed: " <> reason
+            socket = "on socket \"" <> socketPath <> "\""
+            tlsAt = "at \"127.0.0.1\", port " <> show port
+        connectFailure (local "user=native_pg_scram password='scram secret' channel_binding=require")
+          `shouldReturn` failure socket "channel binding is required, but server did not offer an authentication method that supports channel binding"
+        connectFailure (local "user=native_pg_md5 password='md5 secret' channel_binding=require")
+          `shouldReturn` failure socket "channel binding required but not supported by server's authentication request"
+        connectFailure (tcp "sslmode=require channel_binding=require")
+          `shouldReturn` failure tlsAt "channel binding required, but server authenticated client without channel binding"
       it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do
         let version extra = withConnection (tcp ("sslmode=require " <> extra)) $ \(session, _, _) ->
               value session "SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
