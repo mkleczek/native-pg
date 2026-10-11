@@ -20,7 +20,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int16, Int32, Int64)
-import Data.List (intercalate, isPrefixOf)
+import Data.List (intercalate, isInfixOf, isPrefixOf)
 import Data.Maybe (isJust)
 import Data.Scientific (Scientific)
 import Data.Text (Text)
@@ -57,8 +57,9 @@ import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursi
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.Mem (performMajorGC)
-import System.Posix.Files (ownerReadMode, setFileMode)
+import System.Posix.Files (groupReadMode, otherReadMode, ownerReadMode, setFileMode, unionFileModes)
 import System.Posix.Temp (mkdtemp)
+import System.Posix.Types (FileMode)
 import System.Process (readProcessWithExitCode)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -197,6 +198,23 @@ main = withCluster $ \socketPath port -> hspec $ do
                              <> show port
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
+      it "authenticates with a client certificate" $ do
+        pendingWith "client certificates aren't supported"
+        withKeyCopy ownerReadMode $ \key -> do
+          let certified = "user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key
+          withConnection (tcp certified) $ \(session, _, _) ->
+            value session "SELECT current_user" `shouldReturn` Right ([[Just "native_pg_certificate"]], "SELECT 1")
+        failure <- connectFailure (tcp "user=native_pg_certificate sslmode=require sslcert=/nonexistent/client.crt sslkey=/nonexistent/client.key")
+        failure `shouldSatisfy` isInfixOf "connection requires a valid client certificate"
+      it "needs a client certificate's key, readable only by its owner, as libpq does" $ do
+        pendingWith "client certificates aren't supported"
+        let certified key = tcp ("user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key)
+            at = "connection to server at \"127.0.0.1\", port " <> show port <> " failed: "
+        connectFailure (certified "/nonexistent/client.key")
+          `shouldReturn` (at <> "certificate present, but not private key file \"/nonexistent/client.key\"")
+        withKeyCopy (ownerReadMode `unionFileModes` groupReadMode `unionFileModes` otherReadMode) $ \key ->
+          connectFailure (certified key)
+            `shouldReturn` (at <> "private key file \"" <> key <> "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root")
       it "sends a batch larger than the sockets hold while reading its results" $ do
         withConnection (tcp "sslmode=require") $ \(session, _, _) -> do
           let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
@@ -747,6 +765,17 @@ withSilentServer action = do
       Socket.bind sock (Socket.SockAddrUnix (directory </> ".s.PGSQL.5432"))
       Socket.listen sock 4
       action directory
+
+-- | Runs the action with a copy of the client certificate's key, with the
+-- file mode given.
+withKeyCopy :: FileMode -> (FilePath -> IO a) -> IO a
+withKeyCopy mode action = do
+  temporary <- getTemporaryDirectory
+  bracket (mkdtemp (temporary </> "native-pg-key-")) removeDirectoryRecursive $ \directory -> do
+    let key = directory </> "client.key"
+    copyFile (certificate "client.key") key
+    setFileMode key mode
+    action key
 
 -- | Runs the action with a port at 127.0.0.1 where a server answers that it
 -- doesn't take TLS.
