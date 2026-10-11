@@ -92,7 +92,8 @@ data ConnectionString = ConnectionString
     connectionSslServerNameIndication :: Bool,
     -- | From @sslnegotiation@: whether TLS starts without asking the server
     -- first, which needs an sslmode that requires TLS.
-    connectionSslDirect :: Bool
+    connectionSslDirect :: Bool,
+    connectionChannelBinding :: ChannelBindingMode
   }
   deriving (Eq, Show)
 
@@ -435,7 +436,12 @@ resolve option home localUser = do
       | otherwise -> Left ("weak sslmode \"" <> sslModeName sslMode <> "\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")")
     Just other -> Left ("invalid sslnegotiation value: " <> quote other)
   choice "sslcertmode" ["disable", "allow"] ["require"] "knowing whether the server asked for the certificate"
-  choice "channel_binding" ["disable", "prefer"] ["require"] "TLS"
+  channelBinding <- case given "channel_binding" of
+    Nothing -> Right ChannelBindingPrefer
+    Just "disable" -> Right ChannelBindingDisable
+    Just "prefer" -> Right ChannelBindingPrefer
+    Just "require" -> Right ChannelBindingRequire
+    Just other -> Left ("invalid channel_binding value: " <> quote other)
   choice "gssencmode" ["disable", "prefer"] ["require"] "GSSAPI encryption"
   choice "load_balance_hosts" ["disable"] ["random"] "random load balancing"
   for_ (option "replication") $ \(Setting value source) ->
@@ -511,7 +517,8 @@ resolve option home localUser = do
         connectionSslRevocationListDirectory = text <$> given "sslcrldir",
         connectionSslVersions = sslVersions,
         connectionSslServerNameIndication = given "sslsni" /= Just "0",
-        connectionSslDirect = sslDirect
+        connectionSslDirect = sslDirect,
+        connectionChannelBinding = channelBinding
       }
   where
     -- An empty value counts as none, as it does in libpq.
@@ -613,6 +620,7 @@ hostConnectSettings string host =
       connectSslVersions = connectionSslVersions string,
       connectSslServerNameIndication = connectionSslServerNameIndication string,
       connectSslDirect = connectionSslDirect string,
+      connectChannelBinding = connectionChannelBinding string,
       -- With hostaddr, the address is the IP address the name resolved to.
       connectServerName = Just (hostName host)
     }

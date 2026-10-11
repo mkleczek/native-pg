@@ -216,11 +216,9 @@ main = withCluster $ \socketPath port -> hspec $ do
             refusing <- tlsSettings (Host "127.0.0.1" Nothing plaintext) refused
             cancel refusing key `shouldThrow` (== TlsFailure "server does not support SSL, but SSL was required")
       it "binds SCRAM to TLS with channel_binding=require" $ do
-        pendingWith "channel binding isn't supported"
         withConnection (tcp "user=native_pg_scram password='scram secret' sslmode=require channel_binding=require") $ \(session, _, _) ->
           value session "SELECT current_user" `shouldReturn` Right ([[Just "native_pg_scram"]], "SELECT 1")
       it "fails as libpq does with channel_binding=require when the server doesn't bind SCRAM to TLS" $ do
-        pendingWith "channel binding isn't supported"
         let failure at reason = "connection to server " <> at <> " failed: " <> reason
             socket = "on socket \"" <> socketPath <> "\""
             tlsAt = "at \"127.0.0.1\", port " <> show port

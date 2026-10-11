@@ -24,7 +24,7 @@ import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Protocol
 import Database.PostgreSQL.Protocol.Codec
 import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
-import Database.PostgreSQL.Session (ConnectSettings (..), SslMode (..))
+import Database.PostgreSQL.Session (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions)
@@ -259,7 +259,8 @@ main = hspec $ do
               connectionSslRevocationListDirectory = Nothing,
               connectionSslVersions = [Tls12, Tls13],
               connectionSslServerNameIndication = True,
-              connectionSslDirect = False
+              connectionSslDirect = False,
+              connectionChannelBinding = ChannelBindingPrefer
             }
     it "reads a URI" $ do
       let parsed = parse "postgresql://alice:p%40ss@db.example.com:6543/app?application_name=api&connect_timeout=10"
@@ -368,6 +369,11 @@ main = hspec $ do
       fmap connectionSslDirect (parse "sslnegotiation=postgres") `shouldBe` Right False
       parse "sslnegotiation=direct"
         `shouldSatisfy` failsWith "weak sslmode \"prefer\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")"
+    it "reads channel_binding" $ do
+      mapM_
+        (\(string, binding) -> fmap connectionChannelBinding (parse string) `shouldBe` Right binding)
+        [("channel_binding=disable", ChannelBindingDisable), ("channel_binding=require", ChannelBindingRequire), ("", ChannelBindingPrefer)]
+      parse "channel_binding=maybe" `shouldSatisfy` failsWith "invalid channel_binding value: \"maybe\""
     it "rejects what verifies the server's certificate but not its name" $ do
       parse "sslmode=verify-ca" `shouldSatisfy` failsWith "sslmode=verify-ca verifies the server's certificate but not its name, which isn't supported"
       parseWith [("PGSSLMODE", "verify-ca")] "" `shouldSatisfy` failsWith "PGSSLMODE=verify-ca verifies"

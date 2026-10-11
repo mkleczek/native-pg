@@ -18,6 +18,7 @@ module Database.PostgreSQL.Session
     ConnectSettings (..),
     ConnectionError (..),
     SslMode (..),
+    ChannelBindingMode (..),
     ServerError (..),
     ServerInfo (..),
     close,
@@ -66,7 +67,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.Kind (Type)
 import Data.List (sort)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 #if defined(mingw32_HOST_OS)
 import System.Directory (doesDirectoryExist, doesFileExist, getPermissions, listDirectory)
 #else
@@ -83,7 +84,9 @@ import Database.PostgreSQL.Authentication
     scramClientFinal,
     scramClientFirst,
     scramMechanism,
+    scramPlusMechanism,
     scramVerifyServerFinal,
+    serverEndPoint,
   )
 import Database.PostgreSQL.Protocol.Codec
   ( Alternatives (..),
@@ -371,8 +374,19 @@ data ConnectSettings = ConnectSettings
     connectSslServerNameIndication :: Bool,
     -- | Whether to start TLS without asking the server first, as
     -- PostgreSQL 17 takes it.
-    connectSslDirect :: Bool
+    connectSslDirect :: Bool,
+    connectChannelBinding :: ChannelBindingMode
   }
+
+-- | Whether to bind SCRAM to TLS, from libpq's channel_binding.
+data ChannelBindingMode
+  = ChannelBindingDisable
+  | -- | If the server offers it over TLS.
+    ChannelBindingPrefer
+  | -- | Or else fail, as with libpq: the server is then known to have the
+    -- password's secret, and the certificate.
+    ChannelBindingRequire
+  deriving (Eq, Show)
 
 -- | Whether to encrypt with TLS, from libpq's sslmode.
 data SslMode
@@ -413,7 +427,8 @@ connectSettings address user =
       connectSslRevocationListDirectory = Nothing,
       connectSslVersions = [minBound .. maxBound],
       connectSslServerNameIndication = True,
-      connectSslDirect = False
+      connectSslDirect = False,
+      connectChannelBinding = ChannelBindingPrefer
     }
 
 data ServerInfo = ServerInfo
@@ -678,8 +693,27 @@ authenticate settings version session = do
         :|: (\(NegotiateProtocolVersion negotiated (_ :: [ByteString])) -> Reply (ProtocolVersionNegotiated negotiated))
         :|: startupTail
   case request of
-    Authenticated -> pure (version, continueIn session)
+    Authenticated
+      | required -> throwIO (AuthenticationError "channel binding required, but server authenticated client without channel binding")
+      | otherwise -> pure (version, continueIn session)
     ProtocolVersionNegotiated negotiated -> authenticate settings negotiated session
+    SaslRequested mechanisms
+      | Just certificate <- channelServerCertificate channel,
+        connectChannelBinding settings /= ChannelBindingDisable,
+        scramPlusMechanism `elem` mechanisms -> do
+          password <- requirePassword
+          endPoint <- either (throwIO . AuthenticationError) pure (serverEndPoint certificate)
+          (version,) <$> authenticateScram scramPlusMechanism (BoundToServerEndPoint endPoint) password session
+      | required ->
+          throwIO (AuthenticationError "channel binding is required, but server did not offer an authentication method that supports channel binding")
+      | scramMechanism `elem` mechanisms -> do
+          password <- requirePassword
+          let binding
+                | isJust (channelServerCertificate channel) && connectChannelBinding settings /= ChannelBindingDisable = ChannelBindingUnused
+                | otherwise = WithoutChannelBinding
+          (version,) <$> authenticateScram scramMechanism binding password session
+      | otherwise -> throwIO (UnsupportedAuthentication ("SASL with " <> show mechanisms))
+    _ | required -> throwIO (AuthenticationError "channel binding required but not supported by server's authentication request")
     CleartextPasswordRequested -> do
       password <- requirePassword
       send @'PasswordMessageType session (PasswordMessage password)
@@ -688,20 +722,19 @@ authenticate settings version session = do
       password <- requirePassword
       send @'PasswordMessageType session (PasswordMessage (md5Password (connectUser settings) password salt))
       (version,) <$> awaitAuthenticationOk (continueIn session)
-    SaslRequested mechanisms
-      | scramMechanism `elem` mechanisms -> do
-          password <- requirePassword
-          (version,) <$> authenticateScram password session
-      | otherwise -> throwIO (UnsupportedAuthentication ("SASL with " <> show mechanisms))
     UnsupportedMethodRequested method -> throwIO (UnsupportedAuthentication method)
   where
+    Session connection = session
+    channel = connectionChannel connection
+    required = connectChannelBinding settings == ChannelBindingRequire
     requirePassword =
       maybe (throwIO (AuthenticationError "the server asks for a password, but none is set")) pure (connectPassword settings)
 
-authenticateScram :: ByteString -> Session 'Authentication -> IO (Session 'Initialization)
-authenticateScram password session = do
-  (clientFirst, client) <- scramClientFirst WithoutChannelBinding "" <$> newScramNonce
-  send @'SASLInitialResponseType session (SASLInitialResponse scramMechanism (Just clientFirst))
+-- | With the mechanism, and its channel binding.
+authenticateScram :: ByteString -> ChannelBinding -> ByteString -> Session 'Authentication -> IO (Session 'Initialization)
+authenticateScram mechanism binding password session = do
+  (clientFirst, client) <- scramClientFirst binding "" <$> newScramNonce
+  send @'SASLInitialResponseType session (SASLInitialResponse mechanism (Just clientFirst))
   let continuing = continueIn session :: Session 'SaslContinue
   serverFirst <-
     pull continuing $

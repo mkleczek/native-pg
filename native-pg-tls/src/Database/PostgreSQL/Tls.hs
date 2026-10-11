@@ -50,7 +50,7 @@ import Foreign.ForeignPtr (FinalizerPtr, ForeignPtr, finalizeForeignPtr, newFore
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (withArrayLen)
 import Foreign.Marshal.Utils (fromBool, with)
-import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (Storable, peek)
 import Network.Socket (Socket, close, withFdSocket)
 import System.IO.Unsafe (unsafePerformIO)
@@ -152,7 +152,9 @@ systemVerifierMade = unsafePerformIO (newMVar Nothing)
 data TlsConnection = TlsConnection
   { -- | The socket it reads and writes.
     tlsSocket :: Socket,
-    tlsConnection :: ForeignPtr RustlsConnection
+    tlsConnection :: ForeignPtr RustlsConnection,
+    -- | The server's certificate, in DER, once the handshake is done.
+    tlsServerCertificate :: Maybe ByteString
   }
 
 instance Link TlsConnection where
@@ -166,6 +168,8 @@ instance Link TlsConnection where
   {-# INLINE flushReady #-}
   closeLink = closeTls
   {-# INLINE closeLink #-}
+  linkServerCertificate = tlsServerCertificate
+  {-# INLINE linkServerCertificate #-}
 
 -- | Starts TLS over the socket, as a client of the named server, and waits
 -- for the handshake to finish. The name is a host name, which the server's
@@ -178,7 +182,14 @@ startTls (TlsConfig config) serverName sock = do
       built ("invalid server name " <> show serverName) (c_client_connection_new (ConstPtr configPointer) name)
   tls <- newTlsConnection sock connection
   handshake tls
-  pure tls
+  certificate <- withConnection tls $ \rustls -> do
+    peer <- c_connection_get_peer_certificate rustls 0
+    if unConstPtr peer == nullPtr
+      then pure Nothing
+      else alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
+        check "could not read the server's certificate" =<< c_certificate_get_der peer (castPtr bytes) len
+        fmap Just . BS.packCStringLen =<< ((,) . castPtr <$> peek bytes <*> (fromIntegral <$> peek len))
+  pure tls {tlsServerCertificate = certificate}
 
 -- | Takes over a connection rustls made, to read and write it over the
 -- socket. It's freed when it's closed, or when it's no longer used.
@@ -187,7 +198,7 @@ newTlsConnection sock connection = do
   -- Records wait in the connection until the socket takes them, up to this
   -- many bytes.
   c_connection_set_buffer_limit connection 65536
-  TlsConnection sock <$> newForeignPtr p_connection_free connection
+  (\rustls -> TlsConnection sock rustls Nothing) <$> newForeignPtr p_connection_free connection
 
 -- | Sends and receives the handshake's messages until it's done.
 handshake :: TlsConnection -> IO ()
@@ -339,6 +350,8 @@ data CryptoProviderBuilder
 
 data CertifiedKey
 
+data Certificate
+
 data ClientConfig
 
 data RootCertStoreBuilder
@@ -444,6 +457,12 @@ foreign import capi unsafe "rustls.h rustls_connection_read"
 
 foreign import capi unsafe "rustls.h rustls_connection_write"
   c_connection_write :: Ptr RustlsConnection -> Ptr Word8 -> CSize -> Ptr CSize -> IO Word32
+
+foreign import capi unsafe "rustls.h rustls_connection_get_peer_certificate"
+  c_connection_get_peer_certificate :: Ptr RustlsConnection -> CSize -> IO (ConstPtr Certificate)
+
+foreign import capi unsafe "rustls.h rustls_certificate_get_der"
+  c_certificate_get_der :: ConstPtr Certificate -> Ptr () -> Ptr CSize -> IO Word32
 
 foreign import capi unsafe "rustls.h rustls_connection_get_alpn_protocol"
   c_connection_get_alpn_protocol :: Ptr RustlsConnection -> Ptr () -> Ptr CSize -> IO ()

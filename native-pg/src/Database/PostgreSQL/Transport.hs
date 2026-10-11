@@ -237,6 +237,9 @@ class Link link where
   -- | Closes the link and its socket.
   closeLink :: link -> IO ()
 
+  -- | The server's certificate, in DER, over TLS.
+  linkServerCertificate :: link -> Maybe ByteString
+
 instance Link Socket where
   linkSocket = id
   {-# INLINE linkSocket #-}
@@ -248,6 +251,8 @@ instance Link Socket where
   {-# INLINE flushReady #-}
   closeLink = close
   {-# INLINE closeLink #-}
+  linkServerCertificate _ = Nothing
+  {-# INLINE linkServerCertificate #-}
 
 -- | Starts TLS over a connected socket, as a client of the named server, and
 -- gives the channel over it, made as 'newChannel' makes one. A library apart,
@@ -319,7 +324,9 @@ data Channel = Channel
     channelSendSome :: Unsent -> IO Unsent,
     -- | Sends the output, waiting for room as needed.
     channelSend :: Output -> IO (),
-    channelClose :: IO ()
+    channelClose :: IO (),
+    -- | The server's certificate, in DER, over TLS.
+    channelServerCertificate :: Maybe ByteString
   }
 
 -- | The channel over a link, given where the output that waits to be sent is
@@ -330,7 +337,8 @@ newChannel link pending readSize =
     { channelInput = linkInputSource link pending readSize,
       channelSendSome = sendSome link,
       channelSend = sendOutput link,
-      channelClose = closeLink link
+      channelClose = closeLink link,
+      channelServerCertificate = linkServerCertificate link
     }
 {-# INLINABLE newChannel #-}
 {-# SPECIALIZE newChannel :: Socket -> IORef Unsent -> Int -> Channel #-}
