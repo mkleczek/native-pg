@@ -3,7 +3,7 @@
 {-# LANGUAGE MultiWayIf #-}
 
 -- | Raw sockets: connecting, reading into the parser's buffer, and sending
--- serialized messages.
+-- serialized messages, over a link that's the socket itself or TLS over it.
 module Database.PostgreSQL.Transport
   ( Address (..),
     ConnectError (..),
@@ -11,19 +11,21 @@ module Database.PostgreSQL.Transport
     TcpOptions (..),
     connectSocket,
     defaultTcpOptions,
-    sendOutput,
-    socketInputSource,
+
+    -- * Links
+    Link (..),
+    Channel (..),
+    newChannel,
 
     -- * Output sent as answers are read
     Unsent,
     OutputBuffer,
     newOutputBuffer,
     unsent,
-    sendSome,
   )
 where
 
-import Control.Concurrent (threadWaitReadSTM, threadWaitWrite, threadWaitWriteSTM)
+import Control.Concurrent (threadWaitRead, threadWaitReadSTM, threadWaitWrite, threadWaitWriteSTM)
 import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, throwIO, try)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
@@ -64,13 +66,14 @@ import Network.Socket
     getNameInfo,
     isSupportedSocketOption,
     openSocket,
-    recvBuf,
     setSocketOption,
     socket,
     withFdSocket,
   )
 import System.Posix.Types (Fd (..))
 #if defined(mingw32_HOST_OS)
+import Foreign.Ptr (Ptr)
+import Network.Socket (recvBuf)
 import Network.Socket.ByteString (sendMany)
 #else
 import qualified Data.ByteString.Unsafe as BS
@@ -204,24 +207,90 @@ keepalivesInterval = SockOpt (-1) (-1)
 keepalivesCount = SockOpt (-1) (-1)
 #endif
 
--- | Reads from the socket into the parser's buffer, which a new allocation
+-- | A stream of bytes to the server over a connected socket: the socket
+-- itself, or TLS over it. Its operations don't wait: the connection waits on
+-- the socket.
+class Link link where
+  -- | The socket the link reads and writes.
+  linkSocket :: link -> Socket
+
+  -- | Reads what's ready into the buffer, up to its size, without waiting:
+  -- 'Nothing' if nothing is, and 0 at the end of the stream.
+  receiveReady :: link -> Ptr Word8 -> Int -> IO (Maybe Int)
+
+  -- | Takes what it can of the pieces without waiting, and gives how many
+  -- bytes it took.
+  sendReady :: link -> [ByteString] -> IO Int
+
+  -- | Writes what it took but hasn't written yet, without waiting. True if
+  -- nothing is left.
+  flushReady :: link -> IO Bool
+
+  -- | Closes the link and its socket.
+  closeLink :: link -> IO ()
+
+instance Link Socket where
+  linkSocket = id
+  {-# INLINE linkSocket #-}
+  receiveReady = tryReceive
+  {-# INLINE receiveReady #-}
+  sendReady = trySend
+  {-# INLINE sendReady #-}
+  flushReady _ = pure True
+  {-# INLINE flushReady #-}
+  closeLink = close
+  {-# INLINE closeLink #-}
+
+-- | A connection's input and output over its link. It's made with the
+-- connection, from code specialized to the link, so that using it passes no
+-- dictionary, and the rest of the client doesn't know which link it has.
+data Channel = Channel
+  { -- | Reads input. While output is unsent, waiting for input also sends it
+    -- as the link takes it.
+    channelInput :: InputSource,
+    -- | Sends what the link takes without waiting, and gives what's left.
+    channelSendSome :: Unsent -> IO Unsent,
+    -- | Sends the output, waiting for room as needed.
+    channelSend :: Output -> IO (),
+    channelClose :: IO ()
+  }
+
+-- | The channel over a link, given where the output that waits to be sent is
+-- kept, and the size of a read.
+newChannel :: Link link => link -> IORef Unsent -> Int -> Channel
+newChannel link pending readSize =
+  Channel
+    { channelInput = linkInputSource link pending readSize,
+      channelSendSome = sendSome link,
+      channelSend = sendOutput link,
+      channelClose = closeLink link
+    }
+{-# INLINABLE newChannel #-}
+{-# SPECIALIZE newChannel :: Socket -> IORef Unsent -> Int -> Channel #-}
+
+-- | Reads from the link into the parser's buffer, which a new allocation
 -- makes the given size. While output is unsent, waiting for input also sends
--- it as the socket takes it.
-socketInputSource :: Socket -> IORef Unsent -> Int -> InputSource
-socketInputSource sock pending readSize =
+-- it as the link takes it.
+linkInputSource :: Link link => link -> IORef Unsent -> Int -> InputSource
+linkInputSource link pending readSize =
   InputSource
-    { readInputInto = \pointer size -> sendWhileWaiting *> recvBuf sock pointer size,
+    { readInputInto = receive,
       inputReadSize = readSize
     }
   where
-    sendWhileWaiting =
-      readIORef pending >>= \case
-        Unsent [] -> pure ()
-        left -> do
-          readable <- awaitReadableOrWritable sock
-          unless readable $ do
-            writeIORef pending =<< sendSome sock left
-            sendWhileWaiting
+    receive pointer size =
+      receiveReady link pointer size >>= \case
+        Just received -> pure received
+        Nothing -> do
+          left <- readIORef pending
+          flushed <- flushReady link
+          case left of
+            Unsent [] | flushed -> withFdSocket (linkSocket link) (threadWaitRead . Fd)
+            _ -> do
+              readable <- awaitReadableOrWritable (linkSocket link)
+              unless readable $ writeIORef pending =<< sendSome link left
+          receive pointer size
+{-# INLINABLE linkInputSource #-}
 
 -- | A parameter stream gave a different number of bytes than it declared.
 -- The message it belongs to is incomplete, so the connection is unusable.
@@ -235,13 +304,17 @@ data StreamLengthError = StreamLengthError
 instance Exception StreamLengthError
 
 -- | Sends the output, waiting for room in the socket as needed.
-sendOutput :: Socket -> Output -> IO ()
-sendOutput sock output = go =<< unsent Nothing output
+sendOutput :: Link link => link -> Output -> IO ()
+sendOutput link output = go =<< unsent Nothing output
   where
     go left =
-      sendSome sock left >>= \case
-        Unsent [] -> pure ()
-        rest -> withFdSocket sock (threadWaitWrite . Fd) *> go rest
+      sendSome link left >>= \case
+        Unsent [] -> do
+          flushed <- flushReady link
+          unless flushed (awaitWritable *> go (Unsent []))
+        rest -> awaitWritable *> go rest
+    awaitWritable = withFdSocket (linkSocket link) (threadWaitWrite . Fd)
+{-# INLINABLE sendOutput #-}
 
 -- | What's left of an output to send. The server may answer the first
 -- messages of an output before it has read the rest, and stop reading until
@@ -283,21 +356,21 @@ gatherSize, gatherPieces :: Int
 gatherSize = 262144
 gatherPieces = 16
 
--- | Sends what the socket takes without waiting for room in it, pulling
--- streams as it goes, and gives what's left. Each send gathers the parts up
--- front, pulling a stream's chunks, up to 'gatherSize' bytes or
+-- | Sends what the link takes without waiting for room in the socket,
+-- pulling streams as it goes, and gives what's left. Each send gathers the
+-- parts up front, pulling a stream's chunks, up to 'gatherSize' bytes or
 -- 'gatherPieces' pieces. Pulling may wait for the stream's client, so the
 -- bytes before a stream are sent before it's pulled: the server starts on
 -- its statement, and its statement_timeout, as it would without the stream.
-sendSome :: Socket -> Unsent -> IO Unsent
-sendSome sock (Unsent parts) = Unsent <$> go parts
+sendSome :: Link link => link -> Unsent -> IO Unsent
+sendSome link (Unsent parts) = Unsent <$> go parts
   where
     go remaining = do
       (gathered, rest) <- gather 0 [] remaining
       if null gathered
         then pure rest
         else do
-          sent <- trySend sock gathered
+          sent <- sendReady link gathered
           case dropSent sent gathered of
             [] -> go rest
             left -> pure (map PartBytes left <> rest)
@@ -323,6 +396,7 @@ sendSome sock (Unsent parts) = Unsent <$> go parts
         | sent >= BS.length chunk -> dropSent (sent - BS.length chunk) others
         | otherwise -> BS.drop sent chunk : others
       [] -> []
+{-# INLINABLE sendSome #-}
 
 -- | Waits until the socket has input, or room for output. True if it has
 -- input.
@@ -331,6 +405,30 @@ awaitReadableOrWritable sock = withFdSocket sock $ \fd -> do
   (readable, stopReadable) <- threadWaitReadSTM (Fd fd)
   (writable, stopWritable) <- threadWaitWriteSTM (Fd fd)
   atomically ((True <$ readable) `orElse` (False <$ writable)) `finally` (stopReadable *> stopWritable)
+
+-- | Reads what the socket has into the buffer, without waiting: 'Nothing' if
+-- it has nothing, and 0 at the end of the stream.
+tryReceive :: Socket -> Ptr Word8 -> Int -> IO (Maybe Int)
+#if defined(mingw32_HOST_OS)
+-- Sockets block on Windows, so it waits for input.
+tryReceive sock pointer size = Just <$> recvBuf sock pointer size
+#else
+tryReceive sock pointer size =
+  withFdSocket sock $ \fd ->
+    let attempt =
+          c_recv fd pointer (fromIntegral size) 0 >>= \case
+            -1 ->
+              Errno.getErrno >>= \errno ->
+                if
+                  | errno == Errno.eINTR -> attempt
+                  | errno == Errno.eAGAIN || errno == Errno.eWOULDBLOCK -> pure Nothing
+                  | otherwise -> Errno.throwErrno "recv"
+            received -> pure (Just (fromIntegral received))
+     in attempt
+
+foreign import ccall unsafe "recv"
+  c_recv :: CInt -> Ptr Word8 -> CSize -> CInt -> IO Posix.CSsize
+#endif
 
 -- | Sends what the socket takes of the pieces, in one call, without waiting
 -- for room in it, and gives how many bytes it took.

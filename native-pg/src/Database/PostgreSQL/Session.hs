@@ -77,7 +77,7 @@ import Database.PostgreSQL.Protocol.Codec
     Input,
     InputBuffer,
     InputError (..),
-    InputSource,
+    InputSource (..),
     MonadInput (..),
     Output,
     ParseConstructor,
@@ -94,20 +94,18 @@ import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Protocol.Messages
 import Database.PostgreSQL.Transport
   ( Address,
+    Channel (..),
     OutputBuffer,
     TcpOptions,
     Unsent,
     connectSocket,
     defaultTcpOptions,
+    newChannel,
     newOutputBuffer,
-    sendOutput,
-    sendSome,
-    socketInputSource,
     unsent,
   )
-import Network.Socket (Socket)
+import Foreign.Marshal.Alloc (allocaBytes)
 import qualified Network.Socket as Socket
-import qualified Network.Socket.ByteString as SocketBytes
 
 -- | The phases of a connection, each named after what the client waits for in
 -- it.
@@ -284,8 +282,8 @@ instance Accepts 'SyncResult where
        ]
 
 data Connection = Connection
-  { connectionSocket :: Socket,
-    connectionSource :: InputSource,
+  { -- | Input and output over the socket, or TLS over it.
+    connectionChannel :: Channel,
     -- | Bytes read but not consumed yet; the only buffer the library keeps.
     connectionBuffer :: IORef InputBuffer,
     -- | Output of the running batch that the socket hasn't taken yet. Reads
@@ -400,7 +398,7 @@ connect settings =
     output <- newOutputBuffer outputBufferSize
     state <- newIORef Idle
     notifications <- newIORef []
-    let session = Session (Connection sock (socketInputSource sock pending (connectReadSize settings)) buffer pending output state notifications)
+    let session = Session (Connection (newChannel sock pending (connectReadSize settings)) buffer pending output state notifications)
     send @'StartupMessageType session (startupMessage settings)
     (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
     initialize version initializing
@@ -415,7 +413,7 @@ close session@(Session connection) = do
       Idle -> send @'TerminateType session Terminate `catch` \(_ :: IOException) -> pure ()
       _ -> pure ()
     )
-    `finally` Socket.close (connectionSocket connection)
+    `finally` channelClose (connectionChannel connection)
 
 -- | Whether the session can run an operation: none is running, and none
 -- broke it. An operation that an exception interrupts leaves the session
@@ -599,7 +597,7 @@ runBatch session@(Session connection) failed (Batch output reading) = operation 
   -- The server may answer the first statements before it has read the last,
   -- and stop reading until its answers are read. So what the socket doesn't
   -- take at once is sent as the answers are waited for.
-  writeIORef (connectionUnsent connection) =<< sendSome (connectionSocket connection) =<< unsent (Just (connectionOutput connection)) (output <> sync)
+  writeIORef (connectionUnsent connection) =<< channelSendSome (connectionChannel connection) =<< unsent (Just (connectionOutput connection)) (output <> sync)
   result <- reading session
   awaitReady session failed result
 
@@ -659,11 +657,13 @@ awaitNotification session@(Session connection) = operation session $ do
 cancel :: Address -> BackendKey ByteString -> IO ()
 cancel address key =
   bracket (connectSocket defaultTcpOptions address) Socket.close $ \sock -> do
-    sendOutput sock (serialize @(CancelRequest ByteString) @'CancelRequestType (CancelRequest key))
+    pending <- newIORef =<< unsent Nothing mempty
+    let channel = newChannel sock pending 64
+    channelSend channel (serialize @(CancelRequest ByteString) @'CancelRequestType (CancelRequest key))
     -- The server closes the connection once it has handled the request.
     let waitForClose = do
-          received <- SocketBytes.recv sock 64
-          unless (BS.null received) waitForClose
+          received <- allocaBytes 64 $ \buffer -> readInputInto (channelInput channel) buffer 64
+          unless (received == 0) waitForClose
     waitForClose `catch` \(_ :: IOException) -> pure ()
 
 -- | Parse (unless the statement is prepared already), Bind and Execute. A
@@ -1070,7 +1070,7 @@ runOn :: Connection -> Int -> Input a -> IO a
 runOn connection limit parse = do
   buffer <- readIORef (connectionBuffer connection)
   (result, buffer') <-
-    runInputUntil (connectionSource connection) limit buffer parse
+    runInputUntil (channelInput (connectionChannel connection)) limit buffer parse
       `catch` \(InputError message) -> throwIO (ProtocolError message)
   writeIORef (connectionBuffer connection) buffer'
   pure result
@@ -1092,7 +1092,7 @@ send :: forall s a phase. Serializable a s => Session phase -> a -> IO ()
 send session message = sendOutputs session (serialize @a @s message)
 
 sendOutputs :: Session phase -> Output -> IO ()
-sendOutputs (Session connection) = sendOutput (connectionSocket connection)
+sendOutputs (Session connection) = channelSend (connectionChannel connection)
 
 -- | The session in the phase the protocol continues in.
 continueIn :: Session phase -> Session next
