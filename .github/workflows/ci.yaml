@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc: ['9.10.3', '9.12.3']
+    name: GHC ${{ matrix.ghc }}
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        with:
+          ghc-version: ${{ matrix.ghc }}
+      - name: Install rustls-ffi
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.15.4 --repo rustls/rustls-ffi --pattern 'librustls_*_amd64.deb.zip' --dir "$RUNNER_TEMP"
+          unzip -d "$RUNNER_TEMP" "$RUNNER_TEMP"/librustls_*_amd64.deb.zip
+          sudo apt-get install -y "$RUNNER_TEMP"/librustls_*_amd64.deb
+      - name: Install PostgreSQL
+        # The integration tests start their own cluster with initdb and pg_ctl
+        run: |
+          sudo apt-get install -y postgresql
+          ls -d /usr/lib/postgresql/*/bin | sort -V | tail -n 1 >> "$GITHUB_PATH"
+      - name: Build
+        run: cabal build --enable-tests all
+      - name: Test
+        run: cabal test --test-show-details=direct all
