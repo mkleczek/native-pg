@@ -405,8 +405,8 @@ main = hspec $ do
       fmap connectionProtocolVersion (parse "max_protocol_version=3.2") `shouldBe` Right protocolVersion3_2
       parse "min_protocol_version=3.2" `shouldSatisfy` failsWith "min_protocol_version is greater than max_protocol_version"
     it "needs a user when the local one can't be looked up" $ do
-      parseConnectionString (const Nothing) Nothing "" `shouldSatisfy` failsWith "a user has to be given"
-      parseConnectionString (const Nothing) Nothing "user=u" `shouldSatisfy` isRight
+      parseConnectionString (defaultsFrom []) (const Nothing) Nothing "" `shouldSatisfy` failsWith "a user has to be given"
+      parseConnectionString (defaultsFrom []) (const Nothing) Nothing "user=u" `shouldSatisfy` isRight
     it "words failures as libpq does" $ do
       displayException (UnresolvedHost "no_host" "nodename nor servname provided, or not known")
         `shouldBe` "could not translate host name \"no_host\" to address: nodename nor servname provided, or not known"
@@ -588,7 +588,12 @@ parse :: ByteString -> Either String ConnectionString
 parse = parseWith []
 
 parseWith :: [(String, String)] -> ByteString -> Either String ConnectionString
-parseWith environment = parseConnectionString (`lookup` environment) (Just "local")
+parseWith environment = parseConnectionString (defaultsFrom environment) (`lookup` environment) (Just "local")
+
+-- | libpq's defaults, as a client on a Unix system gives them: its socket
+-- directory, and the certificate directory in the home directory.
+defaultsFrom :: [(String, String)] -> Defaults
+defaultsFrom environment = Defaults "/tmp" ((<> "/.postgresql") <$> lookup "HOME" environment)
 
 hosts :: Either String ConnectionString -> Either String [Host]
 hosts = fmap (toList . connectionHosts)

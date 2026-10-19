@@ -106,7 +106,7 @@ main = withCluster $ \socketPath port -> hspec $ do
         -- Without the environment, so that the PG* variables of the shell
         -- running the tests don't change them.
         connectWith string =
-          either fail (connectFirst (\connecting -> connecting {connectTlsClient = Just tlsClient})) (parseConnectionString (const Nothing) (Just "postgres") string)
+          either fail (connectFirst (\connecting -> connecting {connectTlsClient = Just tlsClient})) (parseConnectionString noDefaults (const Nothing) (Just "postgres") string)
         withConnection string = bracket (connectWith string) (\(session, _, _) -> close session)
         connectFailure string = do
           result <- try (connectWith string)
@@ -160,7 +160,7 @@ main = withCluster $ \socketPath port -> hspec $ do
           connectFailure ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
             `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show plaintext <> " failed: server does not support SSL, but SSL was required")
       it "fails as libpq without TLS does, without a TLS client" $ do
-        result <- try (either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") (tcp "sslmode=require")))
+        result <- try (either fail (connectFirst id) (parseConnectionString noDefaults (const Nothing) (Just "postgres") (tcp "sslmode=require")))
         either (pure . displayException @ConnectFailure) (\(session, _, _) -> close session *> fail "connected") result
           `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in")
       it "encrypts by default, with sslmode=prefer, as libpq does" $ do
@@ -175,7 +175,7 @@ main = withCluster $ \socketPath port -> hspec $ do
         withConnection (tcp "sslmode=allow") $ \(session, _, _) ->
           encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
       it "connects in plaintext with sslmode=prefer without a TLS client, as libpq without TLS does" $ do
-        connected <- either fail (connectFirst id) (parseConnectionString (const Nothing) (Just "postgres") (tcp "user=native_pg_plaintext"))
+        connected <- either fail (connectFirst id) (parseConnectionString noDefaults (const Nothing) (Just "postgres") (tcp "user=native_pg_plaintext"))
         (\(session, _, _) -> encrypted session <* close session) connected `shouldReturn` Right ([[Just "f"]], "SELECT 1")
       it "verifies the server's certificate and name with sslmode=verify-full" $ do
         withConnection (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1")) $ \(session, _, _) ->
@@ -204,7 +204,7 @@ main = withCluster $ \socketPath port -> hspec $ do
       it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
         let tlsSettings host connectionString =
               either fail (\parsed -> pure ((hostConnectSettings parsed host) {connectTlsClient = Just tlsClient})) $
-                parseConnectionString (const Nothing) (Just "postgres") connectionString
+                parseConnectionString noDefaults (const Nothing) (Just "postgres") connectionString
         withConnection (tcp "sslmode=require") $ \(session, info, host) -> do
           Just key <- pure (serverBackendKey info)
           cancelling <- tlsSettings host (tcp "sslmode=require")
@@ -792,6 +792,10 @@ connectionTerminated _ = False
 sessionUnusable :: ConnectionError -> Bool
 sessionUnusable (SessionUnusable _) = True
 sessionUnusable _ = False
+
+-- | No default host or certificate directory: every test gives its host.
+noDefaults :: Defaults
+noDefaults = Defaults "/tmp" Nothing
 
 -- | One of the test certificates and keys, which native-pg-tls's tests share.
 certificate :: FilePath -> FilePath

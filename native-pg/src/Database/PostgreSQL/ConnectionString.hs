@@ -15,6 +15,7 @@
 module Database.PostgreSQL.ConnectionString
   ( -- * Connection strings
     ConnectionString (..),
+    Defaults (..),
     Host (..),
     InvalidConnectionString (..),
     TargetSessionAttrs (..),
@@ -78,12 +79,12 @@ data ConnectionString = ConnectionString
     connectionTcpOptions :: TcpOptions,
     connectionSslMode :: SslMode,
     -- | The client certificate and its private key, from @sslcert@ and
-    -- @sslkey@, or libpq's default files in the home directory, unless
-    -- @sslcertmode@ is @disable@.
+    -- @sslkey@, or the default files in the defaults' certificate directory,
+    -- unless @sslcertmode@ is @disable@.
     connectionSslCertificate :: Maybe (FilePath, FilePath),
     -- | Certificate revocation lists: from @sslcrl@, or, if neither it nor
-    -- @sslcrldir@ is given, libpq's default file in the home directory, and
-    -- from @sslcrldir@.
+    -- @sslcrldir@ is given, the default file in the defaults' certificate
+    -- directory, and from @sslcrldir@.
     connectionSslRevocationList :: Maybe FilePath,
     connectionSslRevocationListDirectory :: Maybe FilePath,
     -- | The versions of TLS from @ssl_min_protocol_version@, @TLSv1.2@ by
@@ -129,31 +130,43 @@ newtype InvalidConnectionString = InvalidConnectionString String
 instance Exception InvalidConnectionString where
   displayException (InvalidConnectionString reason) = reason
 
+-- | What libpq builds in, given by the client: where to connect when a string
+-- gives no host, and where the files libpq looks for by default are.
+data Defaults = Defaults
+  { -- | A socket directory, or a host name. libpq's is @/tmp@, or the
+    -- directory it was built with, and @localhost@ on Windows.
+    defaultHost :: String,
+    -- | The directory of @root.crt@, @postgresql.crt@, @postgresql.key@ and
+    -- @root.crl@, if any: libpq's is @~/.postgresql@.
+    defaultCertificateDirectory :: Maybe FilePath
+  }
+  deriving (Eq, Show)
+
 -- | Parses the connection string, and fills in what it leaves out from the
--- environment as libpq does.
-readConnectionString :: ByteString -> IO (Either String ConnectionString)
-readConnectionString string = do
+-- environment and the defaults as libpq does.
+readConnectionString :: Defaults -> ByteString -> IO (Either String ConnectionString)
+readConnectionString defaults string = do
   -- Only the variables it reads: what it leaves unread keeps them, and a
   -- connection that keeps its string to cancel with would keep a copy of the
   -- whole environment.
-  environment <- catMaybes <$> traverse (\name -> fmap (name,) <$> lookupEnv name) ("HOME" : mapMaybe snd optionTable)
+  environment <- catMaybes <$> traverse (\name -> fmap (name,) <$> lookupEnv name) (mapMaybe snd optionTable)
   user <- localUserName
-  case parseConnectionString (`lookup` environment) user string of
+  case parseConnectionString defaults (`lookup` environment) user string of
     -- libpq verifies the server's certificate with sslmode=require too if
     -- the default root certificate file exists.
     Right parsed
       | connectionSslMode parsed == SslRequire,
-        Just roots <- defaultRootCertificate <$> lookup "HOME" environment ->
+        Just roots <- rootCertificateIn <$> defaultCertificateDirectory defaults ->
           doesFileExist roots <&> \verifying ->
             if verifying then Left (requireWithRoots roots) else Right parsed
     parsed -> pure parsed
 
 -- | Like 'readConnectionString', with the environment variables and the local
 -- user's name, if it could be looked up, given.
-parseConnectionString :: (String -> Maybe String) -> Maybe String -> ByteString -> Either String ConnectionString
-parseConnectionString environment localUser string = do
+parseConnectionString :: Defaults -> (String -> Maybe String) -> Maybe String -> ByteString -> Either String ConnectionString
+parseConnectionString defaults environment localUser string = do
   given <- options string
-  resolve (setting environment given) (environment "HOME") localUser
+  resolve (setting environment given) defaults localUser
 
 -- | The operating system's name of the user, which libpq uses when none is
 -- given. The lookup can fail, e.g. for a container user without a passwd
@@ -168,23 +181,15 @@ localUserName = either (\(_ :: IOException) -> Nothing) Just <$> try lookUpUserN
 #endif
 
 -- | The root certificate file libpq verifies the server's certificate
--- against unless another is given, in the home directory.
-defaultRootCertificate :: FilePath -> FilePath
-defaultRootCertificate home = home <> "/.postgresql/root.crt"
+-- against unless another is given, in the certificate directory.
+rootCertificateIn :: FilePath -> FilePath
+rootCertificateIn directory = directory <> "/root.crt"
 
 -- | sslmode=require with root certificates verifies the server's certificate
 -- as verify-ca does.
 requireWithRoots :: FilePath -> String
 requireWithRoots roots =
   "sslmode=require with the root certificate file \"" <> roots <> "\" verifies the server's certificate as verify-ca does, which isn't supported: use sslmode=verify-full"
-
--- | Where libpq connects when no host is given.
-defaultHost :: String
-#if defined(mingw32_HOST_OS)
-defaultHost = "localhost"
-#else
-defaultHost = "/tmp"
-#endif
 
 -- | The options libpq has, with the environment variables that give their
 -- defaults.
@@ -396,10 +401,10 @@ setting environment given keyword =
       value <- environment variable
       Just (Setting (encodeUtf8 (Text.pack value)) variable)
 
--- | The connection string the options give, with the home directory and the
--- local user's name for defaults.
-resolve :: (ByteString -> Maybe Setting) -> Maybe String -> Maybe String -> Either String ConnectionString
-resolve option home localUser = do
+-- | The connection string the options give, with the defaults and the local
+-- user's name.
+resolve :: (ByteString -> Maybe Setting) -> Defaults -> Maybe String -> Either String ConnectionString
+resolve option defaults localUser = do
   let systemRoots = given "sslrootcert" == Just "system"
       rootCertificates = case given "sslrootcert" of
         Just "system" -> Right SystemRootCertificates
@@ -407,8 +412,8 @@ resolve option home localUser = do
         Nothing ->
           maybe
             (Left "could not get home directory to locate root certificate file\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.")
-            (Right . RootCertificateFile . defaultRootCertificate)
-            home
+            (Right . RootCertificateFile . rootCertificateIn)
+            (defaultCertificateDirectory defaults)
   sslMode <- case option "sslmode" of
     Just (Setting value source)
       | systemRoots && value /= "verify-full" ->
@@ -449,11 +454,11 @@ resolve option home localUser = do
       Left (source <> "=" <> text value <> " asks for a replication connection, which isn't supported")
   -- rustls takes keys only in plaintext, and logs no keys through it.
   mapM_ unsupported ["service", "require_auth", "requirepeer", "scram_client_key", "scram_server_key", "sslpassword", "sslkeylogfile"]
-  certificate <- case (given "sslcertmode", given "sslcert", given "sslkey", home) of
+  certificate <- case (given "sslcertmode", given "sslcert", given "sslkey", defaultCertificateDirectory defaults) of
     (Just "disable", _, _, _) -> Right Nothing
     (_, Just chain, Just key, _) -> Right (Just (text chain, text key))
     (_, chain, key, Just directory) ->
-      Right (Just (maybe (directory <> "/.postgresql/postgresql.crt") text chain, maybe (directory <> "/.postgresql/postgresql.key") text key))
+      Right (Just (maybe (directory <> "/postgresql.crt") text chain, maybe (directory <> "/postgresql.key") text key))
     (_, Nothing, _, Nothing) -> Right Nothing
     (_, Just _, Nothing, Nothing) -> Left "could not get home directory to locate client certificate files"
   hosts <- hostList
@@ -512,7 +517,7 @@ resolve option home localUser = do
         connectionSslCertificate = certificate,
         connectionSslRevocationList = case (given "sslcrl", given "sslcrldir") of
           (Just file, _) -> Just (text file)
-          (Nothing, Nothing) -> (<> "/.postgresql/root.crl") <$> home
+          (Nothing, Nothing) -> (<> "/root.crl") <$> defaultCertificateDirectory defaults
           (Nothing, Just _) -> Nothing,
         connectionSslRevocationListDirectory = text <$> given "sslcrldir",
         connectionSslVersions = sslVersions,
@@ -595,7 +600,7 @@ resolve option home localUser = do
               if
                 | not (BS.null name) -> text name
                 | not (BS.null address) -> text address
-                | otherwise -> defaultHost,
+                | otherwise -> defaultHost defaults,
             hostAddress = if BS.null address then Nothing else Just (text address),
             hostPort = port
           }
