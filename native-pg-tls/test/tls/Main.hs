@@ -113,7 +113,7 @@ settings :: ServerVerification -> TlsSettings
 settings verification = TlsSettings verification Nothing [] [minBound .. maxBound] True False
 
 certificate :: FilePath -> FilePath
-certificate name = "test/native-pg-tls/certificates/" <> name
+certificate name = "test/certificates/" <> name
 
 -- | How the client's handshake with the server fails.
 refusal :: TlsConfig -> Socket.Socket -> TlsConnection -> IO String

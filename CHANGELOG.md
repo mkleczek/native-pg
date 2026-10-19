@@ -1,5 +1,5 @@
-# Revision history for haskell-native-pg
+# Revision history for native-pg and native-pg-tls
 
-## 0.1.0.0 -- YYYY-mm-dd
+## 0.1.0.0 -- unreleased
 
-* First version. Released on an unsuspecting world.
+* First version.

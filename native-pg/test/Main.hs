@@ -230,7 +230,7 @@ main = hspec $ do
         `shouldBe` Right ("p=tls-server-end-point,,n=,r=rOprNGfwEbeRWgbNEkqO", "c=" <> Base64.encode "p=tls-server-end-point,,hash")
     it "hashes the server's certificate as its signature algorithm does, or with SHA-256 for SHA-1" $ do
       let endPoint name = do
-            pem <- BS.readFile ("test/native-pg-tls/certificates/" <> name <> ".crt")
+            pem <- BS.readFile ("../native-pg-tls/test/certificates/" <> name <> ".crt")
             pure (fmap (convertToBase Base16) (serverEndPoint (der pem)) :: Either String ByteString)
       endPoint "server" `shouldReturn` Right "ffc8c8c206fee834bde27d211994f9a8b5bc449c0ecddb35df387572b0295188"
       endPoint "rsa-sha256" `shouldReturn` Right "5bd80d76dc3cbc6a0ce8e34397aac96c63bf28bd7603ff11d7cba416cf91c843"

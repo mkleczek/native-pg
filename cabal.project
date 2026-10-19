@@ -1,0 +1,3 @@
+packages: native-pg
+          native-pg-tls
+tests: true

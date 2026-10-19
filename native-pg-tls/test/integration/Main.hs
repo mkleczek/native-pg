@@ -4,8 +4,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Tests against a real PostgreSQL. A temporary cluster is created with the
--- @initdb@ and @pg_ctl@ found on the path, e.g. inside
--- @postgrest-with-pg-17@ to test against PostgreSQL 17.
+-- @initdb@ and @pg_ctl@ found on the path, so the PostgreSQL version is the
+-- one they come from.
 module Main (main) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
@@ -795,7 +795,7 @@ sessionUnusable _ = False
 
 -- | One of the test certificates and keys, which native-pg-tls's tests share.
 certificate :: FilePath -> FilePath
-certificate name = "test/native-pg-tls/certificates/" <> name
+certificate name = "test/certificates/" <> name
 
 rowMisuse :: ConnectionError -> Bool
 rowMisuse (RowMisuse _) = True
