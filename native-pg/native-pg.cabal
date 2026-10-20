@@ -68,7 +68,8 @@ test-suite native-pg-spec
   default-language:   GHC2021
   type:               exitcode-stdio-1.0
   hs-source-dirs:     test
-  other-modules:      TransportSpec
+  other-modules:      CoreSpec
+                      TransportSpec
   main-is:            Main.hs
   ghc-options:        -Wall
   build-depends:      base              >= 4.9 && < 4.22
