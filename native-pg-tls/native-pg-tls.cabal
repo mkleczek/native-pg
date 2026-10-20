@@ -41,7 +41,8 @@ test-suite native-pg-tls-spec
   -- below use the public library.
   hs-source-dirs:     test/tls
                      src
-  other-modules:      Database.PostgreSQL.Tls.Internal
+  other-modules:      TlsSpec
+                      Database.PostgreSQL.Tls.Internal
   main-is:            Main.hs
   ghc-options:        -Wall -threaded
   c-sources:          src/cbits/native-pg-tls.c
