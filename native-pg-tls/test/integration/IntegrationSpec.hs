@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -F -pgmF=skeletest-preprocessor #-}
 
 -- | Tests against a real PostgreSQL. A temporary cluster is created with the
 -- @initdb@ and @pg_ctl@ found on the path, so the PostgreSQL version is the
@@ -9,7 +10,7 @@
 module IntegrationSpec (spec) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
-import Control.Exception (ErrorCall (..), IOException, bracket, bracket_, displayException, finally, throwIO, try)
+import Control.Exception (ErrorCall (..), IOException, bracket, displayException, finally, throwIO, try)
 import Control.Monad (forever, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
@@ -20,7 +21,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int16, Int32, Int64)
-import Data.List (intercalate, isInfixOf, isPrefixOf)
+import Data.List (intercalate)
 import Data.Maybe (isJust)
 import Data.Scientific (Scientific)
 import Data.Text (Text)
@@ -61,7 +62,8 @@ import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (FileMode)
 import System.Timeout (timeout)
 import TestCluster (certificate)
-import Test.Hspec
+import Skeletest
+import qualified Skeletest.Predicate as P
 
 spec :: FilePath -> Socket.PortNumber -> Spec
 spec socketPath port = do
@@ -77,8 +79,8 @@ spec socketPath port = do
   describe "connect" $ do
     it "connects a trusted user and reports the server's parameters" $ do
       (session, info) <- connect (settings "postgres" Nothing)
-      lookup "server_version" (serverParameters info) `shouldSatisfy` isJust
-      serverBackendKey info `shouldSatisfy` isJust
+      lookup "server_version" (serverParameters info) `shouldSatisfy` P.just P.anything
+      serverBackendKey info `shouldSatisfy` P.just P.anything
       serverProtocolVersion info `shouldBe` protocolVersion3_0
       close session
     it "authenticates with SCRAM-SHA-256" $
@@ -88,11 +90,11 @@ spec socketPath port = do
     it "authenticates with a cleartext password" $
       connectAndClose (settings "native_pg_cleartext" (Just "cleartext secret"))
     it "reports a wrong password" $
-      connect (settings "native_pg_scram" (Just "wrong")) `shouldThrow` rejectedWith "28P01"
+      connect (settings "native_pg_scram" (Just "wrong")) `shouldSatisfy` P.throws (rejectedWith "28P01")
     it "reports a missing password" $
-      connect (settings "native_pg_scram" Nothing) `shouldThrow` authenticationError
+      connect (settings "native_pg_scram" Nothing) `shouldSatisfy` P.throws authenticationError
     it "reports a missing database" $
-      connect ((settings "postgres" Nothing) {connectDatabase = Just "missing"}) `shouldThrow` rejectedWith "3D000"
+      connect ((settings "postgres" Nothing) {connectDatabase = Just "missing"}) `shouldSatisfy` P.throws (rejectedWith "3D000")
     it "uses protocol 3.2 where the server has it, and 3.0 otherwise" $ do
       (session, info) <- connect ((settings "postgres" Nothing) {connectProtocolVersion = protocolVersion3_2})
       close session
@@ -107,36 +109,36 @@ spec socketPath port = do
               connectSslMode = SslRequire,
               connectTlsClient = Just tlsClient
             }
-        closed = (== SessionUnusable "the session is closed")
+        closed = P.eq (SessionUnusable "the session is closed")
     for_ [("without TLS", settings "postgres" Nothing), ("with TLS", encrypted)] $ \(label, connecting) ->
       describe label $ do
         it "marks the session unusable and rejects operations after closing" $ bracket (fst <$> connect connecting) close $ \session -> do
           isUsable session `shouldReturn` True
           close session
           isUsable session `shouldReturn` False
-          query session "SELECT 1" [] `shouldThrow` closed
-          prepare session "closed" "SELECT 1" [] `shouldThrow` closed
-          closeStatement session "closed" `shouldThrow` closed
-          runBatch session id (pure ()) `shouldThrow` closed
-          awaitNotification session `shouldThrow` closed
+          query session "SELECT 1" [] `shouldSatisfy` P.throws closed
+          prepare session "closed" "SELECT 1" [] `shouldSatisfy` P.throws closed
+          closeStatement session "closed" `shouldSatisfy` P.throws closed
+          runBatch session id (pure ()) `shouldSatisfy` P.throws closed
+          awaitNotification session `shouldSatisfy` P.throws closed
         it "can close repeatedly, including during bracket cleanup" $ bracket (fst <$> connect connecting) close $ \session -> do
           close session
           timeout 5000000 (close session *> close session) `shouldReturn` Just ()
           isUsable session `shouldReturn` False
         it "can close a broken session repeatedly" $ bracket (fst <$> connect connecting) close $ \session -> do
           let interrupted () _ = throwIO (ErrorCall "interrupted")
-          execute session (statement "SELECT 1" []) interrupted () `shouldThrow` errorCall "interrupted"
+          execute session (statement "SELECT 1" []) interrupted () `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "interrupted")))
           isUsable session `shouldReturn` False
           timeout 5000000 (close session *> close session) `shouldReturn` Just ()
-          query session "SELECT 1" [] `shouldThrow` closed
+          query session "SELECT 1" [] `shouldSatisfy` P.throws closed
         it "can close after an operation is interrupted asynchronously" $ bracket (fst <$> connect connecting) close $ \session -> do
           timeout 100000 (awaitNotification session) `shouldReturn` Nothing
           isUsable session `shouldReturn` False
           timeout 5000000 (close session *> close session) `shouldReturn` Just ()
-          query session "SELECT 1" [] `shouldThrow` closed
+          query session "SELECT 1" [] `shouldSatisfy` P.throws closed
         it "rejects closing during an operation without disrupting it" $ bracket (fst <$> connect connecting) close $ \session -> do
           let step () row = do
-                close session `shouldThrow` (== SessionUnusable "the session is busy with another operation")
+                close session `shouldSatisfy` P.throws (P.eq (SessionUnusable "the session is busy with another operation"))
                 void (columns row)
           execute session (statement "SELECT 1" []) step () `shouldReturn` (Right ((), "SELECT 1"), TxIdle)
           isUsable session `shouldReturn` True
@@ -167,14 +169,14 @@ spec socketPath port = do
             _ <- check session
             isUsable session `shouldReturn` False
             close session
-            query session "SELECT 1" [] `shouldThrow` closed
+            query session "SELECT 1" [] `shouldSatisfy` P.throws closed
           readIORef closes `shouldReturn` 1
     it "closes the channel once when sending Terminate throws" $
       withCloseHooks (throwIO (ErrorCall "terminate failed")) (pure ()) $ \session ->
-        close session `shouldThrow` errorCall "terminate failed"
+        close session `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "terminate failed")))
     it "does not retry channel cleanup if it throws" $
       withCloseHooks (pure ()) (throwIO (ErrorCall "cleanup failed")) $ \session ->
-        close session `shouldThrow` errorCall "cleanup failed"
+        close session `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "cleanup failed")))
     it "closes the channel once when sending Terminate is interrupted" $
       withCloseHooks (threadDelay 10000000) (pure ()) $ \session ->
         timeout 100000 (close session) `shouldReturn` Nothing
@@ -195,11 +197,11 @@ spec socketPath port = do
         bindingFailure = Just (Left "unsupported certificate hash")
     it "uses the supplied binding bytes in SCRAM-PLUS" $
       connectAndClose (suppliedBinding (Just (Right "wrong binding")) ChannelBindingRequire "native_pg_scram")
-        `shouldThrow` rejectedWith "28000"
+        `shouldSatisfy` P.throws (rejectedWith "28000")
     for_ [("preferred", ChannelBindingPrefer), ("required", ChannelBindingRequire)] $ \(label, mode) ->
       it ("reports a binding error when SCRAM-PLUS is " <> label) $
         connectAndClose (suppliedBinding bindingFailure mode "native_pg_scram")
-          `shouldThrow` (== AuthenticationError "unsupported certificate hash")
+          `shouldSatisfy` P.throws (P.eq (AuthenticationError "unsupported certificate hash"))
     it "ignores a binding error when channel binding is disabled" $
       withBinding bindingFailure ChannelBindingDisable "native_pg_scram" $ \session ->
         query session "SELECT current_user" []
@@ -213,7 +215,7 @@ spec socketPath port = do
           `shouldReturn` (Right ([[Just "native_pg_scram"]], "SELECT 1"), TxIdle)
     it "rejects required binding when the TLS client supplies none" $
       connectAndClose (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram")
-        `shouldThrow` (== AuthenticationError "channel binding is required, but server did not offer an authentication method that supports channel binding")
+        `shouldSatisfy` P.throws (P.eq (AuthenticationError "channel binding is required, but server did not offer an authentication method that supports channel binding"))
     it "ignores binding errors on a cancellation connection" $
       withSessionInfo $ \_ info -> do
         Just key <- pure (serverBackendKey info)
@@ -249,7 +251,7 @@ spec socketPath port = do
           ]
     it "words a host name that doesn't resolve as libpq does" $ do
       failure <- connectFailure "host=no-such-host.invalid"
-      failure `shouldSatisfy` isPrefixOf "could not translate host name \"no-such-host.invalid\" to address: "
+      failure `shouldSatisfy` P.hasPrefix "could not translate host name \"no-such-host.invalid\" to address: "
     it "names the application, with the fallback name if none is given" $ do
       withConnection (local "fallback_application_name=fallback") $ \(session, _, _) ->
         value session "SELECT current_setting('application_name')" `shouldReturn` Right ([[Just "fallback"]], "SELECT 1")
@@ -312,7 +314,7 @@ spec socketPath port = do
       it "verifies against the system's root certificates with sslrootcert=system" $ do
         failure <- connectFailure (tcp "sslmode=verify-full sslrootcert=system host=localhost hostaddr=127.0.0.1")
         -- The platforms' verifiers word it differently.
-        failure `shouldSatisfy` isPrefixOf ("connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: ")
+        failure `shouldSatisfy` P.hasPrefix ("connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: ")
       it "needs the root certificate file, as libpq does" $ do
         connectFailure (tcp "sslmode=verify-full sslrootcert=/nonexistent/root.crt host=localhost hostaddr=127.0.0.1")
           `shouldReturn` ( "connection to server at \"localhost\" (127.0.0.1), port "
@@ -335,7 +337,7 @@ spec socketPath port = do
           withPlaintextServer $ \plaintext -> do
             let refused = "host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require"
             refusing <- tlsSettings (Host "127.0.0.1" Nothing plaintext) refused
-            cancel refusing key `shouldThrow` (== TlsFailure "server does not support SSL, but SSL was required")
+            cancel refusing key `shouldSatisfy` P.throws (P.eq (TlsFailure "server does not support SSL, but SSL was required"))
       it "binds SCRAM to TLS with channel_binding=require" $ do
         withConnection (tcp "user=native_pg_scram password='scram secret' sslmode=require channel_binding=require") $ \(session, _, _) ->
           value session "SELECT current_user" `shouldReturn` Right ([[Just "native_pg_scram"]], "SELECT 1")
@@ -373,7 +375,7 @@ spec socketPath port = do
           withConnection (tcp certified) $ \(session, _, _) ->
             value session "SELECT current_user" `shouldReturn` Right ([[Just "native_pg_certificate"]], "SELECT 1")
         failure <- connectFailure (tcp "user=native_pg_certificate sslmode=require sslcert=/nonexistent/client.crt sslkey=/nonexistent/client.key")
-        failure `shouldSatisfy` isInfixOf "connection requires a valid client certificate"
+        failure `shouldSatisfy` P.hasInfix "connection requires a valid client certificate"
       it "needs a client certificate's key, readable only by its owner, as libpq does" $ do
         let certified key = tcp ("user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key)
             at = "connection to server at \"127.0.0.1\", port " <> show port <> " failed: "
@@ -395,7 +397,7 @@ spec socketPath port = do
         connectFailure ("host=" <> Char8.pack silent <> " connect_timeout=2")
           `shouldReturn` ("connection to server on socket \"" <> silent <> "/.s.PGSQL.5432\" failed: timeout expired")
         elapsed <- subtract started <$> getMonotonicTime
-        elapsed `shouldSatisfy` (\seconds -> seconds >= 2 && seconds < 5)
+        elapsed `shouldSatisfy` (P.gte 2 P.&& P.lt 5)
 
   describe "execute" $ do
     it "runs an unprepared statement with parameters" $ withSession $ \session ->
@@ -475,7 +477,7 @@ spec socketPath port = do
       result `shouldBe` Right ([[Just (Char8.replicate 100000 'y')]], "SELECT 1")
     it "streams a column to a slow consumer without holding it in memory" $ withSession $ \session -> do
       enabled <- getRTSStatsEnabled
-      unless enabled $ pendingWith "needs +RTS -T"
+      unless enabled $ skipTest "needs +RTS -T"
       let size = 64 * 1024 * 1024
       (result, _) <-
         execute session (statement ("SELECT repeat('x', " <> Char8.pack (show size) <> ")") []) (\_ row -> Just <$> consumeSlowly row) Nothing
@@ -484,11 +486,11 @@ spec socketPath port = do
       saved <- newIORef Nothing
       _ <- execute session (statement "SELECT 1" []) (\() row -> writeIORef saved (Just row)) ()
       Just row <- readIORef saved
-      nextColumn row `shouldThrow` rowMisuse
+      nextColumn row `shouldSatisfy` P.throws rowMisuse
     it "is unusable while busy, and broken after a failed operation" $ withSession $ \session -> do
       let nested () _ = void (execute session (statement "SELECT 2" []) (\() _ -> pure ()) ())
-      execute session (statement "SELECT 1" []) nested () `shouldThrow` sessionUnusable
-      query session "SELECT 1" [] `shouldThrow` sessionUnusable
+      execute session (statement "SELECT 1" []) nested () `shouldSatisfy` P.throws sessionUnusable
+      query session "SELECT 1" [] `shouldSatisfy` P.throws sessionUnusable
     it "tells whether it's usable" $ withSession $ \session -> do
       isUsable session `shouldReturn` True
       _ <- query session "SELECT 1" []
@@ -497,7 +499,7 @@ spec socketPath port = do
             usableMeanwhile <- isUsable session
             usableMeanwhile `shouldBe` False
             throwIO (ErrorCall "interrupted")
-      execute session (statement "SELECT 1" []) interrupted () `shouldThrow` errorCall "interrupted"
+      execute session (statement "SELECT 1" []) interrupted () `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "interrupted")))
       isUsable session `shouldReturn` False
   describe "decodeRow" $ do
     it "decodes integers, booleans, floats and numerics" $ withSession $ \session ->
@@ -549,9 +551,9 @@ spec socketPath port = do
       outcome <- try (query session "SELECT pg_terminate_backend(pg_backend_pid())" [])
       case outcome of
         Left (ConnectionTerminated (ServerError d)) -> (diagnosticSeverity d, diagnosticCode d) `shouldBe` (SeverityFatal, "57P01")
-        Left other -> expectationFailure ("expected ConnectionTerminated, got " <> show other)
-        Right _ -> expectationFailure "expected ConnectionTerminated"
-      query session "SELECT 1" [] `shouldThrow` sessionUnusable
+        Left other -> failTest ("expected ConnectionTerminated, got " <> show other)
+        Right _ -> failTest "expected ConnectionTerminated"
+      query session "SELECT 1" [] `shouldSatisfy` P.throws sessionUnusable
 
   describe "cancel" $
     it "cancels a running statement, and the session stays usable" $
@@ -562,7 +564,7 @@ spec socketPath port = do
         (result, status) <- query session "SELECT pg_sleep(30)" []
         finished <- getMonotonicTime
         (either errorCode (const Nothing) result, status) `shouldBe` (Just "57014", TxIdle)
-        finished - started `shouldSatisfy` (< 10)
+        finished - started `shouldSatisfy` P.lt 10
         query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
 
   describe "notifications" $ do
@@ -586,14 +588,14 @@ spec socketPath port = do
           _ <- query listener "LISTEN events" []
           Just (Scalar pid) <- pure (processIdOf listenerInfo)
           _ <- query administrator "SELECT pg_terminate_backend($1::int)" [Just (Char8.pack (show pid))]
-          awaitNotification listener `shouldThrow` connectionTerminated
+          awaitNotification listener `shouldSatisfy` P.throws connectionTerminated
 
   describe "transactions" $ do
     let createItems session = void (query session "CREATE TEMP TABLE tx_items (n int)" [])
         countItems = Tx.Statement "SELECT count(*) FROM tx_items" (const []) (Tx.singleRow (Tx.row @'[Int64] id)) False
         insertItem = Tx.Statement "INSERT INTO tx_items VALUES ($1)" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) Tx.noResult False
         items = Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.statement () countItems)
-        failsWith check = either (\(Tx.QueryError _ failure) -> check failure) (const False)
+        failsWith check = P.left (P.con (Tx.QueryError P.anything check))
     it "commits" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem) session `shouldReturn` Right ()
@@ -605,7 +607,7 @@ spec socketPath port = do
     it "rolls back after a failing statement, and reports it with its SQL" $ withSession $ \session -> do
       createItems session
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> Tx.sql "SELECT 1 / 0") session
-      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
+      result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELECT 1 / 0") (servedCode "22012")))
       items session `shouldReturn` Right 0
     it "begins with the isolation level and the mode" $ withSession $ \session ->
       Tx.transactionNoRetry
@@ -629,11 +631,11 @@ spec socketPath port = do
       Tx.transactionNoRetryWith (\_ _ -> pure (Tx.PreparedAs "answer")) Tx.ReadCommitted Tx.Read (Tx.statement "1" answer) session
         `shouldReturn` Right 2
       result <- Tx.transactionNoRetryWith (prepareAs "broken") Tx.ReadCommitted Tx.Read (Tx.statement () (Tx.Statement "SELEC 1" (const []) Tx.noResult True)) session
-      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELEC 1" && failure `servedCode` "42601") (const False)
+      result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELEC 1") (servedCode "42601")))
       readIORef parsed `shouldReturn` ["answer"]
       let divided = Tx.Statement "SELECT 1 / $1::int4" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) Tx.noResult True
       failing <- Tx.transactionNoRetryWith (prepareAs "divided") Tx.ReadCommitted Tx.Read (Tx.statement "0" divided) session
-      failing `shouldSatisfy` either (\(Tx.QueryError _ failure) -> failure `servedCode` "22012") (const False)
+      failing `shouldSatisfy` failsWith (servedCode "22012")
       -- parsed, so prepared, even though it failed to run
       readIORef parsed `shouldReturn` ["divided", "answer"]
     it "runs a pipeline's statements in order, and gives their results" $ withSession $ \session -> do
@@ -648,12 +650,12 @@ spec socketPath port = do
           Tx.Write
           (Tx.pipeline (Pipeline.statement "1" insertItem *> Pipeline.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult False) *> Pipeline.statement "2" insertItem))
           session
-      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
+      result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELECT 1 / 0") (servedCode "22012")))
       items session `shouldReturn` Right 0
     it "reads a pipeline's results after one that doesn't decode, and stays usable" $ withSession $ \session -> do
       let number sql' = Pipeline.statement () (Tx.Statement sql' (const []) (Tx.singleRow (Tx.row @'[Int32] id)) False)
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.pipeline ((,) <$> number "SELECT 'abc'::text" <*> number "SELECT 2::int4")) session
-      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 'abc'::text" && (case failure of Tx.RowFailed _ -> True; _ -> False)) (const False)
+      result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELECT 'abc'::text") (P.con (Tx.RowFailed P.anything))))
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
     it "sends nothing for a transaction without statements" $ withSession $ \session ->
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (pure (5 :: Int)) session `shouldReturn` Right 5
@@ -661,7 +663,7 @@ spec socketPath port = do
       void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
       let insertTwice = Tx.sql "INSERT INTO tx_unique VALUES (1)" *> Tx.sql "INSERT INTO tx_unique VALUES (1)"
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write insertTwice session
-      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "COMMIT" && failure `servedCode` "23505") (const False)
+      result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "COMMIT") (servedCode "23505")))
     it "commits with the final pipeline" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (Pipeline.statement "1" insertItem)) session `shouldReturn` Right ()
@@ -674,32 +676,32 @@ spec socketPath port = do
       createItems session
       let failing = Pipeline.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult False)
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (Pipeline.statement "1" insertItem *> failing)) session
-      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
+      result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELECT 1 / 0") (servedCode "22012")))
       items session `shouldReturn` Right 0
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
     it "reports a failure at commit in the final pipeline, after which the transaction is over" $ withSession $ \session -> do
       void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
       let insert = Pipeline.statement () (Tx.Statement "INSERT INTO tx_unique VALUES (1)" (const []) Tx.noResult False)
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (insert *> insert)) session
-      result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "COMMIT" && failure `servedCode` "23505") (const False)
+      result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "COMMIT") (servedCode "23505")))
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
     it "rejects a statement after the final pipeline" $ withSession $ \session ->
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.finalPipeline (pure ()) *> Tx.sql "SELECT 1") session
-        `shouldThrow` errorCall "a statement after the transaction's final pipeline"
+        `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "a statement after the transaction's final pipeline")))
     it "checks how many rows a result has" $ withSession $ \session -> do
       let numbers :: Tx.Result a -> Int -> Tx.Transaction a
           numbers shape count = Tx.statement () (Tx.Statement ("SELECT n FROM generate_series(1, " <> Char8.pack (show count) <> ") n") (const []) shape False)
           number = Tx.row @'[Int32] id
           run transaction = Tx.transactionNoRetry Tx.ReadCommitted Tx.Read transaction session
-      run (numbers (Tx.singleRow number) 0) >>= (`shouldSatisfy` failsWith (== Tx.UnexpectedAmountOfRows 0))
-      run (numbers (Tx.singleRow number) 2) >>= (`shouldSatisfy` failsWith (== Tx.UnexpectedAmountOfRows 2))
+      run (numbers (Tx.singleRow number) 0) >>= (`shouldSatisfy` failsWith (P.eq (Tx.UnexpectedAmountOfRows 0)))
+      run (numbers (Tx.singleRow number) 2) >>= (`shouldSatisfy` failsWith (P.eq (Tx.UnexpectedAmountOfRows 2)))
       run (numbers (Tx.rowMaybe number) 0) `shouldReturn` Right Nothing
       run (numbers (Tx.rowMaybe number) 1) `shouldReturn` Right (Just 1)
       run (numbers (Tx.rowList number) 3) `shouldReturn` Right [1, 2, 3]
       run (numbers Tx.noResult 3) `shouldReturn` Right ()
     it "reports a row that doesn't decode" $ withSession $ \session -> do
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.statement () (Tx.Statement "SELECT 'abc'::text" (const []) (Tx.singleRow (Tx.row @'[Int32] id)) False)) session
-      result `shouldSatisfy` failsWith (\case Tx.RowFailed _ -> True; _ -> False)
+      result `shouldSatisfy` failsWith (P.con (Tx.RowFailed P.anything))
     it "streams a column larger than the read buffer within the transaction" $ withSession $ \session -> do
       let streamed accumulated current =
             case accumulated of
@@ -734,7 +736,7 @@ spec socketPath port = do
     it "aborts when the transaction throws between statements, and leaves the session usable" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> liftIO (throwIO (ErrorCall "boom"))) session
-        `shouldThrow` errorCall "boom"
+        `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "boom")))
       items session `shouldReturn` Right 0
 
   describe "snippets" $ do
@@ -761,16 +763,16 @@ spec socketPath port = do
       let short = Execution (Unprepared "SELECT $1::text" []) [] [Just (ParameterStream (ByteStream 10 source))] []
       try (execute session short (\() _ -> pure ()) ()) >>= \case
         Left (_ :: StreamLengthError) -> pure ()
-        Right _ -> expectationFailure "expected a StreamLengthError"
-      query session "SELECT 1" [] `shouldThrow` sessionUnusable
+        Right _ -> failTest "expected a StreamLengthError"
+      query session "SELECT 1" [] `shouldSatisfy` P.throws sessionUnusable
     it "throws a parameter stream's failure, and breaks the session" $ withSession $ \session -> do
       sent <- newIORef False
       let source = readIORef sent >>= \done -> if done then throwIO (userError "the client went away") else writeIORef sent True $> Char8.replicate 1000000 'y'
           failing = Execution (Unprepared "SELECT length($1::text)" []) [] [Just (ParameterStream (ByteStream 2000000 source))] []
       try (execute session failing (\() _ -> pure ()) ()) >>= \case
         Left (_ :: IOException) -> pure ()
-        Right _ -> expectationFailure "expected the stream's failure"
-      query session "SELECT 1" [] `shouldThrow` sessionUnusable
+        Right _ -> failTest "expected the stream's failure"
+      query session "SELECT 1" [] `shouldSatisfy` P.throws sessionUnusable
   where
     -- Streams the single column slowly, checking its bytes and that no chunk
     -- is larger than the read buffer, while sampling the live heap. The
@@ -795,7 +797,7 @@ spec socketPath port = do
                   peak'
       baseline <- liveBytes
       (received, small, valid, peak) <- loop 0 0 True True baseline
-      peak - baseline `shouldSatisfy` (< 8 * 1024 * 1024)
+      peak - baseline `shouldSatisfy` P.lt (8 * 1024 * 1024)
       pure (received, small, valid)
 
 data Pair = Pair Int32 Text
@@ -833,7 +835,7 @@ streamedLength source = go 0
 
 -- | Both the first response and the remaining request exceed the socket
 -- buffers, so the client must wait for either direction to make progress.
-batchWhileReading :: Session 'Ready -> Expectation
+batchWhileReading :: Session 'Ready -> IO ()
 batchWhileReading session = do
   let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
       large = collect (statement "SELECT repeat('x', 1000000)" [])
@@ -883,7 +885,7 @@ liveBytes = do
   performMajorGC
   fromIntegral . gcdetails_live_bytes . gc <$> getRTSStats
 
-connectAndClose :: ConnectSettings -> Expectation
+connectAndClose :: ConnectSettings -> IO ()
 connectAndClose settings = do
   (session, _) <- connect settings
   close session
@@ -891,41 +893,35 @@ connectAndClose settings = do
 errorCode :: ServerError -> Maybe ByteString
 errorCode (ServerError fields) = Just (diagnosticCode fields)
 
--- | Whether the statement failed on the server with the SQLSTATE.
-servedCode :: Tx.StatementError -> ByteString -> Bool
-servedCode (Tx.ServerFailed failure) code = errorCode failure == Just code
-servedCode _ _ = False
+-- | A statement failure from the server with the given SQLSTATE.
+servedCode :: ByteString -> Predicate IO Tx.StatementError
+servedCode code = P.con (Tx.ServerFailed (P.eq (Just code) P.<<< errorCode))
 
 -- | The diagnostics of a failed statement.
 failed :: Either ServerError a -> Maybe Diagnostics
 failed = either (\(ServerError fields) -> Just fields) (const Nothing)
 
-rejectedWith :: ByteString -> ConnectionError -> Bool
-rejectedWith code (ConnectionRejected failure) = errorCode failure == Just code
-rejectedWith _ _ = False
+rejectedWith :: ByteString -> Predicate IO ConnectionError
+rejectedWith code = P.con (ConnectionRejected (P.eq (Just code) P.<<< errorCode))
 
-authenticationError :: ConnectionError -> Bool
-authenticationError (AuthenticationError _) = True
-authenticationError _ = False
+authenticationError :: Predicate IO ConnectionError
+authenticationError = P.con (AuthenticationError P.anything)
 
 processIdOf :: ServerInfo -> Maybe ProcessId
 processIdOf info = fst . unScalar <$> serverBackendKey info
 
-connectionTerminated :: ConnectionError -> Bool
-connectionTerminated (ConnectionTerminated _) = True
-connectionTerminated _ = False
+connectionTerminated :: Predicate IO ConnectionError
+connectionTerminated = P.con (ConnectionTerminated P.anything)
 
-sessionUnusable :: ConnectionError -> Bool
-sessionUnusable (SessionUnusable _) = True
-sessionUnusable _ = False
+sessionUnusable :: Predicate IO ConnectionError
+sessionUnusable = P.con (SessionUnusable P.anything)
 
 -- | No default host or certificate directory: every test gives its host.
 noDefaults :: Defaults
 noDefaults = Defaults "/tmp" Nothing
 
-rowMisuse :: ConnectionError -> Bool
-rowMisuse (RowMisuse _) = True
-rowMisuse _ = False
+rowMisuse :: Predicate IO ConnectionError
+rowMisuse = P.con (RowMisuse P.anything)
 
 -- | Runs the action with the directory of a Unix-domain socket that accepts
 -- connections but never answers.

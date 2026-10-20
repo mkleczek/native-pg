@@ -2,7 +2,16 @@ module Main (main) where
 
 import qualified IntegrationSpec
 import TestCluster (withCluster)
-import Test.Hspec (hspec)
+import Skeletest.Internal.Paths (setOriginalDirectory)
+import Skeletest.Main (runSkeletest)
+import System.Directory (getCurrentDirectory)
 
 main :: IO ()
-main = withCluster $ \socketPath port -> hspec (IntegrationSpec.spec socketPath port)
+main = do
+  -- The generated runner normally initializes source locations. This runner
+  -- registers a spec parameterized by the cluster instead; Cabal runs it in
+  -- the package directory, also used for the test certificates.
+  setOriginalDirectory =<< getCurrentDirectory
+  -- Keep setup outside the runner, so cluster failures cannot become XFAILs.
+  withCluster $ \socketPath port ->
+    runSkeletest [] [("test/integration/IntegrationSpec.hs", IntegrationSpec.spec socketPath port)]
