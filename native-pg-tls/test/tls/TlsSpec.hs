@@ -13,7 +13,6 @@ import Control.Monad (unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
-import Data.List (isInfixOf)
 import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Tls.Internal
 import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..))
@@ -23,7 +22,8 @@ import Foreign.Marshal.Array (withArray)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peek)
 import qualified Network.Socket as Socket
-import Test.Hspec
+import Skeletest
+import qualified Skeletest.Predicate as P
 
 spec :: Spec
 spec = do
@@ -87,7 +87,7 @@ spec = do
   describe "a configuration" $
     it "needs its root certificate file" $
       newTlsConfig (settings (VerifyFull (RootCertificateFile (certificate "missing.crt"))))
-        `shouldThrow` \(TlsError reason) -> "could not read root certificate file" `isInfixOf` reason
+        `shouldSatisfy` P.throws (P.con (TlsError (P.hasInfix "could not read root certificate file")))
 
 -- | Sends the pieces, waiting for room in the socket as needed.
 sendAll :: TlsConnection -> [ByteString] -> IO ()
