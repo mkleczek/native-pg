@@ -109,8 +109,8 @@ spec socketPath port = do
             }
         closed = (== SessionUnusable "the session is closed")
     for_ [("without TLS", settings "postgres" Nothing), ("with TLS", encrypted)] $ \(label, connecting) ->
-      describe label $ around (bracket (fst <$> connect connecting) close) $ do
-        it "marks the session unusable and rejects operations after closing" $ \session -> do
+      describe label $ do
+        it "marks the session unusable and rejects operations after closing" $ bracket (fst <$> connect connecting) close $ \session -> do
           isUsable session `shouldReturn` True
           close session
           isUsable session `shouldReturn` False
@@ -119,22 +119,22 @@ spec socketPath port = do
           closeStatement session "closed" `shouldThrow` closed
           runBatch session id (pure ()) `shouldThrow` closed
           awaitNotification session `shouldThrow` closed
-        it "can close repeatedly, including during bracket cleanup" $ \session -> do
+        it "can close repeatedly, including during bracket cleanup" $ bracket (fst <$> connect connecting) close $ \session -> do
           close session
           timeout 5000000 (close session *> close session) `shouldReturn` Just ()
           isUsable session `shouldReturn` False
-        it "can close a broken session repeatedly" $ \session -> do
+        it "can close a broken session repeatedly" $ bracket (fst <$> connect connecting) close $ \session -> do
           let interrupted () _ = throwIO (ErrorCall "interrupted")
           execute session (statement "SELECT 1" []) interrupted () `shouldThrow` errorCall "interrupted"
           isUsable session `shouldReturn` False
           timeout 5000000 (close session *> close session) `shouldReturn` Just ()
           query session "SELECT 1" [] `shouldThrow` closed
-        it "can close after an operation is interrupted asynchronously" $ \session -> do
+        it "can close after an operation is interrupted asynchronously" $ bracket (fst <$> connect connecting) close $ \session -> do
           timeout 100000 (awaitNotification session) `shouldReturn` Nothing
           isUsable session `shouldReturn` False
           timeout 5000000 (close session *> close session) `shouldReturn` Just ()
           query session "SELECT 1" [] `shouldThrow` closed
-        it "rejects closing during an operation without disrupting it" $ \session -> do
+        it "rejects closing during an operation without disrupting it" $ bracket (fst <$> connect connecting) close $ \session -> do
           let step () row = do
                 close session `shouldThrow` (== SessionUnusable "the session is busy with another operation")
                 void (columns row)
@@ -397,33 +397,33 @@ spec socketPath port = do
         elapsed <- subtract started <$> getMonotonicTime
         elapsed `shouldSatisfy` (\seconds -> seconds >= 2 && seconds < 5)
 
-  describe "execute" $ around withSession $ do
-    it "runs an unprepared statement with parameters" $ \session ->
+  describe "execute" $ do
+    it "runs an unprepared statement with parameters" $ withSession $ \session ->
       query session "SELECT $1::int + 1, $2::text" [Just "41", Just "x"]
         `shouldReturn` (Right ([[Just "42", Just "x"]], "SELECT 1"), TxIdle)
-    it "passes NULL parameters and returns NULL columns" $ \session ->
+    it "passes NULL parameters and returns NULL columns" $ withSession $ \session ->
       query session "SELECT $1::text, 1" [Nothing]
         `shouldReturn` (Right ([[Nothing, Just "1"]], "SELECT 1"), TxIdle)
-    it "folds many rows" $ \session -> do
+    it "folds many rows" $ withSession $ \session -> do
       (result, _) <- execute session (statement "SELECT generate_series(1, 10000)" []) (\count row -> (count + 1 :: Int) <$ columns row) 0
       result `shouldBe` Right (10000, "SELECT 10000")
-    it "runs a prepared statement until it's closed" $ \session -> do
+    it "runs a prepared statement until it's closed" $ withSession $ \session -> do
       prepare session "add_one" "SELECT $1::int + 1" [] `shouldReturn` (Right (), TxIdle)
       prepared session "add_one" [Just "1"] `shouldReturn` (Right ([[Just "2"]], "SELECT 1"), TxIdle)
       prepared session "add_one" [Just "41"] `shouldReturn` (Right ([[Just "42"]], "SELECT 1"), TxIdle)
       closeStatement session "add_one" `shouldReturn` (Right (), TxIdle)
       (result, _) <- prepared session "add_one" [Just "1"]
       either errorCode (const Nothing) result `shouldBe` Just "26000"
-    it "returns an error and stays usable" $ \session -> do
+    it "returns an error and stays usable" $ withSession $ \session -> do
       (result, status) <- query session "SELECT 1/0" []
       either errorCode (const Nothing) result `shouldBe` Just "22012"
       status `shouldBe` TxIdle
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
-    it "reports the transaction status" $ \session -> do
+    it "reports the transaction status" $ withSession $ \session -> do
       fmap snd (query session "BEGIN" []) `shouldReturn` TxInTransaction
       fmap snd (query session "SELECT 1/0" []) `shouldReturn` TxFailedTransaction
       fmap snd (query session "ROLLBACK" []) `shouldReturn` TxIdle
-    it "streams a parameter from its source" $ \session -> do
+    it "streams a parameter from its source" $ withSession $ \session -> do
       let pattern = BS.concat (replicate 4096 "0123456789abcdef")
           chunks = 128
       source <- chunkSource (replicate chunks pattern)
@@ -434,7 +434,7 @@ spec socketPath port = do
           (\rows row -> (: rows) <$> columns row)
           []
       result `shouldBe` Right ([[Just "t"]], "SELECT 1")
-    it "sends a parameter in chunks, short and long, larger than the socket's buffers" $ \session -> do
+    it "sends a parameter in chunks, short and long, larger than the socket's buffers" $ withSession $ \session -> do
       let pattern = BS.concat (replicate 4096 "0123456789abcdef")
           chunks = concatMap (\chunk -> [BS.take 100 chunk, BS.drop 100 chunk]) (replicate 128 pattern)
       (result, _) <-
@@ -444,7 +444,7 @@ spec socketPath port = do
           (\rows row -> (: rows) <$> columns row)
           []
       result `shouldBe` Right ([[Just "t"]], "SELECT 1")
-    it "streams a parameter to a prepared statement, whether it returns rows or not" $ \session -> do
+    it "streams a parameter to a prepared statement, whether it returns rows or not" $ withSession $ \session -> do
       _ <- query session "CREATE TEMPORARY TABLE streamed (value text)" []
       prepare session "insert_streamed" "INSERT INTO streamed VALUES ($1)" [] `shouldReturn` (Right (), TxIdle)
       prepare session "length_of" "SELECT length($1::text)" [] `shouldReturn` (Right (), TxIdle)
@@ -453,7 +453,7 @@ spec socketPath port = do
             collectRows session (Execution (Prepared name) [] [Just (ParameterStream (ByteStream 6 source))] [])
       streamed "insert_streamed" `shouldReturn` (Right ([], "INSERT 0 1"), TxIdle)
       streamed "length_of" `shouldReturn` (Right ([[Just "6"]], "SELECT 1"), TxIdle)
-    it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $ \session -> do
+    it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $ withSession $ \session -> do
       _ <- query session "SET statement_timeout = '200ms'" []
       prepare session "slow_length" "SELECT length($1::text)" [] `shouldReturn` (Right (), TxIdle)
       let slowly target = do
@@ -464,32 +464,32 @@ spec socketPath port = do
       slowly (Unprepared "SELECT length($1::text)" []) `shouldReturn` Just "57014"
       slowly (Prepared "slow_length") `shouldReturn` Just "57014"
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
-    it "sends a batch while reading its results, as the server answers before reading all of it" batchWhileReading
-    it "closes a session broken while sending, without waiting for the server to read" $ \session -> do
+    it "sends a batch while reading its results, as the server answers before reading all of it" $ withSession batchWhileReading
+    it "closes a session broken while sending, without waiting for the server to read" $ withSession $ \session -> do
       let slowly = batched id (statement "SELECT repeat('x', 1000000)" []) (\() _ -> threadDelay 60000000) ()
           long = batched id (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')]) (\() _ -> pure ()) ()
       void $ timeout 1000000 (runBatch session id (slowly *> long))
       timeout 5000000 (close session) `shouldReturn` Just ()
-    it "takes a value larger than the read buffer whole" $ \session -> do
+    it "takes a value larger than the read buffer whole" $ withSession $ \session -> do
       (result, _) <- query session "SELECT repeat('y', 100000)" []
       result `shouldBe` Right ([[Just (Char8.replicate 100000 'y')]], "SELECT 1")
-    it "streams a column to a slow consumer without holding it in memory" $ \session -> do
+    it "streams a column to a slow consumer without holding it in memory" $ withSession $ \session -> do
       enabled <- getRTSStatsEnabled
       unless enabled $ pendingWith "needs +RTS -T"
       let size = 64 * 1024 * 1024
       (result, _) <-
         execute session (statement ("SELECT repeat('x', " <> Char8.pack (show size) <> ")") []) (\_ row -> Just <$> consumeSlowly row) Nothing
       fmap fst result `shouldBe` Right (Just (size, True, True))
-    it "rejects a row used after its step" $ \session -> do
+    it "rejects a row used after its step" $ withSession $ \session -> do
       saved <- newIORef Nothing
       _ <- execute session (statement "SELECT 1" []) (\() row -> writeIORef saved (Just row)) ()
       Just row <- readIORef saved
       nextColumn row `shouldThrow` rowMisuse
-    it "is unusable while busy, and broken after a failed operation" $ \session -> do
+    it "is unusable while busy, and broken after a failed operation" $ withSession $ \session -> do
       let nested () _ = void (execute session (statement "SELECT 2" []) (\() _ -> pure ()) ())
       execute session (statement "SELECT 1" []) nested () `shouldThrow` sessionUnusable
       query session "SELECT 1" [] `shouldThrow` sessionUnusable
-    it "tells whether it's usable" $ \session -> do
+    it "tells whether it's usable" $ withSession $ \session -> do
       isUsable session `shouldReturn` True
       _ <- query session "SELECT 1" []
       isUsable session `shouldReturn` True
@@ -499,53 +499,53 @@ spec socketPath port = do
             throwIO (ErrorCall "interrupted")
       execute session (statement "SELECT 1" []) interrupted () `shouldThrow` errorCall "interrupted"
       isUsable session `shouldReturn` False
-  describe "decodeRow" $ around withSession $ do
-    it "decodes integers, booleans, floats and numerics" $ \session ->
+  describe "decodeRow" $ do
+    it "decodes integers, booleans, floats and numerics" $ withSession $ \session ->
       decodeSingle @'[Int16, Int32, Int64, Bool, Float, Double, Scientific] session "SELECT 1::int2, -2::int4, 3::int8, true, 1.5::float4, 2.5::float8, 3.25::numeric" (\a b c d e f g -> pure (a, b, c, d, e, f, g))
         `shouldReturn` Right (1, -2, 3, True, 1.5, 2.5, 3.25)
-    it "decodes text, bytea, char, uuid and json" $ \session ->
+    it "decodes text, bytea, char, uuid and json" $ withSession $ \session ->
       decodeSingle @'[Text, ByteString, Char, UUID, Json, Jsonb] session "SELECT 'héllo'::text, '\\xdeadbeef'::bytea, 'x'::char, '00000000-0000-0000-0000-000000000001'::uuid, '{\"a\":1}'::json, '{\"a\":1}'::jsonb" (\a b c d e f -> pure (a, b, c, d, e, f))
         `shouldReturn` Right ("héllo", BS.pack [0xde, 0xad, 0xbe, 0xef], 'x', UUID.fromWords 0 0 0 1, Json "{\"a\":1}", Jsonb "{\"a\": 1}")
-    it "decodes dates, timestamps and intervals" $ \session ->
+    it "decodes dates, timestamps and intervals" $ withSession $ \session ->
       decodeSingle @'[Day, UTCTime, DiffTime] session "SELECT '2024-01-02'::date, '2024-01-02 03:04:05+00'::timestamptz, '2 hours'::interval" (\a b c -> pure (a, b, c))
         `shouldReturn` Right (fromGregorian 2024 1 2, UTCTime (fromGregorian 2024 1 2) 11045, 7200)
-    it "decodes NULL into Maybe and rejects it otherwise" $ \session -> do
+    it "decodes NULL into Maybe and rejects it otherwise" $ withSession $ \session -> do
       decodeSingle @'[Maybe Int32, Maybe Int32] session "SELECT NULL::int4, 1::int4" (curry pure)
         `shouldReturn` Right (Nothing, Just 1)
       decodeSingle @'[Int32] session "SELECT NULL::int4" (\_ -> pure ())
         `shouldReturn` Left (ColumnDecodingFailed 1 "unexpected NULL")
-    it "decodes arrays, with NULL elements into Maybe" $ \session ->
+    it "decodes arrays, with NULL elements into Maybe" $ withSession $ \session ->
       decodeSingle @'[[Int32], [Maybe Text]] session "SELECT ARRAY[1, 2, 3]::int4[], ARRAY['a', NULL]::text[]" (curry pure)
         `shouldReturn` Right ([1, 2, 3], [Just "a", Nothing])
-    it "decodes composites and arrays of them" $ \session ->
+    it "decodes composites and arrays of them" $ withSession $ \session ->
       decodeSingle @'[Pair, [Pair]] session "SELECT ROW(1, 'a'::text), ARRAY[ROW(2, 'b'::text), ROW(3, 'c'::text)]" (curry pure)
         `shouldReturn` Right (Pair 1 "a", [Pair 2 "b", Pair 3 "c"])
-    it "reports a wrong column count, or a column of another type, and stays usable" $ \session -> do
+    it "reports a wrong column count, or a column of another type, and stays usable" $ withSession $ \session -> do
       decodeSingle @'[Int32] session "SELECT 1::int4, 2::int4" (\_ -> pure ())
         `shouldReturn` Left (ColumnCountMismatch 1 2)
       decodeSingle @'[Int64] session "SELECT 1::int4" (\_ -> pure ())
         `shouldReturn` Left (ColumnDecodingFailed 1 "int8 needs 8 bytes, got 4")
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
-    it "streams a last column after decoding the others" $ \session ->
+    it "streams a last column after decoding the others" $ withSession $ \session ->
       decodeSingleStreaming @'[Int32] session "SELECT 200::int4, repeat('x', 1000000)" (\status body -> (status,) <$> streamedLength body)
         `shouldReturn` Right (200, 1000000)
 
-  describe "errors" $ around withSession $ do
-    it "reports a missing relation with its position in the query" $ \session -> do
+  describe "errors" $ do
+    it "reports a missing relation with its position in the query" $ withSession $ \session -> do
       (result, _) <- query session "SELECT * FROM missing_table" []
       fmap (\d -> (diagnosticSeverity d, diagnosticCode d, diagnosticMessage d, diagnosticPosition d)) (failed result)
         `shouldBe` Just (SeverityError, "42P01", "relation \"missing_table\" does not exist", Just 15)
-    it "reports a constraint violation's detail, table and constraint" $ \session -> do
+    it "reports a constraint violation's detail, table and constraint" $ withSession $ \session -> do
       _ <- query session "CREATE TEMPORARY TABLE item (id int PRIMARY KEY)" []
       _ <- query session "INSERT INTO item VALUES (1)" []
       (result, _) <- query session "INSERT INTO item VALUES (1)" []
       fmap (\d -> (diagnosticCode d, diagnosticDetail d, diagnosticTable d, diagnosticConstraint d)) (failed result)
         `shouldBe` Just ("23505", Just "Key (id)=(1) already exists.", Just "item", Just "item_pkey")
-    it "reports a raised error's own SQLSTATE, detail, hint and context" $ \session -> do
+    it "reports a raised error's own SQLSTATE, detail, hint and context" $ withSession $ \session -> do
       (result, _) <- query session "DO $$ BEGIN RAISE EXCEPTION 'custom' USING ERRCODE = 'PGRST', DETAIL = 'the detail', HINT = 'the hint'; END $$" []
       fmap (\d -> (diagnosticCode d, diagnosticMessage d, diagnosticDetail d, diagnosticHint d, isJust (diagnosticContext d))) (failed result)
         `shouldBe` Just ("PGRST", "custom", Just "the detail", Just "the hint", True)
-    it "throws when the server ends the session, which is then broken" $ \session -> do
+    it "throws when the server ends the session, which is then broken" $ withSession $ \session -> do
       outcome <- try (query session "SELECT pg_terminate_backend(pg_backend_pid())" [])
       case outcome of
         Left (ConnectionTerminated (ServerError d)) -> (diagnosticSeverity d, diagnosticCode d) `shouldBe` (SeverityFatal, "57P01")
@@ -588,33 +588,33 @@ spec socketPath port = do
           _ <- query administrator "SELECT pg_terminate_backend($1::int)" [Just (Char8.pack (show pid))]
           awaitNotification listener `shouldThrow` connectionTerminated
 
-  describe "transactions" $ around withSession $ do
+  describe "transactions" $ do
     let createItems session = void (query session "CREATE TEMP TABLE tx_items (n int)" [])
         countItems = Tx.Statement "SELECT count(*) FROM tx_items" (const []) (Tx.singleRow (Tx.row @'[Int64] id)) False
         insertItem = Tx.Statement "INSERT INTO tx_items VALUES ($1)" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) Tx.noResult False
         items = Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.statement () countItems)
         failsWith check = either (\(Tx.QueryError _ failure) -> check failure) (const False)
-    it "commits" $ \session -> do
+    it "commits" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem) session `shouldReturn` Right ()
       items session `shouldReturn` Right 1
-    it "rolls back when condemned" $ \session -> do
+    it "rolls back when condemned" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> Tx.condemn) session `shouldReturn` Right ()
       items session `shouldReturn` Right 0
-    it "rolls back after a failing statement, and reports it with its SQL" $ \session -> do
+    it "rolls back after a failing statement, and reports it with its SQL" $ withSession $ \session -> do
       createItems session
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> Tx.sql "SELECT 1 / 0") session
       result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
       items session `shouldReturn` Right 0
-    it "begins with the isolation level and the mode" $ \session ->
+    it "begins with the isolation level and the mode" $ withSession $ \session ->
       Tx.transactionNoRetry
         Tx.RepeatableRead
         Tx.Read
         (Tx.statement () (Tx.Statement "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')" (const []) (Tx.singleRow (Tx.row @'[Text, Text] (,))) False))
         session
         `shouldReturn` Right ("repeatable read", "on")
-    it "prepares a preparable statement as its Prepare says, and runs the others unnamed" $ \session -> do
+    it "prepares a preparable statement as its Prepare says, and runs the others unnamed" $ withSession $ \session -> do
       asked <- newIORef []
       parsed <- newIORef []
       let prepareAs name query' _ = do
@@ -636,11 +636,11 @@ spec socketPath port = do
       failing `shouldSatisfy` either (\(Tx.QueryError _ failure) -> failure `servedCode` "22012") (const False)
       -- parsed, so prepared, even though it failed to run
       readIORef parsed `shouldReturn` ["divided", "answer"]
-    it "runs a pipeline's statements in order, and gives their results" $ \session -> do
+    it "runs a pipeline's statements in order, and gives their results" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.pipeline ((,) <$> Pipeline.statement "1" insertItem <*> Pipeline.statement () countItems)) session
         `shouldReturn` Right ((), 1)
-    it "skips a pipeline's statements after one that fails on the server, and reports that one" $ \session -> do
+    it "skips a pipeline's statements after one that fails on the server, and reports that one" $ withSession $ \session -> do
       createItems session
       result <-
         Tx.transactionNoRetry
@@ -650,43 +650,43 @@ spec socketPath port = do
           session
       result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
       items session `shouldReturn` Right 0
-    it "reads a pipeline's results after one that doesn't decode, and stays usable" $ \session -> do
+    it "reads a pipeline's results after one that doesn't decode, and stays usable" $ withSession $ \session -> do
       let number sql' = Pipeline.statement () (Tx.Statement sql' (const []) (Tx.singleRow (Tx.row @'[Int32] id)) False)
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.pipeline ((,) <$> number "SELECT 'abc'::text" <*> number "SELECT 2::int4")) session
       result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 'abc'::text" && (case failure of Tx.RowFailed _ -> True; _ -> False)) (const False)
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
-    it "sends nothing for a transaction without statements" $ \session ->
+    it "sends nothing for a transaction without statements" $ withSession $ \session ->
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (pure (5 :: Int)) session `shouldReturn` Right 5
-    it "reports a failure at commit" $ \session -> do
+    it "reports a failure at commit" $ withSession $ \session -> do
       void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
       let insertTwice = Tx.sql "INSERT INTO tx_unique VALUES (1)" *> Tx.sql "INSERT INTO tx_unique VALUES (1)"
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write insertTwice session
       result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "COMMIT" && failure `servedCode` "23505") (const False)
-    it "commits with the final pipeline" $ \session -> do
+    it "commits with the final pipeline" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (Pipeline.statement "1" insertItem)) session `shouldReturn` Right ()
       items session `shouldReturn` Right 1
-    it "aborts with the final pipeline when condemned before it" $ \session -> do
+    it "aborts with the final pipeline when condemned before it" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.condemn *> Tx.finalPipeline (Pipeline.statement "1" insertItem)) session `shouldReturn` Right ()
       items session `shouldReturn` Right 0
-    it "rolls back after a statement in the final pipeline fails" $ \session -> do
+    it "rolls back after a statement in the final pipeline fails" $ withSession $ \session -> do
       createItems session
       let failing = Pipeline.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult False)
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (Pipeline.statement "1" insertItem *> failing)) session
       result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "SELECT 1 / 0" && failure `servedCode` "22012") (const False)
       items session `shouldReturn` Right 0
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
-    it "reports a failure at commit in the final pipeline, after which the transaction is over" $ \session -> do
+    it "reports a failure at commit in the final pipeline, after which the transaction is over" $ withSession $ \session -> do
       void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
       let insert = Pipeline.statement () (Tx.Statement "INSERT INTO tx_unique VALUES (1)" (const []) Tx.noResult False)
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.finalPipeline (insert *> insert)) session
       result `shouldSatisfy` either (\(Tx.QueryError query' failure) -> query' == "COMMIT" && failure `servedCode` "23505") (const False)
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
-    it "rejects a statement after the final pipeline" $ \session ->
+    it "rejects a statement after the final pipeline" $ withSession $ \session ->
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.finalPipeline (pure ()) *> Tx.sql "SELECT 1") session
         `shouldThrow` errorCall "a statement after the transaction's final pipeline"
-    it "checks how many rows a result has" $ \session -> do
+    it "checks how many rows a result has" $ withSession $ \session -> do
       let numbers :: Tx.Result a -> Int -> Tx.Transaction a
           numbers shape count = Tx.statement () (Tx.Statement ("SELECT n FROM generate_series(1, " <> Char8.pack (show count) <> ") n") (const []) shape False)
           number = Tx.row @'[Int32] id
@@ -697,10 +697,10 @@ spec socketPath port = do
       run (numbers (Tx.rowMaybe number) 1) `shouldReturn` Right (Just 1)
       run (numbers (Tx.rowList number) 3) `shouldReturn` Right [1, 2, 3]
       run (numbers Tx.noResult 3) `shouldReturn` Right ()
-    it "reports a row that doesn't decode" $ \session -> do
+    it "reports a row that doesn't decode" $ withSession $ \session -> do
       result <- Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.statement () (Tx.Statement "SELECT 'abc'::text" (const []) (Tx.singleRow (Tx.row @'[Int32] id)) False)) session
       result `shouldSatisfy` failsWith (\case Tx.RowFailed _ -> True; _ -> False)
-    it "streams a column larger than the read buffer within the transaction" $ \session -> do
+    it "streams a column larger than the read buffer within the transaction" $ withSession $ \session -> do
       let streamed accumulated current =
             case accumulated of
               Nothing -> Just <$> Tx.decodeScopedStreaming @'[Int32] current (\number stream -> (number,Tx.streamLength stream,) <$> drain stream 0)
@@ -714,7 +714,7 @@ spec socketPath port = do
         (Tx.statement () (Tx.Statement "SELECT 7::int4, repeat('x', 1000000)" (const []) (Tx.foldRows streamed Nothing) False))
         session
         `shouldReturn` Right (Just (Right (7, 1000000, 1000000)))
-    it "streams a column that may be NULL within a single row's scope" $ \session -> do
+    it "streams a column that may be NULL within a single row's scope" $ withSession $ \session -> do
       let drain stream received =
             Tx.streamChunk stream >>= \chunk ->
               if BS.null chunk then pure received else drain stream (received + BS.length chunk)
@@ -728,17 +728,17 @@ spec socketPath port = do
         ((,) <$> streamed "SELECT 7::int4, repeat('x', 1000000)" <*> streamed "SELECT 8::int4, NULL::text")
         session
         `shouldReturn` Right ((7, Just 1000000), (8, Nothing))
-    it "rejects NULL in a column streamed as one that can't be NULL" $ \session ->
+    it "rejects NULL in a column streamed as one that can't be NULL" $ withSession $ \session ->
       decodeSingleStreaming @'[Int32] session "SELECT 7::int4, NULL::text" (\_ _ -> pure ())
         `shouldReturn` Left (ColumnDecodingFailed 2 "unexpected NULL in a streamed column")
-    it "aborts when the transaction throws between statements, and leaves the session usable" $ \session -> do
+    it "aborts when the transaction throws between statements, and leaves the session usable" $ withSession $ \session -> do
       createItems session
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Write (Tx.statement "1" insertItem *> liftIO (throwIO (ErrorCall "boom"))) session
         `shouldThrow` errorCall "boom"
       items session `shouldReturn` Right 0
 
-  describe "snippets" $ around withSession $ do
-    it "sends parameters the server reads as their types" $ \session -> do
+  describe "snippets" $ do
+    it "sends parameters the server reads as their types" $ withSession $ \session -> do
       let snippet =
             "SELECT "
               <> Snippet.encoderAndParam (Encoders.nonNullable Encoders.unknown) "41"
@@ -755,15 +755,15 @@ spec socketPath port = do
       Tx.transactionNoRetry Tx.ReadCommitted Tx.Read (Tx.statement () statement) session
         `shouldReturn` Right (42, "a,zażółć", "1", "[1, 2]", True)
 
-  describe "execute (failures)" $ around withSession $ do
-    it "breaks the session when a parameter stream is shorter than declared" $ \session -> do
+  describe "execute (failures)" $ do
+    it "breaks the session when a parameter stream is shorter than declared" $ withSession $ \session -> do
       source <- chunkSource ["short"]
       let short = Execution (Unprepared "SELECT $1::text" []) [] [Just (ParameterStream (ByteStream 10 source))] []
       try (execute session short (\() _ -> pure ()) ()) >>= \case
         Left (_ :: StreamLengthError) -> pure ()
         Right _ -> expectationFailure "expected a StreamLengthError"
       query session "SELECT 1" [] `shouldThrow` sessionUnusable
-    it "throws a parameter stream's failure, and breaks the session" $ \session -> do
+    it "throws a parameter stream's failure, and breaks the session" $ withSession $ \session -> do
       sent <- newIORef False
       let source = readIORef sent >>= \done -> if done then throwIO (userError "the client went away") else writeIORef sent True $> Char8.replicate 1000000 'y'
           failing = Execution (Unprepared "SELECT length($1::text)" []) [] [Just (ParameterStream (ByteStream 2000000 source))] []
