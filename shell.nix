@@ -5,12 +5,12 @@ let
   };
   pkgs = import nixpkgs { };
   # nixpkgs' default GHC, which its binary cache has
+  # Cabal supplies skeletest and its preprocessor; this pin has an older version.
   ghc = pkgs.haskellPackages.ghcWithPackages (
     p: with p; [
       async
       base64-bytestring
       crypton
-      hspec
       memory
       network
       postgresql-binary
