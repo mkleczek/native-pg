@@ -25,11 +25,41 @@ cabal build all
 ## Testing
 
 ```bash
-cabal test all
+cabal test all --test-show-details=direct
 ```
 
-The integration tests start a temporary PostgreSQL cluster with the `initdb`
-and `pg_ctl` found on the path.
+All three suites use skeletest 0.4.2. Cabal builds its preprocessor along with
+the tests. Select a suite and optionally filter its test names:
+
+```bash
+cabal test native-pg-spec --test-show-details=direct
+cabal test native-pg-integration --test-show-details=direct --test-option='[close]'
+```
+
+The integration tests start one temporary PostgreSQL cluster with the `initdb`
+and `pg_ctl` found on the path. Each session wrapper opens a fresh connection
+and closes it after the test, including on failure. The integration runner
+registers its spec explicitly so that cluster setup stays outside the tests;
+the core and TLS runners discover `*Spec.hs` modules automatically.
+
+For a test-first jj change, first run the regression without a marker and check
+that it fails for the intended reason. Then mark that individual test with
+`xfail`, giving the missing behavior or issue as the reason:
+
+```haskell
+xfail "issue-123: explain the missing behavior" $
+  it "describes the regression" regression
+```
+
+Record the failing test in one change. Implement the behavior in a child change
+and remove the marker there. An expected failure passes the suite; an unexpected
+success (`XPASS`) fails it, so the marker cannot silently outlive the fix.
+Ordinary exceptions also count as expected failures, so check the unmarked
+failure before adding the marker. Existing passing tests stay unmarked.
+
+Keep independent test/implementation pairs on separate branches and merge their
+tips into the bookmarked feature change. To select expected failures in a suite,
+pass `--test-option=@xfail` (a selection matching no tests fails).
 
 ## Licence
 
