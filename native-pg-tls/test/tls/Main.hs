@@ -4,6 +4,7 @@
 -- | TLS connections against a server in the same process, over a pair of
 -- Unix-domain sockets. The server is rustls too, through its server API, and
 -- its side of a connection runs on the same functions as the client's.
+-- Each side has exclusive access to its own TLS connection.
 module Main (main) where
 
 import Control.Concurrent (threadWaitRead, threadWaitWrite)
@@ -56,7 +57,8 @@ main = hspec $ do
         let payload = BS.pack (take 1000000 (cycle [0 .. 250]))
             client = do
               tls <- startTls config "localhost" sock
-              snd <$> concurrently (sendAll tls [BS.take 300000 payload, BS.drop 300000 payload]) (receiveExactly tls (BS.length payload))
+              sendAll tls [BS.take 300000 payload, BS.drop 300000 payload]
+              receiveExactly tls (BS.length payload)
             echo = do
               handshake server
               sendAll server . pure =<< receiveExactly server (BS.length payload)

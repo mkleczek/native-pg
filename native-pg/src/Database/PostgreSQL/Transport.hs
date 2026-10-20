@@ -218,6 +218,12 @@ keepalivesCount = SockOpt (-1) (-1)
 -- | A stream of bytes to the server over a connected socket: the socket
 -- itself, or TLS over it. Its operations don't wait: the connection waits on
 -- the socket.
+--
+-- Callers must ensure exclusive access to each connection. Receiving,
+-- sending, flushing and closing must not overlap, whether called on the
+-- link directly or through any 'Channel' built from it. Ownership may pass
+-- to another thread between calls. Different connections may be used
+-- concurrently.
 class Link link where
   -- | The socket the link reads and writes.
   linkSocket :: link -> Socket
@@ -316,6 +322,11 @@ instance Exception TlsError where
 -- | A connection's input and output over its link. It's made with the
 -- connection, from code specialized to the link, so that using it passes no
 -- dictionary, and the rest of the client doesn't know which link it has.
+--
+-- Callers must ensure exclusive access to the channel and its underlying
+-- 'Link', including calls to the 'InputSource' in 'channelInput'. Reading
+-- may also send and flush pending output, so reads and writes must not run
+-- concurrently. Ownership may pass to another thread between calls.
 data Channel = Channel
   { -- | Reads input. While output is unsent, waiting for input also sends it
     -- as the link takes it.

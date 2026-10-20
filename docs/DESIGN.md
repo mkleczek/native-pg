@@ -32,9 +32,10 @@ The library does none of the following:
   cache key: PostgREST, for example, can key on the request plan instead of
   generating SQL text just to look a statement up.
 - **Connection pooling.**
-- **Threads.** The library starts none. Sending and receiving are separate
-  operations, so a client that pipelines large messages can run them
-  concurrently.
+- **Threads.** The library starts none. A session operation sends pending
+  output as it waits for input, in the calling thread. Clients can use
+  different connections concurrently. Direct users of transport links or
+  channels must ensure exclusive access to each connection.
 
 ## State
 
@@ -255,10 +256,17 @@ any -> Broken | Closed
 - Values the library returns are slices of the read buffer, so it copies
   nothing. A client that keeps a value for long should copy it, so the value
   doesn't keep the whole read buffer alive.
-- Parsers read through `InputSource`, so tests can feed plain byte strings.
-- TLS is a link like the socket: a `Link` class gives a connection's reads
-  and writes, and its channel is made from code specialized to its link.
-  The link over TLS comes from a library apart, native-pg-tls, through
+- The parser and serializer expose the wire protocol through `InputSource`
+  and `Output`, without transport-specific operations. Tests can feed plain
+  byte strings.
+- A `Link` supplies a connection's reads and writes, and its `Channel` is
+  made from code specialized to that link. Both require exclusive access
+  to the connection: reads, writes, flushing and closing must not overlap,
+  including reads through the channel's `InputSource`. A read may also send
+  pending output. Ownership may pass to another thread between calls.
+  Session operations enforce exclusive access during query I/O; callers
+  using links or channels directly enforce it themselves.
+- The link over TLS comes from a library apart, native-pg-tls, through
   rustls-ffi, which a client gives native-pg as a `TlsClient`, so that this
   library has no C (step 8 of the integration plan).
 - Dependencies: `network`, plus `crypton` for SCRAM and MD5. PostgREST
