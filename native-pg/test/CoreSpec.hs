@@ -4,7 +4,7 @@
 
 module CoreSpec (spec) where
 
-import Control.Exception (displayException, evaluate)
+import Control.Exception (ErrorCall, displayException, evaluate)
 import Data.ByteArray.Encoding (Base (Base16), convertToBase)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -13,7 +13,6 @@ import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (toList)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
-import Data.List (isInfixOf)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word8)
@@ -30,7 +29,8 @@ import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
-import Test.Hspec
+import Skeletest
+import qualified Skeletest.Predicate as P
 
 spec :: Spec
 spec = do
@@ -68,7 +68,7 @@ spec = do
       encodes @(CancelRequest ByteString) @'CancelRequestType cancelRequest cancelRequestBytes
     it "rejects a zero byte inside a C string" $
       evaluate (outputByteString (serialize @(Query ByteString) @'QueryType (Query "a\0b")))
-        `shouldThrow` anyErrorCall
+        `shouldSatisfy` P.throws (P.anything @ErrorCall)
     it "round-trips every frontend message" $ do
       roundTrip @(StartupMessage ByteString) @'StartupMessageType startupMessage
       roundTrip @SSLRequest @'SSLRequestType SSLRequest
@@ -118,10 +118,10 @@ spec = do
       decodes @ReadyForQuery @'ReadyForQueryType ("Z" <> int32 5 <> "T") (ReadyForQuery TxInTransaction)
     it "rejects an unknown transaction status" $
       parseEnvelope @ReadyForQuery @'ReadyForQueryType ("Z" <> int32 5 <> "X")
-        `shouldSatisfy` isLeft
+        `shouldSatisfy` P.left P.anything
     it "rejects a message whose fields don't fill its length" $
       parseEnvelope @(CommandComplete ByteString) @'CommandCompleteType ("C" <> int32 12 <> "SELECT\0x")
-        `shouldSatisfy` isLeft
+        `shouldSatisfy` P.left P.anything
     it "round-trips every backend message" $ do
       roundTrip @AuthenticationOk @'AuthenticationOkType AuthenticationOk
       roundTrip @AuthenticationKerberosV5 @'AuthenticationKerberosV5Type AuthenticationKerberosV5
@@ -167,7 +167,7 @@ spec = do
       dispatch ("1" <> int32 4 <> "2" <> int32 4 <> "Z" <> int32 5 <> "I")
         `shouldBe` Right ["ParseComplete", "BindComplete", "ReadyForQuery TxIdle"]
     it "rejects a message no alternative accepts" $
-      dispatch ("D" <> int32 6 <> int16 0) `shouldSatisfy` isLeft
+      dispatch ("D" <> int32 6 <> int16 0) `shouldSatisfy` P.left P.anything
 
   describe "input" $ do
     it "parses messages arriving a byte at a time into small buffers" $ do
@@ -198,7 +198,7 @@ spec = do
         )
         `shouldBe` Right (SeverityError, "42P01", "relation does not exist", Just 15, Nothing)
     it "rejects an error without a SQLSTATE" $
-      diagnostics [Scalar (byte 'S', "ERROR"), Scalar (byte 'M', "no code")] `shouldSatisfy` isLeft
+      diagnostics [Scalar (byte 'S', "ERROR"), Scalar (byte 'M', "no code")] `shouldSatisfy` P.left P.anything
 
   describe "authentication" $ do
     it "answers an MD5 password request" $
@@ -207,16 +207,16 @@ spec = do
       let (clientFirst, client) = scramClientFirst WithoutChannelBinding "user" "rOprNGfwEbeRWgbNEkqO"
       clientFirst `shouldBe` "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
       case scramClientFinal "pencil" client rfc7677ServerFirst of
-        Left err -> expectationFailure err
+        Left err -> failTest err
         Right (clientFinal, serverSignature) -> do
           clientFinal
             `shouldBe` "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
           scramVerifyServerFinal serverSignature "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=" `shouldBe` Right ()
-          scramVerifyServerFinal serverSignature "v=AAAA" `shouldSatisfy` isLeft
-          scramVerifyServerFinal serverSignature "e=invalid-proof" `shouldSatisfy` isLeft
+          scramVerifyServerFinal serverSignature "v=AAAA" `shouldSatisfy` P.left P.anything
+          scramVerifyServerFinal serverSignature "e=invalid-proof" `shouldSatisfy` P.left P.anything
     it "rejects a server nonce that doesn't extend the client's" $ do
       let (_, client) = scramClientFirst WithoutChannelBinding "user" "rOprNGfwEbeRWgbNEkqO"
-      fmap fst (scramClientFinal "pencil" client "r=other,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096") `shouldSatisfy` isLeft
+      fmap fst (scramClientFinal "pencil" client "r=other,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096") `shouldSatisfy` P.left P.anything
 
   describe "channel binding" $ do
     it "says in SCRAM's messages how it binds to the channel" $ do
@@ -387,7 +387,7 @@ spec = do
       parse "require_auth=password" `shouldSatisfy` failsWith "require_auth isn't supported"
       parse "load_balance_hosts=random" `shouldSatisfy` failsWith "requires random load balancing"
       parse "passfile=/pgpass" `shouldSatisfy` failsWith "password files aren't supported"
-      parse "passfile=/pgpass password=x" `shouldSatisfy` isRight
+      parse "passfile=/pgpass password=x" `shouldSatisfy` P.right P.anything
     it "reports malformed strings as libpq does" $ do
       parse "host" `shouldSatisfy` failsWith "missing \"=\" after \"host\" in connection info string"
       parse "password='abc" `shouldSatisfy` failsWith "unterminated quoted string"
@@ -406,7 +406,7 @@ spec = do
       parse "min_protocol_version=3.2" `shouldSatisfy` failsWith "min_protocol_version is greater than max_protocol_version"
     it "needs a user when the local one can't be looked up" $ do
       parseConnectionString (defaultsFrom []) (const Nothing) Nothing "" `shouldSatisfy` failsWith "a user has to be given"
-      parseConnectionString (defaultsFrom []) (const Nothing) Nothing "user=u" `shouldSatisfy` isRight
+      parseConnectionString (defaultsFrom []) (const Nothing) Nothing "user=u" `shouldSatisfy` P.right P.anything
     it "words failures as libpq does" $ do
       displayException (UnresolvedHost "no_host" "nodename nor servname provided, or not known")
         `shouldBe` "could not translate host name \"no_host\" to address: nodename nor servname provided, or not known"
@@ -442,7 +442,7 @@ spec = do
       paramView (Encoders.rawParam Encoders.rawUnknown Nothing) `shouldBe` (Just (Scalar 705), TextFormat, Nothing)
       case Encoders.rawParam Encoders.rawJsonb (Just (ParameterStream (ByteStream 2 (pure "{}")))) of
         Tx.Param oid format (Just (ParameterStream stream)) -> (oid, format, byteStreamLength stream) `shouldBe` (Just (Scalar 3802), TextFormat, 2)
-        _ -> expectationFailure "the parameter isn't streamed"
+        _ -> failTest "the parameter isn't streamed"
     it "sends a one-dimensional array of the elements' type" $
       paramView (Encoders.param (Encoders.nonNullable (Encoders.foldableArray (Encoders.nonNullable Encoders.text))) ["a", "bc"])
         `shouldBe` ( Just (Scalar 1009),
@@ -528,13 +528,13 @@ dispatch input = do
         :|: (\(ReadyForQuery status) -> "ReadyForQuery " <> show status)
         :|: NoAlternatives
 
-encodes :: forall a s. Serializable a s => a -> ByteString -> Expectation
+encodes :: forall a s. Serializable a s => a -> ByteString -> IO ()
 encodes message expected = outputByteString (serialize @a @s message) `shouldBe` expected
 
-decodes :: forall a s. (Parsable a s, Eq a, Show a) => ByteString -> a -> Expectation
+decodes :: forall a s. (Parsable a s, Eq a, Show a) => ByteString -> a -> IO ()
 decodes input expected = parseEnvelope @a @s input `shouldBe` Right (Envelope expected)
 
-roundTrip :: forall a s. (Parsable a s, Serializable a s, Eq a, Show a) => a -> Expectation
+roundTrip :: forall a s. (Parsable a s, Serializable a s, Eq a, Show a) => a -> IO ()
 roundTrip message = parseEnvelope @a @s (outputByteString (serialize @a @s message)) `shouldBe` Right (Envelope message)
 
 startupMessage :: StartupMessage ByteString
@@ -605,11 +605,5 @@ paramView (Tx.Param oid format value) = (oid, format, bytes <$> value)
     bytes (ParameterBytes strict) = strict
     bytes (ParameterStream _) = error "a streamed parameter"
 
-failsWith :: String -> Either String a -> Bool
-failsWith message = either (message `isInfixOf`) (const False)
-
-isRight :: Either a b -> Bool
-isRight = not . isLeft
-
-isLeft :: Either a b -> Bool
-isLeft = either (const True) (const False)
+failsWith :: String -> Predicate IO (Either String a)
+failsWith message = P.left (P.hasInfix message)

@@ -14,7 +14,7 @@ import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr)
 import System.Timeout (timeout)
-import Test.Hspec
+import Skeletest
 
 spec :: Spec
 spec = describe "channels over a link without a socket" $ do
