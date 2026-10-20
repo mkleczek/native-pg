@@ -31,9 +31,12 @@ import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCerti
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import Test.Hspec
+import qualified TransportSpec
 
 main :: IO ()
 main = hspec $ do
+  TransportSpec.spec
+
   describe "frontend messages" $ do
     it "encodes Sync" $
       encodes @Sync @'SyncType Sync "S\0\0\0\4"

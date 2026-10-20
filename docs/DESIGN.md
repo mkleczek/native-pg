@@ -269,11 +269,20 @@ any -> Broken | Closed
   byte strings.
 - A `Link` supplies a connection's reads and writes, and its `Channel` is
   made from code specialized to that link. Both require exclusive access
-  to the connection: reads, writes, flushing and closing must not overlap,
-  including reads through the channel's `InputSource`. A read may also send
-  pending output. Ownership may pass to another thread between calls.
-  Session operations enforce exclusive access during query I/O; callers
-  using links or channels directly enforce it themselves.
+  to the connection: reads, writes, flushing, readiness waits and closing
+  must not overlap, including reads through the channel's `InputSource`.
+  A read may also send pending output. Ownership may pass to another thread
+  between calls. Session operations enforce exclusive access during query
+  I/O; callers using links or channels directly enforce it themselves.
+- A `Link` exposes `awaitReadable`, `awaitWritable` and
+  `awaitReadableOrWritable`, keeping its underlying connection private.
+  These interruptible waits suspend the calling thread without doing I/O.
+  The combined wait returns `Readable` or `Writable`, preferring input when
+  both events have been observed. It lets a channel send pending output
+  while waiting for responses, so neither peer has to finish sending before
+  reading. Socket event registrations are released even if waiting throws.
+  After waking, the channel retries the nonblocking operation: readiness
+  needn't mean progress, e.g. when only part of a TLS record has arrived.
 - native-pg-tls supplies a TLS `Link` through rustls-ffi. Its public API is
   just `tlsClient`, which a client gives native-pg as a `TlsClient`.
   TLS configuration construction, connection operations and FFI helpers

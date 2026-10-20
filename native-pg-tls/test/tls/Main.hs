@@ -7,7 +7,6 @@
 -- Each side has exclusive access to its own TLS connection.
 module Main (main) where
 
-import Control.Concurrent (threadWaitRead, threadWaitWrite)
 import Control.Concurrent.Async (concurrently)
 import Control.Exception (bracket, displayException, throwIO, try)
 import Control.Monad (unless, void)
@@ -24,7 +23,6 @@ import Foreign.Marshal.Array (withArray)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peek)
 import qualified Network.Socket as Socket
-import System.Posix.Types (Fd (..))
 import Test.Hspec
 
 main :: IO ()
@@ -83,7 +81,7 @@ sendAll tls pieces = do
   flushed <- flushReady tls
   let rest = dropBytes taken pieces
   unless (null rest && flushed) $ do
-    Socket.withFdSocket (linkSocket tls) (threadWaitWrite . Fd)
+    awaitWritable tls
     sendAll tls rest
   where
     dropBytes taken = \case
@@ -107,7 +105,7 @@ receiveExactly tls count = BS.concat . reverse <$> go 0 []
                 chunk <- BS.packCStringLen (castPtr buffer, received)
                 go (got + received) (chunk : chunks)
               Nothing -> do
-                Socket.withFdSocket (linkSocket tls) (threadWaitRead . Fd)
+                awaitReadable tls
                 go got chunks
 
 -- | The settings with the verification, and rustls's defaults otherwise.

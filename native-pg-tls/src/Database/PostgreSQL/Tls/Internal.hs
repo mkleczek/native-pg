@@ -4,9 +4,9 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The private TLS 'Link' implementation, through rustls-ffi. Only the
--- handshake waits for the socket. Reads and writes take what's ready, so
--- the transport waits on the socket as it does without TLS.
+-- | The private TLS 'Link' implementation, through rustls-ffi. The handshake
+-- drives its own I/O. Reads and writes take what's ready;
+-- the transport waits through the 'Link' readiness operations.
 --
 -- Construction and handshaking require exclusive access to the socket and
 -- connection. Subsequent I/O follows the 'Link' exclusive-access contract.
@@ -29,7 +29,6 @@ module Database.PostgreSQL.Tls.Internal
   )
 where
 
-import Control.Concurrent (threadWaitRead, threadWaitWrite)
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
 import Control.Exception (IOException, bracket, catch, finally, onException, throwIO)
 import Control.Monad (unless, void, when)
@@ -51,7 +50,6 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (Storable, peek)
 import Network.Socket (Socket, close, withFdSocket)
 import System.IO.Unsafe (unsafePerformIO)
-import System.Posix.Types (Fd (..))
 
 -- | A version's number in TLS.
 version :: TlsVersion -> Word16
@@ -155,8 +153,12 @@ data TlsConnection = TlsConnection
   }
 
 instance Link TlsConnection where
-  linkSocket = tlsSocket
-  {-# INLINE linkSocket #-}
+  awaitReadable = awaitReadable . tlsSocket
+  {-# INLINE awaitReadable #-}
+  awaitWritable = awaitWritable . tlsSocket
+  {-# INLINE awaitWritable #-}
+  awaitReadableOrWritable = awaitReadableOrWritable . tlsSocket
+  {-# INLINE awaitReadableOrWritable #-}
   receiveReady = receiveTls
   {-# INLINE receiveReady #-}
   sendReady = sendTls
@@ -203,15 +205,13 @@ handshake tls = do
   flushed <- flushTls tls
   handshaking <- withConnection tls c_connection_is_handshaking
   if
-    | not flushed -> waitFor threadWaitWrite *> handshake tls
+    | not flushed -> awaitWritable tls *> handshake tls
     | handshaking == CBool 0 -> pure ()
     | otherwise ->
         readRecords tls >>= \case
           Read -> handshake tls
-          WouldBlock -> waitFor threadWaitRead *> handshake tls
+          WouldBlock -> awaitReadable tls *> handshake tls
           Ended -> throwIO (TlsError "the connection closed during the handshake")
-  where
-    waitFor wait = withFdSocket (tlsSocket tls) (wait . Fd)
 
 -- | Reads what's ready into the buffer, up to its size, without waiting:
 -- 'Nothing' if nothing is, and 0 at the end of the stream.

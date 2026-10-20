@@ -14,6 +14,7 @@ module Database.PostgreSQL.Transport
 
     -- * Links
     Link (..),
+    Readiness (..),
     Channel (..),
     newChannel,
 
@@ -34,7 +35,7 @@ module Database.PostgreSQL.Transport
 where
 
 import Control.Concurrent (threadWaitRead, threadWaitReadSTM, threadWaitWrite, threadWaitWriteSTM)
-import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, throwIO, try)
+import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, throwIO, try)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -215,18 +216,31 @@ keepalivesInterval = SockOpt (-1) (-1)
 keepalivesCount = SockOpt (-1) (-1)
 #endif
 
--- | A stream of bytes to the server over a connected socket: the socket
--- itself, or TLS over it. Its operations don't wait: the connection waits on
--- the socket.
+-- | A stream of bytes to the server, such as a socket or TLS over it.
+-- Reading, sending and flushing take what's ready without waiting.
+-- Readiness waits suspend the calling thread until an operation can be
+-- retried; they don't read or write, and don't guarantee progress. For
+-- example, socket input may contain only part of a TLS record.
 --
 -- Callers must ensure exclusive access to each connection. Receiving,
--- sending, flushing and closing must not overlap, whether called on the
--- link directly or through any 'Channel' built from it. Ownership may pass
--- to another thread between calls. Different connections may be used
--- concurrently.
+-- sending, flushing, waiting and closing must not overlap, whether called
+-- on the link directly or through any 'Channel' built from it. Ownership
+-- may pass to another thread between calls. Different connections may be
+-- used concurrently.
 class Link link where
-  -- | The socket the link reads and writes.
-  linkSocket :: link -> Socket
+  -- | Waits until receiving can be retried after 'receiveReady' returns
+  -- 'Nothing'. The wait must be interruptible.
+  awaitReadable :: link -> IO ()
+
+  -- | Waits until sending or flushing can be retried after stalling.
+  -- The wait must be interruptible.
+  awaitWritable :: link -> IO ()
+
+  -- | Waits for either direction, so pending output can be sent while
+  -- waiting for input. If both readiness events have been observed,
+  -- prefers 'Readable'. The wait must be interruptible and release its
+  -- registrations when it returns or is interrupted.
+  awaitReadableOrWritable :: link -> IO Readiness
 
   -- | Reads what's ready into the buffer, up to its size, without waiting:
   -- 'Nothing' if nothing is, and 0 at the end of the stream.
@@ -240,15 +254,25 @@ class Link link where
   -- nothing is left.
   flushReady :: link -> IO Bool
 
-  -- | Closes the link and its socket.
+  -- | Closes the link and releases its underlying connection.
   closeLink :: link -> IO ()
 
   -- | The server's certificate, in DER, over TLS.
   linkServerCertificate :: link -> Maybe ByteString
 
+-- | Which operation to retry after waiting for either direction.
+data Readiness = Readable | Writable
+  deriving (Eq, Show)
+
 instance Link Socket where
-  linkSocket = id
-  {-# INLINE linkSocket #-}
+  awaitReadable sock = withFdSocket sock (threadWaitRead . Fd)
+  {-# INLINE awaitReadable #-}
+  awaitWritable sock = withFdSocket sock (threadWaitWrite . Fd)
+  {-# INLINE awaitWritable #-}
+  awaitReadableOrWritable sock = withFdSocket sock $ \fd ->
+    bracket (threadWaitReadSTM (Fd fd)) snd $ \(readable, _) ->
+      bracket (threadWaitWriteSTM (Fd fd)) snd $ \(writable, _) ->
+        atomically ((Readable <$ readable) `orElse` (Writable <$ writable))
   receiveReady = tryReceive
   {-# INLINE receiveReady #-}
   sendReady = trySend
@@ -371,10 +395,11 @@ linkInputSource link pending readSize =
           left <- readIORef pending
           flushed <- flushReady link
           case left of
-            Unsent [] | flushed -> withFdSocket (linkSocket link) (threadWaitRead . Fd)
-            _ -> do
-              readable <- awaitReadableOrWritable (linkSocket link)
-              unless readable $ writeIORef pending =<< sendSome link left
+            Unsent [] | flushed -> awaitReadable link
+            _ ->
+              awaitReadableOrWritable link >>= \case
+                Readable -> pure ()
+                Writable -> writeIORef pending =<< sendSome link left
           receive pointer size
 {-# INLINABLE linkInputSource #-}
 
@@ -389,7 +414,7 @@ data StreamLengthError = StreamLengthError
 
 instance Exception StreamLengthError
 
--- | Sends the output, waiting for room in the socket as needed.
+-- | Sends the output, waiting for the link to become writable as needed.
 sendOutput :: Link link => link -> Output -> IO ()
 sendOutput link output = go =<< unsent Nothing output
   where
@@ -397,9 +422,8 @@ sendOutput link output = go =<< unsent Nothing output
       sendSome link left >>= \case
         Unsent [] -> do
           flushed <- flushReady link
-          unless flushed (awaitWritable *> go (Unsent []))
-        rest -> awaitWritable *> go rest
-    awaitWritable = withFdSocket (linkSocket link) (threadWaitWrite . Fd)
+          unless flushed (awaitWritable link *> go (Unsent []))
+        rest -> awaitWritable link *> go rest
 {-# INLINABLE sendOutput #-}
 
 -- | What's left of an output to send. The server may answer the first
@@ -483,14 +507,6 @@ sendSome link (Unsent parts) = Unsent <$> go parts
         | otherwise -> BS.drop sent chunk : others
       [] -> []
 {-# INLINABLE sendSome #-}
-
--- | Waits until the socket has input, or room for output. True if it has
--- input.
-awaitReadableOrWritable :: Socket -> IO Bool
-awaitReadableOrWritable sock = withFdSocket sock $ \fd -> do
-  (readable, stopReadable) <- threadWaitReadSTM (Fd fd)
-  (writable, stopWritable) <- threadWaitWriteSTM (Fd fd)
-  atomically ((True <$ readable) `orElse` (False <$ writable)) `finally` (stopReadable *> stopWritable)
 
 -- | Reads what the socket has into the buffer, without waiting: 'Nothing' if
 -- it has nothing, and 0 at the end of the stream.

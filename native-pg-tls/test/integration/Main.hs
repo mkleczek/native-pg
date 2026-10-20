@@ -229,6 +229,9 @@ main = withCluster $ \socketPath port -> hspec $ do
       it "encrypts with sslmode=require, without verifying the server" $ do
         withConnection (tcp "sslmode=require") $ \(session, _, _) ->
           encrypted session `shouldReturn` Right ([[Just "t"]], "SELECT 1")
+      it "sends a large batch while reading its responses over TLS" $
+        withConnection (tcp "sslmode=require") $ \(session, _, _) ->
+          batchWhileReading session
       it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $ do
         withConnection (local "sslmode=require") $ \(session, _, _) ->
           encrypted session `shouldReturn` Right ([[Just "f"]], "SELECT 1")
@@ -420,12 +423,7 @@ main = withCluster $ \socketPath port -> hspec $ do
       slowly (Unprepared "SELECT length($1::text)" []) `shouldReturn` Just "57014"
       slowly (Prepared "slow_length") `shouldReturn` Just "57014"
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
-    it "sends a batch while reading its results, as the server answers before reading all of it" $ \session -> do
-      let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
-          large = collect (statement "SELECT repeat('x', 1000000)" [])
-          long = collect (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')])
-      outcome <- timeout 10000000 (runBatch session id ((\_ (rows, _) -> rows) <$> large <*> long))
-      fmap fst outcome `shouldBe` Just (Right [[Just "2000000"]])
+    it "sends a batch while reading its results, as the server answers before reading all of it" batchWhileReading
     it "closes a session broken while sending, without waiting for the server to read" $ \session -> do
       let slowly = batched id (statement "SELECT repeat('x', 1000000)" []) (\() _ -> threadDelay 60000000) ()
           long = batched id (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')]) (\() _ -> pure ()) ()
@@ -791,6 +789,16 @@ streamedLength source = go 0
     go !count = do
       chunk <- byteStreamNext source
       if BS.null chunk then pure count else go (count + BS.length chunk)
+
+-- | Both the first response and the remaining request exceed the socket
+-- buffers, so the client must wait for either direction to make progress.
+batchWhileReading :: Session 'Ready -> Expectation
+batchWhileReading session = do
+  let collect execution = batched id execution (\rows row -> (: rows) <$> columns row) []
+      large = collect (statement "SELECT repeat('x', 1000000)" [])
+      long = collect (statement "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')])
+  outcome <- timeout 10000000 (runBatch session id ((\_ (rows, _) -> rows) <$> large <*> long))
+  fmap fst outcome `shouldBe` Just (Right [[Just "2000000"]])
 
 statement :: ByteString -> [Maybe ByteString] -> Execution
 statement sql parameters = Execution (Unprepared sql []) [] (map (fmap ParameterBytes) parameters) []
