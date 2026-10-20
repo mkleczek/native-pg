@@ -56,7 +56,7 @@ module Database.PostgreSQL.Session
   )
 where
 
-import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, onException, throwIO, try)
+import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, mask, onException, throwIO, try)
 import Control.Monad (filterM, join, unless, when, (<=<))
 import Data.Bifunctor (first)
 import Data.Foldable (for_, toList)
@@ -324,13 +324,14 @@ data Connection = Connection
   }
 
 -- | Session handles can be copied, so the connection tracks at run time
--- whether an operation is in progress.
+-- whether an operation is in progress, or the session is no longer usable.
 data SessionState
   = Idle
   | Busy
   | -- | An operation failed with an exception, leaving the protocol state
     -- unknown.
     Broken
+  | Closed
 
 -- | A connection in a known phase.
 newtype Session (phase :: Phase) = Session Connection
@@ -454,8 +455,8 @@ data ConnectionError
   | -- | Authentication failed on the client's side: a password is needed but
     -- missing, or the server's SCRAM signature doesn't match.
     AuthenticationError String
-  | -- | The session is busy with another operation, or broke in an earlier
-    -- one.
+  | -- | The session is busy with another operation, broke in an earlier
+    -- one, or has been closed.
     SessionUnusable String
   | -- | A row or a column stream was used out of turn.
     RowMisuse String
@@ -641,21 +642,31 @@ requestTls sock = do
     Just other -> throwIO (TlsFailure ("received invalid response to SSL negotiation: " <> [toEnum (fromIntegral other)]))
     Nothing -> throwIO (TlsFailure "server closed the connection unexpectedly")
 
--- | Ends the session and closes its socket, in whatever state it is.
+-- | Ends an idle or broken session and closes its socket. The session is
+-- unusable from then on, even if closing throws. Further calls do nothing.
+-- Throws 'SessionUnusable' if an operation is still running; interrupt it
+-- and wait for it to finish before closing.
 close :: Session phase -> IO ()
-close session@(Session connection) = do
-  state <- readIORef (connectionState connection)
-  -- A broken session may have stopped in the middle of a message, and the
-  -- server may not be reading, so it isn't told to terminate.
-  ( case state of
-      Idle -> send @'TerminateType session Terminate `catch` \(_ :: IOException) -> pure ()
-      _ -> pure ()
-    )
-    `finally` channelClose (connectionChannel connection)
+close session@(Session connection) = mask $ \restore -> do
+  state <- atomicModifyIORef' (connectionState connection) $ \case
+    Busy -> (Busy, Busy)
+    previous -> (Closed, previous)
+  case state of
+    Closed -> pure ()
+    Busy -> throwIO (SessionUnusable "the session is busy with another operation")
+    _ ->
+      -- A broken session may have stopped in the middle of a message, and
+      -- the server may not be reading, so it isn't told to terminate.
+      restore
+        ( case state of
+            Idle -> send @'TerminateType session Terminate `catch` \(_ :: IOException) -> pure ()
+            _ -> pure ()
+        )
+        `finally` channelClose (connectionChannel connection)
 
--- | Whether the session can run an operation: none is running, and none
--- broke it. An operation that an exception interrupts leaves the session
--- broken, e.g. when its thread is killed.
+-- | Whether the session can run an operation: it hasn't been closed, none
+-- is running, and none broke it. An operation that an exception interrupts
+-- leaves the session broken, e.g. when its thread is killed.
 isUsable :: Session phase -> IO Bool
 isUsable (Session connection) = do
   state <- readIORef (connectionState connection)
@@ -1338,13 +1349,14 @@ runOn connection limit parse = do
 -- | Runs an operation on an idle session. The session is busy meanwhile, and
 -- broken if the operation fails with an exception.
 operation :: Session 'Ready -> IO a -> IO a
-operation (Session connection) action = do
+operation (Session connection) action = mask $ \restore -> do
   acquired <- atomicModifyIORef' (connectionState connection) $ \case
     Idle -> (Busy, Nothing)
     Busy -> (Busy, Just "the session is busy with another operation")
     Broken -> (Broken, Just "the session broke during an earlier operation")
+    Closed -> (Closed, Just "the session is closed")
   maybe (pure ()) (throwIO . SessionUnusable) acquired
-  result <- action `onException` writeIORef (connectionState connection) Broken
+  result <- restore action `onException` writeIORef (connectionState connection) Broken
   writeIORef (connectionState connection) Idle
   pure result
 

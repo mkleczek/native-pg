@@ -10,7 +10,7 @@ module Main (main) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Exception (ErrorCall (..), IOException, bracket, bracket_, displayException, finally, throwIO, try)
-import Control.Monad (forever, unless, void)
+import Control.Monad (forever, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
@@ -48,7 +48,7 @@ import Database.PostgreSQL.Session
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Tls (tlsClient)
-import Database.PostgreSQL.Transport (Address (..), StreamLengthError)
+import Database.PostgreSQL.Transport (Address (..), Channel (..), StreamLengthError, TlsClient (..))
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import qualified Network.Socket as Socket
@@ -100,6 +100,83 @@ main = withCluster $ \socketPath port -> hspec $ do
       let major = fmap fst . Char8.readInt =<< lookup "server_version" (serverParameters info)
       serverProtocolVersion info
         `shouldBe` (if maybe False (>= 18) major then protocolVersion3_2 else protocolVersion3_0)
+
+  describe "close" $ do
+    let encrypted =
+          (connectSettings (TcpAddress "127.0.0.1" port) "postgres")
+            { connectDatabase = Just "postgres",
+              connectSslMode = SslRequire,
+              connectTlsClient = Just tlsClient
+            }
+        closed = (== SessionUnusable "the session is closed")
+    for_ [("without TLS", settings "postgres" Nothing), ("with TLS", encrypted)] $ \(label, connecting) ->
+      describe label $ around (bracket (fst <$> connect connecting) close) $ do
+        it "marks the session unusable and rejects operations after closing" $ \session -> do
+          isUsable session `shouldReturn` True
+          close session
+          isUsable session `shouldReturn` False
+          query session "SELECT 1" [] `shouldThrow` closed
+          prepare session "closed" "SELECT 1" [] `shouldThrow` closed
+          closeStatement session "closed" `shouldThrow` closed
+          runBatch session id (pure ()) `shouldThrow` closed
+          awaitNotification session `shouldThrow` closed
+        it "can close repeatedly, including during bracket cleanup" $ \session -> do
+          close session
+          timeout 5000000 (close session *> close session) `shouldReturn` Just ()
+          isUsable session `shouldReturn` False
+        it "can close a broken session repeatedly" $ \session -> do
+          let interrupted () _ = throwIO (ErrorCall "interrupted")
+          execute session (statement "SELECT 1" []) interrupted () `shouldThrow` errorCall "interrupted"
+          isUsable session `shouldReturn` False
+          timeout 5000000 (close session *> close session) `shouldReturn` Just ()
+          query session "SELECT 1" [] `shouldThrow` closed
+        it "can close after an operation is interrupted asynchronously" $ \session -> do
+          timeout 100000 (awaitNotification session) `shouldReturn` Nothing
+          isUsable session `shouldReturn` False
+          timeout 5000000 (close session *> close session) `shouldReturn` Just ()
+          query session "SELECT 1" [] `shouldThrow` closed
+        it "rejects closing during an operation without disrupting it" $ \session -> do
+          let step () row = do
+                close session `shouldThrow` (== SessionUnusable "the session is busy with another operation")
+                void (columns row)
+          execute session (statement "SELECT 1" []) step () `shouldReturn` (Right ((), "SELECT 1"), TxIdle)
+          isUsable session `shouldReturn` True
+          query session "SELECT 2" [] `shouldReturn` (Right ([[Just "2"]], "SELECT 1"), TxIdle)
+
+    -- Observe cleanup through the public channel API, including failures
+    -- before and after the TLS connection is freed.
+    let withCloseHooks beforeSend afterClose check = do
+          closing <- newIORef False
+          closes <- newIORef (0 :: Int)
+          let client = TlsClient $ \tls serverName sock -> do
+                make <- startTlsChannel tlsClient tls serverName sock
+                pure $ \pendingOutput size ->
+                  let channel = make pendingOutput size
+                   in channel
+                        { channelSend = \output -> do
+                            ending <- readIORef closing
+                            when ending beforeSend
+                            channelSend channel output,
+                          channelClose =
+                            (modifyIORef closes (+ 1) *> channelClose channel)
+                              `finally` afterClose
+                        }
+          bracket (fst <$> connect (encrypted {connectTlsClient = Just client})) close $ \session -> do
+            writeIORef closing True
+            _ <- check session
+            isUsable session `shouldReturn` False
+            close session
+            query session "SELECT 1" [] `shouldThrow` closed
+          readIORef closes `shouldReturn` 1
+    it "closes the channel once when sending Terminate throws" $
+      withCloseHooks (throwIO (ErrorCall "terminate failed")) (pure ()) $ \session ->
+        close session `shouldThrow` errorCall "terminate failed"
+    it "does not retry channel cleanup if it throws" $
+      withCloseHooks (pure ()) (throwIO (ErrorCall "cleanup failed")) $ \session ->
+        close session `shouldThrow` errorCall "cleanup failed"
+    it "closes the channel once when sending Terminate is interrupted" $
+      withCloseHooks (threadDelay 10000000) (pure ()) $ \session ->
+        timeout 100000 (close session) `shouldReturn` Nothing
 
   describe "connection strings" $ do
     let directory = takeDirectory socketPath

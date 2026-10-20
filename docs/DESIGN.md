@@ -236,9 +236,17 @@ any -> Broken | Closed
   does. The cancelled statement fails in its own session with SQLSTATE
   57014, and that session stays usable.
 - Haskell can't stop a stale session handle from being reused, so the
-  connection also tracks at run time whether it's idle, busy or broken. An
-  operation on a busy or broken session fails. An operation that throws
-  leaves the session broken, because its protocol state is then unknown.
+  connection also tracks at run time whether it's idle, busy, broken or
+  closed. An operation on a busy, broken or closed session fails. An
+  operation that throws leaves the session broken, because its protocol
+  state is then unknown. State transitions are masked against asynchronous
+  exceptions, while the operation itself remains interruptible.
+- `close` marks an idle or broken session closed before ending the
+  connection. Repeated calls do nothing, including after a close that
+  throws, so the channel and TLS connection are closed only once. Closed
+  sessions report `isUsable = False` and reject operations with
+  `SessionUnusable`. Closing a busy session fails without changing its
+  state; interrupt the operation and wait for it to finish first.
 
 ### Socket I/O
 
