@@ -100,7 +100,6 @@ instance Link TestLink where
   awaitWritable = testWritable
   awaitReadableOrWritable = testEither
   closeLink _ = pure ()
-  linkServerCertificate _ = Nothing
 
 testLink :: TestLink
 testLink =

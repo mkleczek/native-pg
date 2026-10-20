@@ -20,6 +20,7 @@ module Database.PostgreSQL.Transport
 
     -- * TLS links
     TlsClient (..),
+    TlsChannel (..),
     TlsSettings (..),
     ServerVerification (..),
     RootCertificates (..),
@@ -257,9 +258,6 @@ class Link link where
   -- | Closes the link and releases its underlying connection.
   closeLink :: link -> IO ()
 
-  -- | The server's certificate, in DER, over TLS.
-  linkServerCertificate :: link -> Maybe ByteString
-
 -- | Which operation to retry after waiting for either direction.
 data Readiness = Readable | Writable
   deriving (Eq, Show)
@@ -281,15 +279,26 @@ instance Link Socket where
   {-# INLINE flushReady #-}
   closeLink = close
   {-# INLINE closeLink #-}
-  linkServerCertificate _ = Nothing
-  {-# INLINE linkServerCertificate #-}
 
 -- | Starts TLS over a connected socket, as a client of the named server, and
--- gives the channel over it, made as 'newChannel' makes one. A library apart,
--- native-pg-tls, has one, so that this one has no C. Throws 'TlsError' if
--- TLS fails.
+-- gives its channel builder and channel-binding data. A library apart,
+-- native-pg-tls, has one, so that this one has no C. Throws 'TlsError' if TLS
+-- fails.
 newtype TlsClient = TlsClient
-  { startTlsChannel :: TlsSettings -> HostName -> Socket -> IO (IORef Unsent -> Int -> Channel)
+  { startTlsChannel :: TlsSettings -> HostName -> Socket -> IO TlsChannel
+  }
+
+-- | The result of TLS setup. Authentication consumes the binding data;
+-- the link and channel only carry bytes.
+data TlsChannel = TlsChannel
+  { -- | Makes the channel as 'newChannel' does, once the session has allocated
+    -- its pending output.
+    tlsChannel :: IORef Unsent -> Int -> Channel,
+    -- | The @tls-server-end-point@ binding: the hash of the server's
+    -- certificate, or why it couldn't be computed. 'Nothing' means binding
+    -- is unavailable. A 'Left' is reported only if authentication selects
+    -- SCRAM-PLUS; it mustn't prevent TLS use without channel binding.
+    tlsServerEndPoint :: Maybe (Either String ByteString)
   }
 
 -- | How a TLS link is configured.
@@ -359,9 +368,7 @@ data Channel = Channel
     channelSendSome :: Unsent -> IO Unsent,
     -- | Sends the output, waiting for room as needed.
     channelSend :: Output -> IO (),
-    channelClose :: IO (),
-    -- | The server's certificate, in DER, over TLS.
-    channelServerCertificate :: Maybe ByteString
+    channelClose :: IO ()
   }
 
 -- | The channel over a link, given where the output that waits to be sent is
@@ -372,8 +379,7 @@ newChannel link pending readSize =
     { channelInput = linkInputSource link pending readSize,
       channelSendSome = sendSome link,
       channelSend = sendOutput link,
-      channelClose = closeLink link,
-      channelServerCertificate = linkServerCertificate link
+      channelClose = closeLink link
     }
 {-# INLINABLE newChannel #-}
 {-# SPECIALIZE newChannel :: Socket -> IORef Unsent -> Int -> Channel #-}

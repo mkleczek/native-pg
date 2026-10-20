@@ -37,7 +37,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import Data.Foldable (for_)
 import Data.Word (Word16, Word32, Word8)
-import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel)
+import Database.PostgreSQL.Authentication (serverEndPoint)
+import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString)
@@ -71,7 +72,21 @@ tlsClient = TlsClient $ \settings serverName sock -> do
     unless (protocol == "postgresql") $ do
       closeTls tls
       throwIO (TlsError "direct SSL connection was established without ALPN protocol negotiation extension")
-  pure (newChannel tls)
+  binding <- channelBinding tls
+  pure (TlsChannel (newChannel tls) binding)
+
+-- | Supplies authentication with tls-server-end-point data. An unsupported
+-- certificate hash is kept as an error for authentication to report only
+-- if it selects channel binding.
+channelBinding :: TlsConnection -> IO (Maybe (Either String ByteString))
+channelBinding tls = withConnection tls $ \rustls -> do
+  peer <- c_connection_get_peer_certificate rustls 0
+  if unConstPtr peer == nullPtr
+    then pure Nothing
+    else alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
+      check "could not read the server's certificate" =<< c_certificate_get_der peer (castPtr bytes) len
+      certificate <- BS.packCStringLen =<< ((,) . castPtr <$> peek bytes <*> (fromIntegral <$> peek len))
+      pure (Just (serverEndPoint certificate))
 
 -- | A configuration for TLS connections, which any number of them share.
 newtype TlsConfig = TlsConfig (ForeignPtr ClientConfig)
@@ -147,9 +162,7 @@ systemVerifierMade = unsafePerformIO (newMVar Nothing)
 data TlsConnection = TlsConnection
   { -- | The socket it reads and writes.
     tlsSocket :: Socket,
-    tlsConnection :: ForeignPtr RustlsConnection,
-    -- | The server's certificate, in DER, once the handshake is done.
-    tlsServerCertificate :: Maybe ByteString
+    tlsConnection :: ForeignPtr RustlsConnection
   }
 
 instance Link TlsConnection where
@@ -167,8 +180,6 @@ instance Link TlsConnection where
   {-# INLINE flushReady #-}
   closeLink = closeTls
   {-# INLINE closeLink #-}
-  linkServerCertificate = tlsServerCertificate
-  {-# INLINE linkServerCertificate #-}
 
 -- | Starts TLS over the socket, as a client of the named server, and waits
 -- for the handshake to finish. The name is a host name, which the server's
@@ -181,14 +192,7 @@ startTls (TlsConfig config) serverName sock = do
       built ("invalid server name " <> show serverName) (c_client_connection_new (ConstPtr configPointer) name)
   tls <- newTlsConnection sock connection
   handshake tls
-  certificate <- withConnection tls $ \rustls -> do
-    peer <- c_connection_get_peer_certificate rustls 0
-    if unConstPtr peer == nullPtr
-      then pure Nothing
-      else alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
-        check "could not read the server's certificate" =<< c_certificate_get_der peer (castPtr bytes) len
-        fmap Just . BS.packCStringLen =<< ((,) . castPtr <$> peek bytes <*> (fromIntegral <$> peek len))
-  pure tls {tlsServerCertificate = certificate}
+  pure tls
 
 -- | Takes over a connection rustls made, to read and write it over the
 -- socket. It's freed when it's closed, or when it's no longer used.
@@ -197,7 +201,7 @@ newTlsConnection sock connection = do
   -- Records wait in the connection until the socket takes them, up to this
   -- many bytes.
   c_connection_set_buffer_limit connection 65536
-  (\rustls -> TlsConnection sock rustls Nothing) <$> newForeignPtr p_connection_free connection
+  TlsConnection sock <$> newForeignPtr p_connection_free connection
 
 -- | Sends and receives the handshake's messages until it's done.
 handshake :: TlsConnection -> IO ()

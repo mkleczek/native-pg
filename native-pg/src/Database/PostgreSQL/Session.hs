@@ -86,7 +86,6 @@ import Database.PostgreSQL.Authentication
     scramMechanism,
     scramPlusMechanism,
     scramVerifyServerFinal,
-    serverEndPoint,
   )
 import Database.PostgreSQL.Protocol.Codec
   ( Alternatives (..),
@@ -116,6 +115,7 @@ import Database.PostgreSQL.Transport
     RootCertificates (..),
     ServerVerification (..),
     TcpOptions,
+    TlsChannel (..),
     TlsClient (..),
     TlsError,
     TlsSettings (..),
@@ -488,7 +488,7 @@ connect settings = withChannel settings start
   where
     -- Given how to make the channel, once there's somewhere for its unsent
     -- output.
-    start channel = do
+    start channel binding = do
       buffer <- newIORef emptyInputBuffer
       pending <- newIORef =<< unsent Nothing mempty
       output <- newOutputBuffer outputBufferSize
@@ -496,13 +496,13 @@ connect settings = withChannel settings start
       notifications <- newIORef []
       let session = Session (Connection (channel pending (connectReadSize settings)) buffer pending output state notifications)
       send @'StartupMessageType session (startupMessage settings)
-      (version, initializing) <- authenticate settings (connectProtocolVersion settings) session
+      (version, initializing) <- authenticate settings binding (connectProtocolVersion settings) session
       initialize version initializing
 
 -- | Connects a socket to the server, starts TLS over it as the settings ask,
--- and runs the action with how to make the channel over it. The socket is
--- closed if the action fails.
-withChannel :: ConnectSettings -> ((IORef Unsent -> Int -> Channel) -> IO a) -> IO a
+-- and runs the action with its channel builder and optional channel-binding
+-- result. The socket is closed if the action fails.
+withChannel :: ConnectSettings -> ((IORef Unsent -> Int -> Channel) -> Maybe (Either String ByteString) -> IO a) -> IO a
 withChannel settings use = case (connectSslMode settings, connectAddress settings, connectTlsClient settings) of
   (SslDisable, _, _) -> attempt Nothing
   (_, UnixAddress _, _) -> attempt Nothing
@@ -545,13 +545,13 @@ withChannel settings use = case (connectSslMode settings, connectAddress setting
             case accepted of
               False
                 | required -> throwIO (TlsFailure "server does not support SSL, but SSL was required")
-                | otherwise -> use (newChannel sock)
+                | otherwise -> use (newChannel sock) Nothing
               True -> do
                 let started = do
                       certificate <- clientCertificate
                       lists <- revocationLists
-                      use
-                        =<< startTlsChannel
+                      opened <-
+                        startTlsChannel
                           client
                           ( TlsSettings
                               verification
@@ -564,8 +564,9 @@ withChannel settings use = case (connectSslMode settings, connectAddress setting
                           (fromMaybe host (connectServerName settings))
                           sock
                           `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
+                      use (tlsChannel opened) (tlsServerEndPoint opened)
                 if required then started else started `catch` (throwIO . FailedWithTls)
-          _ -> use (newChannel sock)
+          _ -> use (newChannel sock) Nothing
     -- The client certificate, if its file exists, with its private key,
     -- which has to exist and be readable only by its owner, as with libpq.
     clientCertificate = case connectSslCertificate settings of
@@ -690,8 +691,8 @@ data AuthenticationRequest
   | UnsupportedMethodRequested String
   | ProtocolVersionNegotiated ProtocolVersion
 
-authenticate :: ConnectSettings -> ProtocolVersion -> Session 'Authentication -> IO (ProtocolVersion, Session 'Initialization)
-authenticate settings version session = do
+authenticate :: ConnectSettings -> Maybe (Either String ByteString) -> ProtocolVersion -> Session 'Authentication -> IO (ProtocolVersion, Session 'Initialization)
+authenticate settings bindingData version session = do
   request <-
     pull session $
       (\AuthenticationOk -> Reply Authenticated)
@@ -707,20 +708,20 @@ authenticate settings version session = do
     Authenticated
       | required -> throwIO (AuthenticationError "channel binding required, but server authenticated client without channel binding")
       | otherwise -> pure (version, continueIn session)
-    ProtocolVersionNegotiated negotiated -> authenticate settings negotiated session
+    ProtocolVersionNegotiated negotiated -> authenticate settings bindingData negotiated session
     SaslRequested mechanisms
-      | Just certificate <- channelServerCertificate channel,
+      | Just binding <- bindingData,
         connectChannelBinding settings /= ChannelBindingDisable,
         scramPlusMechanism `elem` mechanisms -> do
           password <- requirePassword
-          endPoint <- either (throwIO . AuthenticationError) pure (serverEndPoint certificate)
+          endPoint <- either (throwIO . AuthenticationError) pure binding
           (version,) <$> authenticateScram scramPlusMechanism (BoundToServerEndPoint endPoint) password session
       | required ->
           throwIO (AuthenticationError "channel binding is required, but server did not offer an authentication method that supports channel binding")
       | scramMechanism `elem` mechanisms -> do
           password <- requirePassword
           let binding
-                | isJust (channelServerCertificate channel) && connectChannelBinding settings /= ChannelBindingDisable = ChannelBindingUnused
+                | isJust bindingData && connectChannelBinding settings /= ChannelBindingDisable = ChannelBindingUnused
                 | otherwise = WithoutChannelBinding
           (version,) <$> authenticateScram scramMechanism binding password session
       | otherwise -> throwIO (UnsupportedAuthentication ("SASL with " <> show mechanisms))
@@ -735,8 +736,6 @@ authenticate settings version session = do
       (version,) <$> awaitAuthenticationOk (continueIn session)
     UnsupportedMethodRequested method -> throwIO (UnsupportedAuthentication method)
   where
-    Session connection = session
-    channel = connectionChannel connection
     required = connectChannelBinding settings == ChannelBindingRequire
     requirePassword =
       maybe (throwIO (AuthenticationError "the server asks for a password, but none is set")) pure (connectPassword settings)
@@ -924,7 +923,7 @@ awaitNotification session@(Session connection) = operation session $ do
 -- comes too late does nothing.
 cancel :: ConnectSettings -> BackendKey ByteString -> IO ()
 cancel settings key =
-  withChannel settings $ \opened -> do
+  withChannel settings $ \opened _ -> do
     pending <- newIORef =<< unsent Nothing mempty
     let channel = opened pending 64
     ( do

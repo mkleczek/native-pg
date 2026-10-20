@@ -287,6 +287,15 @@ any -> Broken | Closed
   just `tlsClient`, which a client gives native-pg as a `TlsClient`.
   TLS configuration construction, connection operations and FFI helpers
   stay in a private implementation module. This keeps native-pg free of C.
+- TLS setup returns a `TlsChannel`: a channel builder and optional
+  `tls-server-end-point` binding data. The TLS client derives this data from
+  the server's certificate; authentication consumes the hash without
+  receiving the certificate. `Link` and `Channel` contain only I/O,
+  readiness and closing operations, with no authentication metadata.
+  An unavailable binding and a failure to compute one are distinct.
+  The latter becomes an authentication error only if SCRAM-PLUS is selected,
+  so other authentication methods, disabled channel binding and cancellation
+  don't fail because of an unsupported certificate hash.
 - Dependencies: `network`, plus `crypton` for SCRAM and MD5. PostgREST
   already trusts `crypton` for verifying JWT signatures, through `jose-jwt`.
   Its hashing and PBKDF2 are C code. All of the library's cryptography is in

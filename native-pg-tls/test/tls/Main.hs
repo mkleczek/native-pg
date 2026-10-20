@@ -16,7 +16,7 @@ import qualified Data.ByteString.Unsafe as BS
 import Data.List (isInfixOf)
 import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Tls.Internal
-import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsError (..), TlsSettings (..))
+import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..))
 import Foreign.C.Types (CSize (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (withArray)
@@ -47,6 +47,21 @@ main = hspec $ do
       withServer "server-other-name" $ \sock server -> do
         config <- newTlsConfig (settings (VerifyFull (RootCertificateFile (certificate "ca.crt"))))
         refusal config sock server `shouldReturn` "SSL error: invalid peer certificate: NotValidForName"
+
+  describe "TLS setup" $
+    it "supplies the server-end-point hash separately from the channel" $
+      withServer "server" $ \sock server -> do
+        (opened, ()) <-
+          concurrently
+            (startTlsChannel tlsClient (settings (VerifyFull (RootCertificateFile (certificate "ca.crt")))) "localhost" sock)
+            (handshake server)
+        let expected = BS.pack
+              [ 0xff, 0xc8, 0xc8, 0xc2, 0x06, 0xfe, 0xe8, 0x34,
+                0xbd, 0xe2, 0x7d, 0x21, 0x19, 0x94, 0xf9, 0xa8,
+                0xb5, 0xbc, 0x44, 0x9c, 0x0e, 0xcd, 0xdb, 0x35,
+                0xdf, 0x38, 0x75, 0x72, 0xb0, 0x29, 0x51, 0x88
+              ]
+        tlsServerEndPoint opened `shouldBe` Just (Right expected)
 
   describe "a connection" $ do
     it "carries more bytes both ways than the sockets hold" $

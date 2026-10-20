@@ -48,7 +48,7 @@ import Database.PostgreSQL.Session
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Tls (tlsClient)
-import Database.PostgreSQL.Transport (Address (..), Channel (..), StreamLengthError, TlsClient (..))
+import Database.PostgreSQL.Transport (Address (..), Channel (..), StreamLengthError, TlsChannel (..), TlsClient (..))
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import qualified Network.Socket as Socket
@@ -149,18 +149,20 @@ main = withCluster $ \socketPath port -> hspec $ do
           closing <- newIORef False
           closes <- newIORef (0 :: Int)
           let client = TlsClient $ \tls serverName sock -> do
-                make <- startTlsChannel tlsClient tls serverName sock
-                pure $ \pendingOutput size ->
-                  let channel = make pendingOutput size
-                   in channel
-                        { channelSend = \output -> do
-                            ending <- readIORef closing
-                            when ending beforeSend
-                            channelSend channel output,
-                          channelClose =
-                            (modifyIORef closes (+ 1) *> channelClose channel)
-                              `finally` afterClose
-                        }
+                opened <- startTlsChannel tlsClient tls serverName sock
+                pure opened
+                  { tlsChannel = \pendingOutput size ->
+                      let channel = tlsChannel opened pendingOutput size
+                       in channel
+                            { channelSend = \output -> do
+                                ending <- readIORef closing
+                                when ending beforeSend
+                                channelSend channel output,
+                              channelClose =
+                                (modifyIORef closes (+ 1) *> channelClose channel)
+                                  `finally` afterClose
+                            }
+                  }
           bracket (fst <$> connect (encrypted {connectTlsClient = Just client})) close $ \session -> do
             writeIORef closing True
             _ <- check session
@@ -177,6 +179,46 @@ main = withCluster $ \socketPath port -> hspec $ do
     it "closes the channel once when sending Terminate is interrupted" $
       withCloseHooks (threadDelay 10000000) (pure ()) $ \session ->
         timeout 100000 (close session) `shouldReturn` Nothing
+
+  describe "channel-binding data from TLS setup" $ do
+    let suppliedBinding supplied mode user =
+          (connectSettings (TcpAddress "127.0.0.1" port) user)
+            { connectDatabase = Just "postgres",
+              connectPassword = Just "scram secret",
+              connectSslMode = SslRequire,
+              connectChannelBinding = mode,
+              connectTlsClient = Just (TlsClient $ \tls serverName sock -> do
+                opened <- startTlsChannel tlsClient tls serverName sock
+                pure opened {tlsServerEndPoint = supplied})
+            }
+        withBinding supplied mode user =
+          bracket (fst <$> connect (suppliedBinding supplied mode user)) close
+        bindingFailure = Just (Left "unsupported certificate hash")
+    it "uses the supplied binding bytes in SCRAM-PLUS" $
+      connectAndClose (suppliedBinding (Just (Right "wrong binding")) ChannelBindingRequire "native_pg_scram")
+        `shouldThrow` rejectedWith "28000"
+    for_ [("preferred", ChannelBindingPrefer), ("required", ChannelBindingRequire)] $ \(label, mode) ->
+      it ("reports a binding error when SCRAM-PLUS is " <> label) $
+        connectAndClose (suppliedBinding bindingFailure mode "native_pg_scram")
+          `shouldThrow` (== AuthenticationError "unsupported certificate hash")
+    it "ignores a binding error when channel binding is disabled" $
+      withBinding bindingFailure ChannelBindingDisable "native_pg_scram" $ \session ->
+        query session "SELECT current_user" []
+          `shouldReturn` (Right ([[Just "native_pg_scram"]], "SELECT 1"), TxIdle)
+    it "does not require binding data for non-SCRAM authentication" $
+      withBinding bindingFailure ChannelBindingPrefer "postgres" $ \session ->
+        query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
+    it "allows unbound SCRAM when binding is unavailable and optional" $
+      withBinding Nothing ChannelBindingPrefer "native_pg_scram" $ \session ->
+        query session "SELECT current_user" []
+          `shouldReturn` (Right ([[Just "native_pg_scram"]], "SELECT 1"), TxIdle)
+    it "rejects required binding when the TLS client supplies none" $
+      connectAndClose (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram")
+        `shouldThrow` (== AuthenticationError "channel binding is required, but server did not offer an authentication method that supports channel binding")
+    it "ignores binding errors on a cancellation connection" $
+      withSessionInfo $ \_ info -> do
+        Just key <- pure (serverBackendKey info)
+        cancel (suppliedBinding bindingFailure ChannelBindingRequire "postgres") key
 
   describe "connection strings" $ do
     let directory = takeDirectory socketPath
