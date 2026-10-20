@@ -266,9 +266,10 @@ any -> Broken | Closed
   pending output. Ownership may pass to another thread between calls.
   Session operations enforce exclusive access during query I/O; callers
   using links or channels directly enforce it themselves.
-- The link over TLS comes from a library apart, native-pg-tls, through
-  rustls-ffi, which a client gives native-pg as a `TlsClient`, so that this
-  library has no C (step 8 of the integration plan).
+- native-pg-tls supplies a TLS `Link` through rustls-ffi. Its public API is
+  just `tlsClient`, which a client gives native-pg as a `TlsClient`.
+  TLS configuration construction, connection operations and FFI helpers
+  stay in a private implementation module. This keeps native-pg free of C.
 - Dependencies: `network`, plus `crypton` for SCRAM and MD5. PostgREST
   already trusts `crypton` for verifying JWT signatures, through `jose-jwt`.
   Its hashing and PBKDF2 are C code. All of the library's cryptography is in

@@ -16,8 +16,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import Data.List (isInfixOf)
 import Data.Word (Word32, Word8)
-import Database.PostgreSQL.Tls
-import Database.PostgreSQL.Transport (RootCertificates (..), ServerVerification (..), TlsError (..), TlsSettings (..))
+import Database.PostgreSQL.Tls.Internal
+import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsError (..), TlsSettings (..))
 import Foreign.C.Types (CSize (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (withArray)
@@ -68,7 +68,7 @@ main = hspec $ do
       withServer "server" $ \sock server -> do
         config <- newTlsConfig (settings (VerifyFull (RootCertificateFile (certificate "ca.crt"))))
         (client, ()) <- concurrently (startTls config "localhost" sock) (handshake server)
-        closeTls client
+        closeLink client
         receiveExactly server 1 `shouldReturn` BS.empty
 
   describe "a configuration" $
@@ -79,11 +79,11 @@ main = hspec $ do
 -- | Sends the pieces, waiting for room in the socket as needed.
 sendAll :: TlsConnection -> [ByteString] -> IO ()
 sendAll tls pieces = do
-  taken <- sendTls tls pieces
-  flushed <- flushTls tls
+  taken <- sendReady tls pieces
+  flushed <- flushReady tls
   let rest = dropBytes taken pieces
   unless (null rest && flushed) $ do
-    Socket.withFdSocket (tlsSocket tls) (threadWaitWrite . Fd)
+    Socket.withFdSocket (linkSocket tls) (threadWaitWrite . Fd)
     sendAll tls rest
   where
     dropBytes taken = \case
@@ -101,13 +101,13 @@ receiveExactly tls count = BS.concat . reverse <$> go 0 []
       | got >= count = pure chunks
       | otherwise =
           allocaBytes 16384 $ \buffer ->
-            receiveTls tls buffer 16384 >>= \case
+            receiveReady tls buffer 16384 >>= \case
               Just 0 -> pure chunks
               Just received -> do
                 chunk <- BS.packCStringLen (castPtr buffer, received)
                 go (got + received) (chunk : chunks)
               Nothing -> do
-                Socket.withFdSocket (tlsSocket tls) (threadWaitRead . Fd)
+                Socket.withFdSocket (linkSocket tls) (threadWaitRead . Fd)
                 go got chunks
 
 -- | The settings with the verification, and rustls's defaults otherwise.
