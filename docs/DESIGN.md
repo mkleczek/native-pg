@@ -287,6 +287,13 @@ any -> Broken | Closed
   just `tlsClient`, which a client gives native-pg as a `TlsClient`.
   TLS configuration construction, connection operations and FFI helpers
   stay in a private implementation module. This keeps native-pg free of C.
+- A private TLS configuration is tied to one server name. rustls-ffi 0.15
+  borrows that name for both the connection and its configuration's session
+  cache, so a temporary `withCString` allocation is insufficient even after
+  handshaking. The configuration owns one NUL-terminated, GHC-managed pinned
+  buffer. Both configuration and connection finalizers keep it alive through
+  native teardown; either owner can outlive the other. This adds setup-time
+  storage, with no copying or synchronization on the I/O path.
 - TLS setup returns a `TlsChannel`: a channel builder and optional
   `tls-server-end-point` binding data. The TLS client derives this data from
   the server's certificate; authentication consumes the hash without

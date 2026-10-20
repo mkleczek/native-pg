@@ -30,7 +30,7 @@ module Database.PostgreSQL.Tls.Internal
 where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
-import Control.Exception (IOException, bracket, catch, finally, onException, throwIO)
+import Control.Exception (IOException, bracket, catch, finally, mask, mask_, onException, throwIO)
 import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -41,14 +41,15 @@ import Database.PostgreSQL.Authentication (serverEndPoint)
 import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
-import Foreign.C.String (CString, peekCStringLen, withCString)
+import Foreign.C.String (CString, peekCStringLen, withCString, withCStringLen)
 import Foreign.C.Types (CBool (..), CChar, CInt (..), CSize (..), CUInt (..))
-import Foreign.ForeignPtr (FinalizerPtr, ForeignPtr, finalizeForeignPtr, newForeignPtr, withForeignPtr)
+import qualified Foreign.Concurrent as Foreign
+import Foreign.ForeignPtr (ForeignPtr, finalizeForeignPtr, mallocForeignPtrBytes, withForeignPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (withArrayLen)
-import Foreign.Marshal.Utils (fromBool, with)
+import Foreign.Marshal.Utils (copyBytes, fromBool, with)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Foreign.Storable (Storable, peek)
+import Foreign.Storable (Storable, peek, pokeByteOff)
 import Network.Socket (Socket, close, withFdSocket)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -62,8 +63,8 @@ version = \case
 -- time, so that changed certificate files count, as with libpq.
 tlsClient :: TlsClient
 tlsClient = TlsClient $ \settings serverName sock -> do
-  config <- newTlsConfig settings
-  tls <- startTls config serverName sock
+  config <- newTlsConfig settings serverName
+  tls <- startTls config sock
   when (tlsAlpnRequired settings) $ do
     protocol <- withConnection tls $ \connection ->
       alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
@@ -88,13 +89,16 @@ channelBinding tls = withConnection tls $ \rustls -> do
       certificate <- BS.packCStringLen =<< ((,) . castPtr <$> peek bytes <*> (fromIntegral <$> peek len))
       pure (Just (serverEndPoint certificate))
 
--- | A configuration for TLS connections, which any number of them share.
-newtype TlsConfig = TlsConfig (ForeignPtr ClientConfig)
+-- | A configuration for connections to one server. rustls-ffi 0.15 borrows
+-- the C server name, including in the configuration's session-cache keys.
+-- Own it until the configuration and every connection using it are freed.
+data TlsConfig = TlsConfig (ForeignPtr ClientConfig) (ForeignPtr CChar)
 
--- | A configuration with the settings. Its connections offer ALPN's
--- @postgresql@. Throws 'TlsError' if a certificate file can't be used.
-newTlsConfig :: TlsSettings -> IO TlsConfig
-newTlsConfig settings = do
+-- | A configuration for the named host or IP address, with the settings.
+-- Its connections offer ALPN's @postgresql@. Throws 'TlsError' if a
+-- certificate file can't be used.
+newTlsConfig :: TlsSettings -> String -> IO TlsConfig
+newTlsConfig settings serverName = do
   builder <-
     -- The default provider, rustls-ffi's from its build, made the process's.
     bracket (built "rustls has no crypto provider" c_crypto_provider_builder_new_from_default) c_crypto_provider_builder_free $ \providerBuilder ->
@@ -124,9 +128,23 @@ newTlsConfig settings = do
       check "could not configure ALPN" =<< c_offer_postgresql builder
     )
     `onException` c_client_config_builder_free builder
-  -- Building consumes the builder, whether it succeeds or not.
-  config <- built "could not create the SSL configuration" (c_client_config_builder_build builder)
-  TlsConfig <$> newForeignPtr p_client_config_free (unConstPtr config)
+  -- Building consumes the builder, whether it succeeds or not. Mask the
+  -- transfer of ownership to the finalizer.
+  mask_ $ do
+    config <- built "could not create the SSL configuration" (c_client_config_builder_build builder)
+    -- GHC owns this pinned storage; it has no freeing finalizer whose order
+    -- would have to be coordinated with the native config and connections.
+    name <-
+      ( withCStringLen serverName $ \(bytes, len) -> do
+          owned <- mallocForeignPtrBytes (len + 1)
+          withForeignPtr owned $ \pointer -> do
+            copyBytes pointer bytes len
+            pokeByteOff pointer len (0 :: CChar)
+          pure owned
+      )
+        `onException` c_client_config_free config
+    owned <- Foreign.newForeignPtr (unConstPtr config) (withForeignPtr name $ \_ -> c_client_config_free config)
+    pure (TlsConfig owned name)
   where
     withVerifier roots useVerifier =
       bracket c_root_cert_store_builder_new c_root_cert_store_builder_free $ \storeBuilder -> do
@@ -181,27 +199,31 @@ instance Link TlsConnection where
   closeLink = closeTls
   {-# INLINE closeLink #-}
 
--- | Starts TLS over the socket, as a client of the named server, and waits
--- for the handshake to finish. The name is a host name, which the server's
--- certificate is checked against, or an IP address. Throws 'TlsError' if the
--- handshake fails.
-startTls :: TlsConfig -> String -> Socket -> IO TlsConnection
-startTls (TlsConfig config) serverName sock = do
+-- | Starts TLS over the socket for the configuration's server, and waits
+-- for the handshake to finish. Throws 'TlsError' if the name is invalid or
+-- the handshake fails.
+startTls :: TlsConfig -> Socket -> IO TlsConnection
+startTls (TlsConfig config name) sock = mask $ \restore -> do
   connection <- withForeignPtr config $ \configPointer ->
-    withCString serverName $ \name ->
-      built ("invalid server name " <> show serverName) (c_client_connection_new (ConstPtr configPointer) name)
-  tls <- newTlsConnection sock connection
-  handshake tls
+    withForeignPtr name $ \namePointer ->
+      built "could not create the TLS client connection" (c_client_connection_new (ConstPtr configPointer) namePointer)
+  -- rustls retains the native config. Independently keep the name's storage
+  -- alive through connection teardown, even if the Haskell config is gone.
+  tls <- ownTlsConnection sock connection (withForeignPtr name $ \_ -> c_connection_free connection)
+  restore (handshake tls) `onException` finalizeForeignPtr (tlsConnection tls)
   pure tls
 
 -- | Takes over a connection rustls made, to read and write it over the
 -- socket. It's freed when it's closed, or when it's no longer used.
 newTlsConnection :: Socket -> Ptr RustlsConnection -> IO TlsConnection
-newTlsConnection sock connection = do
+newTlsConnection sock connection = ownTlsConnection sock connection (c_connection_free connection)
+
+ownTlsConnection :: Socket -> Ptr RustlsConnection -> IO () -> IO TlsConnection
+ownTlsConnection sock connection release = do
   -- Records wait in the connection until the socket takes them, up to this
   -- many bytes.
   c_connection_set_buffer_limit connection 65536
-  TlsConnection sock <$> newForeignPtr p_connection_free connection
+  TlsConnection sock <$> Foreign.newForeignPtr connection release
 
 -- | Sends and receives the handshake's messages until it's done.
 handshake :: TlsConnection -> IO ()
@@ -402,8 +424,8 @@ foreign import capi unsafe "rustls.h rustls_client_config_builder_set_certified_
 foreign import capi unsafe "rustls.h rustls_client_config_builder_build"
   c_client_config_builder_build :: Ptr ClientConfigBuilder -> Ptr () -> IO Word32
 
-foreign import capi unsafe "rustls.h &rustls_client_config_free"
-  p_client_config_free :: FinalizerPtr ClientConfig
+foreign import capi unsafe "rustls.h rustls_client_config_free"
+  c_client_config_free :: ConstPtr ClientConfig -> IO ()
 
 foreign import capi unsafe "rustls.h rustls_root_cert_store_builder_new"
   c_root_cert_store_builder_new :: IO (Ptr RootCertStoreBuilder)
@@ -471,8 +493,8 @@ foreign import capi unsafe "rustls.h rustls_connection_get_alpn_protocol"
 foreign import capi unsafe "rustls.h rustls_connection_send_close_notify"
   c_connection_send_close_notify :: Ptr RustlsConnection -> IO ()
 
-foreign import capi unsafe "rustls.h &rustls_connection_free"
-  p_connection_free :: FinalizerPtr RustlsConnection
+foreign import capi unsafe "rustls.h rustls_connection_free"
+  c_connection_free :: Ptr RustlsConnection -> IO ()
 
 foreign import capi unsafe "rustls.h rustls_error"
   c_error :: CUInt -> Ptr CChar -> CSize -> Ptr CSize -> IO ()
