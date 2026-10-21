@@ -441,6 +441,7 @@ newtype Unsent = Unsent [Part]
 data Part
   = PartBytes ByteString
   | PartStream ByteStream Int
+  | PartBorrowedStream ByteStream Int
 
 -- | Memory that outputs are written to, reused once what was written to it
 -- is sent.
@@ -464,6 +465,7 @@ unsent reused output = do
     part (Left copied) = PartBytes copied
     part (Right (UncopiedBytes value)) = PartBytes value
     part (Right (UncopiedStream source)) = PartStream source 0
+    part (Right (UncopiedBorrowedStream source)) = PartBorrowedStream source 0
 
 -- | Bytes gathered for one send, and how many pieces at most. A client's
 -- stream comes in chunks of up to 16 KiB from warp, and sending each on its
@@ -496,6 +498,19 @@ sendSome link (Unsent parts) = Unsent <$> go parts
       | otherwise = case remaining of
           [] -> pure (reverse pieces, [])
           PartBytes chunk : others -> gather (size + BS.length chunk) (chunk : pieces) others
+          -- The next pull may overwrite the current chunk, including any
+          -- suffix a partial send has left in front of this cursor.
+          PartBorrowedStream _ _ : _ | not (null pieces) -> pure (reverse pieces, remaining)
+          PartBorrowedStream source given : others -> do
+            chunk <- byteStreamNext source
+            let delivered = given + BS.length chunk
+            if
+              | BS.null chunk -> do
+                  unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
+                  gather size pieces others
+              | delivered > byteStreamLength source ->
+                  throwIO (StreamLengthError (byteStreamLength source) delivered)
+              | otherwise -> gather size pieces (PartBytes chunk : PartBorrowedStream source delivered : others)
           PartStream _ 0 : _ | not (null pieces) -> pure (reverse pieces, remaining)
           PartStream source given : others -> do
             chunk <- byteStreamNext source

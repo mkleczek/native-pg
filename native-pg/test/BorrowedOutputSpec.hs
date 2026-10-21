@@ -18,8 +18,7 @@ import Skeletest
 
 spec :: Spec
 spec = describe "borrowed parameter streams" $ do
-  xfail "the stream sender pulls again before accepting the borrowed chunk" $
-    it "keeps a reused source buffer unchanged across partial writes" $ do
+  it "keeps a reused source buffer unchanged across partial writes" $ do
       buffer <- newBuffer 32
       pulls <- newIORef (0 :: Int)
       received <- newIORef BS.empty

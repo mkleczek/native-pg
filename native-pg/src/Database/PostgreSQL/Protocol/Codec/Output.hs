@@ -17,6 +17,7 @@ module Database.PostgreSQL.Protocol.Codec.Output
     bytes,
     cstring,
     stream,
+    borrowedStream,
   )
 where
 
@@ -64,6 +65,7 @@ newtype Write = Write ((Ptr Word8 -> Uncopied -> IO ()) -> Ptr Word8 -> IO (Ptr 
 data Uncopied
   = UncopiedBytes ByteString
   | UncopiedStream ByteStream
+  | UncopiedBorrowedStream ByteStream
 
 instance Semigroup Output where
   Output leftLength leftCopied (Write left) <> Output rightLength rightCopied (Write right) =
@@ -99,6 +101,7 @@ outputByteString output = unsafeDupablePerformIO $ do
   where
     uncopiedBytes (UncopiedBytes value) = value
     uncopiedBytes (UncopiedStream _) = error "an output with streams has no byte string"
+    uncopiedBytes (UncopiedBorrowedStream _) = error "an output with streams has no byte string"
 
 -- | Each value's output, one after another. Unlike 'foldMap', it composes no
 -- output per value: their lengths are summed, and one loop writes them.
@@ -172,3 +175,8 @@ cstring value
 stream :: ByteStream -> Output
 stream source = Output (byteStreamLength source) 0 (Write (\uncopied pointer -> uncopied pointer (UncopiedStream source) $> pointer))
 {-# INLINE stream #-}
+
+-- | The source may overwrite a chunk on its next pull.
+borrowedStream :: ByteStream -> Output
+borrowedStream source = Output (byteStreamLength source) 0 (Write (\uncopied pointer -> uncopied pointer (UncopiedBorrowedStream source) $> pointer))
+{-# INLINE borrowedStream #-}

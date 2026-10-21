@@ -84,6 +84,7 @@ import Database.PostgreSQL.Protocol.Codec
   )
 import Database.PostgreSQL.Protocol.Codec.Output
   ( bytes,
+    borrowedStream,
     int32,
     outputs,
     stream,
@@ -431,7 +432,7 @@ instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
   serialize (Just (ParameterBytes value)) = int32 (lengthAsInt32 (BS.length value)) <> bytes value
   serialize (Just (ParameterChunks chunks)) = int32 (lengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
   serialize (Just (ParameterStream source)) = int32 (lengthAsInt32 (byteStreamLength source)) <> stream source
-  serialize (Just (ParameterBorrowedStream source)) = int32 (lengthAsInt32 (byteStreamLength source)) <> stream source
+  serialize (Just (ParameterBorrowedStream source)) = int32 (lengthAsInt32 (byteStreamLength source)) <> borrowedStream source
   {-# INLINE serialize #-}
 
 lengthAsInt32 :: Int -> Int32

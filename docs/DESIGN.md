@@ -474,3 +474,13 @@ WAI's continuation-passing `Application` type is for.
    transaction status tracking. (Done; transaction status came with step 3.)
 5. Cancel and `LISTEN`/`NOTIFY`. (Done.)
 6. PostgREST integration: see `INTEGRATION.md`.
+
+### Borrowed upload chunks
+
+`ParameterBorrowedStream` accepts a source whose current chunk remains valid
+until its next pull. The sender keeps a barrier after that chunk, so partial
+writes never trigger a pull that overwrites unsent bytes. It may still return
+pending output while reading PostgreSQL replies, avoiding a write-only wait
+that could deadlock a full-duplex exchange. The source and its storage loan
+must stay alive until the operation completes or its session is closed.
+Ordinary `ParameterStream` chunks retain their existing owned-value contract.
