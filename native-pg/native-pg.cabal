@@ -69,7 +69,8 @@ test-suite native-pg-spec
   default-language:   GHC2021
   type:               exitcode-stdio-1.0
   hs-source-dirs:     test
-  other-modules:      CoreSpec
+  other-modules:      BorrowedOutputSpec
+                      CoreSpec
                       TransportSpec
   main-is:            Main.hs
   ghc-options:        -Wall -threaded -F -pgmF=skeletest-preprocessor
