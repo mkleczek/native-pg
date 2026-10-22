@@ -33,14 +33,14 @@ spec socketPath port = describe "pooled connection setup" $ do
       closeSelected (connection, _, _) = PG.closeConnection connection
       encrypted connecting = connecting { PG.connectTlsClient = Just tlsClient }
 
-  xfail "pooled startup is pending" $ it "authenticates with tiny setup buffers while body storage is busy" $
+  it "authenticates with tiny setup buffers while body storage is busy" $
     withResources settings $ \resources -> Resources.withBuffers resources (positiveInt @2) $ \_ ->
       bracket (Streaming.connect resources (local "native_pg_scram" (Just "scram secret"))) (PG.closeConnection . fst) $ \(connection, info) -> do
         PG.isConnectionUsable connection `shouldReturn` True
         isJust (lookup "server_version" (PG.serverParameters info)) `shouldBe` True
         timeout 1000000 (Resources.withSetupBuffers resources (positiveInt @2) (pure . length)) `shouldReturn` Just 2
 
-  xfail "pooled startup cleanup is pending" $ it "returns the complete setup pair after authentication fails" $
+  it "returns the complete setup pair after authentication fails" $
     withResources settings $ \resources -> do
       result <- try @PG.ConnectionError (Streaming.connect resources (local "native_pg_scram" (Just "wrong")))
       case result of
@@ -80,7 +80,7 @@ spec socketPath port = describe "pooled connection setup" $ do
         Right connected -> closeSelected connected >> failTest "missing hosts connected"
       timeout 1000000 (Resources.withSetupBuffers resources (positiveInt @2) (pure . length)) `shouldReturn` Just 2
 
-  xfail "pooled startup cancellation is pending" $ it "returns setup storage when a silent startup is cancelled" $
+  it "returns setup storage when a silent startup is cancelled" $
     withResources settings $ \resources ->
       bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
         Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
