@@ -49,6 +49,19 @@ The library's runtime state is only:
 
 Everything else lives in types or belongs to the client.
 
+## Caller-owned buffers
+
+`Database.PostgreSQL.Buffer` identifies initialized, fixed-capacity storage.
+The client may allocate it itself and initialize it once before adding it
+to a pool. A loan gives one operation exclusive access; sharing a pool does
+not permit two connections to use the same storage concurrently. TLS can
+reuse initialized storage without clearing it before every read.
+
+Reusable parser storage requires a separate borrowed-chunk API. Existing
+byte-string results must keep their ownership semantics: they cannot become
+aliases of storage that the next read overwrites. Retained values are copied;
+borrowed values are consumed synchronously before the storage is reused.
+
 ## Principles
 
 1. **Type level first, through typeclass metaprogramming.** Computation over
