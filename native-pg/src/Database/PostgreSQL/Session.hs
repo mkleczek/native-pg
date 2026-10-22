@@ -15,6 +15,9 @@ module Database.PostgreSQL.Session
     Session,
     Context,
     Connection,
+    sessionFromContext,
+    executeWithContext,
+    isConnectionUsable,
 
     -- * Connecting
     ConnectSettings (..),
@@ -1308,3 +1311,13 @@ sendOutputs (Session connection) = channelSend (connectionChannel connection)
 -- | The session in the phase the protocol continues in.
 continueIn :: Session phase -> Session next
 continueIn (Session connection) = Session connection
+
+-- | Compatibility bridge for explicit operation contexts.
+sessionFromContext :: Context -> Session 'Ready
+sessionFromContext = Session . contextConnection
+
+executeWithContext :: Context -> Execution -> (acc -> Row -> IO acc) -> acc -> IO (Either ServerError (acc, ByteString), TransactionStatus)
+executeWithContext = execute . sessionFromContext
+
+isConnectionUsable :: Connection -> IO Bool
+isConnectionUsable connection = isUsable (Session connection)

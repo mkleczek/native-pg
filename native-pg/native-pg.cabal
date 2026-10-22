@@ -73,6 +73,7 @@ test-suite native-pg-spec
   other-modules:      BorrowedOutputSpec
                       BorrowingSpec
                       CoreSpec
+                      ContextSpec
                       FramingSpec
                       OutputBufferSpec
                       TransportSpec
