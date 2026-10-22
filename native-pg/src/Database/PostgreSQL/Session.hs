@@ -60,6 +60,9 @@ module Database.PostgreSQL.Session
     Row,
     columnBytes,
     columnStream,
+    columnStreamWithChunks,
+    columnChunks,
+    withColumnStream,
     decodeRow,
     decodeRowStreaming,
     decodeRowStreamingNullable,
@@ -1076,6 +1079,26 @@ columnStream row = do
               writeIORef (rowCursor row) current {cursorValueLeft = cursorValueLeft current - BS.length chunk}
               pure chunk
       }
+
+-- | Owned pulls and borrowed draining for the same column cursor.
+columnStreamWithChunks :: Row -> IO (ByteStream, (ByteString -> IO ()) -> IO ())
+columnStreamWithChunks row = do
+  stream <- columnStream row
+  let chunks use = do
+        chunk <- byteStreamNext stream
+        unless (BS.null chunk) (use chunk *> chunks use)
+  pure (stream, chunks)
+
+-- | Consumes the current column with synchronous borrowed callbacks.
+columnChunks :: Row -> (ByteString -> IO ()) -> IO ()
+columnChunks row use = columnStreamWithChunks row >>= \(_, chunks) -> chunks use
+
+-- | A field-only borrowed Source, with its declared length. Chunks expire
+-- on the next pull or callback return. Field EOF does not imply that the
+-- statement or transaction succeeded; the enclosing operation reads their
+-- trailing completion messages and may still report a server error.
+withColumnStream :: Row -> (ByteStream -> IO a) -> IO a
+withColumnStream row use = columnStream row >>= use
 
 -- | A row's columns, described by the Haskell types they decode to.
 class DecodeRow (columns :: [Type]) where
