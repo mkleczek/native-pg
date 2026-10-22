@@ -57,15 +57,23 @@ for the outbound TLS staging dimension of bounded-memory streaming.
 
 ## State
 
-The library's runtime state is only:
+A persistent `Connection` retains the transport channel, protocol usability
+state and owned notification metadata. It does not retain an operation's input
+cursor, pending output or output scratch allocation.
 
-- the read buffer: bytes read from the socket but not yet consumed;
-- the protocol state machine's position: phase, transaction status and the
-  responses still expected;
-- notifications that arrived during an operation, until the client takes
-  them with `awaitNotification`.
+An explicit `Context` binds that connection to its input cursor, output workspace
+and pending writes. The private supplied-buffer constructor claims the
+connection for its callback and expires the context before releasing storage.
+The owned compatibility `Session` carries its own context rather than installing
+request buffers into connection IORefs. Context-aware Session, Pipeline and
+Transaction entrypoints share the same state machine and concrete `Input` parser.
 
-Everything else lives in types or belongs to the client.
+A channel's input-source constructor receives the current context's pending
+writes explicitly. It can advance output while waiting for input without
+capturing another operation's output reference. Supplied input reads only the
+header needed to learn a protocol envelope, then batches refills up to that
+envelope's boundary. The following envelope remains in the transport when an
+operation completes; no request-byte leftovers are installed on the connection.
 
 ## Caller-owned buffers
 
@@ -79,6 +87,32 @@ Reusable parser storage requires a separate borrowed-chunk API. Existing
 byte-string results must keep their ownership semantics: they cannot become
 aliases of storage that the next read overwrites. Retained values are copied;
 borrowed values are consumed synchronously before the storage is reused.
+
+`bufferFromInitializedMemory` adapts shared initialized storage without clearing
+it on each loan. Input and output ranges must be disjoint, including descriptors
+whose `ForeignPtr`s point into the same allocation at different offsets.
+
+Borrowed field consumers are separate from materializers. `columnChunks` and
+`streamChunks` call synchronous sinks directly inside the input loan.
+`withColumnStream` gives a length-bearing field source: bytes remain borrowed
+until its next pull or scope exit. Pulls are exclusive, row advancement is blocked
+while the source owns the column, and teardown cancels and joins an unfinished
+pull before returning storage. Repeated cancellation cannot interrupt that join.
+Caught parser or borrowed-callback exceptions still invalidate the row, because
+input may already have compacted before the exception occurred.
+
+Explicit owned operations (`columnBytes`, decoded columns, and leading columns
+of a streaming decoder) assemble stable owned chunks across small input blocks.
+They may allocate the complete field size. PostgreSQL metadata C strings and
+remaining authentication payloads also assemble owned values across refills.
+The low-level `readInputExactly` primitive retains its contiguous-capacity bound.
+The body workspace budget therefore applies to borrowed transfer, not to values
+the application deliberately materializes or retains.
+
+Field EOF is not an execution or transaction success signal. Execution consumes
+trailing command completion and ready messages, and a transaction can still fail
+at `COMMIT`. A commit-safe response must finish the transaction before exposing
+its materialized body; borrowed field transfer alone cannot make that guarantee.
 
 ## Principles
 
