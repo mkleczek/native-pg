@@ -1,0 +1,36 @@
+cabal-version: 3.0
+name: streaming-io
+version: 0.1.0.0
+synopsis: Borrowed streams and bounded operation buffers
+license: BSD-3-Clause
+build-type: Simple
+extra-source-files: test/check-positive-int.sh
+                    test/compile/*.hs
+
+library
+  default-language: GHC2021
+  hs-source-dirs: src
+  ghc-options: -Wall
+  exposed-modules: Network.Streaming
+                   Network.Streaming.PositiveInt
+                   Network.Streaming.Resources
+                   Network.Streaming.Resources.Internal
+  other-modules: Network.Streaming.Internal.ListPrefix
+  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, stm >=2.5 && <2.6
+
+test-suite streaming-io-spec
+  type: exitcode-stdio-1.0
+  default-language: GHC2021
+  hs-source-dirs: test src
+  main-is: Main.hs
+  other-modules: ListPrefixSpec
+                 Network.Streaming.Internal.ListPrefix
+                 Network.Streaming
+                 Network.Streaming.PositiveInt
+                 Network.Streaming.Resources
+                 Network.Streaming.Resources.Internal
+                 PositiveIntSpec
+                 ResourcesSpec
+  ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
+  build-depends: base, bytestring, stm, streaming-io, skeletest >=0.4.2 && <0.5
