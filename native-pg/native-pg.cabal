@@ -20,11 +20,11 @@ common implementation
   hs-source-dirs:     src
   ghc-options:        -Wall
   other-modules:      Database.PostgreSQL.Internal.Authentication
-                      Database.PostgreSQL.Internal.Buffer
                       Database.PostgreSQL.Internal.Channel
                       Database.PostgreSQL.Internal.Context
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Exchange
+                      Database.PostgreSQL.Internal.Execution
                       Database.PostgreSQL.Internal.HostSelection
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
@@ -41,7 +41,7 @@ common implementation
                       Database.PostgreSQL.Internal.Protocol.Messages.Parse
                       Database.PostgreSQL.Internal.Protocol.Messages.Startup
                       Database.PostgreSQL.Internal.Protocol.Messages.Types
-                      Database.PostgreSQL.Internal.Result
+                      Database.PostgreSQL.Internal.Row
                       Database.PostgreSQL.Internal.Socket
                       Database.PostgreSQL.Internal.Socket.Link
                       Database.PostgreSQL.Internal.Some
@@ -73,15 +73,12 @@ library
                       Database.PostgreSQL.Decoding
                       Database.PostgreSQL.Diagnostics
                       Database.PostgreSQL.Encoders
-                      Database.PostgreSQL.Pipeline
                       Database.PostgreSQL.Session
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
-                      Database.PostgreSQL.Statement
                       Database.PostgreSQL.Streaming
                       Database.PostgreSQL.Streaming.Types
                       Database.PostgreSQL.Transaction
-                      Database.PostgreSQL.Transaction.Pull
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Transport.Link
                       Database.PostgreSQL.Types
@@ -95,15 +92,12 @@ test-suite native-pg-spec
                       Database.PostgreSQL.Decoding
                       Database.PostgreSQL.Diagnostics
                       Database.PostgreSQL.Encoders
-                      Database.PostgreSQL.Pipeline
                       Database.PostgreSQL.Session
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
-                      Database.PostgreSQL.Statement
                       Database.PostgreSQL.Streaming
                       Database.PostgreSQL.Streaming.Types
                       Database.PostgreSQL.Transaction
-                      Database.PostgreSQL.Transaction.Pull
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Transport.Link
                       Database.PostgreSQL.Types

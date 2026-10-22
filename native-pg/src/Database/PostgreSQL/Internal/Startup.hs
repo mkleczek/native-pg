@@ -5,7 +5,7 @@
 
 -- | Private socket negotiation, authentication and startup exchange.
 module Database.PostgreSQL.Internal.Startup
-  ( withChannel, startSession, connectWithBuffers,
+  ( withChannel, startSession, connectOwned, connectWithBuffers,
   ) where
 
 import Control.Exception (Exception (..), IOException, bracketOnError, catch, throwIO, try)
@@ -25,14 +25,14 @@ import qualified System.Posix.Files as Posix
 import qualified System.Posix.User as Posix
 #endif
 import Database.PostgreSQL.Session.Settings
-import Network.Streaming.Resources.Internal (Buffer)
+import Network.Streaming.Buffer (Buffer)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange
 import Database.PostgreSQL.Internal.Authentication
   ( ChannelBinding (..), md5Password, newScramNonce, scramClientFinal,
     scramClientFirst, scramMechanism, scramPlusMechanism, scramVerifyServerFinal,
   )
-import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), InputSource (..), Serializable (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
 import Database.PostgreSQL.Transport
   ( Address (..), newChannel, RootCertificates (..), ServerVerification (..),
@@ -44,6 +44,19 @@ import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Storable (peek)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
+
+-- | Connects, authenticates and waits until the server is ready for a query.
+-- Throws 'Database.PostgreSQL.Transport.ConnectError' when the socket doesn't
+-- connect, and 'ConnectionError' when the server rejects the connection.
+connectOwned :: ConnectSettings -> IO (Session 'Ready, ServerInfo)
+connectOwned settings = withChannel settings start
+  where
+    -- Given how to make the channel, once there's somewhere for its unsent
+    -- output.
+    start channel binding = do
+      connection <- newConnection channel (connectReadSize settings)
+      context <- newOwnedContext connection
+      startSession settings binding context
 
 -- | Startup/authentication using caller-supplied initialized workspace.
 -- Integration-only callers reserve separate setup capacity for this scope.
@@ -57,7 +70,7 @@ connectWithBuffers input output settings = withChannel settings $ \channel bindi
 startSession :: ConnectSettings -> Maybe (Either String ByteString) -> Context -> IO (Session 'Ready, ServerInfo)
 startSession settings binding context = do
   let session = Session context
-  send @'StartupMessageType session (startupMessage settings)
+  send session (startupMessage settings)
   (version, initializing) <- authenticate settings binding (connectProtocolVersion settings) session
   initialize version initializing
 
@@ -193,7 +206,7 @@ requestTls :: Socket -> IO Bool
 requestTls sock = do
   pending <- newIORef =<< unsent Nothing mempty
   let channel = newChannel sock
-  channelSend channel (serialize @SSLRequest @'SSLRequestType SSLRequest)
+  channelSend channel (serialize SSLRequest)
   answer <- allocaBytes 1 $ \byte -> do
     received <- readInputInto (channelInput channel pending 1) byte 1
     if received == 0 then pure Nothing else Just <$> peek byte
@@ -258,11 +271,11 @@ authenticate settings bindingData version session = do
     _ | required -> throwIO (AuthenticationError "channel binding required but not supported by server's authentication request")
     CleartextPasswordRequested -> do
       password <- requirePassword
-      send @'PasswordMessageType session (PasswordMessage password)
+      send session (PasswordMessage password)
       (version,) <$> awaitAuthenticationOk (continueIn session)
     Md5PasswordRequested salt -> do
       password <- requirePassword
-      send @'PasswordMessageType session (PasswordMessage (md5Password (connectUser settings) password salt))
+      send session (PasswordMessage (md5Password (connectUser settings) password salt))
       (version,) <$> awaitAuthenticationOk (continueIn session)
     UnsupportedMethodRequested method -> throwIO (UnsupportedAuthentication method)
   where
@@ -274,13 +287,13 @@ authenticate settings bindingData version session = do
 authenticateScram :: ByteString -> ChannelBinding -> ByteString -> Session 'Authentication -> IO (Session 'Initialization)
 authenticateScram mechanism binding password session = do
   (clientFirst, client) <- scramClientFirst binding "" <$> newScramNonce
-  send @'SASLInitialResponseType session (SASLInitialResponse mechanism (Just clientFirst))
+  send session (SASLInitialResponse mechanism (Just clientFirst))
   let continuing = continueIn session :: Session 'SaslContinue
   serverFirst <-
     pull continuing $
       (\(AuthenticationSASLContinue challenge) -> Reply challenge) :|: startupTail
   (clientFinal, serverSignature) <- either (throwIO . AuthenticationError) pure (scramClientFinal password client serverFirst)
-  send @'SASLResponseType continuing (SASLResponse clientFinal)
+  send continuing (SASLResponse clientFinal)
   let finishing = continueIn continuing :: Session 'SaslFinal
   serverFinal <-
     pull finishing $

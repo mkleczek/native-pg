@@ -39,9 +39,9 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Word (Word8, Word16, Word32)
-import Database.PostgreSQL.Internal.Buffer (newBuffer)
-import Network.Streaming.Resources.Internal (Buffer)
-import qualified Network.Streaming.Resources.Internal as Buffer
+import Network.Streaming.PositiveInt (mkPositiveInt)
+import Network.Streaming.Buffer (Buffer, newBuffer)
+import qualified Network.Streaming.Buffer as Buffer
 import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, moveBytes)
 import Foreign.Ptr (Ptr, plusPtr)
@@ -405,7 +405,8 @@ fill metadata source end count buffer
     reallocate = do
       let unconsumed = bufferEnd buffer - bufferStart buffer
           capacity = max (inputReadSize source) count
-      memory <- Buffer.bufferMemory <$> newBuffer capacity
+      storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
+      let memory = Buffer.bufferMemory storage
       unsafeWithForeignPtr memory $ \target ->
         unsafeWithForeignPtr (bufferMemory buffer) $ \origin ->
           copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
@@ -429,7 +430,7 @@ suppliedCapacity buffer = case bufferHome buffer of
 
 expandMetadata :: Int -> InputBuffer -> IO InputBuffer
 expandMetadata capacity buffer = do
-  storage <- newBuffer capacity
+  storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
   let count = bufferEnd buffer - bufferStart buffer
       home = case bufferHome buffer of
         Nothing -> Just (HomeBuffer (bufferMemory buffer) (bufferCapacity buffer))

@@ -16,10 +16,11 @@ import Data.Functor (($>))
 import Data.Maybe (fromMaybe)
 import Database.PostgreSQL.ConnectionString.Types
 import Database.PostgreSQL.Internal.Protocol.Codec (InputError (..))
-import Database.PostgreSQL.Session
-  ( Column (..), Execution (..), Phase (Ready), ProtocolVersion (..),
-    ServerError, Session, Statement (..), columnBytes, execute, nextColumn,
-  )
+import Database.PostgreSQL.Session (Session)
+import Database.PostgreSQL.Diagnostics (ServerError)
+import Database.PostgreSQL.Types (ProtocolVersion (..))
+import Database.PostgreSQL.Internal.Execution (Execution (..), Statement (..), execute)
+import Database.PostgreSQL.Internal.Row (Column (..), columnBytes, nextColumn)
 import Database.PostgreSQL.Session.Settings
 import System.Timeout (timeout)
 
@@ -85,7 +86,7 @@ connectFirstUsing open dispose value adjust string =
     version (ProtocolVersion major minor) = show major <> "." <> show minor
 
 -- | The first column of the first row a query returns, as text.
-queryValue :: Session 'Ready -> ByteString -> IO (Either ServerError ByteString)
+queryValue :: Session -> ByteString -> IO (Either ServerError ByteString)
 queryValue session query = do
   (result, _) <- execute session (Execution (Unprepared query []) [] [] []) firstValue Nothing
   pure (fromMaybe "" . fst <$> result)

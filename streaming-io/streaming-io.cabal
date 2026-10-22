@@ -14,7 +14,7 @@ library
   exposed-modules: Network.Streaming
                    Network.Streaming.PositiveInt
                    Network.Streaming.Resources
-                   Network.Streaming.Resources.Internal
+                   Network.Streaming.Buffer
   other-modules: Network.Streaming.Internal.ListPrefix
   build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, stm >=2.5 && <2.6
 
@@ -28,7 +28,7 @@ test-suite streaming-io-spec
                  Network.Streaming
                  Network.Streaming.PositiveInt
                  Network.Streaming.Resources
-                 Network.Streaming.Resources.Internal
+                 Network.Streaming.Buffer
                  PositiveIntSpec
                  ResourcesSpec
                  StreamingSpec

@@ -133,10 +133,11 @@ infixr 5 :|:
 -- their binds are inlined instead of called through the class's dictionary,
 -- which allocates closures for every message.
 class Parsable (a :: Type) s where
-  parser :: Input a
+  fieldParser :: Input a
 
+-- A primitive value can have several wire encodings, so its schema stays explicit.
 class Serializable (a :: Type) s where
-  serialize :: a -> Output
+  serializeField :: a -> Output
 
 class ParseConstructor (payload :: Payload) f a | payload f -> a where
   parseWithConstructor :: f -> Input a
@@ -175,97 +176,97 @@ parseChoice = parseWithConstructor @('PayloadChoice alternatives)
 -- We keep these instances explicit instead of using a generic `Storable` one,
 -- because that would also admit platform-sized numerics like `Int` and `Word`.
 instance Parsable Word8 ('FixedBytesAtom 1) where
-  parser = readInputWord8
-  {-# INLINE parser #-}
+  fieldParser = readInputWord8
+  {-# INLINE fieldParser #-}
 
 instance Parsable Word16 ('FixedBytesAtom 2) where
-  parser = readInputWord16
-  {-# INLINE parser #-}
+  fieldParser = readInputWord16
+  {-# INLINE fieldParser #-}
 
 instance Parsable Int16 ('FixedBytesAtom 2) where
-  parser = fromIntegral <$> parser @Word16 @('FixedBytesAtom 2)
-  {-# INLINE parser #-}
+  fieldParser = fromIntegral <$> fieldParser @Word16 @('FixedBytesAtom 2)
+  {-# INLINE fieldParser #-}
 
 instance Parsable Word32 ('FixedBytesAtom 4) where
-  parser = readInputWord32
-  {-# INLINE parser #-}
+  fieldParser = readInputWord32
+  {-# INLINE fieldParser #-}
 
 instance Parsable Int32 ('FixedBytesAtom 4) where
-  parser = fromIntegral <$> parser @Word32 @('FixedBytesAtom 4)
-  {-# INLINE parser #-}
+  fieldParser = fromIntegral <$> fieldParser @Word32 @('FixedBytesAtom 4)
+  {-# INLINE fieldParser #-}
 
 instance KnownNat n => Parsable ByteString ('FixedBytesAtom n) where
-  parser = readInputExactly (natAsInt @n)
-  {-# INLINE parser #-}
+  fieldParser = readInputExactly (natAsInt @n)
+  {-# INLINE fieldParser #-}
 
 instance Parsable ByteString 'CStringAtom where
-  parser = readInputCStringBytes
-  {-# INLINE parser #-}
+  fieldParser = readInputCStringBytes
+  {-# INLINE fieldParser #-}
 
 instance Parsable ByteString 'RemainingBytesAtom where
-  parser = readInputRemaining
-  {-# INLINE parser #-}
+  fieldParser = readInputRemaining
+  {-# INLINE fieldParser #-}
 
 instance Parsable (Maybe ByteString) 'MaybeBytes32Atom where
-  parser = do
-    lengthOrMissing <- parser @Int32 @('FixedBytesAtom 4)
+  fieldParser = do
+    lengthOrMissing <- fieldParser @Int32 @('FixedBytesAtom 4)
     case compare lengthOrMissing (-1) of
       EQ -> pure Nothing
       GT -> Just <$> readInputExactly (fromIntegral lengthOrMissing)
       LT -> throwError ("negative length " <> show lengthOrMissing <> " is invalid for MaybeBytes32Atom")
-  {-# INLINE parser #-}
+  {-# INLINE fieldParser #-}
 
 instance KnownChar value => Parsable () ('PayloadConst 1 (value :: Char)) where
-  parser = expectConstant (charByte @value) =<< parser @Word8 @('FixedBytesAtom 1)
-  {-# INLINE parser #-}
+  fieldParser = expectConstant (charByte @value) =<< fieldParser @Word8 @('FixedBytesAtom 1)
+  {-# INLINE fieldParser #-}
 
 instance KnownNat value => Parsable () ('PayloadConst 1 (value :: Nat)) where
-  parser = expectConstant (natConstant @value) =<< parser @Word8 @('FixedBytesAtom 1)
-  {-# INLINE parser #-}
+  fieldParser = expectConstant (natConstant @value) =<< fieldParser @Word8 @('FixedBytesAtom 1)
+  {-# INLINE fieldParser #-}
 
 instance KnownNat value => Parsable () ('PayloadConst 2 (value :: Nat)) where
-  parser = expectConstant (natConstant @value) =<< parser @Word16 @('FixedBytesAtom 2)
-  {-# INLINE parser #-}
+  fieldParser = expectConstant (natConstant @value) =<< fieldParser @Word16 @('FixedBytesAtom 2)
+  {-# INLINE fieldParser #-}
 
 instance KnownNat value => Parsable () ('PayloadConst 4 (value :: Nat)) where
-  parser = expectConstant (natConstant @value) =<< parser @Word32 @('FixedBytesAtom 4)
-  {-# INLINE parser #-}
+  fieldParser = expectConstant (natConstant @value) =<< fieldParser @Word32 @('FixedBytesAtom 4)
+  {-# INLINE fieldParser #-}
 
 instance forall a (payload :: Payload). Parsable a payload => Parsable a ('PayloadBounded payload) where
-  parser = withBoundedInput (parser @a @payload)
-  {-# INLINE parser #-}
+  fieldParser = withBoundedInput (fieldParser @a @payload)
+  {-# INLINE fieldParser #-}
 
 instance Parsable a field => Parsable a ('PayloadField field) where
-  parser = parser @a @field
-  {-# INLINE parser #-}
+  fieldParser = fieldParser @a @field
+  {-# INLINE fieldParser #-}
 
 instance forall a (payload :: Payload). Parsable a payload => Parsable [a] ('PayloadZeroTerminated payload) where
-  parser = go []
+  fieldParser = go []
     where
       go acc = do
         end <- (== 0) <$> peekInputByteAt 0
         if end
           then readInputExactly 1 $> reverse acc
-          else go . (: acc) =<< parser @a @payload
-  {-# INLINE parser #-}
+          else go . (: acc) =<< fieldParser @a @payload
+  {-# INLINE fieldParser #-}
 
 instance forall a (payload :: Payload). Parsable a payload => Parsable [a] ('PayloadCounted16 payload) where
-  parser = do
-    count <- parser @Int16 @('FixedBytesAtom 2)
+  fieldParser = do
+    count <- fieldParser @Int16 @('FixedBytesAtom 2)
     unless
       (count >= 0)
       (throwError ("negative element count " <> show count <> " is invalid for PayloadCounted16"))
-    replicateM (fromIntegral count) (parser @a @payload)
-  {-# INLINE parser #-}
+    replicateM (fromIntegral count) (fieldParser @a @payload)
+  {-# INLINE fieldParser #-}
 
 instance forall a (payload :: Payload). Parsable a payload => Parsable [a] ('PayloadCounted32 payload) where
-  parser = do
-    count <- parser @Int32 @('FixedBytesAtom 4)
+  fieldParser = do
+    count <- fieldParser @Int32 @('FixedBytesAtom 4)
     unless
       (count >= 0)
       (throwError ("negative element count " <> show count <> " is invalid for PayloadCounted32"))
-    replicateM (fromIntegral count) (parser @a @payload)
-  {-# INLINE parser #-}
+    replicateM (fromIntegral count) (fieldParser @a @payload)
+  {-# INLINE fieldParser #-}
 
 instance {-# OVERLAPPABLE #-}
   ( HasPayload singleton payload,
@@ -274,43 +275,43 @@ instance {-# OVERLAPPABLE #-}
   ) =>
   Parsable a singleton
   where
-  parser = parseWithConstructor @payload (constructorOf @_ @singleton @a)
-  {-# INLINE parser #-}
+  fieldParser = parseWithConstructor @payload (constructorOf @_ @singleton @a)
+  {-# INLINE fieldParser #-}
 
 instance Parsable a 'CStringAtom => ParseConstructor 'CStringAtom (a -> r) r where
-  parseWithConstructor constructor = constructor <$> parser @a @'CStringAtom
+  parseWithConstructor constructor = constructor <$> fieldParser @a @'CStringAtom
   {-# INLINE parseWithConstructor #-}
 
 instance Parsable a ('FixedBytesAtom n) => ParseConstructor ('FixedBytesAtom n) (a -> r) r where
-  parseWithConstructor constructor = constructor <$> parser @a @('FixedBytesAtom n)
+  parseWithConstructor constructor = constructor <$> fieldParser @a @('FixedBytesAtom n)
   {-# INLINE parseWithConstructor #-}
 
 instance Parsable a 'RemainingBytesAtom => ParseConstructor 'RemainingBytesAtom (a -> r) r where
-  parseWithConstructor constructor = constructor <$> parser @a @'RemainingBytesAtom
+  parseWithConstructor constructor = constructor <$> fieldParser @a @'RemainingBytesAtom
   {-# INLINE parseWithConstructor #-}
 
 instance Parsable a 'MaybeBytes32Atom => ParseConstructor 'MaybeBytes32Atom (a -> r) r where
-  parseWithConstructor constructor = constructor <$> parser @a @'MaybeBytes32Atom
+  parseWithConstructor constructor = constructor <$> fieldParser @a @'MaybeBytes32Atom
   {-# INLINE parseWithConstructor #-}
 
 instance Parsable a field => ParseConstructor ('PayloadField field) (a -> r) r where
-  parseWithConstructor constructor = constructor <$> parser @a @field
+  parseWithConstructor constructor = constructor <$> fieldParser @a @field
   {-# INLINE parseWithConstructor #-}
 
 instance Parsable [a] ('PayloadZeroTerminated payload) => ParseConstructor ('PayloadZeroTerminated payload) ([a] -> r) r where
-  parseWithConstructor constructor = constructor <$> parser @[a] @('PayloadZeroTerminated payload)
+  parseWithConstructor constructor = constructor <$> fieldParser @[a] @('PayloadZeroTerminated payload)
   {-# INLINE parseWithConstructor #-}
 
 instance Parsable [a] ('PayloadCounted16 payload) => ParseConstructor ('PayloadCounted16 payload) ([a] -> r) r where
-  parseWithConstructor constructor = constructor <$> parser @[a] @('PayloadCounted16 payload)
+  parseWithConstructor constructor = constructor <$> fieldParser @[a] @('PayloadCounted16 payload)
   {-# INLINE parseWithConstructor #-}
 
 instance Parsable [a] ('PayloadCounted32 payload) => ParseConstructor ('PayloadCounted32 payload) ([a] -> r) r where
-  parseWithConstructor constructor = constructor <$> parser @[a] @('PayloadCounted32 payload)
+  parseWithConstructor constructor = constructor <$> fieldParser @[a] @('PayloadCounted32 payload)
   {-# INLINE parseWithConstructor #-}
 
 instance Parsable () ('PayloadConst bytes value) => ParseConstructor ('PayloadConst bytes value) r r where
-  parseWithConstructor constructor = parser @() @('PayloadConst bytes value) $> constructor
+  parseWithConstructor constructor = fieldParser @() @('PayloadConst bytes value) $> constructor
   {-# INLINE parseWithConstructor #-}
 
 instance ParseConstructor payload f a => ParseConstructor ('PayloadBounded payload) f a where
@@ -352,27 +353,27 @@ instance
   {-# INLINE parseWithConstructor #-}
 
 instance Serializable Word8 ('FixedBytesAtom 1) where
-  serialize = word8
-  {-# INLINE serialize #-}
+  serializeField = word8
+  {-# INLINE serializeField #-}
 
 instance Serializable Word16 ('FixedBytesAtom 2) where
-  serialize = word16
-  {-# INLINE serialize #-}
+  serializeField = word16
+  {-# INLINE serializeField #-}
 
 instance Serializable Int16 ('FixedBytesAtom 2) where
-  serialize = int16
-  {-# INLINE serialize #-}
+  serializeField = int16
+  {-# INLINE serializeField #-}
 
 instance Serializable Word32 ('FixedBytesAtom 4) where
-  serialize = word32
-  {-# INLINE serialize #-}
+  serializeField = word32
+  {-# INLINE serializeField #-}
 
 instance Serializable Int32 ('FixedBytesAtom 4) where
-  serialize = int32
-  {-# INLINE serialize #-}
+  serializeField = int32
+  {-# INLINE serializeField #-}
 
 instance KnownNat n => Serializable ByteString ('FixedBytesAtom n) where
-  serialize value
+  serializeField value
     | BS.length value == natAsInt @n = bytes value
     | otherwise =
         error $
@@ -380,55 +381,55 @@ instance KnownNat n => Serializable ByteString ('FixedBytesAtom n) where
             <> show (natAsInt @n)
             <> " bytes for FixedBytesAtom, got "
             <> show (BS.length value)
-  {-# INLINE serialize #-}
+  {-# INLINE serializeField #-}
 
 instance Serializable ByteString 'CStringAtom where
-  serialize = cstring
-  {-# INLINE serialize #-}
+  serializeField = cstring
+  {-# INLINE serializeField #-}
 
 instance Serializable ByteString 'RemainingBytesAtom where
-  serialize = bytes
-  {-# INLINE serialize #-}
+  serializeField = bytes
+  {-# INLINE serializeField #-}
 
 instance Serializable (Maybe ByteString) 'MaybeBytes32Atom where
-  serialize = maybe (int32 (-1)) (\value -> int32 (lengthAsInt32 (BS.length value)) <> bytes value)
-  {-# INLINE serialize #-}
+  serializeField = maybe (int32 (-1)) (\value -> int32 (lengthAsInt32 (BS.length value)) <> bytes value)
+  {-# INLINE serializeField #-}
 
 instance KnownChar value => Serializable () ('PayloadConst 1 (value :: Char)) where
-  serialize () = word8 (charByte @value)
-  {-# INLINE serialize #-}
+  serializeField () = word8 (charByte @value)
+  {-# INLINE serializeField #-}
 
 instance KnownNat value => Serializable () ('PayloadConst 1 (value :: Nat)) where
-  serialize () = word8 (natConstant @value)
-  {-# INLINE serialize #-}
+  serializeField () = word8 (natConstant @value)
+  {-# INLINE serializeField #-}
 
 instance KnownNat value => Serializable () ('PayloadConst 2 (value :: Nat)) where
-  serialize () = word16 (natConstant @value)
-  {-# INLINE serialize #-}
+  serializeField () = word16 (natConstant @value)
+  {-# INLINE serializeField #-}
 
 instance KnownNat value => Serializable () ('PayloadConst 4 (value :: Nat)) where
-  serialize () = word32 (natConstant @value)
-  {-# INLINE serialize #-}
+  serializeField () = word32 (natConstant @value)
+  {-# INLINE serializeField #-}
 
 instance forall a (payload :: Payload). Serializable a payload => Serializable a ('PayloadBounded payload) where
-  serialize = withLengthPrefix . serialize @a @payload
-  {-# INLINE serialize #-}
+  serializeField = withLengthPrefix . serializeField @a @payload
+  {-# INLINE serializeField #-}
 
 instance Serializable a field => Serializable a ('PayloadField field) where
-  serialize = serialize @a @field
-  {-# INLINE serialize #-}
+  serializeField = serializeField @a @field
+  {-# INLINE serializeField #-}
 
 instance forall a (payload :: Payload). Serializable a payload => Serializable [a] ('PayloadZeroTerminated payload) where
-  serialize values = outputs (serialize @a @payload) values <> word8 0
-  {-# INLINE serialize #-}
+  serializeField values = outputs (serializeField @a @payload) values <> word8 0
+  {-# INLINE serializeField #-}
 
 instance forall a (payload :: Payload). Serializable a payload => Serializable [a] ('PayloadCounted16 payload) where
-  serialize values = int16 (countAsInt16 values) <> outputs (serialize @a @payload) values
-  {-# INLINE serialize #-}
+  serializeField values = int16 (countAsInt16 values) <> outputs (serializeField @a @payload) values
+  {-# INLINE serializeField #-}
 
 instance forall a (payload :: Payload). Serializable a payload => Serializable [a] ('PayloadCounted32 payload) where
-  serialize values = int32 (lengthAsInt32 (length values)) <> outputs (serialize @a @payload) values
-  {-# INLINE serialize #-}
+  serializeField values = int32 (lengthAsInt32 (length values)) <> outputs (serializeField @a @payload) values
+  {-# INLINE serializeField #-}
 
 instance {-# OVERLAPPABLE #-}
   ( HasPayload singleton payload,
@@ -437,43 +438,43 @@ instance {-# OVERLAPPABLE #-}
   ) =>
   Serializable a singleton
   where
-  serialize value = destructorOf @_ @singleton @a value (serializeWith @payload id)
-  {-# INLINE serialize #-}
+  serializeField value = destructorOf @_ @singleton @a value (serializeWith @payload id)
+  {-# INLINE serializeField #-}
 
 instance Serializable a 'CStringAtom => SerializeConstructor 'CStringAtom (a -> r) r where
-  serializeWith continue = continue . serialize @a @'CStringAtom
+  serializeWith continue = continue . serializeField @a @'CStringAtom
   {-# INLINE serializeWith #-}
 
 instance Serializable a ('FixedBytesAtom n) => SerializeConstructor ('FixedBytesAtom n) (a -> r) r where
-  serializeWith continue = continue . serialize @a @('FixedBytesAtom n)
+  serializeWith continue = continue . serializeField @a @('FixedBytesAtom n)
   {-# INLINE serializeWith #-}
 
 instance Serializable a 'RemainingBytesAtom => SerializeConstructor 'RemainingBytesAtom (a -> r) r where
-  serializeWith continue = continue . serialize @a @'RemainingBytesAtom
+  serializeWith continue = continue . serializeField @a @'RemainingBytesAtom
   {-# INLINE serializeWith #-}
 
 instance Serializable a 'MaybeBytes32Atom => SerializeConstructor 'MaybeBytes32Atom (a -> r) r where
-  serializeWith continue = continue . serialize @a @'MaybeBytes32Atom
+  serializeWith continue = continue . serializeField @a @'MaybeBytes32Atom
   {-# INLINE serializeWith #-}
 
 instance Serializable a field => SerializeConstructor ('PayloadField field) (a -> r) r where
-  serializeWith continue = continue . serialize @a @field
+  serializeWith continue = continue . serializeField @a @field
   {-# INLINE serializeWith #-}
 
 instance Serializable [a] ('PayloadZeroTerminated payload) => SerializeConstructor ('PayloadZeroTerminated payload) ([a] -> r) r where
-  serializeWith continue = continue . serialize @[a] @('PayloadZeroTerminated payload)
+  serializeWith continue = continue . serializeField @[a] @('PayloadZeroTerminated payload)
   {-# INLINE serializeWith #-}
 
 instance Serializable [a] ('PayloadCounted16 payload) => SerializeConstructor ('PayloadCounted16 payload) ([a] -> r) r where
-  serializeWith continue = continue . serialize @[a] @('PayloadCounted16 payload)
+  serializeWith continue = continue . serializeField @[a] @('PayloadCounted16 payload)
   {-# INLINE serializeWith #-}
 
 instance Serializable [a] ('PayloadCounted32 payload) => SerializeConstructor ('PayloadCounted32 payload) ([a] -> r) r where
-  serializeWith continue = continue . serialize @[a] @('PayloadCounted32 payload)
+  serializeWith continue = continue . serializeField @[a] @('PayloadCounted32 payload)
   {-# INLINE serializeWith #-}
 
 instance Serializable () ('PayloadConst bytes value) => SerializeConstructor ('PayloadConst bytes value) r r where
-  serializeWith continue = continue (serialize @() @('PayloadConst bytes value) ())
+  serializeWith continue = continue (serializeField @() @('PayloadConst bytes value) ())
   {-# INLINE serializeWith #-}
 
 instance SerializeConstructor payload k r => SerializeConstructor ('PayloadBounded payload) k r where
@@ -590,7 +591,7 @@ instance PayloadPrefix payload => PayloadPrefix ('PayloadBounded payload) where
 -- | The length prefix counts its own four bytes.
 withBoundedInput :: Input a -> Input a
 withBoundedInput inner = do
-  totalLength <- parser @Int32 @('FixedBytesAtom 4)
+  totalLength <- fieldParser @Int32 @('FixedBytesAtom 4)
   unless
     (totalLength >= 4)
     (throwError ("length " <> show totalLength <> " is invalid for PayloadBounded"))
@@ -664,12 +665,12 @@ charByte
 {-# INLINE charByte #-}
 
 instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
-  serialize Nothing = int32 (-1)
-  serialize (Just (ParameterBytes value)) = int32 (parameterLengthAsInt32 (BS.length value)) <> bytes value
-  serialize (Just (ParameterChunks chunks)) = int32 (parameterLengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
-  serialize (Just (ParameterStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> stream source
-  serialize (Just (ParameterBorrowedStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> borrowedStream source
-  {-# INLINE serialize #-}
+  serializeField Nothing = int32 (-1)
+  serializeField (Just (ParameterBytes value)) = int32 (parameterLengthAsInt32 (BS.length value)) <> bytes value
+  serializeField (Just (ParameterChunks chunks)) = int32 (parameterLengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
+  serializeField (Just (ParameterStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> stream source
+  serializeField (Just (ParameterBorrowedStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> borrowedStream source
+  {-# INLINE serializeField #-}
 
 parameterLengthAsInt32 :: Int -> Int32
 parameterLengthAsInt32 count

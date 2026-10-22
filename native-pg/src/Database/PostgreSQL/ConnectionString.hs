@@ -48,7 +48,9 @@ import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word8)
 import Database.PostgreSQL.ConnectionString.Types
 import qualified Database.PostgreSQL.Internal.HostSelection as HostSelection
-import Database.PostgreSQL.Session (Phase (Ready), Session, close, connect, protocolVersion3_0, protocolVersion3_2)
+import Database.PostgreSQL.Session (Session, close, connection)
+import Database.PostgreSQL.Types (protocolVersion3_0, protocolVersion3_2)
+import Database.PostgreSQL.Internal.Startup (connectOwned)
 import Database.PostgreSQL.Session.Settings
 import Database.PostgreSQL.Transport (RootCertificates (..), TcpOptions (..), TlsVersion (..))
 import System.Directory (doesFileExist)
@@ -640,8 +642,8 @@ resolve option defaults localUser = do
 -- @prefer-standby@, the hosts are tried for a standby first, and then for any
 -- server. The settings for each host can be adjusted, e.g. for a bigger read
 -- buffer. Throws 'ConnectFailure' when no host qualifies.
-connectFirst :: (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Session 'Ready, ServerInfo, Host)
-connectFirst = HostSelection.connectFirstUsing connect close HostSelection.queryValue
+connectFirst :: (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Session, ServerInfo, Host)
+connectFirst = HostSelection.connectFirstUsing connectOwned (close . connection) HostSelection.queryValue
 
 -- | C's isspace, which libpq uses, in the C locale.
 isBlank :: Char -> Bool

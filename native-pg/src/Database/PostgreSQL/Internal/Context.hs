@@ -29,7 +29,7 @@ import Control.Exception (catch, finally, mask, onException, throwIO, uninterrup
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
-import Network.Streaming.Resources.Internal (Buffer, bufferCapacity, bufferMemory)
+import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (plusPtr)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
@@ -192,7 +192,8 @@ runContextOperation context action = mask $ \restore -> do
             _ -> throwIO (SessionUnusable "the connection is no longer usable")
           else claimConnection connection
         result <- restore action `onException` breakConnection connection
-        unless (contextScoped context) (writeIORef (connectionState connection) Idle)
+        unless (contextScoped context) $
+          atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
         pure result
   run `finally` done
 

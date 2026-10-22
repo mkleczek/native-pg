@@ -8,6 +8,7 @@ module Database.PostgreSQL.Internal.Exchange
     Reply (..), startupTail, sessionTail, onError, onNotice, onParameterStatus,
     serverError, sessionError, pullReply, keepNotification, copyNotification,
     pullEither, pull, receive, runOn, operation, send, sendOutputs, continueIn,
+    sync, awaitReady,
   ) where
 
 import Control.Exception (throwIO)
@@ -19,7 +20,7 @@ import Database.PostgreSQL.Diagnostics (ServerError (..))
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
 import Database.PostgreSQL.Diagnostics (isConnectionFatal)
-import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), Input, Output, ParseConstructor, Serializable (..), parseChoice)
+import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), Input, Output, ParseConstructor, Serializable, parseChoice)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
 
@@ -321,8 +322,8 @@ operation :: Session 'Ready -> IO a -> IO a
 operation (Session context) = runContextOperation context
 
 {-# INLINE send #-}
-send :: forall s a phase. Serializable a s => Session phase -> a -> IO ()
-send session message = sendOutputs session (serialize @a @s message)
+send :: forall a s phase. Serializable (Envelope a s) s => Session phase -> Envelope a s -> IO ()
+send session message = sendOutputs session (serialize message)
 
 sendOutputs :: Session phase -> Output -> IO ()
 sendOutputs (Session context) = sendContextOutput context
@@ -330,3 +331,25 @@ sendOutputs (Session context) = sendContextOutput context
 -- | The session in the phase the protocol continues in.
 continueIn :: Session phase -> Session next
 continueIn (Session context) = Session context
+
+sync :: Output
+sync = serialize Sync
+
+-- | Pulls the ReadyForQuery that ends a Sync. An error before it, e.g. a
+-- deferred constraint failing at the implicit commit, replaces a successful
+-- result, given by the function.
+awaitReady :: Session phase -> (ServerError -> e) -> Either e a -> IO (Either e a, TransactionStatus)
+awaitReady session failed result = do
+  let syncing = continueIn session :: Session 'SyncResult
+  reply <-
+    receive syncing $
+      (\(ReadyForQuery status) -> Reply status) :|: sessionTail
+  case reply of
+    Reply status -> pure (result, status)
+    Skip -> awaitReady session failed result
+    Notified notification -> do
+      keepNotification session notification
+      awaitReady session failed result
+    Rejected fields -> do
+      failure <- sessionError fields
+      awaitReady session failed (result >>= const (Left (failed failure)))
