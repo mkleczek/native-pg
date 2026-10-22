@@ -31,7 +31,9 @@ module Database.PostgreSQL.Transport
     Unsent,
     OutputBuffer,
     newOutputBuffer,
+    outputBufferFrom,
     unsent,
+    unsentEmpty,
   )
 where
 
@@ -45,6 +47,7 @@ import Data.IORef (IORef, readIORef, writeIORef)
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
+import qualified Database.PostgreSQL.Buffer as Buffer
 import Database.PostgreSQL.Protocol.Codec
   ( ByteStream (..),
     InputSource (..),
@@ -368,6 +371,7 @@ data Channel = Channel
     channelSendSome :: Unsent -> IO Unsent,
     -- | Sends the output, waiting for room as needed.
     channelSend :: Output -> IO (),
+    channelSendBuffered :: OutputBuffer -> Output -> IO (),
     channelClose :: IO ()
   }
 
@@ -379,6 +383,7 @@ newChannel link pending readSize =
     { channelInput = linkInputSource link pending readSize,
       channelSendSome = sendSome link,
       channelSend = sendOutput link,
+      channelSendBuffered = sendOutputWith link . Just,
       channelClose = closeLink link
     }
 {-# INLINABLE newChannel #-}
@@ -422,7 +427,11 @@ instance Exception StreamLengthError
 
 -- | Sends the output, waiting for the link to become writable as needed.
 sendOutput :: Link link => link -> Output -> IO ()
-sendOutput link output = go =<< unsent Nothing output
+sendOutput link = sendOutputWith link Nothing
+{-# INLINABLE sendOutput #-}
+
+sendOutputWith :: Link link => link -> Maybe OutputBuffer -> Output -> IO ()
+sendOutputWith link buffer output = go =<< unsent buffer output
   where
     go left =
       sendSome link left >>= \case
@@ -430,12 +439,15 @@ sendOutput link output = go =<< unsent Nothing output
           flushed <- flushReady link
           unless flushed (awaitWritable link *> go (Unsent []))
         rest -> awaitWritable link *> go rest
-{-# INLINABLE sendOutput #-}
+{-# INLINABLE sendOutputWith #-}
 
 -- | What's left of an output to send. The server may answer the first
 -- messages of an output before it has read the rest, and stop reading until
 -- its answers are read. So output can be sent as the answers are read.
 newtype Unsent = Unsent [Part]
+
+unsentEmpty :: Unsent -> Bool
+unsentEmpty (Unsent parts) = null parts
 
 -- | Bytes, or a stream with how many bytes it has given.
 data Part
@@ -444,10 +456,14 @@ data Part
 
 -- | Memory that outputs are written to, reused once what was written to it
 -- is sent.
-data OutputBuffer = OutputBuffer (ForeignPtr Word8) Int
+data OutputBuffer = OutputBuffer (ForeignPtr Word8) Int Bool
 
 newOutputBuffer :: Int -> IO OutputBuffer
-newOutputBuffer size = (`OutputBuffer` size) <$> mallocPlainForeignPtrBytes size
+newOutputBuffer size = (\memory -> OutputBuffer memory size False) <$> mallocPlainForeignPtrBytes size
+
+-- | The caller must keep the loan exclusive until all output has been sent.
+outputBufferFrom :: Buffer.Buffer -> OutputBuffer
+outputBufferFrom buffer = OutputBuffer (Buffer.bufferMemory buffer) (Buffer.bufferCapacity buffer) True
 
 -- | All of the output. Its copied bytes are written to the buffer if there's
 -- one and they fit, and to a new one of their size otherwise. The buffer
@@ -456,7 +472,7 @@ newOutputBuffer size = (`OutputBuffer` size) <$> mallocPlainForeignPtrBytes size
 unsent :: Maybe OutputBuffer -> Output -> IO Unsent
 unsent reused output = do
   memory <- case reused of
-    Just (OutputBuffer memory size) | outputCopied output <= size -> pure memory
+    Just (OutputBuffer memory size _) | outputCopied output <= size -> pure memory
     _ -> mallocPlainForeignPtrBytes (outputCopied output)
   parts <- writeOutput memory output
   pure (Unsent (map part parts))
