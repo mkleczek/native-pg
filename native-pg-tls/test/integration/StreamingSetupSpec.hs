@@ -19,8 +19,8 @@ import qualified Database.PostgreSQL.ConnectionString as CS
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Streaming as Streaming
 import Database.PostgreSQL.Tls (tlsClient)
-import Database.PostgreSQL.Protocol (TransactionStatus (..))
-import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
+import Database.PostgreSQL.Session (TransactionStatus (..))
+import Database.PostgreSQL.Streaming (ByteStream (..))
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (fillBytes)
 import Database.PostgreSQL.Transport (Address (..))
