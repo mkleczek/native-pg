@@ -42,12 +42,14 @@ import Control.Exception (Exception (..), IOException, bracket, bracketOnError, 
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BSI
 import Data.Foldable (for_)
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
 import qualified Database.PostgreSQL.Buffer as Buffer
+import Database.PostgreSQL.Protocol.Codec.Output (Writer, WriteResult (..), outputWriter, runWriter)
 import Database.PostgreSQL.Protocol.Codec
   ( ByteStream (..),
     InputSource (..),
@@ -57,7 +59,7 @@ import Database.PostgreSQL.Protocol.Codec
     writeOutput,
   )
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
-import Foreign.ForeignPtr (ForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import GHC.Conc (atomically, orElse)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import GHC.IO.Exception (IOException (..))
@@ -453,6 +455,7 @@ unsentEmpty (Unsent parts) = null parts
 data Part
   = PartBytes ByteString
   | PartStream ByteStream Int
+  | PartOutput OutputBuffer Writer
 
 -- | Memory that outputs are written to, reused once what was written to it
 -- is sent.
@@ -465,11 +468,14 @@ newOutputBuffer size = (\memory -> OutputBuffer memory size False) <$> mallocPla
 outputBufferFrom :: Buffer.Buffer -> OutputBuffer
 outputBufferFrom buffer = OutputBuffer (Buffer.bufferMemory buffer) (Buffer.bufferCapacity buffer) True
 
--- | All of the output. Its copied bytes are written to the buffer if there's
--- one and they fit, and to a new one of their size otherwise. The buffer
--- mustn't be written to again until they're sent. Long byte strings, and the
--- chunks of its streams, are sent from where they are, without being copied.
+-- | All of the output. Caller-supplied buffers are filled incrementally and
+-- reused only after their bytes have been sent. Legacy buffers may grow to
+-- fit the copied output. Long byte strings and streams retain their own
+-- storage until accepted by the link.
 unsent :: Maybe OutputBuffer -> Output -> IO Unsent
+unsent (Just buffer@(OutputBuffer _ size True)) output
+  | size < 4 = ioError (userError "output buffer capacity must be at least four bytes")
+  | otherwise = pure (Unsent [PartOutput buffer (outputWriter output)])
 unsent reused output = do
   memory <- case reused of
     Just (OutputBuffer memory size _) | outputCopied output <= size -> pure memory
@@ -480,6 +486,21 @@ unsent reused output = do
     part (Left copied) = PartBytes copied
     part (Right (UncopiedBytes value)) = PartBytes value
     part (Right (UncopiedStream source)) = PartStream source 0
+
+renderOutput :: OutputBuffer -> Writer -> IO [Part]
+renderOutput buffer@(OutputBuffer memory capacity _) writer =
+  withForeignPtr memory $ \pointer -> do
+    result <- runWriter writer pointer capacity 0
+    let copied count parts
+          | count > 0 = PartBytes (BSI.BS memory count) : parts
+          | otherwise = parts
+        resume rest = [PartOutput buffer rest]
+        uncopied (UncopiedBytes value) = PartBytes value
+        uncopied (UncopiedStream source) = PartStream source 0
+    pure $ case result of
+      Finished count -> copied count []
+      NeedSpace count rest -> copied count (resume rest)
+      Yield count part rest -> copied count (uncopied part : resume rest)
 
 -- | Bytes gathered for one send, and how many pieces at most. A client's
 -- stream comes in chunks of up to 16 KiB from warp, and sending each on its
@@ -511,7 +532,18 @@ sendSome link (Unsent parts) = Unsent <$> go parts
       | size >= gatherSize || length pieces >= gatherPieces = pure (reverse pieces, remaining)
       | otherwise = case remaining of
           [] -> pure (reverse pieces, [])
-          PartBytes chunk : others -> gather (size + BS.length chunk) (chunk : pieces) others
+          -- Rendering the next buffer would overwrite gathered bytes that
+          -- a partial send still owns.
+          PartOutput _ _ : _ | not (null pieces) -> pure (reverse pieces, remaining)
+          PartOutput buffer steps : others -> do
+            rendered <- renderOutput buffer steps
+            gather size pieces (rendered <> others)
+          PartBytes chunk : others
+            | BS.null chunk -> gather size pieces others
+            | otherwise ->
+                let (prefix, suffix) = BS.splitAt (gatherSize - size) chunk
+                    rest = [PartBytes suffix | not (BS.null suffix)] <> others
+                 in gather (size + BS.length prefix) (prefix : pieces) rest
           PartStream _ 0 : _ | not (null pieces) -> pure (reverse pieces, remaining)
           PartStream source given : others -> do
             chunk <- byteStreamNext source
@@ -522,7 +554,7 @@ sendSome link (Unsent parts) = Unsent <$> go parts
                   gather size pieces others
               | delivered > byteStreamLength source ->
                   throwIO (StreamLengthError (byteStreamLength source) delivered)
-              | otherwise -> gather (size + BS.length chunk) (chunk : pieces) (PartStream source delivered : others)
+              | otherwise -> gather size pieces (PartBytes chunk : PartStream source delivered : others)
     dropSent sent = \case
       chunk : others
         | sent >= BS.length chunk -> dropSent (sent - BS.length chunk) others

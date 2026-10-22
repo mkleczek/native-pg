@@ -82,13 +82,11 @@ spec = describe "channels over a link without a socket" $ do
     channel <- channelWith link sync
     timeout 1000000 (readBytes channel) `shouldReturn` Just "reply"
 
-  xfail "one large piece can exceed the transport gather budget" $
-    it "bounds each send even for a single large immutable value" $ do
+  it "bounds each send even for a single large immutable value" $ do
       let payload = BS.replicate 600000 42
       checkGather (serialize @ByteString @'RemainingBytesAtom payload) payload
 
-  xfail "one stream chunk can exceed the transport gather budget" $
-    it "splits a large stream chunk without losing its partial-write suffix" $ do
+  it "splits a large stream chunk without losing its partial-write suffix" $ do
       let payload = BS.replicate 600000 61
       next <- newIORef payload
       let source = ByteStream (BS.length payload) (readIORef next <* writeIORef next BS.empty)

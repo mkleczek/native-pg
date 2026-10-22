@@ -19,8 +19,7 @@ import Skeletest
 
 spec :: Spec
 spec = describe "caller-owned output storage" $ do
-  xfail "outputs larger than the supplied buffer allocate replacement storage" $
-    it "serializes a large batch through the same small buffer" $ do
+  it "serializes a large batch through the same small buffer" $ do
       buffer <- newBuffer 16
       addresses <- newIORef True
       sent <- newIORef BS.empty

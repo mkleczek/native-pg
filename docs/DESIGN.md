@@ -148,12 +148,17 @@ function that takes the fields and serializes them. `PayloadBounded` writes
 its length, which counts its own four bytes, from the computed size before
 the content. So a field's bytes can be streamed whenever its length is known.
 
-Output is its length, how many of its bytes are copied, and a function that
-writes them. Composing outputs composes the functions, so a message's fields
-become one function, not a structure built at run time, and a batch is
-written in one pass into one buffer of the copied bytes' size. Client-supplied
-byte strings of 8 KiB or more aren't copied: they're sent from where they
-are, as parts of their own. A parameter can also be given in chunks, each
+Output records its length, how many bytes need copying, and a resumable writer.
+Composition joins writers directly, so adjacent fields can be written without
+building intermediate instruction nodes. The bounded sender and the contiguous
+serializer run the same writer. It stops when scratch space fills or a direct
+byte string or stream must be sent. Its continuation retains the remaining
+values, not the old scratch pointer, so sending can resume in different storage.
+Inspecting lengths or composing writers never pulls parameter sources. Arrays
+and chunk lists scan their sizes without retaining a serializer for each
+element; their writers are built as sending advances. Client-supplied byte strings of
+8 KiB or more aren't copied: they're sent from where they are, as parts of
+their own. A parameter can also be given in chunks, each
 sent so, without copying them into one first, or be a `ByteStream`. Its
 chunks are pulled from the client's source, after the declared length. A
 stream that gives a different number of bytes leaves the message incomplete,

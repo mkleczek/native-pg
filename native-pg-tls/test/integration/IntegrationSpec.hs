@@ -159,6 +159,10 @@ spec socketPath port = do
                                 ending <- readIORef closing
                                 when ending beforeSend
                                 channelSend channel output,
+                              channelSendBuffered = \buffer output -> do
+                                ending <- readIORef closing
+                                when ending beforeSend
+                                channelSendBuffered channel buffer output,
                               channelClose =
                                 (modifyIORef closes (+ 1) *> channelClose channel)
                                   `finally` afterClose
