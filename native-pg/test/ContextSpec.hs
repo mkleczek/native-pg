@@ -15,7 +15,7 @@ import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Protocol (TransactionStatus (..))
 import qualified Database.PostgreSQL.Session as PG
 import Database.PostgreSQL.Transport
-import Foreign.ForeignPtr (withForeignPtr)
+import Foreign.ForeignPtr (withForeignPtr, plusForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
@@ -118,6 +118,20 @@ spec = describe "explicit operation contexts" $ do
     completed <- timeout 1000000 (readMVar finished)
     isNothing early `shouldBe` True
     isNothing completed `shouldBe` False
+
+  xfail "supplied contexts do not yet reject overlapping storage" $ it "rejects identical and partially overlapping workspaces before callback entry" $ do
+    connection <- newConnection idleChannel 16
+    arena <- newBuffer 32
+    input <- bufferFromInitializedMemory (bufferMemory arena) 16
+    overlap <- bufferFromInitializedMemory (plusForeignPtr (bufferMemory arena) 8) 16
+    entered <- newIORef False
+    let rejected output = do
+          result <- try @ConnectionError (withContext connection input output (\_ -> writeIORef entered True))
+          result `shouldBe` Left (SessionUnusable "input and output storage overlap")
+    rejected input
+    rejected overlap
+    readIORef entered `shouldReturn` False
+    PG.isConnectionUsable connection `shouldReturn` True
 
 reply :: BS.ByteString
 reply = "2\0\0\0\4D\0\0\0\13\0\1\0\0\0\3abcC\0\0\0\13SELECT 1\0Z\0\0\0\5I"
