@@ -15,8 +15,6 @@ module Database.PostgreSQL.Protocol.Codec.Input
     MonadInput (..),
     emptyInputBuffer,
     reusableInputBuffer,
-    attachInputBuffer,
-    detachInputBuffer,
     withInputSome,
     inputPosition,
     peekInputMetadataByteAt,
@@ -96,27 +94,6 @@ emptyInputBuffer = case BS.empty of
 -- | Empty input backed by storage lent by the caller.
 reusableInputBuffer :: Buffer -> InputBuffer
 reusableInputBuffer storage = InputBuffer (Buffer.bufferMemory storage) (Buffer.bufferCapacity storage) 0 0 0 True Nothing
-
--- | Moves unread bytes into caller-owned input storage, preserving position.
-attachInputBuffer :: Buffer -> InputBuffer -> IO InputBuffer
-attachInputBuffer storage previous = do
-  when (bufferReusable previous) (throwIO (InputError "input storage is already borrowed"))
-  let count = bufferEnd previous - bufferStart previous
-      capacity = Buffer.bufferCapacity storage
-  when (count > capacity) (throwIO (InputError "unread input exceeds supplied buffer capacity"))
-  withForeignPtr (Buffer.bufferMemory storage) $ \target ->
-    withForeignPtr (bufferMemory previous) $ \origin ->
-      copyBytes target (origin `plusPtr` bufferStart previous) count
-  pure (reusableInputBuffer storage) {bufferEnd = count, bufferPosition = bufferPosition previous}
-
--- | Ends a loan, retaining only an owned copy of unread bytes.
-detachInputBuffer :: InputBuffer -> IO InputBuffer
-detachInputBuffer buffer
-  | not (bufferReusable buffer) = pure buffer
-  | otherwise = do
-      bytes <- evaluate (BS.copy (slice (bufferEnd buffer - bufferStart buffer) buffer))
-      let BSI.BS memory size = bytes
-      pure (InputBuffer memory size 0 size (bufferPosition buffer) False Nothing)
 
 -- | Borrows one chunk until the callback returns, then consumes it.
 -- The callback must not retain the bytes or read this input recursively.

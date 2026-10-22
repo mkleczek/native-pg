@@ -115,15 +115,6 @@ spec = describe "caller-owned input" $ do
     _ <- runInput source (reusableInputBuffer storage) (withInputSome 8 consume *> withInputSome 8 consume)
     readIORef chunks `shouldReturn` [(0, "abcd"), (0, "efgh")]
 
-  it "detaches unread bytes before the original storage is reused" $ do
-    storage <- newBuffer 4
-    source <- bytesSource 4 "abcdefgh" (const (pure ()))
-    (_, attached) <- runInput source (reusableInputBuffer storage) (readInputExactly 2)
-    detached <- detachInputBuffer attached
-    _ <- runInput source (reusableInputBuffer storage) (readInputExactly 4)
-    (value, _) <- runInput source detached (readInputExactly 2)
-    value `shouldBe` "cd"
-
   it "does not enter rollback handlers after reusable storage was refilled" $ do
     storage <- newBuffer 4
     calls <- newIORef (0 :: Int)
