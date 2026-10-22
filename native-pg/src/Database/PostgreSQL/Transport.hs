@@ -369,6 +369,8 @@ data Channel = Channel
   { -- | Reads input. While output is unsent, waiting for input also sends it
     -- as the link takes it.
     channelInput :: InputSource,
+    -- | Input associated with the caller's operation-local pending output.
+    channelInputWith :: IORef Unsent -> Int -> InputSource,
     -- | Sends what the link takes without waiting, and gives what's left.
     channelSendSome :: Unsent -> IO Unsent,
     -- | Sends the output, waiting for room as needed.
@@ -383,6 +385,7 @@ newChannel :: Link link => link -> IORef Unsent -> Int -> Channel
 newChannel link pending readSize =
   Channel
     { channelInput = linkInputSource link pending readSize,
+      channelInputWith = \_ _ -> linkInputSource link pending readSize,
       channelSendSome = sendSome link,
       channelSend = sendOutput link,
       channelSendBuffered = sendOutputWith link . Just,
