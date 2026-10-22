@@ -2,6 +2,7 @@
 -- | Integration API. Buffer aliases expire when their lease or resource scope ends.
 module Network.Streaming.Resources.Internal
   ( Resources, ResourceSettings (..), withResources
+  , validateSettings
   , Buffer (..), BufferGrant, Lease, tryAcquire, tryAcquireSetup, release, leaseBuffers
   , withBuffers, withSetupBuffers
   ) where
@@ -37,12 +38,10 @@ data Lease grant = Lease !Pool grant !(TVar Bool)
 -- | Budgets are rounded down to complete blocks. Every block is initialized
 -- here so admission and return never allocate or clear body storage.
 withResources :: ResourceSettings -> (Resources -> IO a) -> IO a
-withResources settings action
-  | streamMemoryBytes settings < ioBufferBytes settings = invalid "stream budget must fit a block"
-  | setupMemoryBytes settings < ioBufferBytes settings = invalid "setup budget must fit a block"
-  | otherwise = bracket create retire action
+withResources settings action = do
+  either (ioError . userError) pure (validateSettings settings)
+  bracket create retire action
   where
-    invalid = ioError . userError
     create = Resources <$> newPool (streamMemoryBytes settings) <*> newPool (setupMemoryBytes settings)
     newPool budget = do
       let blockBytes = positiveIntValue (ioBufferBytes settings)
@@ -54,6 +53,13 @@ withResources settings action
       Pool count <$> newTVarIO buffers <*> newTVarIO True
     retire (Resources streams setup) = atomically (close streams >> close setup)
     close (Pool _ free active) = writeTVar active False >> writeTVar free []
+
+-- | Validate configuration without allocating resource storage.
+validateSettings :: ResourceSettings -> Either String ()
+validateSettings settings
+  | streamMemoryBytes settings < ioBufferBytes settings = Left "stream budget must fit a block"
+  | setupMemoryBytes settings < ioBufferBytes settings = Left "setup budget must fit a block"
+  | otherwise = Right ()
 
 -- | Ownership transfers only when the surrounding transaction commits.
 -- The caller must mask the interval between admission and installing cleanup.
