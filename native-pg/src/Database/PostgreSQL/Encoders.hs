@@ -23,6 +23,7 @@ module Database.PostgreSQL.Encoders
     foldableArray,
 
     -- * Bytes as they are
+    Parameter (..),
     Raw,
     rawParam,
     rawJson,
@@ -36,7 +37,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LBS
 import Data.Text (Text)
 import Data.Word (Word32)
-import Database.PostgreSQL.Protocol (FormatCode (..), Parameter (..), Scalar (..))
+import Database.PostgreSQL.Protocol (FormatCode (..), Parameter (..))
 import Database.PostgreSQL.Transaction (Param (..))
 import qualified PostgreSQL.Binary.Encoding as Binary
 
@@ -57,7 +58,7 @@ nullable (Value oid arrayOid format encode) = NullableOrNot oid arrayOid format 
 param :: NullableOrNot a -> a -> Param
 param (NullableOrNot oid _ format encode) value =
   Param
-    { paramType = Just (Scalar oid),
+    { paramType = Just oid,
       paramFormat = format,
       paramValue = ParameterBytes . Binary.encodingBytes <$> encode value
     }
@@ -93,7 +94,7 @@ data Raw = Raw Word32 FormatCode
 rawParam :: Raw -> Maybe Parameter -> Param
 rawParam (Raw oid format) value =
   Param
-    { paramType = Just (Scalar oid),
+    { paramType = Just oid,
       paramFormat = format,
       paramValue = value
     }

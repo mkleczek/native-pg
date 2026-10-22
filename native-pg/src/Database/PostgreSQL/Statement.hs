@@ -42,8 +42,9 @@ where
 import Control.Exception (Exception)
 import Control.Monad (join)
 import Data.ByteString (ByteString)
+import Data.Word (Word32)
 import Database.PostgreSQL.Decoding (DecodingError (..))
-import Database.PostgreSQL.Protocol (FormatCode (..), OptionalOid, Parameter)
+import Database.PostgreSQL.Protocol (FormatCode (..), Parameter)
 import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
 import Database.PostgreSQL.Session
   ( DecodeRow (RowFunction, mapRowFunction),
@@ -68,7 +69,7 @@ data Statement params result = Statement
 -- | A parameter.
 data Param = Param
   { -- | 'Nothing' lets the server infer the type.
-    paramType :: OptionalOid,
+    paramType :: Maybe Word32,
     paramFormat :: FormatCode,
     -- | 'Nothing' is NULL.
     paramValue :: Maybe Parameter

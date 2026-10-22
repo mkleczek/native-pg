@@ -7,6 +7,7 @@ module CoreSpec (spec) where
 import Control.Exception (ErrorCall, displayException, evaluate)
 import Data.ByteArray.Encoding (Base (Base16), convertToBase)
 import Data.ByteString (ByteString)
+import Data.Word (Word32)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Char8 as Char8
@@ -422,30 +423,30 @@ spec = do
             <> Snippet.sql " WHERE true"
     it "numbers the placeholders in the order of the parameters" $
       fmap (map paramView) (Snippet.render snippet)
-        `shouldBe` ("SELECT $1, $2 WHERE true", [(Just (Scalar 705), TextFormat, Just "1"), (Just (Scalar 17), BinaryFormat, Nothing)])
+        `shouldBe` ("SELECT $1, $2 WHERE true", [(Just 705, TextFormat, Just "1"), (Just 17, BinaryFormat, Nothing)])
     it "makes a statement of the SQL and the parameters" $ do
       let statement = Snippet.dynamicallyParameterized snippet Tx.noResult True
       Tx.statementSql statement `shouldBe` "SELECT $1, $2 WHERE true"
-      map paramView (Tx.statementParams statement ()) `shouldBe` [(Just (Scalar 705), TextFormat, Just "1"), (Just (Scalar 17), BinaryFormat, Nothing)]
+      map paramView (Tx.statementParams statement ()) `shouldBe` [(Just 705, TextFormat, Just "1"), (Just 17, BinaryFormat, Nothing)]
       Tx.statementPreparable statement `shouldBe` True
 
   describe "encoders" $ do
     it "sends the type OIDs, formats and bytes of hasql's encoders" $ do
-      paramView (Encoders.param (Encoders.nonNullable Encoders.text) "zażółć") `shouldBe` (Just (Scalar 25), BinaryFormat, Just (encodeUtf8 "zażółć"))
-      paramView (Encoders.param (Encoders.nonNullable Encoders.jsonLazyBytes) "{}") `shouldBe` (Just (Scalar 114), BinaryFormat, Just "{}")
-      paramView (Encoders.param (Encoders.nonNullable Encoders.jsonbLazyBytes) "{}") `shouldBe` (Just (Scalar 3802), BinaryFormat, Just "\1{}")
-      paramView (Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes) Nothing) `shouldBe` (Just (Scalar 3802), BinaryFormat, Nothing)
+      paramView (Encoders.param (Encoders.nonNullable Encoders.text) "zażółć") `shouldBe` (Just 25, BinaryFormat, Just (encodeUtf8 "zażółć"))
+      paramView (Encoders.param (Encoders.nonNullable Encoders.jsonLazyBytes) "{}") `shouldBe` (Just 114, BinaryFormat, Just "{}")
+      paramView (Encoders.param (Encoders.nonNullable Encoders.jsonbLazyBytes) "{}") `shouldBe` (Just 3802, BinaryFormat, Just "\1{}")
+      paramView (Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes) Nothing) `shouldBe` (Just 3802, BinaryFormat, Nothing)
     it "sends bytes as they are, at hand or streamed" $ do
-      paramView (Encoders.rawParam Encoders.rawJson (Just (ParameterBytes "{}"))) `shouldBe` (Just (Scalar 114), BinaryFormat, Just "{}")
-      paramView (Encoders.rawParam Encoders.rawJsonb (Just (ParameterBytes "{}"))) `shouldBe` (Just (Scalar 3802), TextFormat, Just "{}")
-      paramView (Encoders.rawParam Encoders.rawBytea (Just (ParameterBytes "\0"))) `shouldBe` (Just (Scalar 17), BinaryFormat, Just "\0")
-      paramView (Encoders.rawParam Encoders.rawUnknown Nothing) `shouldBe` (Just (Scalar 705), TextFormat, Nothing)
+      paramView (Encoders.rawParam Encoders.rawJson (Just (ParameterBytes "{}"))) `shouldBe` (Just 114, BinaryFormat, Just "{}")
+      paramView (Encoders.rawParam Encoders.rawJsonb (Just (ParameterBytes "{}"))) `shouldBe` (Just 3802, TextFormat, Just "{}")
+      paramView (Encoders.rawParam Encoders.rawBytea (Just (ParameterBytes "\0"))) `shouldBe` (Just 17, BinaryFormat, Just "\0")
+      paramView (Encoders.rawParam Encoders.rawUnknown Nothing) `shouldBe` (Just 705, TextFormat, Nothing)
       case Encoders.rawParam Encoders.rawJsonb (Just (ParameterStream (ByteStream 2 (pure "{}")))) of
-        Tx.Param oid format (Just (ParameterStream stream)) -> (oid, format, byteStreamLength stream) `shouldBe` (Just (Scalar 3802), TextFormat, 2)
+        Tx.Param oid format (Just (ParameterStream stream)) -> (oid, format, byteStreamLength stream) `shouldBe` (Just 3802, TextFormat, 2)
         _ -> failTest "the parameter isn't streamed"
     it "sends a one-dimensional array of the elements' type" $
       paramView (Encoders.param (Encoders.nonNullable (Encoders.foldableArray (Encoders.nonNullable Encoders.text))) ["a", "bc"])
-        `shouldBe` ( Just (Scalar 1009),
+        `shouldBe` ( Just 1009,
                      BinaryFormat,
                      Just (int32 1 <> int32 0 <> int32 25 <> int32 2 <> int32 1 <> int32 1 <> "a" <> int32 2 <> "bc")
                    )
@@ -599,7 +600,7 @@ hosts :: Either String ConnectionString -> Either String [Host]
 hosts = fmap (toList . connectionHosts)
 
 -- | A parameter's type, format and bytes, which can be compared.
-paramView :: Tx.Param -> (OptionalOid, FormatCode, Maybe ByteString)
+paramView :: Tx.Param -> (Maybe Word32, FormatCode, Maybe ByteString)
 paramView (Tx.Param oid format value) = (oid, format, bytes <$> value)
   where
     bytes (ParameterBytes strict) = strict

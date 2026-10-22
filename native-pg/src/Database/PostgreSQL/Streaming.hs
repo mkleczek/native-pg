@@ -3,6 +3,8 @@
 -- protocol state between calls; Resources can be shared with an HTTP server.
 module Database.PostgreSQL.Streaming
   ( withOperation,
+    withBuffers,
+    ByteStream (..),
     connect,
     connectFirst,
   ) where
@@ -13,6 +15,7 @@ import qualified Database.PostgreSQL.Buffer as Buffer
 import qualified Database.PostgreSQL.Internal.Context as Context
 import qualified Database.PostgreSQL.Session as Session
 import Database.PostgreSQL.Session (Connection, Context, ConnectSettings, ServerInfo)
+import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Resources (Resources)
 import qualified Network.Streaming.Resources.Internal as Resources
@@ -22,11 +25,17 @@ import qualified Network.Streaming.Resources.Internal as Resources
 withOperation :: Resources -> Connection -> (Context -> IO a) -> IO a
 withOperation resources connection action = Resources.withBuffers resources (positiveInt @2) $ \buffers ->
   case buffers of
-    [input, output] -> do
-      input' <- buffer input
-      output' <- buffer output
-      Context.withContext connection input' output' action
+    [input, output] -> withBuffers input output connection action
     _ -> ioError (userError "invalid operation workspace grant")
+
+-- | Use disjoint, initialized shared storage for one exclusive operation.
+-- Both buffers must remain exclusively owned until the callback returns;
+-- borrowed slices expire before that ownership is released.
+withBuffers :: Resources.Buffer -> Resources.Buffer -> Connection -> (Context -> IO a) -> IO a
+withBuffers input output connection action = do
+  input' <- buffer input
+  output' <- buffer output
+  Context.withContext connection input' output' action
 
 buffer :: Resources.Buffer -> IO Buffer.Buffer
 buffer descriptor = Buffer.bufferFromInitializedMemory
