@@ -12,6 +12,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
 import Database.PostgreSQL.Buffer
+import Database.PostgreSQL.Diagnostics (Diagnostics (..))
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Protocol (TransactionStatus (..))
 import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
@@ -90,11 +91,13 @@ spec = describe "borrowed field streams" $ do
       delivered <- newIORef False
       result <- PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
-        stream <- PG.columnStream row
-        drain (byteStreamNext stream) (const (pure ()))
+        PG.withColumnStream row $ \stream ->
+          drain (byteStreamNext stream) (const (pure ()))
         writeIORef delivered True) ()
       readIORef delivered `shouldReturn` True
-      case fst result of Left _ -> pure (); Right _ -> failTest "late server error was lost after field EOF"
+      case fst result of
+        Left (PG.ServerError fields) -> diagnosticCode fields `shouldBe` "23514"
+        Right _ -> failTest "late server error was lost after field EOF"
 
   it "borrows Tx.streamChunks directly through its nullable scoped decoder" $
     withFields [Just payload] ready $ \context input -> do
@@ -159,6 +162,29 @@ spec = describe "borrowed field streams" $ do
       Pipeline.runPipelineIn context (Just prepare) (Pipeline.statement () statement) `shouldReturn` Right ()
       readIORef inside `shouldReturn` True
       readIORef received `shouldReturn` payload
+
+  it "reports a COMMIT failure after the borrowed body was delivered" $ do
+    let parse = message 49 ""
+        bind = message 50 ""
+        completed tag = message 67 (tag <> "\0")
+        row = message 68 ("\0\1" <> number (BS.length payload) <> payload)
+        response = parse <> bind <> completed "BEGIN"
+          <> parse <> bind <> row <> completed "SELECT 1" <> ready
+          <> parse <> bind <> lateError <> ready
+    withResponse response $ \context _ -> do
+      delivered <- newIORef False
+      let statement = Tx.Statement "SELECT field" (const [])
+            (Tx.singleRow (Tx.scopedRow $ \current ->
+              Tx.decodeScopedStreamingNullable @'[] current $ \stream -> do
+                maybe (failTest "unexpected NULL") (\source -> Tx.streamChunks source (const (pure ()))) stream
+                writeIORef delivered True)) False
+      result <- Tx.transactionNoRetryIn Tx.ReadCommitted Tx.Read (Tx.statement () statement) context
+      readIORef delivered `shouldReturn` True
+      case result of
+        Left (Tx.QueryError query (Tx.ServerFailed (PG.ServerError fields))) -> do
+          query `shouldBe` "COMMIT"
+          diagnosticCode fields `shouldBe` "23514"
+        _ -> failTest "deferred COMMIT error was lost after field EOF"
 
 collect :: Buffer -> IORef Bool -> IORef BS.ByteString -> BS.ByteString -> IO ()
 collect input inside received chunk = do
