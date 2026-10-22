@@ -71,7 +71,9 @@ module Database.PostgreSQL.Session
   )
 where
 
-import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, mask, throwIO, try)
+import Control.Concurrent (ThreadId, myThreadId, killThread)
+import Control.Concurrent.MVar (newMVar, takeMVar, putMVar, readMVar)
+import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, mask, onException, throwIO, uninterruptibleMask_, try)
 import Control.Monad (filterM, join, unless, when, (<=<))
 import Data.Bifunctor (first)
 import Data.Foldable (for_, toList)
@@ -117,6 +119,8 @@ import Database.PostgreSQL.Protocol.Codec
     inputPosition,
     parseChoice,
     readInputSome,
+    readInputBorrowedSome,
+    withInputSome,
     skipInput,
   )
 import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
@@ -962,7 +966,7 @@ readRows session@(Session context) step = go
         Right (Completed tag) -> pure (Right (acc, tag))
         Right (RowStarted rowLength columnCount) -> do
           row <- startRow context rowLength columnCount
-          acc' <- step acc row
+          acc' <- step acc row `onException` invalidateRow row
           finishRow row
           go acc'
 
@@ -1002,7 +1006,9 @@ data RowCursor = RowCursor
     -- | Unread bytes of the current column's value.
     cursorValueLeft :: !Int,
     -- | Whether the current column's value is being read already.
-    cursorValueTaken :: !Bool
+    cursorValueTaken :: !Bool,
+    -- | A synchronous borrowed consumer owns the column.
+    cursorBorrowed :: !Bool
   }
 
 data Column
@@ -1017,13 +1023,14 @@ startRow context rowLength columnCount = do
   unless (rowLength >= 6 && columnCount >= 0) $
     throwIO (ProtocolError ("invalid DataRow length " <> show rowLength <> " or column count " <> show columnCount))
   position <- inputPosition <$> readIORef (contextInput context)
-  cursor <- newIORef (RowCursor True 0 0 False)
+  cursor <- newIORef (RowCursor True 0 0 False False)
   pure (Row context columnCount (position + fromIntegral rowLength - 6) cursor)
 
 -- | Skips what the step left unread, so the next message can be read.
 finishRow :: Row -> IO ()
 finishRow row = do
-  writeIORef (rowCursor row) (RowCursor False 0 0 True)
+  _ <- activeCursor row
+  writeIORef (rowCursor row) (RowCursor False 0 0 True False)
   position <- inputPosition <$> readIORef (contextInput (rowContext row))
   inRow row (skipInput (rowEnd row - position))
 
@@ -1042,10 +1049,10 @@ nextColumn row = do
       let column = cursorColumn cursor + 1
       case compare size (-1) of
         EQ -> do
-          writeIORef (rowCursor row) (RowCursor True column 0 True)
+          writeIORef (rowCursor row) (RowCursor True column 0 True False)
           pure (Just NullColumn)
         GT -> do
-          writeIORef (rowCursor row) (RowCursor True column (fromIntegral size) False)
+          writeIORef (rowCursor row) (RowCursor True column (fromIntegral size) False False)
           pure (Just (Column (fromIntegral size)))
         LT -> throwIO (ProtocolError ("invalid column length " <> show size))
 
@@ -1058,47 +1065,107 @@ columnBytes row = do
   writeIORef (rowCursor row) cursor {cursorValueLeft = 0, cursorValueTaken = True}
   pure value
 
--- | The current column's value as chunks that are slices of the read buffer,
--- each at most the read size. The stream is valid until the next column is
--- pulled.
+-- | The current column's value as owned chunks, each no larger than the
+-- available input storage. The stream is valid until the next column is
+-- pulled; returned chunks remain valid across reads.
 columnStream :: Row -> IO ByteStream
-columnStream row = do
-  cursor <- untakenCursor row
-  writeIORef (rowCursor row) cursor {cursorValueTaken = True}
-  pure
-    ByteStream
-      { byteStreamLength = cursorValueLeft cursor,
-        byteStreamNext = do
-          current <- activeCursor row
-          unless (cursorColumn current == cursorColumn cursor) $
-            throwIO (RowMisuse "a column stream was read after the next column was pulled")
-          if cursorValueLeft current == 0
-            then pure BS.empty
-            else do
-              chunk <- inRow row (readInputSome (cursorValueLeft current))
-              writeIORef (rowCursor row) current {cursorValueLeft = cursorValueLeft current - BS.length chunk}
-              pure chunk
-      }
+columnStream = fmap fst . columnStreamWithChunks
 
--- | Owned pulls and borrowed draining for the same column cursor.
+-- | Owned pulls and borrowed draining for the same column cursor. Both
+-- expire together when the row or column advances; neither may overlap.
 columnStreamWithChunks :: Row -> IO (ByteStream, (ByteString -> IO ()) -> IO ())
 columnStreamWithChunks row = do
-  stream <- columnStream row
-  let chunks use = do
-        chunk <- byteStreamNext stream
-        unless (BS.null chunk) (use chunk *> chunks use)
-  pure (stream, chunks)
+  cursor <- untakenCursor row
+  writeIORef (rowCursor row) cursor {cursorValueTaken = True}
+  let currentCursor = do
+        current <- activeCursor row
+        unless (cursorColumn current == cursorColumn cursor) $
+          throwIO (RowMisuse "a column stream was read after the next column was pulled")
+        pure current
+      next = do
+        current <- currentCursor
+        if cursorValueLeft current == 0
+          then pure BS.empty
+          else do
+            chunk <- inRow row (readInputSome (cursorValueLeft current))
+            writeIORef (rowCursor row) current {cursorValueLeft = cursorValueLeft current - BS.length chunk}
+            pure chunk
+      chunks use = currentCursor >>= \current -> borrowColumnChunks row current use
+  pure (ByteStream (cursorValueLeft cursor) next, chunks)
 
--- | Consumes the current column with synchronous borrowed callbacks.
+-- | Calls the consumer with successive borrowed chunks of this column.
+-- Chunks are valid only until their callback returns; copy retained bytes.
+-- A callback exception invalidates the row even if the step catches it,
+-- because input may have been refilled before the callback was invoked.
 columnChunks :: Row -> (ByteString -> IO ()) -> IO ()
-columnChunks row use = columnStreamWithChunks row >>= \(_, chunks) -> chunks use
+columnChunks row use = do
+  (_, chunks) <- columnStreamWithChunks row
+  chunks use
+
+borrowColumnChunks :: Row -> RowCursor -> (ByteString -> IO ()) -> IO ()
+borrowColumnChunks row cursor use = do
+  writeIORef (rowCursor row) cursor {cursorValueTaken = True, cursorBorrowed = True}
+  let loop remaining
+        | remaining == 0 = pure ()
+        | otherwise = do
+            size <- inRow row $ withInputSome remaining $ \chunk -> do
+              use chunk
+              pure (BS.length chunk)
+            let left = remaining - size
+            writeIORef (rowCursor row) cursor {cursorValueLeft = left, cursorValueTaken = True, cursorBorrowed = True}
+            loop left
+  loop (cursorValueLeft cursor) `onException`
+    writeIORef (rowCursor row) cursor {cursorActive = False, cursorValueTaken = True}
+  writeIORef (rowCursor row) cursor {cursorValueLeft = 0, cursorValueTaken = True}
 
 -- | A field-only borrowed Source, with its declared length. Chunks expire
 -- on the next pull or callback return. Field EOF does not imply that the
--- statement or transaction succeeded; the enclosing operation reads their
--- trailing completion messages and may still report a server error.
+-- statement or transaction succeeded; the enclosing operation still reads
+-- trailing completion messages and can report a late server error.
 withColumnStream :: Row -> (ByteStream -> IO a) -> IO a
-withColumnStream row use = columnStream row >>= use
+withColumnStream row use = mask $ \restore -> do
+  cursor <- untakenCursor row
+  writeIORef (rowCursor row) cursor {cursorValueTaken = True, cursorBorrowed = True}
+  state <- newIORef PullAvailable
+  finished <- newMVar ()
+  let next = mask $ \resume -> do
+        thread <- myThreadId
+        failure <- atomicModifyIORef' state $ \case
+          PullAvailable -> (PullReading thread, Nothing)
+          current@(PullReading _) -> (current, Just "a column Source was pulled concurrently")
+          PullExpired -> (PullExpired, Just "a column Source was used after its scope ended")
+        maybe (pure ()) (throwIO . RowMisuse) failure
+        takeMVar finished
+        let done = do
+              putMVar finished ()
+              atomicModifyIORef' state (\current -> (case current of PullReading _ -> PullAvailable; other -> other, ()))
+            readChunk = do
+              ensureContextActive (rowContext row)
+              current <- readIORef (rowCursor row)
+              unless (cursorActive current && cursorBorrowed current && cursorColumn current == cursorColumn cursor) $
+                throwIO (RowMisuse "a column Source no longer owns its row")
+              if cursorValueLeft current == 0
+                then pure BS.empty
+                else do
+                  chunk <- inRow row (readInputBorrowedSome (cursorValueLeft current))
+                  writeIORef (rowCursor row) current {cursorValueLeft = cursorValueLeft current - BS.length chunk}
+                  pure chunk
+        resume readChunk `onException` invalidateRow row `finally` done
+      closeSource = do
+        owner <- atomicModifyIORef' state $ \case
+          PullReading thread -> (PullExpired, Just thread)
+          _ -> (PullExpired, Nothing)
+        for_ owner $ \thread -> do
+          invalidateRow row
+          -- The callback cannot return storage while a cancelled pull is
+          -- still unwinding inside the transport or parser.
+          uninterruptibleMask_ (killThread thread *> readMVar finished)
+        atomicModifyIORef' (rowCursor row) (\current -> (current {cursorBorrowed = False}, ()))
+  restore (use (ByteStream (cursorValueLeft cursor) next))
+    `onException` invalidateRow row
+    `finally` closeSource
+
+data PullState = PullAvailable | PullReading ThreadId | PullExpired
 
 -- | A row's columns, described by the Haskell types they decode to.
 class DecodeRow (columns :: [Type]) where
@@ -1150,7 +1217,7 @@ decodeRow row function = do
     Left failure -> pure (Left failure)
     Right () -> do
       decoded <- inRow row (applyColumns @columns 1 function)
-      writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True)
+      writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True False)
       either (pure . Left) (fmap Right) decoded
 -- Inlined so that each call site unrolls the decoding of its own columns.
 {-# INLINE decodeRow #-}
@@ -1183,14 +1250,14 @@ decodeRowStreamingNullable row function = do
             pure (Right (fromIntegral size, continue))
       case decoded of
         Left failure -> do
-          writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True)
+          writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True False)
           pure (Left failure)
         Right (size, continue)
           | size < 0 -> do
-              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True)
+              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True False)
               Right <$> continue Nothing
           | otherwise -> do
-              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) size False)
+              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) size False False)
               stream <- columnStream row
               Right <$> continue (Just stream)
 {-# INLINE decodeRowStreamingNullable #-}
@@ -1209,8 +1276,10 @@ startDecoding row expected = do
 
 activeCursor :: Row -> IO RowCursor
 activeCursor row = do
+  ensureContextActive (rowContext row)
   cursor <- readIORef (rowCursor row)
-  unless (cursorActive cursor) $ throwIO (RowMisuse "a row was used after its step returned")
+  unless (cursorActive cursor) $ throwIO (RowMisuse "a row was used after its step returned or a read failed")
+  when (cursorBorrowed cursor) $ throwIO (RowMisuse "a row was used during its column callback")
   pure cursor
 
 untakenCursor :: Row -> IO RowCursor
@@ -1221,7 +1290,12 @@ untakenCursor row = do
   pure cursor
 
 inRow :: Row -> Input a -> IO a
-inRow row = runOn (rowContext row) (rowEnd row)
+inRow row parse = runOn (rowContext row) (rowEnd row) parse `onException` invalidateRow row
+
+-- A parser may have compacted supplied input before it throws. Its previous
+-- cursor cannot safely be resumed even if the row callback catches the error.
+invalidateRow :: Row -> IO ()
+invalidateRow row = atomicModifyIORef' (rowCursor row) (\cursor -> (cursor {cursorActive = False}, ()))
 
 -- | What a handler makes of a message.
 data Reply a

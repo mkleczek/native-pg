@@ -23,6 +23,7 @@ module Database.PostgreSQL.Protocol.Codec.Input
     readInputWord8,
     readInputWord16,
     readInputWord32,
+    readInputBorrowedSome,
     runBodyParser,
     runInput,
     runInputUntil,
@@ -253,6 +254,15 @@ readInputSome count = do
   putBuffer (consume size buffer)
   pure value
 {-# INLINE readInputSome #-}
+
+-- | Borrows one chunk until the next input read or operation scope end.
+-- Callers must enforce exclusivity and the scope of the returned slice.
+readInputBorrowedSome :: Int -> Input ByteString
+readInputBorrowedSome count = do
+  (size, buffer) <- someInput count
+  putBuffer (consume size buffer)
+  pure (slice size buffer)
+{-# INLINE readInputBorrowedSome #-}
 
 -- Scalars decode directly from the current storage instead of constructing
 -- an owned ByteString that reusable input would have to copy.

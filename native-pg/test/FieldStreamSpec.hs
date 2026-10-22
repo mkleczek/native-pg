@@ -21,7 +21,7 @@ import Skeletest hiding (context)
 
 spec :: Spec
 spec = describe "borrowed field streams" $ do
-  xfail "column chunks still use owned pulls" $ it "borrows columnChunks directly from the supplied input" $
+  it "borrows columnChunks directly from the supplied input" $
     withFields [Just payload] ready $ \context input -> do
       inside <- newIORef True
       received <- newIORef BS.empty
@@ -32,7 +32,7 @@ spec = describe "borrowed field streams" $ do
       readIORef inside `shouldReturn` True
       readIORef received `shouldReturn` payload
 
-  xfail "scoped column source still uses owned pulls" $ it "borrows a Source until its next pull or scope end" $
+  it "borrows a Source until its next pull or scope end" $
     withFields [Just payload] ready $ \context input -> do
       inside <- newIORef True
       received <- newIORef BS.empty
@@ -45,7 +45,7 @@ spec = describe "borrowed field streams" $ do
       readIORef inside `shouldReturn` True
       readIORef received `shouldReturn` payload
 
-  xfail "column Source is not yet scoped independently from its row" $ it "expires an escaped Source even before the row callback returns" $
+  it "expires an escaped Source even before the row callback returns" $
     withFields [Just "abc"] ready $ \context _ -> do
       result <- PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
@@ -54,7 +54,7 @@ spec = describe "borrowed field streams" $ do
         case failure of Left (RowMisuse _) -> pure (); _ -> failTest "escaped Source remained readable") ()
       result `shouldBe` (Right ((), "SELECT 1"), TxIdle)
 
-  xfail "borrowed callbacks do not yet exclude recursive row use" $ it "rejects row advancement during a borrowed callback" $
+  it "rejects row advancement during a borrowed callback" $
     withFields [Just payload] ready $ \context _ -> do
       _ <- PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
@@ -63,7 +63,7 @@ spec = describe "borrowed field streams" $ do
           case failure of Left (RowMisuse _) -> pure (); _ -> failTest "row advanced during borrowed callback") ()
       pure ()
 
-  xfail "caught borrowed callback failures can still complete a row" $ it "keeps a caught borrowed callback failure terminal" $
+  it "keeps a caught borrowed callback failure terminal" $
     withFields [Just payload] ready $ \context _ -> do
       result <- try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
@@ -71,7 +71,7 @@ spec = describe "borrowed field streams" $ do
         pure ()) ()
       case result of Left (RowMisuse _) -> pure (); _ -> failTest "failed callback left a recoverable row"
 
-  xfail "caught parser failures do not yet invalidate rows" $ it "invalidates a row after a caught materialization failure" $
+  it "invalidates a row after a caught materialization failure" $
     withFields [Just payload] ready $ \context _ -> do
       result <- try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
