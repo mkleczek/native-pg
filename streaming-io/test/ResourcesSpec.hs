@@ -7,6 +7,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import System.Timeout (timeout)
 import Control.Concurrent.STM (atomically, retry, orElse)
 import Data.Maybe (isNothing)
+import Data.Tuple (Solo (MkSolo))
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Storable (peek, poke)
 import Data.Either (isLeft)
@@ -34,110 +35,140 @@ spec = do
  describe "storage" $ do
   it "initializes blocks once and reuses their addresses and contents" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      first <- withBuffers resources (positiveInt @1) $ \[buffer] -> do
+      first <- withBuffers @(Solo Buffer) resources $ withOneBuffer $ \buffer -> do
         bufferCapacity buffer `shouldBe` 8
         withForeignPtr (bufferMemory buffer) $ \pointer -> do
           peek pointer `shouldReturn` 0
           poke pointer 73
         pure (bufferMemory buffer)
-      withBuffers resources (positiveInt @1) $ \[buffer] -> do
+      withBuffers @(Solo Buffer) resources $ withOneBuffer $ \buffer -> do
         bufferMemory buffer `shouldBe` first
         withForeignPtr (bufferMemory buffer) $ \pointer -> peek pointer `shouldReturn` 73
 
  describe "whole-block grants" $ do
   it "acquires every requested block or leaves all available blocks alone" $
     withResources (ResourceSettings (positiveInt @25) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      first <- atomically (tryAcquire resources (positiveInt @2)) >>= requireLease
-      length (leaseBuffers first) `shouldBe` 2
-      isNothing <$> atomically (tryAcquire resources (positiveInt @2)) `shouldReturn` True
-      lastBlock <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
-      isNothing <$> atomically (tryAcquire resources (positiveInt @1)) `shouldReturn` True
-      atomically (release first >> release lastBlock)
-      allBlocks <- atomically (tryAcquire resources (positiveInt @3)) >>= requireLease
-      length (leaseBuffers allBlocks) `shouldBe` 3
+      first <- atomically (tryAcquire @(Buffer, Buffer) resources) >>= requireLease
+      let (firstBuffer, secondBuffer) = leaseBuffers first
+      bufferMemory firstBuffer `shouldNotBe` bufferMemory secondBuffer
+      isNothing <$> atomically (tryAcquire @(Buffer, Buffer) resources) `shouldReturn` True
+      lastBlock <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
+      isNothing <$> atomically (tryAcquire @(Solo Buffer) resources) `shouldReturn` True
+      atomically (release lastBlock >> release first)
+      allBlocks <- atomically (tryAcquire @(Buffer, Buffer, Buffer) resources) >>= requireLease
+      let (a, b, c) = leaseBuffers allBlocks
+      map bufferMemory [a, b, c] `shouldBe` map bufferMemory [firstBuffer, secondBuffer, onlyBuffer (leaseBuffers lastBlock)]
       atomically (release allBlocks)
+  it "returns five-block tuples without copying buffer payloads" $
+    withResources (ResourceSettings (positiveInt @40) (positiveInt @8) (positiveInt @8)) $ \resources -> do
+      original <- withBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) resources $ \(a, b, c, d, e) -> do
+        withForeignPtr (bufferMemory c) $ \pointer -> poke pointer 91
+        pure (map bufferMemory [a, b, c, d, e])
+      withBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) resources $ \(a, b, c, d, e) -> do
+        map bufferMemory [a, b, c, d, e] `shouldBe` original
+        withForeignPtr (bufferMemory c) $ \pointer -> peek pointer `shouldReturn` 91
   it "throws for loan counts that exceed capacity" $
     withResources (ResourceSettings (positiveInt @24) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      largest <- requirePositive (toInteger (maxBound :: Int))
-      mapM_ (\count -> do
-        result <- try (atomically (tryAcquire resources count)) :: IO (Either IOError (Maybe Lease))
-        isLeft result `shouldBe` True) [positiveInt @4, largest]
+      result <- try (atomically (tryAcquire @(Buffer, Buffer, Buffer, Buffer) resources)) :: IO (Either IOError (Maybe (Lease (Buffer, Buffer, Buffer, Buffer))))
+      isLeft result `shouldBe` True
   it "rolls back a grant with other admission checks in the same transaction" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      _ <- atomically $ (tryAcquire resources (positiveInt @1) >> retry) `orElse` pure ()
-      lease <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      _ <- atomically $ (tryAcquire @(Solo Buffer) resources >> retry) `orElse` pure ()
+      lease <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
       atomically (release lease)
 
  describe "lease ownership" $ do
   it "returns a lease only once even after another borrower acquires its blocks" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      first <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      first <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
       atomically (release first >> release first)
-      second <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      second <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
       atomically (release first)
-      isNothing <$> atomically (tryAcquire resources (positiveInt @1)) `shouldReturn` True
+      isNothing <$> atomically (tryAcquire @(Solo Buffer) resources) `shouldReturn` True
       atomically (release second)
   it "rejects acquisition after the owning scope ends, including after a late return" $ do
     (resources, lease) <- withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      lease <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      lease <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
       pure (resources, lease)
     atomically (release lease)
-    result <- try (atomically (tryAcquire resources (positiveInt @1))) :: IO (Either IOError (Maybe Lease))
+    result <- try (atomically (tryAcquire @(Solo Buffer) resources)) :: IO (Either IOError (Maybe (Lease (Solo Buffer))))
     isLeft result `shouldBe` True
   it "returns buffers after callback exceptions" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      result <- try (withBuffers resources (positiveInt @1) $ const $ ioError (userError "callback")) :: IO (Either IOError ())
+      result <- try (withBuffers @(Solo Buffer) resources $ const $ ioError (userError "callback")) :: IO (Either IOError ())
       isLeft result `shouldBe` True
-      timeout 1000000 (withBuffers resources (positiveInt @1) (pure . length)) `shouldReturn` Just 1
+      timeout 1000000 (withBuffers @(Solo Buffer) resources (const (pure (1 :: Int)))) `shouldReturn` Just 1
   it "returns buffers after asynchronous cancellation" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       started <- newEmptyMVar
       hold <- newEmptyMVar
       done <- newEmptyMVar
       worker <- forkFinally
-        (withBuffers resources (positiveInt @1) $ const $ putMVar started () >> takeMVar hold)
+        (withBuffers @(Solo Buffer) resources $ const $ putMVar started () >> takeMVar hold)
         (const $ putMVar done ())
       timeout 1000000 (takeMVar started) `shouldReturn` Just ()
       killThread worker
       timeout 1000000 (takeMVar done) `shouldReturn` Just ()
-      timeout 1000000 (withBuffers resources (positiveInt @1) (pure . length)) `shouldReturn` Just 1
+      timeout 1000000 (withBuffers @(Solo Buffer) resources (const (pure (1 :: Int)))) `shouldReturn` Just 1
   it "cancels blocked acquisition without consuming a future return" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      lease <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      lease <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
       started <- newEmptyMVar
       done <- newEmptyMVar
       worker <- forkFinally
-        (putMVar started () >> withBuffers resources (positiveInt @1) (pure . length))
+        (putMVar started () >> withBuffers @(Solo Buffer) resources (const (pure (1 :: Int))))
         (putMVar done)
       takeMVar started
       killThread worker
       outcome <- timeout 1000000 (takeMVar done)
       fmap isLeft outcome `shouldBe` Just True
       atomically (release lease)
-      timeout 1000000 (withBuffers resources (positiveInt @1) (pure . length)) `shouldReturn` Just 1
+      timeout 1000000 (withBuffers @(Solo Buffer) resources (const (pure (1 :: Int)))) `shouldReturn` Just 1
+
+  it "wakes blocked borrowers when their resource scope retires" $ do
+    started <- newEmptyMVar
+    done <- newEmptyMVar
+    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
+      _ <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
+      _ <- forkFinally
+        (putMVar started () >> withBuffers @(Solo Buffer) resources (const (pure (1 :: Int))))
+        (putMVar done)
+      takeMVar started
+    outcome <- timeout 1000000 (takeMVar done)
+    fmap isLeft outcome `shouldBe` Just True
 
  describe "setup capacity" $ do
   it "admits setup while every stream block is busy" $
     withResources (ResourceSettings (positiveInt @16) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      streams <- atomically (tryAcquire resources (positiveInt @2)) >>= requireLease
-      setup <- atomically (tryAcquireSetup resources (positiveInt @1)) >>= requireLease
-      map bufferMemory (leaseBuffers setup) `shouldNotBe` map bufferMemory (leaseBuffers streams)
-      isNothing <$> atomically (tryAcquireSetup resources (positiveInt @1)) `shouldReturn` True
+      streams <- atomically (tryAcquire @(Buffer, Buffer) resources) >>= requireLease
+      setup <- atomically (tryAcquireSetup @(Solo Buffer) resources) >>= requireLease
+      let MkSolo setupBuffer = leaseBuffers setup
+          (streamA, streamB) = leaseBuffers streams
+      bufferMemory setupBuffer `shouldNotBe` bufferMemory streamA
+      bufferMemory setupBuffer `shouldNotBe` bufferMemory streamB
+      isNothing <$> atomically (tryAcquireSetup @(Solo Buffer) resources) `shouldReturn` True
       atomically (release streams >> release setup)
   it "validates requests against setup capacity" $
     withResources (ResourceSettings (positiveInt @16) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      result <- try (atomically (tryAcquireSetup resources (positiveInt @2))) :: IO (Either IOError (Maybe Lease))
+      result <- try (atomically (tryAcquireSetup @(Buffer, Buffer) resources)) :: IO (Either IOError (Maybe (Lease (Buffer, Buffer))))
       isLeft result `shouldBe` True
   it "reuses setup storage without taking a stream block" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      setupMemory <- withSetupBuffers resources (positiveInt @1) $ \[buffer] -> pure (bufferMemory buffer)
-      streams <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
-      timeout 1000000 (withSetupBuffers resources (positiveInt @1) $ \[buffer] -> do
+      setupMemory <- withSetupBuffers @(Solo Buffer) resources $ withOneBuffer $ \buffer -> pure (bufferMemory buffer)
+      streams <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
+      streamMemory <- withOneBuffer (pure . bufferMemory) (leaseBuffers streams)
+      timeout 1000000 (withSetupBuffers @(Solo Buffer) resources $ withOneBuffer $ \buffer -> do
         bufferMemory buffer `shouldBe` setupMemory
-        bufferMemory buffer `shouldNotBe` bufferMemory (head (leaseBuffers streams))) `shouldReturn` Just ()
+        bufferMemory buffer `shouldNotBe` streamMemory) `shouldReturn` Just ()
       atomically (release streams)
 
-requireLease :: Maybe Lease -> IO Lease
+withOneBuffer :: (Buffer -> IO a) -> Solo Buffer -> IO a
+withOneBuffer action (MkSolo buffer) = action buffer
+
+onlyBuffer :: Solo Buffer -> Buffer
+onlyBuffer (MkSolo buffer) = buffer
+
+requireLease :: Maybe (Lease grant) -> IO (Lease grant)
 requireLease = maybe (failTest "expected an available lease") pure
 
 rejects :: ResourceSettings -> IO ()
