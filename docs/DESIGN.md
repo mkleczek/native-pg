@@ -67,6 +67,43 @@ The library's runtime state is only:
 
 Everything else lives in types or belongs to the client.
 
+## Shared operation resources
+
+The independent `streaming-io` package owns fixed initialized blocks, with
+separate body and setup budgets. `withResources` brackets the service; its
+lifetime encloses all connection pools and active operations. Blocks are
+allocated and initialized once, not for each loan. A pool grant is atomic:
+it either supplies all requested blocks or waits without holding a partial set.
+
+`Database.PostgreSQL.Streaming.connect` and `connectFirst` borrow a temporary
+setup pair for startup, authentication and host qualification. The returned
+`Connection` retains no payload buffers. `withOperation resources connection`
+borrows a body pair and supplies an opaque `Context`; context-aware Session,
+Pipeline and Transaction entrypoints use it. These facades are for callers
+whose operation owns its whole grant. An HTTP/database integration instead
+reserves all blocks and a ready connection together, then uses the internal
+context constructor, avoiding nested acquisitions of the same finite pool.
+
+Connection and operation scopes are distinct. Only one scope may use a
+connection at a time; input and output storage must be disjoint. Contexts,
+rows and borrowed sources expire before storage is returned. A source can
+run on a child thread inside its scope, but teardown cancels and joins an
+unfinished operation before releasing the grant. Transport callbacks must
+therefore be cancellable. These contracts do not introduce a transport mutex.
+
+The fixed budget covers borrowed body workspace. Owned protocol metadata,
+control-plane operations, deliberately materialized values, TLS internal
+allocations and kernel buffers are separate. An application can share the
+same resources across HTTP and database pools; request handlers need only
+connect sources and synchronous sinks.
+
+Resource sizes and loan counts use opaque `PositiveInt` values.
+`positiveInt @n` checks constant positivity and the target `Int` range at compile
+time; `mkPositiveInt` checks runtime configuration before narrowing from
+`Integer`. Pool capacity and combined budget constraints remain runtime checks.
+The compiler boundary fixtures can be checked from `streaming-io/` with
+`GHC=ghc sh test/check-positive-int.sh`, alongside the Skeletest runtime tests.
+
 ## Caller-owned buffers
 
 `Database.PostgreSQL.Buffer` identifies initialized, fixed-capacity storage.
@@ -533,15 +570,17 @@ Ordinary `ParameterStream` chunks retain their existing owned-value contract.
 
 ### Values outside transport storage
 
-Contiguous parser values must fit the supplied input region. The parser never
-grows that region, and protocol frame boundaries still prevent reads crossing
-into the next message. Large streamed columns pass through repeated refills.
-A value that must be contiguous cannot make progress merely by waiting for the
-same undersized buffer; it fails and the caller must supply suitable storage.
+The low-level contiguous `readInputExactly` primitive requires its value to
+fit the supplied input region. Borrowed body chunks use repeated refills and
+keep their original supplied storage. Explicit owned field decoders instead
+assemble stable values across refills and can allocate the whole field.
 
-Owned metadata can contain many small fields copied across successive refills,
-so its aggregate size is independent of input capacity. Materialized `CopyData`
-also needs its entire body to fit; Session has no streamed COPY parser.
+Protocol discriminators may need lookahead beyond a tiny body block. The
+concrete parser temporarily owns that metadata, then restores the supplied
+buffer before exposing body slices. C strings, authentication payloads and
+other owned metadata also span refills. This allocation is protocol overhead,
+not an expansion of the borrowed body workspace. Session has no streamed COPY
+parser; materializing a `CopyData` message remains an owned-value path.
 
 Notifications received during a query are copied into a FIFO until
 `awaitNotification` can return them. Stopping socket reads at a queued
