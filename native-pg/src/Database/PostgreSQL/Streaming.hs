@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 -- | Operation-scoped byte storage. Connections keep only transport and
 -- protocol state between calls; Resources can be shared with an HTTP server.
 module Database.PostgreSQL.Streaming
@@ -7,13 +8,27 @@ module Database.PostgreSQL.Streaming
   ) where
 
 import Database.PostgreSQL.ConnectionString (ConnectionString, Host)
+import qualified Database.PostgreSQL.Buffer as Buffer
+import qualified Database.PostgreSQL.Internal.Context as Context
 import Database.PostgreSQL.Session (Connection, Context, ConnectSettings, ServerInfo)
+import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Resources (Resources)
+import qualified Network.Streaming.Resources.Internal as Resources
 
 -- | Borrow an initialized input/output pair for one exclusive connection
 -- scope. Borrowed rows and streams expire before the pair is returned.
 withOperation :: Resources -> Connection -> (Context -> IO a) -> IO a
-withOperation _ _ _ = ioError (userError "pooled operations are not implemented")
+withOperation resources connection action = Resources.withBuffers resources (positiveInt @2) $ \buffers ->
+  case buffers of
+    [input, output] -> do
+      input' <- buffer input
+      output' <- buffer output
+      Context.withContext connection input' output' action
+    _ -> ioError (userError "invalid operation workspace grant")
+
+buffer :: Resources.Buffer -> IO Buffer.Buffer
+buffer descriptor = Buffer.bufferFromInitializedMemory
+  (Resources.bufferMemory descriptor) (Resources.bufferCapacity descriptor)
 
 -- | Establish a connection using the separate setup budget. The returned
 -- connection retains no payload workspace.

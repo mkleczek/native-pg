@@ -20,7 +20,7 @@ import System.Timeout (timeout)
 
 spec :: Spec
 spec = describe "shared operation resources" $ do
-  xfail "the pooled operation facade is not implemented" $ it "holds exactly a pair only within the operation" $ do
+  it "holds exactly a pair only within the operation" $ do
     withResources settings $ \resources -> do
       connection <- Context.newConnection idleChannel 16
       PG.withOperation resources connection $ \_ -> do
@@ -29,7 +29,7 @@ spec = describe "shared operation resources" $ do
       unavailable resources `shouldReturn` False
       PG.isConnectionUsable connection `shouldReturn` True
 
-  xfail "the pooled operation facade is not implemented" $ it "returns storage and invalidates the connection after a callback failure" $ do
+  it "returns storage and invalidates the connection after a callback failure" $ do
     withResources settings $ \resources -> do
       connection <- Context.newConnection idleChannel 16
       result <- try @IOException $ PG.withOperation resources connection $ \_ -> ioError (userError "stop")
@@ -37,7 +37,7 @@ spec = describe "shared operation resources" $ do
       unavailable resources `shouldReturn` False
       PG.isConnectionUsable connection `shouldReturn` False
 
-  xfail "the pooled operation facade is not implemented" $ it "does not consume a partial pair while waiting or after cancellation" $ do
+  it "does not consume a partial pair while waiting or after cancellation" $ do
     withResources settings $ \resources -> Resources.withBuffers resources (positiveInt @1) $ \_ -> do
       connection <- Context.newConnection idleChannel 16
       entered <- newEmptyMVar
