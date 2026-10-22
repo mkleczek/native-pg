@@ -6,7 +6,7 @@ module Network.Streaming.Resources.Internal
   ) where
 
 import Control.Concurrent.STM
-  ( STM, TVar, atomically, newTVarIO, readTVar, writeTVar, retry, throwSTM )
+  ( STM, TVar, atomically, newTVar, newTVarIO, readTVar, writeTVar, retry, throwSTM )
 import Control.Exception (bracket)
 import Control.Monad (replicateM)
 import Foreign.Marshal.Utils (fillBytes)
@@ -25,8 +25,8 @@ data Buffer = Buffer
   , bufferCapacity :: !Int
   }
 
-data Resources = Resources !Int !(TVar [Buffer])
-data Lease = Lease !(TVar [Buffer]) [Buffer]
+data Resources = Resources !Int !(TVar [Buffer]) !(TVar Bool)
+data Lease = Lease !(TVar [Buffer]) [Buffer] !(TVar Bool)
 
 withResources :: ResourceSettings -> (Resources -> IO a) -> IO a
 withResources settings action
@@ -39,21 +39,26 @@ withResources settings action
         withForeignPtr memory $ \pointer -> fillBytes pointer 0 blockBytes
         pure (Buffer memory blockBytes)
       free <- newTVarIO buffers
-      action (Resources (length buffers) free)
+      active <- newTVarIO True
+      bracket (pure (Resources (length buffers) free active))
+        (const $ atomically $ writeTVar active False >> writeTVar free []) action
   where
     invalid = ioError . userError
 
 tryAcquire :: Resources -> PositiveInt -> STM (Maybe Lease)
-tryAcquire (Resources capacity free) requested
+tryAcquire (Resources capacity free active) requested
   | count > capacity = throwSTM (userError "buffer count must fit capacity")
   | otherwise = do
+      alive <- readTVar active
+      if alive then pure () else throwSTM (userError "resources are retired")
       buffers <- readTVar free
       let (selected, remaining) = splitAt count buffers
       if length selected < count
         then pure Nothing
         else do
           writeTVar free remaining
-          pure (Just (Lease free selected))
+          returned <- newTVar False
+          pure (Just (Lease free selected returned))
   where
     count = positiveIntValue requested
 
@@ -61,12 +66,17 @@ tryAcquireSetup :: Resources -> PositiveInt -> STM (Maybe Lease)
 tryAcquireSetup = tryAcquire
 
 release :: Lease -> STM ()
-release (Lease free buffers) = do
-  available <- readTVar free
-  writeTVar free (buffers ++ available)
+release (Lease free buffers returned) = do
+  alreadyReturned <- readTVar returned
+  if alreadyReturned
+    then pure ()
+    else do
+      writeTVar returned True
+      available <- readTVar free
+      writeTVar free (buffers ++ available)
 
 leaseBuffers :: Lease -> [Buffer]
-leaseBuffers (Lease _ buffers) = buffers
+leaseBuffers (Lease _ buffers _) = buffers
 
 withBuffers :: Resources -> PositiveInt -> ([Buffer] -> IO a) -> IO a
 withBuffers resources count action =
