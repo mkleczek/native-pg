@@ -70,6 +70,7 @@ test-suite native-pg-spec
   type:               exitcode-stdio-1.0
   hs-source-dirs:     test
   other-modules:      CoreSpec
+                      OutputBufferSpec
                       TransportSpec
   main-is:            Main.hs
   ghc-options:        -Wall -threaded -F -pgmF=skeletest-preprocessor

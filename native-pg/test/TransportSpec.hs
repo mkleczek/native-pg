@@ -8,7 +8,9 @@ import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Database.PostgreSQL.Protocol (Sync (..), SyncType (SyncType))
-import Database.PostgreSQL.Protocol.Codec (InputSource (..), Output, serialize)
+import Database.PostgreSQL.Protocol.Codec (ByteStream (..), InputSource (..), Output, serialize)
+import Database.PostgreSQL.Protocol.Codec.Payload (Payload (RemainingBytesAtom, MaybeBytes32Atom))
+import Database.PostgreSQL.Protocol (Parameter (..))
 import Database.PostgreSQL.Transport
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes)
@@ -79,6 +81,37 @@ spec = describe "channels over a link without a socket" $ do
           }
     channel <- channelWith link sync
     timeout 1000000 (readBytes channel) `shouldReturn` Just "reply"
+
+  xfail "one large piece can exceed the transport gather budget" $
+    it "bounds each send even for a single large immutable value" $ do
+      let payload = BS.replicate 600000 42
+      checkGather (serialize @ByteString @'RemainingBytesAtom payload) payload
+
+  xfail "one stream chunk can exceed the transport gather budget" $
+    it "splits a large stream chunk without losing its partial-write suffix" $ do
+      let payload = BS.replicate 600000 61
+      next <- newIORef payload
+      let source = ByteStream (BS.length payload) (readIORef next <* writeIORef next BS.empty)
+          output = serialize @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterStream source))
+      checkGather output ("\0\9'\192" <> payload)
+
+checkGather :: Output -> ByteString -> IO ()
+checkGather output expected = do
+  calls <- newIORef []
+  sent <- newIORef BS.empty
+  let link = testLink
+        { testSend = \pieces -> do
+            let offered = BS.concat pieces
+                accepted = BS.take 100003 offered
+            modifyIORef' calls (BS.length offered :)
+            modifyIORef' sent (<> accepted)
+            pure (BS.length accepted),
+          testWritable = pure ()
+        }
+  channel <- channelWith link mempty
+  channelSend channel output
+  readIORef sent `shouldReturn` expected
+  (all (<= 262144) <$> readIORef calls) `shouldReturn` True
 
 -- No socket or file descriptor: the channel must use the link's waits.
 -- Unspecified waits and writes fail so that each test exercises the
