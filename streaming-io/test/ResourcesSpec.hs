@@ -2,6 +2,9 @@
 module ResourcesSpec (spec) where
 
 import Control.Exception (try)
+import Control.Concurrent (forkFinally, killThread)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import System.Timeout (timeout)
 import Control.Concurrent.STM (atomically, retry, orElse)
 import Data.Maybe (isNothing)
 import Foreign.ForeignPtr (withForeignPtr)
@@ -53,6 +56,54 @@ spec = do
       _ <- atomically $ (tryAcquire resources (positiveInt @1) >> retry) `orElse` pure ()
       lease <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
       atomically (release lease)
+
+ describe "lease ownership" $ do
+  xfail "per-lease return ownership is pending" $ it "returns a lease only once even after another borrower acquires its blocks" $
+    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
+      first <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      atomically (release first >> release first)
+      second <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      atomically (release first)
+      isNothing <$> atomically (tryAcquire resources (positiveInt @1)) `shouldReturn` True
+      atomically (release second)
+  xfail "resource retirement is pending" $ it "rejects acquisition after the owning scope ends, including after a late return" $ do
+    (resources, lease) <- withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
+      lease <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      pure (resources, lease)
+    atomically (release lease)
+    result <- try (atomically (tryAcquire resources (positiveInt @1))) :: IO (Either IOError (Maybe Lease))
+    isLeft result `shouldBe` True
+  it "returns buffers after callback exceptions" $
+    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
+      result <- try (withBuffers resources (positiveInt @1) $ const $ ioError (userError "callback")) :: IO (Either IOError ())
+      isLeft result `shouldBe` True
+      timeout 1000000 (withBuffers resources (positiveInt @1) (pure . length)) `shouldReturn` Just 1
+  it "returns buffers after asynchronous cancellation" $
+    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
+      started <- newEmptyMVar
+      hold <- newEmptyMVar
+      done <- newEmptyMVar
+      worker <- forkFinally
+        (withBuffers resources (positiveInt @1) $ const $ putMVar started () >> takeMVar hold)
+        (const $ putMVar done ())
+      timeout 1000000 (takeMVar started) `shouldReturn` Just ()
+      killThread worker
+      timeout 1000000 (takeMVar done) `shouldReturn` Just ()
+      timeout 1000000 (withBuffers resources (positiveInt @1) (pure . length)) `shouldReturn` Just 1
+  it "cancels blocked acquisition without consuming a future return" $
+    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
+      lease <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
+      started <- newEmptyMVar
+      done <- newEmptyMVar
+      worker <- forkFinally
+        (putMVar started () >> withBuffers resources (positiveInt @1) (pure . length))
+        (putMVar done)
+      takeMVar started
+      killThread worker
+      outcome <- timeout 1000000 (takeMVar done)
+      fmap isLeft outcome `shouldBe` Just True
+      atomically (release lease)
+      timeout 1000000 (withBuffers resources (positiveInt @1) (pure . length)) `shouldReturn` Just 1
 
 requireLease :: Maybe Lease -> IO Lease
 requireLease = maybe (failTest "expected an available lease") pure
