@@ -124,7 +124,8 @@ withInputSome count use = do
 data InputEnv = InputEnv
   { envSource :: InputSource,
     -- | The position where the innermost bounded part ends.
-    envLimit :: {-# UNPACK #-} !Int
+    envLimit :: {-# UNPACK #-} !Int,
+    envFramed :: !Bool
   }
 
 -- | The input is malformed, or ended early.
@@ -218,7 +219,7 @@ runInput source = runInputUntil source unbounded
 -- | Like 'runInput', but the parser can't read past the given position.
 runInputUntil :: InputSource -> Int -> InputBuffer -> Input a -> IO (a, InputBuffer)
 runInputUntil source limit buffer (Input parser) = IO $ \s ->
-  case parser (InputEnv source limit) buffer s of
+  case parser (InputEnv source limit False) buffer s of
     (# s', buffer', a #) -> (# s', (a, buffer') #)
 {-# INLINE runInputUntil #-}
 
@@ -226,7 +227,10 @@ runInputUntil source limit buffer (Input parser) = IO $ \s ->
 -- | Like 'runInputUntil', batching refills within the current envelope while
 -- preserving the next envelope for a later operation.
 runInputFramedUntil :: InputSource -> Int -> InputBuffer -> Input a -> IO (a, InputBuffer)
-runInputFramedUntil = runInputUntil
+runInputFramedUntil source limit buffer (Input parser) = IO $ \s ->
+  case parser (InputEnv source limit True) buffer s of
+    (# s', buffer', a #) -> (# s', (a, buffer') #)
+{-# INLINE runInputFramedUntil #-}
 
 inputPosition :: InputBuffer -> Int
 inputPosition = bufferPosition
@@ -338,15 +342,24 @@ ensureAvailable count = Input $ \env buffer s ->
     else
       if bufferEnd buffer - bufferStart buffer >= count
         then (# s, buffer, buffer #)
-        else case unIO (fill (envSource env) count buffer) s of
+        else case unIO (fill (envSource env) (refillEnd env buffer count) count buffer) s of
           (# s', buffer' #) -> (# s', buffer', buffer' #)
 {-# INLINE ensureAvailable #-}
+
+-- Exact envelope headers establish the bound; body refills can then batch
+-- without pulling bytes that would outlive the current operation.
+refillEnd :: InputEnv -> InputBuffer -> Int -> Int
+refillEnd env buffer count
+  | not (envFramed env) = maxBound
+  | envLimit env == maxBound = bufferPosition buffer + count
+  | otherwise = envLimit env
+{-# INLINE refillEnd #-}
 
 -- | Reads until the given number of bytes is available. Reads go to the free
 -- part of the current allocation if the bytes fit there, and otherwise to a
 -- new initialized allocation. Caller-owned input compacts in place instead.
-fill :: InputSource -> Int -> InputBuffer -> IO InputBuffer
-fill source count buffer
+fill :: InputSource -> Int -> Int -> InputBuffer -> IO InputBuffer
+fill source end count buffer
   | bufferReusable buffer && count > bufferCapacity buffer =
       throwIO (InputError ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (bufferCapacity buffer)))
   | bufferStart buffer + count <= bufferCapacity buffer = readUntilAvailable buffer
@@ -371,7 +384,9 @@ fill source count buffer
       | otherwise = do
           received <-
             withForeignPtr (bufferMemory current) $ \pointer ->
-              readInputInto source (pointer `plusPtr` bufferEnd current) (bufferCapacity current - bufferEnd current)
+              readInputInto source (pointer `plusPtr` bufferEnd current)
+                (min (bufferCapacity current - bufferEnd current)
+                  (end - bufferPosition current - (bufferEnd current - bufferStart current)))
           when (received <= 0) (throwIO (InputError "unexpected end of input"))
           readUntilAvailable current {bufferEnd = bufferEnd current + received}
 {-# NOINLINE fill #-}

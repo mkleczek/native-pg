@@ -6,6 +6,7 @@ module Database.PostgreSQL.Internal.Context
     withContext,
     contextConnection,
     contextInput,
+    runContextInput,
     contextOutput,
     contextPending,
     contextReadSize,
@@ -21,15 +22,15 @@ module Database.PostgreSQL.Internal.Context
 
 import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (MVar, newMVar, takeMVar, putMVar, readMVar)
-import Control.Exception (Exception (..), finally, mask, onException, throwIO)
+import Control.Exception (Exception (..), catch, finally, mask, onException, throwIO)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Database.PostgreSQL.Buffer (Buffer, bufferCapacity)
 import Database.PostgreSQL.Diagnostics (ServerError (..))
-import Database.PostgreSQL.Protocol.Codec (InputBuffer, reusableInputBuffer, emptyInputBuffer)
+import Database.PostgreSQL.Protocol.Codec (Input, InputBuffer, InputError (..), reusableInputBuffer, emptyInputBuffer, runInputUntil, runInputFramedUntil)
 import Database.PostgreSQL.Protocol.Messages (Notification)
-import Database.PostgreSQL.Transport (Channel, OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer)
+import Database.PostgreSQL.Transport (Channel (..), OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer)
 
 data Connection = Connection
   { -- | Input and output over the socket, or TLS over it.
@@ -124,6 +125,20 @@ newOwnedContext connection = do
   finished <- newMVar ()
   pure (Context connection (connectionBuffer connection) (connectionOutput connection)
     (connectionUnsent connection) (connectionReadSize connection) False use finished)
+
+-- | Runs a concrete parser against this operation's cursor and pending
+-- output. Supplied scopes never read beyond a known protocol envelope.
+runContextInput :: Context -> Int -> Input a -> IO a
+runContextInput context limit parse = do
+  ensureContextActive context
+  input <- readIORef (contextInput context)
+  let connection = contextConnection context
+      source = channelInput (connectionChannel connection) (contextPending context) (contextReadSize context)
+      run = if contextScoped context then runInputFramedUntil else runInputUntil
+  (result, input') <- run source limit input parse
+    `catch` \(InputError reason) -> throwIO (ProtocolError reason)
+  writeIORef (contextInput context) input'
+  pure result
 
 -- | Binds supplied initialized buffers for the callback. Acquires the
 -- connection before exposing the Context and cancels/joins any operation

@@ -40,7 +40,7 @@ spec = describe "protocol framing" $ do
       skipInput (fromIntegral size)
       pure "streamed") `shouldReturn` Right "streamed"
 
-  xfail "framed refill isolation is declared but not implemented" $ it "batches primitive reads inside a frame without pulling its successor" $ do
+  it "batches primitive reads inside a frame without pulling its successor" $ do
     let body = outputByteString (mconcat (replicate 100 (serialize @Int32 @('FixedBytesAtom 4) 7)))
         envelope = outputByteString (serialize @Int32 @('FixedBytesAtom 4) 400) <> body
         bytes = envelope <> "next"
