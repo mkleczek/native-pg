@@ -38,9 +38,9 @@ The library does none of the following:
   different connections concurrently. Direct users of transport links or
   channels must ensure exclusive access to each connection.
 
-Pipeline planning completes before `runBatch` sends anything. It retains the
-statement descriptions, parameters and result continuations for that pipeline;
-stream callbacks are not pulled during planning. Buffer capacity governs the
+Pipeline planning completes before `pipeline` queues its output. It retains the
+statement descriptions, parameters and result cursors for that pipeline;
+parameter sources are not pulled during planning. Buffer capacity governs the
 subsequent transfer, but does not bound this retained plan. Incremental planning
 would require a separate protocol/transaction design, rather than a quota on
 the current API.
@@ -61,12 +61,13 @@ A persistent `Connection` retains the transport channel, protocol usability
 state and owned notification metadata. It does not retain an operation's input
 cursor, pending output or output scratch allocation.
 
-An explicit `Context` binds that connection to its input cursor, output workspace
+A private `Context` binds that connection to its input cursor, output workspace
 and pending writes. The private supplied-buffer constructor claims the
 connection for its callback and expires the context before releasing storage.
-The owned compatibility `Session` carries its own context rather than installing
-request buffers into connection IORefs. Context-aware Session, Pipeline and
-Transaction entrypoints share the same state machine and concrete `Input` parser.
+A standalone owned `Session` carries its own context rather than installing
+request buffers into connection IORefs. Both buffer callbacks supply a public
+`Session` directly; `Transaction.runTransaction` accepts that handle. These
+paths share the same state machine and concrete `Input` parser.
 
 A channel's input-source constructor receives the current context's pending
 writes explicitly. It can advance output while waiting for input without
@@ -82,15 +83,18 @@ separate body and setup budgets. `withResources` brackets the service; its
 lifetime encloses all connection pools and active operations. Blocks are
 allocated and initialized once, not for each loan. A pool grant is atomic:
 it either supplies all requested blocks or waits without holding a partial set.
+The grant type fixes the number of blocks: `Solo Buffer` for one block, or a
+homogeneous tuple of two through five `Buffer` values. Integration callbacks
+receive that shape directly. `Lease grant` preserves it through STM admission,
+`leaseBuffers` and release; no runtime count or partial list match is needed.
 
 `Database.PostgreSQL.Streaming.connect` and `connectFirst` borrow a temporary
 setup pair for startup, authentication and host qualification. The returned
 `Connection` retains no payload buffers. `withOperation resources connection`
-borrows a body pair and supplies an opaque `Context`; context-aware Session,
-Pipeline and Transaction entrypoints use it. These facades are for callers
+borrows a body pair and supplies an opaque `Session`. These facades are for callers
 whose operation owns its whole grant. An HTTP/database integration instead
-reserves all blocks and a ready connection together, then uses the internal
-context constructor, avoiding nested acquisitions of the same finite pool.
+reserves all blocks and a ready connection together, then uses public
+`withBuffers`, avoiding nested acquisitions of the same finite pool.
 
 Connection and operation scopes are distinct. Only one scope may use a
 connection at a time; input and output storage must be disjoint. Contexts,
@@ -105,7 +109,8 @@ allocations and kernel buffers are separate. An application can share the
 same resources across HTTP and database pools; request handlers need only
 connect sources and synchronous sinks.
 
-Resource sizes and loan counts use opaque `PositiveInt` values.
+Resource sizes use opaque `PositiveInt` values. Grant sizes are determined by
+their tuple types.
 `positiveInt @n` checks constant positivity and the target `Int` range at compile
 time; `mkPositiveInt` checks runtime configuration before narrowing from
 `Integer`. Pool capacity and combined budget constraints remain runtime checks.
@@ -114,9 +119,22 @@ The compiler boundary fixtures can be checked from `streaming-io/` with
 
 ## Caller-owned buffers
 
-`Database.PostgreSQL.Internal.Buffer` identifies initialized, fixed-capacity storage.
-The client may allocate it itself and initialize it once before adding it
-to a pool. A loan gives one operation exclusive access; sharing a pool does
+`Buffer`, defined in `Network.Streaming.Buffer`, identifies initialized, fixed-capacity storage.
+Native-pg uses this shared descriptor directly. Allocation
+helpers live alongside it in `Network.Streaming.Buffer`; pool
+creation uses the same helpers. Each pool owns one contiguous initialized block
+and lends disjoint slices; any retained slice keeps the backing block alive.
+New allocations use `calloc`, satisfying TLS's initialized-destination requirement
+without clearing storage on each loan.
+Allocation budgets and block sizes require `PositiveInt`: constants are checked
+at compile time, while dynamic parser capacities use checked runtime construction.
+Pool counts follow directly from budget division; trailing bytes remain unused.
+Externally supplied descriptors still undergo operation-boundary validation.
+`Network.Streaming.Resources` owns configuration, acquisition and release; its
+`Resources` and `Lease` representations are private. The generic `ListPrefix`
+implementation is hidden, and no internal streaming-io module is exposed.
+Manually constructed descriptors must refer to already-initialized storage.
+A loan gives one operation exclusive access; sharing a pool does
 not permit two connections to use the same storage concurrently. TLS can
 reuse initialized storage without clearing it before every read.
 
@@ -125,20 +143,23 @@ byte-string results must keep their ownership semantics: they cannot become
 aliases of storage that the next read overwrites. Retained values are copied;
 borrowed values are consumed synchronously before the storage is reused.
 
-`bufferFromInitializedMemory` adapts shared initialized storage without clearing
-it on each loan. Input and output ranges must be disjoint, including descriptors
+The operation boundary validates positive capacities and requires at least four
+output bytes before entering the callback. Input and output ranges must be disjoint, including descriptors
 whose `ForeignPtr`s point into the same allocation at different offsets.
 
-Borrowed field consumers are separate from materializers. `columnChunks` and
-`streamChunks` call synchronous sinks directly inside the input loan.
-`withColumnStream` gives a length-bearing field source: bytes remain borrowed
-until its next pull or scope exit. Pulls are exclusive, row advancement is blocked
-while the source owns the column, and teardown cancels and joins an unfinished
-pull before returning storage. Repeated cancellation cannot interrupt that join.
-Caught parser or borrowed-callback exceptions still invalidate the row, because
-input may already have compacted before the exception occurred.
+Borrowed field consumers are separate from materializers. Public `nextChunk`
+returns a slice of input storage, valid until the next input operation or scope
+exit. Advancing a row, submitting another pipeline or finishing the transaction
+expires its field. Consumers copy bytes they need to retain.
 
-Explicit owned operations (`columnBytes`, decoded columns, and leading columns
+Private protocol helpers also support synchronous `columnChunks` sinks and a
+length-bearing `withColumnStream` source. In that private source interface,
+pulls are exclusive and row advancement is blocked while the source owns the
+column. Teardown cancels and joins an unfinished pull before returning storage;
+repeated cancellation cannot interrupt the join. Parser or borrowed-callback
+failures invalidate the row because input may already have compacted.
+
+Explicit owned operations (private `columnBytes`, decoded columns, and leading columns
 of a streaming decoder) assemble stable owned chunks across small input blocks.
 They may allocate the complete field size. PostgreSQL metadata C strings and
 remaining authentication payloads also assemble owned values across refills.
@@ -148,8 +169,9 @@ the application deliberately materializes or retains.
 
 Field EOF is not an execution or transaction success signal. Execution consumes
 trailing command completion and ready messages, and a transaction can still fail
-at `COMMIT`. A commit-safe response must finish the transaction before exposing
-its materialized body; borrowed field transfer alone cannot make that guarantee.
+at `COMMIT`. A streamed write response can withhold one owned final chunk until
+transaction completion. Earlier bytes may already be visible; a failure aborts
+the incomplete HTTP response instead of replacing it with an error response.
 
 ## Principles
 
@@ -185,17 +207,29 @@ The original code is a guideline, not a literal requirement.
    `DataRowType :: DataRowType (BackendSessionMessage 'D' (PayloadCounted16 'MaybeBytes32Atom))`.
    Shared shapes are named (`OidType`, `RowFieldType`) and referenced with
    `PayloadField`.
-3. **Semantic values are plain data, separate from the schema**, and
-   polymorphic in the byte representation (`DataRow bytes`, `RowField bytes`).
-   `Envelope a s` ties a value to its schema; `Scalar` wraps primitive-like
-   values.
+3. **Complete message types carry their framing.** Each is an
+   `Envelope PrivatePayload Schema` alias, polymorphic in its byte representation
+   where needed. Bidirectional patterns preserve construction and matching without
+   exporting raw payloads. `serialize SSLRequest` infers its schema from the
+   argument; no canonical-schema type family is needed. `Envelope` is a newtype
+   with a nominal schema role, so framing cannot be changed with `coerce`.
+   Complete-message parsers take that type first: `parseMessage @ReadyForQuery`
+   checks a byte string, while `parser @ReadyForQuery` runs in monomorphic
+   `Input` and leaves subsequent messages for the next parser. Both infer the
+   schema; private payload and schema parameters are invisible.
+   Primitive fields remain schema-directed: `serializeField` and `fieldParser`
+   explicitly select encodings such as a C string or remaining bytes. `Scalar`
+   wraps typed fields.
+   `DataRowHeader` is an incomplete streaming prefix and stays schema-directed.
 4. **Codecs are derived from the schema, not hand-written.** `HasConstructor`
    supplies the constructor, `ParseConstructor` folds it over the payload's
    fields, and the overlappable `Parsable a singleton` instance ties them
-   together. `Serializable` is derived the same way. Atom instances are
+   together. `Serializable` is derived the same way for the complete framed
+   type. `parseMessage` returns that type without adding another envelope.
+   Atom instances are
    explicit and sized exactly, so platform-sized `Int` can't slip in.
-5. **Input is pulled incrementally.** `MonadInput` reads only what a parser
-   needs from an `InputSource`; `withInputLimit` scopes a parser to a length
+5. **Input is pulled incrementally.** Monomorphic `Input` parsers read only
+   what they need from an `InputSource`; `withInputLimit` scopes a parser to a length
    prefix and discards whatever it leaves.
 6. **Messages are grouped by protocol phase**: `Startup`, `AuthBackend`,
    `AuthFrontend`, `FrontendSession`, `BackendSession`, `Copy`.
@@ -289,7 +323,8 @@ borrowed body chunks retain their existing lifetime contract.
 The state machine is a separate layer and a client of the parser. In each
 state it pulls the next message with the choice of messages legal there.
 
-Phases form a promoted kind and index the session, `Session (phase :: Phase)`.
+Private phases form a promoted kind and index the protocol engine's
+`Session (phase :: Phase)`. The public `Session` fixes the ready phase.
 Each phase is named after what the client waits for in it, and its
 `Accepts` instance lists, as an associated type, the server messages it
 accepts. Transitions are functions from a session in one phase to a session
@@ -324,26 +359,27 @@ any -> Broken | Closed
 - The client asks for protocol 3.0 by default. Version 3.2 is a setting:
   servers before 18 negotiate it down, and some connection poolers reject
   it.
-- `Ready` carries the transaction status from the last `ReadyForQuery`.
-  Transactions are plain SQL sent by the client; the library only reports
-  the status.
+- `ReadyForQuery` supplies the transaction status. The private protocol
+  layer reports it; the canonical transaction runtime sends `BEGIN`, `COMMIT`
+  or `ROLLBACK` and checks that completion leaves an idle session.
 - In `ExtendedQuery`, the expected responses follow from the frontend
   messages sent: `Parse` gives `ParseComplete`, `Bind` gives `BindComplete`,
   `Execute` gives `DataRow*` then `CommandComplete`, `EmptyQueryResponse` or
   `PortalSuspended`, and `Sync` gives `ReadyForQuery`. When the client sends
-  a pipeline as one typed value, the expected responses are computed from
-  its type rather than kept in a runtime queue. After an `ErrorResponse`,
-  everything up to the next `ReadyForQuery` is skipped.
+  a pipeline, each private protocol phase accepts its expected messages while
+  the transaction runtime tracks queued statements and cursor order. After
+  an `ErrorResponse`, everything up to the next `ReadyForQuery` is skipped.
 - `NoticeResponse`, `ParameterStatus` and `NotificationResponse` are accepted
   in every phase after authentication. Notices and parameter reports are
   skipped.
-- **Notifications.** The client listens with plain SQL (`LISTEN`) and pulls
+- **Notifications (private protocol support).** Tests listen with plain SQL (`LISTEN`) and pull
   each notification with `awaitNotification`, which blocks on an idle
   session. One that arrives during an operation, e.g. a session's own
   `NOTIFY`, which comes before its `ReadyForQuery`, is kept until the next
   `awaitNotification`. Notifications come out in the order they arrived. A
   listener whose session the server ends gets `ConnectionTerminated`, so it
-  knows to reconnect.
+  knows to reconnect. PostgREST does not currently require this interface, so
+  it is not part of the public client API.
 - **Cancelling.** `cancel` sends a `CancelRequest` with the session's backend
   key over a new connection, and waits for the server to close it, as libpq
   does. The cancelled statement fails in its own session with SQLSTATE
@@ -351,8 +387,10 @@ any -> Broken | Closed
 - Haskell can't stop a stale session handle from being reused, so the
   connection also tracks at run time whether it's idle, busy, broken or
   closed. An operation on a busy, broken or closed session fails. An
-  operation that throws leaves the session broken, because its protocol
-  state is then unknown. State transitions are masked against asynchronous
+  exception escaping a raw protocol operation leaves the session broken,
+  because its protocol state is then unknown. The transaction scope catches
+  query and ordinary application failures, drains and rolls back when safe,
+  and rethrows after cleanup. State transitions are masked against asynchronous
   exceptions, while the operation itself remains interruptible.
 - `close` marks an idle or broken session closed before ending the
   connection. Repeated calls do nothing, including after a close that
@@ -373,9 +411,10 @@ any -> Broken | Closed
   and schema operations to inline. Refills stay on the slow path. Cursor
   records and owned results can still allocate; an unboxed return tuple alone
   does not eliminate those allocations. Codec tests feed plain byte strings through this private API.
-- Borrowed result chunks expire on the next pull or when their callback ends.
-  Owned field decoders and `streamChunk` return stable values. Applications
-  copy borrowed data if they need to retain it beyond its scope.
+- Borrowed result chunks from `nextChunk` expire on the next input operation
+  or when the transaction scope ends. Owned field decoders return stable
+  values. Applications copy borrowed data before retaining it across an
+  input operation.
 - There is one library. Public modules live in `src/Database/PostgreSQL` and
   are listed in `exposed-modules`; implementation modules live below its
   `Internal/` directory and are listed in `other-modules`. Protocol messages,
@@ -387,9 +426,22 @@ any -> Broken | Closed
   interfaces to internal counterparts. Shared concrete types live in public
   `Types`, `Session.Settings`, `ConnectionString.Types`, `Streaming.Types` and
   `Transport.Link` modules. Private helpers are split by responsibility:
-  `Exchange`, `Startup`, `HostSelection`, `Channel` and `Socket`. Opaque handle
-  and result representations stay private where implementation modules need
-  their constructors; their public operations live in the public modules.
+  `Exchange`, `Startup`, `HostSelection`, `Channel` and `Socket`. `Transaction`
+  defines its opaque query types directly; their constructors remain hidden
+  from clients. Shared internal connection state remains private.
+- PostgREST's current production usage defines the client boundary. `Session`
+  exposes two opaque handles: `Connection` for pooled transport state and
+  `Session` for query operations with storage. `connection` retrieves the
+  persistent handle from a session, including the standalone owned path.
+  `close` and `isUsable` operate on `Connection`; `closeStatement` takes a
+  `Session`, and `cancel` uses connection settings and a backend key. `Context`
+  and buffer-to-session construction remain private. Configuration
+  belongs to `Session.Settings` and errors to `Diagnostics`. Execution and row
+  primitives are private. The public `Transaction` module defines statements,
+  pipelines, preparation, row schemas and scoped cursors, and composes those
+  primitives through one transaction engine.
+  The test-only integration package compiles both core and TLS sources, so
+  whitebox coverage does not require publishing low-level operations.
 - `Transport` deliberately exposes `Link` and TLS configuration for alternative
   transport providers. A provider builds an abstract `Channel` with `newChannel`
   and supplies it through `TlsClient`. Channel input, pending output and mutable
@@ -443,9 +495,68 @@ any -> Broken | Closed
   before taking it, and decides whether to take it whole or as a stream. So
   the client, not the server, decides what gets allocated for data.
 
-### Streaming API
+### Transaction and streaming API
 
-A streamed value has the same shape in both directions:
+`Database.PostgreSQL.Transaction` owns the query API: `Statement`, `Pipeline`,
+`RowDecoder`, `Result`, `Field`, preparation selection and transaction actions.
+Statements describe SQL, parameters, row decoding, cardinality and preparation
+eligibility. They do not refer to HTTP, sinks, sessions or buffer allocation.
+There are no separate statement, pipeline or pull transaction modules.
+
+`runTransaction` runs a rank-2 `Transaction tx` action and owns its cleanup.
+`Transaction` wraps `ReaderT Runtime IO` and derives its monad, `MonadIO` and
+`MonadUnliftIO` instances. `withRunInIO` captures that runtime for external
+`IO` callbacks; it does not open another transaction or allocate body storage.
+
+`Pipeline` wraps strict `StateT [Pending] (ReaderT Runtime IO)` and derives only
+`Functor` and `Applicative`. Each run starts with an empty pending list. Statements
+prepend to it in constant time, then one reversal restores wire order before
+submission. Preparation effects and cursor values retain applicative order.
+This avoids quadratic list append in left-associated batches; planning still
+retains metadata proportional to the number of statements.
+
+`pipeline` returns result cursors without reading their results; `nextRow` and
+`nextChunk` advance them on demand. Protocol operations enforce one calling
+thread, exclusive use and scope lifetime. Synchronous callback nesting between
+operations is allowed; re-entry while an operation is active is rejected.
+Escaped actions cannot access the database after the scope ends. The transaction
+driver starts no result worker. The parser remains the concrete `Input`
+implementation; transaction composition adds no `MonadInput` dictionary to
+parsing.
+
+`row` decodes owned metadata. `streamingRow` decodes that metadata followed by
+one nullable `Field tx`; `fieldLength` reports its declared length. `nextChunk`
+returns borrowed bytes until field EOF, represented by an empty chunk. A chunk
+expires at the next input operation or scope exit. Advancing its row, submitting
+another pipeline or finishing the transaction expires the field itself. Consume
+each chunk before those operations, or copy it before retaining it.
+
+Owned results use this same cursor engine. `rowList`, `singleRowValue` and
+`rowMaybeValue` consume `Result tx (Const a)` values; `singleRow` and `rowMaybe`
+constrain a statement's row schema. Owned single-row collectors count extra
+rows without decoding unused values, preserving cardinality errors.
+`foldRows` runs a transaction action for each decoded row, so a step can pull a
+field and send its chunks synchronously before the next row is requested.
+Collectors establish statement completion; successful transaction completion
+still requires `finishTransaction`.
+
+`finishTransaction` drains and validates remaining results, then observes the
+transaction ending. With `finalPipeline`, that ending was queued with the batch;
+otherwise it is sent after the results. A condemned transaction rolls back.
+Finishing an empty scope sends nothing. Leaving the scope unfinished drains
+pending results and rolls back any still-open transaction; an ending already
+queued by `finalPipeline` cannot be changed.
+
+Lifting and unlifting preserve application exceptions without wrapping them.
+An ordinary application exception between operations allows the scope to drain
+and roll back. Each protocol operation catches unsafe failures before returning
+to application code, so catching such a failure cannot make a broken connection
+reusable. Interrupted I/O and asynchronous exceptions escaping an unfinished
+scope discard the connection without waiting to drain, as do unsafe parser and
+parameter-source failures. A successfully finished transaction remains usable
+if later HTTP output fails.
+
+A streamed input parameter has this shape:
 
 ```haskell
 data ByteStream = ByteStream
@@ -458,16 +569,15 @@ data ByteStream = ByteStream
   A WAI request body with `KnownLength n` becomes
   `ByteStream n (getRequestBodyChunk req)`. A body without a length (chunked
   upload) has to be buffered by the client, or rejected.
-- **Results.** `execute` folds the rows with a step, and the step pulls
-  each row's columns in order with `nextColumn`. For each column the client
-  sees its length from the `DataRow` prefix, then takes the value whole
-  (`columnBytes`) or as a `ByteStream` (`columnStream`). `byteStreamNext`
-  returns slices of the read buffer, each at most the read size; the library
-  makes no copies. Reads are limited to the row, so a column can't run past
-  it.
-- **Scope.** A row is valid only during its step, and a column's stream only
-  until the next column is pulled; later use throws `RowMisuse`. Whatever the
-  client leaves unread is skipped.
+- **Callback results.** `Statement.scopedRow` or `foldRows` supplies a scoped row.
+  `decodeScopedStreamingNullable` decodes its leading columns and exposes the
+  last column as a nullable `ScopedStream`. `streamLength` reports its length;
+  `streamChunks` passes slices of the input buffer to a synchronous sink without
+  copying them. `streamChunk` instead returns an owned chunk.
+- **Scope.** The row and stream carry the callback's scope in their types.
+  Borrowed chunks expire when their sink callback returns. Private row
+  operations also check for stale access at runtime. Whatever the client
+  leaves unread is skipped.
 - **Measured.** A 64 MiB column streamed to a slow consumer through the
   default 16 KiB buffer didn't grow the live heap at all, sampled at 16 major
   collections on PostgreSQL 14, 17 and 18.
@@ -480,19 +590,18 @@ execution's result formats). The per-value decoders come from
 top of them, through typeclass metaprogramming:
 
 - **The columns are a type-level list.** In
-  `decodeRow @'[Int32, Maybe Text] row (\count name -> ...)`, an associated
-  type computes the function's type from the list. `DecodeRow` folds over the
-  list and decodes all the columns in one pass over the read buffer.
-  `decodeRow` is inlined, so each call site's decoding is specialized to its
-  columns, with no dictionaries left.
-- **A streamed last column.** `decodeRowStreaming` takes one more column, not
-  in the list, and passes it to the function as a `ByteStream`. A
-  `ByteStream` in the list is a type error that points to it.
+  `Transaction.row @'[Int32, Maybe Text] (\count name -> Const (count, name))`, an associated
+  type computes the function's type from the list. Private `DecodeRow`
+  machinery decodes the columns in one pass. The public combinators inline
+  through it, specializing each call site's decoding to its columns.
+- **A streamed last column.** `streamingRow` takes one more column, outside
+  the type-level list, and passes it to the constructor as `Maybe (Field tx)`.
+  A `ByteStream` in the list is a type error that points to it.
 - **Value types.** `DecodeValue` maps a Haskell type to a decoder:
   - integers, floats, `Bool`, `Scientific`, `Char`, `Text`, `UUID`, dates and
     times;
   - `ByteString` for `bytea`, and `Json` / `Jsonb` for JSON text. These
-    three are slices of the read buffer;
+    three produce owned values, independent of subsequent buffer reuse;
   - lists for one-dimensional arrays;
   - user types as composites, with `composite (Pair <$> field <*> field)`.
 - **NULL.** `DecodeField` lets `Maybe` accept NULL (in a column, an array
@@ -500,14 +609,20 @@ top of them, through typeclass metaprogramming:
 - **Sizes.** Fixed-size types check the value's size, so an `int4` read as
   `Int64` fails instead of being misread. That matters because
   `postgresql-binary`'s integer decoder takes any width.
-- **Errors are values.** A wrong column count, an unexpected NULL or a value
-  that doesn't decode is returned as a `DecodingError`. The rest of the row is
-  skipped and the session stays usable.
+- **Errors.** A wrong column count, an unexpected NULL or a value that does
+  not decode produces a `DecodingError`. The transaction runner reports it
+  through `QueryError`, then skips unread data and rolls back an open
+  transaction so the connection can be reused.
 
 ### Prepared statements
 
-- The operations map onto protocol messages. `prepare` sends `Parse` and
-  `Sync`, `closeStatement` sends `Close` and `Sync`, and `execute` sends
+- The private execution engine maps operations onto protocol messages.
+  Applications supply a `Prepare` callback to `Transaction.runTransactionWith`
+  and select eligible statements with `statementPreparable`. The callback
+  returns `PreparedAs` for an existing name or `PrepareAs` with an action run
+  after the server accepts its parse, even if execution later fails. Applications
+  can deallocate with `Session.closeStatement`. Internally, `prepare` sends
+  `Parse` and `Sync`, `closeStatement` sends `Close` and `Sync`, and `execute` sends
   `Bind`, `Execute` and `Sync`, all in one write. An `Unprepared` statement
   adds a `Parse` of the unnamed statement to the same write, so a one-off
   query costs one round trip.
@@ -515,40 +630,40 @@ top of them, through typeclass metaprogramming:
   exists on a connection: prepared statements are per session. The client
   tracks which connections have which statements, and re-prepares when it
   gets SQLSTATE 26000 (`invalid_sql_statement_name`).
-- Parameters stay untyped (see the gaps above).
+- Parameter OIDs are optional, allowing the server to infer their types.
 
-### WAI usage
+### HTTP/1.1 usage
 
-```haskell
-app request respond =
-  withSession pool $ \session -> do   -- the client's own pool
-    let body = ByteStream size (getRequestBodyChunk request)
-    (result, _) <- execute session (Execution statement [] [Just (ParameterStream body)] []) answer Nothing
-    ...
-  where
-    -- The status is decoded; the body, last, is streamed.
-    answer _ row =
-      fmap (either (const Nothing) Just) . decodeRowStreaming @'[Int32] row $ \status body ->
-        respond $
-          responseStream (toStatus status) [(hContentLength, showLength (byteStreamLength body))] $ \write flush ->
-            forEachChunk body (write . byteString) >> flush
-```
+PostgREST connects request-body input to a streamed statement parameter and
+pulls the result's last column within the database transaction scope. It calls
+`respond` before that scope returns. App uses `withRunInIO` at this HTTP
+boundary to run `nextChunk` and `finishTransaction` inside Warp's response
+callback. MainTx and other transaction code use ordinary monadic composition
+without a runner argument. The HTTP sink finishes
+writing each borrowed chunk before the next native input operation.
+For a write, PostgREST copies only the final chunk, finishes the transaction
+inside Warp's response callback, and sends the copy on success. Both protocols
+run sequentially on the request thread. Buffer provisioning stays below the
+handler in the transport and connection adapters.
 
-With `Content-Length` set, Warp sends the body as it is; it only falls back
-to chunked encoding when no length is given, and HTTP/2 has no chunked
-encoding at all. `respond` runs inside the connection scope, which is what
-WAI's continuation-passing `Application` type is for.
+Warp uses `Content-Length` when available and chunked encoding otherwise.
+This integration covers HTTP/1.1 only. A field's EOF does not establish
+transaction success; finishing the response requires successful transaction
+completion. If the entire body fits in its first chunk, PostgREST can own that
+chunk and complete the transaction before sending HTTP headers.
 
 ## Consequences for PostgREST
 
 - **Body column last.** `body` must be the last column of the main queries.
   The status, headers, counts and the checks that depend on them
   (`max-affected`, singular object) then come before it.
-- **Writes stay buffered.** Statement errors, including AFTER triggers of
+- **Writes retain only their tail.** Statement errors, including AFTER triggers of
   mutating CTEs, are reported before the row. Commit-time failures (deferred
-  constraints, serialization failures) arrive after it. So only read-only
-  transactions stream. PostgREST buffers write responses until `COMMIT`
-  succeeds. These owned responses remain outside transport buffer accounting.
+  constraints, serialization failures) arrive after it. Borrowed prefixes stream
+  directly; one copied final chunk waits for `COMMIT`. That extra chunk is outside
+  the shared buffer budget and is bounded by the transfer chunk size. A failed
+  commit aborts an already-started response. Required materialization for other
+  application features remains supported.
 - **Request bodies.** A raw body with `Content-Length` streams into `Bind`.
   PostgreSQL requires a parameter length before its bytes, so an upload of
   unknown length must be materialized first. Existing application body policy
@@ -623,10 +738,10 @@ other owned metadata also span refills. This allocation is protocol overhead,
 not an expansion of the borrowed body workspace. Session has no streamed COPY
 parser; materializing a `CopyData` message remains an owned-value path.
 
-Notifications received during a query are copied into a FIFO until
+In the private protocol engine, notifications received during a query are copied into a FIFO until
 `awaitNotification` can return them. Stopping socket reads at a queued
 notification could prevent the query itself from completing on the same stream.
-Buffer availability therefore cannot bound this queue under the existing API.
+Buffer availability therefore cannot bound this queue under that internal interface.
 A synchronous notification consumer or a dedicated notification connection
 would need a separate design if that queue must also apply backpressure.
 
