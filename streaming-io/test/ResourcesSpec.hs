@@ -31,7 +31,7 @@ spec = do
         withForeignPtr (bufferMemory buffer) $ \pointer -> peek pointer `shouldReturn` 73
 
  describe "whole-block grants" $ do
-  xfail "whole-block admission is pending" $ it "acquires every requested block or leaves all available blocks alone" $
+  it "acquires every requested block or leaves all available blocks alone" $
     withResources (ResourceSettings (positiveInt @25) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       first <- atomically (tryAcquire resources (positiveInt @2)) >>= requireLease
       length (leaseBuffers first) `shouldBe` 2
@@ -42,7 +42,7 @@ spec = do
       allBlocks <- atomically (tryAcquire resources (positiveInt @3)) >>= requireLease
       length (leaseBuffers allBlocks) `shouldBe` 3
       atomically (release allBlocks)
-  xfail "count validation is pending" $ it "throws for loan counts that exceed capacity" $
+  it "throws for loan counts that exceed capacity" $
     withResources (ResourceSettings (positiveInt @24) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       largest <- requirePositive (toInteger (maxBound :: Int))
       mapM_ (\count -> do
