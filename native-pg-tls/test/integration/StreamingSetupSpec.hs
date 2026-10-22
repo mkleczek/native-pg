@@ -49,7 +49,7 @@ spec socketPath port = describe "pooled connection setup" $ do
         Right (connection, _) -> PG.closeConnection connection >> failTest "wrong password was accepted"
       timeout 1000000 (Resources.withSetupBuffers resources (positiveInt @2) (pure . length)) `shouldReturn` Just 2
 
-  xfail "pooled host qualification is pending" $ it "closes an unsuitable TLS host and tries the next host using the same setup pair" $
+  it "closes an unsuitable TLS host and tries the next host using the same setup pair" $
     withResources settings $ \resources -> do
       string <- parse "sslmode=require target_session_attrs=read-write"
       let adjusted = string { CS.connectionHosts = CS.Host "127.0.0.1" Nothing port :| toList (CS.connectionHosts string) }
@@ -61,7 +61,7 @@ spec socketPath port = describe "pooled connection setup" $ do
         PG.isConnectionUsable connection `shouldReturn` True
         timeout 1000000 (Resources.withSetupBuffers resources (positiveInt @2) (pure . length)) `shouldReturn` Just 2
 
-  xfail "pooled standby fallback is pending" $ it "retries primary hosts when prefer-standby finds no standby" $
+  it "retries primary hosts when prefer-standby finds no standby" $
     withResources settings $ \resources -> do
       string <- parse "target_session_attrs=prefer-standby"
       bracket (Streaming.connectFirst resources id string) closeSelected $ \(connection, _, host) -> do
@@ -69,7 +69,7 @@ spec socketPath port = describe "pooled connection setup" $ do
         PG.isConnectionUsable connection `shouldReturn` True
       timeout 1000000 (Resources.withSetupBuffers resources (positiveInt @2) (pure . length)) `shouldReturn` Just 2
 
-  xfail "pooled host failures are pending" $ it "reports failed hosts in order and returns setup storage" $
+  it "reports failed hosts in order and returns setup storage" $
     withResources settings $ \resources -> do
       string <- parse ""
       let missing = [CS.Host "/missing-native-pg-first" Nothing port, CS.Host "/missing-native-pg-second" Nothing port]
