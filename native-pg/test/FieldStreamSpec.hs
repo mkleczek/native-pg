@@ -137,7 +137,7 @@ spec = describe "borrowed field streams" $ do
       joined <- timeout 1000000 (readMVar stopped)
       isNothing joined `shouldBe` False) `finally` cleanup
 
-  xfail "explicit owned column materialization is still contiguous" $ it "materializes an owned column larger than the supplied block" $
+  it "materializes an owned column larger than the supplied block" $
     withFields [Just payload] ready $ \context _ -> do
       result <- PG.executeWithContext context execution (\values row -> do
         _ <- PG.nextColumn row
@@ -145,7 +145,7 @@ spec = describe "borrowed field streams" $ do
         pure (value : values)) []
       result `shouldBe` (Right ([payload], "SELECT 1"), TxIdle)
 
-  xfail "leading typed owned fields are still contiguous" $ it "assembles leading owned metadata while borrowing the selected body" $
+  it "assembles leading owned metadata while borrowing the selected body" $
     withFields [Just payload, Just payload] ready $ \context input -> do
       inside <- newIORef True
       received <- newIORef BS.empty

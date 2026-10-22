@@ -75,6 +75,7 @@ where
 import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (newMVar, takeMVar, putMVar, readMVar)
 import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, mask, onException, throwIO, uninterruptibleMask_, try)
+import Control.Monad.Except (throwError)
 import Control.Monad (filterM, join, unless, when, (<=<))
 import Data.Bifunctor (first)
 import Data.Foldable (for_, toList)
@@ -1057,12 +1058,13 @@ nextColumn row = do
           pure (Just (Column (fromIntegral size)))
         LT -> throwIO (ProtocolError ("invalid column length " <> show size))
 
--- | The current column's value, whole. It is a slice of the read buffer, or
--- for a value larger than the buffer's free space, a new allocation.
+-- | Materializes the current column into an owned value that remains valid
+-- across later input reads. May allocate memory proportional to the field;
+-- use 'columnChunks' or 'withColumnStream' for borrowed body transfer.
 columnBytes :: Row -> IO ByteString
 columnBytes row = do
   cursor <- untakenCursor row
-  value <- inRow row (readInputExactly (cursorValueLeft cursor))
+  value <- inRow row (readOwnedBytes (cursorValueLeft cursor))
   writeIORef (rowCursor row) cursor {cursorValueLeft = 0, cursorValueTaken = True}
   pure value
 
@@ -1168,6 +1170,25 @@ withColumnStream row use = mask $ \restore -> do
 
 data PullState = PullAvailable | PullReading ThreadId | PullExpired
 
+-- Explicit materializers own their results separately from the reusable
+-- body workspace. Each copied chunk is stable before the next refill.
+readOwnedBytes :: Int -> Input ByteString
+readOwnedBytes count = gather count []
+  where
+    gather remaining chunks
+      | remaining == 0 = pure (BS.concat (reverse chunks))
+      | otherwise = do
+          chunk <- readInputSome remaining
+          gather (remaining - BS.length chunk) (chunk : chunks)
+
+readOwnedNullable :: Input (Maybe ByteString)
+readOwnedNullable = do
+  size <- parser @Int32 @('FixedBytesAtom 4)
+  case compare size (-1) of
+    EQ -> pure Nothing
+    GT -> Just <$> readOwnedBytes (fromIntegral size)
+    LT -> throwError ("negative length " <> show size <> " is invalid for MaybeBytes32Atom")
+
 -- | A row's columns, described by the Haskell types they decode to.
 class DecodeRow (columns :: [Type]) where
   -- | A function from the columns' values, in order, to @final@.
@@ -1200,7 +1221,7 @@ instance (DecodeField a, DecodeRow columns) => DecodeRow (a ': columns) where
   mapRowFunction f function = mapRowFunction @columns f . function
   {-# INLINE mapRowFunction #-}
   applyColumns column function = do
-    value <- parser @(Maybe ByteString) @'MaybeBytes32Atom
+    value <- readOwnedNullable
     case decodeField value of
       Left message -> pure (Left (ColumnDecodingFailed column message))
       Right decoded -> applyColumns @columns (column + 1) (function decoded)
@@ -1210,7 +1231,8 @@ instance (DecodeField a, DecodeRow columns) => DecodeRow (a ': columns) where
 -- @decodeRow \@'[Int32, Text] row (\\count name -> ...)@, and runs the
 -- action the function returns. The row has to have exactly these columns,
 -- and none of them may have been pulled. The columns are decoded in one pass
--- over the read buffer, and decoded byte strings are slices of it.
+-- over the input. Materialized fields are owned and may allocate their full
+-- size; use a streaming decoder for a borrowed body column.
 decodeRow :: forall columns r. DecodeRow columns => Row -> RowFunction columns (IO r) -> IO (Either DecodingError r)
 decodeRow row function = do
   started <- startDecoding row (rowArity @columns)
