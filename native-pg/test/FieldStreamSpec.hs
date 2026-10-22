@@ -2,8 +2,12 @@
 {-# LANGUAGE OverloadedStrings #-}
 module FieldStreamSpec (spec) where
 
-import Control.Exception (SomeException, evaluate, throwIO, try)
-import Control.Monad (unless)
+import Control.Exception (SomeException, evaluate, finally, throwIO, try)
+import Control.Concurrent (forkFinally, killThread, threadDelay)
+import Control.Concurrent.MVar
+import Data.Maybe (isNothing)
+import System.Timeout (timeout)
+import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
@@ -12,6 +16,8 @@ import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Protocol (TransactionStatus (..))
 import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
 import qualified Database.PostgreSQL.Session as PG
+import qualified Database.PostgreSQL.Transaction as Tx
+import qualified Database.PostgreSQL.Pipeline as Pipeline
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, minusPtr)
@@ -90,6 +96,47 @@ spec = describe "borrowed field streams" $ do
       readIORef delivered `shouldReturn` True
       case fst result of Left _ -> pure (); Right _ -> failTest "late server error was lost after field EOF"
 
+  xfail "typed scoped streams still drain owned pulls" $ it "borrows Tx.streamChunks directly through its nullable scoped decoder" $
+    withFields [Just payload] ready $ \context input -> do
+      inside <- newIORef True
+      received <- newIORef BS.empty
+      let statement = Tx.Statement "SELECT field" (const [])
+            (Tx.singleRow (Tx.scopedRow $ \current ->
+              Tx.decodeScopedStreamingNullable @'[] current $ \stream ->
+                maybe (failTest "unexpected NULL") (\source -> Tx.streamChunks source (collect input inside received)) stream)) True
+          prepare _ _ = pure (Pipeline.PreparedAs "")
+      Pipeline.runPipelineIn context (Just prepare) (Pipeline.statement () statement) `shouldReturn` Right ()
+      readIORef inside `shouldReturn` True
+      readIORef received `shouldReturn` payload
+
+  it "keeps NULL handling available through scoped streaming decoders" $
+    withFields [Nothing] ready $ \context _ -> do
+      let statement = Tx.Statement "SELECT NULL" (const [])
+            (Tx.singleRow (Tx.scopedRow $ \current -> Tx.decodeScopedStreamingNullable @'[] current (pure . maybe True (const False)))) True
+          prepare _ _ = pure (Pipeline.PreparedAs "")
+      Pipeline.runPipelineIn context (Just prepare) (Pipeline.statement () statement) `shouldReturn` Right True
+
+  it "cancels and joins an unfinished field pull before closing its scope" $ do
+    blocked <- newEmptyMVar
+    stopped <- newEmptyMVar
+    entered <- newIORef False
+    child <- newIORef Nothing
+    let observe offset = when (offset >= 32) $ do
+          first <- atomicModifyIORef' entered (\previous -> (True, not previous))
+          when first (putMVar blocked () *> threadDelay 10000000)
+        cleanup = readIORef child >>= maybe (pure ()) killThread
+    (do
+      result <- withFieldsObserved observe [Just payload] ready $ \context _ ->
+        try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
+          _ <- PG.nextColumn row
+          PG.withColumnStream row $ \source -> do
+            thread <- forkFinally (drain (byteStreamNext source) (const (pure ()))) (putMVar stopped)
+            writeIORef child (Just thread)
+            timeout 1000000 (readMVar blocked) `shouldReturn` Just ()) ()
+      case result of Left (RowMisuse _) -> pure (); _ -> failTest "abandoned pull left a usable row"
+      joined <- timeout 1000000 (readMVar stopped)
+      isNothing joined `shouldBe` False) `finally` cleanup
+
 collect :: Buffer -> IORef Bool -> IORef BS.ByteString -> BS.ByteString -> IO ()
 collect input inside received chunk = do
   offset <- BSU.unsafeUseAsCString chunk $ \pointer ->
@@ -110,7 +157,10 @@ execution :: PG.Execution
 execution = PG.Execution (PG.Prepared "") [] [] []
 
 withFields :: [Maybe BS.ByteString] -> BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
-withFields columns trailing action = do
+withFields = withFieldsObserved (const (pure ()))
+
+withFieldsObserved :: (Int -> IO ()) -> [Maybe BS.ByteString] -> BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
+withFieldsObserved observe columns trailing action = do
   input <- newBuffer 16
   output <- newBuffer 16
   let count = length columns
@@ -120,6 +170,7 @@ withFields columns trailing action = do
   remaining <- newIORef response
   let receive pointer size = do
         bytes <- readIORef remaining
+        observe (BS.length response - BS.length bytes)
         let chunk = BS.take size bytes
         BS.useAsCString chunk $ \origin -> copyBytes pointer (castPtr origin) (BS.length chunk)
         writeIORef remaining (BS.drop (BS.length chunk) bytes)
