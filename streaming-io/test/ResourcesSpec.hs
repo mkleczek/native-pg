@@ -106,18 +106,18 @@ spec = do
       timeout 1000000 (withBuffers resources (positiveInt @1) (pure . length)) `shouldReturn` Just 1
 
  describe "setup capacity" $ do
-  xfail "separate setup capacity is pending" $ it "admits setup while every stream block is busy" $
+  it "admits setup while every stream block is busy" $
     withResources (ResourceSettings (positiveInt @16) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       streams <- atomically (tryAcquire resources (positiveInt @2)) >>= requireLease
       setup <- atomically (tryAcquireSetup resources (positiveInt @1)) >>= requireLease
       map bufferMemory (leaseBuffers setup) `shouldNotBe` map bufferMemory (leaseBuffers streams)
       isNothing <$> atomically (tryAcquireSetup resources (positiveInt @1)) `shouldReturn` True
       atomically (release streams >> release setup)
-  xfail "setup count validation is pending" $ it "validates requests against setup capacity" $
+  it "validates requests against setup capacity" $
     withResources (ResourceSettings (positiveInt @16) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       result <- try (atomically (tryAcquireSetup resources (positiveInt @2))) :: IO (Either IOError (Maybe Lease))
       isLeft result `shouldBe` True
-  xfail "setup bracket isolation is pending" $ it "reuses setup storage without taking a stream block" $
+  it "reuses setup storage without taking a stream block" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       setupMemory <- withSetupBuffers resources (positiveInt @1) $ \[buffer] -> pure (bufferMemory buffer)
       streams <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
