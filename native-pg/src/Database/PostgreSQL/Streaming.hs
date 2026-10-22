@@ -8,6 +8,7 @@ module Database.PostgreSQL.Streaming
   ) where
 
 import Database.PostgreSQL.ConnectionString (ConnectionString, Host)
+import qualified Database.PostgreSQL.ConnectionString as ConnectionString
 import qualified Database.PostgreSQL.Buffer as Buffer
 import qualified Database.PostgreSQL.Session as Session
 import Database.PostgreSQL.Session (Connection, Context, ConnectSettings, ServerInfo)
@@ -28,7 +29,8 @@ connect resources settings = withSetupPair resources $ \input output ->
 
 -- | Try hosts and qualify the connection using temporary setup storage.
 connectFirst :: Resources -> (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Connection, ServerInfo, Host)
-connectFirst _ _ _ = ioError (userError "pooled host selection is not implemented")
+connectFirst resources adjust string = withSetupPair resources $ \input output ->
+  ConnectionString.connectFirstWithBuffers input output adjust string
 
 withSetupPair :: Resources -> (Buffer.Buffer -> Buffer.Buffer -> IO a) -> IO a
 withSetupPair resources action = Resources.withSetupBuffers resources (positiveInt @2) $ \buffers ->
