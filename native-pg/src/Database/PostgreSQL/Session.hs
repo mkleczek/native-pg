@@ -1,22 +1,16 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- | The protocol state machine. It is a client of the parser: in each phase it
--- pulls the next message, choosing among the messages that phase accepts.
+-- | Public session API.
 module Database.PostgreSQL.Session
-  ( -- * Phases
-    Accepts (..),
-    Phase (..),
+  ( Phase (Ready),
     Session,
     Context,
     Connection,
     sessionFromContext,
-    connectWithBuffers,
     closeConnection,
     isConnectionUsable,
     prepareWithContext,
@@ -24,8 +18,6 @@ module Database.PostgreSQL.Session
     executeWithContext,
     runBatchWithContext,
     awaitNotificationWithContext,
-
-    -- * Connecting
     ConnectSettings (..),
     ConnectionError (..),
     SslMode (..),
@@ -36,24 +28,16 @@ module Database.PostgreSQL.Session
     connect,
     connectSettings,
     isUsable,
-
-    -- * Statements
     Execution (..),
     Statement (..),
     closeStatement,
     execute,
     prepare,
-
-    -- * Batches
     Batch,
     batched,
     runBatch,
-
-    -- * Cancelling and notifications
     awaitNotification,
     cancel,
-
-    -- * Rows
     Column (..),
     DecodeRow (RowFunction, mapRowFunction),
     Row,
@@ -68,374 +52,53 @@ module Database.PostgreSQL.Session
     decodeRowStreamingUsing,
     nextColumn,
     rowColumnCount,
-  )
-where
+    FormatCode (..),
+    TransactionStatus (..),
+    ProtocolVersion (..),
+    protocolVersion3_0,
+    protocolVersion3_2,
+    BackendKey,
+    backendProcessId,
+    Notification,
+    notificationProcessId,
+    notificationChannel,
+    notificationPayload
+  ) where
 
 import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (newMVar, takeMVar, putMVar, readMVar)
-import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, mask, onException, throwIO, uninterruptibleMask_, try)
+import Control.Exception (IOException, catch, finally, mask, onException, throwIO, uninterruptibleMask_)
 import Control.Monad.Except (throwError)
-import Control.Monad (filterM, join, unless, when, (<=<))
+import Control.Monad (join, unless, when)
 import Data.Bifunctor (first)
-import Data.Foldable (for_, toList)
+import Data.Foldable (for_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Char (isDigit)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.Word (Word32)
 import Data.Kind (Type)
-import Data.List (sort)
-import Data.Maybe (fromMaybe, isJust)
-#if defined(mingw32_HOST_OS)
-import System.Directory (doesDirectoryExist, doesFileExist, getPermissions, listDirectory)
-#else
-import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
-import qualified System.Posix.Files as Posix
-import qualified System.Posix.User as Posix
-#endif
-import Database.PostgreSQL.Buffer (Buffer)
 import Database.PostgreSQL.Internal.Context
+import Database.PostgreSQL.Internal.Exchange
+import Database.PostgreSQL.Internal.Startup (startSession, withChannel)
+import Database.PostgreSQL.Session.Settings
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..))
-import Database.PostgreSQL.Diagnostics (ServerError (..), diagnostics, isConnectionFatal)
-import Database.PostgreSQL.Authentication
-  ( ChannelBinding (..),
-    md5Password,
-    newScramNonce,
-    scramClientFinal,
-    scramClientFirst,
-    scramMechanism,
-    scramPlusMechanism,
-    scramVerifyServerFinal,
+import Database.PostgreSQL.Diagnostics (ServerError (..))
+import Database.PostgreSQL.Internal.Protocol.Codec
+  ( Alternatives (..), ByteStream (..), Input, InputSource (..), Output,
+    Parsable (..), Serializable (..), inputPosition, readInputSome,
+    readInputBorrowedSome, withInputSome, skipInput,
   )
-import Database.PostgreSQL.Protocol.Codec
-  ( Alternatives (..),
-    ByteStream (..),
-    Input,
-    InputSource (..),
-    Output,
-    ParseConstructor,
-    Parsable (..),
-    Serializable (..),
-    inputPosition,
-    parseChoice,
-    readInputSome,
-    readInputBorrowedSome,
-    withInputSome,
-    skipInput,
-  )
-import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
-import Database.PostgreSQL.Protocol.Messages
-import Database.PostgreSQL.Transport
-  ( Address (..),
-    Channel (..),
-    RootCertificates (..),
-    ServerVerification (..),
-    TcpOptions,
-    TlsChannel (..),
-    TlsClient (..),
-    TlsError,
-    TlsSettings (..),
-    TlsVersion,
-    connectSocket,
-    defaultTcpOptions,
-    newChannel,
-    unsent,
-  )
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
+import Database.PostgreSQL.Internal.Protocol.Messages hiding (notificationProcessId)
+import qualified Database.PostgreSQL.Internal.Protocol.Messages.Types as Protocol
+import Database.PostgreSQL.Internal.Channel (Channel (..), unsent)
 import Foreign.Marshal.Alloc (allocaBytes)
-import Foreign.Storable (peek)
-import Network.Socket (HostName, Socket)
-import qualified Network.Socket as Socket
-
--- | The phases of a connection, each named after what the client waits for in
--- it.
-data Phase
-  = -- | The answer to the startup message: an authentication request, or
-    -- AuthenticationOk when none is needed.
-    Authentication
-  | -- | The server's SCRAM challenge, after the client's first SASL message.
-    SaslContinue
-  | -- | The server's SCRAM signature, after the client's proof.
-    SaslFinal
-  | -- | AuthenticationOk, after the client's password.
-    AuthenticationResult
-  | -- | The server's parameters and backend key, until it's ready for
-    -- queries.
-    Initialization
-  | -- | Ready for a query.
-    Ready
-  | -- | The result of a Parse.
-    ParseResult
-  | -- | The result of a Bind.
-    BindResult
-  | -- | The result of a Close.
-    CloseResult
-  | -- | The parameters' types, which a Describe of a statement answers
-    -- first.
-    DescribeResult
-  | -- | The columns of the statement's rows, or NoData, which follow them.
-    RowDescriptionResult
-  | -- | The rows of an Execute, until the command completes.
-    Rows
-  | -- | The ReadyForQuery that answers a Sync.
-    SyncResult
-
--- | The server messages a phase accepts. Handlers for a phase's messages are
--- given in the same order.
-class Accepts (phase :: Phase) where
-  type Accepted phase :: [Payload]
-
-instance Accepts 'Authentication where
-  type
-    Accepted 'Authentication =
-      '[ 'PayloadField 'AuthenticationOkType,
-         'PayloadField 'AuthenticationCleartextPasswordType,
-         'PayloadField 'AuthenticationMD5PasswordType,
-         'PayloadField 'AuthenticationSASLType,
-         'PayloadField 'AuthenticationKerberosV5Type,
-         'PayloadField 'AuthenticationGSSType,
-         'PayloadField 'AuthenticationSSPIType,
-         'PayloadField 'NegotiateProtocolVersionType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType
-       ]
-
-instance Accepts 'SaslContinue where
-  type
-    Accepted 'SaslContinue =
-      '[ 'PayloadField 'AuthenticationSASLContinueType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType
-       ]
-
-instance Accepts 'SaslFinal where
-  type
-    Accepted 'SaslFinal =
-      '[ 'PayloadField 'AuthenticationSASLFinalType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType
-       ]
-
-instance Accepts 'AuthenticationResult where
-  type
-    Accepted 'AuthenticationResult =
-      '[ 'PayloadField 'AuthenticationOkType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType
-       ]
-
-instance Accepts 'Initialization where
-  type
-    Accepted 'Initialization =
-      '[ 'PayloadField 'ParameterStatusType,
-         'PayloadField 'BackendKeyDataType,
-         'PayloadField 'ReadyForQueryType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType
-       ]
-
--- | Between queries the server only sends messages of its own accord.
-instance Accepts 'Ready where
-  type
-    Accepted 'Ready =
-      '[ 'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType,
-         'PayloadField 'ParameterStatusType,
-         'PayloadField 'NotificationResponseType
-       ]
-
-instance Accepts 'ParseResult where
-  type
-    Accepted 'ParseResult =
-      '[ 'PayloadField 'ParseCompleteType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType,
-         'PayloadField 'ParameterStatusType,
-         'PayloadField 'NotificationResponseType
-       ]
-
-instance Accepts 'BindResult where
-  type
-    Accepted 'BindResult =
-      '[ 'PayloadField 'BindCompleteType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType,
-         'PayloadField 'ParameterStatusType,
-         'PayloadField 'NotificationResponseType
-       ]
-
-instance Accepts 'CloseResult where
-  type
-    Accepted 'CloseResult =
-      '[ 'PayloadField 'CloseCompleteType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType,
-         'PayloadField 'ParameterStatusType,
-         'PayloadField 'NotificationResponseType
-       ]
-
-instance Accepts 'DescribeResult where
-  type
-    Accepted 'DescribeResult =
-      '[ 'PayloadField 'ParameterDescriptionType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType,
-         'PayloadField 'ParameterStatusType,
-         'PayloadField 'NotificationResponseType
-       ]
-
-instance Accepts 'RowDescriptionResult where
-  type
-    Accepted 'RowDescriptionResult =
-      '[ 'PayloadField 'RowDescriptionType,
-         'PayloadField 'NoDataType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType,
-         'PayloadField 'ParameterStatusType,
-         'PayloadField 'NotificationResponseType
-       ]
-
--- | Rows are read only up to their headers; their columns are pulled after.
-instance Accepts 'Rows where
-  type
-    Accepted 'Rows =
-      '[ 'PayloadField 'DataRowHeaderType,
-         'PayloadField 'CommandCompleteType,
-         'PayloadField 'EmptyQueryResponseType,
-         'PayloadField 'PortalSuspendedType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType,
-         'PayloadField 'ParameterStatusType,
-         'PayloadField 'NotificationResponseType
-       ]
-
--- | An error here comes from the Sync itself, e.g. a deferred constraint
--- failing as the implicit transaction commits.
-instance Accepts 'SyncResult where
-  type
-    Accepted 'SyncResult =
-      '[ 'PayloadField 'ReadyForQueryType,
-         'PayloadField 'ErrorResponseType,
-         'PayloadField 'NoticeResponseType,
-         'PayloadField 'ParameterStatusType,
-         'PayloadField 'NotificationResponseType
-       ]
-
--- | A connection in a known phase.
-newtype Session (phase :: Phase) = Session Context
 
 -- | A compatibility handle backed directly by an explicit operation context.
 -- No buffers are installed on the connection. The handle expires with it.
 sessionFromContext :: Context -> Session 'Ready
 sessionFromContext = Session
-
-sessionConnection :: Session phase -> Connection
-sessionConnection (Session context) = contextConnection context
-
-data ConnectSettings = ConnectSettings
-  { connectAddress :: Address,
-    connectUser :: ByteString,
-    -- | Used only if the server asks for a password.
-    connectPassword :: Maybe ByteString,
-    -- | The server uses the user name when this is missing.
-    connectDatabase :: Maybe ByteString,
-    -- | More startup parameters, e.g. @application_name@ or @options@.
-    connectParameters :: [(ByteString, ByteString)],
-    -- | Version 3.2, which PostgreSQL 18 supports, has longer cancel keys, but
-    -- some connection poolers reject it.
-    connectProtocolVersion :: ProtocolVersion,
-    -- | The size of a read buffer.
-    connectReadSize :: Int,
-    connectTcpOptions :: TcpOptions,
-    -- | Whether to encrypt with TLS, which isn't used over Unix-domain
-    -- sockets, as with libpq.
-    connectSslMode :: SslMode,
-    -- | The server's name for TLS, if the address's host isn't, e.g. because
-    -- it's an IP address the name resolved to.
-    connectServerName :: Maybe HostName,
-    -- | What starts TLS: native-pg-tls's, which this library doesn't depend
-    -- on. Without it, a connection that requires TLS fails.
-    connectTlsClient :: Maybe TlsClient,
-    -- | A client certificate and its private key, in PEM files, used if the
-    -- certificate file exists, as with libpq.
-    connectSslCertificate :: Maybe (FilePath, FilePath),
-    -- | A file of certificate revocation lists, used if it exists, and a
-    -- directory of them, named as OpenSSL's c_rehash names them, as with
-    -- libpq.
-    connectSslRevocationList :: Maybe FilePath,
-    connectSslRevocationListDirectory :: Maybe FilePath,
-    -- | The versions of TLS the connection may use.
-    connectSslVersions :: [TlsVersion],
-    -- | Whether to send the server's name with TLS, unless it's an IP
-    -- address.
-    connectSslServerNameIndication :: Bool,
-    -- | Whether to start TLS without asking the server first, as
-    -- PostgreSQL 17 takes it.
-    connectSslDirect :: Bool,
-    connectChannelBinding :: ChannelBindingMode
-  }
-
--- | Whether to bind SCRAM to TLS, from libpq's channel_binding.
-data ChannelBindingMode
-  = ChannelBindingDisable
-  | -- | If the server offers it over TLS.
-    ChannelBindingPrefer
-  | -- | Or else fail, as with libpq: the server is then known to have the
-    -- password's secret, and the certificate.
-    ChannelBindingRequire
-  deriving (Eq, Show)
-
--- | Whether to encrypt with TLS, from libpq's sslmode.
-data SslMode
-  = -- | Without TLS.
-    SslDisable
-  | -- | Without TLS, and if the server rejects the connection, with TLS,
-    -- without verifying the server.
-    SslAllow
-  | -- | With TLS if the server takes it, without verifying the server, and if
-    -- it then fails or the server rejects the connection, without TLS.
-    SslPrefer
-  | -- | With TLS, without verifying the server.
-    SslRequire
-  | -- | With TLS, verifying the server's certificate against the root
-    -- certificates, and its name.
-    SslVerifyFull RootCertificates
-  deriving (Eq, Show)
-
--- | No password, database or extra parameters, protocol 3.0, 16 KiB read
--- buffers, TCP keepalives and no TLS, but TLS's versions and server name
--- indication should it be asked for.
-connectSettings :: Address -> ByteString -> ConnectSettings
-connectSettings address user =
-  ConnectSettings
-    { connectAddress = address,
-      connectUser = user,
-      connectPassword = Nothing,
-      connectDatabase = Nothing,
-      connectParameters = [],
-      connectProtocolVersion = protocolVersion3_0,
-      connectReadSize = 16384,
-      connectTcpOptions = defaultTcpOptions,
-      connectSslMode = SslDisable,
-      connectServerName = Nothing,
-      connectTlsClient = Nothing,
-      connectSslCertificate = Nothing,
-      connectSslRevocationList = Nothing,
-      connectSslRevocationListDirectory = Nothing,
-      connectSslVersions = [minBound .. maxBound],
-      connectSslServerNameIndication = True,
-      connectSslDirect = False,
-      connectChannelBinding = ChannelBindingPrefer
-    }
-
-data ServerInfo = ServerInfo
-  { serverProtocolVersion :: ProtocolVersion,
-    -- | The parameters the server reported, e.g. @server_version@, in order.
-    serverParameters :: [(ByteString, ByteString)],
-    -- | Needed to cancel a query. Some connection poolers don't send it.
-    serverBackendKey :: Maybe (BackendKey ByteString)
-  }
-  deriving (Eq, Show)
 
 -- | Connects, authenticates and waits until the server is ready for a query.
 -- Throws 'Database.PostgreSQL.Transport.ConnectError' when the socket doesn't
@@ -449,166 +112,6 @@ connect settings = withChannel settings start
       connection <- newConnection channel (connectReadSize settings)
       context <- newOwnedContext connection
       startSession settings binding context
-
--- | Startup/authentication using caller-supplied initialized workspace.
--- Integration-only callers reserve separate setup capacity for this scope.
-connectWithBuffers :: Buffer -> Buffer -> ConnectSettings -> IO (Connection, ServerInfo)
-connectWithBuffers input output settings = withChannel settings $ \channel binding -> do
-  connection <- newConnection channel (connectReadSize settings)
-  withContext connection input output $ \context -> do
-    (_, info) <- startSession settings binding context
-    pure (connection, info)
-
-startSession :: ConnectSettings -> Maybe (Either String ByteString) -> Context -> IO (Session 'Ready, ServerInfo)
-startSession settings binding context = do
-  let session = Session context
-  send @'StartupMessageType session (startupMessage settings)
-  (version, initializing) <- authenticate settings binding (connectProtocolVersion settings) session
-  initialize version initializing
-
--- | Connects a socket to the server, starts TLS over it as the settings ask,
--- and runs the action with its channel builder and optional channel-binding
--- result. The socket is closed if the action fails.
-withChannel :: ConnectSettings -> (Channel -> Maybe (Either String ByteString) -> IO a) -> IO a
-withChannel settings use = case (connectSslMode settings, connectAddress settings, connectTlsClient settings) of
-  (SslDisable, _, _) -> attempt Nothing
-  (_, UnixAddress _, _) -> attempt Nothing
-  -- As libpq without TLS does.
-  (SslAllow, _, Nothing) -> attempt Nothing
-  (SslPrefer, _, Nothing) -> attempt Nothing
-  (mode, _, Nothing) -> throwIO (TlsFailure ("sslmode value \"" <> sslModeName mode <> "\" invalid when SSL support is not compiled in"))
-  (SslAllow, TcpAddress {}, Just client) ->
-    attempt Nothing `catch` \failure -> case failure of
-      ConnectionRejected _ -> attempt (Just (client, NoVerification, True))
-      _ -> throwIO failure
-  (SslPrefer, TcpAddress {}, Just client) ->
-    attempt (Just (client, NoVerification, False)) `catch` \(FailedWithTls _) -> attempt Nothing
-  (SslRequire, TcpAddress {}, Just client) -> attempt (Just (client, NoVerification, True))
-  (SslVerifyFull roots, TcpAddress {}, Just client) -> do
-    case roots of
-      RootCertificateFile file -> do
-        exists <- doesFileExist file
-        unless exists . throwIO . TlsFailure $
-          "root certificate file \""
-            <> file
-            <> "\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
-      SystemRootCertificates -> pure ()
-    attempt (Just (client, VerifyFull roots, True))
-  where
-    sslModeName mode = case mode of
-      SslDisable -> "disable"
-      SslAllow -> "allow"
-      SslPrefer -> "prefer"
-      SslRequire -> "require"
-      SslVerifyFull _ -> "verify-full"
-    -- Over a new socket, with TLS if a client, the verification, and whether
-    -- it's required are given. A failure after TLS started, when it isn't
-    -- required, is thrown as 'FailedWithTls'.
-    attempt tls =
-      bracketOnError (connectSocket (connectTcpOptions settings) (connectAddress settings)) Socket.close $ \sock ->
-        case (tls, connectAddress settings) of
-          (Just (client, verification, required), TcpAddress host _) -> do
-            accepted <- if connectSslDirect settings then pure True else requestTls sock
-            case accepted of
-              False
-                | required -> throwIO (TlsFailure "server does not support SSL, but SSL was required")
-                | otherwise -> use (newChannel sock) Nothing
-              True -> do
-                let started = do
-                      certificate <- clientCertificate
-                      lists <- revocationLists
-                      opened <-
-                        startTlsChannel
-                          client
-                          ( TlsSettings
-                              verification
-                              certificate
-                              lists
-                              (connectSslVersions settings)
-                              (connectSslServerNameIndication settings)
-                              (connectSslDirect settings)
-                          )
-                          (fromMaybe host (connectServerName settings))
-                          sock
-                          `catch` \(failure :: TlsError) -> throwIO (TlsFailure (displayException failure))
-                      use (tlsChannel opened) (tlsServerEndPoint opened)
-                if required then started else started `catch` (throwIO . FailedWithTls)
-          _ -> use (newChannel sock) Nothing
-    -- The client certificate, if its file exists, with its private key,
-    -- which has to exist and be readable only by its owner, as with libpq.
-    clientCertificate = case connectSslCertificate settings of
-      Nothing -> pure Nothing
-      Just (chain, key) -> do
-        present <- doesFileExist chain
-        if not present
-          then pure Nothing
-          else do
-            usable <- try (privateKeyFile key)
-            case usable of
-              Left (_ :: IOException) -> throwIO (TlsFailure ("certificate present, but not private key file \"" <> key <> "\""))
-              Right (Just problem) -> throwIO (TlsFailure ("private key file \"" <> key <> "\" " <> problem))
-              Right Nothing -> pure (Just (chain, key))
-    revocationLists = do
-      file <- filterM doesFileExist (toList (connectSslRevocationList settings))
-      directory <- case connectSslRevocationListDirectory settings of
-        Nothing -> pure []
-        Just directory -> do
-          exists <- doesDirectoryExist directory
-          if exists
-            then map ((directory <> "/") <>) . sort . filter rehashed <$> listDirectory directory
-            else pure []
-      pure (file <> directory)
-    -- c_rehash's names of revocation lists: their issuer's hash, .r and a
-    -- number.
-    rehashed name = case break (== '.') name of
-      (_, '.' : 'r' : number) -> not (null number) && all isDigit number
-      _ -> False
-
--- | What's wrong with a private key file, as libpq checks it, if anything.
-privateKeyFile :: FilePath -> IO (Maybe String)
-#if defined(mingw32_HOST_OS)
-privateKeyFile key = Nothing <$ getPermissions key
-#else
-privateKeyFile key = do
-  status <- Posix.getFileStatus key
-  user <- Posix.getEffectiveUserID
-  let mode = Posix.fileMode status
-      open bits = Posix.intersectFileModes mode bits /= Posix.nullFileMode
-      groupOrWorld = foldr Posix.unionFileModes Posix.nullFileMode [Posix.groupModes, Posix.otherModes]
-      groupWriteOrWorld = foldr Posix.unionFileModes Posix.nullFileMode [Posix.groupWriteMode, Posix.groupExecuteMode, Posix.otherModes]
-  pure $
-    if
-      | not (Posix.isRegularFile status) -> Just "is not a regular file"
-      | Posix.fileOwner status == user && open groupOrWorld -> Just tooOpen
-      | Posix.fileOwner status == 0 && open groupWriteOrWorld -> Just tooOpen
-      | otherwise -> Nothing
-  where
-    tooOpen = "has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root"
-#endif
-
--- | A connection with TLS that wasn't required failed, so it's tried without.
-newtype FailedWithTls = FailedWithTls ConnectionError
-  deriving (Show)
-
-instance Exception FailedWithTls
-
--- | Asks the server for TLS, and reads its answer, a single byte, so that no
--- unencrypted byte after it is taken for TLS's: whether it takes TLS.
-requestTls :: Socket -> IO Bool
-requestTls sock = do
-  pending <- newIORef =<< unsent Nothing mempty
-  let channel = newChannel sock
-  channelSend channel (serialize @SSLRequest @'SSLRequestType SSLRequest)
-  answer <- allocaBytes 1 $ \byte -> do
-    received <- readInputInto (channelInput channel pending 1) byte 1
-    if received == 0 then pure Nothing else Just <$> peek byte
-  case answer of
-    Just 83 -> pure True
-    Just 78 -> pure False
-    -- The server isn't authenticated yet, so its error isn't read.
-    Just 69 -> throwIO (TlsFailure "server sent an error response during SSL exchange")
-    Just other -> throwIO (TlsFailure ("received invalid response to SSL negotiation: " <> [toEnum (fromIntegral other)]))
-    Nothing -> throwIO (TlsFailure "server closed the connection unexpectedly")
 
 -- | Ends an idle or broken session and closes its socket. The session is
 -- unusable from then on, even if closing throws. Further calls do nothing.
@@ -647,117 +150,6 @@ isConnectionUsable connection = do
   pure $ case state of
     Idle -> True
     _ -> False
-
-startupMessage :: ConnectSettings -> StartupMessage ByteString
-startupMessage settings =
-  StartupMessage (connectProtocolVersion settings) $
-    map Scalar $
-      ("user", connectUser settings)
-        : maybe [] (\database -> [("database", database)]) (connectDatabase settings)
-        <> connectParameters settings
-
-data AuthenticationRequest
-  = Authenticated
-  | CleartextPasswordRequested
-  | Md5PasswordRequested ByteString
-  | SaslRequested [ByteString]
-  | UnsupportedMethodRequested String
-  | ProtocolVersionNegotiated ProtocolVersion
-
-authenticate :: ConnectSettings -> Maybe (Either String ByteString) -> ProtocolVersion -> Session 'Authentication -> IO (ProtocolVersion, Session 'Initialization)
-authenticate settings bindingData version session = do
-  request <-
-    pull session $
-      (\AuthenticationOk -> Reply Authenticated)
-        :|: (\AuthenticationCleartextPassword -> Reply CleartextPasswordRequested)
-        :|: (\(AuthenticationMD5Password salt) -> Reply (Md5PasswordRequested salt))
-        :|: (\(AuthenticationSASL mechanisms) -> Reply (SaslRequested mechanisms))
-        :|: (\AuthenticationKerberosV5 -> Reply (UnsupportedMethodRequested "Kerberos V5"))
-        :|: (\AuthenticationGSS -> Reply (UnsupportedMethodRequested "GSSAPI"))
-        :|: (\AuthenticationSSPI -> Reply (UnsupportedMethodRequested "SSPI"))
-        :|: (\(NegotiateProtocolVersion negotiated (_ :: [ByteString])) -> Reply (ProtocolVersionNegotiated negotiated))
-        :|: startupTail
-  case request of
-    Authenticated
-      | required -> throwIO (AuthenticationError "channel binding required, but server authenticated client without channel binding")
-      | otherwise -> pure (version, continueIn session)
-    ProtocolVersionNegotiated negotiated -> authenticate settings bindingData negotiated session
-    SaslRequested mechanisms
-      | Just binding <- bindingData,
-        connectChannelBinding settings /= ChannelBindingDisable,
-        scramPlusMechanism `elem` mechanisms -> do
-          password <- requirePassword
-          endPoint <- either (throwIO . AuthenticationError) pure binding
-          (version,) <$> authenticateScram scramPlusMechanism (BoundToServerEndPoint endPoint) password session
-      | required ->
-          throwIO (AuthenticationError "channel binding is required, but server did not offer an authentication method that supports channel binding")
-      | scramMechanism `elem` mechanisms -> do
-          password <- requirePassword
-          let binding
-                | isJust bindingData && connectChannelBinding settings /= ChannelBindingDisable = ChannelBindingUnused
-                | otherwise = WithoutChannelBinding
-          (version,) <$> authenticateScram scramMechanism binding password session
-      | otherwise -> throwIO (UnsupportedAuthentication ("SASL with " <> show mechanisms))
-    _ | required -> throwIO (AuthenticationError "channel binding required but not supported by server's authentication request")
-    CleartextPasswordRequested -> do
-      password <- requirePassword
-      send @'PasswordMessageType session (PasswordMessage password)
-      (version,) <$> awaitAuthenticationOk (continueIn session)
-    Md5PasswordRequested salt -> do
-      password <- requirePassword
-      send @'PasswordMessageType session (PasswordMessage (md5Password (connectUser settings) password salt))
-      (version,) <$> awaitAuthenticationOk (continueIn session)
-    UnsupportedMethodRequested method -> throwIO (UnsupportedAuthentication method)
-  where
-    required = connectChannelBinding settings == ChannelBindingRequire
-    requirePassword =
-      maybe (throwIO (AuthenticationError "the server asks for a password, but none is set")) pure (connectPassword settings)
-
--- | With the mechanism, and its channel binding.
-authenticateScram :: ByteString -> ChannelBinding -> ByteString -> Session 'Authentication -> IO (Session 'Initialization)
-authenticateScram mechanism binding password session = do
-  (clientFirst, client) <- scramClientFirst binding "" <$> newScramNonce
-  send @'SASLInitialResponseType session (SASLInitialResponse mechanism (Just clientFirst))
-  let continuing = continueIn session :: Session 'SaslContinue
-  serverFirst <-
-    pull continuing $
-      (\(AuthenticationSASLContinue challenge) -> Reply challenge) :|: startupTail
-  (clientFinal, serverSignature) <- either (throwIO . AuthenticationError) pure (scramClientFinal password client serverFirst)
-  send @'SASLResponseType continuing (SASLResponse clientFinal)
-  let finishing = continueIn continuing :: Session 'SaslFinal
-  serverFinal <-
-    pull finishing $
-      (\(AuthenticationSASLFinal outcome) -> Reply outcome) :|: startupTail
-  either (throwIO . AuthenticationError) pure (scramVerifyServerFinal serverSignature serverFinal)
-  awaitAuthenticationOk (continueIn finishing)
-
-awaitAuthenticationOk :: Session 'AuthenticationResult -> IO (Session 'Initialization)
-awaitAuthenticationOk session = do
-  pull session $
-    (\AuthenticationOk -> Reply ()) :|: startupTail
-  pure (continueIn session)
-
-data InitializationMessage
-  = ParameterReported ByteString ByteString
-  | BackendKeyReported (BackendKey ByteString)
-  | Initialized
-
--- | Values kept for the connection's lifetime are copied, so they don't keep
--- read buffers alive.
-initialize :: ProtocolVersion -> Session 'Initialization -> IO (Session 'Ready, ServerInfo)
-initialize version session = go [] Nothing
-  where
-    go parameters backendKey = do
-      message <-
-        pull session $
-          (\(ParameterStatus (Scalar (name, value))) -> Reply (ParameterReported (BS.copy name) (BS.copy value)))
-            :|: (\(BackendKeyData (Scalar (processId, Scalar secret))) -> Reply (BackendKeyReported (Scalar (processId, Scalar (BS.copy secret)))))
-            :|: (\(ReadyForQuery _) -> Reply Initialized)
-            :|: startupTail
-      case message of
-        ParameterReported name value -> go ((name, value) : parameters) backendKey
-        BackendKeyReported key -> go parameters (Just key)
-        Initialized -> pure (continueIn session, ServerInfo version (reverse parameters) backendKey)
 
 -- | A statement to run.
 data Statement
@@ -1324,126 +716,6 @@ inRow row parse = runOn (rowContext row) (rowEnd row) parse `onException` invali
 invalidateRow :: Row -> IO ()
 invalidateRow row = atomicModifyIORef' (rowCursor row) (\cursor -> (cursor {cursorActive = False}, ()))
 
--- | What a handler makes of a message.
-data Reply a
-  = Reply a
-  | -- | Keep pulling.
-    Skip
-  | -- | Keep the notification for 'awaitNotification', and keep pulling.
-    Notified (Notification ByteString)
-  | Rejected [ErrorNoticeField ByteString]
-
--- | Handlers for the messages any phase of startup accepts last.
-startupTail :: Alternatives '[ErrorResponse ByteString -> Reply a, NoticeResponse ByteString -> Reply a] (Reply a)
-startupTail = onError :|: onNotice :|: NoAlternatives
-
--- | Handlers for the messages any phase after startup accepts last. Notices
--- and reports of parameters and notifications are skipped for now.
-sessionTail ::
-  Alternatives
-    '[ ErrorResponse ByteString -> Reply a,
-       NoticeResponse ByteString -> Reply a,
-       ParameterStatus ByteString -> Reply a,
-       NotificationResponse ByteString -> Reply a
-     ]
-    (Reply a)
-sessionTail = onError :|: onNotice :|: onParameterStatus :|: (\(NotificationResponse notification) -> Notified notification) :|: NoAlternatives
-
-onError :: ErrorResponse ByteString -> Reply a
-onError (ErrorResponse fields) = Rejected fields
-
-onNotice :: NoticeResponse ByteString -> Reply a
-onNotice _ = Skip
-
-onParameterStatus :: ParameterStatus ByteString -> Reply a
-onParameterStatus _ = Skip
-
--- | Decodes an error's fields, which are copied out of the read buffer.
-serverError :: [ErrorNoticeField ByteString] -> IO ServerError
-serverError = either (throwIO . ProtocolError) (pure . ServerError) . diagnostics
-
--- | An error during a session. One after which the server ends the session
--- is thrown as 'ConnectionTerminated', leaving the session broken.
-sessionError :: [ErrorNoticeField ByteString] -> IO ServerError
-sessionError fields = do
-  failure <- serverError fields
-  when (isConnectionFatal failure) $ throwIO (ConnectionTerminated failure)
-  pure failure
-
--- | Pulls messages until one gives a reply or an error. Skipped messages are
--- pulled past.
-pullReply ::
-  ParseConstructor ('PayloadChoice (Accepted phase)) (Alternatives functions (Reply a)) (Reply a) =>
-  Session phase ->
-  Alternatives functions (Reply a) ->
-  IO (Either [ErrorNoticeField ByteString] a)
-pullReply session handlers = do
-  reply <- receive session handlers
-  case reply of
-    Reply a -> pure (Right a)
-    Skip -> pullReply session handlers
-    Notified notification -> do
-      keepNotification session notification
-      pullReply session handlers
-    Rejected fields -> pure (Left fields)
-
--- | Keeps a notification, copied out of the read buffer, for
--- 'awaitNotification'.
-keepNotification :: Session phase -> Notification ByteString -> IO ()
-keepNotification session notification =
-  atomicModifyIORef' (connectionNotifications (sessionConnection session)) (\kept -> (copyNotification notification : kept, ()))
-
-copyNotification :: Notification ByteString -> Notification ByteString
-copyNotification (Notification processId channel payload) = Notification processId (BS.copy channel) (BS.copy payload)
-
--- | Pulls a reply during a session; see 'sessionError'.
-pullEither ::
-  ParseConstructor ('PayloadChoice (Accepted phase)) (Alternatives functions (Reply a)) (Reply a) =>
-  Session phase ->
-  Alternatives functions (Reply a) ->
-  IO (Either ServerError a)
-pullEither session handlers =
-  pullReply session handlers >>= either (fmap Left . sessionError) (pure . Right)
-
--- | Pulls a reply during startup, when any error is thrown as
--- 'ConnectionRejected'.
-pull ::
-  ParseConstructor ('PayloadChoice (Accepted phase)) (Alternatives functions (Reply a)) (Reply a) =>
-  Session phase ->
-  Alternatives functions (Reply a) ->
-  IO a
-pull session handlers =
-  pullReply session handlers >>= either (throwIO . ConnectionRejected <=< serverError) pure
-
--- | Pulls the next message, which has to be one the phase accepts, and passes
--- it to its handler.
-receive ::
-  forall phase functions r.
-  ParseConstructor ('PayloadChoice (Accepted phase)) (Alternatives functions r) r =>
-  Session phase ->
-  Alternatives functions r ->
-  IO r
-receive (Session context) handlers = runOn context maxBound (parseChoice @(Accepted phase) handlers)
-
--- | Runs a parser on the context's unconsumed bytes, reading no further
--- than the given position.
-runOn :: Context -> Int -> Input a -> IO a
-runOn = runContextInput
-
--- | Runs an operation within its workspace and connection ownership.
-operation :: Session 'Ready -> IO a -> IO a
-operation (Session context) = runContextOperation context
-
-send :: forall s a phase. Serializable a s => Session phase -> a -> IO ()
-send session message = sendOutputs session (serialize @a @s message)
-
-sendOutputs :: Session phase -> Output -> IO ()
-sendOutputs (Session context) = sendContextOutput context
-
--- | The session in the phase the protocol continues in.
-continueIn :: Session phase -> Session next
-continueIn (Session context) = Session context
-
 -- | Explicit-context variants for bounded integrations.
 prepareWithContext :: Context -> ByteString -> ByteString -> [Maybe Word32] -> IO (Either ServerError (), TransactionStatus)
 prepareWithContext = prepare . sessionFromContext
@@ -1459,3 +731,12 @@ runBatchWithContext = runBatch . sessionFromContext
 
 awaitNotificationWithContext :: Context -> IO (Notification ByteString)
 awaitNotificationWithContext = awaitNotification . sessionFromContext
+
+-- | The backend process identifier, for server activity queries.
+backendProcessId :: BackendKey bytes -> Int32
+backendProcessId (Protocol.Scalar (Protocol.Scalar processId, _)) = processId
+
+-- | The process that sent the notification.
+notificationProcessId :: Notification bytes -> Int32
+notificationProcessId notification = case Protocol.notificationProcessId notification of
+  Protocol.Scalar processId -> processId

@@ -11,10 +11,10 @@
 -- TLS is used as @sslmode@ asks, except for @verify-ca@, and @require@ with a
 -- root certificate file, which libpq verifies as @verify-ca@. Options this
 -- client doesn't implement are rejected, unless they only matter with TLS or
--- GSSAPI. Password and service files aren't read.
+-- GSSAPI. Password files follow libpq's lookup and permission rules; service
+-- files aren't read.
 module Database.PostgreSQL.ConnectionString
-  ( -- * Connection strings
-    ConnectionString (..),
+  ( ConnectionString (..),
     Defaults (..),
     Host (..),
     InvalidConnectionString (..),
@@ -23,127 +23,43 @@ module Database.PostgreSQL.ConnectionString
     hostSocketAddress,
     parseConnectionString,
     readConnectionString,
-
-    -- * Connecting
     ConnectFailure (..),
     HostFailure (..),
-    connectFirst,
-    connectFirstWithBuffers,
-  )
-where
+    connectFirst
+  ) where
 
 import Control.Applicative ((<|>))
-import Control.Exception (Exception (..), Handler (..), IOException, bracketOnError, catches, throwIO, try)
+#if defined(mingw32_HOST_OS)
+import Control.Exception (IOException, try)
+#else
+import Control.Exception (IOException, bracket, try)
+#endif
 import Control.Monad (join, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_, toList)
-import Data.Functor (($>), (<&>))
-import Data.List (intercalate)
+import Data.Functor ((<&>))
 import Data.List.NonEmpty (NonEmpty (..))
-import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word8)
-import Database.PostgreSQL.Buffer (Buffer)
-import qualified Database.PostgreSQL.Internal.Context as Context
-import Database.PostgreSQL.Protocol (ProtocolVersion (..), protocolVersion3_0, protocolVersion3_2)
-import Database.PostgreSQL.Protocol.Codec (InputError (..))
-import Database.PostgreSQL.Session
-import Database.PostgreSQL.Transport (Address (..), ConnectError, RootCertificates (..), TcpOptions (..), TlsVersion (..))
-import Network.Socket (PortNumber)
+import Database.PostgreSQL.ConnectionString.Types
+import qualified Database.PostgreSQL.Internal.HostSelection as HostSelection
+import Database.PostgreSQL.Session (Phase (Ready), Session, close, connect, protocolVersion3_0, protocolVersion3_2)
+import Database.PostgreSQL.Session.Settings
+import Database.PostgreSQL.Transport (RootCertificates (..), TcpOptions (..), TlsVersion (..))
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv)
-import System.Timeout (timeout)
 #if !defined(mingw32_HOST_OS)
-import System.Posix.User (getEffectiveUserName)
+import Data.Bits ((.&.))
+import System.IO (hClose)
+import System.Posix.User (getEffectiveUserID, getEffectiveUserName, getUserEntryForID, homeDirectory)
+import System.Posix.Files (fileMode, getFdStatus, isRegularFile)
+import System.Posix.IO (OpenMode (ReadOnly), OpenFileFlags (..), closeFd, defaultFileFlags, dup, fdToHandle, openFd)
 #endif
-
--- | What a connection string asks for, with the environment's defaults.
-data ConnectionString = ConnectionString
-  { -- | Tried in order.
-    connectionHosts :: NonEmpty Host,
-    connectionUser :: ByteString,
-    connectionPassword :: Maybe ByteString,
-    connectionDatabase :: ByteString,
-    -- | Startup parameters: @application_name@, or else
-    -- @fallback_application_name@, @options@ and @client_encoding@, where
-    -- given.
-    connectionParameters :: [(ByteString, ByteString)],
-    -- | Seconds each host has to connect, authenticate and qualify.
-    connectionTimeout :: Maybe Int,
-    connectionTargetSessionAttrs :: TargetSessionAttrs,
-    -- | The version asked for, from @max_protocol_version@, and the lowest one
-    -- accepted, from @min_protocol_version@.
-    connectionProtocolVersion :: ProtocolVersion,
-    connectionMinProtocolVersion :: ProtocolVersion,
-    connectionTcpOptions :: TcpOptions,
-    connectionSslMode :: SslMode,
-    -- | The client certificate and its private key, from @sslcert@ and
-    -- @sslkey@, or the default files in the defaults' certificate directory,
-    -- unless @sslcertmode@ is @disable@.
-    connectionSslCertificate :: Maybe (FilePath, FilePath),
-    -- | Certificate revocation lists: from @sslcrl@, or, if neither it nor
-    -- @sslcrldir@ is given, the default file in the defaults' certificate
-    -- directory, and from @sslcrldir@.
-    connectionSslRevocationList :: Maybe FilePath,
-    connectionSslRevocationListDirectory :: Maybe FilePath,
-    -- | The versions of TLS from @ssl_min_protocol_version@, @TLSv1.2@ by
-    -- default, to @ssl_max_protocol_version@, that rustls has.
-    connectionSslVersions :: [TlsVersion],
-    connectionSslServerNameIndication :: Bool,
-    -- | From @sslnegotiation@: whether TLS starts without asking the server
-    -- first, which needs an sslmode that requires TLS.
-    connectionSslDirect :: Bool,
-    connectionChannelBinding :: ChannelBindingMode
-  }
-  deriving (Eq, Show)
-
--- | A server to try.
-data Host = Host
-  { -- | As the connection string names it: a host name, an IP address, or the
-    -- directory of a Unix-domain socket.
-    hostName :: String,
-    -- | From @hostaddr@: the IP address to connect to instead of looking up
-    -- the name.
-    hostAddress :: Maybe String,
-    hostPort :: PortNumber
-  }
-  deriving (Eq, Show)
-
--- | Which servers qualify, from @target_session_attrs@.
-data TargetSessionAttrs
-  = AnySession
-  | -- | Not in hot standby, and not read-only by default.
-    ReadWriteSession
-  | ReadOnlySession
-  | -- | Not in hot standby.
-    PrimarySession
-  | StandbySession
-  | -- | A standby if a host is one, or else any server.
-    PreferStandbySession
-  deriving (Eq, Show)
-
--- | A connection string that can't be used, for the reason given.
-newtype InvalidConnectionString = InvalidConnectionString String
-  deriving (Show)
-
-instance Exception InvalidConnectionString where
-  displayException (InvalidConnectionString reason) = reason
-
--- | What libpq builds in, given by the client: where to connect when a string
--- gives no host, and where the files libpq looks for by default are.
-data Defaults = Defaults
-  { -- | A socket directory, or a host name. libpq's is @/tmp@, or the
-    -- directory it was built with, and @localhost@ on Windows.
-    defaultHost :: String,
-    -- | The directory of @root.crt@, @postgresql.crt@, @postgresql.key@ and
-    -- @root.crl@, if any: libpq's is @~/.postgresql@.
-    defaultCertificateDirectory :: Maybe FilePath
-  }
-  deriving (Eq, Show)
 
 -- | Parses the connection string, and fills in what it leaves out from the
 -- environment and the defaults as libpq does.
@@ -154,22 +70,131 @@ readConnectionString defaults string = do
   -- whole environment.
   environment <- catMaybes <$> traverse (\name -> fmap (name,) <$> lookupEnv name) (mapMaybe snd optionTable)
   user <- localUserName
-  case parseConnectionString defaults (`lookup` environment) user string of
-    -- libpq verifies the server's certificate with sslmode=require too if
-    -- the default root certificate file exists.
-    Right parsed
-      | connectionSslMode parsed == SslRequire,
-        Just roots <- rootCertificateIn <$> defaultCertificateDirectory defaults ->
-          doesFileExist roots <&> \verifying ->
-            if verifying then Left (requireWithRoots roots) else Right parsed
-    parsed -> pure parsed
+  let parsed = do
+        given <- options string
+        resolved <- resolve (setting (`lookup` environment) given) defaults user
+        pure (given, resolved)
+  case parsed of
+    Left failure -> pure (Left failure)
+    Right (given, resolved) -> do
+      withPasswords <- passwordsFromFile defaults (setting (`lookup` environment) given) resolved
+      -- libpq verifies the server's certificate with sslmode=require too if
+      -- the default root certificate file exists.
+      case withPasswords of
+        parsedWithPasswords
+          | connectionSslMode parsedWithPasswords == SslRequire,
+            Just roots <- rootCertificateIn <$> defaultCertificateDirectory defaults ->
+              doesFileExist roots <&> \verifying ->
+                if verifying then Left (requireWithRoots roots) else Right parsedWithPasswords
+          | otherwise -> pure (Right parsedWithPasswords)
 
 -- | Like 'readConnectionString', with the environment variables and the local
--- user's name, if it could be looked up, given.
+-- user's name, if it could be looked up, given. This pure parser accepts
+-- @passfile@ but leaves password-file lookup to 'readConnectionString'.
 parseConnectionString :: Defaults -> (String -> Maybe String) -> Maybe String -> ByteString -> Either String ConnectionString
 parseConnectionString defaults environment localUser string = do
   given <- options string
   resolve (setting environment given) defaults localUser
+
+-- | Password files are only consulted when neither the connection string nor
+-- PGPASSWORD supplied a password. Keep the matches by host: a later host may
+-- require different credentials after an earlier connection attempt fails.
+passwordsFromFile :: Defaults -> (ByteString -> Maybe Setting) -> ConnectionString -> IO ConnectionString
+passwordsFromFile defaults option parsed
+  | isJust (connectionPassword parsed) = pure parsed
+  | otherwise = do
+      file <- maybe defaultPasswordFile (pure . Just . text) (value "passfile")
+      case file of
+        Nothing -> pure parsed
+        Just path -> do
+          contents <- readPasswordFile path
+          let entries = map (Char8.dropWhileEnd (== '\r')) (Char8.lines contents)
+              names = maybe [] (Char8.split ',') (value "host")
+              addresses = maybe [] (Char8.split ',') (value "hostaddr")
+              matches (index, host) =
+                (host,) <$> passwordFor entries (matchingHost names addresses index) (Char8.pack (show (hostPort host))) (connectionDatabase parsed) (connectionUser parsed)
+          pure parsed{connectionHostPasswords = mapMaybe matches (zip [0 ..] (toList (connectionHosts parsed)))}
+  where
+    value keyword = case option keyword of
+      Just (Setting bytes _) | not (BS.null bytes) -> Just bytes
+      _ -> Nothing
+    at index = fromMaybe BS.empty . listToMaybe . drop index
+    matchingHost names addresses index
+      | not (BS.null name) =
+          if BS.null address && text name == defaultHost defaults && isSocket (text name) then "localhost" else name
+      | not (BS.null address) = address
+      | otherwise = "localhost"
+      where
+        name = at index names
+        address = at index addresses
+    isSocket ('/' : _) = True
+    isSocket ('@' : _) = True
+    isSocket _ = False
+
+-- | The default path follows libpq, independently of the TLS directory.
+defaultPasswordFile :: IO (Maybe FilePath)
+defaultPasswordFile =
+#if defined(mingw32_HOST_OS)
+  fmap (<> "/postgresql/pgpass.conf") <$> lookupEnv "APPDATA"
+#else
+  either (\(_ :: IOException) -> Nothing) Just <$> try locate
+  where
+    locate = do
+      home <- lookupEnv "HOME"
+      directory <- case home of
+        Just directory | not (null directory) -> pure directory
+        _ -> homeDirectory <$> (getEffectiveUserID >>= getUserEntryForID)
+      pure (directory <> "/.pgpass")
+#endif
+
+-- | Missing, unreadable, non-regular and insecure files are ignored. On Unix,
+-- inspect the opened descriptor rather than checking a path and reopening it.
+readPasswordFile :: FilePath -> IO ByteString
+readPasswordFile path = either (\(_ :: IOException) -> BS.empty) id <$> try readContents
+  where
+#if defined(mingw32_HOST_OS)
+    readContents = BS.readFile path
+#else
+    readContents = bracket open closeFd $ \fd -> do
+      status <- getFdStatus fd
+      if isRegularFile status && fileMode status .&. 0o077 == 0
+        then bracket (dup fd >>= fdToHandle) hClose BS.hGetContents
+        else pure BS.empty
+    -- O_NONBLOCK prevents a named pipe from blocking before fstat rejects it.
+#if MIN_VERSION_unix(2,8,0)
+    open = openFd path ReadOnly defaultFileFlags{nonBlock = True}
+#else
+    open = openFd path ReadOnly Nothing defaultFileFlags{nonBlock = True}
+#endif
+#endif
+
+-- | First matching line wins. Only an unescaped, whole-field '*' is a
+-- wildcard. The password is the remainder of the line, with escapes removed.
+passwordFor :: [ByteString] -> ByteString -> ByteString -> ByteString -> ByteString -> Maybe ByteString
+passwordFor entries host port database user = listToMaybe (mapMaybe match entries)
+  where
+    match line
+      | BS.null line || BS.head line == 35 = Nothing
+      | otherwise = do
+          (hostField, rest1) <- field line
+          (portField, rest2) <- field rest1
+          (databaseField, rest3) <- field rest2
+          (userField, password) <- field rest3
+          if and (zipWith matches [hostField, portField, databaseField, userField] [host, port, database, user])
+            then Just (unescape password)
+            else Nothing
+    matches rawField value = rawField == "*" || unescape rawField == value
+    field = go [] . BS.unpack
+      where
+        go _ [] = Nothing
+        go acc (92 : next : rest) = go (next : 92 : acc) rest
+        go acc (58 : rest) = Just (BS.pack (reverse acc), BS.pack rest)
+        go acc (next : rest) = go (next : acc) rest
+    unescape = BS.pack . go . BS.unpack
+      where
+        go (92 : next : rest) = next : go rest
+        go (next : rest) = next : go rest
+        go [] = []
 
 -- | The operating system's name of the user, which libpq uses when none is
 -- given. The lookup can fail, e.g. for a container user without a passwd
@@ -468,9 +493,6 @@ resolve option defaults localUser = do
   user <- case given "user" of
     Just user -> Right user
     Nothing -> maybe (Left "could not look up the local user's name, so a user has to be given") (Right . encodeUtf8 . Text.pack) localUser
-  password <- case given "password" of
-    Nothing | Just _ <- given "passfile" -> Left "password files aren't supported, so a password has to be given"
-    password -> Right password
   connectTimeout <- traverse (integer "connect_timeout") (given "connect_timeout")
   target <- case maybe "any" (\(Setting value _) -> value) (option "target_session_attrs") of
     "any" -> Right AnySession
@@ -503,7 +525,8 @@ resolve option defaults localUser = do
     ConnectionString
       { connectionHosts = hosts,
         connectionUser = user,
-        connectionPassword = password,
+        connectionPassword = given "password",
+        connectionHostPasswords = [],
         connectionDatabase = fromMaybe user (given "dbname"),
         connectionParameters =
           [("application_name", name) | Just name <- [given "application_name" <|> given "fallback_application_name"]]
@@ -612,168 +635,13 @@ resolve option defaults localUser = do
       [] -> ""
     commaSeparated value = if BS.null value then [""] else Char8.split ',' value
 
--- | The settings for connecting to one of the hosts.
-hostConnectSettings :: ConnectionString -> Host -> ConnectSettings
-hostConnectSettings string host =
-  (connectSettings (hostSocketAddress host) (connectionUser string))
-    { connectPassword = connectionPassword string,
-      connectDatabase = Just (connectionDatabase string),
-      connectParameters = connectionParameters string,
-      connectProtocolVersion = connectionProtocolVersion string,
-      connectTcpOptions = connectionTcpOptions string,
-      connectSslMode = connectionSslMode string,
-      connectSslCertificate = connectionSslCertificate string,
-      connectSslRevocationList = connectionSslRevocationList string,
-      connectSslRevocationListDirectory = connectionSslRevocationListDirectory string,
-      connectSslVersions = connectionSslVersions string,
-      connectSslServerNameIndication = connectionSslServerNameIndication string,
-      connectSslDirect = connectionSslDirect string,
-      connectChannelBinding = connectionChannelBinding string,
-      -- With hostaddr, the address is the IP address the name resolved to.
-      connectServerName = Just (hostName host)
-    }
-
--- | Where to connect. A socket directory names the Unix-domain socket for the
--- port in it, and one starting with @\@@ a socket in Linux's abstract
--- namespace.
-hostSocketAddress :: Host -> Address
-hostSocketAddress host = case (hostAddress host, hostName host) of
-  (Just address, _) -> TcpAddress address (hostPort host)
-  (Nothing, directory@('/' : _)) -> UnixAddress (socketFile directory)
-  (Nothing, '@' : abstract) -> UnixAddress ('\0' : socketFile abstract)
-  (Nothing, name) -> TcpAddress name (hostPort host)
-  where
-    socketFile directory = directory <> "/.s.PGSQL." <> show (hostPort host)
-
--- | No host qualified: each attempt's host and failure, in order.
--- 'displayException' words it as libpq does.
-newtype ConnectFailure = ConnectFailure [(Host, HostFailure)]
-  deriving (Show)
-
--- | Why a host didn't qualify.
-data HostFailure
-  = -- | The socket didn't connect.
-    NotConnected ConnectError
-  | -- | The server rejected the connection, or the startup failed.
-    NotStarted ConnectionError
-  | -- | The connection broke during the startup.
-    Broke String
-  | -- | The connect timeout passed first.
-    TimedOut
-  | -- | The server doesn't have the session attributes or the protocol
-    -- version asked for.
-    Unsuitable String
-  | -- | Checking the session attributes failed.
-    CheckFailed ServerError
-  deriving (Show)
-
-instance Exception ConnectFailure where
-  displayException (ConnectFailure failures) = intercalate "\n" (map describe failures)
-    where
-      describe = \case
-        (_, NotConnected failure) -> displayException failure
-        (host, failure) -> "connection to server " <> location host <> " failed: " <> reason failure
-      reason = \case
-        NotConnected failure -> displayException failure
-        NotStarted failure -> displayException failure
-        Broke why -> why
-        TimedOut -> "timeout expired"
-        Unsuitable why -> why
-        CheckFailed failure -> displayException failure
-      location host = case hostSocketAddress host of
-        UnixAddress path -> "on socket " <> show path
-        TcpAddress address port
-          | address == hostName host -> "at " <> show address <> ", port " <> show port
-          | otherwise -> "at " <> show (hostName host) <> " (" <> address <> "), port " <> show port
-
 -- | Connects to the first host that accepts the connection and qualifies
 -- under @target_session_attrs@, giving each host the connect timeout. With
 -- @prefer-standby@, the hosts are tried for a standby first, and then for any
 -- server. The settings for each host can be adjusted, e.g. for a bigger read
 -- buffer. Throws 'ConnectFailure' when no host qualifies.
 connectFirst :: (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Session 'Ready, ServerInfo, Host)
-connectFirst = connectFirstUsing connect close queryValue
-
--- | Integration-only host selection using initialized setup storage. Each
--- startup and qualification context expires before this pair is returned.
-connectFirstWithBuffers :: Buffer -> Buffer -> (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Connection, ServerInfo, Host)
-connectFirstWithBuffers input output = connectFirstUsing (connectWithBuffers input output) closeConnection value
-  where
-    value connection query = Context.withContext connection input output $ \context ->
-      queryValue (sessionFromContext context) query
-
-connectFirstUsing
-  :: (ConnectSettings -> IO (connection, ServerInfo))
-  -> (connection -> IO ())
-  -> (connection -> ByteString -> IO (Either ServerError ByteString))
-  -> (ConnectSettings -> ConnectSettings)
-  -> ConnectionString
-  -> IO (connection, ServerInfo, Host)
-connectFirstUsing open dispose value adjust string =
-  either (throwIO . ConnectFailure . reverse) pure =<< case connectionTargetSessionAttrs string of
-    PreferStandbySession -> attempt StandbySession hosts [] >>= either (attempt AnySession hosts) (pure . Right)
-    target -> attempt target hosts []
-  where
-    hosts = toList (connectionHosts string)
-    attempt _ [] failures = pure (Left failures)
-    attempt target (host : others) failures =
-      tryHost target host >>= \case
-        Right connected -> pure (Right connected)
-        Left failure -> attempt target others ((host, failure) : failures)
-    tryHost target host =
-      fromMaybe (Left TimedOut) <$> withTimeout (establish target host `catches` handlers)
-    withTimeout = maybe (fmap Just) (\seconds -> timeout (seconds * 1000000)) (connectionTimeout string)
-    handlers =
-      [ Handler (pure . Left . NotConnected),
-        Handler (pure . Left . NotStarted),
-        Handler (\(failure :: IOException) -> pure (Left (Broke (displayException failure)))),
-        Handler (\(InputError why) -> pure (Left (Broke why)))
-      ]
-    establish target host =
-      bracketOnError (open (adjust (hostConnectSettings string host))) (dispose . fst) $ \(session, info) ->
-        qualify target session info >>= \case
-          Nothing -> pure (Right (session, info, host))
-          Just failure -> dispose session $> Left failure
-    qualify target session info
-      | serverProtocolVersion info < connectionMinProtocolVersion string =
-          pure . Just . Unsuitable $
-            "server only supports protocol version "
-              <> version (serverProtocolVersion info)
-              <> ", but min_protocol_version was set to "
-              <> version (connectionMinProtocolVersion string)
-      | otherwise = case target of
-          ReadWriteSession -> expect False "session is read-only" <$> readOnly
-          ReadOnlySession -> expect True "session is not read-only" <$> readOnly
-          PrimarySession -> expect False "server is in hot standby mode" <$> standby
-          StandbySession -> expect True "server is not in hot standby mode" <$> standby
-          _ -> pure Nothing
-      where
-        reported name = lookup name (serverParameters info)
-        -- Servers since 14 report both; for older ones, ask.
-        readOnly = case (reported "in_hot_standby", reported "default_transaction_read_only") of
-          (Just inStandby, Just readOnlyDefault) -> pure (Right (inStandby == "on" || readOnlyDefault == "on"))
-          _ -> fmap (== "on") <$> value session "SHOW transaction_read_only"
-        standby = case reported "in_hot_standby" of
-          Just inStandby -> pure (Right (inStandby == "on"))
-          Nothing -> fmap (== "t") <$> value session "SELECT pg_catalog.pg_is_in_recovery()"
-        expect wanted why = \case
-          Left failure -> Just (CheckFailed failure)
-          Right actual
-            | actual == wanted -> Nothing
-            | otherwise -> Just (Unsuitable why)
-    version (ProtocolVersion major minor) = show major <> "." <> show minor
-
--- | The first column of the first row a query returns, as text.
-queryValue :: Session 'Ready -> ByteString -> IO (Either ServerError ByteString)
-queryValue session query = do
-  (result, _) <- execute session (Execution (Unprepared query []) [] [] []) firstValue Nothing
-  pure (fromMaybe "" . fst <$> result)
-  where
-    firstValue (Just value) _ = pure (Just value)
-    firstValue Nothing row =
-      nextColumn row >>= \case
-        Just (Column _) -> Just . BS.copy <$> columnBytes row
-        _ -> pure (Just "")
+connectFirst = HostSelection.connectFirstUsing connect close HostSelection.queryValue
 
 -- | C's isspace, which libpq uses, in the C locale.
 isBlank :: Char -> Bool

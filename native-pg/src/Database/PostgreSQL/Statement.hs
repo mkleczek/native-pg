@@ -10,22 +10,18 @@
 -- has a scope variable, as 'runST' does, so the row and the streams taken
 -- from it can't leave the step.
 module Database.PostgreSQL.Statement
-  ( -- * Statements
-    Statement (..),
+  ( Statement (..),
     Param (..),
+    FormatCode (..),
     QueryError (..),
     StatementError (..),
-
-    -- * Results
-    Result (..),
+    Result,
     RowDecoder,
     row,
     noResult,
     singleRow,
     rowMaybe,
     rowList,
-
-    -- * Streaming
     ScopedRow,
     ScopedStream,
     foldRows,
@@ -35,21 +31,21 @@ module Database.PostgreSQL.Statement
     decodeScopedStreamingNullable,
     streamLength,
     streamChunk,
-    streamChunks,
-  )
-where
+    streamChunks
+  ) where
 
-import Control.Exception (Exception)
 import Control.Monad (join)
 import Data.ByteString (ByteString)
 import Data.Word (Word32)
+import Database.PostgreSQL.Diagnostics (QueryError (..), StatementError (..))
+import Database.PostgreSQL.Internal.Result (Result (..))
 import Database.PostgreSQL.Decoding (DecodingError (..))
-import Database.PostgreSQL.Protocol (FormatCode (..), Parameter)
-import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
+import Database.PostgreSQL.Types (FormatCode (..))
+import Database.PostgreSQL.Streaming.Types (Parameter)
+import Database.PostgreSQL.Streaming.Types (ByteStream (..))
 import Database.PostgreSQL.Session
   ( DecodeRow (RowFunction, mapRowFunction),
     Row,
-    ServerError,
     decodeRow,
     columnStreamWithChunks,
     decodeRowStreamingUsing,
@@ -74,28 +70,6 @@ data Param = Param
     -- | 'Nothing' is NULL.
     paramValue :: Maybe Parameter
   }
-
--- | A statement failed: its SQL, and why.
-data QueryError = QueryError ByteString StatementError
-  deriving (Eq, Show)
-
-instance Exception QueryError
-
-data StatementError
-  = -- | The server reported an error.
-    ServerFailed ServerError
-  | -- | A row couldn't be decoded.
-    RowFailed DecodingError
-  | -- | The result had this many rows, which its shape doesn't allow.
-    UnexpectedAmountOfRows Int
-  deriving (Eq, Show)
-
--- | How the rows of a result become its value: a fold over them, and a last
--- step that can reject the result.
-data Result a = forall accumulated. Result accumulated (accumulated -> Row -> IO (Either DecodingError accumulated)) (accumulated -> Either StatementError a)
-
-instance Functor Result where
-  fmap f (Result initial step finish) = Result initial step (fmap f . finish)
 
 -- | Decodes a row into a value.
 newtype RowDecoder a = RowDecoder (Row -> IO (Either DecodingError a))

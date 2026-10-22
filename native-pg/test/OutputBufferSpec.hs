@@ -8,12 +8,13 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
 import Control.Monad (forM_)
-import qualified Database.PostgreSQL.Protocol.Codec as Output
+import qualified Database.PostgreSQL.Internal.Protocol.Codec as Output
 import Database.PostgreSQL.Internal.Context
-import Database.PostgreSQL.Buffer
-import Database.PostgreSQL.Protocol (Sync (..), SyncType (SyncType), Parse (..), ParseType (ParseType), Query (..), QueryType (QueryType), Execute (..), ExecuteType (ExecuteType))
-import Database.PostgreSQL.Protocol.Codec (serialize)
-import Database.PostgreSQL.Transport
+import Database.PostgreSQL.Internal.Buffer
+import Database.PostgreSQL.Internal.Protocol (Sync (..), SyncType (SyncType), Parse (..), ParseType (ParseType), Query (..), QueryType (QueryType), Execute (..), ExecuteType (ExecuteType))
+import Database.PostgreSQL.Internal.Protocol.Codec (serialize)
+import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Internal.Channel
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (castPtr, plusPtr)
 import Skeletest hiding (context)

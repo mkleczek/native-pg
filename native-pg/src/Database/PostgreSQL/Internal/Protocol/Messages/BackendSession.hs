@@ -2,7 +2,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Database.PostgreSQL.Protocol.Messages.BackendSession
+module Database.PostgreSQL.Internal.Protocol.Messages.BackendSession
   ( BackendKeyDataType (BackendKeyDataType),
     BindCompleteType (BindCompleteType),
     CloseCompleteType (CloseCompleteType),
@@ -73,14 +73,14 @@ module Database.PostgreSQL.Protocol.Messages.BackendSession
 where
 
 import Data.Int (Int16, Int32)
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec
   ( HasConstructor (..),
   )
-import Database.PostgreSQL.Protocol.Codec.Payload
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Empty,
     Payload (..),
   )
-import Database.PostgreSQL.Protocol.Messages.Types
+import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( BackendKey,
     BackendKeyType (BackendKeyType),
     CopyResponse,

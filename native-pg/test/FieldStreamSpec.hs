@@ -11,11 +11,11 @@ import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
-import Database.PostgreSQL.Buffer
+import Database.PostgreSQL.Internal.Buffer
 import Database.PostgreSQL.Diagnostics (Diagnostics (..))
 import Database.PostgreSQL.Internal.Context
-import Database.PostgreSQL.Protocol (TransactionStatus (..))
-import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
+import Database.PostgreSQL.Internal.Protocol (TransactionStatus (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..))
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Transaction as Tx
 import qualified Database.PostgreSQL.Pipeline as Pipeline
@@ -23,7 +23,8 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, minusPtr)
 import Data.Word (Word8)
-import Database.PostgreSQL.Transport
+import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Internal.Channel
 import Skeletest hiding (context)
 
 spec :: Spec

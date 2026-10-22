@@ -10,7 +10,7 @@
 -- Everything is resolved by instance search over the schema and every method
 -- is inlined, so a message's parser or serializer specializes into
 -- straight-line code with its constants folded in.
-module Database.PostgreSQL.Protocol.Codec
+module Database.PostgreSQL.Internal.Protocol.Codec
   ( Alternatives (..),
     ByteStream (..),
     HasConstructor (..),
@@ -50,6 +50,7 @@ import Control.Monad (replicateM, unless)
 import Control.Monad.Except (MonadError (..))
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
+import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import qualified Data.ByteString as BS
 import Data.Char (ord)
 import Data.Functor (($>))
@@ -57,7 +58,7 @@ import Data.Int (Int16, Int32)
 import Data.Kind (Type)
 import Data.Proxy (Proxy (..))
 import Data.Word (Word16, Word32, Word8)
-import Database.PostgreSQL.Protocol.Codec.Input
+import Database.PostgreSQL.Internal.Protocol.Codec.Input
   ( Input,
     InputBuffer,
     InputError (..),
@@ -79,7 +80,7 @@ import Database.PostgreSQL.Protocol.Codec.Input
     runInputFramedUntil,
     skipInput,
   )
-import Database.PostgreSQL.Protocol.Codec.Output
+import Database.PostgreSQL.Internal.Protocol.Codec.Output
   ( ByteStream (..),
     Output,
     Uncopied (..),
@@ -91,12 +92,14 @@ import Database.PostgreSQL.Protocol.Codec.Output
     outputCopied,
     outputLength,
     outputs,
+    stream,
+    borrowedStream,
     word16,
     word32,
     word8,
     writeOutput,
   )
-import Database.PostgreSQL.Protocol.Codec.Payload
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
 import GHC.TypeLits (KnownChar, KnownNat, Nat, charVal, natVal)
@@ -659,3 +662,16 @@ charByte
   where
     code = ord (charVal (Proxy @value))
 {-# INLINE charByte #-}
+
+instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
+  serialize Nothing = int32 (-1)
+  serialize (Just (ParameterBytes value)) = int32 (parameterLengthAsInt32 (BS.length value)) <> bytes value
+  serialize (Just (ParameterChunks chunks)) = int32 (parameterLengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
+  serialize (Just (ParameterStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> stream source
+  serialize (Just (ParameterBorrowedStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> borrowedStream source
+  {-# INLINE serialize #-}
+
+parameterLengthAsInt32 :: Int -> Int32
+parameterLengthAsInt32 count
+  | count <= fromIntegral (maxBound @Int32) = fromIntegral count
+  | otherwise = error ("a parameter of " <> show count <> " bytes doesn't fit in an Int32 length")
