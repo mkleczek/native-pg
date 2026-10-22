@@ -29,9 +29,10 @@ import Control.Applicative ((<|>))
 import Control.Monad (join)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import Data.Word (Word32)
 import Data.Functor ((<&>))
 import Data.Maybe (fromMaybe)
-import Database.PostgreSQL.Protocol (FormatCode (..), OptionalOid, TransactionStatus)
+import Database.PostgreSQL.Protocol (FormatCode (..), TransactionStatus)
 import Database.PostgreSQL.Session
   ( Batch,
     Execution (..),
@@ -66,7 +67,7 @@ instance Applicative Pipeline where
 
 -- | Gives how a statement runs prepared, from its SQL and its parameters'
 -- types, e.g. from a statement cache.
-type Prepare = ByteString -> [OptionalOid] -> IO Prepared
+type Prepare = ByteString -> [Maybe Word32] -> IO Prepared
 
 data Prepared
   = -- | It's prepared under the name already.

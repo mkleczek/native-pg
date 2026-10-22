@@ -83,6 +83,7 @@ import qualified Data.ByteString as BS
 import Data.Char (isDigit)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
+import Data.Word (Word32)
 import Data.Kind (Type)
 import Data.List (sort)
 import Data.Maybe (fromMaybe, isJust)
@@ -112,7 +113,6 @@ import Database.PostgreSQL.Protocol.Codec
     ByteStream (..),
     Input,
     InputSource (..),
-    MonadInput (..),
     Output,
     ParseConstructor,
     Parsable (..),
@@ -763,13 +763,13 @@ initialize version session = go [] Nothing
 data Statement
   = -- | SQL parsed for this execution only, as the unnamed statement, with its
     -- parameters' types. 'Nothing' lets the server infer a type.
-    Unprepared ByteString [OptionalOid]
+    Unprepared ByteString [Maybe Word32]
   | -- | A statement prepared earlier under this name.
     Prepared ByteString
   | -- | SQL parsed and prepared under the name, with its parameters' types,
     -- and run. The action runs once the server has parsed it, e.g. to
     -- remember that the statement is prepared, even if running it fails.
-    Preparing ByteString ByteString [OptionalOid] (IO ())
+    Preparing ByteString ByteString [Maybe Word32] (IO ())
 
 data Execution = Execution
   { executionStatement :: Statement,
@@ -783,9 +783,9 @@ data Execution = Execution
 
 -- | Prepares a statement under a name, with its parameters' types. 'Nothing'
 -- lets the server infer a type.
-prepare :: Session 'Ready -> ByteString -> ByteString -> [OptionalOid] -> IO (Either ServerError (), TransactionStatus)
+prepare :: Session 'Ready -> ByteString -> ByteString -> [Maybe Word32] -> IO (Either ServerError (), TransactionStatus)
 prepare session name query parameterTypes = operation session $ do
-  sendOutputs session (serialize @(Parse ByteString) @'ParseType (Parse name query parameterTypes) <> sync)
+  sendOutputs session (serialize @(Parse ByteString) @'ParseType (Parse name query (map (fmap Scalar) parameterTypes)) <> sync)
   parsed <- pullEither (continueIn session :: Session 'ParseResult) ((\ParseComplete -> Reply ()) :|: sessionTail)
   awaitReady session id parsed
 
@@ -930,11 +930,11 @@ executionMessages execution =
     <> serialize @(Execute ByteString) @'ExecuteType (Execute "" 0)
   where
     (preamble, statementName) = case executionStatement execution of
-      Unprepared query parameterTypes -> (serialize @(Parse ByteString) @'ParseType (Parse "" query parameterTypes), "")
+      Unprepared query parameterTypes -> (serialize @(Parse ByteString) @'ParseType (Parse "" query (map (fmap Scalar) parameterTypes)), "")
       Prepared name
         | streamsParameter execution -> (serialize @(Describe ByteString) @'DescribeType (Describe PreparedStatement name), name)
         | otherwise -> (mempty, name)
-      Preparing name query parameterTypes _ -> (serialize @(Parse ByteString) @'ParseType (Parse name query parameterTypes), name)
+      Preparing name query parameterTypes _ -> (serialize @(Parse ByteString) @'ParseType (Parse name query (map (fmap Scalar) parameterTypes)), name)
 
 -- | Whether a parameter of the execution streams.
 streamsParameter :: Execution -> Bool
@@ -1445,7 +1445,7 @@ continueIn :: Session phase -> Session next
 continueIn (Session context) = Session context
 
 -- | Explicit-context variants for bounded integrations.
-prepareWithContext :: Context -> ByteString -> ByteString -> [OptionalOid] -> IO (Either ServerError (), TransactionStatus)
+prepareWithContext :: Context -> ByteString -> ByteString -> [Maybe Word32] -> IO (Either ServerError (), TransactionStatus)
 prepareWithContext = prepare . sessionFromContext
 
 closeStatementWithContext :: Context -> ByteString -> IO (Either ServerError (), TransactionStatus)
