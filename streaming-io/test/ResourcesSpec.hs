@@ -58,7 +58,7 @@ spec = do
       atomically (release lease)
 
  describe "lease ownership" $ do
-  xfail "per-lease return ownership is pending" $ it "returns a lease only once even after another borrower acquires its blocks" $
+  it "returns a lease only once even after another borrower acquires its blocks" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       first <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
       atomically (release first >> release first)
@@ -66,7 +66,7 @@ spec = do
       atomically (release first)
       isNothing <$> atomically (tryAcquire resources (positiveInt @1)) `shouldReturn` True
       atomically (release second)
-  xfail "resource retirement is pending" $ it "rejects acquisition after the owning scope ends, including after a late return" $ do
+  it "rejects acquisition after the owning scope ends, including after a late return" $ do
     (resources, lease) <- withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       lease <- atomically (tryAcquire resources (positiveInt @1)) >>= requireLease
       pure (resources, lease)
