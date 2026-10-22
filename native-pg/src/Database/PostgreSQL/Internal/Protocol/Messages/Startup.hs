@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Database.PostgreSQL.Internal.Protocol.Messages.Startup
@@ -7,14 +8,16 @@ module Database.PostgreSQL.Internal.Protocol.Messages.Startup
     SSLRequestType (SSLRequestType),
     GSSENCRequestType (GSSENCRequestType),
     CancelRequestType (CancelRequestType),
-    StartupMessageEnvelope,
-    SSLRequestEnvelope,
-    GSSENCRequestEnvelope,
-    CancelRequestEnvelope,
-    StartupMessage (..),
-    SSLRequest (SSLRequest),
-    GSSENCRequest (GSSENCRequest),
-    CancelRequest (CancelRequest),
+    StartupMessage,
+    pattern StartupMessage,
+    startupMessageProtocolVersion,
+    startupMessageParameters,
+    SSLRequest,
+    pattern SSLRequest,
+    GSSENCRequest,
+    pattern GSSENCRequest,
+    CancelRequest,
+    pattern CancelRequest,
     parseStartupMessage,
     parseCancelRequest,
   )
@@ -28,12 +31,12 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
 import Database.PostgreSQL.Internal.Protocol.Messages.Parse
-  ( parseEnvelope,
+  ( parseMessage,
   )
 import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( BackendKey,
     BackendKeyType (BackendKeyType),
-    Envelope,
+    Envelope (..),
     ProtocolVersion,
     ProtocolVersionType (ProtocolVersionType),
     StartupParameter,
@@ -72,71 +75,72 @@ data CancelRequestType (payload :: Payload) where
           )
       )
 
-data StartupMessage bytes = StartupMessage
-  { startupMessageProtocolVersion :: ProtocolVersion,
-    startupMessageParameters :: [StartupParameter bytes]
-  }
+data StartupMessagePayload bytes = StartupMessagePayload ProtocolVersion [StartupParameter bytes]
 
-deriving instance Eq bytes => Eq (StartupMessage bytes)
-deriving instance Show bytes => Show (StartupMessage bytes)
+deriving instance Eq bytes => Eq (StartupMessagePayload bytes)
+deriving instance Show bytes => Show (StartupMessagePayload bytes)
 
-type StartupMessageEnvelope bytes =
-  Envelope
-    (StartupMessage bytes)
-    'StartupMessageType
+type StartupMessage bytes = Envelope (StartupMessagePayload bytes) 'StartupMessageType
+
+pattern StartupMessage :: ProtocolVersion -> [StartupParameter bytes] -> StartupMessage bytes
+pattern StartupMessage {startupMessageProtocolVersion, startupMessageParameters} = Envelope (StartupMessagePayload startupMessageProtocolVersion startupMessageParameters)
+{-# COMPLETE StartupMessage #-}
 
 instance HasConstructor 'StartupMessageType (StartupMessage bytes) where
   type ConstructorOf 'StartupMessageType (StartupMessage bytes) r = ProtocolVersion -> [StartupParameter bytes] -> r
   constructorOf = StartupMessage
   destructorOf (StartupMessage version parameters) k = k version parameters
 
-data SSLRequest = SSLRequest
+data SSLRequestPayload = SSLRequestPayload
 
-deriving instance Eq SSLRequest
-deriving instance Show SSLRequest
+deriving instance Eq SSLRequestPayload
+deriving instance Show SSLRequestPayload
 
-type SSLRequestEnvelope =
-  Envelope
-    SSLRequest
-    'SSLRequestType
+type SSLRequest = Envelope SSLRequestPayload 'SSLRequestType
+
+pattern SSLRequest :: SSLRequest
+pattern SSLRequest = Envelope SSLRequestPayload
+{-# COMPLETE SSLRequest #-}
 
 instance HasConstructor 'SSLRequestType SSLRequest where
   type ConstructorOf 'SSLRequestType SSLRequest r = r
   constructorOf = SSLRequest
   destructorOf SSLRequest k = k
 
-data GSSENCRequest = GSSENCRequest
+data GSSENCRequestPayload = GSSENCRequestPayload
 
-deriving instance Eq GSSENCRequest
-deriving instance Show GSSENCRequest
+deriving instance Eq GSSENCRequestPayload
+deriving instance Show GSSENCRequestPayload
 
-type GSSENCRequestEnvelope =
-  Envelope
-    GSSENCRequest
-    'GSSENCRequestType
+type GSSENCRequest = Envelope GSSENCRequestPayload 'GSSENCRequestType
+
+pattern GSSENCRequest :: GSSENCRequest
+pattern GSSENCRequest = Envelope GSSENCRequestPayload
+{-# COMPLETE GSSENCRequest #-}
 
 instance HasConstructor 'GSSENCRequestType GSSENCRequest where
   type ConstructorOf 'GSSENCRequestType GSSENCRequest r = r
   constructorOf = GSSENCRequest
   destructorOf GSSENCRequest k = k
 
-newtype CancelRequest bytes = CancelRequest (BackendKey bytes)
+newtype CancelRequestPayload bytes = CancelRequestPayload (BackendKey bytes)
 
-deriving instance Eq bytes => Eq (CancelRequest bytes)
-deriving instance Show bytes => Show (CancelRequest bytes)
+deriving instance Eq bytes => Eq (CancelRequestPayload bytes)
+deriving instance Show bytes => Show (CancelRequestPayload bytes)
 
-type CancelRequestEnvelope bytes =
-  Envelope
-    (CancelRequest bytes)
-    'CancelRequestType
+type CancelRequest bytes = Envelope (CancelRequestPayload bytes) 'CancelRequestType
+
+pattern CancelRequest :: BackendKey bytes -> CancelRequest bytes
+pattern CancelRequest key = Envelope (CancelRequestPayload key)
+{-# COMPLETE CancelRequest #-}
 
 instance HasConstructor 'CancelRequestType (CancelRequest bytes) where
   type ConstructorOf 'CancelRequestType (CancelRequest bytes) r = BackendKey bytes -> r
   constructorOf = CancelRequest
   destructorOf (CancelRequest key) k = k key
 
-parseStartupMessage :: ByteString -> Either String (StartupMessageEnvelope ByteString)
-parseStartupMessage = parseEnvelope @(StartupMessage ByteString) @'StartupMessageType
+parseStartupMessage :: ByteString -> Either String (StartupMessage ByteString)
+parseStartupMessage = parseMessage
 
-parseCancelRequest :: ByteString -> Either String (CancelRequestEnvelope ByteString)
-parseCancelRequest = parseEnvelope @(CancelRequest ByteString) @'CancelRequestType
+parseCancelRequest :: ByteString -> Either String (CancelRequest ByteString)
+parseCancelRequest = parseMessage

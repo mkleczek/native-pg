@@ -1,31 +1,38 @@
 module Database.PostgreSQL.Internal.Protocol.Messages.Parse
-  ( parseEnvelope,
-    serializeEnvelope,
+  ( parseMessage,
+    parser,
+    serialize,
   )
 where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Database.PostgreSQL.Internal.Protocol.Codec
-  ( Output,
+  ( Input,
+    Output,
     Parsable (..),
     Serializable (..),
     runBodyParser,
   )
-import Database.PostgreSQL.Internal.Protocol.Messages.Types
-  ( Envelope (Envelope),
-  )
+import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope)
 
-parseEnvelope :: forall a s. Parsable a s => ByteString -> Either String (Envelope a s)
-parseEnvelope input = do
-  (message, rest) <- runBodyParser input (parser @a @s)
+parser :: forall message {payload} {schema}.
+  (message ~ Envelope payload schema, Parsable message schema) => Input message
+parser = fieldParser @message @schema
+{-# INLINE parser #-}
+
+parseMessage :: forall message {payload} {schema}.
+  (message ~ Envelope payload schema, Parsable message schema) => ByteString -> Either String message
+parseMessage input = do
+  (message, rest) <- runBodyParser input (parser @message)
   if BS.null rest
-    then pure (Envelope message)
+    then pure message
     else
       Left $
         "parser left "
           <> show (BS.length rest)
           <> " unconsumed bytes"
 
-serializeEnvelope :: forall a s. Serializable a s => Envelope a s -> Output
-serializeEnvelope (Envelope message) = serialize @a @s message
+serialize :: forall a s. Serializable (Envelope a s) s => Envelope a s -> Output
+serialize = serializeField @(Envelope a s) @s
+{-# INLINE serialize #-}

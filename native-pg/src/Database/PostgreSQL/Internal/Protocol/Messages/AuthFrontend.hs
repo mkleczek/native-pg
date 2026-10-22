@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Database.PostgreSQL.Internal.Protocol.Messages.AuthFrontend
@@ -7,14 +8,14 @@ module Database.PostgreSQL.Internal.Protocol.Messages.AuthFrontend
     GSSResponseType (GSSResponseType),
     SASLInitialResponseType (SASLInitialResponseType),
     SASLResponseType (SASLResponseType),
-    PasswordMessageEnvelope,
-    GSSResponseEnvelope,
-    SASLInitialResponseEnvelope,
-    SASLResponseEnvelope,
-    PasswordMessage (PasswordMessage),
-    GSSResponse (GSSResponse),
-    SASLInitialResponse (SASLInitialResponse),
-    SASLResponse (SASLResponse),
+    PasswordMessage,
+    pattern PasswordMessage,
+    GSSResponse,
+    pattern GSSResponse,
+    SASLInitialResponse,
+    pattern SASLInitialResponse,
+    SASLResponse,
+    pattern SASLResponse,
   )
 where
 
@@ -24,7 +25,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
-import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope)
+import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope (..))
 
 type AuthFrontendTag = 'PayloadConst 1 'p'
 
@@ -54,61 +55,64 @@ data SASLResponseType (payload :: Payload) where
     SASLResponseType
       (AuthFrontendMessage 'RemainingBytesAtom)
 
-newtype PasswordMessage bytes = PasswordMessage bytes
+newtype PasswordMessagePayload bytes = PasswordMessagePayload bytes
 
-deriving instance Eq bytes => Eq (PasswordMessage bytes)
-deriving instance Show bytes => Show (PasswordMessage bytes)
+deriving instance Eq bytes => Eq (PasswordMessagePayload bytes)
+deriving instance Show bytes => Show (PasswordMessagePayload bytes)
 
-type PasswordMessageEnvelope bytes =
-  Envelope
-    (PasswordMessage bytes)
-    'PasswordMessageType
+type PasswordMessage bytes = Envelope (PasswordMessagePayload bytes) 'PasswordMessageType
+
+pattern PasswordMessage :: bytes -> PasswordMessage bytes
+pattern PasswordMessage password = Envelope (PasswordMessagePayload password)
+{-# COMPLETE PasswordMessage #-}
 
 instance HasConstructor 'PasswordMessageType (PasswordMessage bytes) where
   type ConstructorOf 'PasswordMessageType (PasswordMessage bytes) r = bytes -> r
   constructorOf = PasswordMessage
   destructorOf (PasswordMessage password) k = k password
 
-newtype GSSResponse bytes = GSSResponse bytes
+newtype GSSResponsePayload bytes = GSSResponsePayload bytes
 
-deriving instance Eq bytes => Eq (GSSResponse bytes)
-deriving instance Show bytes => Show (GSSResponse bytes)
+deriving instance Eq bytes => Eq (GSSResponsePayload bytes)
+deriving instance Show bytes => Show (GSSResponsePayload bytes)
 
-type GSSResponseEnvelope bytes =
-  Envelope
-    (GSSResponse bytes)
-    'GSSResponseType
+type GSSResponse bytes = Envelope (GSSResponsePayload bytes) 'GSSResponseType
+
+pattern GSSResponse :: bytes -> GSSResponse bytes
+pattern GSSResponse token = Envelope (GSSResponsePayload token)
+{-# COMPLETE GSSResponse #-}
 
 instance HasConstructor 'GSSResponseType (GSSResponse bytes) where
   type ConstructorOf 'GSSResponseType (GSSResponse bytes) r = bytes -> r
   constructorOf = GSSResponse
   destructorOf (GSSResponse token) k = k token
 
-data SASLInitialResponse bytes =
-  SASLInitialResponse bytes (Maybe bytes)
+data SASLInitialResponsePayload bytes = SASLInitialResponsePayload bytes (Maybe bytes)
 
-deriving instance Eq bytes => Eq (SASLInitialResponse bytes)
-deriving instance Show bytes => Show (SASLInitialResponse bytes)
+deriving instance Eq bytes => Eq (SASLInitialResponsePayload bytes)
+deriving instance Show bytes => Show (SASLInitialResponsePayload bytes)
 
-type SASLInitialResponseEnvelope bytes =
-  Envelope
-    (SASLInitialResponse bytes)
-    'SASLInitialResponseType
+type SASLInitialResponse bytes = Envelope (SASLInitialResponsePayload bytes) 'SASLInitialResponseType
+
+pattern SASLInitialResponse :: bytes -> Maybe bytes -> SASLInitialResponse bytes
+pattern SASLInitialResponse mechanism response = Envelope (SASLInitialResponsePayload mechanism response)
+{-# COMPLETE SASLInitialResponse #-}
 
 instance HasConstructor 'SASLInitialResponseType (SASLInitialResponse bytes) where
   type ConstructorOf 'SASLInitialResponseType (SASLInitialResponse bytes) r = bytes -> Maybe bytes -> r
   constructorOf = SASLInitialResponse
   destructorOf (SASLInitialResponse mechanism response) k = k mechanism response
 
-newtype SASLResponse bytes = SASLResponse bytes
+newtype SASLResponsePayload bytes = SASLResponsePayload bytes
 
-deriving instance Eq bytes => Eq (SASLResponse bytes)
-deriving instance Show bytes => Show (SASLResponse bytes)
+deriving instance Eq bytes => Eq (SASLResponsePayload bytes)
+deriving instance Show bytes => Show (SASLResponsePayload bytes)
 
-type SASLResponseEnvelope bytes =
-  Envelope
-    (SASLResponse bytes)
-    'SASLResponseType
+type SASLResponse bytes = Envelope (SASLResponsePayload bytes) 'SASLResponseType
+
+pattern SASLResponse :: bytes -> SASLResponse bytes
+pattern SASLResponse response = Envelope (SASLResponsePayload response)
+{-# COMPLETE SASLResponse #-}
 
 instance HasConstructor 'SASLResponseType (SASLResponse bytes) where
   type ConstructorOf 'SASLResponseType (SASLResponse bytes) r = bytes -> r

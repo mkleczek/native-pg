@@ -34,7 +34,7 @@ spec = describe "protocol framing" $ do
 
   it "permits a streamed row body across source chunks" $ do
     let column = BS.replicate 1024 120
-        body = outputByteString (serialize @Int16 @('FixedBytesAtom 2) 1 <> serialize @Int32 @('FixedBytesAtom 4) 1024) <> column
+        body = outputByteString (serializeField @Int16 @('FixedBytesAtom 2) 1 <> serializeField @Int32 @('FixedBytesAtom 4) 1024) <> column
     source <- bytesSource (frameHeader 68 body <> body)
     inputResult (runInputUntil source maxBound emptyInputBuffer $ do
       _ <- parser @DataRowHeader @('PayloadField 'DataRowHeaderType)
@@ -43,8 +43,8 @@ spec = describe "protocol framing" $ do
       pure "streamed") `shouldReturn` Right "streamed"
 
   it "batches primitive reads inside a frame without pulling its successor" $ do
-    let body = outputByteString (mconcat (replicate 100 (serialize @Int32 @('FixedBytesAtom 4) 7)))
-        envelope = outputByteString (serialize @Int32 @('FixedBytesAtom 4) 400) <> body
+    let body = outputByteString (mconcat (replicate 100 (serializeField @Int32 @('FixedBytesAtom 4) 7)))
+        envelope = outputByteString (serializeField @Int32 @('FixedBytesAtom 4) 400) <> body
         bytes = envelope <> "next"
     offset <- newIORef 0
     requests <- newIORef []
@@ -80,7 +80,7 @@ spec = describe "protocol framing" $ do
     readIORef inside `shouldReturn` True
 
 frameHeader :: Word8 -> ByteString -> ByteString
-frameHeader tag body = BS.singleton tag <> outputByteString (serialize @Int32 @('FixedBytesAtom 4) (fromIntegral (BS.length body + 4)))
+frameHeader tag body = BS.singleton tag <> outputByteString (serializeField @Int32 @('FixedBytesAtom 4) (fromIntegral (BS.length body + 4)))
 
 inputResult :: IO (ByteString, InputBuffer) -> IO (Either String ByteString)
 inputResult action = either (\(InputError reason) -> Left reason) (Right . fst) <$> try action

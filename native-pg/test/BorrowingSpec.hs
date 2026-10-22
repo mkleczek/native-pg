@@ -26,13 +26,13 @@ spec :: Spec
 spec = describe "caller-owned input" $ do
   it "decodes scalar boundaries through one-byte fills and compaction" $ do
     forM_ [1, 4] $ \fragment -> do
-      storage <- newBuffer 4
+      storage <- newBuffer (positiveInt @4)
       source <- bytesSource fragment scalarBytes (const (pure ()))
       (values, _) <- runInput source (reusableInputBuffer storage) scalarValues
       values `shouldBe` scalarExpected
 
   it "forces scalar values before their reusable storage is overwritten" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     source <- bytesSource 4 scalarBytes (const (pure ()))
     (values, _) <- runInput source (reusableInputBuffer storage) scalarValues
     -- Do not inspect any result until every original byte has been overwritten.
@@ -41,7 +41,7 @@ spec = describe "caller-owned input" $ do
 
   it "rejects bounded scalars before reading outside their frame" $ do
     forM_ [False, True] $ \prefilled -> forM_ scalarParsers $ \(width, parse) -> do
-      storage <- newBuffer 4
+      storage <- newBuffer (positiveInt @4)
       calls <- newIORef (0 :: Int)
       source <- bytesSource 4 "abcdefgh" (\_ -> modifyIORef' calls (+ 1))
       let empty = reusableInputBuffer storage
@@ -56,7 +56,7 @@ spec = describe "caller-owned input" $ do
 
   it "rejects each truncated scalar without reading beyond the source" $ do
     forM_ scalarParsers $ \(width, parse) -> forM_ [0 .. width - 1] $ \available -> do
-      storage <- newBuffer 4
+      storage <- newBuffer (positiveInt @4)
       calls <- newIORef (0 :: Int)
       source <- bytesSource 1 (BS.replicate available 255) (\_ -> modifyIORef' calls (+ 1))
       result <- try @InputError (runInput source (reusableInputBuffer storage) parse)
@@ -64,7 +64,7 @@ spec = describe "caller-owned input" $ do
       readIORef calls `shouldReturn` available + 1
 
   it "does not allocate an owned ByteString for every reusable scalar" $ do
-    storage <- newBuffer 65536
+    storage <- newBuffer (positiveInt @65536)
     source <- bytesSource 65536 (BS.replicate 40000 1) (const (pure ()))
     -- Fill before measuring, so this isolates reads from an existing workspace.
     (_, filled) <- runInput source (reusableInputBuffer storage) (peekInputByteAt 0)
@@ -176,16 +176,16 @@ scalarBytes = BS.pack [99, 0, 255, 0, 0, 255, 255, 127, 255, 128, 0, 0, 0, 0, 0,
 
 scalarValues :: Input [Integer]
 scalarValues = skipInput 1 *> sequence
-  [ toInteger <$> parser @Word8 @('FixedBytesAtom 1),
-    toInteger <$> parser @Word8 @('FixedBytesAtom 1),
-    toInteger <$> parser @Word16 @('FixedBytesAtom 2),
-    toInteger <$> parser @Word16 @('FixedBytesAtom 2),
-    toInteger <$> parser @Int16 @('FixedBytesAtom 2),
-    toInteger <$> parser @Int16 @('FixedBytesAtom 2),
-    toInteger <$> parser @Word32 @('FixedBytesAtom 4),
-    toInteger <$> parser @Word32 @('FixedBytesAtom 4),
-    toInteger <$> parser @Int32 @('FixedBytesAtom 4),
-    toInteger <$> parser @Int32 @('FixedBytesAtom 4)
+  [ toInteger <$> fieldParser @Word8 @('FixedBytesAtom 1),
+    toInteger <$> fieldParser @Word8 @('FixedBytesAtom 1),
+    toInteger <$> fieldParser @Word16 @('FixedBytesAtom 2),
+    toInteger <$> fieldParser @Word16 @('FixedBytesAtom 2),
+    toInteger <$> fieldParser @Int16 @('FixedBytesAtom 2),
+    toInteger <$> fieldParser @Int16 @('FixedBytesAtom 2),
+    toInteger <$> fieldParser @Word32 @('FixedBytesAtom 4),
+    toInteger <$> fieldParser @Word32 @('FixedBytesAtom 4),
+    toInteger <$> fieldParser @Int32 @('FixedBytesAtom 4),
+    toInteger <$> fieldParser @Int32 @('FixedBytesAtom 4)
   ]
 
 scalarExpected :: [Integer]
@@ -193,15 +193,15 @@ scalarExpected = [0, 255, 0, 65535, 32767, -32768, 0, 4294967295, 2147483647, -2
 
 scalarParsers :: [(Int, Input Integer)]
 scalarParsers =
-  [ (1, toInteger <$> parser @Word8 @('FixedBytesAtom 1)),
-    (2, toInteger <$> parser @Word16 @('FixedBytesAtom 2)),
-    (2, toInteger <$> parser @Int16 @('FixedBytesAtom 2)),
-    (4, toInteger <$> parser @Word32 @('FixedBytesAtom 4)),
-    (4, toInteger <$> parser @Int32 @('FixedBytesAtom 4))
+  [ (1, toInteger <$> fieldParser @Word8 @('FixedBytesAtom 1)),
+    (2, toInteger <$> fieldParser @Word16 @('FixedBytesAtom 2)),
+    (2, toInteger <$> fieldParser @Int16 @('FixedBytesAtom 2)),
+    (4, toInteger <$> fieldParser @Word32 @('FixedBytesAtom 4)),
+    (4, toInteger <$> fieldParser @Int32 @('FixedBytesAtom 4))
   ]
 
 sumWords :: Int -> Word32 -> Input Word32
 sumWords 0 !total = pure total
 sumWords count !total = do
-  value <- parser @Word32 @('FixedBytesAtom 4)
+  value <- fieldParser @Word32 @('FixedBytesAtom 4)
   sumWords (count - 1) (total + value)
