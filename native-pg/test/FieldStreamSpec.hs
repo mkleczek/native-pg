@@ -96,7 +96,7 @@ spec = describe "borrowed field streams" $ do
       readIORef delivered `shouldReturn` True
       case fst result of Left _ -> pure (); Right _ -> failTest "late server error was lost after field EOF"
 
-  xfail "typed scoped streams still drain owned pulls" $ it "borrows Tx.streamChunks directly through its nullable scoped decoder" $
+  it "borrows Tx.streamChunks directly through its nullable scoped decoder" $
     withFields [Just payload] ready $ \context input -> do
       inside <- newIORef True
       received <- newIORef BS.empty

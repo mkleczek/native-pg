@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- | Statements, with the names and shape of hasql's: SQL, its parameters, and
 -- how its result is read, by typed row decoders or by a fold over its rows.
@@ -39,9 +40,9 @@ module Database.PostgreSQL.Statement
 where
 
 import Control.Exception (Exception)
+import Control.Monad (join)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
-import Database.PostgreSQL.Decoding (DecodingError)
+import Database.PostgreSQL.Decoding (DecodingError (..))
 import Database.PostgreSQL.Protocol (FormatCode (..), OptionalOid, Parameter)
 import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
 import Database.PostgreSQL.Session
@@ -49,8 +50,9 @@ import Database.PostgreSQL.Session
     Row,
     ServerError,
     decodeRow,
-    decodeRowStreaming,
-    decodeRowStreamingNullable,
+    columnStreamWithChunks,
+    decodeRowStreamingUsing,
+    rowColumnCount,
   )
 
 -- | A statement: its SQL, its parameters, and how its result is read.
@@ -137,7 +139,7 @@ rowList (RowDecoder decode) = Result [] step (Right . reverse)
 newtype ScopedRow s = ScopedRow Row
 
 -- | A column stream that can be read only within that step.
-newtype ScopedStream s = ScopedStream ByteStream
+data ScopedStream s = ScopedStream ByteStream ((ByteString -> IO ()) -> IO ())
 
 -- | Folds the rows with the step. The rows, and the streams taken from them,
 -- have the step's scope in their type, which the result can't mention, so
@@ -159,27 +161,31 @@ decodeScoped (ScopedRow current) = decodeRow @columns current
 -- function.
 decodeScopedStreaming :: forall columns s r. DecodeRow columns => ScopedRow s -> RowFunction columns (ScopedStream s -> IO r) -> IO (Either DecodingError r)
 decodeScopedStreaming (ScopedRow current) function =
-  decodeRowStreaming @columns current (mapRowFunction @columns @(ScopedStream s -> IO r) @(ByteStream -> IO r) (. ScopedStream) function)
+  join <$> decodeScopedStreamingNullable @columns @s @(Either DecodingError r) (ScopedRow current)
+    (mapRowFunction @columns @(ScopedStream s -> IO r) @(Maybe (ScopedStream s) -> IO (Either DecodingError r)) streamOrFail function)
+  where
+    streamOrFail continue = maybe
+      (pure (Left (ColumnDecodingFailed (rowColumnCount current) "unexpected NULL in a streamed column")))
+      (fmap Right . continue)
 {-# INLINE decodeScopedStreaming #-}
 
 -- | Like 'decodeScopedStreaming', but the streamed column may be NULL, which
 -- the function gets as 'Nothing'.
 decodeScopedStreamingNullable :: forall columns s r. DecodeRow columns => ScopedRow s -> RowFunction columns (Maybe (ScopedStream s) -> IO r) -> IO (Either DecodingError r)
 decodeScopedStreamingNullable (ScopedRow current) function =
-  decodeRowStreamingNullable @columns current (mapRowFunction @columns @(Maybe (ScopedStream s) -> IO r) @(Maybe ByteStream -> IO r) (. fmap ScopedStream) function)
+  decodeRowStreamingUsing @columns @(ScopedStream s) @r (fmap (uncurry ScopedStream) . columnStreamWithChunks) current function
 {-# INLINE decodeScopedStreamingNullable #-}
 
 -- | The stream's length in bytes.
 streamLength :: ScopedStream s -> Int
-streamLength (ScopedStream stream) = byteStreamLength stream
+streamLength (ScopedStream stream _) = byteStreamLength stream
 
 -- | The next chunk of the stream, or an empty one at its end.
 streamChunk :: ScopedStream s -> IO ByteString
-streamChunk (ScopedStream stream) = byteStreamNext stream
+streamChunk (ScopedStream stream _) = byteStreamNext stream
 
--- | Drains the remaining field through synchronous borrowed callbacks.
--- Completion of the field does not establish statement/transaction success.
+-- | Consumes the remaining stream through borrowed chunks. A chunk is valid
+-- only during its callback; copy it if the consumer needs to retain it.
+-- Field completion does not establish statement or transaction success.
 streamChunks :: ScopedStream s -> (ByteString -> IO ()) -> IO ()
-streamChunks source use = do
-  chunk <- streamChunk source
-  if BS.null chunk then pure () else use chunk *> streamChunks source use
+streamChunks (ScopedStream _ consume) = consume
