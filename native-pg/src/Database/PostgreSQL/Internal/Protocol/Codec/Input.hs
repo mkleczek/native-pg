@@ -7,7 +7,7 @@
 -- aren't consumed yet. Only when it needs more than the buffer holds does it
 -- read from the source, which blocks until bytes arrive. One read may fill
 -- the buffer's free space, but nothing else is read ahead.
-module Database.PostgreSQL.Protocol.Codec.Input
+module Database.PostgreSQL.Internal.Protocol.Codec.Input
   ( Input,
     InputBuffer,
     InputError (..),
@@ -39,8 +39,9 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Word (Word8, Word16, Word32)
-import Database.PostgreSQL.Buffer (Buffer)
-import qualified Database.PostgreSQL.Buffer as Buffer
+import Database.PostgreSQL.Internal.Buffer (newBuffer)
+import Network.Streaming.Resources.Internal (Buffer)
+import qualified Network.Streaming.Resources.Internal as Buffer
 import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, moveBytes)
 import Foreign.Ptr (Ptr, plusPtr)
@@ -404,7 +405,7 @@ fill metadata source end count buffer
     reallocate = do
       let unconsumed = bufferEnd buffer - bufferStart buffer
           capacity = max (inputReadSize source) count
-      memory <- Buffer.bufferMemory <$> Buffer.newBuffer capacity
+      memory <- Buffer.bufferMemory <$> newBuffer capacity
       unsafeWithForeignPtr memory $ \target ->
         unsafeWithForeignPtr (bufferMemory buffer) $ \origin ->
           copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
@@ -428,7 +429,7 @@ suppliedCapacity buffer = case bufferHome buffer of
 
 expandMetadata :: Int -> InputBuffer -> IO InputBuffer
 expandMetadata capacity buffer = do
-  storage <- Buffer.newBuffer capacity
+  storage <- newBuffer capacity
   let count = bufferEnd buffer - bufferStart buffer
       home = case bufferHome buffer of
         Nothing -> Just (HomeBuffer (bufferMemory buffer) (bufferCapacity buffer))

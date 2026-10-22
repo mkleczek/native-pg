@@ -2,7 +2,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Database.PostgreSQL.Protocol.Messages.FrontendSession
+module Database.PostgreSQL.Internal.Protocol.Messages.FrontendSession
   ( BindType (BindType),
     CloseType (CloseType),
     DescribeType (DescribeType),
@@ -37,14 +37,14 @@ module Database.PostgreSQL.Protocol.Messages.FrontendSession
 where
 
 import Data.Int (Int32)
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec
   ( HasConstructor (..),
   )
-import Database.PostgreSQL.Protocol.Codec.Payload
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Empty,
     Payload (..),
   )
-import Database.PostgreSQL.Protocol.Messages.Types
+import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( BindBody,
     BindBodyType (BindBodyType),
     Envelope,

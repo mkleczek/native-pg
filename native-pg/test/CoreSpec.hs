@@ -17,17 +17,18 @@ import Data.Int (Int32)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word8)
-import Database.PostgreSQL.Authentication
+import Database.PostgreSQL.Internal.Authentication
 import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Diagnostics
+import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
 import qualified Database.PostgreSQL.Encoders as Encoders
-import Database.PostgreSQL.Protocol
-import Database.PostgreSQL.Protocol.Codec
-import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
+import Database.PostgreSQL.Internal.Protocol
+import Database.PostgreSQL.Internal.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
-import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions)
+import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions, serverEndPoint)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import Skeletest
@@ -247,6 +248,7 @@ spec = do
             { connectionHosts = Host "/tmp" Nothing 5432 :| [],
               connectionUser = "local",
               connectionPassword = Nothing,
+              connectionHostPasswords = [],
               connectionDatabase = "local",
               connectionParameters = [],
               connectionTimeout = Nothing,
@@ -387,7 +389,8 @@ spec = do
       parse "service=x" `shouldSatisfy` failsWith "service isn't supported"
       parse "require_auth=password" `shouldSatisfy` failsWith "require_auth isn't supported"
       parse "load_balance_hosts=random" `shouldSatisfy` failsWith "requires random load balancing"
-      parse "passfile=/pgpass" `shouldSatisfy` failsWith "password files aren't supported"
+    it "accepts password-file options without doing IO in the pure parser" $ do
+      parse "passfile=/pgpass" `shouldSatisfy` P.right P.anything
       parse "passfile=/pgpass password=x" `shouldSatisfy` P.right P.anything
     it "reports malformed strings as libpq does" $ do
       parse "host" `shouldSatisfy` failsWith "missing \"=\" after \"host\" in connection info string"

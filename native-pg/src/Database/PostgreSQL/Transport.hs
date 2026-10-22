@@ -1,24 +1,16 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiWayIf #-}
 
--- | Raw sockets: connecting, reading into the parser's buffer, and sending
--- serialized messages, over a link that's the socket itself or TLS over it.
+-- | Public transport API.
 module Database.PostgreSQL.Transport
   ( Address (..),
     ConnectError (..),
     StreamLengthError (..),
     TcpOptions (..),
-    connectSocket,
     defaultTcpOptions,
-
-    -- * Links
     Link (..),
     Readiness (..),
-    Channel (..),
+    Channel,
     newChannel,
-
-    -- * TLS links
     TlsClient (..),
     TlsChannel (..),
     TlsSettings (..),
@@ -26,79 +18,25 @@ module Database.PostgreSQL.Transport
     RootCertificates (..),
     TlsVersion (..),
     TlsError (..),
-
-    -- * Output sent as answers are read
-    Unsent,
-    OutputBuffer,
-    newOutputBuffer,
-    outputBufferFrom,
-    unsent,
-    unsentEmpty,
+    serverEndPoint,
   )
 where
 
-import Control.Concurrent (threadWaitRead, threadWaitReadSTM, threadWaitWrite, threadWaitWriteSTM)
-import Control.Exception (Exception (..), IOException, bracket, bracketOnError, catch, throwIO, try)
-import Control.Monad (unless, when)
+import Control.Exception (Exception (..), IOException)
+import Crypto.Hash (HashAlgorithm, SHA224 (..), SHA256 (..), SHA384 (..), SHA512 (..), hashWith)
+import Data.Bits (shiftL, testBit, (.&.), (.|.))
+import qualified Data.ByteArray as ByteArray
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Internal as BSI
-import Data.Foldable (for_)
-import Data.IORef (IORef, readIORef, writeIORef)
 import Data.List (intercalate)
-import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
-import qualified Database.PostgreSQL.Buffer as Buffer
-import Database.PostgreSQL.Protocol.Codec.Output (Writer, WriteResult (..), outputWriter, runWriter)
-import Database.PostgreSQL.Protocol.Codec
-  ( ByteStream (..),
-    InputSource (..),
-    Output,
-    Uncopied (..),
-    outputCopied,
-    writeOutput,
-  )
+import Database.PostgreSQL.Internal.Channel (Channel)
+import qualified Database.PostgreSQL.Internal.Channel as Channel
+import Database.PostgreSQL.Internal.Socket.Link ()
+import Database.PostgreSQL.Transport.Link
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
-import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
-import GHC.Conc (atomically, orElse)
-import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import GHC.IO.Exception (IOException (..))
-import Network.Socket
-  ( AddrInfo (..),
-    Family (AF_UNIX),
-    HostName,
-    NameInfoFlag (NI_NUMERICHOST),
-    PortNumber,
-    SockAddr (SockAddrUnix),
-    Socket,
-    SocketOption (KeepAlive, NoDelay, SockOpt, UserTimeout),
-    SocketType (Stream),
-    close,
-    connect,
-    defaultHints,
-    defaultProtocol,
-    getAddrInfo,
-    getNameInfo,
-    isSupportedSocketOption,
-    openSocket,
-    setSocketOption,
-    socket,
-    withFdSocket,
-  )
-import System.Posix.Types (Fd (..))
-#if defined(mingw32_HOST_OS)
-import Foreign.Ptr (Ptr)
-import Network.Socket (recvBuf)
-import Network.Socket.ByteString (sendMany)
-#else
-import qualified Data.ByteString.Unsafe as BS
-import qualified Foreign.C.Error as Errno
-import Foreign.C.Types (CChar, CInt (..), CSize (..))
-import Foreign.Marshal.Alloc (allocaBytes)
-import Foreign.Ptr (Ptr, nullPtr)
-import Foreign.Storable (pokeByteOff, sizeOf)
-import qualified System.Posix.Types as Posix
-#endif
+import Network.Socket (HostName, PortNumber, Socket)
 
 data Address
   = -- | A host name or IP address, and a port.
@@ -163,127 +101,6 @@ instance Exception ConnectError where
       socketHint errno
         | errno == eNOENT || errno == eCONNREFUSED = "\n\tIs the server running locally and accepting connections on that socket?"
         | otherwise = ""
-
--- | Connects to the address, or throws 'ConnectError'. For a host name, the
--- addresses it resolves to are tried in order.
-connectSocket :: TcpOptions -> Address -> IO Socket
-connectSocket _ (UnixAddress path) =
-  bracketOnError (socket AF_UNIX Stream defaultProtocol) close $ \sock -> do
-    connect sock (SockAddrUnix path) `catch` (throwIO . UnreachableSocket path)
-    pure sock
-connectSocket options (TcpAddress host port) = do
-  addresses <-
-    getAddrInfo (Just defaultHints {addrSocketType = Stream}) (Just host) (Just (show port))
-      `catch` \failure -> throwIO (UnresolvedHost host (ioe_description failure))
-  connectFirst [] addresses
-  where
-    connectFirst [] [] = throwIO (UnresolvedHost host "no address found")
-    connectFirst failures [] = throwIO (UnreachableHost host port (reverse failures))
-    connectFirst failures (address : others) =
-      try (connectTo address) >>= \case
-        Right sock -> pure sock
-        Left failure -> do
-          numeric <- fst <$> getNameInfo [NI_NUMERICHOST] True False (addrAddress address)
-          connectFirst ((fromMaybe host numeric, failure) : failures) others
-    connectTo address =
-      bracketOnError (openSocket address) close $ \sock -> do
-        -- Messages are small and sent whole, so don't wait to coalesce them.
-        setSocketOption sock NoDelay 1
-        setTcpOptions sock options
-        connect sock (addrAddress address)
-        pure sock
-
-setTcpOptions :: Socket -> TcpOptions -> IO ()
-setTcpOptions sock options = do
-  when (tcpKeepalives options) $ do
-    setSocketOption sock KeepAlive 1
-    for_ (tcpKeepalivesIdle options) (setIfSupported keepalivesIdle)
-    for_ (tcpKeepalivesInterval options) (setIfSupported keepalivesInterval)
-    for_ (tcpKeepalivesCount options) (setIfSupported keepalivesCount)
-  for_ (tcpUserTimeout options) (setIfSupported UserTimeout)
-  where
-    setIfSupported option value =
-      when (isSupportedSocketOption option) (setSocketOption sock option value)
-
--- | TCP_KEEPIDLE (TCP_KEEPALIVE on macOS), TCP_KEEPINTVL and TCP_KEEPCNT,
--- which the network package doesn't name, at level IPPROTO_TCP.
-keepalivesIdle, keepalivesInterval, keepalivesCount :: SocketOption
-#if defined(linux_HOST_OS)
-keepalivesIdle = SockOpt 6 4
-keepalivesInterval = SockOpt 6 5
-keepalivesCount = SockOpt 6 6
-#elif defined(darwin_HOST_OS)
-keepalivesIdle = SockOpt 6 0x10
-keepalivesInterval = SockOpt 6 0x101
-keepalivesCount = SockOpt 6 0x102
-#else
-keepalivesIdle = SockOpt (-1) (-1)
-keepalivesInterval = SockOpt (-1) (-1)
-keepalivesCount = SockOpt (-1) (-1)
-#endif
-
--- | A stream of bytes to the server, such as a socket or TLS over it.
--- Reading, sending and flushing take what's ready without waiting.
--- Readiness waits suspend the calling thread until an operation can be
--- retried; they don't read or write, and don't guarantee progress. For
--- example, socket input may contain only part of a TLS record.
---
--- Callers must ensure exclusive access to each connection. Receiving,
--- sending, flushing, waiting and closing must not overlap, whether called
--- on the link directly or through any 'Channel' built from it. Ownership
--- may pass to another thread between calls. Different connections may be
--- used concurrently.
-class Link link where
-  -- | Waits until receiving can be retried after 'receiveReady' returns
-  -- 'Nothing'. The wait must be interruptible.
-  awaitReadable :: link -> IO ()
-
-  -- | Waits until sending or flushing can be retried after stalling.
-  -- The wait must be interruptible.
-  awaitWritable :: link -> IO ()
-
-  -- | Waits for either direction, so pending output can be sent while
-  -- waiting for input. If both readiness events have been observed,
-  -- prefers 'Readable'. The wait must be interruptible and release its
-  -- registrations when it returns or is interrupted.
-  awaitReadableOrWritable :: link -> IO Readiness
-
-  -- | Reads what's ready into the buffer, up to its size, without waiting:
-  -- 'Nothing' if nothing is, and 0 at the end of the stream.
-  receiveReady :: link -> Ptr Word8 -> Int -> IO (Maybe Int)
-
-  -- | Takes what it can of the pieces without waiting, and gives how many
-  -- bytes it took.
-  sendReady :: link -> [ByteString] -> IO Int
-
-  -- | Writes what it took but hasn't written yet, without waiting. True if
-  -- nothing is left.
-  flushReady :: link -> IO Bool
-
-  -- | Closes the link and releases its underlying connection.
-  closeLink :: link -> IO ()
-
--- | Which operation to retry after waiting for either direction.
-data Readiness = Readable | Writable
-  deriving (Eq, Show)
-
-instance Link Socket where
-  awaitReadable sock = withFdSocket sock (threadWaitRead . Fd)
-  {-# INLINE awaitReadable #-}
-  awaitWritable sock = withFdSocket sock (threadWaitWrite . Fd)
-  {-# INLINE awaitWritable #-}
-  awaitReadableOrWritable sock = withFdSocket sock $ \fd ->
-    bracket (threadWaitReadSTM (Fd fd)) snd $ \(readable, _) ->
-      bracket (threadWaitWriteSTM (Fd fd)) snd $ \(writable, _) ->
-        atomically ((Readable <$ readable) `orElse` (Writable <$ writable))
-  receiveReady = tryReceive
-  {-# INLINE receiveReady #-}
-  sendReady = trySend
-  {-# INLINE sendReady #-}
-  flushReady _ = pure True
-  {-# INLINE flushReady #-}
-  closeLink = close
-  {-# INLINE closeLink #-}
 
 -- | Starts TLS over a connected socket, as a client of the named server, and
 -- gives its channel builder and channel-binding data. A library apart,
@@ -357,283 +174,65 @@ newtype TlsError = TlsError String
 instance Exception TlsError where
   displayException (TlsError reason) = "SSL error: " <> reason
 
--- | A connection's input and output over its link. It's made with the
--- connection, from code specialized to the link, so that using it passes no
--- dictionary, and the rest of the client doesn't know which link it has.
---
--- Callers must ensure exclusive access to the channel and its underlying
--- 'Link', including calls to the 'InputSource' in 'channelInput'. Reading
--- may also send and flush pending output, so reads and writes must not run
--- concurrently. Ownership may pass to another thread between calls.
-data Channel = Channel
-  { -- | Reads input. While output is unsent, waiting for input also sends it
-    -- as the link takes it.
-    channelInput :: IORef Unsent -> Int -> InputSource,
-    -- | Sends what the link takes without waiting, and gives what's left.
-    channelSendSome :: Unsent -> IO Unsent,
-    -- | Sends the output, waiting for room as needed.
-    channelSend :: Output -> IO (),
-    channelSendBuffered :: OutputBuffer -> Output -> IO (),
-    channelClose :: IO ()
-  }
-
 -- | A channel retains the link; each input operation supplies its own pending
--- output and read size.
+-- output and read size. Callers must ensure exclusive access to the channel
+-- and its link, including reads and writes through the channel.
 newChannel :: Link link => link -> Channel
-newChannel link =
-  Channel
-    { channelInput = linkInputSource link,
-      channelSendSome = sendSome link,
-      channelSend = sendOutput link,
-      channelSendBuffered = sendOutputWith link . Just,
-      channelClose = closeLink link
-    }
+newChannel = Channel.newChannel
 {-# INLINABLE newChannel #-}
 {-# SPECIALIZE newChannel :: Socket -> Channel #-}
 
--- | Reads from the link into the parser's buffer, which a new allocation
--- makes the given size. While output is unsent, waiting for input also sends
--- it as the link takes it.
-linkInputSource :: Link link => link -> IORef Unsent -> Int -> InputSource
-linkInputSource link pending readSize =
-  InputSource
-    { readInputInto = receive,
-      inputReadSize = readSize
-    }
+-- | Channel binding's data for tls-server-end-point (RFC 5929): the hash of
+-- the server's certificate, given in DER, with the hash its signature
+-- algorithm uses, or SHA-256 for MD5 and SHA-1. Fails for a certificate
+-- whose signature algorithm has no hash, e.g. Ed25519, as PostgreSQL does.
+serverEndPoint :: ByteString -> Either String ByteString
+serverEndPoint certificate = do
+  (_, body, _) <- element 0x30 certificate
+  -- The certificate's signed part, then its signature's algorithm.
+  (_, _, afterSigned) <- element 0x30 body
+  (_, algorithm, _) <- element 0x30 afterSigned
+  (_, identifier, _) <- element 0x06 algorithm
+  case lookup identifier hashes of
+    Just hash -> Right (hash certificate)
+    Nothing -> Left "could not determine the hash of the server certificate's signature algorithm"
   where
-    receive pointer size =
-      receiveReady link pointer size >>= \case
-        Just received -> pure received
-        Nothing -> do
-          left <- readIORef pending
-          flushed <- flushReady link
-          case left of
-            Unsent [] | flushed -> awaitReadable link
-            _ ->
-              awaitReadableOrWritable link >>= \case
-                Readable -> pure ()
-                Writable -> writeIORef pending =<< sendSome link left
-          receive pointer size
-{-# INLINABLE linkInputSource #-}
+    hashes =
+      [ (rsa 4, digest SHA256), -- MD5
+        (rsa 5, digest SHA256), -- SHA-1
+        (rsa 14, digest SHA224),
+        (rsa 11, digest SHA256),
+        (rsa 12, digest SHA384),
+        (rsa 13, digest SHA512),
+        (ecdsa [1], digest SHA256), -- SHA-1
+        (ecdsa [3, 1], digest SHA224),
+        (ecdsa [3, 2], digest SHA256),
+        (ecdsa [3, 3], digest SHA384),
+        (ecdsa [3, 4], digest SHA512)
+      ]
+    -- 1.2.840.113549.1.1.n and 1.2.840.10045.4.n
+    rsa n = BS.pack [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, n]
+    ecdsa ns = BS.pack ([0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04] <> ns)
+    digest :: HashAlgorithm algorithm => algorithm -> ByteString -> ByteString
+    digest algorithm = ByteArray.convert . hashWith algorithm
 
--- | A parameter stream gave a different number of bytes than it declared.
--- The message it belongs to is incomplete, so the connection is unusable.
-data StreamLengthError = StreamLengthError
-  { declaredLength :: Int,
-    -- | At least this many.
-    deliveredLength :: Int
-  }
-  deriving (Show)
-
-instance Exception StreamLengthError
-
--- | Sends the output, waiting for the link to become writable as needed.
-sendOutput :: Link link => link -> Output -> IO ()
-sendOutput link = sendOutputWith link Nothing
-{-# INLINABLE sendOutput #-}
-
-sendOutputWith :: Link link => link -> Maybe OutputBuffer -> Output -> IO ()
-sendOutputWith link buffer output = go =<< unsent buffer output
+-- | A DER element with the tag: its header, its content, and what follows.
+element :: Word8 -> ByteString -> Either String (ByteString, ByteString, ByteString)
+element tag bytes = case BS.unpack (BS.take 2 bytes) of
+  [actual, first]
+    | actual /= tag -> Left "malformed certificate"
+    | not (testBit first 7) -> split 2 (fromIntegral first)
+    | otherwise -> do
+        let count = fromIntegral (first .&. 0x7f)
+            lengthBytes = BS.take count (BS.drop 2 bytes)
+        if count == 0 || count > 4 || BS.length lengthBytes < count
+          then Left "malformed certificate"
+          else split (2 + count) (BS.foldl' (\total byte -> total `shiftL` 8 .|. fromIntegral byte) 0 lengthBytes)
+  _ -> Left "malformed certificate"
   where
-    go left =
-      sendSome link left >>= \case
-        Unsent [] -> do
-          flushed <- flushReady link
-          unless flushed (awaitWritable link *> go (Unsent []))
-        rest -> awaitWritable link *> go rest
-{-# INLINABLE sendOutputWith #-}
-
--- | What's left of an output to send. The server may answer the first
--- messages of an output before it has read the rest, and stop reading until
--- its answers are read. So output can be sent as the answers are read.
-newtype Unsent = Unsent [Part]
-
-unsentEmpty :: Unsent -> Bool
-unsentEmpty (Unsent parts) = null parts
-
--- | Bytes, or a stream with how many bytes it has given.
-data Part
-  = PartBytes ByteString
-  | PartStream ByteStream Int
-  | PartOutput OutputBuffer Writer
-  | PartBorrowedStream ByteStream Int
-
--- | Memory that outputs are written to, reused once what was written to it
--- is sent.
-data OutputBuffer = OutputBuffer (ForeignPtr Word8) Int Bool
-
-newOutputBuffer :: Int -> IO OutputBuffer
-newOutputBuffer size = (\memory -> OutputBuffer memory size False) <$> mallocPlainForeignPtrBytes size
-
--- | The caller must keep the loan exclusive until all output has been sent.
-outputBufferFrom :: Buffer.Buffer -> OutputBuffer
-outputBufferFrom buffer = OutputBuffer (Buffer.bufferMemory buffer) (Buffer.bufferCapacity buffer) True
-
--- | All of the output. Caller-supplied buffers are filled incrementally and
--- reused only after their bytes have been sent. Legacy buffers may grow to
--- fit the copied output. Long byte strings and streams retain their own
--- storage until accepted by the link.
-unsent :: Maybe OutputBuffer -> Output -> IO Unsent
-unsent (Just buffer@(OutputBuffer _ size True)) output
-  | size < 4 = ioError (userError "output buffer capacity must be at least four bytes")
-  | otherwise = pure (Unsent [PartOutput buffer (outputWriter output)])
-unsent reused output = do
-  memory <- case reused of
-    Just (OutputBuffer memory size _) | outputCopied output <= size -> pure memory
-    _ -> mallocPlainForeignPtrBytes (outputCopied output)
-  parts <- writeOutput memory output
-  pure (Unsent (map part parts))
-  where
-    part (Left copied) = PartBytes copied
-    part (Right (UncopiedBytes value)) = PartBytes value
-    part (Right (UncopiedStream source)) = PartStream source 0
-    part (Right (UncopiedBorrowedStream source)) = PartBorrowedStream source 0
-
-renderOutput :: OutputBuffer -> Writer -> IO [Part]
-renderOutput buffer@(OutputBuffer memory capacity _) writer =
-  withForeignPtr memory $ \pointer -> do
-    result <- runWriter writer pointer capacity 0
-    let copied count parts
-          | count > 0 = PartBytes (BSI.BS memory count) : parts
-          | otherwise = parts
-        resume rest = [PartOutput buffer rest]
-        uncopied (UncopiedBytes value) = PartBytes value
-        uncopied (UncopiedStream source) = PartStream source 0
-        uncopied (UncopiedBorrowedStream source) = PartBorrowedStream source 0
-    pure $ case result of
-      Finished count -> copied count []
-      NeedSpace count rest -> copied count (resume rest)
-      Yield count part rest -> copied count (uncopied part : resume rest)
-
--- | Bytes gathered for one send, and how many pieces at most. A client's
--- stream comes in chunks of up to 16 KiB from warp, and sending each on its
--- own wakes the server once per chunk.
-gatherSize, gatherPieces :: Int
-gatherSize = 262144
-gatherPieces = 16
-
--- | Sends what the link takes without waiting for room in the socket,
--- pulling streams as it goes, and gives what's left. Each send gathers the
--- parts up front, pulling a stream's chunks, up to 'gatherSize' bytes or
--- 'gatherPieces' pieces. Pulling may wait for the stream's client, so the
--- bytes before a stream are sent before it's pulled: the server starts on
--- its statement, and its statement_timeout, as it would without the stream.
-sendSome :: Link link => link -> Unsent -> IO Unsent
-sendSome link (Unsent parts) = Unsent <$> go parts
-  where
-    go remaining = do
-      (gathered, rest) <- gather 0 [] remaining
-      if null gathered
-        then pure rest
-        else do
-          sent <- sendReady link gathered
-          case dropSent sent gathered of
-            [] -> go rest
-            left -> pure (map PartBytes left <> rest)
-    -- the pieces so far, last first, and their size
-    gather size pieces remaining
-      | size >= gatherSize || length pieces >= gatherPieces = pure (reverse pieces, remaining)
-      | otherwise = case remaining of
-          [] -> pure (reverse pieces, [])
-          -- Rendering the next buffer would overwrite gathered bytes that
-          -- a partial send still owns.
-          PartOutput _ _ : _ | not (null pieces) -> pure (reverse pieces, remaining)
-          PartOutput buffer steps : others -> do
-            rendered <- renderOutput buffer steps
-            gather size pieces (rendered <> others)
-          -- The next pull may overwrite the current chunk, including any
-          -- suffix a partial send has left in front of this cursor.
-          PartBorrowedStream _ _ : _ | not (null pieces) -> pure (reverse pieces, remaining)
-          PartBorrowedStream source given : others -> do
-            chunk <- byteStreamNext source
-            let delivered = given + BS.length chunk
-            if
-              | BS.null chunk -> do
-                  unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
-                  gather size pieces others
-              | delivered > byteStreamLength source ->
-                  throwIO (StreamLengthError (byteStreamLength source) delivered)
-              | otherwise -> gather size pieces (PartBytes chunk : PartBorrowedStream source delivered : others)
-          PartBytes chunk : others
-            | BS.null chunk -> gather size pieces others
-            | otherwise ->
-                let (prefix, suffix) = BS.splitAt (gatherSize - size) chunk
-                    rest = [PartBytes suffix | not (BS.null suffix)] <> others
-                 in gather (size + BS.length prefix) (prefix : pieces) rest
-          PartStream _ 0 : _ | not (null pieces) -> pure (reverse pieces, remaining)
-          PartStream source given : others -> do
-            chunk <- byteStreamNext source
-            let delivered = given + BS.length chunk
-            if
-              | BS.null chunk -> do
-                  unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
-                  gather size pieces others
-              | delivered > byteStreamLength source ->
-                  throwIO (StreamLengthError (byteStreamLength source) delivered)
-              | otherwise -> gather size pieces (PartBytes chunk : PartStream source delivered : others)
-    dropSent sent = \case
-      chunk : others
-        | sent >= BS.length chunk -> dropSent (sent - BS.length chunk) others
-        | otherwise -> BS.drop sent chunk : others
-      [] -> []
-{-# INLINABLE sendSome #-}
-
--- | Reads what the socket has into the buffer, without waiting: 'Nothing' if
--- it has nothing, and 0 at the end of the stream.
-tryReceive :: Socket -> Ptr Word8 -> Int -> IO (Maybe Int)
-#if defined(mingw32_HOST_OS)
--- Sockets block on Windows, so it waits for input.
-tryReceive sock pointer size = Just <$> recvBuf sock pointer size
-#else
-tryReceive sock pointer size =
-  withFdSocket sock $ \fd ->
-    let attempt =
-          c_recv fd pointer (fromIntegral size) 0 >>= \case
-            -1 ->
-              Errno.getErrno >>= \errno ->
-                if
-                  | errno == Errno.eINTR -> attempt
-                  | errno == Errno.eAGAIN || errno == Errno.eWOULDBLOCK -> pure Nothing
-                  | otherwise -> Errno.throwErrno "recv"
-            received -> pure (Just (fromIntegral received))
-     in attempt
-
-foreign import ccall unsafe "recv"
-  c_recv :: CInt -> Ptr Word8 -> CSize -> CInt -> IO Posix.CSsize
-#endif
-
--- | Sends what the socket takes of the pieces, in one call, without waiting
--- for room in it, and gives how many bytes it took.
-trySend :: Socket -> [ByteString] -> IO Int
-#if defined(mingw32_HOST_OS)
--- Sockets block on Windows, so it waits until all are sent, and the answers
--- are read only after the whole output is sent.
-trySend sock pieces = sum (map BS.length pieces) <$ sendMany sock pieces
-#else
-trySend sock pieces =
-  withFdSocket sock $ \fd ->
-    allocaBytes (length pieces * iovecSize) $ \iovecs ->
-      let -- each piece's struct iovec: where it is, and its length
-          describe _ [] = attempt
-          describe offset (piece : others) =
-            BS.unsafeUseAsCStringLen piece $ \(pointer, size) -> do
-              pokeByteOff iovecs offset pointer
-              pokeByteOff iovecs (offset + sizeOf pointer) (fromIntegral size :: CSize)
-              describe (offset + iovecSize) others
-          attempt =
-            c_writev fd iovecs (fromIntegral (length pieces)) >>= \case
-              -1 ->
-                Errno.getErrno >>= \errno ->
-                  if
-                    | errno == Errno.eINTR -> attempt
-                    | errno == Errno.eAGAIN || errno == Errno.eWOULDBLOCK -> pure 0
-                    | otherwise -> Errno.throwErrno "writev"
-              sent -> pure (fromIntegral sent)
-       in describe 0 pieces
-  where
-    iovecSize = sizeOf (nullPtr :: Ptr CChar) + sizeOf (0 :: CSize)
-
--- network's sockets don't block, so a full socket fails with EAGAIN.
-foreign import ccall unsafe "writev"
-  c_writev :: CInt -> Ptr () -> CInt -> IO Posix.CSsize
-#endif
+    split headerLength contentLength
+      | BS.length bytes < headerLength + contentLength = Left "malformed certificate"
+      | otherwise =
+          let (header, rest) = BS.splitAt headerLength bytes
+              (content, after) = BS.splitAt contentLength rest
+           in Right (header, content, after)

@@ -10,11 +10,12 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Maybe (isNothing)
 import Data.IORef
-import Database.PostgreSQL.Buffer
+import Database.PostgreSQL.Internal.Buffer
 import Database.PostgreSQL.Internal.Context
-import Database.PostgreSQL.Protocol (TransactionStatus (..))
+import Database.PostgreSQL.Internal.Protocol (TransactionStatus (..))
 import qualified Database.PostgreSQL.Session as PG
-import Database.PostgreSQL.Transport
+import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Internal.Channel
 import Foreign.ForeignPtr (withForeignPtr, plusForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)

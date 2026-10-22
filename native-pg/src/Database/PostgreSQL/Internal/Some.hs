@@ -1,7 +1,7 @@
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 
-module Data.Some (
+module Database.PostgreSQL.Internal.Some (
   Some,
   toSome,
   withSome

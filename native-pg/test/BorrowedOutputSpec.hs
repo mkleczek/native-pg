@@ -7,11 +7,12 @@ import Control.Exception (evaluate)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.IORef
-import Database.PostgreSQL.Buffer
-import Database.PostgreSQL.Protocol (Parameter (..))
-import Database.PostgreSQL.Protocol.Codec
-import Database.PostgreSQL.Protocol.Codec.Payload (Payload (MaybeBytes32Atom))
-import Database.PostgreSQL.Transport
+import Database.PostgreSQL.Internal.Buffer
+import Database.PostgreSQL.Internal.Protocol (Parameter (..))
+import Database.PostgreSQL.Internal.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (MaybeBytes32Atom))
+import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Internal.Channel
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (fillBytes)
 import Skeletest

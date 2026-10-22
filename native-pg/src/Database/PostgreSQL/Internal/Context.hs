@@ -25,17 +25,17 @@ module Database.PostgreSQL.Internal.Context
 
 import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (MVar, newMVar, takeMVar, putMVar, readMVar)
-import Control.Exception (Exception (..), catch, finally, mask, onException, throwIO, uninterruptibleMask_)
+import Control.Exception (catch, finally, mask, onException, throwIO, uninterruptibleMask_)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
-import Database.PostgreSQL.Buffer (Buffer, bufferCapacity, bufferMemory)
+import Network.Streaming.Resources.Internal (Buffer, bufferCapacity, bufferMemory)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (plusPtr)
-import Database.PostgreSQL.Diagnostics (ServerError (..))
-import Database.PostgreSQL.Protocol.Codec (Output, Input, InputBuffer, InputError (..), reusableInputBuffer, emptyInputBuffer, runInputUntil, runInputFramedUntil)
-import Database.PostgreSQL.Protocol.Messages (Notification)
-import Database.PostgreSQL.Transport (Channel (..), OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer)
+import Database.PostgreSQL.Diagnostics (ConnectionError (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), reusableInputBuffer, emptyInputBuffer, runInputUntil, runInputFramedUntil)
+import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
+import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer)
 
 data Connection = Connection
   { -- | Input and output over the socket, or TLS over it.
@@ -56,40 +56,6 @@ data SessionState
     -- unknown.
     Broken
   | Closed
-
-data ConnectionError
-  = -- | The server refused the connection.
-    ConnectionRejected ServerError
-  | -- | The server ended the session with this error, e.g. because an
-    -- administrator terminated it.
-    ConnectionTerminated ServerError
-  | -- | The server's messages don't follow the protocol.
-    ProtocolError String
-  | -- | The server asked for an authentication method this client doesn't
-    -- implement.
-    UnsupportedAuthentication String
-  | -- | Authentication failed on the client's side: a password is needed but
-    -- missing, or the server's SCRAM signature doesn't match.
-    AuthenticationError String
-  | -- | The session is busy with another operation, broke in an earlier
-    -- one, or has been closed.
-    SessionUnusable String
-  | -- | A row or a column stream was used out of turn.
-    RowMisuse String
-  | -- | TLS couldn't be started, e.g. because the server doesn't take it.
-    TlsFailure String
-  deriving (Eq, Show)
-
-instance Exception ConnectionError where
-  displayException failure = case failure of
-    ConnectionRejected rejection -> displayException rejection
-    ConnectionTerminated termination -> displayException termination
-    ProtocolError reason -> "protocol error: " <> reason
-    UnsupportedAuthentication method -> "the server asks for authentication with " <> method <> ", which isn't supported"
-    AuthenticationError reason -> reason
-    SessionUnusable reason -> reason
-    RowMisuse reason -> reason
-    TlsFailure reason -> reason
 
 -- | Builds protocol/link state for a connected, initialized transport.
 newConnection :: Channel -> Int -> IO Connection
@@ -158,6 +124,8 @@ runContextInput context limit parse = do
 -- still running on another thread before the buffers may be reused.
 withContext :: Connection -> Buffer -> Buffer -> (Context -> IO a) -> IO a
 withContext connection input output use = do
+  when (bufferCapacity input <= 0 || bufferCapacity output <= 0)
+    (ioError (userError "buffer capacity must be positive"))
   withForeignPtr (bufferMemory input) $ \inputStart ->
     withForeignPtr (bufferMemory output) $ \outputStart ->
       when (inputStart < outputStart `plusPtr` bufferCapacity output &&

@@ -5,16 +5,16 @@ module FramingSpec (spec) where
 
 import Control.Exception (try)
 import Control.Monad (replicateM, replicateM_)
-import Database.PostgreSQL.Buffer (newBuffer, bufferMemory)
+import Database.PostgreSQL.Internal.Buffer (newBuffer, bufferMemory)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Int (Int16, Int32)
 import Data.Word (Word8)
-import Database.PostgreSQL.Protocol
-import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
+import Database.PostgreSQL.Internal.Protocol
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Data.IORef (newIORef, modifyIORef', readIORef)
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr, minusPtr)
 import Foreign.ForeignPtr (withForeignPtr)

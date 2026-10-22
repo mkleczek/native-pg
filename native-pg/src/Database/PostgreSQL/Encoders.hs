@@ -37,7 +37,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LBS
 import Data.Text (Text)
 import Data.Word (Word32)
-import Database.PostgreSQL.Protocol (FormatCode (..), Parameter (..))
+import Database.PostgreSQL.Types (FormatCode (..))
+import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Transaction (Param (..))
 import qualified PostgreSQL.Binary.Encoding as Binary
 

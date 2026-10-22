@@ -1,4 +1,4 @@
-module Database.PostgreSQL.Protocol.Messages.Parse
+module Database.PostgreSQL.Internal.Protocol.Messages.Parse
   ( parseEnvelope,
     serializeEnvelope,
   )
@@ -6,13 +6,13 @@ where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec
   ( Output,
     Parsable (..),
     Serializable (..),
     runBodyParser,
   )
-import Database.PostgreSQL.Protocol.Messages.Types
+import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( Envelope (Envelope),
   )
 

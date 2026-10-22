@@ -2,7 +2,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Database.PostgreSQL.Protocol.Messages.Startup
+module Database.PostgreSQL.Internal.Protocol.Messages.Startup
   ( StartupMessageType (StartupMessageType),
     SSLRequestType (SSLRequestType),
     GSSENCRequestType (GSSENCRequestType),
@@ -21,16 +21,16 @@ module Database.PostgreSQL.Protocol.Messages.Startup
 where
 
 import Data.ByteString (ByteString)
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec
   ( HasConstructor (..),
   )
-import Database.PostgreSQL.Protocol.Codec.Payload
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
-import Database.PostgreSQL.Protocol.Messages.Parse
+import Database.PostgreSQL.Internal.Protocol.Messages.Parse
   ( parseEnvelope,
   )
-import Database.PostgreSQL.Protocol.Messages.Types
+import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( BackendKey,
     BackendKeyType (BackendKeyType),
     Envelope,

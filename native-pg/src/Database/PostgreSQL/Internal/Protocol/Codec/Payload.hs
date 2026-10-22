@@ -7,7 +7,7 @@
 -- This module deliberately stays below the message layer. It only defines the
 -- wire-oriented payload language itself; semantic interpretation is deferred
 -- until a later design pass.
-module Database.PostgreSQL.Protocol.Codec.Payload
+module Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Empty,
     Payload (..),
   )

@@ -32,7 +32,7 @@ import Data.ByteString (ByteString)
 import Data.Word (Word32)
 import Data.Functor ((<&>))
 import Data.Maybe (fromMaybe)
-import Database.PostgreSQL.Protocol (FormatCode (..), TransactionStatus)
+import Database.PostgreSQL.Types (TransactionStatus)
 import Database.PostgreSQL.Session
   ( Batch,
     Execution (..),
@@ -42,6 +42,7 @@ import Database.PostgreSQL.Session
     runBatch,
   )
 import qualified Database.PostgreSQL.Session as Session
+import Database.PostgreSQL.Internal.Result (Result (..))
 import Database.PostgreSQL.Statement
 
 -- | Statements to send together. Building it looks up the statements that

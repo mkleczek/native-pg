@@ -2,15 +2,15 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Database.PostgreSQL.Protocol.Messages.AuthBackend where
+module Database.PostgreSQL.Internal.Protocol.Messages.AuthBackend where
 
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec
   ( HasConstructor (..),
   )
-import Database.PostgreSQL.Protocol.Codec.Payload
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
-import Database.PostgreSQL.Protocol.Messages.Types
+import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( Envelope (..),
   )
 

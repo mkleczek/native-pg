@@ -11,11 +11,11 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Int (Int16, Int32)
-import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import GHC.Conc (getAllocationCounter)
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Database.PostgreSQL.Buffer
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Buffer
+import Database.PostgreSQL.Internal.Protocol.Codec
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, castPtr, minusPtr)
@@ -50,7 +50,7 @@ spec = describe "caller-owned input" $ do
         else pure empty
       -- A full workspace must still respect a shorter enclosing frame.
       before <- readIORef calls
-      result <- try @InputError (runInputUntil source maxBound input (withInputLimit (width - 1) parse))
+      result <- try @InputError (runInputFramedUntil source maxBound input (withInputLimit (width - 1) parse))
       either show (const "accepted") result `shouldBe` "InputError \"unexpected end of a bounded part: needed " <> show width <> " bytes\""
       readIORef calls `shouldReturn` before
 
