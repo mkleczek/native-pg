@@ -5,11 +5,16 @@
 {-# OPTIONS_GHC -F -pgmF=skeletest-preprocessor #-}
 module StreamingSetupSpec (spec) where
 
+import Control.Concurrent (forkFinally, killThread)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (bracket, try)
 import Data.Foldable (traverse_)
 import Data.List.NonEmpty (NonEmpty (..), toList)
 import Data.Maybe (isJust)
 import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString as Bytes
+import qualified Data.ByteString.Builder as Builder
+import qualified Data.ByteString.Lazy as Lazy
 import qualified Database.PostgreSQL.ConnectionString as CS
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Streaming as Streaming
@@ -19,6 +24,7 @@ import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Resources (ResourceSettings (..), withResources)
 import qualified Network.Streaming.Resources.Internal as Resources
 import qualified Network.Socket as Socket
+import qualified Network.Socket.ByteString as SocketBytes
 import Skeletest
 import System.FilePath (takeDirectory)
 import System.Timeout (timeout)
@@ -80,6 +86,17 @@ spec socketPath port = describe "pooled connection setup" $ do
         Right connected -> closeSelected connected >> failTest "missing hosts connected"
       timeout 1000000 (Resources.withSetupBuffers resources (positiveInt @2) (pure . length)) `shouldReturn` Just 2
 
+  it "uses setup storage for fallback qualification queries when startup omits attributes" $
+    withResources settings $ \resources -> Resources.withBuffers resources (positiveInt @2) $ \_ ->
+      withOlderServer $ \scriptedPort -> do
+        string <- either failTest pure $
+          CS.parseConnectionString (CS.Defaults "/tmp" Nothing) (const Nothing) (Just "postgres")
+            ("host=127.0.0.1 user=postgres dbname=postgres sslmode=disable target_session_attrs=read-write port=" <> BS.pack (show scriptedPort))
+        bracket (Streaming.connectFirst resources id string) closeSelected $ \(connection, info, _) -> do
+          PG.serverParameters info `shouldBe` []
+          PG.isConnectionUsable connection `shouldReturn` True
+          timeout 1000000 (Resources.withSetupBuffers resources (positiveInt @2) (pure . length)) `shouldReturn` Just 2
+
   it "returns setup storage when a silent startup is cancelled" $
     withResources settings $ \resources ->
       bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
@@ -93,3 +110,48 @@ spec socketPath port = describe "pooled connection setup" $ do
 
 settings :: ResourceSettings
 settings = ResourceSettings (positiveInt @32) (positiveInt @32) (positiveInt @16)
+
+-- A pre-14 startup omits the reported attributes and must answer a SHOW query.
+withOlderServer :: (Socket.PortNumber -> IO a) -> IO a
+withOlderServer action =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
+    Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen listener 1
+    port <- Socket.socketPort listener
+    done <- newEmptyMVar
+    bracket (forkFinally (serve listener) (putMVar done))
+      (\thread -> killThread thread >> readMVar done >> pure ()) $ \_ -> do
+        result <- timeout 5000000 (action port) >>= maybe (failTest "scripted connection timed out") pure
+        outcome <- timeout 1000000 (readMVar done)
+        case outcome of
+          Just (Right ()) -> pure result
+          Just (Left failure) -> failTest (show failure)
+          Nothing -> failTest "scripted server did not finish"
+  where
+    serve listener = bracket (fst <$> Socket.accept listener) Socket.close $ \socket -> do
+      size <- messageSize <$> receiveExactly socket 4
+      _ <- receiveExactly socket (size - 4)
+      SocketBytes.sendAll socket (frame 'R' (bytes (Builder.word32BE 0)) <> frame 'Z' "I")
+      frontendUntil socket 'S'
+      let row = bytes $ Builder.word16BE 1 <> Builder.word32BE 3 <> Builder.byteString "off"
+      SocketBytes.sendAll socket $
+        frame '1' "" <> frame '2' ""
+          <> frame 'D' row <> frame 'C' "SHOW\0" <> frame 'Z' "I"
+      frontendUntil socket 'X'
+    frontendUntil socket wanted = do
+      kind <- receiveExactly socket 1
+      size <- messageSize <$> receiveExactly socket 4
+      _ <- receiveExactly socket (size - 4)
+      if kind == BS.singleton wanted then pure () else frontendUntil socket wanted
+    frame kind payload = BS.singleton kind <> bytes (Builder.word32BE (fromIntegral (BS.length payload + 4))) <> payload
+    bytes = Lazy.toStrict . Builder.toLazyByteString
+    messageSize = Bytes.foldl' (\total byte -> total * 256 + fromIntegral byte) 0
+
+receiveExactly :: Socket.Socket -> Int -> IO BS.ByteString
+receiveExactly socket = go []
+  where
+    go chunks 0 = pure (BS.concat (reverse chunks))
+    go chunks remaining = do
+      chunk <- SocketBytes.recv socket remaining
+      if BS.null chunk then fail "scripted peer closed early"
+        else go (chunk : chunks) (remaining - BS.length chunk)
