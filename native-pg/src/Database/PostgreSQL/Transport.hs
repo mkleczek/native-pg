@@ -296,8 +296,8 @@ newtype TlsClient = TlsClient
 -- | The result of TLS setup. Authentication consumes the binding data;
 -- the link and channel only carry bytes.
 data TlsChannel = TlsChannel
-  { -- | Makes the channel as 'newChannel' does, once the session has allocated
-    -- its pending output.
+  { -- | The transport channel. Pending output is supplied separately for
+    -- each operation's input source.
     tlsChannel :: Channel,
     -- | The @tls-server-end-point@ binding: the hash of the server's
     -- certificate, or why it couldn't be computed. 'Nothing' means binding

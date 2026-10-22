@@ -16,7 +16,7 @@ import Database.PostgreSQL.Protocol.Codec (serialize)
 import Database.PostgreSQL.Transport
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (castPtr, plusPtr)
-import Skeletest
+import Skeletest hiding (context)
 
 spec :: Spec
 spec = describe "caller-owned output storage" $ do

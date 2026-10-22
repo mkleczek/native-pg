@@ -16,6 +16,8 @@ module Database.PostgreSQL.Pipeline
     statement,
     runPipeline,
     runPipelineWithStatus,
+    runPipelineIn,
+    runPipelineWithStatusIn,
 
     -- * Prepared statements
     Prepare,
@@ -109,3 +111,10 @@ runPipelineWithStatus :: Maybe Prepare -> Pipeline a -> Session 'Ready -> IO (Ei
 runPipelineWithStatus prepare (Pipeline plan) session = do
   Planned final batch <- plan prepare
   first join <$> runBatch session (QueryError (fromMaybe "" final) . ServerFailed) batch
+
+-- | Runs a pipeline using an explicitly scoped operation workspace.
+runPipelineIn :: Session.Context -> Maybe Prepare -> Pipeline a -> IO (Either QueryError a)
+runPipelineIn context prepare pipeline = runPipeline prepare pipeline (Session.sessionFromContext context)
+
+runPipelineWithStatusIn :: Session.Context -> Maybe Prepare -> Pipeline a -> IO (Either QueryError a, TransactionStatus)
+runPipelineWithStatusIn context prepare pipeline = runPipelineWithStatus prepare pipeline (Session.sessionFromContext context)

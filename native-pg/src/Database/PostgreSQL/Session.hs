@@ -16,8 +16,15 @@ module Database.PostgreSQL.Session
     Context,
     Connection,
     sessionFromContext,
-    executeWithContext,
+    sessionConnection,
+    connectWithBuffers,
+    closeConnection,
     isConnectionUsable,
+    prepareWithContext,
+    closeStatementWithContext,
+    executeWithContext,
+    runBatchWithContext,
+    awaitNotificationWithContext,
 
     -- * Connecting
     ConnectSettings (..),
@@ -61,7 +68,7 @@ module Database.PostgreSQL.Session
   )
 where
 
-import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, mask, onException, throwIO, try)
+import Control.Exception (Exception (..), IOException, bracketOnError, catch, finally, mask, throwIO, try)
 import Control.Monad (filterM, join, unless, when, (<=<))
 import Data.Bifunctor (first)
 import Data.Foldable (for_, toList)
@@ -80,6 +87,7 @@ import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import qualified System.Posix.Files as Posix
 import qualified System.Posix.User as Posix
 #endif
+import Database.PostgreSQL.Buffer (Buffer)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..))
 import Database.PostgreSQL.Diagnostics (ServerError (..), diagnostics, isConnectionFatal)
@@ -97,18 +105,15 @@ import Database.PostgreSQL.Protocol.Codec
   ( Alternatives (..),
     ByteStream (..),
     Input,
-    InputError (..),
     InputSource (..),
     MonadInput (..),
     Output,
     ParseConstructor,
     Parsable (..),
     Serializable (..),
-    emptyInputBuffer,
     inputPosition,
     parseChoice,
     readInputSome,
-    runInputUntil,
     skipInput,
   )
 import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
@@ -127,7 +132,6 @@ import Database.PostgreSQL.Transport
     connectSocket,
     defaultTcpOptions,
     newChannel,
-    newOutputBuffer,
     unsent,
   )
 import Foreign.Marshal.Alloc (allocaBytes)
@@ -310,7 +314,15 @@ instance Accepts 'SyncResult where
        ]
 
 -- | A connection in a known phase.
-newtype Session (phase :: Phase) = Session Connection
+newtype Session (phase :: Phase) = Session Context
+
+-- | A compatibility handle backed directly by an explicit operation context.
+-- No buffers are installed on the connection. The handle expires with it.
+sessionFromContext :: Context -> Session 'Ready
+sessionFromContext = Session
+
+sessionConnection :: Session phase -> Connection
+sessionConnection (Session context) = contextConnection context
 
 data ConnectSettings = ConnectSettings
   { connectAddress :: Address,
@@ -417,11 +429,6 @@ data ServerInfo = ServerInfo
   }
   deriving (Eq, Show)
 
--- | The size of the buffer a connection writes its batches to. A batch that
--- copies more bytes gets a buffer of its own.
-outputBufferSize :: Int
-outputBufferSize = 16384
-
 -- | Connects, authenticates and waits until the server is ready for a query.
 -- Throws 'Database.PostgreSQL.Transport.ConnectError' when the socket doesn't
 -- connect, and 'ConnectionError' when the server rejects the connection.
@@ -431,15 +438,25 @@ connect settings = withChannel settings start
     -- Given how to make the channel, once there's somewhere for its unsent
     -- output.
     start channel binding = do
-      buffer <- newIORef emptyInputBuffer
-      pending <- newIORef =<< unsent Nothing mempty
-      output <- newOutputBuffer outputBufferSize
-      state <- newIORef Idle
-      notifications <- newIORef []
-      let session = Session (Connection channel (connectReadSize settings) buffer pending output state notifications)
-      send @'StartupMessageType session (startupMessage settings)
-      (version, initializing) <- authenticate settings binding (connectProtocolVersion settings) session
-      initialize version initializing
+      connection <- newConnection channel (connectReadSize settings)
+      context <- newOwnedContext connection
+      startSession settings binding context
+
+-- | Startup/authentication using caller-supplied initialized workspace.
+-- Integration-only callers reserve separate setup capacity for this scope.
+connectWithBuffers :: Buffer -> Buffer -> ConnectSettings -> IO (Connection, ServerInfo)
+connectWithBuffers input output settings = withChannel settings $ \channel binding -> do
+  connection <- newConnection channel (connectReadSize settings)
+  withContext connection input output $ \context -> do
+    (_, info) <- startSession settings binding context
+    pure (connection, info)
+
+startSession :: ConnectSettings -> Maybe (Either String ByteString) -> Context -> IO (Session 'Ready, ServerInfo)
+startSession settings binding context = do
+  let session = Session context
+  send @'StartupMessageType session (startupMessage settings)
+  (version, initializing) <- authenticate settings binding (connectProtocolVersion settings) session
+  initialize version initializing
 
 -- | Connects a socket to the server, starts TLS over it as the settings ask,
 -- and runs the action with its channel builder and optional channel-binding
@@ -590,7 +607,10 @@ requestTls sock = do
 -- Throws 'SessionUnusable' if an operation is still running; interrupt it
 -- and wait for it to finish before closing.
 close :: Session phase -> IO ()
-close session@(Session connection) = mask $ \restore -> do
+close = closeConnection . sessionConnection
+
+closeConnection :: Connection -> IO ()
+closeConnection connection = mask $ \restore -> do
   state <- atomicModifyIORef' (connectionState connection) $ \case
     Busy -> (Busy, Busy)
     previous -> (Closed, previous)
@@ -602,7 +622,7 @@ close session@(Session connection) = mask $ \restore -> do
       -- the server may not be reading, so it isn't told to terminate.
       restore
         ( case state of
-            Idle -> send @'TerminateType session Terminate `catch` \(_ :: IOException) -> pure ()
+            Idle -> channelSend (connectionChannel connection) (serialize @Terminate @'TerminateType Terminate) `catch` \(_ :: IOException) -> pure ()
             _ -> pure ()
         )
         `finally` channelClose (connectionChannel connection)
@@ -611,7 +631,10 @@ close session@(Session connection) = mask $ \restore -> do
 -- is running, and none broke it. An operation that an exception interrupts
 -- leaves the session broken, e.g. when its thread is killed.
 isUsable :: Session phase -> IO Bool
-isUsable (Session connection) = do
+isUsable = isConnectionUsable . sessionConnection
+
+isConnectionUsable :: Connection -> IO Bool
+isConnectionUsable connection = do
   state <- readIORef (connectionState connection)
   pure $ case state of
     Idle -> True
@@ -801,11 +824,11 @@ batched failed execution step initial =
 --
 -- If a step throws, the session is broken.
 runBatch :: Session 'Ready -> (ServerError -> e) -> Batch e a -> IO (Either e a, TransactionStatus)
-runBatch session@(Session connection) failed (Batch output reading) = operation session $ do
+runBatch session@(Session context) failed (Batch output reading) = operation session $ do
   -- The server may answer the first statements before it has read the last,
   -- and stop reading until its answers are read. So what the socket doesn't
   -- take at once is sent as the answers are waited for.
-  writeIORef (connectionUnsent connection) =<< channelSendSome (connectionChannel connection) =<< unsent (Just (connectionOutput connection)) (output <> sync)
+  queueContextOutput context (output <> sync)
   result <- reading session
   awaitReady session failed result
 
@@ -842,7 +865,8 @@ readExecution session execution step initial = do
 -- because an administrator terminated it, this throws
 -- 'ConnectionTerminated'.
 awaitNotification :: Session 'Ready -> IO (Notification ByteString)
-awaitNotification session@(Session connection) = operation session $ do
+awaitNotification session = operation session $ do
+  let connection = sessionConnection session
   kept <- atomicModifyIORef' (connectionNotifications connection) takeOldest
   maybe waitForOne pure kept
   where
@@ -920,7 +944,7 @@ data RowsMessage
   | Completed ByteString
 
 readRows :: Session 'Rows -> (acc -> Row -> IO acc) -> acc -> IO (Either ServerError (acc, ByteString))
-readRows session@(Session connection) step = go
+readRows session@(Session context) step = go
   where
     go acc = do
       message <-
@@ -934,7 +958,7 @@ readRows session@(Session connection) step = go
         Left failure -> pure (Left failure)
         Right (Completed tag) -> pure (Right (acc, tag))
         Right (RowStarted rowLength columnCount) -> do
-          row <- startRow connection rowLength columnCount
+          row <- startRow context rowLength columnCount
           acc' <- step acc row
           finishRow row
           go acc'
@@ -961,7 +985,7 @@ awaitReady session failed result = do
 -- | A row, whose columns are pulled in order. It's valid only during the step
 -- it's given to.
 data Row = Row
-  { rowConnection :: Connection,
+  { rowContext :: Context,
     rowColumnCount :: Int,
     -- | The position where the row ends.
     rowEnd :: Int,
@@ -985,19 +1009,19 @@ data Column
     Column Int
   deriving (Eq, Show)
 
-startRow :: Connection -> Int32 -> Int -> IO Row
-startRow connection rowLength columnCount = do
+startRow :: Context -> Int32 -> Int -> IO Row
+startRow context rowLength columnCount = do
   unless (rowLength >= 6 && columnCount >= 0) $
     throwIO (ProtocolError ("invalid DataRow length " <> show rowLength <> " or column count " <> show columnCount))
-  position <- inputPosition <$> readIORef (connectionBuffer connection)
+  position <- inputPosition <$> readIORef (contextInput context)
   cursor <- newIORef (RowCursor True 0 0 False)
-  pure (Row connection columnCount (position + fromIntegral rowLength - 6) cursor)
+  pure (Row context columnCount (position + fromIntegral rowLength - 6) cursor)
 
 -- | Skips what the step left unread, so the next message can be read.
 finishRow :: Row -> IO ()
 finishRow row = do
   writeIORef (rowCursor row) (RowCursor False 0 0 True)
-  position <- inputPosition <$> readIORef (connectionBuffer (rowConnection row))
+  position <- inputPosition <$> readIORef (contextInput (rowContext row))
   inRow row (skipInput (rowEnd row - position))
 
 -- | Pulls the next column, skipping what's left unread of the current one.
@@ -1174,7 +1198,7 @@ untakenCursor row = do
   pure cursor
 
 inRow :: Row -> Input a -> IO a
-inRow row = runOn (rowConnection row) (rowEnd row)
+inRow row = runOn (rowContext row) (rowEnd row)
 
 -- | What a handler makes of a message.
 data Reply a
@@ -1242,8 +1266,8 @@ pullReply session handlers = do
 -- | Keeps a notification, copied out of the read buffer, for
 -- 'awaitNotification'.
 keepNotification :: Session phase -> Notification ByteString -> IO ()
-keepNotification (Session connection) notification =
-  atomicModifyIORef' (connectionNotifications connection) (\kept -> (copyNotification notification : kept, ()))
+keepNotification session notification =
+  atomicModifyIORef' (connectionNotifications (sessionConnection session)) (\kept -> (copyNotification notification : kept, ()))
 
 copyNotification :: Notification ByteString -> Notification ByteString
 copyNotification (Notification processId channel payload) = Notification processId (BS.copy channel) (BS.copy payload)
@@ -1275,49 +1299,39 @@ receive ::
   Session phase ->
   Alternatives functions r ->
   IO r
-receive (Session connection) handlers = runOn connection maxBound (parseChoice @(Accepted phase) handlers)
+receive (Session context) handlers = runOn context maxBound (parseChoice @(Accepted phase) handlers)
 
--- | Runs a parser on the connection's unconsumed bytes, reading no further
+-- | Runs a parser on the context's unconsumed bytes, reading no further
 -- than the given position.
-runOn :: Connection -> Int -> Input a -> IO a
-runOn connection limit parse = do
-  buffer <- readIORef (connectionBuffer connection)
-  (result, buffer') <-
-    runInputUntil (channelInput (connectionChannel connection) (connectionUnsent connection) (connectionReadSize connection)) limit buffer parse
-      `catch` \(InputError message) -> throwIO (ProtocolError message)
-  writeIORef (connectionBuffer connection) buffer'
-  pure result
+runOn :: Context -> Int -> Input a -> IO a
+runOn = runContextInput
 
--- | Runs an operation on an idle session. The session is busy meanwhile, and
--- broken if the operation fails with an exception.
+-- | Runs an operation within its workspace and connection ownership.
 operation :: Session 'Ready -> IO a -> IO a
-operation (Session connection) action = mask $ \restore -> do
-  acquired <- atomicModifyIORef' (connectionState connection) $ \case
-    Idle -> (Busy, Nothing)
-    Busy -> (Busy, Just "the session is busy with another operation")
-    Broken -> (Broken, Just "the session broke during an earlier operation")
-    Closed -> (Closed, Just "the session is closed")
-  maybe (pure ()) (throwIO . SessionUnusable) acquired
-  result <- restore action `onException` writeIORef (connectionState connection) Broken
-  writeIORef (connectionState connection) Idle
-  pure result
+operation (Session context) = runContextOperation context
 
 send :: forall s a phase. Serializable a s => Session phase -> a -> IO ()
 send session message = sendOutputs session (serialize @a @s message)
 
 sendOutputs :: Session phase -> Output -> IO ()
-sendOutputs (Session connection) = channelSend (connectionChannel connection)
+sendOutputs (Session context) = sendContextOutput context
 
 -- | The session in the phase the protocol continues in.
 continueIn :: Session phase -> Session next
-continueIn (Session connection) = Session connection
+continueIn (Session context) = Session context
 
--- | Compatibility bridge for explicit operation contexts.
-sessionFromContext :: Context -> Session 'Ready
-sessionFromContext = Session . contextConnection
+-- | Explicit-context variants for bounded integrations.
+prepareWithContext :: Context -> ByteString -> ByteString -> [OptionalOid] -> IO (Either ServerError (), TransactionStatus)
+prepareWithContext = prepare . sessionFromContext
+
+closeStatementWithContext :: Context -> ByteString -> IO (Either ServerError (), TransactionStatus)
+closeStatementWithContext = closeStatement . sessionFromContext
 
 executeWithContext :: Context -> Execution -> (acc -> Row -> IO acc) -> acc -> IO (Either ServerError (acc, ByteString), TransactionStatus)
 executeWithContext = execute . sessionFromContext
 
-isConnectionUsable :: Connection -> IO Bool
-isConnectionUsable connection = isUsable (Session connection)
+runBatchWithContext :: Context -> (ServerError -> e) -> Batch e a -> IO (Either e a, TransactionStatus)
+runBatchWithContext = runBatch . sessionFromContext
+
+awaitNotificationWithContext :: Context -> IO (Notification ByteString)
+awaitNotificationWithContext = awaitNotification . sessionFromContext

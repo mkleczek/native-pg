@@ -18,12 +18,12 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
-import Skeletest
+import Skeletest hiding (context)
 import System.Timeout (timeout)
 
 spec :: Spec
 spec = describe "explicit operation contexts" $ do
-  xfail "session operation routing has not migrated to Context" $ it "runs consecutive operations using only the current supplied workspaces" $ do
+  it "runs consecutive operations using only the current supplied workspaces" $ do
     input <- newBuffer 16
     output <- newBuffer 16
     remaining <- newIORef (reply <> reply)

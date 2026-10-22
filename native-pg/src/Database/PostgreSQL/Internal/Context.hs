@@ -38,14 +38,6 @@ data Connection = Connection
   { -- | Input and output over the socket, or TLS over it.
     connectionChannel :: Channel,
     connectionReadSize :: Int,
-    -- | Bytes read but not consumed yet; the only buffer the library keeps.
-    connectionBuffer :: IORef InputBuffer,
-    -- | Output of the running batch that the socket hasn't taken yet. Reads
-    -- send it as they wait.
-    connectionUnsent :: IORef Unsent,
-    -- | Where batches are written. The next batch reuses it, since a batch
-    -- has been sent whole by the time its results are read.
-    connectionOutput :: OutputBuffer,
     connectionState :: IORef SessionState,
     -- | Notifications that arrived during operations, newest first, until
     -- 'awaitNotification' takes them.
@@ -99,12 +91,9 @@ instance Exception ConnectionError where
 -- | Builds protocol/link state for a connected, initialized transport.
 newConnection :: Channel -> Int -> IO Connection
 newConnection channel readSize = do
-  input <- newIORef emptyInputBuffer
-  pending <- newIORef =<< unsent Nothing mempty
-  output <- newOutputBuffer 16384
   state <- newIORef Idle
   notifications <- newIORef []
-  pure (Connection channel readSize input pending output state notifications)
+  pure (Connection channel readSize state notifications)
 
 -- | Mutable byte ownership for one operation scope, separate from protocol
 -- state. The public module exports only the type.
@@ -123,10 +112,12 @@ data ContextUse = Available | Using ThreadId | Expired
 
 newOwnedContext :: Connection -> IO Context
 newOwnedContext connection = do
+  input <- newIORef emptyInputBuffer
+  pending <- newIORef =<< unsent Nothing mempty
+  output <- newOutputBuffer 16384
   use <- newIORef Available
   finished <- newMVar ()
-  pure (Context connection (connectionBuffer connection) (connectionOutput connection)
-    (connectionUnsent connection) (connectionReadSize connection) False use finished)
+  pure (Context connection input output pending (connectionReadSize connection) False use finished)
 
 -- | Sends output for this context.
 sendContextOutput :: Context -> Output -> IO ()

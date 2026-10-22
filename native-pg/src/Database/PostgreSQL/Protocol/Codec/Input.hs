@@ -223,7 +223,6 @@ runInputUntil source limit buffer (Input parser) = IO $ \s ->
     (# s', buffer', a #) -> (# s', (a, buffer') #)
 {-# INLINE runInputUntil #-}
 
--- | How many bytes were consumed before the first unconsumed one.
 -- | Like 'runInputUntil', batching refills within the current envelope while
 -- preserving the next envelope for a later operation.
 runInputFramedUntil :: InputSource -> Int -> InputBuffer -> Input a -> IO (a, InputBuffer)
@@ -232,6 +231,7 @@ runInputFramedUntil source limit buffer (Input parser) = IO $ \s ->
     (# s', buffer', a #) -> (# s', (a, buffer') #)
 {-# INLINE runInputFramedUntil #-}
 
+-- | How many bytes were consumed before the first unconsumed one.
 inputPosition :: InputBuffer -> Int
 inputPosition = bufferPosition
 

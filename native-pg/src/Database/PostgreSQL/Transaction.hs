@@ -21,6 +21,8 @@ module Database.PostgreSQL.Transaction
     Prepare,
     Prepared (..),
     transactionNoRetryWith,
+    transactionNoRetryIn,
+    transactionNoRetryWithIn,
     statement,
     sql,
     pipeline,
@@ -64,6 +66,7 @@ import Data.Maybe (isNothing)
 import Database.PostgreSQL.Pipeline (Pipeline, Prepare, Prepared (..), runPipelineWithStatus)
 import qualified Database.PostgreSQL.Pipeline as Pipeline
 import Database.PostgreSQL.Protocol (TransactionStatus (..))
+import qualified Database.PostgreSQL.Session as Session
 import Database.PostgreSQL.Session (Phase (Ready), Session)
 import Database.PostgreSQL.Statement
 
@@ -199,3 +202,10 @@ send context statements = do
   pending <- atomicModifyIORef' (contextBegin context) (Nothing,)
   let withBegin = maybe statements (\begin -> Pipeline.statement () (Statement begin (const []) noResult False) *> statements) pending
   runPipelineWithStatus (contextPrepare context) withBegin (contextSession context)
+
+-- | Runs a transaction through an explicitly scoped operation workspace.
+transactionNoRetryIn :: IsolationLevel -> Mode -> Transaction a -> Session.Context -> IO (Either QueryError a)
+transactionNoRetryIn isolation mode transaction = transactionNoRetry isolation mode transaction . Session.sessionFromContext
+
+transactionNoRetryWithIn :: Prepare -> IsolationLevel -> Mode -> Transaction a -> Session.Context -> IO (Either QueryError a)
+transactionNoRetryWithIn prepare isolation mode transaction = transactionNoRetryWith prepare isolation mode transaction . Session.sessionFromContext
