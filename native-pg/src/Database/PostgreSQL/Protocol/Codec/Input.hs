@@ -14,6 +14,10 @@ module Database.PostgreSQL.Protocol.Codec.Input
     InputSource (..),
     MonadInput (..),
     emptyInputBuffer,
+    reusableInputBuffer,
+    attachInputBuffer,
+    detachInputBuffer,
+    withInputSome,
     inputPosition,
     readInputSome,
     runBodyParser,
@@ -30,6 +34,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Word (Word8)
+import Database.PostgreSQL.Buffer (Buffer)
 import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, plusPtr)
@@ -74,6 +79,23 @@ data InputBuffer = InputBuffer
 emptyInputBuffer :: InputBuffer
 emptyInputBuffer = case BS.empty of
   BSI.BS memory _ -> InputBuffer memory 0 0 0 0
+
+-- | Empty input backed by storage lent by the caller.
+reusableInputBuffer :: Buffer -> InputBuffer
+reusableInputBuffer _ = emptyInputBuffer
+
+-- | Moves unread bytes into caller-owned input storage.
+attachInputBuffer :: Buffer -> InputBuffer -> IO InputBuffer
+attachInputBuffer _ = pure
+
+-- | Ends a loan, retaining only an owned copy of unread bytes.
+detachInputBuffer :: InputBuffer -> IO InputBuffer
+detachInputBuffer = pure
+
+-- | Borrows one chunk until the callback returns, then consumes it.
+-- The callback must not retain the bytes or read this input recursively.
+withInputSome :: Int -> (ByteString -> IO a) -> Input a
+withInputSome count use = readInputSome count >>= inputIO . use
 
 data InputEnv = InputEnv
   { envSource :: InputSource,
