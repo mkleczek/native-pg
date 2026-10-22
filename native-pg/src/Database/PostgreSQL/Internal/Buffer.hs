@@ -1,7 +1,9 @@
 -- | Initialized storage owned by the caller. A buffer may be lent to only
 -- one operation at a time; returning from that operation ends the loan.
 module Database.PostgreSQL.Internal.Buffer
-  ( newBuffer,
+  ( Buffer (..),
+    bufferFromInitializedMemory,
+    newBuffer,
     initializeBuffer,
   )
 where
@@ -30,3 +32,7 @@ initializeBuffer memory size = do
 
 validateCapacity :: Int -> IO ()
 validateCapacity size = when (size <= 0) (ioError (userError "buffer capacity must be positive"))
+
+-- Compatibility name for fixtures predating the initialized-buffer API.
+bufferFromInitializedMemory :: ForeignPtr Word8 -> Int -> IO Buffer
+bufferFromInitializedMemory = initializeBuffer

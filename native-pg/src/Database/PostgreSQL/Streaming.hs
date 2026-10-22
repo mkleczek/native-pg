@@ -17,17 +17,14 @@ import qualified Database.PostgreSQL.Internal.Context as Context
 import qualified Database.PostgreSQL.Session as Session
 import Database.PostgreSQL.Session (Connection, Context, ConnectSettings, ServerInfo)
 import Database.PostgreSQL.Streaming.Types (ByteStream (..))
-import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Resources (Resources)
 import qualified Network.Streaming.Resources.Internal as Resources
 
 -- | Borrow an initialized input/output pair for one exclusive connection
 -- scope. Borrowed rows and streams expire before the pair is returned.
 withOperation :: Resources -> Connection -> (Context -> IO a) -> IO a
-withOperation resources connection action = Resources.withBuffers resources (positiveInt @2) $ \buffers ->
-  case buffers of
-    [input, output] -> withBuffers input output connection action
-    _ -> ioError (userError "invalid operation workspace grant")
+withOperation resources connection action = Resources.withBuffers @(Resources.Buffer, Resources.Buffer) resources $ \(input, output) ->
+  withBuffers input output connection action
 
 -- | Use disjoint, initialized shared storage for one exclusive operation.
 -- Both buffers must remain exclusively owned until the callback returns;
@@ -56,10 +53,7 @@ connectFirst resources adjust string = withSetupPair resources $ \input output -
       HostSelection.queryValue (Session.sessionFromContext context) query) adjust string
 
 withSetupPair :: Resources -> (Buffer.Buffer -> Buffer.Buffer -> IO a) -> IO a
-withSetupPair resources action = Resources.withSetupBuffers resources (positiveInt @2) $ \buffers ->
-  case buffers of
-    [input, output] -> do
-      input' <- buffer input
-      output' <- buffer output
-      action input' output'
-    _ -> ioError (userError "invalid setup workspace grant")
+withSetupPair resources action = Resources.withSetupBuffers @(Resources.Buffer, Resources.Buffer) resources $ \(input, output) -> do
+  input' <- buffer input
+  output' <- buffer output
+  action input' output'

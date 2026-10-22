@@ -12,7 +12,7 @@ import System.Process (readProcessWithExitCode)
 
 -- | One of the test certificates and keys, which native-pg-tls's tests share.
 certificate :: FilePath -> FilePath
-certificate name = "test/certificates/" <> name
+certificate name = "native-pg-tls/test/certificates/" <> name
 
 -- | Runs the action with the socket path and the port of a new cluster, which
 -- has a role for each password method. On its port, at 127.0.0.1, it takes
