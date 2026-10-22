@@ -189,10 +189,17 @@ instance MonadInput Input where
     limit <- getLimit
     if limit == unbounded
       then throwError "RemainingBytesAtom needs an enclosing bounded part"
-      else readInputExactly . (limit -) . bufferPosition =<< getBuffer
+      else do
+        buffer <- getBuffer
+        let count = limit - bufferPosition buffer
+        if bufferReusable buffer
+          then ownedRemaining count []
+          else readInputExactly count
   {-# INLINE readInputRemaining #-}
 
-  readInputCStringBytes = cstringFrom 0
+  readInputCStringBytes = do
+    buffer <- getBuffer
+    if bufferReusable buffer then reusableCString [] else cstringFrom 0
   {-# INLINE readInputCStringBytes #-}
 
   withInputLimit count (Input action) = Input $ \env buffer s ->
@@ -390,6 +397,32 @@ fill source end count buffer
           when (received <= 0) (throwIO (InputError "unexpected end of input"))
           readUntilAvailable current {bufferEnd = bufferEnd current + received}
 {-# NOINLINE fill #-}
+
+-- Metadata is owned independently from the operation arena. Unlike a field's
+-- contiguous materialization, it may span any number of bounded refills.
+ownedRemaining :: Int -> [ByteString] -> Input ByteString
+ownedRemaining remaining chunks
+  | remaining == 0 = pure (BS.concat (reverse chunks))
+  | otherwise = do
+      chunk <- readInputSome remaining
+      ownedRemaining (remaining - BS.length chunk) (chunk : chunks)
+
+reusableCString :: [ByteString] -> Input ByteString
+reusableCString chunks = do
+  before <- getBuffer
+  limit <- getLimit
+  when (bufferPosition before >= limit) (throwError "unterminated C-string")
+  buffer <- ensureAvailable 1
+  let available = min (bufferEnd buffer - bufferStart buffer) (limit - bufferPosition buffer)
+  case BS.elemIndex 0 (slice available buffer) of
+    Just size -> do
+      part <- ownedSlice size buffer
+      putBuffer (consume (size + 1) buffer)
+      pure (BS.concat (reverse (part : chunks)))
+    Nothing -> do
+      part <- ownedSlice available buffer
+      putBuffer (consume available buffer)
+      reusableCString (part : chunks)
 
 -- | Reads a zero-terminated string whose first given number of bytes are
 -- known not to be zero.

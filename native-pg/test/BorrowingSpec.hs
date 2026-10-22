@@ -142,6 +142,26 @@ spec = describe "caller-owned input" $ do
           (const (pure "recovered"))
     inputResult (runInput source emptyInputBuffer parser) `shouldReturn` Right "recovered"
 
+  it "assembles long C-string metadata into owned storage" $ do
+    storage <- newBuffer 4
+    let name = BS.replicate 100 120
+    source <- bytesSource 4 (name <> "\0next") (const (pure ()))
+    (values, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
+      name' <- withInputLimit 101 readInputCStringBytes
+      next <- readInputExactly 4
+      pure [name', next]
+    values `shouldBe` [name, "next"]
+
+  it "assembles bounded authentication metadata across supplied refills" $ do
+    storage <- newBuffer 4
+    let challenge = BS.replicate 100 99
+    source <- bytesSource 4 (challenge <> "next") (const (pure ()))
+    (values, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
+      value <- withInputLimit 100 readInputRemaining
+      next <- readInputExactly 4
+      pure [value, next]
+    values `shouldBe` [challenge, "next"]
+
 inputResult :: IO (ByteString, InputBuffer) -> IO (Either String ByteString)
 inputResult action = either (\(InputError reason) -> Left reason) (Right . fst) <$> try action
 
