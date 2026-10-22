@@ -66,7 +66,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
 import Database.PostgreSQL.Pipeline (Pipeline, Prepare, Prepared (..), runPipelineWithStatus)
 import qualified Database.PostgreSQL.Pipeline as Pipeline
-import Database.PostgreSQL.Protocol (TransactionStatus (..))
+import Database.PostgreSQL.Types (TransactionStatus (..))
 import qualified Database.PostgreSQL.Session as Session
 import Database.PostgreSQL.Session (Phase (Ready), Session)
 import Database.PostgreSQL.Statement

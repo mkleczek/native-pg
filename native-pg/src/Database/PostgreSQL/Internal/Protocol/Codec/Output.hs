@@ -2,7 +2,7 @@
 
 -- | Serialized bytes with their length known before they are written, so a
 -- length prefix can be written ahead of them.
-module Database.PostgreSQL.Protocol.Codec.Output
+module Database.PostgreSQL.Internal.Protocol.Codec.Output
   ( ByteStream (..),
     Output,
     Writer,
@@ -29,6 +29,7 @@ where
 
 import Data.Bits (shiftR)
 import Data.ByteString (ByteString)
+import Database.PostgreSQL.Streaming.Types (ByteStream (..))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
@@ -40,13 +41,6 @@ import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Foreign.Storable (pokeByteOff)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import System.IO.Unsafe (unsafeDupablePerformIO)
-
--- | Bytes that arrive in chunks, with their total length known up front.
-data ByteStream = ByteStream
-  { byteStreamLength :: !Int,
-    -- | The next chunk. An empty one means the end.
-    byteStreamNext :: IO ByteString
-  }
 
 -- | The sizes are strict so length prefixes need not run the writer.
 -- The writer has a tail continuation, so composition can fuse adjacent pokes

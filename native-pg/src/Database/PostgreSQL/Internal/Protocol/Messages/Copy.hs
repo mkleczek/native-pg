@@ -2,7 +2,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Database.PostgreSQL.Protocol.Messages.Copy
+module Database.PostgreSQL.Internal.Protocol.Messages.Copy
   ( CopyDataType (CopyDataType),
     CopyDoneType (CopyDoneType),
     CopyFailType (CopyFailType),
@@ -15,14 +15,14 @@ module Database.PostgreSQL.Protocol.Messages.Copy
   )
 where
 
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec
   ( HasConstructor (..),
   )
-import Database.PostgreSQL.Protocol.Codec.Payload
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Empty,
     Payload (..),
   )
-import Database.PostgreSQL.Protocol.Messages.Types (Envelope)
+import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope)
 
 type CopyMessage tag payload =
   'PayloadStruct

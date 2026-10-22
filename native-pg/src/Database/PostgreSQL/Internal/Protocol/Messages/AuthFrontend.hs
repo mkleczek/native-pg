@@ -2,7 +2,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Database.PostgreSQL.Protocol.Messages.AuthFrontend
+module Database.PostgreSQL.Internal.Protocol.Messages.AuthFrontend
   ( PasswordMessageType (PasswordMessageType),
     GSSResponseType (GSSResponseType),
     SASLInitialResponseType (SASLInitialResponseType),
@@ -18,13 +18,13 @@ module Database.PostgreSQL.Protocol.Messages.AuthFrontend
   )
 where
 
-import Database.PostgreSQL.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec
   ( HasConstructor (..),
   )
-import Database.PostgreSQL.Protocol.Codec.Payload
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
-import Database.PostgreSQL.Protocol.Messages.Types (Envelope)
+import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope)
 
 type AuthFrontendTag = 'PayloadConst 1 'p'
 

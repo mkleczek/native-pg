@@ -2,7 +2,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Database.PostgreSQL.Protocol.Messages.Types
+module Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( Envelope (..),
     SomeEnvelope,
     Scalar (..),
@@ -71,25 +71,17 @@ where
 
 import Data.Bits ((.|.), shiftL, shiftR)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
 import Data.Int (Int16, Int32)
 import Data.Kind (Type)
 import Data.Maybe (fromMaybe)
-import Data.Word (Word16, Word32, Word8)
-import Database.PostgreSQL.Protocol.Codec
+import Data.Word (Word32, Word8)
+import Database.PostgreSQL.Types
+import Database.PostgreSQL.Streaming.Types (Parameter (..))
+import Database.PostgreSQL.Internal.Protocol.Codec
   ( Alternatives (..),
-    ByteStream (..),
     HasConstructor (..),
-    Serializable (..),
   )
-import Database.PostgreSQL.Protocol.Codec.Output
-  ( bytes,
-    borrowedStream,
-    int32,
-    outputs,
-    stream,
-  )
-import Database.PostgreSQL.Protocol.Codec.Payload
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
 import GHC.Exts (Any)
@@ -270,15 +262,6 @@ instance HasConstructor 'BackendKeyType (BackendKey bytes) where
   constructorOf processId = Scalar . (processId,)
   destructorOf (Scalar (processId, secretKey)) k = k processId secretKey
 
-data ProtocolVersion = ProtocolVersion
-  { protocolVersionMajor :: Word16,
-    protocolVersionMinor :: Word16
-  }
-
-deriving instance Eq ProtocolVersion
-deriving instance Ord ProtocolVersion
-deriving instance Show ProtocolVersion
-
 type ProtocolVersionEnvelope =
   Envelope
     ProtocolVersion
@@ -296,12 +279,6 @@ protocolVersionCode :: ProtocolVersion -> Word32
 protocolVersionCode version =
   shiftL (fromIntegral (protocolVersionMajor version)) 16
     .|. fromIntegral (protocolVersionMinor version)
-
-protocolVersion3_0 :: ProtocolVersion
-protocolVersion3_0 = ProtocolVersion 3 0
-
-protocolVersion3_2 :: ProtocolVersion
-protocolVersion3_2 = ProtocolVersion 3 2
 
 cancelRequestCode :: Word32
 cancelRequestCode = 80877102
@@ -323,14 +300,6 @@ instance HasConstructor 'StartupParameterType (StartupParameter bytes) where
   type ConstructorOf 'StartupParameterType (StartupParameter bytes) r = bytes -> bytes -> r
   constructorOf name value = Scalar (name, value)
   destructorOf (Scalar (name, value)) k = k name value
-
-data FormatCode
-  = TextFormat
-  | BinaryFormat
-
-deriving instance Eq FormatCode
-deriving instance Ord FormatCode
-deriving instance Show FormatCode
 
 type FormatCodeEnvelope =
   Envelope
@@ -414,32 +383,6 @@ instance HasConstructor 'BindBodyType (BindBody value) where
   destructorOf (BindBody portalName statementName parameterFormats parameterValues resultFormats) k =
     k portalName statementName parameterFormats parameterValues resultFormats
 
--- | A parameter value the client sends: bytes at hand, whole or in chunks,
--- or a stream it supplies while the value is sent.
-data Parameter
-  = ParameterBytes ByteString
-  | -- | Sent one after another, each from where it is, as 'bytes' sends a
-    -- long one, so that they aren't copied into one first.
-    ParameterChunks [ByteString]
-  | ParameterStream ByteStream
-  | -- | Each chunk may reuse storage after the next pull. The source and
-    -- its storage must remain exclusively lent until the operation ends.
-    -- The sender accepts the whole chunk before pulling another.
-    ParameterBorrowedStream ByteStream
-
-instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
-  serialize Nothing = int32 (-1)
-  serialize (Just (ParameterBytes value)) = int32 (lengthAsInt32 (BS.length value)) <> bytes value
-  serialize (Just (ParameterChunks chunks)) = int32 (lengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
-  serialize (Just (ParameterStream source)) = int32 (lengthAsInt32 (byteStreamLength source)) <> stream source
-  serialize (Just (ParameterBorrowedStream source)) = int32 (lengthAsInt32 (byteStreamLength source)) <> borrowedStream source
-  {-# INLINE serialize #-}
-
-lengthAsInt32 :: Int -> Int32
-lengthAsInt32 count
-  | count <= fromIntegral (maxBound @Int32) = fromIntegral count
-  | otherwise = error ("a parameter of " <> show count <> " bytes doesn't fit in an Int32 length")
-
 type CopyResponse = Scalar (CopyFormat, [FormatCode])
 
 type CopyResponseEnvelope =
@@ -495,15 +438,6 @@ instance HasConstructor 'ParameterStatusValueType (ParameterStatusValue bytes) w
   type ConstructorOf 'ParameterStatusValueType (ParameterStatusValue bytes) r = bytes -> bytes -> r
   constructorOf name value = Scalar (name, value)
   destructorOf (Scalar (name, value)) k = k name value
-
-data TransactionStatus
-  = TxIdle
-  | TxInTransaction
-  | TxFailedTransaction
-
-deriving instance Eq TransactionStatus
-deriving instance Ord TransactionStatus
-deriving instance Show TransactionStatus
 
 type TransactionStatusEnvelope =
   Envelope

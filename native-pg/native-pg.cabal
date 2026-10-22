@@ -11,44 +11,41 @@ maintainer:         michal@kleczek.org
 category:           Database, PostgreSQL
 build-type:         Simple
 tested-with:        GHC == 9.10.3, GHC == 9.12.3
+extra-source-files: test/check-api-boundary.sh
+                    test/api-boundary/Client.hs
 
-library
+common implementation
   default-language:   GHC2021
-  -- cabal builds the components with quasi-quotes with dynamic objects too,
-  -- which need those of the libraries they use, so this one has them too
   default-extensions: QuasiQuotes
   hs-source-dirs:     src
   ghc-options:        -Wall
-  exposed-modules:    Database.PostgreSQL.Authentication
-                      Database.PostgreSQL.Buffer
-                      Database.PostgreSQL.ConnectionString
-                      Database.PostgreSQL.Decoding
-                      Database.PostgreSQL.Diagnostics
-                      Database.PostgreSQL.Encoders
-                      Database.PostgreSQL.Pipeline
-                      Database.PostgreSQL.Protocol
-                      Database.PostgreSQL.Protocol.Codec
-                      Database.PostgreSQL.Protocol.Codec.Payload
-                      Database.PostgreSQL.Protocol.Messages
-                      Database.PostgreSQL.Protocol.Messages.AuthBackend
-                      Database.PostgreSQL.Protocol.Messages.AuthFrontend
-                      Database.PostgreSQL.Protocol.Messages.BackendSession
-                      Database.PostgreSQL.Protocol.Messages.Copy
-                      Database.PostgreSQL.Protocol.Messages.FrontendSession
-                      Database.PostgreSQL.Protocol.Messages.MessageType
-                      Database.PostgreSQL.Protocol.Messages.Parse
-                      Database.PostgreSQL.Protocol.Messages.Startup
-                      Database.PostgreSQL.Protocol.Messages.Types
-                      Database.PostgreSQL.Session
+  other-modules:      Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Buffer
+                      Database.PostgreSQL.Internal.Channel
                       Database.PostgreSQL.Internal.Context
-                      Database.PostgreSQL.Snippet
-                      Database.PostgreSQL.Statement
-                      Database.PostgreSQL.Streaming
-                      Database.PostgreSQL.Transaction
-                      Database.PostgreSQL.Transport
-  other-modules:      Data.Some
-                      Database.PostgreSQL.Protocol.Codec.Input
-                      Database.PostgreSQL.Protocol.Codec.Output
+                      Database.PostgreSQL.Internal.Diagnostics
+                      Database.PostgreSQL.Internal.Exchange
+                      Database.PostgreSQL.Internal.HostSelection
+                      Database.PostgreSQL.Internal.Protocol
+                      Database.PostgreSQL.Internal.Protocol.Codec
+                      Database.PostgreSQL.Internal.Protocol.Codec.Input
+                      Database.PostgreSQL.Internal.Protocol.Codec.Output
+                      Database.PostgreSQL.Internal.Protocol.Codec.Payload
+                      Database.PostgreSQL.Internal.Protocol.Messages
+                      Database.PostgreSQL.Internal.Protocol.Messages.AuthBackend
+                      Database.PostgreSQL.Internal.Protocol.Messages.AuthFrontend
+                      Database.PostgreSQL.Internal.Protocol.Messages.BackendSession
+                      Database.PostgreSQL.Internal.Protocol.Messages.Copy
+                      Database.PostgreSQL.Internal.Protocol.Messages.FrontendSession
+                      Database.PostgreSQL.Internal.Protocol.Messages.MessageType
+                      Database.PostgreSQL.Internal.Protocol.Messages.Parse
+                      Database.PostgreSQL.Internal.Protocol.Messages.Startup
+                      Database.PostgreSQL.Internal.Protocol.Messages.Types
+                      Database.PostgreSQL.Internal.Result
+                      Database.PostgreSQL.Internal.Socket
+                      Database.PostgreSQL.Internal.Socket.Link
+                      Database.PostgreSQL.Internal.Some
+                      Database.PostgreSQL.Internal.Startup
   build-depends:      base              >= 4.9 && < 4.22
                     , base64-bytestring >= 1 && < 1.3
                     , bytestring        >= 0.10.8 && < 0.13
@@ -68,11 +65,46 @@ library
     build-depends:
       unix
 
+library
+  import:             implementation
+  exposed-modules:    Database.PostgreSQL.ConnectionString
+                      Database.PostgreSQL.ConnectionString.Types
+                      Database.PostgreSQL.Decoding
+                      Database.PostgreSQL.Diagnostics
+                      Database.PostgreSQL.Encoders
+                      Database.PostgreSQL.Pipeline
+                      Database.PostgreSQL.Session
+                      Database.PostgreSQL.Session.Settings
+                      Database.PostgreSQL.Snippet
+                      Database.PostgreSQL.Statement
+                      Database.PostgreSQL.Streaming
+                      Database.PostgreSQL.Streaming.Types
+                      Database.PostgreSQL.Transaction
+                      Database.PostgreSQL.Transport
+                      Database.PostgreSQL.Transport.Link
+                      Database.PostgreSQL.Types
+
 test-suite native-pg-spec
-  default-language:   GHC2021
+  import:             implementation
   type:               exitcode-stdio-1.0
   hs-source-dirs:     test
-  other-modules:      BorrowedOutputSpec
+  other-modules:      Database.PostgreSQL.ConnectionString
+                      Database.PostgreSQL.ConnectionString.Types
+                      Database.PostgreSQL.Decoding
+                      Database.PostgreSQL.Diagnostics
+                      Database.PostgreSQL.Encoders
+                      Database.PostgreSQL.Pipeline
+                      Database.PostgreSQL.Session
+                      Database.PostgreSQL.Session.Settings
+                      Database.PostgreSQL.Snippet
+                      Database.PostgreSQL.Statement
+                      Database.PostgreSQL.Streaming
+                      Database.PostgreSQL.Streaming.Types
+                      Database.PostgreSQL.Transaction
+                      Database.PostgreSQL.Transport
+                      Database.PostgreSQL.Transport.Link
+                      Database.PostgreSQL.Types
+                      BorrowedOutputSpec
                       BorrowingSpec
                       CoreSpec
                       ContextSpec
@@ -84,14 +116,7 @@ test-suite native-pg-spec
   main-is:            Main.hs
   ghc-options:        -Wall -threaded -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
-  build-depends:      base              >= 4.9 && < 4.22
-                    , base64-bytestring >= 1 && < 1.3
-                    , bytestring        >= 0.10.8 && < 0.13
-                    , skeletest         >= 0.4.2 && < 0.5
-                    , mtl               >= 2.2.2 && < 2.4
-                    , memory            >= 0.18 && < 0.19
-                    , text              >= 1.2.2 && < 2.2
-                    , network           >= 3.1 && < 3.3
-                    , native-pg
-                    , streaming-io
+  -- Whitebox tests compile the sources so hidden modules stay unavailable
+  -- to clients without requiring a separate implementation library.
+  build-depends:      skeletest >= 0.4.2 && < 0.5
                     , stm

@@ -17,17 +17,18 @@ import Data.Int (Int32)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word8)
-import Database.PostgreSQL.Authentication
+import Database.PostgreSQL.Internal.Authentication
 import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Diagnostics
+import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
 import qualified Database.PostgreSQL.Encoders as Encoders
-import Database.PostgreSQL.Protocol
-import Database.PostgreSQL.Protocol.Codec
-import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
+import Database.PostgreSQL.Internal.Protocol
+import Database.PostgreSQL.Internal.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
-import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions)
+import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions, serverEndPoint)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import Skeletest

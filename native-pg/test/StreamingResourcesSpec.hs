@@ -11,7 +11,8 @@ import Data.Maybe (isNothing)
 import qualified Database.PostgreSQL.Internal.Context as Context
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Streaming as PG
-import Database.PostgreSQL.Transport
+import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Internal.Channel
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Resources
 import qualified Network.Streaming.Resources.Internal as Resources

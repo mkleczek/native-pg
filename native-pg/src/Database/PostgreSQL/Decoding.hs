@@ -28,7 +28,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time (Day, DiffTime, LocalTime, TimeOfDay, UTCTime)
 import Data.UUID (UUID)
-import Database.PostgreSQL.Protocol.Codec (ByteStream)
+import Database.PostgreSQL.Streaming.Types (ByteStream)
 import GHC.TypeLits (ErrorMessage (..), TypeError)
 import qualified PostgreSQL.Binary.Decoding as Binary
 

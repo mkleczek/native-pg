@@ -3,20 +3,26 @@
 
 module TransportSpec (spec) where
 
+import Control.Concurrent (threadDelay)
+import Control.Exception (ErrorCall (..), bracket, finally, throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
-import Database.PostgreSQL.Protocol (Sync (..), SyncType (SyncType))
-import Database.PostgreSQL.Protocol.Codec (ByteStream (..), InputSource (..), Output, serialize)
-import Database.PostgreSQL.Protocol.Codec.Payload (Payload (RemainingBytesAtom, MaybeBytes32Atom))
-import Database.PostgreSQL.Protocol (Parameter (..))
-import Database.PostgreSQL.Transport
+import Database.PostgreSQL.Internal.Protocol (Sync (..), SyncType (SyncType))
+import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), InputSource (..), Output, serialize)
+import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (RemainingBytesAtom, MaybeBytes32Atom))
+import Database.PostgreSQL.Internal.Protocol (Parameter (..))
+import Database.PostgreSQL.Internal.Context (newConnection, newOwnedContext)
+import qualified Database.PostgreSQL.Session as Session
+import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Internal.Channel
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr)
 import System.Timeout (timeout)
 import Skeletest
+import qualified Skeletest.Predicate as P
 
 spec :: Spec
 spec = describe "channels over a link without a socket" $ do
@@ -110,6 +116,37 @@ spec = describe "channels over a link without a socket" $ do
           output = serialize @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterStream source))
       checkGather output ("\0\9'\192" <> payload)
 
+  it "closes the channel once when sending Terminate throws" $
+    withCloseHooks (throwIO (ErrorCall "terminate failed")) (pure ()) $ \session ->
+      Session.close session `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "terminate failed")))
+
+  it "does not retry channel cleanup if it throws" $
+    withCloseHooks (pure ()) (throwIO (ErrorCall "cleanup failed")) $ \session ->
+      Session.close session `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "cleanup failed")))
+
+  it "closes the channel once when sending Terminate is interrupted" $
+    withCloseHooks (threadDelay 10000000) (pure ()) $ \session ->
+      timeout 100000 (Session.close session) `shouldReturn` Nothing
+
+withCloseHooks :: IO () -> IO () -> (Session.Session 'Session.Ready -> IO a) -> IO ()
+withCloseHooks beforeSend afterClose check = do
+  closes <- newIORef (0 :: Int)
+  let link = testLink
+        { testSend = \pieces -> do
+            BS.concat pieces `shouldBe` "X\0\0\0\4"
+            beforeSend
+            pure (sum (map BS.length pieces)),
+          testClose = (modifyIORef' closes (+ 1)) `finally` afterClose
+        }
+      open = Session.sessionFromContext <$> (newOwnedContext =<< newConnection (newChannel link) 16)
+  bracket open Session.close $ \session -> do
+    _ <- check session
+    Session.isUsable session `shouldReturn` False
+    Session.close session
+    Session.execute session (Session.Execution (Session.Prepared "") [] [] []) (\() _ -> pure ()) ()
+      `shouldSatisfy` P.throws (P.eq (Session.SessionUnusable "the session is closed"))
+  readIORef closes `shouldReturn` 1
+
 checkGather :: Output -> ByteString -> IO ()
 checkGather output expected = do
   calls <- newIORef []
@@ -137,7 +174,8 @@ data TestLink = TestLink
     testFlush :: IO Bool,
     testReadable :: IO (),
     testWritable :: IO (),
-    testEither :: IO Readiness
+    testEither :: IO Readiness,
+    testClose :: IO ()
   }
 
 instance Link TestLink where
@@ -147,7 +185,7 @@ instance Link TestLink where
   awaitReadable = testReadable
   awaitWritable = testWritable
   awaitReadableOrWritable = testEither
-  closeLink _ = pure ()
+  closeLink = testClose
 
 testLink :: TestLink
 testLink =
@@ -158,6 +196,7 @@ testLink =
     (fail "unexpected read wait")
     (fail "unexpected write wait")
     (fail "unexpected combined wait")
+    (pure ())
 
 channelWith :: TestLink -> Output -> IO (Channel, IORef Unsent)
 channelWith link output = do
