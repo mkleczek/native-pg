@@ -1,5 +1,5 @@
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module BorrowingSpec (spec) where
@@ -14,7 +14,8 @@ import Data.Int (Int16, Int32)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import GHC.Conc (getAllocationCounter)
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Database.PostgreSQL.Internal.Buffer
+import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Buffer (bufferMemory, newBuffer)
 import Database.PostgreSQL.Internal.Protocol.Codec
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
@@ -26,13 +27,13 @@ spec :: Spec
 spec = describe "caller-owned input" $ do
   it "decodes scalar boundaries through one-byte fills and compaction" $ do
     forM_ [1, 4] $ \fragment -> do
-      storage <- newBuffer 4
+      storage <- newBuffer (positiveInt @4)
       source <- bytesSource fragment scalarBytes (const (pure ()))
       (values, _) <- runInput source (reusableInputBuffer storage) scalarValues
       values `shouldBe` scalarExpected
 
   it "forces scalar values before their reusable storage is overwritten" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     source <- bytesSource 4 scalarBytes (const (pure ()))
     (values, _) <- runInput source (reusableInputBuffer storage) scalarValues
     -- Do not inspect any result until every original byte has been overwritten.
@@ -41,7 +42,7 @@ spec = describe "caller-owned input" $ do
 
   it "rejects bounded scalars before reading outside their frame" $ do
     forM_ [False, True] $ \prefilled -> forM_ scalarParsers $ \(width, parse) -> do
-      storage <- newBuffer 4
+      storage <- newBuffer (positiveInt @4)
       calls <- newIORef (0 :: Int)
       source <- bytesSource 4 "abcdefgh" (\_ -> modifyIORef' calls (+ 1))
       let empty = reusableInputBuffer storage
@@ -56,7 +57,7 @@ spec = describe "caller-owned input" $ do
 
   it "rejects each truncated scalar without reading beyond the source" $ do
     forM_ scalarParsers $ \(width, parse) -> forM_ [0 .. width - 1] $ \available -> do
-      storage <- newBuffer 4
+      storage <- newBuffer (positiveInt @4)
       calls <- newIORef (0 :: Int)
       source <- bytesSource 1 (BS.replicate available 255) (\_ -> modifyIORef' calls (+ 1))
       result <- try @InputError (runInput source (reusableInputBuffer storage) parse)
@@ -64,7 +65,7 @@ spec = describe "caller-owned input" $ do
       readIORef calls `shouldReturn` available + 1
 
   it "does not allocate an owned ByteString for every reusable scalar" $ do
-    storage <- newBuffer 65536
+    storage <- newBuffer (positiveInt @65536)
     source <- bytesSource 65536 (BS.replicate 40000 1) (const (pure ()))
     -- Fill before measuring, so this isolates reads from an existing workspace.
     (_, filled) <- runInput source (reusableInputBuffer storage) (peekInputByteAt 0)
@@ -78,7 +79,7 @@ spec = describe "caller-owned input" $ do
       else failTest ("10000 buffered Word32 reads allocated " <> show allocated <> " bytes (limit 1600000)")
 
   it "compacts unread bytes in the same allocation" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     writes <- newIORef []
     source <- bytesSource 3 "abcdefghij" (\pointer -> withForeignPtr (bufferMemory storage) $ \base -> modifyIORef' writes (<> [pointer `minusPtr` base]))
     (values, _) <- runInput source (reusableInputBuffer storage) (sequence [readInputExactly 3, readInputExactly 3, readInputExactly 4])
@@ -87,7 +88,7 @@ spec = describe "caller-owned input" $ do
     all (\offset -> offset >= 0 && offset < 4) offsets `shouldBe` True
 
   it "rejects a contiguous request larger than storage before reading" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     readCalls <- newIORef (0 :: Int)
     source <- bytesSource 4 "abcde" (\_ -> modifyIORef' readCalls (+ 1))
     result <- inputResult (runInput source (reusableInputBuffer storage) (readInputExactly 5))
@@ -95,7 +96,7 @@ spec = describe "caller-owned input" $ do
     readIORef readCalls `shouldReturn` 0
 
   it "keeps returned exact, chunk and C-string values stable across reuse" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     source <- bytesSource 4 "abc\0defghijk" (const (pure ()))
     (values, _) <- runInput source (reusableInputBuffer storage) $ do
       string <- readInputCStringBytes
@@ -105,7 +106,7 @@ spec = describe "caller-owned input" $ do
     values `shouldBe` ["abc", "defg", "hijk"]
 
   it "borrows a chunk directly from the supplied storage" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     source <- bytesSource 4 "abcdefgh" (const (pure ()))
     chunks <- newIORef []
     let consume chunk = do
@@ -116,7 +117,7 @@ spec = describe "caller-owned input" $ do
     readIORef chunks `shouldReturn` [(0, "abcd"), (0, "efgh")]
 
   it "does not enter rollback handlers after reusable storage was refilled" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     calls <- newIORef (0 :: Int)
     source <- bytesSource 4 "abcdefgh" (\_ -> modifyIORef' calls (+ 1))
     let parser = catchError
@@ -134,7 +135,7 @@ spec = describe "caller-owned input" $ do
     inputResult (runInput source emptyInputBuffer parser) `shouldReturn` Right "recovered"
 
   it "assembles long C-string metadata into owned storage" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     let name = BS.replicate 100 120
     source <- bytesSource 4 (name <> "\0next") (const (pure ()))
     (values, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
@@ -144,7 +145,7 @@ spec = describe "caller-owned input" $ do
     values `shouldBe` [name, "next"]
 
   it "assembles bounded authentication metadata across supplied refills" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     let challenge = BS.replicate 100 99
     source <- bytesSource 4 (challenge <> "next") (const (pure ()))
     (values, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do

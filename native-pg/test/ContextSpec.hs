@@ -10,7 +10,6 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Maybe (isNothing)
 import Data.IORef
-import Database.PostgreSQL.Internal.Buffer
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Protocol (TransactionStatus (..))
 import qualified Database.PostgreSQL.Session as PG
@@ -20,14 +19,16 @@ import Foreign.ForeignPtr (withForeignPtr, plusForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
+import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Buffer (Buffer (..), newBuffer)
 import Skeletest hiding (context)
 import System.Timeout (timeout)
 
 spec :: Spec
 spec = describe "explicit operation contexts" $ do
   it "runs consecutive operations using only the current supplied workspaces" $ do
-    input <- newBuffer 16
-    output <- newBuffer 16
+    input <- newBuffer (positiveInt @16)
+    output <- newBuffer (positiveInt @16)
     remaining <- newIORef (reply <> reply)
     supplied <- newIORef True
     let receive pointer size = do
@@ -59,16 +60,16 @@ spec = describe "explicit operation contexts" $ do
 
   it "expires escaped contexts before the storage can be reused" $ do
     connection <- newConnection idleChannel 16
-    input <- newBuffer 16
-    output <- newBuffer 16
+    input <- newBuffer (positiveInt @16)
+    output <- newBuffer (positiveInt @16)
     context <- withContext connection input output pure
     failure <- try @ConnectionError (runContextOperation context (pure ()))
     failure `shouldBe` Left (SessionUnusable "the operation context has expired")
 
   it "rejects overlapping scopes without breaking the outer operation" $ do
     connection <- newConnection idleChannel 16
-    input <- newBuffer 16
-    output <- newBuffer 16
+    input <- newBuffer (positiveInt @16)
+    output <- newBuffer (positiveInt @16)
     withContext connection input output $ \_ -> do
       result <- try @ConnectionError (withContext connection input output (\_ -> pure ()))
       result `shouldBe` Left (SessionUnusable "the session is busy with another operation")
@@ -77,8 +78,8 @@ spec = describe "explicit operation contexts" $ do
 
   it "cancels and joins an unfinished child operation before returning storage" $ do
     connection <- newConnection idleChannel 16
-    input <- newBuffer 16
-    output <- newBuffer 16
+    input <- newBuffer (positiveInt @16)
+    output <- newBuffer (positiveInt @16)
     started <- newEmptyMVar
     stopped <- newEmptyMVar
     result <- timeout 1000000 $ withContext connection input output $ \context -> do
@@ -94,8 +95,8 @@ spec = describe "explicit operation contexts" $ do
 
   it "keeps storage loaned until a cancelled child's cleanup has finished" $ do
     connection <- newConnection idleChannel 16
-    input <- newBuffer 16
-    output <- newBuffer 16
+    input <- newBuffer (positiveInt @16)
+    output <- newBuffer (positiveInt @16)
     started <- newEmptyMVar
     cleaning <- newEmptyMVar
     allowCleanup <- newEmptyMVar
@@ -122,9 +123,9 @@ spec = describe "explicit operation contexts" $ do
 
   it "rejects identical and partially overlapping workspaces before callback entry" $ do
     connection <- newConnection idleChannel 16
-    arena <- newBuffer 32
-    input <- bufferFromInitializedMemory (bufferMemory arena) 16
-    overlap <- bufferFromInitializedMemory (plusForeignPtr (bufferMemory arena) 8) 16
+    arena <- newBuffer (positiveInt @32)
+    let input = Buffer (bufferMemory arena) 16
+        overlap = Buffer (plusForeignPtr (bufferMemory arena) 8) 16
     entered <- newIORef False
     let rejected output = do
           result <- try @ConnectionError (withContext connection input output (\_ -> writeIORef entered True))

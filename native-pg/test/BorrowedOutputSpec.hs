@@ -7,7 +7,8 @@ import Control.Exception (evaluate)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.IORef
-import Database.PostgreSQL.Internal.Buffer
+import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Buffer (bufferMemory, newBuffer)
 import Database.PostgreSQL.Internal.Protocol (Parameter (..))
 import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (MaybeBytes32Atom))
@@ -20,7 +21,7 @@ import Skeletest
 spec :: Spec
 spec = describe "borrowed parameter streams" $ do
   it "keeps a reused source buffer unchanged across partial writes" $ do
-      buffer <- newBuffer 32
+      buffer <- newBuffer (positiveInt @32)
       pulls <- newIORef (0 :: Int)
       received <- newIORef BS.empty
       let next = do

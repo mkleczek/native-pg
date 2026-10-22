@@ -10,7 +10,7 @@ import Data.IORef
 import Control.Monad (forM_)
 import qualified Database.PostgreSQL.Internal.Protocol.Codec as Output
 import Database.PostgreSQL.Internal.Context
-import Database.PostgreSQL.Internal.Buffer
+import Network.Streaming.Resources.Internal (bufferMemory, bufferCapacity, newBuffer)
 import Database.PostgreSQL.Internal.Protocol (Sync (..), SyncType (SyncType), Parse (..), ParseType (ParseType), Query (..), QueryType (QueryType), Execute (..), ExecuteType (ExecuteType))
 import Database.PostgreSQL.Internal.Protocol.Codec (serialize)
 import Database.PostgreSQL.Transport hiding (newChannel)
