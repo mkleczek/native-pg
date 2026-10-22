@@ -17,11 +17,29 @@ The design is in [docs/DESIGN.md](docs/DESIGN.md). The API isn't stable yet.
 
 Bounded integrations use an explicit opaque `Context`. Its input cursor,
 output workspace and pending writes belong to the operation; the persistent
-`Connection` retains transport and protocol state. The integration-only
-`Database.PostgreSQL.Internal.Context.withContext` binds two disjoint initialized
-buffers for its callback. `Buffer.bufferFromInitializedMemory` adapts storage
-already initialized by a shared pool without allocating, copying or clearing it.
-The existing owned `Session` API remains available.
+`Connection` retains transport and protocol state.
+`Database.PostgreSQL.Streaming.withOperation` borrows two initialized buffers
+from shared `Resources` for its callback. Integrations that already hold a pair
+use `Streaming.withBuffers`; it adapts the descriptors without allocating,
+copying or clearing their storage. The existing owned `Session` API remains
+available.
+
+Client code uses `ConnectionString`, `Session`, `Streaming`, `Statement`,
+`Encoders`, `Decoding`, `Diagnostics`, `Snippet`, `Pipeline` and `Transaction`.
+`Statement.Result`, `Session.Context` and `Session.Connection` are abstract;
+statement parameter types and preparation callbacks use ordinary `Word32` OIDs.
+`Encoders.Parameter` and `Streaming.ByteStream` provide streamed parameters.
+Public modules live directly under `src/Database/PostgreSQL`; protocol codecs,
+authentication machinery and mutable buffers live under its `Internal/`
+directory and are not exposed by the library. `Transport` is the extension API
+for TLS providers:
+implement `Link`, build an abstract `Channel` with `newChannel`, and return it
+from a `TlsClient`.
+
+Public modules contain the API implementations. Shared settings, connection
+string types, stream types and link definitions live in public submodules;
+the existing imports above remain supported. `Internal` contains protocol
+exchange, startup negotiation, host selection and opaque state representations.
 
 `columnChunks` and typed `streamChunks` consume borrowed chunks synchronously.
 `withColumnStream` exposes a length-bearing `ByteStream`: its next-pull action
@@ -63,6 +81,13 @@ the tests. Select a suite and optionally filter its test names:
 ```bash
 cabal test native-pg-spec --test-show-details=direct
 cabal test native-pg-integration --test-show-details=direct --test-option='[close]'
+```
+
+Check the installed client API, including rejected imports of private modules:
+
+```bash
+cabal build native-pg
+cabal exec -- sh native-pg/test/check-api-boundary.sh
 ```
 
 The integration tests start one temporary PostgreSQL cluster with the `initdb`
