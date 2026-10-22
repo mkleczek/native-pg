@@ -6,7 +6,7 @@ module Network.Streaming.Resources.Internal
   ) where
 
 import Control.Concurrent.STM
-  ( STM, TVar, atomically, newTVarIO, readTVar, writeTVar, retry )
+  ( STM, TVar, atomically, newTVarIO, readTVar, writeTVar, retry, throwSTM )
 import Control.Exception (bracket)
 import Control.Monad (replicateM)
 import Foreign.Marshal.Utils (fillBytes)
@@ -25,7 +25,7 @@ data Buffer = Buffer
   , bufferCapacity :: !Int
   }
 
-data Resources = Resources !(TVar [Buffer])
+data Resources = Resources !Int !(TVar [Buffer])
 data Lease = Lease !(TVar [Buffer]) [Buffer]
 
 withResources :: ResourceSettings -> (Resources -> IO a) -> IO a
@@ -39,18 +39,23 @@ withResources settings action
         withForeignPtr memory $ \pointer -> fillBytes pointer 0 blockBytes
         pure (Buffer memory blockBytes)
       free <- newTVarIO buffers
-      action (Resources free)
+      action (Resources (length buffers) free)
   where
     invalid = ioError . userError
 
 tryAcquire :: Resources -> PositiveInt -> STM (Maybe Lease)
-tryAcquire (Resources free) _ = do
-  buffers <- readTVar free
-  case buffers of
-    [] -> pure Nothing
-    buffer : remaining -> do
-      writeTVar free remaining
-      pure (Just (Lease free [buffer]))
+tryAcquire (Resources capacity free) requested
+  | count > capacity = throwSTM (userError "buffer count must fit capacity")
+  | otherwise = do
+      buffers <- readTVar free
+      let (selected, remaining) = splitAt count buffers
+      if length selected < count
+        then pure Nothing
+        else do
+          writeTVar free remaining
+          pure (Just (Lease free selected))
+  where
+    count = positiveIntValue requested
 
 tryAcquireSetup :: Resources -> PositiveInt -> STM (Maybe Lease)
 tryAcquireSetup = tryAcquire
