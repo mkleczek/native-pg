@@ -1,4 +1,5 @@
-packages: streaming-io
+packages: .
+          streaming-io
           native-pg
           native-pg-tls
 tests: true

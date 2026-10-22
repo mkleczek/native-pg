@@ -57,6 +57,13 @@ spec = describe "explicit operation contexts" $ do
     readIORef supplied `shouldReturn` True
     PG.isConnectionUsable connection `shouldReturn` True
 
+  xfail "completed owned operations must preserve a marked-broken connection" $ it "preserves a connection marked broken inside a completed owned operation" $ do
+    connection <- newConnection idleChannel 16
+    context <- newOwnedContext connection
+    runContextOperation context (breakConnection connection)
+    PG.isConnectionUsable connection `shouldReturn` False
+
+
   it "expires escaped contexts before the storage can be reused" $ do
     connection <- newConnection idleChannel 16
     input <- newBuffer 16
