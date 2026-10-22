@@ -16,7 +16,6 @@ module Database.PostgreSQL.Session
     Context,
     Connection,
     sessionFromContext,
-    sessionConnection,
     connectWithBuffers,
     closeConnection,
     isConnectionUsable,
