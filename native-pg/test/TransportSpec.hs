@@ -71,6 +71,23 @@ spec = describe "channels over a link without a socket" $ do
     timeout 1000000 (readBytes channel) `shouldReturn` Just "reply"
     readIORef sent `shouldReturn` syncBytes
 
+  xfail "operation-local pending output is not implemented" $ it "uses the current operation's pending output instead of the channel creator's" $ do
+    sent <- newIORef BS.empty
+    let link = testLink
+          { testReceive = \pointer size -> do
+              request <- readIORef sent
+              if request == syncBytes then provide "reply" pointer size else pure Nothing,
+            testSend = collect sent,
+            testEither = pure Writable
+          }
+    channel <- channelWith link mempty
+    current <- newIORef =<< unsent Nothing sync
+    timeout 1000000 (allocaBytes 16 $ \pointer -> do
+      count <- readInputInto (channelInputWith channel current 16) pointer 16
+      BS.packCStringLen (castPtr pointer, count)) `shouldReturn` Just "reply"
+    readIORef sent `shouldReturn` syncBytes
+    (unsentEmpty <$> readIORef current) `shouldReturn` True
+
   it "reads ready input even when output is still pending" $ do
     ready <- newIORef False
     let link = testLink
