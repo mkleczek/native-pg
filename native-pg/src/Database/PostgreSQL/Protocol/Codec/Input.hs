@@ -19,6 +19,7 @@ module Database.PostgreSQL.Protocol.Codec.Input
     detachInputBuffer,
     withInputSome,
     inputPosition,
+    peekInputMetadataByteAt,
     readInputSome,
     readInputWord8,
     readInputWord16,
@@ -81,16 +82,20 @@ data InputBuffer = InputBuffer
     bufferEnd :: {-# UNPACK #-} !Int,
     -- | How many bytes were consumed before 'bufferStart'.
     bufferPosition :: {-# UNPACK #-} !Int,
-    bufferReusable :: !Bool
+    bufferReusable :: !Bool,
+    -- | The supplied workspace while a protocol discriminator uses owned lookahead.
+    bufferHome :: !(Maybe HomeBuffer)
   }
+
+data HomeBuffer = HomeBuffer !(ForeignPtr Word8) !Int
 
 emptyInputBuffer :: InputBuffer
 emptyInputBuffer = case BS.empty of
-  BSI.BS memory _ -> InputBuffer memory 0 0 0 0 False
+  BSI.BS memory _ -> InputBuffer memory 0 0 0 0 False Nothing
 
 -- | Empty input backed by storage lent by the caller.
 reusableInputBuffer :: Buffer -> InputBuffer
-reusableInputBuffer storage = InputBuffer (Buffer.bufferMemory storage) (Buffer.bufferCapacity storage) 0 0 0 True
+reusableInputBuffer storage = InputBuffer (Buffer.bufferMemory storage) (Buffer.bufferCapacity storage) 0 0 0 True Nothing
 
 -- | Moves unread bytes into caller-owned input storage, preserving position.
 attachInputBuffer :: Buffer -> InputBuffer -> IO InputBuffer
@@ -111,12 +116,13 @@ detachInputBuffer buffer
   | otherwise = do
       bytes <- evaluate (BS.copy (slice (bufferEnd buffer - bufferStart buffer) buffer))
       let BSI.BS memory size = bytes
-      pure (InputBuffer memory size 0 size (bufferPosition buffer) False)
+      pure (InputBuffer memory size 0 size (bufferPosition buffer) False Nothing)
 
 -- | Borrows one chunk until the callback returns, then consumes it.
 -- The callback must not retain the bytes or read this input recursively.
 withInputSome :: Int -> (ByteString -> IO a) -> Input a
 withInputSome count use = do
+  restoreBorrowedWorkspace
   (size, buffer) <- someInput count
   result <- inputIO (use (slice size buffer))
   putBuffer (consume size buffer)
@@ -259,6 +265,7 @@ readInputSome count = do
 -- Callers must enforce exclusivity and the scope of the returned slice.
 readInputBorrowedSome :: Int -> Input ByteString
 readInputBorrowedSome count = do
+  restoreBorrowedWorkspace
   (size, buffer) <- someInput count
   putBuffer (consume size buffer)
   pure (slice size buffer)
@@ -300,6 +307,25 @@ readScalar count decode = do
   pure value
 {-# INLINE readScalar #-}
 
+-- Protocol constants, unlike body fields, can span a small supplied block.
+-- This helper is private to the codec implementation, not part of MonadInput.
+peekInputMetadataByteAt :: Int -> Input Word8
+peekInputMetadataByteAt offset = do
+  buffer <- ensureAvailableWith True (offset + 1)
+  inputIO $ unsafeWithForeignPtr (bufferMemory buffer) $ \pointer ->
+    peekByteOff pointer (bufferStart buffer + offset)
+{-# INLINE peekInputMetadataByteAt #-}
+
+restoreBorrowedWorkspace :: Input ()
+restoreBorrowedWorkspace = do
+  buffer <- getBuffer
+  case bufferHome buffer of
+    Nothing -> pure ()
+    Just (HomeBuffer _ capacity) -> do
+      when (bufferEnd buffer - bufferStart buffer > capacity) $
+        throwError "borrowed input cannot expose unconsumed protocol lookahead"
+      putBuffer =<< inputIO (restoreHome buffer)
+
 someInput :: Int -> Input (Int, InputBuffer)
 someInput count
   | count <= 0 = throwError "a streamed input request must be positive"
@@ -324,7 +350,7 @@ skipInput count
 runBodyParser :: ByteString -> Input a -> Either String (a, ByteString)
 runBodyParser (BSI.BS memory size) parser =
   unsafeDupablePerformIO $ do
-    result <- try (runInput endOfInput (InputBuffer memory size 0 size 0 False) parser)
+    result <- try (runInput endOfInput (InputBuffer memory size 0 size 0 False Nothing) parser)
     pure $ case result of
       Left (InputError message) -> Left message
       Right (a, buffer) -> Right (a, slice (bufferEnd buffer - bufferStart buffer) buffer)
@@ -353,15 +379,21 @@ unbounded = maxBound
 -- | Makes the given number of unconsumed bytes available, reading from the
 -- source as needed, and returns the buffer holding them.
 ensureAvailable :: Int -> Input InputBuffer
-ensureAvailable count = Input $ \env buffer s ->
+ensureAvailable = ensureAvailableWith False
+{-# INLINE ensureAvailable #-}
+
+ensureAvailableWith :: Bool -> Int -> Input InputBuffer
+ensureAvailableWith metadata count = Input $ \env buffer s ->
   if bufferPosition buffer + count > envLimit env
     then unInput (throwError ("unexpected end of a bounded part: needed " <> show count <> " bytes")) env buffer s
+    else if bufferReusable buffer && not metadata && count > suppliedCapacity buffer
+      then unInput (throwError ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (suppliedCapacity buffer))) env buffer s
     else
       if bufferEnd buffer - bufferStart buffer >= count
         then (# s, buffer, buffer #)
-        else case unIO (fill (envSource env) (refillEnd env buffer count) count buffer) s of
+        else case unIO (fill metadata (envSource env) (refillEnd env buffer count) count buffer) s of
           (# s', buffer' #) -> (# s', buffer', buffer' #)
-{-# INLINE ensureAvailable #-}
+{-# INLINE ensureAvailableWith #-}
 
 -- Exact envelope headers establish the bound; body refills can then batch
 -- without pulling bytes that would outlive the current operation.
@@ -375,10 +407,14 @@ refillEnd env buffer count
 -- | Reads until the given number of bytes is available. Reads go to the free
 -- part of the current allocation if the bytes fit there, and otherwise to a
 -- new initialized allocation. Caller-owned input compacts in place instead.
-fill :: InputSource -> Int -> Int -> InputBuffer -> IO InputBuffer
-fill source end count buffer
+fill :: Bool -> InputSource -> Int -> Int -> InputBuffer -> IO InputBuffer
+fill metadata source end count buffer
   | bufferReusable buffer && count > bufferCapacity buffer =
-      throwIO (InputError ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (bufferCapacity buffer)))
+      if metadata
+        then readUntilAvailable =<< expandMetadata count buffer
+        else throwIO (InputError ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (suppliedCapacity buffer)))
+  | Just (HomeBuffer _ capacity) <- bufferHome buffer,
+    count <= capacity = fill metadata source end count =<< restoreHome buffer
   | bufferStart buffer + count <= bufferCapacity buffer = readUntilAvailable buffer
   | bufferReusable buffer = readUntilAvailable =<< compact
   | otherwise = readUntilAvailable =<< reallocate
@@ -395,7 +431,7 @@ fill source end count buffer
       unsafeWithForeignPtr memory $ \target ->
         unsafeWithForeignPtr (bufferMemory buffer) $ \origin ->
           copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
-      pure (InputBuffer memory capacity 0 unconsumed (bufferPosition buffer) False)
+      pure (InputBuffer memory capacity 0 unconsumed (bufferPosition buffer) False Nothing)
     readUntilAvailable current
       | bufferEnd current - bufferStart current >= count = pure current
       | otherwise = do
@@ -407,6 +443,34 @@ fill source end count buffer
           when (received <= 0) (throwIO (InputError "unexpected end of input"))
           readUntilAvailable current {bufferEnd = bufferEnd current + received}
 {-# NOINLINE fill #-}
+
+suppliedCapacity :: InputBuffer -> Int
+suppliedCapacity buffer = case bufferHome buffer of
+  Nothing -> bufferCapacity buffer
+  Just (HomeBuffer _ capacity) -> capacity
+
+expandMetadata :: Int -> InputBuffer -> IO InputBuffer
+expandMetadata capacity buffer = do
+  storage <- Buffer.newBuffer capacity
+  let count = bufferEnd buffer - bufferStart buffer
+      home = case bufferHome buffer of
+        Nothing -> Just (HomeBuffer (bufferMemory buffer) (bufferCapacity buffer))
+        previous -> previous
+  withForeignPtr (Buffer.bufferMemory storage) $ \target ->
+    withForeignPtr (bufferMemory buffer) $ \origin ->
+      copyBytes target (origin `plusPtr` bufferStart buffer) count
+  pure (InputBuffer (Buffer.bufferMemory storage) capacity 0 count (bufferPosition buffer) True home)
+
+restoreHome :: InputBuffer -> IO InputBuffer
+restoreHome buffer = case bufferHome buffer of
+  Nothing -> pure buffer
+  Just (HomeBuffer memory capacity) -> do
+    let count = bufferEnd buffer - bufferStart buffer
+    when (count > capacity) (throwIO (InputError "protocol lookahead exceeds its supplied workspace"))
+    withForeignPtr memory $ \target ->
+      withForeignPtr (bufferMemory buffer) $ \origin ->
+        copyBytes target (origin `plusPtr` bufferStart buffer) count
+    pure (InputBuffer memory capacity 0 count (bufferPosition buffer) True Nothing)
 
 -- Metadata is owned independently from the operation arena. Unlike a field's
 -- contiguous materialization, it may span any number of bounded refills.

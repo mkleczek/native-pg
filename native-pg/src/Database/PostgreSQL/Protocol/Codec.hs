@@ -71,6 +71,7 @@ import Database.PostgreSQL.Protocol.Codec.Input
     detachInputBuffer,
     withInputSome,
     inputPosition,
+    peekInputMetadataByteAt,
     readInputSome,
     readInputWord8,
     readInputWord16,
@@ -560,13 +561,13 @@ instance PayloadPrefix ('PayloadChoice alternatives) where
 
 instance KnownChar value => PayloadPrefix ('PayloadConst 1 (value :: Char)) where
   matchPrefix offset mismatch _ continue = do
-    actual <- peekInputByteAt offset
+    actual <- peekInputMetadataByteAt offset
     if actual == charByte @value then continue (offset + 1) else mismatch
   {-# INLINE matchPrefix #-}
 
 instance KnownNat value => PayloadPrefix ('PayloadConst 1 (value :: Nat)) where
   matchPrefix offset mismatch _ continue = do
-    actual <- peekInputByteAt offset
+    actual <- peekInputMetadataByteAt offset
     if actual == natConstant @value then continue (offset + 1) else mismatch
   {-# INLINE matchPrefix #-}
 
@@ -611,17 +612,17 @@ expectConstant expected actual =
 
 peekBigEndianWord16At :: Int -> Input Word16
 peekBigEndianWord16At offset = do
-  low <- peekInputByteAt (offset + 1)
-  high <- peekInputByteAt offset
+  low <- peekInputMetadataByteAt (offset + 1)
+  high <- peekInputMetadataByteAt offset
   pure (shiftL (fromIntegral high) 8 .|. fromIntegral low)
 {-# INLINE peekBigEndianWord16At #-}
 
 peekBigEndianWord32At :: Int -> Input Word32
 peekBigEndianWord32At offset = do
-  byte3 <- peekInputByteAt (offset + 3)
-  byte0 <- peekInputByteAt offset
-  byte1 <- peekInputByteAt (offset + 1)
-  byte2 <- peekInputByteAt (offset + 2)
+  byte3 <- peekInputMetadataByteAt (offset + 3)
+  byte0 <- peekInputMetadataByteAt offset
+  byte1 <- peekInputMetadataByteAt (offset + 1)
+  byte2 <- peekInputMetadataByteAt (offset + 2)
   pure $
     shiftL (fromIntegral byte0) 24
       .|. shiftL (fromIntegral byte1) 16

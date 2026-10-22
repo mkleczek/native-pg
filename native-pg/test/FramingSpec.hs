@@ -65,7 +65,7 @@ spec = describe "protocol framing" $ do
     (length calls <= 28) `shouldBe` True
     maximum calls `shouldBe` 16
 
-  xfail "authentication selector lookahead still requires nine contiguous bytes" $ it "restores supplied storage after owned protocol selector lookahead" $ do
+  it "restores supplied storage after owned protocol selector lookahead" $ do
     storage <- newBuffer 4
     source <- bytesSource ("R\0\0\0\8\0\0\0\0" <> BS.replicate 32 120)
     inside <- newIORef True
