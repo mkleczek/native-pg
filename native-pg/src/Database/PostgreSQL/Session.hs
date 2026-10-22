@@ -967,6 +967,7 @@ streamsParameter :: Execution -> Bool
 streamsParameter = any streamed . executionParameters
   where
     streamed (Just (ParameterStream _)) = True
+    streamed (Just (ParameterBorrowedStream _)) = True
     streamed _ = False
 
 sync :: Output

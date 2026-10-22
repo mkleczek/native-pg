@@ -6,13 +6,14 @@ the two differ, this document wins.
 ## Goals
 
 - Replace hasql in PostgREST with a pure-Haskell PostgreSQL client.
-- **Bounded memory.** PostgREST must run in memory-constrained environments
-  without OOMs or allocation failures. The library reads only when the
-  client asks for data and holds at most one read buffer; anything allocated
-  beyond that is the client's choice.
-- Never materialize large values. A request body goes from the WAI request
-  into `Bind`; the response body column goes from the socket to the WAI
-  response.
+- **Bounded request storage.** Caller-owned buffer capacity and availability
+  control transport scratch space and request admission.
+  Streaming reads follow consumer demand, so a slow consumer applies
+  backpressure instead of accumulating the rest of the transfer.
+- Stream large values where their semantics permit it: a request body goes
+  from WAI into `Bind`, and a response column goes from PostgreSQL to WAI.
+  Features that require the full body remain supported, with owned storage
+  outside the reusable transport buffers.
 - Work as a streaming parser and serializer over a raw socket, keeping no
   state beyond what the protocol needs.
 - Usable from plain WAI with no special treatment. No WAI dependency, but the
@@ -22,11 +23,11 @@ the two differ, this document wins.
 
 The library does none of the following:
 
-- **Memory beyond the read buffer.** The library reads the socket only when
-  the client pulls the next message or chunk and the read buffer is empty. A
-  client that stops pulling stops the reads; TCP flow control then fills and
-  PostgreSQL waits in `send()`. Buffer pools, read-ahead and limits on what
-  the client keeps are built by the client on top of that.
+- **Application memory policy.** The library reads the socket only when the
+  client pulls the next message or chunk and the read buffer is empty. A
+  client that stops pulling stops the reads; TCP flow control then makes
+  PostgreSQL wait. The client owns buffer pools and the values, callbacks and
+  caches that it retains itself. There are no separate library memory quotas.
 - **Prepared statement caching.** The client names its statements and
   decides when to `Parse` and `Close` them. Only the client knows a good
   cache key: PostgREST, for example, can key on the request plan instead of
@@ -36,6 +37,23 @@ The library does none of the following:
   output as it waits for input, in the calling thread. Clients can use
   different connections concurrently. Direct users of transport links or
   channels must ensure exclusive access to each connection.
+
+Pipeline planning completes before `runBatch` sends anything. It retains the
+statement descriptions, parameters and result continuations for that pipeline;
+stream callbacks are not pulled during planning. Buffer capacity governs the
+subsequent transfer, but does not bound this retained plan. Incremental planning
+would require a separate protocol/transaction design, rather than a quota on
+the current API.
+
+The TLS adapter sets rustls's output buffer limit to 65536 bytes for every
+native connection, before its handshake. This bounds unsent application
+plaintext before handshake completion and unsent TLS records; it does not
+promise a 64 KiB total TLS allocation or cap inbound records, certificate and
+handshake state, or kernel socket buffers. `sendReady` can accept a prefix and
+then returns zero when the peer stops reading. The caller retains the remaining
+application output and retries after readiness; draining the peer resumes
+without losing or duplicating bytes. This existing fixed policy is sufficient
+for the outbound TLS staging dimension of bounded-memory streaming.
 
 ## State
 
@@ -148,12 +166,17 @@ function that takes the fields and serializes them. `PayloadBounded` writes
 its length, which counts its own four bytes, from the computed size before
 the content. So a field's bytes can be streamed whenever its length is known.
 
-Output is its length, how many of its bytes are copied, and a function that
-writes them. Composing outputs composes the functions, so a message's fields
-become one function, not a structure built at run time, and a batch is
-written in one pass into one buffer of the copied bytes' size. Client-supplied
-byte strings of 8 KiB or more aren't copied: they're sent from where they
-are, as parts of their own. A parameter can also be given in chunks, each
+Output records its length, how many bytes need copying, and a resumable writer.
+Composition joins writers directly, so adjacent fields can be written without
+building intermediate instruction nodes. The bounded sender and the contiguous
+serializer run the same writer. It stops when scratch space fills or a direct
+byte string or stream must be sent. Its continuation retains the remaining
+values, not the old scratch pointer, so sending can resume in different storage.
+Inspecting lengths or composing writers never pulls parameter sources. Arrays
+and chunk lists scan their sizes without retaining a serializer for each
+element; their writers are built as sending advances. Client-supplied byte strings of
+8 KiB or more aren't copied: they're sent from where they are, as parts of
+their own. A parameter can also be given in chunks, each
 sent so, without copying them into one first, or be a `ByteStream`. Its
 chunks are pulled from the client's source, after the declared length. A
 stream that gives a different number of bytes leaves the message incomplete,
@@ -447,10 +470,11 @@ WAI's continuation-passing `Application` type is for.
   mutating CTEs, are reported before the row. Commit-time failures (deferred
   constraints, serialization failures) arrive after it. So only read-only
   transactions stream. PostgREST buffers write responses until `COMMIT`
-  succeeds, as a list of chunks rather than one contiguous block, up to a
-  configured limit.
-- **Request bodies.** A body with `Content-Length` streams into `Bind`. A
-  chunked upload is buffered up to a configured limit, or rejected.
+  succeeds. These owned responses remain outside transport buffer accounting.
+- **Request bodies.** A raw body with `Content-Length` streams into `Bind`.
+  PostgreSQL requires a parameter length before its bytes, so an upload of
+  unknown length must be materialized first. Existing application body policy
+  still applies; buffer provisioning adds no separate limit.
 - **Respond inside the DB scope.** Handlers call `respond` inside the
   database scope instead of returning a `Response` after the transaction
   ends.
@@ -481,3 +505,48 @@ WAI's continuation-passing `Application` type is for.
    transaction status tracking. (Done; transaction status came with step 3.)
 5. Cancel and `LISTEN`/`NOTIFY`. (Done.)
 6. PostgREST integration: see `INTEGRATION.md`.
+
+### Bounded serialization
+
+`outputBufferFrom` lends initialized caller storage to a resumable serializer.
+It requires at least four bytes, enough for the largest indivisible protocol
+scalar. Copied fields fill that storage incrementally; a partial send keeps
+the current slice alive and unchanged before the next fill. The sender resumes
+with the remaining writer, without rebuilding the already emitted fields.
+After running out of space, it resumes in an empty buffer of at least four
+bytes; the replacement may have a different capacity. The contiguous serializer
+instead resumes after a direct part at its existing scratch offset.
+Existing immutable
+byte strings may be sent directly. This bounds serialization scratch space,
+not the caller-owned message values or pipeline metadata. The legacy allocating
+serializer remains available when no caller buffer is supplied.
+
+### Borrowed upload chunks
+
+`ParameterBorrowedStream` accepts a source whose current chunk remains valid
+until its next pull. The sender keeps a barrier after that chunk, so partial
+writes never trigger a pull that overwrites unsent bytes. It may still return
+pending output while reading PostgreSQL replies, avoiding a write-only wait
+that could deadlock a full-duplex exchange. The source and its storage loan
+must stay alive until the operation completes or its session is closed.
+Ordinary `ParameterStream` chunks retain their existing owned-value contract.
+
+### Values outside transport storage
+
+Contiguous parser values must fit the supplied input region. The parser never
+grows that region, and protocol frame boundaries still prevent reads crossing
+into the next message. Large streamed columns pass through repeated refills.
+A value that must be contiguous cannot make progress merely by waiting for the
+same undersized buffer; it fails and the caller must supply suitable storage.
+
+Owned metadata can contain many small fields copied across successive refills,
+so its aggregate size is independent of input capacity. Materialized `CopyData`
+also needs its entire body to fit; Session has no streamed COPY parser.
+
+Notifications received during a query are copied into a FIFO until
+`awaitNotification` can return them. Stopping socket reads at a queued
+notification could prevent the query itself from completing on the same stream.
+Buffer availability therefore cannot bound this queue under the existing API.
+A synchronous notification consumer or a dedicated notification connection
+would need a separate design if that queue must also apply backpressure.
+

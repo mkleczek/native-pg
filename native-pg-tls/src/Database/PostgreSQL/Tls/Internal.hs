@@ -220,8 +220,9 @@ newTlsConnection sock connection = ownTlsConnection sock connection (c_connectio
 
 ownTlsConnection :: Socket -> Ptr RustlsConnection -> IO () -> IO TlsConnection
 ownTlsConnection sock connection release = do
-  -- Records wait in the connection until the socket takes them, up to this
-  -- many bytes.
+  -- Bound pre-handshake unsent plaintext and unsent TLS records independently
+  -- of how much application output the caller offers. This is rustls's output
+  -- budget, not a cap on inbound records, handshake state or kernel buffers.
   c_connection_set_buffer_limit connection 65536
   TlsConnection sock <$> Foreign.newForeignPtr connection release
 

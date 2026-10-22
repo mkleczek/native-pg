@@ -90,6 +90,24 @@ spec = do
               sendAll server . pure =<< receiveExactly server (BS.length payload)
         fst <$> concurrently client echo `shouldReturn` payload
 
+    it "bounds retained output when the peer stops reading and resumes without loss" $
+      withServer "server" $ \sock server -> do
+        Socket.setSocketOption sock Socket.SendBuffer 4096
+        config <- newTlsConfig (settings (VerifyFull (RootCertificateFile (certificate "ca.crt")))) "localhost"
+        (client, ()) <- concurrently (startTls config sock) (handshake server)
+        let payload = BS.replicate 1048576 42
+        first <- sendReady client [payload]
+        -- The first encrypt pass must stop at the rustls budget before the
+        -- blocked socket can push the remainder back into the caller.
+        (first > 0 && first <= 65536) `shouldBe` True
+        (accepted, stalled) <- fillUntilStalled client payload 16 first
+        (accepted <= 131072, stalled) `shouldBe` (True, True)
+        snd <$> concurrently (sendAll client []) (receiveExactly server accepted)
+          `shouldReturn` BS.take accepted payload
+        snd <$> concurrently (sendAll client [BS.drop accepted payload]) (receiveExactly server (BS.length payload - accepted))
+          `shouldReturn` BS.drop accepted payload
+        closeLink client
+
     it "keeps the server name alive for tickets after setup returns" $
       withServer "server" $ \sock server -> do
         -- Only the returned connection remains live during subsequent I/O.
@@ -136,6 +154,16 @@ reclaimTemporaryBuffers :: IO ()
 reclaimTemporaryBuffers = replicateM_ 4 $ do
   performMajorGC
   replicateM_ 1024 (allocaBytes 1024 $ \buffer -> fillBytes buffer 120 1024)
+
+-- A finite retry budget keeps a broken no-progress implementation from
+-- hanging the suite while the peer deliberately withholds reads.
+fillUntilStalled :: TlsConnection -> ByteString -> Int -> Int -> IO (Int, Bool)
+fillUntilStalled _ _ 0 accepted = pure (accepted, False)
+fillUntilStalled tls payload retries accepted = do
+  taken <- sendReady tls [BS.drop accepted payload]
+  if taken == 0
+    then pure (accepted, True)
+    else fillUntilStalled tls payload (retries - 1) (accepted + taken)
 
 -- | Sends the pieces, waiting for room in the socket as needed.
 sendAll :: TlsConnection -> [ByteString] -> IO ()
