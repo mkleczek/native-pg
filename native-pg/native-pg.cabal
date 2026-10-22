@@ -59,6 +59,7 @@ common implementation
                     , scientific        >= 0.3 && < 0.4
                     , text              >= 1.2.2 && < 2.2
                     , time              >= 1.9 && < 2
+                    , unliftio-core     >= 0.2 && < 0.3
                     , uuid              >= 1.3 && < 2
 
   if !os(windows)
@@ -80,6 +81,7 @@ library
                       Database.PostgreSQL.Streaming
                       Database.PostgreSQL.Streaming.Types
                       Database.PostgreSQL.Transaction
+                      Database.PostgreSQL.Transaction.Pull
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Transport.Link
                       Database.PostgreSQL.Types
@@ -101,6 +103,7 @@ test-suite native-pg-spec
                       Database.PostgreSQL.Streaming
                       Database.PostgreSQL.Streaming.Types
                       Database.PostgreSQL.Transaction
+                      Database.PostgreSQL.Transaction.Pull
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Transport.Link
                       Database.PostgreSQL.Types
@@ -111,6 +114,7 @@ test-suite native-pg-spec
                       FramingSpec
                       StreamingResourcesSpec
                       FieldStreamSpec
+                      TransactionSpec
                       OutputBufferSpec
                       TransportSpec
   main-is:            Main.hs

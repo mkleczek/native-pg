@@ -8,6 +8,7 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (IOException, SomeException, bracket, finally, try)
 import Control.Monad (void)
 import Data.Maybe (isNothing)
+import Data.Tuple (Solo)
 import qualified Database.PostgreSQL.Internal.Context as Context
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Streaming as PG
@@ -26,7 +27,7 @@ spec = describe "shared operation resources" $ do
       connection <- Context.newConnection idleChannel 16
       PG.withOperation resources connection $ \_ -> do
         unavailable resources `shouldReturn` True
-        Resources.withSetupBuffers resources (positiveInt @2) (\_ -> pure ())
+        Resources.withSetupBuffers @(Resources.Buffer, Resources.Buffer) resources (\_ -> pure ())
       unavailable resources `shouldReturn` False
       PG.isConnectionUsable connection `shouldReturn` True
 
@@ -39,7 +40,7 @@ spec = describe "shared operation resources" $ do
       PG.isConnectionUsable connection `shouldReturn` False
 
   it "does not consume a partial pair while waiting or after cancellation" $ do
-    withResources settings $ \resources -> Resources.withBuffers resources (positiveInt @1) $ \_ -> do
+    withResources settings $ \resources -> Resources.withBuffers @(Solo Resources.Buffer) resources $ \_ -> do
       connection <- Context.newConnection idleChannel 16
       entered <- newEmptyMVar
       stopped <- newEmptyMVar
@@ -50,7 +51,7 @@ spec = describe "shared operation resources" $ do
           timeout 20000 (readMVar entered) `shouldReturn` Nothing
           timeout 20000 (readMVar stopped) `shouldReturn` Nothing
           -- The other block remains available until the whole pair is free.
-          Resources.withBuffers resources (positiveInt @1) (\_ -> pure ()))
+          Resources.withBuffers @(Solo Resources.Buffer) resources (\_ -> pure ()))
       PG.isConnectionUsable connection `shouldReturn` True
 
 settings :: ResourceSettings
@@ -58,7 +59,7 @@ settings = ResourceSettings (positiveInt @32) (positiveInt @32) (positiveInt @16
 
 unavailable :: Resources -> IO Bool
 unavailable resources = atomically $ do
-  lease <- Resources.tryAcquire resources (positiveInt @1)
+  lease <- Resources.tryAcquire @(Solo Resources.Buffer) resources
   mapM_ Resources.release lease
   pure (isNothing lease)
 
