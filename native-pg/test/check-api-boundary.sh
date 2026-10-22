@@ -15,10 +15,11 @@ fi
 
 check() {
   "$compiler" -v0 -fno-code -fforce-recomp -XGHC2021 -hide-all-packages \
-    -package base -package bytestring -package native-pg -outputdir "$output_dir" "$1"
+    -package base -package bytestring -package streaming-io -package native-pg -outputdir "$output_dir" "$1"
 }
 
 check "$package_dir/test/api-boundary/Client.hs"
+
 
 reject_module() {
   printf 'module Hidden where\nimport %s\n' "$1" >"$output_dir/Hidden.hs"
@@ -32,10 +33,17 @@ reject_module() {
   fi
 }
 
+reject_module Database.PostgreSQL.Transaction.Pull
+reject_module Database.PostgreSQL.Pipeline
+reject_module Database.PostgreSQL.Statement
+reject_module Network.Streaming.Resources.Internal
+reject_module Network.Streaming.Internal.ListPrefix
+
 for private_module in \
   Authentication Buffer Internal.Context Internal.Session Internal.Transport \
   Internal.ConnectionString Internal.Statement Internal.Diagnostics Internal.Some \
   Internal.Channel Internal.Exchange Internal.HostSelection Internal.Result \
+  Internal.Execution Internal.Row \
   Internal.Socket Internal.Socket.Link Internal.Startup \
   Protocol Protocol.Codec Protocol.Codec.Input Protocol.Codec.Output \
   Protocol.Codec.Payload Protocol.Messages Protocol.Messages.AuthBackend \
@@ -55,7 +63,45 @@ for private_symbol in \
   'Transport (OutputBuffer)' \
   'Transport (connectSocket)' \
   'Diagnostics (diagnostics)' \
-  'Statement (Result(Result))'; do
+  'Session (Context)' \
+  'Session (sessionFromContext)' \
+  'Session (closeConnection)' \
+  'Session (isConnectionUsable)' \
+  'Transaction (withTransaction)' \
+  'Transaction (withTransactionWith)' \
+  'Transaction (transactionNoRetryIn)' \
+  'Transaction (transactionNoRetryWithIn)' \
+  'Session (connect)' \
+  'Session (ConnectSettings)' \
+  'Session (ConnectionError)' \
+  'Session (ProtocolVersion)' \
+  'Session (Phase)' \
+  'Session (Ready)' \
+  'Session (Execution)' \
+  'Session (Statement)' \
+  'Session (Batch)' \
+  'Session (prepare)' \
+  'Session (execute)' \
+  'Session (batched)' \
+  'Session (runBatch)' \
+  'Session (awaitNotification)' \
+  'Session (executeWithContext)' \
+  'Session (Row)' \
+  'Session (Column)' \
+  'Session (DecodeRow)' \
+  'Session (columnBytes)' \
+  'Session (columnChunks)' \
+  'Session (withColumnStream)' \
+  'Session (decodeRow)' \
+  'Session (nextColumn)' \
+  'Session (backendProcessId)' \
+  'Transaction (Transaction(Transaction))' \
+  'Transaction (Pipeline(Pipeline))' \
+  'Transaction (Result(Result))' \
+  'Transaction (Field(Field))' \
+  'Transaction (RowDecoder(RowDecoder))' \
+  'Transaction (Runtime)' \
+  'Transaction (ApplicationFailure)'; do
   printf 'module Hidden where\nimport Database.PostgreSQL.%s\n' "$private_symbol" >"$output_dir/Hidden.hs"
   if check "$output_dir/Hidden.hs" >"$output_dir/error.log" 2>&1; then
     echo "Unexpected public implementation detail: $private_symbol" >&2

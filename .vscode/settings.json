@@ -1,0 +1,5 @@
+{
+    "haskell.serverExecutablePath": "${workspaceFolder}/.vscode/hls",
+    "nixEnvSelector.nixFile": "${workspaceFolder}/.vscode/shell.nix",
+    "nixEnvSelector.useFlakes": false
+}

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep GHCup HLS and GHC together even when an editor selector injected Nix GHC.
+export PATH="$HOME/.ghcup/bin:/usr/bin:/bin:$PATH:$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin"
+unset GHC_PACKAGE_PATH GHC_ENVIRONMENT NIX_GHC NIX_GHCPKG NIX_GHC_LIBDIR NIX_GHC_DOCDIR
+# Inherited Nix SDK settings also interfere with GHCup's system C compiler.
+unset SDKROOT DEVELOPER_DIR
+hls_executable=$(command -v haskell-language-server-wrapper) || {
+  echo 'Install HLS with GHCup before opening this project.' >&2
+  exit 1
+}
+project_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_root"
+
+# Editor environment selectors can retain a deleted nix-shell temporary directory.
+export TMPDIR=/tmp
+# Cabal supplies build tools such as skeletest-preprocessor on PATH; HLS still
+# needs its cradle to choose packages rather than Cabal's exec environment file.
+# nix-shell takes a shell command, so preserve HLS arguments as literal words.
+printf -v hls_command '%q ' cabal exec -v0 -- env -u GHC_ENVIRONMENT "TMPDIR=$TMPDIR" "$hls_executable" "$@"
+exec nix-shell "$project_root/.vscode/shell.nix" --run "exec $hls_command"
