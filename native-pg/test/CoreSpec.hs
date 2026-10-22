@@ -37,125 +37,127 @@ import qualified Skeletest.Predicate as P
 spec :: Spec
 spec = do
   describe "frontend messages" $ do
+    it "infers startup negotiation framing from message constructors" $ do
+      outputByteString (serialize SSLRequest) `shouldBe` (int32 8 <> int32 80877103)
+      outputByteString (serialize GSSENCRequest) `shouldBe` (int32 8 <> int32 80877104)
     it "encodes Sync" $
-      encodes @Sync @'SyncType Sync "S\0\0\0\4"
+      encodes @Sync Sync "S\0\0\0\4"
     it "encodes Query" $
-      encodes @(Query ByteString) @'QueryType (Query "SELECT 1") ("Q" <> int32 13 <> "SELECT 1\0")
+      encodes @(Query ByteString) (Query "SELECT 1") ("Q" <> int32 13 <> "SELECT 1\0")
     it "encodes Parse with an unspecified parameter type" $
       encodes
         @(Parse ByteString)
-        @'ParseType
         (Parse "" "SELECT $1" [Nothing])
         ("P" <> int32 21 <> "\0SELECT $1\0" <> int16 1 <> int32 0)
     it "encodes Bind with a NULL parameter" $
       encodes
         @(Bind ByteString)
-        @'BindType
         (Bind (BindBody "" "statement" [BinaryFormat] [Just "1", Nothing] [TextFormat]))
         ("B" <> int32 34 <> "\0statement\0" <> int16 1 <> int16 1 <> int16 2 <> int32 1 <> "1" <> int32 (-1) <> int16 1 <> int16 0)
     it "encodes Bind with a parameter in chunks, short and long, as one value" $
       let long = BS.replicate 10000 (byte 'x')
        in encodes
             @(Bind Parameter)
-            @'BindType
             (Bind (BindBody "" "s" [BinaryFormat] [Just (ParameterChunks ["ab", long, "", "cd"])] [TextFormat]))
             ("B" <> int32 10025 <> "\0s\0" <> int16 1 <> int16 1 <> int16 1 <> int32 10004 <> "ab" <> long <> "cd" <> int16 1 <> int16 0)
     it "encodes Execute" $
-      encodes @(Execute ByteString) @'ExecuteType (Execute "" 0) ("E" <> int32 9 <> "\0" <> int32 0)
+      encodes @(Execute ByteString) (Execute "" 0) ("E" <> int32 9 <> "\0" <> int32 0)
     it "encodes Describe of a portal" $
-      encodes @(Describe ByteString) @'DescribeType (Describe Portal "") ("D" <> int32 6 <> "P\0")
+      encodes @(Describe ByteString) (Describe Portal "") ("D" <> int32 6 <> "P\0")
     it "encodes a StartupMessage, whose length counts itself" $
-      encodes @(StartupMessage ByteString) @'StartupMessageType startupMessage startupMessageBytes
+      encodes @(StartupMessage ByteString) startupMessage startupMessageBytes
     it "encodes a CancelRequest" $
-      encodes @(CancelRequest ByteString) @'CancelRequestType cancelRequest cancelRequestBytes
+      encodes @(CancelRequest ByteString) cancelRequest cancelRequestBytes
     it "rejects a zero byte inside a C string" $
-      evaluate (outputByteString (serialize @(Query ByteString) @'QueryType (Query "a\0b")))
+      evaluate (outputByteString (serialize (Query "a\0b" :: Query ByteString)))
         `shouldSatisfy` P.throws (P.anything @ErrorCall)
     it "round-trips every frontend message" $ do
-      roundTrip @(StartupMessage ByteString) @'StartupMessageType startupMessage
-      roundTrip @SSLRequest @'SSLRequestType SSLRequest
-      roundTrip @GSSENCRequest @'GSSENCRequestType GSSENCRequest
-      roundTrip @(CancelRequest ByteString) @'CancelRequestType cancelRequest
-      roundTrip @(PasswordMessage ByteString) @'PasswordMessageType (PasswordMessage "secret")
-      roundTrip @(GSSResponse ByteString) @'GSSResponseType (GSSResponse "token")
-      roundTrip @(SASLInitialResponse ByteString) @'SASLInitialResponseType (SASLInitialResponse "SCRAM-SHA-256" (Just "n,,n=,r=nonce"))
-      roundTrip @(SASLInitialResponse ByteString) @'SASLInitialResponseType (SASLInitialResponse "SCRAM-SHA-256" Nothing)
-      roundTrip @(SASLResponse ByteString) @'SASLResponseType (SASLResponse "c=biws,r=nonce,p=proof")
-      roundTrip @(Bind ByteString) @'BindType (Bind (BindBody "portal" "statement" [TextFormat, BinaryFormat] [Just "", Nothing] []))
-      roundTrip @(Close ByteString) @'CloseType (Close PreparedStatement "statement")
-      roundTrip @(Describe ByteString) @'DescribeType (Describe PreparedStatement "statement")
-      roundTrip @(Execute ByteString) @'ExecuteType (Execute "portal" 100)
-      roundTrip @Flush @'FlushType Flush
-      roundTrip @(FunctionCall ByteString) @'FunctionCallType (FunctionCall (Scalar 1) [BinaryFormat] [Just "x"] TextFormat)
-      roundTrip @(Parse ByteString) @'ParseType (Parse "statement" "SELECT $1, $2" [Just (Scalar 23), Nothing])
-      roundTrip @(Query ByteString) @'QueryType (Query "SELECT 1")
-      roundTrip @Sync @'SyncType Sync
-      roundTrip @Terminate @'TerminateType Terminate
-      roundTrip @(CopyData ByteString) @'CopyDataType (CopyData "1\t2\n")
-      roundTrip @CopyDone @'CopyDoneType CopyDone
-      roundTrip @(CopyFail ByteString) @'CopyFailType (CopyFail "client gave up")
+      roundTrip @(StartupMessage ByteString) startupMessage
+      roundTrip @SSLRequest SSLRequest
+      roundTrip @GSSENCRequest GSSENCRequest
+      roundTrip @(CancelRequest ByteString) cancelRequest
+      roundTrip @(PasswordMessage ByteString) (PasswordMessage "secret")
+      roundTrip @(GSSResponse ByteString) (GSSResponse "token")
+      roundTrip @(SASLInitialResponse ByteString) (SASLInitialResponse "SCRAM-SHA-256" (Just "n,,n=,r=nonce"))
+      roundTrip @(SASLInitialResponse ByteString) (SASLInitialResponse "SCRAM-SHA-256" Nothing)
+      roundTrip @(SASLResponse ByteString) (SASLResponse "c=biws,r=nonce,p=proof")
+      roundTrip @(Bind ByteString) (Bind (BindBody "portal" "statement" [TextFormat, BinaryFormat] [Just "", Nothing] []))
+      roundTrip @(Close ByteString) (Close PreparedStatement "statement")
+      roundTrip @(Describe ByteString) (Describe PreparedStatement "statement")
+      roundTrip @(Execute ByteString) (Execute "portal" 100)
+      roundTrip @Flush Flush
+      roundTrip @(FunctionCall ByteString) (FunctionCall (Scalar 1) [BinaryFormat] [Just "x"] TextFormat)
+      roundTrip @(Parse ByteString) (Parse "statement" "SELECT $1, $2" [Just (Scalar 23), Nothing])
+      roundTrip @(Query ByteString) (Query "SELECT 1")
+      roundTrip @Sync Sync
+      roundTrip @Terminate Terminate
+      roundTrip @(CopyData ByteString) (CopyData "1\t2\n")
+      roundTrip @CopyDone CopyDone
+      roundTrip @(CopyFail ByteString) (CopyFail "client gave up")
+
+  describe "primitive field schemas" $
+    it "keeps schema selection explicit for the same byte value" $ do
+      outputByteString (serializeField @ByteString @'CStringAtom "value") `shouldBe` "value\0"
+      outputByteString (serializeField @ByteString @'RemainingBytesAtom "value") `shouldBe` "value"
 
   describe "backend messages" $ do
     it "decodes AuthenticationOk" $
-      decodes @AuthenticationOk @'AuthenticationOkType ("R" <> int32 8 <> int32 0) AuthenticationOk
+      decodes @AuthenticationOk ("R" <> int32 8 <> int32 0) AuthenticationOk
     it "decodes AuthenticationSASL" $
       decodes
         @(AuthenticationSASL ByteString)
-        @'AuthenticationSASLType
         ("R" <> int32 42 <> int32 10 <> "SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0")
         (AuthenticationSASL ["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"])
     it "decodes BackendKeyData with a protocol 3.2 secret key" $
       decodes
         @(BackendKeyData ByteString)
-        @'BackendKeyDataType
         ("K" <> int32 40 <> int32 42 <> BS.replicate 32 7)
         (BackendKeyData (Scalar (Scalar 42, Scalar (BS.replicate 32 7))))
     it "decodes NegotiateProtocolVersion" $
       decodes
         @(NegotiateProtocolVersion ByteString)
-        @'NegotiateProtocolVersionType
         ("v" <> int32 24 <> int32 196608 <> int32 1 <> "_pq_.option\0")
         (NegotiateProtocolVersion protocolVersion3_0 ["_pq_.option"])
     it "decodes ReadyForQuery" $
-      decodes @ReadyForQuery @'ReadyForQueryType ("Z" <> int32 5 <> "T") (ReadyForQuery TxInTransaction)
+      decodes @ReadyForQuery ("Z" <> int32 5 <> "T") (ReadyForQuery TxInTransaction)
     it "rejects an unknown transaction status" $
-      parseEnvelope @ReadyForQuery @'ReadyForQueryType ("Z" <> int32 5 <> "X")
+      parseMessage @ReadyForQuery ("Z" <> int32 5 <> "X")
         `shouldSatisfy` P.left P.anything
     it "rejects a message whose fields don't fill its length" $
-      parseEnvelope @(CommandComplete ByteString) @'CommandCompleteType ("C" <> int32 12 <> "SELECT\0x")
+      parseMessage @(CommandComplete ByteString) ("C" <> int32 12 <> "SELECT\0x")
         `shouldSatisfy` P.left P.anything
     it "round-trips every backend message" $ do
-      roundTrip @AuthenticationOk @'AuthenticationOkType AuthenticationOk
-      roundTrip @AuthenticationKerberosV5 @'AuthenticationKerberosV5Type AuthenticationKerberosV5
-      roundTrip @AuthenticationCleartextPassword @'AuthenticationCleartextPasswordType AuthenticationCleartextPassword
-      roundTrip @(AuthenticationMD5Password ByteString) @'AuthenticationMD5PasswordType (AuthenticationMD5Password "salt")
-      roundTrip @AuthenticationGSS @'AuthenticationGSSType AuthenticationGSS
-      roundTrip @(AuthenticationGSSContinue ByteString) @'AuthenticationGSSContinueType (AuthenticationGSSContinue "token")
-      roundTrip @AuthenticationSSPI @'AuthenticationSSPIType AuthenticationSSPI
-      roundTrip @(AuthenticationSASL ByteString) @'AuthenticationSASLType (AuthenticationSASL ["SCRAM-SHA-256"])
-      roundTrip @(AuthenticationSASLContinue ByteString) @'AuthenticationSASLContinueType (AuthenticationSASLContinue "r=nonce,s=salt,i=4096")
-      roundTrip @(AuthenticationSASLFinal ByteString) @'AuthenticationSASLFinalType (AuthenticationSASLFinal "v=signature")
-      roundTrip @(BackendKeyData ByteString) @'BackendKeyDataType (BackendKeyData (Scalar (Scalar 7, Scalar "key!")))
-      roundTrip @BindComplete @'BindCompleteType BindComplete
-      roundTrip @CloseComplete @'CloseCompleteType CloseComplete
-      roundTrip @(CommandComplete ByteString) @'CommandCompleteType (CommandComplete "SELECT 1")
-      roundTrip @CopyInResponse @'CopyInResponseType (CopyInResponse (Scalar (CopyText, [TextFormat])))
-      roundTrip @CopyOutResponse @'CopyOutResponseType (CopyOutResponse (Scalar (CopyBinary, [BinaryFormat, BinaryFormat])))
-      roundTrip @CopyBothResponse @'CopyBothResponseType (CopyBothResponse (Scalar (CopyBinary, [])))
-      roundTrip @(DataRow ByteString) @'DataRowType (DataRow [Just "1", Nothing, Just ""])
-      roundTrip @EmptyQueryResponse @'EmptyQueryResponseType EmptyQueryResponse
-      roundTrip @(ErrorResponse ByteString) @'ErrorResponseType (ErrorResponse errorFields)
-      roundTrip @(FunctionCallResponse ByteString) @'FunctionCallResponseType (FunctionCallResponse Nothing)
-      roundTrip @(NegotiateProtocolVersion ByteString) @'NegotiateProtocolVersionType (NegotiateProtocolVersion protocolVersion3_0 [])
-      roundTrip @NoData @'NoDataType NoData
-      roundTrip @(NoticeResponse ByteString) @'NoticeResponseType (NoticeResponse errorFields)
-      roundTrip @(NotificationResponse ByteString) @'NotificationResponseType (NotificationResponse (Notification (Scalar 9) "channel" "payload"))
-      roundTrip @ParameterDescription @'ParameterDescriptionType (ParameterDescription [Scalar 23, Scalar 114])
-      roundTrip @(ParameterStatus ByteString) @'ParameterStatusType (ParameterStatus (Scalar ("server_version", "18.0")))
-      roundTrip @ParseComplete @'ParseCompleteType ParseComplete
-      roundTrip @PortalSuspended @'PortalSuspendedType PortalSuspended
-      roundTrip @ReadyForQuery @'ReadyForQueryType (ReadyForQuery TxFailedTransaction)
-      roundTrip @(RowDescription ByteString) @'RowDescriptionType (RowDescription [rowField, rowField {rowFieldTableOid = Nothing, rowFieldColumnAttributeNumber = Nothing}])
+      roundTrip @AuthenticationOk AuthenticationOk
+      roundTrip @AuthenticationKerberosV5 AuthenticationKerberosV5
+      roundTrip @AuthenticationCleartextPassword AuthenticationCleartextPassword
+      roundTrip @(AuthenticationMD5Password ByteString) (AuthenticationMD5Password "salt")
+      roundTrip @AuthenticationGSS AuthenticationGSS
+      roundTrip @(AuthenticationGSSContinue ByteString) (AuthenticationGSSContinue "token")
+      roundTrip @AuthenticationSSPI AuthenticationSSPI
+      roundTrip @(AuthenticationSASL ByteString) (AuthenticationSASL ["SCRAM-SHA-256"])
+      roundTrip @(AuthenticationSASLContinue ByteString) (AuthenticationSASLContinue "r=nonce,s=salt,i=4096")
+      roundTrip @(AuthenticationSASLFinal ByteString) (AuthenticationSASLFinal "v=signature")
+      roundTrip @(BackendKeyData ByteString) (BackendKeyData (Scalar (Scalar 7, Scalar "key!")))
+      roundTrip @BindComplete BindComplete
+      roundTrip @CloseComplete CloseComplete
+      roundTrip @(CommandComplete ByteString) (CommandComplete "SELECT 1")
+      roundTrip @CopyInResponse (CopyInResponse (Scalar (CopyText, [TextFormat])))
+      roundTrip @CopyOutResponse (CopyOutResponse (Scalar (CopyBinary, [BinaryFormat, BinaryFormat])))
+      roundTrip @CopyBothResponse (CopyBothResponse (Scalar (CopyBinary, [])))
+      roundTrip @(DataRow ByteString) (DataRow [Just "1", Nothing, Just ""])
+      roundTrip @EmptyQueryResponse EmptyQueryResponse
+      roundTrip @(ErrorResponse ByteString) (ErrorResponse errorFields)
+      roundTrip @(FunctionCallResponse ByteString) (FunctionCallResponse Nothing)
+      roundTrip @(NegotiateProtocolVersion ByteString) (NegotiateProtocolVersion protocolVersion3_0 [])
+      roundTrip @NoData NoData
+      roundTrip @(NoticeResponse ByteString) (NoticeResponse errorFields)
+      roundTrip @(NotificationResponse ByteString) (NotificationResponse (Notification (Scalar 9) "channel" "payload"))
+      roundTrip @ParameterDescription (ParameterDescription [Scalar 23, Scalar 114])
+      roundTrip @(ParameterStatus ByteString) (ParameterStatus (Scalar ("server_version", "18.0")))
+      roundTrip @ParseComplete ParseComplete
+      roundTrip @PortalSuspended PortalSuspended
+      roundTrip @ReadyForQuery (ReadyForQuery TxFailedTransaction)
+      roundTrip @(RowDescription ByteString) (RowDescription [rowField, rowField {rowFieldTableOid = Nothing, rowFieldColumnAttributeNumber = Nothing}])
 
   describe "choice" $ do
     it "dispatches on the message tag" $
@@ -461,10 +463,10 @@ rfc7677ServerFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22
 conversation :: ByteString
 conversation =
   BS.concat
-    [ outputByteString (serialize @ParseComplete @'ParseCompleteType ParseComplete),
-      outputByteString (serialize @(DataRow ByteString) @'DataRowType (DataRow [Just "42", Nothing, Just "a longer value"])),
-      outputByteString (serialize @(CommandComplete ByteString) @'CommandCompleteType (CommandComplete "SELECT 1")),
-      outputByteString (serialize @ReadyForQuery @'ReadyForQueryType (ReadyForQuery TxIdle))
+    [ outputByteString (serialize ParseComplete),
+      outputByteString (serialize (DataRow [Just "42", Nothing, Just "a longer value"] :: DataRow ByteString)),
+      outputByteString (serialize (CommandComplete "SELECT 1" :: CommandComplete ByteString)),
+      outputByteString (serialize (ReadyForQuery TxIdle))
     ]
 
 type QueryReplies =
@@ -532,14 +534,14 @@ dispatch input = do
         :|: (\(ReadyForQuery status) -> "ReadyForQuery " <> show status)
         :|: NoAlternatives
 
-encodes :: forall a s. Serializable a s => a -> ByteString -> IO ()
-encodes message expected = outputByteString (serialize @a @s message) `shouldBe` expected
+encodes :: forall message a s. (message ~ Envelope a s, Serializable message s) => message -> ByteString -> IO ()
+encodes message expected = outputByteString (serialize message) `shouldBe` expected
 
-decodes :: forall a s. (Parsable a s, Eq a, Show a) => ByteString -> a -> IO ()
-decodes input expected = parseEnvelope @a @s input `shouldBe` Right (Envelope expected)
+decodes :: forall message a s. (message ~ Envelope a s, Parsable message s, Eq message, Show message) => ByteString -> message -> IO ()
+decodes input expected = parseMessage @message input `shouldBe` Right expected
 
-roundTrip :: forall a s. (Parsable a s, Serializable a s, Eq a, Show a) => a -> IO ()
-roundTrip message = parseEnvelope @a @s (outputByteString (serialize @a @s message)) `shouldBe` Right (Envelope message)
+roundTrip :: forall message a s. (message ~ Envelope a s, Parsable message s, Serializable message s, Eq message, Show message) => message -> IO ()
+roundTrip message = parseMessage @message (outputByteString (serialize message)) `shouldBe` Right message
 
 startupMessage :: StartupMessage ByteString
 startupMessage =

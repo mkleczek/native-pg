@@ -5,7 +5,8 @@ module FramingSpec (spec) where
 
 import Control.Exception (try)
 import Control.Monad (replicateM, replicateM_)
-import Database.PostgreSQL.Internal.Buffer (newBuffer, bufferMemory)
+import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Buffer (bufferMemory, newBuffer)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
@@ -32,13 +33,22 @@ spec = describe "protocol framing" $ do
     inputResult (runInput source emptyInputBuffer (withInputLimit 4 (readInputExactly 3)))
       `shouldReturn` Left "bounded parser left 1 unconsumed bytes"
 
+  it "parses consecutive complete messages across tiny caller-owned storage refills" $ do
+    let ready = ReadyForQuery TxIdle
+        command = CommandComplete "SELECT 1" :: CommandComplete ByteString
+    source <- bytesSource (outputByteString (serialize ready <> serialize command))
+    storage <- newBuffer (positiveInt @4)
+    (messages, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $
+      (,) <$> parser @ReadyForQuery <*> parser @(CommandComplete ByteString)
+    messages `shouldBe` (ready, command)
+
   it "permits a streamed row body across source chunks" $ do
     let column = BS.replicate 1024 120
         body = outputByteString (serialize @Int16 @('FixedBytesAtom 2) 1 <> serialize @Int32 @('FixedBytesAtom 4) 1024) <> column
     source <- bytesSource (frameHeader 68 body <> body)
     inputResult (runInputUntil source maxBound emptyInputBuffer $ do
-      _ <- parser @DataRowHeader @('PayloadField 'DataRowHeaderType)
-      size <- parser @Int32 @('FixedBytesAtom 4)
+      _ <- fieldParser @DataRowHeader @('PayloadField 'DataRowHeaderType)
+      size <- fieldParser @Int32 @('FixedBytesAtom 4)
       skipInput (fromIntegral size)
       pure "streamed") `shouldReturn` Right "streamed"
 
@@ -48,7 +58,7 @@ spec = describe "protocol framing" $ do
         bytes = envelope <> "next"
     offset <- newIORef 0
     requests <- newIORef []
-    storage <- newBuffer 16
+    storage <- newBuffer (positiveInt @16)
     let source = InputSource (\pointer size -> do
           modifyIORef' requests (size :)
           consumed <- readIORef offset
@@ -57,8 +67,8 @@ spec = describe "protocol framing" $ do
           modifyIORef' offset (+ BS.length chunk)
           pure (BS.length chunk)) 16
     (values, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
-      length' <- parser @Int32 @('FixedBytesAtom 4)
-      withInputLimit (fromIntegral length') (replicateM 100 (parser @Int32 @('FixedBytesAtom 4)))
+      length' <- fieldParser @Int32 @('FixedBytesAtom 4)
+      withInputLimit (fromIntegral length') (replicateM 100 (fieldParser @Int32 @('FixedBytesAtom 4)))
     values `shouldBe` replicate 100 7
     readIORef offset `shouldReturn` BS.length envelope
     calls <- readIORef requests
@@ -66,7 +76,7 @@ spec = describe "protocol framing" $ do
     maximum calls `shouldBe` 16
 
   it "restores supplied storage after owned protocol selector lookahead" $ do
-    storage <- newBuffer 4
+    storage <- newBuffer (positiveInt @4)
     source <- bytesSource ("R\0\0\0\8\0\0\0\0" <> BS.replicate 32 120)
     inside <- newIORef True
     let consume chunk = do
