@@ -7,6 +7,7 @@ module Database.PostgreSQL.Internal.Context
     contextConnection,
     contextInput,
     contextOutput,
+    sendContextOutput,
     contextPending,
     contextReadSize,
     contextScoped,
@@ -27,9 +28,9 @@ import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Database.PostgreSQL.Buffer (Buffer, bufferCapacity)
 import Database.PostgreSQL.Diagnostics (ServerError (..))
-import Database.PostgreSQL.Protocol.Codec (InputBuffer, reusableInputBuffer, emptyInputBuffer)
+import Database.PostgreSQL.Protocol.Codec (Output, InputBuffer, reusableInputBuffer, emptyInputBuffer)
 import Database.PostgreSQL.Protocol.Messages (Notification)
-import Database.PostgreSQL.Transport (Channel, OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer)
+import Database.PostgreSQL.Transport (Channel (..), OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer)
 
 data Connection = Connection
   { -- | Input and output over the socket, or TLS over it.
@@ -124,6 +125,12 @@ newOwnedContext connection = do
   finished <- newMVar ()
   pure (Context connection (connectionBuffer connection) (connectionOutput connection)
     (connectionUnsent connection) (connectionReadSize connection) False use finished)
+
+-- | Sends output for this context.
+sendContextOutput :: Context -> Output -> IO ()
+sendContextOutput context output = do
+  ensureContextActive context
+  channelSend (connectionChannel (contextConnection context)) output
 
 -- | Binds supplied initialized buffers for the callback. Acquires the
 -- connection before exposing the Context and cancels/joins any operation

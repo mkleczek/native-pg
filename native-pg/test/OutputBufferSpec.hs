@@ -9,6 +9,7 @@ import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
 import Control.Monad (forM_)
 import qualified Database.PostgreSQL.Protocol.Codec as Output
+import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Buffer
 import Database.PostgreSQL.Protocol (Sync (..), SyncType (SyncType), Parse (..), ParseType (ParseType), Query (..), QueryType (QueryType), Execute (..), ExecuteType (ExecuteType))
 import Database.PostgreSQL.Protocol.Codec (serialize)
@@ -33,6 +34,24 @@ spec = describe "caller-owned output storage" $ do
       channelSendBuffered (newChannel link) (outputBufferFrom buffer) batch
       readIORef sent `shouldReturn` wire
       readIORef addresses `shouldReturn` True
+
+  xfail "context output is not bound to supplied storage" $ it "sends through the current context's supplied workspace" $ do
+    input <- newBuffer 16
+    output <- newBuffer 16
+    supplied <- newIORef True
+    sent <- newIORef BS.empty
+    let link = Sender $ \chunks -> do
+          withForeignPtr (bufferMemory output) $ \start ->
+            mapM_ (\chunk -> BSU.unsafeUseAsCStringLen chunk $ \(pointer, size) ->
+              modifyIORef' supplied (&& (castPtr pointer >= start && castPtr pointer `plusPtr` size <= start `plusPtr` bufferCapacity output))) chunks
+          accepted <- evaluate (BS.copy (BS.concat chunks))
+          modifyIORef' sent (<> accepted)
+          pure (BS.length accepted)
+    connection <- newConnection (newChannel link) 16
+    withContext connection input output $ \context ->
+      runContextOperation context (sendContextOutput context batch)
+    readIORef sent `shouldReturn` wire
+    readIORef supplied `shouldReturn` True
 
   it "preserves unsent bytes across partial writes" $ do
     buffer <- newBuffer 16
