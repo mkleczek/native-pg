@@ -17,6 +17,7 @@ module Database.PostgreSQL.Internal.Context
     newConnection,
     runContextOperation,
     ensureContextActive,
+    breakConnection,
     Connection (..),
     SessionState (..),
     ConnectionError (..),
@@ -24,11 +25,13 @@ module Database.PostgreSQL.Internal.Context
 
 import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (MVar, newMVar, takeMVar, putMVar, readMVar)
-import Control.Exception (Exception (..), catch, finally, mask, onException, throwIO)
+import Control.Exception (Exception (..), catch, finally, mask, onException, throwIO, uninterruptibleMask_)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
-import Database.PostgreSQL.Buffer (Buffer, bufferCapacity)
+import Database.PostgreSQL.Buffer (Buffer, bufferCapacity, bufferMemory)
+import Foreign.ForeignPtr (withForeignPtr)
+import Foreign.Ptr (plusPtr)
 import Database.PostgreSQL.Diagnostics (ServerError (..))
 import Database.PostgreSQL.Protocol.Codec (Output, Input, InputBuffer, InputError (..), reusableInputBuffer, emptyInputBuffer, runInputUntil, runInputFramedUntil)
 import Database.PostgreSQL.Protocol.Messages (Notification)
@@ -155,6 +158,11 @@ runContextInput context limit parse = do
 -- still running on another thread before the buffers may be reused.
 withContext :: Connection -> Buffer -> Buffer -> (Context -> IO a) -> IO a
 withContext connection input output use = do
+  withForeignPtr (bufferMemory input) $ \inputStart ->
+    withForeignPtr (bufferMemory output) $ \outputStart ->
+      when (inputStart < outputStart `plusPtr` bufferCapacity output &&
+            outputStart < inputStart `plusPtr` bufferCapacity input)
+        (throwIO (SessionUnusable "input and output storage overlap"))
   when (bufferCapacity output < 4) (ioError (userError "output buffer capacity must be at least four bytes"))
   mask $ \restore -> do
     claimConnection connection
@@ -165,11 +173,11 @@ withContext connection input output use = do
       finished <- newMVar ()
       pure (Context connection cursor (outputBufferFrom output) pending (bufferCapacity input) True state finished))
       `onException` writeIORef (connectionState connection) Idle
-    result <- restore (use context) `onException` writeIORef (connectionState connection) Broken
+    result <- restore (use context) `onException` breakConnection connection
       `finally` expireContext context
     pending <- readIORef (contextPending context)
     unless (unsentEmpty pending) $ do
-      writeIORef (connectionState connection) Broken
+      breakConnection connection
       throwIO (SessionUnusable "operation scope ended with unsent output")
     atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
     pure result
@@ -182,9 +190,12 @@ expireContext context = do
   case owner of
     Nothing -> pure ()
     Just thread -> do
-      writeIORef (connectionState (contextConnection context)) Broken
-      killThread thread
-      readMVar (contextFinished context)
+      breakConnection (contextConnection context)
+      -- A second cancellation must not return the loan while the first
+      -- cancellation is still unwinding a child that can touch its buffers.
+      uninterruptibleMask_ $ do
+        killThread thread
+        readMVar (contextFinished context)
 
 ensureContextActive :: Context -> IO ()
 ensureContextActive context = readIORef (contextUse context) >>= \case
@@ -204,15 +215,15 @@ runContextOperation context action = mask $ \restore -> do
   takeMVar (contextFinished context)
   let connection = contextConnection context
       done = do
-        atomicModifyIORef' (contextUse context) (\state -> (case state of Using _ -> Available; other -> other, ()))
         putMVar (contextFinished context) ()
+        atomicModifyIORef' (contextUse context) (\state -> (case state of Using _ -> Available; other -> other, ()))
       run = do
         if contextScoped context
           then readIORef (connectionState connection) >>= \case
             Busy -> pure ()
             _ -> throwIO (SessionUnusable "the connection is no longer usable")
           else claimConnection connection
-        result <- restore action `onException` writeIORef (connectionState connection) Broken
+        result <- restore action `onException` breakConnection connection
         unless (contextScoped context) (writeIORef (connectionState connection) Idle)
         pure result
   run `finally` done
@@ -225,3 +236,8 @@ claimConnection connection = do
     Broken -> (Broken, Just "the session broke during an earlier operation")
     Closed -> (Closed, Just "the session is closed")
   maybe (pure ()) (throwIO . SessionUnusable) failure
+
+-- | A late cleanup cannot resurrect a connection already closed by its owner.
+breakConnection :: Connection -> IO ()
+breakConnection connection = atomicModifyIORef' (connectionState connection) $ \state ->
+  (case state of Closed -> Closed; _ -> Broken, ())
