@@ -4,6 +4,7 @@ module Database.PostgreSQL.Buffer
   ( Buffer,
     newBuffer,
     initializeBuffer,
+    bufferFromInitializedMemory,
     bufferMemory,
     bufferCapacity,
   )
@@ -33,6 +34,15 @@ initializeBuffer :: ForeignPtr Word8 -> Int -> IO Buffer
 initializeBuffer memory size = do
   validateCapacity size
   withForeignPtr memory $ \pointer -> fillBytes pointer 0 size
+  pure (Buffer memory size)
+
+-- | Adapts storage that its owner has already initialized. Unlike
+-- 'initializeBuffer', this only creates a descriptor; the caller guarantees
+-- the allocation contains at least the given number of initialized writable
+-- bytes and keeps each loan exclusive until its operation returns.
+bufferFromInitializedMemory :: ForeignPtr Word8 -> Int -> IO Buffer
+bufferFromInitializedMemory memory size = do
+  validateCapacity size
   pure (Buffer memory size)
 
 validateCapacity :: Int -> IO ()
