@@ -34,11 +34,13 @@ module Database.PostgreSQL.Statement
     decodeScopedStreamingNullable,
     streamLength,
     streamChunk,
+    streamChunks,
   )
 where
 
 import Control.Exception (Exception)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Database.PostgreSQL.Decoding (DecodingError)
 import Database.PostgreSQL.Protocol (FormatCode (..), OptionalOid, Parameter)
 import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
@@ -174,3 +176,10 @@ streamLength (ScopedStream stream) = byteStreamLength stream
 -- | The next chunk of the stream, or an empty one at its end.
 streamChunk :: ScopedStream s -> IO ByteString
 streamChunk (ScopedStream stream) = byteStreamNext stream
+
+-- | Drains the remaining field through synchronous borrowed callbacks.
+-- Completion of the field does not establish statement/transaction success.
+streamChunks :: ScopedStream s -> (ByteString -> IO ()) -> IO ()
+streamChunks source use = do
+  chunk <- streamChunk source
+  if BS.null chunk then pure () else use chunk *> streamChunks source use

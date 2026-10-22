@@ -66,6 +66,7 @@ module Database.PostgreSQL.Session
     decodeRow,
     decodeRowStreaming,
     decodeRowStreamingNullable,
+    decodeRowStreamingUsing,
     nextColumn,
     rowColumnCount,
   )
@@ -1235,7 +1236,12 @@ decodeRowStreaming row function =
 -- | Like 'decodeRowStreaming', but the streamed column may be NULL, which the
 -- function gets as 'Nothing'.
 decodeRowStreamingNullable :: forall columns r. DecodeRow columns => Row -> RowFunction columns (Maybe ByteStream -> IO r) -> IO (Either DecodingError r)
-decodeRowStreamingNullable row function = do
+decodeRowStreamingNullable = decodeRowStreamingUsing @columns columnStream
+{-# INLINE decodeRowStreamingNullable #-}
+
+-- | Chooses how the final column is consumed while its cursor is unclaimed.
+decodeRowStreamingUsing :: forall columns stream r. DecodeRow columns => (Row -> IO stream) -> Row -> RowFunction columns (Maybe stream -> IO r) -> IO (Either DecodingError r)
+decodeRowStreamingUsing makeStream row function = do
   let streamed = rowArity @columns + 1
   started <- startDecoding row streamed
   case started of
@@ -1258,9 +1264,9 @@ decodeRowStreamingNullable row function = do
               Right <$> continue Nothing
           | otherwise -> do
               writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) size False False)
-              stream <- columnStream row
+              stream <- makeStream row
               Right <$> continue (Just stream)
-{-# INLINE decodeRowStreamingNullable #-}
+{-# INLINE decodeRowStreamingUsing #-}
 
 -- | Checks that no column of the row has been pulled yet, and that it has
 -- the expected number of columns.

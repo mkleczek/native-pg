@@ -54,6 +54,7 @@ module Database.PostgreSQL.Transaction
     decodeScopedStreamingNullable,
     streamLength,
     streamChunk,
+    streamChunks,
   )
 where
 
