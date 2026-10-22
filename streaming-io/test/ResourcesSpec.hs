@@ -9,7 +9,7 @@ import Skeletest
 
 spec :: Spec
 spec = describe "resource settings" $ do
-  xfail "settings validation is pending" $ it "rejects budgets smaller than one block" $
+  it "rejects budgets smaller than one block" $
     mapM_ rejects [ResourceSettings (positiveInt @7) (positiveInt @16) (positiveInt @8), ResourceSettings (positiveInt @32) (positiveInt @7) (positiveInt @8)]
 
 rejects :: ResourceSettings -> IO ()
