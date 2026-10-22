@@ -5,9 +5,13 @@ module Network.Streaming.Resources.Internal
   , withBuffers, withSetupBuffers
   ) where
 
-import Control.Concurrent.STM (STM)
+import Control.Concurrent.STM
+  ( STM, TVar, atomically, newTVarIO, readTVar, writeTVar, retry )
+import Control.Exception (bracket)
+import Control.Monad (replicateM)
+import Foreign.Marshal.Utils (fillBytes)
 import Data.Word (Word8)
-import Foreign.ForeignPtr (ForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
 import Network.Streaming.PositiveInt (PositiveInt, positiveIntValue)
 
 data ResourceSettings = ResourceSettings
@@ -21,31 +25,49 @@ data Buffer = Buffer
   , bufferCapacity :: !Int
   }
 
-data Resources = Resources
-data Lease = Lease [Buffer]
+data Resources = Resources !(TVar [Buffer])
+data Lease = Lease !(TVar [Buffer]) [Buffer]
 
 withResources :: ResourceSettings -> (Resources -> IO a) -> IO a
 withResources settings action
   | streamMemoryBytes settings < ioBufferBytes settings = invalid "stream budget must fit a block"
   | setupMemoryBytes settings < ioBufferBytes settings = invalid "setup budget must fit a block"
-  | otherwise = action Resources
+  | otherwise = do
+      let blockBytes = positiveIntValue (ioBufferBytes settings)
+      buffers <- replicateM (positiveIntValue (streamMemoryBytes settings) `div` blockBytes) $ do
+        memory <- mallocForeignPtrBytes blockBytes
+        withForeignPtr memory $ \pointer -> fillBytes pointer 0 blockBytes
+        pure (Buffer memory blockBytes)
+      free <- newTVarIO buffers
+      action (Resources free)
   where
     invalid = ioError . userError
 
 tryAcquire :: Resources -> PositiveInt -> STM (Maybe Lease)
-tryAcquire _ _ = pure Nothing
+tryAcquire (Resources free) _ = do
+  buffers <- readTVar free
+  case buffers of
+    [] -> pure Nothing
+    buffer : remaining -> do
+      writeTVar free remaining
+      pure (Just (Lease free [buffer]))
 
 tryAcquireSetup :: Resources -> PositiveInt -> STM (Maybe Lease)
 tryAcquireSetup = tryAcquire
 
 release :: Lease -> STM ()
-release _ = pure ()
+release (Lease free buffers) = do
+  available <- readTVar free
+  writeTVar free (buffers ++ available)
 
 leaseBuffers :: Lease -> [Buffer]
-leaseBuffers (Lease buffers) = buffers
+leaseBuffers (Lease _ buffers) = buffers
 
 withBuffers :: Resources -> PositiveInt -> ([Buffer] -> IO a) -> IO a
-withBuffers _ _ _ = ioError (userError "buffer loans are not implemented")
+withBuffers resources count action =
+  bracket acquire (atomically . release) (action . leaseBuffers)
+  where
+    acquire = atomically (tryAcquire resources count >>= maybe retry pure)
 
 withSetupBuffers :: Resources -> PositiveInt -> ([Buffer] -> IO a) -> IO a
 withSetupBuffers = withBuffers

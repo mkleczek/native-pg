@@ -16,7 +16,7 @@ spec = do
     mapM_ rejects [ResourceSettings (positiveInt @7) (positiveInt @16) (positiveInt @8), ResourceSettings (positiveInt @32) (positiveInt @7) (positiveInt @8)]
 
  describe "storage" $ do
-  xfail "resource storage is pending" $ it "initializes blocks once and reuses their addresses and contents" $
+  it "initializes blocks once and reuses their addresses and contents" $
     withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
       first <- withBuffers resources (positiveInt @1) $ \[buffer] -> do
         bufferCapacity buffer `shouldBe` 8
