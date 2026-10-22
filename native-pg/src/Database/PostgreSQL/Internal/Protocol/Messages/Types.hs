@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE RoleAnnotations #-}
 
 module Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( Envelope (..),
@@ -87,6 +88,8 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload
 import GHC.Exts (Any)
 import Unsafe.Coerce (unsafeCoerce)
 
+-- Framing is part of message identity, not a coercible tag.
+type role Envelope representational nominal
 newtype Envelope a (s :: k) = Envelope {unEnvelope :: a}
 
 deriving instance Eq a => Eq (Envelope a s)

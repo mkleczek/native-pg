@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Database.PostgreSQL.Internal.Protocol.Messages.BackendSession
@@ -25,50 +26,50 @@ module Database.PostgreSQL.Internal.Protocol.Messages.BackendSession
     PortalSuspendedType (PortalSuspendedType),
     ReadyForQueryType (ReadyForQueryType),
     RowDescriptionType (RowDescriptionType),
-    BackendKeyDataEnvelope,
-    BindCompleteEnvelope,
-    CloseCompleteEnvelope,
-    CommandCompleteEnvelope,
-    CopyInResponseEnvelope,
-    CopyOutResponseEnvelope,
-    CopyBothResponseEnvelope,
-    DataRowEnvelope,
     DataRowHeaderEnvelope,
-    EmptyQueryResponseEnvelope,
-    ErrorResponseEnvelope,
-    FunctionCallResponseEnvelope,
-    NegotiateProtocolVersionEnvelope,
-    NoDataEnvelope,
-    NoticeResponseEnvelope,
-    NotificationResponseEnvelope,
-    ParameterDescriptionEnvelope,
-    ParameterStatusEnvelope,
-    ParseCompleteEnvelope,
-    PortalSuspendedEnvelope,
-    ReadyForQueryEnvelope,
-    RowDescriptionEnvelope,
-    BackendKeyData (BackendKeyData),
-    BindComplete (BindComplete),
-    CloseComplete (CloseComplete),
-    CommandComplete (CommandComplete),
-    CopyInResponse (CopyInResponse),
-    CopyOutResponse (CopyOutResponse),
-    CopyBothResponse (CopyBothResponse),
-    DataRow (DataRow),
+    BackendKeyData,
+    pattern BackendKeyData,
+    BindComplete,
+    pattern BindComplete,
+    CloseComplete,
+    pattern CloseComplete,
+    CommandComplete,
+    pattern CommandComplete,
+    CopyInResponse,
+    pattern CopyInResponse,
+    CopyOutResponse,
+    pattern CopyOutResponse,
+    CopyBothResponse,
+    pattern CopyBothResponse,
+    DataRow,
+    pattern DataRow,
     DataRowHeader (..),
-    EmptyQueryResponse (EmptyQueryResponse),
-    ErrorResponse (ErrorResponse),
-    FunctionCallResponse (FunctionCallResponse),
-    NegotiateProtocolVersion (NegotiateProtocolVersion),
-    NoData (NoData),
-    NoticeResponse (NoticeResponse),
-    NotificationResponse (NotificationResponse),
-    ParameterDescription (ParameterDescription),
-    ParameterStatus (ParameterStatus),
-    ParseComplete (ParseComplete),
-    PortalSuspended (PortalSuspended),
-    ReadyForQuery (ReadyForQuery),
-    RowDescription (RowDescription),
+    EmptyQueryResponse,
+    pattern EmptyQueryResponse,
+    ErrorResponse,
+    pattern ErrorResponse,
+    FunctionCallResponse,
+    pattern FunctionCallResponse,
+    NegotiateProtocolVersion,
+    pattern NegotiateProtocolVersion,
+    NoData,
+    pattern NoData,
+    NoticeResponse,
+    pattern NoticeResponse,
+    NotificationResponse,
+    pattern NotificationResponse,
+    ParameterDescription,
+    pattern ParameterDescription,
+    ParameterStatus,
+    pattern ParameterStatus,
+    ParseComplete,
+    pattern ParseComplete,
+    PortalSuspended,
+    pattern PortalSuspended,
+    ReadyForQuery,
+    pattern ReadyForQuery,
+    RowDescription,
+    pattern RowDescription,
   )
 where
 
@@ -85,7 +86,7 @@ import Database.PostgreSQL.Internal.Protocol.Messages.Types
     BackendKeyType (BackendKeyType),
     CopyResponse,
     CopyResponseType (CopyResponseType),
-    Envelope,
+    Envelope (Envelope),
     ErrorNoticeField,
     ErrorNoticeFieldType (ErrorNoticeFieldType),
     Notification,
@@ -220,120 +221,136 @@ data RowDescriptionType (payload :: Payload) where
     RowDescriptionType
       (BackendSessionMessage 'T' (PayloadCounted16 ('PayloadField 'RowFieldType)))
 
-newtype BackendKeyData bytes = BackendKeyData (BackendKey bytes)
+newtype BackendKeyDataPayload bytes = BackendKeyDataPayload (BackendKey bytes)
 
-deriving instance Eq bytes => Eq (BackendKeyData bytes)
-deriving instance Show bytes => Show (BackendKeyData bytes)
+deriving instance Eq bytes => Eq (BackendKeyDataPayload bytes)
+deriving instance Show bytes => Show (BackendKeyDataPayload bytes)
 
-type BackendKeyDataEnvelope bytes =
-  Envelope
-    (BackendKeyData bytes)
-    'BackendKeyDataType
+type BackendKeyData bytes = Envelope (BackendKeyDataPayload bytes) 'BackendKeyDataType
+
+pattern BackendKeyData :: BackendKey bytes -> BackendKeyData bytes
+pattern BackendKeyData key = Envelope (BackendKeyDataPayload key)
+
+{-# COMPLETE BackendKeyData #-}
 
 instance HasConstructor 'BackendKeyDataType (BackendKeyData bytes) where
   type ConstructorOf 'BackendKeyDataType (BackendKeyData bytes) r = BackendKey bytes -> r
   constructorOf = BackendKeyData
   destructorOf (BackendKeyData key) k = k key
 
-data BindComplete = BindComplete
+data BindCompletePayload = BindCompletePayload
 
-deriving instance Eq BindComplete
-deriving instance Show BindComplete
+deriving instance Eq BindCompletePayload
+deriving instance Show BindCompletePayload
 
-type BindCompleteEnvelope =
-  Envelope
-    BindComplete
-    'BindCompleteType
+type BindComplete = Envelope BindCompletePayload 'BindCompleteType
+
+pattern BindComplete :: BindComplete
+pattern BindComplete = Envelope BindCompletePayload
+
+{-# COMPLETE BindComplete #-}
 
 instance HasConstructor 'BindCompleteType BindComplete where
   type ConstructorOf 'BindCompleteType BindComplete r = r
   constructorOf = BindComplete
   destructorOf BindComplete k = k
 
-data CloseComplete = CloseComplete
+data CloseCompletePayload = CloseCompletePayload
 
-deriving instance Eq CloseComplete
-deriving instance Show CloseComplete
+deriving instance Eq CloseCompletePayload
+deriving instance Show CloseCompletePayload
 
-type CloseCompleteEnvelope =
-  Envelope
-    CloseComplete
-    'CloseCompleteType
+type CloseComplete = Envelope CloseCompletePayload 'CloseCompleteType
+
+pattern CloseComplete :: CloseComplete
+pattern CloseComplete = Envelope CloseCompletePayload
+
+{-# COMPLETE CloseComplete #-}
 
 instance HasConstructor 'CloseCompleteType CloseComplete where
   type ConstructorOf 'CloseCompleteType CloseComplete r = r
   constructorOf = CloseComplete
   destructorOf CloseComplete k = k
 
-newtype CommandComplete bytes = CommandComplete bytes
+newtype CommandCompletePayload bytes = CommandCompletePayload bytes
 
-deriving instance Eq bytes => Eq (CommandComplete bytes)
-deriving instance Show bytes => Show (CommandComplete bytes)
+deriving instance Eq bytes => Eq (CommandCompletePayload bytes)
+deriving instance Show bytes => Show (CommandCompletePayload bytes)
 
-type CommandCompleteEnvelope bytes =
-  Envelope
-    (CommandComplete bytes)
-    'CommandCompleteType
+type CommandComplete bytes = Envelope (CommandCompletePayload bytes) 'CommandCompleteType
+
+pattern CommandComplete :: bytes -> CommandComplete bytes
+pattern CommandComplete tag = Envelope (CommandCompletePayload tag)
+
+{-# COMPLETE CommandComplete #-}
 
 instance HasConstructor 'CommandCompleteType (CommandComplete bytes) where
   type ConstructorOf 'CommandCompleteType (CommandComplete bytes) r = bytes -> r
   constructorOf = CommandComplete
   destructorOf (CommandComplete tag) k = k tag
 
-newtype CopyInResponse = CopyInResponse CopyResponse
+newtype CopyInResponsePayload = CopyInResponsePayload CopyResponse
 
-deriving instance Eq CopyInResponse
-deriving instance Show CopyInResponse
+deriving instance Eq CopyInResponsePayload
+deriving instance Show CopyInResponsePayload
 
-type CopyInResponseEnvelope =
-  Envelope
-    CopyInResponse
-    'CopyInResponseType
+type CopyInResponse = Envelope CopyInResponsePayload 'CopyInResponseType
+
+pattern CopyInResponse :: CopyResponse -> CopyInResponse
+pattern CopyInResponse response = Envelope (CopyInResponsePayload response)
+
+{-# COMPLETE CopyInResponse #-}
 
 instance HasConstructor 'CopyInResponseType CopyInResponse where
   type ConstructorOf 'CopyInResponseType CopyInResponse r = CopyResponse -> r
   constructorOf = CopyInResponse
   destructorOf (CopyInResponse response) k = k response
 
-newtype CopyOutResponse = CopyOutResponse CopyResponse
+newtype CopyOutResponsePayload = CopyOutResponsePayload CopyResponse
 
-deriving instance Eq CopyOutResponse
-deriving instance Show CopyOutResponse
+deriving instance Eq CopyOutResponsePayload
+deriving instance Show CopyOutResponsePayload
 
-type CopyOutResponseEnvelope =
-  Envelope
-    CopyOutResponse
-    'CopyOutResponseType
+type CopyOutResponse = Envelope CopyOutResponsePayload 'CopyOutResponseType
+
+pattern CopyOutResponse :: CopyResponse -> CopyOutResponse
+pattern CopyOutResponse response = Envelope (CopyOutResponsePayload response)
+
+{-# COMPLETE CopyOutResponse #-}
 
 instance HasConstructor 'CopyOutResponseType CopyOutResponse where
   type ConstructorOf 'CopyOutResponseType CopyOutResponse r = CopyResponse -> r
   constructorOf = CopyOutResponse
   destructorOf (CopyOutResponse response) k = k response
 
-newtype CopyBothResponse = CopyBothResponse CopyResponse
+newtype CopyBothResponsePayload = CopyBothResponsePayload CopyResponse
 
-deriving instance Eq CopyBothResponse
-deriving instance Show CopyBothResponse
+deriving instance Eq CopyBothResponsePayload
+deriving instance Show CopyBothResponsePayload
 
-type CopyBothResponseEnvelope =
-  Envelope
-    CopyBothResponse
-    'CopyBothResponseType
+type CopyBothResponse = Envelope CopyBothResponsePayload 'CopyBothResponseType
+
+pattern CopyBothResponse :: CopyResponse -> CopyBothResponse
+pattern CopyBothResponse response = Envelope (CopyBothResponsePayload response)
+
+{-# COMPLETE CopyBothResponse #-}
 
 instance HasConstructor 'CopyBothResponseType CopyBothResponse where
   type ConstructorOf 'CopyBothResponseType CopyBothResponse r = CopyResponse -> r
   constructorOf = CopyBothResponse
   destructorOf (CopyBothResponse response) k = k response
 
-newtype DataRow bytes = DataRow [Maybe bytes]
+newtype DataRowPayload bytes = DataRowPayload [Maybe bytes]
 
-deriving instance Eq bytes => Eq (DataRow bytes)
-deriving instance Show bytes => Show (DataRow bytes)
+deriving instance Eq bytes => Eq (DataRowPayload bytes)
+deriving instance Show bytes => Show (DataRowPayload bytes)
 
-type DataRowEnvelope bytes =
-  Envelope
-    (DataRow bytes)
-    'DataRowType
+type DataRow bytes = Envelope (DataRowPayload bytes) 'DataRowType
+
+pattern DataRow :: [Maybe bytes] -> DataRow bytes
+pattern DataRow values = Envelope (DataRowPayload values)
+
+{-# COMPLETE DataRow #-}
 
 instance HasConstructor 'DataRowType (DataRow bytes) where
   type ConstructorOf 'DataRowType (DataRow bytes) r = [Maybe bytes] -> r
@@ -359,201 +376,227 @@ instance HasConstructor 'DataRowHeaderType DataRowHeader where
   constructorOf = DataRowHeader
   destructorOf (DataRowHeader rowLength columnCount) k = k rowLength columnCount
 
-data EmptyQueryResponse = EmptyQueryResponse
+data EmptyQueryResponsePayload = EmptyQueryResponsePayload
 
-deriving instance Eq EmptyQueryResponse
-deriving instance Show EmptyQueryResponse
+deriving instance Eq EmptyQueryResponsePayload
+deriving instance Show EmptyQueryResponsePayload
 
-type EmptyQueryResponseEnvelope =
-  Envelope
-    EmptyQueryResponse
-    'EmptyQueryResponseType
+type EmptyQueryResponse = Envelope EmptyQueryResponsePayload 'EmptyQueryResponseType
+
+pattern EmptyQueryResponse :: EmptyQueryResponse
+pattern EmptyQueryResponse = Envelope EmptyQueryResponsePayload
+
+{-# COMPLETE EmptyQueryResponse #-}
 
 instance HasConstructor 'EmptyQueryResponseType EmptyQueryResponse where
   type ConstructorOf 'EmptyQueryResponseType EmptyQueryResponse r = r
   constructorOf = EmptyQueryResponse
   destructorOf EmptyQueryResponse k = k
 
-newtype ErrorResponse bytes = ErrorResponse [ErrorNoticeField bytes]
+newtype ErrorResponsePayload bytes = ErrorResponsePayload [ErrorNoticeField bytes]
 
-deriving instance Eq bytes => Eq (ErrorResponse bytes)
-deriving instance Show bytes => Show (ErrorResponse bytes)
+deriving instance Eq bytes => Eq (ErrorResponsePayload bytes)
+deriving instance Show bytes => Show (ErrorResponsePayload bytes)
 
-type ErrorResponseEnvelope bytes =
-  Envelope
-    (ErrorResponse bytes)
-    'ErrorResponseType
+type ErrorResponse bytes = Envelope (ErrorResponsePayload bytes) 'ErrorResponseType
+
+pattern ErrorResponse :: [ErrorNoticeField bytes] -> ErrorResponse bytes
+pattern ErrorResponse fields = Envelope (ErrorResponsePayload fields)
+
+{-# COMPLETE ErrorResponse #-}
 
 instance HasConstructor 'ErrorResponseType (ErrorResponse bytes) where
   type ConstructorOf 'ErrorResponseType (ErrorResponse bytes) r = [ErrorNoticeField bytes] -> r
   constructorOf = ErrorResponse
   destructorOf (ErrorResponse fields) k = k fields
 
-newtype FunctionCallResponse bytes =
-  FunctionCallResponse (Maybe bytes)
+newtype FunctionCallResponsePayload bytes =
+  FunctionCallResponsePayload (Maybe bytes)
 
-deriving instance Eq bytes => Eq (FunctionCallResponse bytes)
-deriving instance Show bytes => Show (FunctionCallResponse bytes)
+deriving instance Eq bytes => Eq (FunctionCallResponsePayload bytes)
+deriving instance Show bytes => Show (FunctionCallResponsePayload bytes)
 
-type FunctionCallResponseEnvelope bytes =
-  Envelope
-    (FunctionCallResponse bytes)
-    'FunctionCallResponseType
+type FunctionCallResponse bytes = Envelope (FunctionCallResponsePayload bytes) 'FunctionCallResponseType
+
+pattern FunctionCallResponse :: Maybe bytes -> FunctionCallResponse bytes
+pattern FunctionCallResponse result = Envelope (FunctionCallResponsePayload result)
+
+{-# COMPLETE FunctionCallResponse #-}
 
 instance HasConstructor 'FunctionCallResponseType (FunctionCallResponse bytes) where
   type ConstructorOf 'FunctionCallResponseType (FunctionCallResponse bytes) r = Maybe bytes -> r
   constructorOf = FunctionCallResponse
   destructorOf (FunctionCallResponse result) k = k result
 
-data NegotiateProtocolVersion bytes =
-  NegotiateProtocolVersion
+data NegotiateProtocolVersionPayload bytes =
+  NegotiateProtocolVersionPayload
     ProtocolVersion
     [bytes]
 
-deriving instance Eq bytes => Eq (NegotiateProtocolVersion bytes)
-deriving instance Show bytes => Show (NegotiateProtocolVersion bytes)
+deriving instance Eq bytes => Eq (NegotiateProtocolVersionPayload bytes)
+deriving instance Show bytes => Show (NegotiateProtocolVersionPayload bytes)
 
-type NegotiateProtocolVersionEnvelope bytes =
-  Envelope
-    (NegotiateProtocolVersion bytes)
-    'NegotiateProtocolVersionType
+type NegotiateProtocolVersion bytes = Envelope (NegotiateProtocolVersionPayload bytes) 'NegotiateProtocolVersionType
+
+pattern NegotiateProtocolVersion :: ProtocolVersion -> [bytes] -> NegotiateProtocolVersion bytes
+pattern NegotiateProtocolVersion version unrecognizedOptions = Envelope (NegotiateProtocolVersionPayload version unrecognizedOptions)
+
+{-# COMPLETE NegotiateProtocolVersion #-}
 
 instance HasConstructor 'NegotiateProtocolVersionType (NegotiateProtocolVersion bytes) where
   type ConstructorOf 'NegotiateProtocolVersionType (NegotiateProtocolVersion bytes) r = ProtocolVersion -> [bytes] -> r
   constructorOf = NegotiateProtocolVersion
   destructorOf (NegotiateProtocolVersion version unrecognizedOptions) k = k version unrecognizedOptions
 
-data NoData = NoData
+data NoDataPayload = NoDataPayload
 
-deriving instance Eq NoData
-deriving instance Show NoData
+deriving instance Eq NoDataPayload
+deriving instance Show NoDataPayload
 
-type NoDataEnvelope =
-  Envelope
-    NoData
-    'NoDataType
+type NoData = Envelope NoDataPayload 'NoDataType
+
+pattern NoData :: NoData
+pattern NoData = Envelope NoDataPayload
+
+{-# COMPLETE NoData #-}
 
 instance HasConstructor 'NoDataType NoData where
   type ConstructorOf 'NoDataType NoData r = r
   constructorOf = NoData
   destructorOf NoData k = k
 
-newtype NoticeResponse bytes = NoticeResponse [ErrorNoticeField bytes]
+newtype NoticeResponsePayload bytes = NoticeResponsePayload [ErrorNoticeField bytes]
 
-deriving instance Eq bytes => Eq (NoticeResponse bytes)
-deriving instance Show bytes => Show (NoticeResponse bytes)
+deriving instance Eq bytes => Eq (NoticeResponsePayload bytes)
+deriving instance Show bytes => Show (NoticeResponsePayload bytes)
 
-type NoticeResponseEnvelope bytes =
-  Envelope
-    (NoticeResponse bytes)
-    'NoticeResponseType
+type NoticeResponse bytes = Envelope (NoticeResponsePayload bytes) 'NoticeResponseType
+
+pattern NoticeResponse :: [ErrorNoticeField bytes] -> NoticeResponse bytes
+pattern NoticeResponse fields = Envelope (NoticeResponsePayload fields)
+
+{-# COMPLETE NoticeResponse #-}
 
 instance HasConstructor 'NoticeResponseType (NoticeResponse bytes) where
   type ConstructorOf 'NoticeResponseType (NoticeResponse bytes) r = [ErrorNoticeField bytes] -> r
   constructorOf = NoticeResponse
   destructorOf (NoticeResponse fields) k = k fields
 
-newtype NotificationResponse bytes =
-  NotificationResponse (Notification bytes)
+newtype NotificationResponsePayload bytes =
+  NotificationResponsePayload (Notification bytes)
 
-deriving instance Eq bytes => Eq (NotificationResponse bytes)
-deriving instance Show bytes => Show (NotificationResponse bytes)
+deriving instance Eq bytes => Eq (NotificationResponsePayload bytes)
+deriving instance Show bytes => Show (NotificationResponsePayload bytes)
 
-type NotificationResponseEnvelope bytes =
-  Envelope
-    (NotificationResponse bytes)
-    'NotificationResponseType
+type NotificationResponse bytes = Envelope (NotificationResponsePayload bytes) 'NotificationResponseType
+
+pattern NotificationResponse :: Notification bytes -> NotificationResponse bytes
+pattern NotificationResponse notification = Envelope (NotificationResponsePayload notification)
+
+{-# COMPLETE NotificationResponse #-}
 
 instance HasConstructor 'NotificationResponseType (NotificationResponse bytes) where
   type ConstructorOf 'NotificationResponseType (NotificationResponse bytes) r = Notification bytes -> r
   constructorOf = NotificationResponse
   destructorOf (NotificationResponse notification) k = k notification
 
-newtype ParameterDescription = ParameterDescription [Oid]
+newtype ParameterDescriptionPayload = ParameterDescriptionPayload [Oid]
 
-deriving instance Eq ParameterDescription
-deriving instance Show ParameterDescription
+deriving instance Eq ParameterDescriptionPayload
+deriving instance Show ParameterDescriptionPayload
 
-type ParameterDescriptionEnvelope =
-  Envelope
-    ParameterDescription
-    'ParameterDescriptionType
+type ParameterDescription = Envelope ParameterDescriptionPayload 'ParameterDescriptionType
+
+pattern ParameterDescription :: [Oid] -> ParameterDescription
+pattern ParameterDescription types = Envelope (ParameterDescriptionPayload types)
+
+{-# COMPLETE ParameterDescription #-}
 
 instance HasConstructor 'ParameterDescriptionType ParameterDescription where
   type ConstructorOf 'ParameterDescriptionType ParameterDescription r = [Oid] -> r
   constructorOf = ParameterDescription
   destructorOf (ParameterDescription types) k = k types
 
-newtype ParameterStatus bytes = ParameterStatus (ParameterStatusValue bytes)
+newtype ParameterStatusPayload bytes = ParameterStatusPayload (ParameterStatusValue bytes)
 
-deriving instance Eq bytes => Eq (ParameterStatus bytes)
-deriving instance Show bytes => Show (ParameterStatus bytes)
+deriving instance Eq bytes => Eq (ParameterStatusPayload bytes)
+deriving instance Show bytes => Show (ParameterStatusPayload bytes)
 
-type ParameterStatusEnvelope bytes =
-  Envelope
-    (ParameterStatus bytes)
-    'ParameterStatusType
+type ParameterStatus bytes = Envelope (ParameterStatusPayload bytes) 'ParameterStatusType
+
+pattern ParameterStatus :: ParameterStatusValue bytes -> ParameterStatus bytes
+pattern ParameterStatus status = Envelope (ParameterStatusPayload status)
+
+{-# COMPLETE ParameterStatus #-}
 
 instance HasConstructor 'ParameterStatusType (ParameterStatus bytes) where
   type ConstructorOf 'ParameterStatusType (ParameterStatus bytes) r = ParameterStatusValue bytes -> r
   constructorOf = ParameterStatus
   destructorOf (ParameterStatus status) k = k status
 
-data ParseComplete = ParseComplete
+data ParseCompletePayload = ParseCompletePayload
 
-deriving instance Eq ParseComplete
-deriving instance Show ParseComplete
+deriving instance Eq ParseCompletePayload
+deriving instance Show ParseCompletePayload
 
-type ParseCompleteEnvelope =
-  Envelope
-    ParseComplete
-    'ParseCompleteType
+type ParseComplete = Envelope ParseCompletePayload 'ParseCompleteType
+
+pattern ParseComplete :: ParseComplete
+pattern ParseComplete = Envelope ParseCompletePayload
+
+{-# COMPLETE ParseComplete #-}
 
 instance HasConstructor 'ParseCompleteType ParseComplete where
   type ConstructorOf 'ParseCompleteType ParseComplete r = r
   constructorOf = ParseComplete
   destructorOf ParseComplete k = k
 
-data PortalSuspended = PortalSuspended
+data PortalSuspendedPayload = PortalSuspendedPayload
 
-deriving instance Eq PortalSuspended
-deriving instance Show PortalSuspended
+deriving instance Eq PortalSuspendedPayload
+deriving instance Show PortalSuspendedPayload
 
-type PortalSuspendedEnvelope =
-  Envelope
-    PortalSuspended
-    'PortalSuspendedType
+type PortalSuspended = Envelope PortalSuspendedPayload 'PortalSuspendedType
+
+pattern PortalSuspended :: PortalSuspended
+pattern PortalSuspended = Envelope PortalSuspendedPayload
+
+{-# COMPLETE PortalSuspended #-}
 
 instance HasConstructor 'PortalSuspendedType PortalSuspended where
   type ConstructorOf 'PortalSuspendedType PortalSuspended r = r
   constructorOf = PortalSuspended
   destructorOf PortalSuspended k = k
 
-newtype ReadyForQuery =
-  ReadyForQuery TransactionStatus
+newtype ReadyForQueryPayload =
+  ReadyForQueryPayload TransactionStatus
 
-deriving instance Eq ReadyForQuery
-deriving instance Show ReadyForQuery
+deriving instance Eq ReadyForQueryPayload
+deriving instance Show ReadyForQueryPayload
 
-type ReadyForQueryEnvelope =
-  Envelope
-    ReadyForQuery
-    'ReadyForQueryType
+type ReadyForQuery = Envelope ReadyForQueryPayload 'ReadyForQueryType
+
+pattern ReadyForQuery :: TransactionStatus -> ReadyForQuery
+pattern ReadyForQuery status = Envelope (ReadyForQueryPayload status)
+
+{-# COMPLETE ReadyForQuery #-}
 
 instance HasConstructor 'ReadyForQueryType ReadyForQuery where
   type ConstructorOf 'ReadyForQueryType ReadyForQuery r = TransactionStatus -> r
   constructorOf = ReadyForQuery
   destructorOf (ReadyForQuery status) k = k status
 
-newtype RowDescription bytes = RowDescription [RowField bytes]
+newtype RowDescriptionPayload bytes = RowDescriptionPayload [RowField bytes]
 
-deriving instance Eq bytes => Eq (RowDescription bytes)
-deriving instance Show bytes => Show (RowDescription bytes)
+deriving instance Eq bytes => Eq (RowDescriptionPayload bytes)
+deriving instance Show bytes => Show (RowDescriptionPayload bytes)
 
-type RowDescriptionEnvelope bytes =
-  Envelope
-    (RowDescription bytes)
-    'RowDescriptionType
+type RowDescription bytes = Envelope (RowDescriptionPayload bytes) 'RowDescriptionType
+
+pattern RowDescription :: [RowField bytes] -> RowDescription bytes
+pattern RowDescription fields = Envelope (RowDescriptionPayload fields)
+
+{-# COMPLETE RowDescription #-}
 
 instance HasConstructor 'RowDescriptionType (RowDescription bytes) where
   type ConstructorOf 'RowDescriptionType (RowDescription bytes) r = [RowField bytes] -> r

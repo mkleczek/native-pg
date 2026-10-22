@@ -2,6 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module FieldStreamSpec (spec) where
 
+import Control.Monad.IO.Unlift (withRunInIO)
 import Control.Exception (SomeException, evaluate, finally, throwIO, try)
 import Control.Concurrent (forkFinally, killThread, threadDelay)
 import Control.Concurrent.MVar
@@ -14,11 +15,13 @@ import Data.IORef
 import Database.PostgreSQL.Internal.Buffer
 import Database.PostgreSQL.Diagnostics (Diagnostics (..))
 import Database.PostgreSQL.Internal.Context
+import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Internal.Protocol (TransactionStatus (..))
 import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..))
-import qualified Database.PostgreSQL.Session as PG
+import qualified Database.PostgreSQL.Internal.Execution as PG
+import qualified Database.PostgreSQL.Internal.Row as PG
+import qualified Database.PostgreSQL.Diagnostics as PG
 import qualified Database.PostgreSQL.Transaction as Tx
-import qualified Database.PostgreSQL.Pipeline as Pipeline
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, minusPtr)
@@ -100,25 +103,31 @@ spec = describe "borrowed field streams" $ do
         Left (PG.ServerError fields) -> diagnosticCode fields `shouldBe` "23514"
         Right _ -> failTest "late server error was lost after field EOF"
 
-  it "borrows Tx.streamChunks directly through its nullable scoped decoder" $
-    withFields [Just payload] ready $ \context input -> do
-      inside <- newIORef True
-      received <- newIORef BS.empty
-      let statement = Tx.Statement "SELECT field" (const [])
-            (Tx.singleRow (Tx.scopedRow $ \current ->
-              Tx.decodeScopedStreamingNullable @'[] current $ \stream ->
-                maybe (failTest "unexpected NULL") (\source -> Tx.streamChunks source (collect input inside received)) stream)) True
-          prepare _ _ = pure (Pipeline.PreparedAs "")
-      Pipeline.runPipelineIn context (Just prepare) (Pipeline.statement () statement) `shouldReturn` Right ()
-      readIORef inside `shouldReturn` True
-      readIORef received `shouldReturn` payload
+  it "borrows canonical field chunks through its nullable streaming decoder" $
+    withTransactionFields [Just payload] $ \context input ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        inside <- newIORef True
+        received <- newIORef BS.empty
+        let statement = Tx.Statement "SELECT field" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed)) False
+        cursor <- run (Tx.pipeline (Tx.statement () statement))
+        result <- run (Tx.nextRow cursor)
+        case result of
+          Just (Streamed (Just field)) -> drain (run (Tx.nextChunk field)) (collect input inside received)
+          _ -> failTest "unexpected NULL"
+        run Tx.finishTransaction
+        readIORef inside `shouldReturn` True
+        readIORef received `shouldReturn` payload
 
-  it "keeps NULL handling available through scoped streaming decoders" $
-    withFields [Nothing] ready $ \context _ -> do
-      let statement = Tx.Statement "SELECT NULL" (const [])
-            (Tx.singleRow (Tx.scopedRow $ \current -> Tx.decodeScopedStreamingNullable @'[] current (pure . maybe True (const False)))) True
-          prepare _ _ = pure (Pipeline.PreparedAs "")
-      Pipeline.runPipelineIn context (Just prepare) (Pipeline.statement () statement) `shouldReturn` Right True
+  it "keeps NULL handling available through streaming decoders" $
+    withTransactionFields [Nothing] $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        let statement = Tx.Statement "SELECT NULL" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed)) False
+        cursor <- run (Tx.pipeline (Tx.statement () statement))
+        result <- run (Tx.nextRow cursor)
+        case result of
+          Just (Streamed Nothing) -> pure ()
+          _ -> failTest "expected NULL"
+        run Tx.finishTransaction
 
   it "cancels and joins an unfinished field pull before closing its scope" $ do
     blocked <- newEmptyMVar
@@ -150,42 +159,56 @@ spec = describe "borrowed field streams" $ do
       result `shouldBe` (Right ([payload], "SELECT 1"), TxIdle)
 
   it "assembles leading owned metadata while borrowing the selected body" $
-    withFields [Just payload, Just payload] ready $ \context input -> do
-      inside <- newIORef True
-      received <- newIORef BS.empty
-      let statement = Tx.Statement "SELECT metadata, body" (const [])
-            (Tx.singleRow (Tx.scopedRow $ \current ->
-              Tx.decodeScopedStreamingNullable @'[BS.ByteString] current $ \metadata stream -> do
-                metadata `shouldBe` payload
-                maybe (failTest "unexpected NULL") (\source -> Tx.streamChunks source (collect input inside received)) stream
-                metadata `shouldBe` payload)) True
-          prepare _ _ = pure (Pipeline.PreparedAs "")
-      Pipeline.runPipelineIn context (Just prepare) (Pipeline.statement () statement) `shouldReturn` Right ()
-      readIORef inside `shouldReturn` True
-      readIORef received `shouldReturn` payload
+    withTransactionFields [Just payload, Just payload] $ \context input ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        inside <- newIORef True
+        received <- newIORef BS.empty
+        let statement = Tx.Statement "SELECT metadata, body" (const []) (Tx.singleRow (Tx.streamingRow @'[BS.ByteString] Metadata)) False
+        cursor <- run (Tx.pipeline (Tx.statement () statement))
+        result <- run (Tx.nextRow cursor)
+        case result of
+          Just (Metadata metadata (Just field)) -> do
+            metadata `shouldBe` payload
+            drain (run (Tx.nextChunk field)) (collect input inside received)
+            metadata `shouldBe` payload
+          _ -> failTest "unexpected NULL"
+        run Tx.finishTransaction
+        readIORef inside `shouldReturn` True
+        readIORef received `shouldReturn` payload
 
   it "reports a COMMIT failure after the borrowed body was delivered" $ do
-    let parse = message 49 ""
-        bind = message 50 ""
-        completed tag = message 67 (tag <> "\0")
-        row = message 68 ("\0\1" <> number (BS.length payload) <> payload)
-        response = parse <> bind <> completed "BEGIN"
-          <> parse <> bind <> row <> completed "SELECT 1" <> ready
-          <> parse <> bind <> lateError <> ready
+    let row = message 68 ("\0\1" <> number (BS.length payload) <> payload)
+        response = command "BEGIN" <> message 49 "" <> message 50 "" <> row <> message 67 "SELECT 1\0" <> message 90 "T"
+          <> message 49 "" <> message 50 "" <> lateError <> message 90 "E" <> command "ROLLBACK" <> ready
     withResponse response $ \context _ -> do
       delivered <- newIORef False
-      let statement = Tx.Statement "SELECT field" (const [])
-            (Tx.singleRow (Tx.scopedRow $ \current ->
-              Tx.decodeScopedStreamingNullable @'[] current $ \stream -> do
-                maybe (failTest "unexpected NULL") (\source -> Tx.streamChunks source (const (pure ()))) stream
-                writeIORef delivered True)) False
-      result <- Tx.transactionNoRetryIn Tx.ReadCommitted Tx.Read (Tx.statement () statement) context
+      result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        let statement = Tx.Statement "SELECT field" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed)) False
+        cursor <- run (Tx.pipeline (Tx.statement () statement))
+        current <- run (Tx.nextRow cursor)
+        case current of
+          Just (Streamed (Just field)) -> drain (run (Tx.nextChunk field)) (const (pure ()))
+          _ -> failTest "unexpected NULL"
+        writeIORef delivered True
+        run Tx.finishTransaction
       readIORef delivered `shouldReturn` True
       case result of
         Left (Tx.QueryError query (Tx.ServerFailed (PG.ServerError fields))) -> do
           query `shouldBe` "COMMIT"
           diagnosticCode fields `shouldBe` "23514"
         _ -> failTest "deferred COMMIT error was lost after field EOF"
+
+newtype Streamed tx = Streamed (Maybe (Tx.Field tx))
+data Metadata tx = Metadata BS.ByteString (Maybe (Tx.Field tx))
+
+command :: BS.ByteString -> BS.ByteString
+command tag = message 49 "" <> message 50 "" <> message 67 (tag <> "\0")
+
+withTransactionFields :: [Maybe BS.ByteString] -> (Context -> Buffer -> IO a) -> IO a
+withTransactionFields columns =
+  let body = BS.pack [0, fromIntegral (length columns)]
+        <> foldMap (maybe (number (-1)) (\value -> number (BS.length value) <> value)) columns
+  in withResponse (command "BEGIN" <> message 49 "" <> message 50 "" <> message 68 body <> message 67 "SELECT 1\0" <> message 90 "T" <> command "COMMIT" <> ready)
 
 collect :: Buffer -> IORef Bool -> IORef BS.ByteString -> BS.ByteString -> IO ()
 collect input inside received chunk = do
@@ -201,7 +224,7 @@ drain source sink = do
   unless (BS.null chunk) (sink chunk *> drain source sink)
 
 payload :: BS.ByteString
-payload = BS.concat (map (\n -> BS.replicate 31 n) [65..72])
+payload = BS.concat (map (BS.replicate 31) [65..72])
 
 execution :: PG.Execution
 execution = PG.Execution (PG.Prepared "") [] [] []
@@ -233,7 +256,7 @@ withResponseObserved observe response action = do
         writeIORef remaining (BS.drop (BS.length chunk) bytes)
         pure (Just (BS.length chunk))
   connection <- newConnection (newChannel (Scripted receive)) 16
-  withContext connection input output (\context -> action context input)
+  withContext connection input output (`action` input)
 
 newtype Scripted = Scripted (Ptr Word8 -> Int -> IO (Maybe Int))
 instance Link Scripted where

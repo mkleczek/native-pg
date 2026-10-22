@@ -1,3 +1,4 @@
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -10,9 +11,9 @@ import Data.IORef
 import Control.Monad (forM_)
 import qualified Database.PostgreSQL.Internal.Protocol.Codec as Output
 import Database.PostgreSQL.Internal.Context
-import Database.PostgreSQL.Internal.Buffer
-import Database.PostgreSQL.Internal.Protocol (Sync (..), SyncType (SyncType), Parse (..), ParseType (ParseType), Query (..), QueryType (QueryType), Execute (..), ExecuteType (ExecuteType))
-import Database.PostgreSQL.Internal.Protocol.Codec (serialize)
+import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Buffer (bufferMemory, bufferCapacity, newBuffer)
+import Database.PostgreSQL.Internal.Protocol (pattern Sync, pattern Parse, pattern Execute, pattern Query, serialize)
 import Database.PostgreSQL.Transport hiding (newChannel)
 import Database.PostgreSQL.Internal.Channel
 import Foreign.ForeignPtr (withForeignPtr)
@@ -22,7 +23,7 @@ import Skeletest hiding (context)
 spec :: Spec
 spec = describe "caller-owned output storage" $ do
   it "serializes a large batch through the same small buffer" $ do
-      buffer <- newBuffer 16
+      buffer <- newBuffer (positiveInt @16)
       addresses <- newIORef True
       sent <- newIORef BS.empty
       let link = Sender $ \chunks -> do
@@ -37,8 +38,8 @@ spec = describe "caller-owned output storage" $ do
       readIORef addresses `shouldReturn` True
 
   it "sends through the current context's supplied workspace" $ do
-    input <- newBuffer 16
-    output <- newBuffer 16
+    input <- newBuffer (positiveInt @16)
+    output <- newBuffer (positiveInt @16)
     supplied <- newIORef True
     sent <- newIORef BS.empty
     let link = Sender $ \chunks -> do
@@ -55,7 +56,7 @@ spec = describe "caller-owned output storage" $ do
     readIORef supplied `shouldReturn` True
 
   it "preserves unsent bytes across partial writes" $ do
-    buffer <- newBuffer 16
+    buffer <- newBuffer (positiveInt @16)
     sent <- newIORef BS.empty
     let link = Sender $ \chunks -> do
           prefix <- evaluate (BS.copy (BS.take 3 (BS.concat chunks)))
@@ -64,12 +65,12 @@ spec = describe "caller-owned output storage" $ do
     channelSendBuffered (newChannel link) (outputBufferFrom buffer) batch
     readIORef sent `shouldReturn` wire
   it "matches contiguous serialization for complete messages at small capacities" $ do
-    let output = serialize @(Parse BS.ByteString) @'ParseType (Parse ("" :: BS.ByteString) "SELECT $1" [])
-          <> serialize @(Query BS.ByteString) @'QueryType (Query (BS.replicate 9000 65))
-          <> serialize @(Execute BS.ByteString) @'ExecuteType (Execute ("" :: BS.ByteString) 17)
-          <> serialize @Sync @'SyncType Sync
+    let output = serialize (Parse ("" :: BS.ByteString) "SELECT $1" [])
+          <> serialize (Query (BS.replicate 9000 65))
+          <> serialize (Execute ("" :: BS.ByteString) 17)
+          <> serialize Sync
         expected = Output.outputByteString output
-    forM_ [4, 7, 256] $ \capacity -> do
+    forM_ [positiveInt @4, positiveInt @7, positiveInt @256] $ \capacity -> do
       buffer <- newBuffer capacity
       received <- newIORef BS.empty
       let sender = Sender $ \chunks -> do
@@ -80,7 +81,7 @@ spec = describe "caller-owned output storage" $ do
       readIORef received `shouldReturn` expected
 
   where
-    batch = mconcat (replicate 40 (serialize @Sync @'SyncType Sync))
+    batch = mconcat (replicate 40 (serialize Sync))
     wire = BS.concat (replicate 40 "S\0\0\0\4")
 
 newtype Sender = Sender ([BS.ByteString] -> IO Int)

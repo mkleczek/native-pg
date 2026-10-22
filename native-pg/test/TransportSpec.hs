@@ -1,3 +1,4 @@
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -9,12 +10,15 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
-import Database.PostgreSQL.Internal.Protocol (Sync (..), SyncType (SyncType))
-import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), InputSource (..), Output, serialize)
+import Database.PostgreSQL.Internal.Protocol (pattern Sync, serialize)
+import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), InputSource (..), Output, serializeField)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (RemainingBytesAtom, MaybeBytes32Atom))
 import Database.PostgreSQL.Internal.Protocol (Parameter (..))
 import Database.PostgreSQL.Internal.Context (newConnection, newOwnedContext)
 import qualified Database.PostgreSQL.Session as Session
+import qualified Database.PostgreSQL.Internal.Exchange as Exchange
+import qualified Database.PostgreSQL.Internal.Execution as Session
+import qualified Database.PostgreSQL.Diagnostics as Session
 import Database.PostgreSQL.Transport hiding (newChannel)
 import Database.PostgreSQL.Internal.Channel
 import Foreign.Marshal.Alloc (allocaBytes)
@@ -107,28 +111,28 @@ spec = describe "channels over a link without a socket" $ do
 
   it "bounds each send even for a single large immutable value" $ do
       let payload = BS.replicate 600000 42
-      checkGather (serialize @ByteString @'RemainingBytesAtom payload) payload
+      checkGather (serializeField @ByteString @'RemainingBytesAtom payload) payload
 
   it "splits a large stream chunk without losing its partial-write suffix" $ do
       let payload = BS.replicate 600000 61
       next <- newIORef payload
       let source = ByteStream (BS.length payload) (readIORef next <* writeIORef next BS.empty)
-          output = serialize @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterStream source))
+          output = serializeField @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterStream source))
       checkGather output ("\0\9'\192" <> payload)
 
   it "closes the channel once when sending Terminate throws" $
     withCloseHooks (throwIO (ErrorCall "terminate failed")) (pure ()) $ \session ->
-      Session.close session `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "terminate failed")))
+      Session.close (Session.connection session) `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "terminate failed")))
 
   it "does not retry channel cleanup if it throws" $
     withCloseHooks (pure ()) (throwIO (ErrorCall "cleanup failed")) $ \session ->
-      Session.close session `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "cleanup failed")))
+      Session.close (Session.connection session) `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "cleanup failed")))
 
   it "closes the channel once when sending Terminate is interrupted" $
     withCloseHooks (threadDelay 10000000) (pure ()) $ \session ->
-      timeout 100000 (Session.close session) `shouldReturn` Nothing
+      timeout 100000 (Session.close (Session.connection session)) `shouldReturn` Nothing
 
-withCloseHooks :: IO () -> IO () -> (Session.Session 'Session.Ready -> IO a) -> IO ()
+withCloseHooks :: IO () -> IO () -> (Session.Session -> IO a) -> IO ()
 withCloseHooks beforeSend afterClose check = do
   closes <- newIORef (0 :: Int)
   let link = testLink
@@ -138,11 +142,11 @@ withCloseHooks beforeSend afterClose check = do
             pure (sum (map BS.length pieces)),
           testClose = (modifyIORef' closes (+ 1)) `finally` afterClose
         }
-      open = Session.sessionFromContext <$> (newOwnedContext =<< newConnection (newChannel link) 16)
-  bracket open Session.close $ \session -> do
+      open = Exchange.Session <$> (newOwnedContext =<< newConnection (newChannel link) 16)
+  bracket open (Session.close . Session.connection) $ \session -> do
     _ <- check session
-    Session.isUsable session `shouldReturn` False
-    Session.close session
+    Session.isUsable (Session.connection session) `shouldReturn` False
+    Session.close (Session.connection session)
     Session.execute session (Session.Execution (Session.Prepared "") [] [] []) (\() _ -> pure ()) ()
       `shouldSatisfy` P.throws (P.eq (Session.SessionUnusable "the session is closed"))
   readIORef closes `shouldReturn` 1
@@ -221,7 +225,7 @@ collect sent pieces = do
   pure (BS.length bytes)
 
 sync :: Output
-sync = serialize @Sync @'SyncType Sync
+sync = serialize Sync
 
 syncBytes :: ByteString
 syncBytes = "S\0\0\0\4"

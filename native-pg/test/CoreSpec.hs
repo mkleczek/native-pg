@@ -25,7 +25,7 @@ import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Internal.Protocol
 import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
-import Database.PostgreSQL.Session (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
+import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions, serverEndPoint)

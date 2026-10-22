@@ -29,7 +29,7 @@ spec = describe "borrowed parameter streams" $ do
               withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer (fromIntegral count + 65) 32
               pure (BSI.BS (bufferMemory buffer) 32)
           source = ByteStream 96 next
-          output = serialize @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterBorrowedStream source))
+          output = serializeField @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterBorrowedStream source))
           sender = Sender $ \pieces -> do
             prefix <- evaluate (BS.copy (BS.take 7 (BS.concat pieces)))
             modifyIORef' received (<> prefix)

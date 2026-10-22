@@ -16,14 +16,14 @@ import GHC.Conc (getAllocationCounter)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
-import Database.PostgreSQL.Internal.Buffer (newBuffer)
-import Network.Streaming.Resources.Internal (Buffer (..))
+import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Buffer (Buffer, bufferMemory, bufferCapacity, newBuffer)
 import Database.PostgreSQL.Internal.Context
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import qualified Database.PostgreSQL.Diagnostics as PG
 import qualified Database.PostgreSQL.Session as Session
 import Database.PostgreSQL.Streaming.Types (ByteStream (..), Parameter (..))
-import qualified Database.PostgreSQL.Transaction.Pull as Tx
+import qualified Database.PostgreSQL.Transaction as Tx
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, minusPtr)
@@ -39,7 +39,7 @@ bodyStatement = Tx.Statement "SELECT body" (const []) (Tx.singleRow (Tx.streamin
 
 spec :: Spec
 spec = describe "canonical transactions" $ do
-  xfail "transaction execution follows in the implementation" $ it "supports nested synchronous unlifting between protocol operations" $
+  it "supports nested synchronous unlifting between protocol operations" $
     withResponse ordinary $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
         cursor <- Tx.pipeline (Tx.statement () bodyStatement)
@@ -51,7 +51,7 @@ spec = describe "canonical transactions" $ do
               _ -> failTest "nested unlift lost its row"
         Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "preserves a caught lifted exception and permits subsequent protocol work" $
+  it "preserves a caught lifted exception and permits subsequent protocol work" $
     withResponse ordinary $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
         marker <- liftIO (newIORef ())
@@ -63,7 +63,7 @@ spec = describe "canonical transactions" $ do
         _ <- Tx.pipeline (Tx.statement () bodyStatement)
         Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "preserves unlifted exception identity through rollback and session reuse" $ do
+  it "preserves unlifted exception identity through rollback and session reuse" $ do
     marker <- newIORef ()
     let rolledBack = command "BEGIN" <> rows [[Just payload]] <> readyTx <> command "ROLLBACK" <> ready
     withResponse (rolledBack <> ordinary) $ \context _ -> do
@@ -77,7 +77,7 @@ spec = describe "canonical transactions" $ do
         _ <- Tx.pipeline (Tx.statement () bodyStatement)
         Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "keeps the owning protocol guard after rejected parameter callback reentry" $ do
+  it "keeps the owning protocol guard after rejected parameter callback reentry" $ do
     connection <- withResponse (command "BEGIN" <> command "SELECT 1" <> readyTx <> command "COMMIT" <> ready) $ \context _ -> do
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         attempted <- newIORef (0 :: Int)
@@ -96,9 +96,9 @@ spec = describe "canonical transactions" $ do
         run Tx.finishTransaction
         readIORef attempted `shouldReturn` 2
       pure (contextConnection context)
-    Session.isConnectionUsable connection `shouldReturn` True
+    Session.isUsable connection `shouldReturn` True
 
-  xfail "transaction execution follows in the implementation" $ it "guards parameter callbacks resumed while cleaning up an unfinished scope" $ do
+  it "guards parameter callbacks resumed while cleaning up an unfinished scope" $ do
     attempted <- newIORef (0 :: Int)
     remaining <- newIORef "x"
     connection <- withDeferredResponse (command "BEGIN" <> command "SELECT 1" <> readyTx <> command "ROLLBACK" <> ready) $ \context _ -> do
@@ -117,9 +117,9 @@ spec = describe "canonical transactions" $ do
         readIORef attempted `shouldReturn` 0
       readIORef attempted `shouldReturn` 2
       pure (contextConnection context)
-    Session.isConnectionUsable connection `shouldReturn` True
+    Session.isUsable connection `shouldReturn` True
 
-  xfail "transaction execution follows in the implementation" $ it "keeps a caught parameter callback failure from making the session reusable" $ do
+  it "keeps a caught parameter callback failure from making the session reusable" $ do
     opened <- newIORef Nothing
     outcome <- try @ConnectionError $ withResponse ordinary $ \context _ -> do
       writeIORef opened (Just (contextConnection context))
@@ -138,10 +138,10 @@ spec = describe "canonical transactions" $ do
       Right _ -> pure ()
     connection <- readIORef opened
     case connection of
-      Just value -> Session.isConnectionUsable value `shouldReturn` False
+      Just value -> Session.isUsable value `shouldReturn` False
       Nothing -> failTest "transaction context did not open"
 
-  xfail "transaction execution follows in the implementation" $ it "poisons a producer failure even when it uses a recoverable public exception type" $ do
+  it "poisons a producer failure even when it uses a recoverable public exception type" $ do
     opened <- newIORef Nothing
     outcome <- try @ConnectionError $ withDeferredResponse ordinary $ \context _ -> do
       writeIORef opened (Just (contextConnection context))
@@ -164,10 +164,10 @@ spec = describe "canonical transactions" $ do
       Right _ -> pure ()
     connection <- readIORef opened
     case connection of
-      Just value -> Session.isConnectionUsable value `shouldReturn` False
+      Just value -> Session.isUsable value `shouldReturn` False
       Nothing -> failTest "transaction context did not open"
 
-  xfail "transaction execution follows in the implementation" $ it "poisons a parse observer failure even when it uses a recoverable public exception type" $ do
+  it "poisons a parse observer failure even when it uses a recoverable public exception type" $ do
     let response = command "BEGIN" <> command "SELECT 1" <> readyTx <> command "ROLLBACK" <> ready
         prepare _ _ = pure (Tx.PrepareAs "named" (throwIO (SessionUnusable "observer marker")))
         query = Tx.Statement "SELECT 1" (const []) Tx.noResult True
@@ -182,9 +182,9 @@ spec = describe "canonical transactions" $ do
           Left (SessionUnusable _) -> pure ()
           _ -> failTest "caught parse observer failure allowed another operation"
       pure (contextConnection context)
-    Session.isConnectionUsable connection `shouldReturn` False
+    Session.isUsable connection `shouldReturn` False
 
-  xfail "transaction execution follows in the implementation" $ it "finishes an empty scope without reading or writing the transport" $ do
+  it "finishes an empty scope without reading or writing the transport" $ do
     readCalls <- newIORef (0 :: Int)
     writes <- newIORef (0 :: Int)
     withResponseCallbacks (const (modifyIORef' readCalls (+ 1))) (const (modifyIORef' writes (+ 1))) "" $ \context _ ->
@@ -193,7 +193,7 @@ spec = describe "canonical transactions" $ do
     readIORef readCalls `shouldReturn` 0
     readIORef writes `shouldReturn` 0
 
-  xfail "transaction execution follows in the implementation" $ it "preserves preparation, wire and cursor order across applicative association" $ do
+  it "preserves preparation, wire and cursor order across applicative association" $ do
     prepared <- newIORef []
     parsed <- newIORef []
     sent <- newIORef BS.empty
@@ -224,7 +224,7 @@ spec = describe "canonical transactions" $ do
     map (`BS.isInfixOf` bytes) wireQueries `shouldBe` replicate 6 True
     positions `shouldBe` sort positions
 
-  xfail "transaction execution follows in the implementation" $ it "isolates pending statements between empty and repeated pipeline plans" $ do
+  it "isolates pending statements between empty and repeated pipeline plans" $ do
     sent <- newIORef BS.empty
     let response = command "BEGIN" <> readyTx <> rows [[Just "first"]] <> readyTx
           <> rows [[Just "second"]] <> readyTx <> command "COMMIT" <> ready
@@ -246,20 +246,20 @@ spec = describe "canonical transactions" $ do
     BS.null second `shouldBe` False
     BS.isInfixOf "SELECT repeated" (BS.drop (BS.length "SELECT repeated") second) `shouldBe` False
 
-  xfail "transaction execution follows in the implementation" $ it "scales allocation linearly for left-associated pipeline composition" $ do
+  it "scales allocation linearly for left-associated pipeline composition" $ do
     small <- pipelineAllocation 1000
     large <- pipelineAllocation 4000
     -- A fourfold batch leaves room for fixed costs while rejecting quadratic growth.
     unless (large < small * 7) $
       failTest ("pipeline allocation grew from " <> show small <> " to " <> show large <> " bytes")
 
-  xfail "transaction execution follows in the implementation" $ it "keeps bounded output allocation below six megabytes for a thousand statements" $ do
-    output <- newBuffer 256
+  it "keeps bounded output allocation below six megabytes for a thousand statements" $ do
+    output <- newBuffer (positiveInt @256)
     allocated <- pipelineAllocationWith output 1000
     unless (allocated < 6000000) $
       failTest ("bounded pipeline allocated " <> show allocated <> " bytes")
 
-  xfail "transaction execution follows in the implementation" $ it "collects owned and streamed results in one ordered pipeline" $
+  it "collects owned and streamed results in one ordered pipeline" $
     withResponse (command "BEGIN" <> rows [[Just payload]] <> rows [[Just payload]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const) False
@@ -273,7 +273,7 @@ spec = describe "canonical transactions" $ do
         readIORef received `shouldReturn` payload
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "rolls back an owned collector's scope unless completion is explicit" $ do
+  it "rolls back an owned collector's scope unless completion is explicit" $ do
     sent <- newIORef BS.empty
     let response = command "BEGIN" <> rows [[Just payload]] <> readyTx <> command "ROLLBACK" <> ready
         record chunks = modifyIORef' sent (<> BS.concat chunks)
@@ -286,7 +286,7 @@ spec = describe "canonical transactions" $ do
     BS.isInfixOf "ROLLBACK\0" bytes `shouldBe` True
     BS.isInfixOf "COMMIT\0" bytes `shouldBe` False
 
-  xfail "transaction execution follows in the implementation" $ it "collects owned rows in order" $
+  it "collects owned rows in order" $
     withResponse (command "BEGIN" <> rows [[Just "first"], [Just "second"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const) False
@@ -294,7 +294,7 @@ spec = describe "canonical transactions" $ do
         run (Tx.rowList cursor) `shouldReturn` ["first", "second"]
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "checks owned cardinality before allowing transaction completion" $
+  it "checks owned cardinality before allowing transaction completion" $
     withResponse (command "BEGIN" <> rows [[Just "first"], [Just "second"]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ -> do
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let owned = Tx.Statement "SELECT owned" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const)) False
@@ -305,7 +305,7 @@ spec = describe "canonical transactions" $ do
         Left (PG.QueryError "SELECT owned" (PG.UnexpectedAmountOfRows 2)) -> pure ()
         _ -> failTest "owned collector accepted extra rows"
 
-  xfail "transaction execution follows in the implementation" $ it "reports extra owned rows before decoding their malformed columns" $
+  it "reports extra owned rows before decoding their malformed columns" $
     forM_ [False, True] $ \optional ->
       withResponse (command "BEGIN" <> rows [[Just (number 7)], [Just "x"]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ -> do
         result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
@@ -320,7 +320,7 @@ spec = describe "canonical transactions" $ do
           Left (PG.QueryError "SELECT owned" (PG.UnexpectedAmountOfRows 2)) -> pure ()
           _ -> failTest "extra-row decoding hid the owned cardinality error"
 
-  xfail "transaction execution follows in the implementation" $ it "reports the same late statement failure through an owned collector" $
+  it "reports the same late statement failure through an owned collector" $
     withResponse (command "BEGIN" <> parse <> bind <> dataRow [Just payload] <> lateError <> readyFailed <> command "ROLLBACK" <> ready) $ \context _ -> do
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const) False
@@ -331,7 +331,7 @@ spec = describe "canonical transactions" $ do
         Left (PG.QueryError "SELECT owned" (PG.ServerFailed _)) -> pure ()
         _ -> failTest "owned collector lost the late statement failure"
 
-  xfail "transaction execution follows in the implementation" $ it "returns a pipeline cursor before reading any results" $ do
+  it "returns a pipeline cursor before reading any results" $ do
     readCount <- newIORef (0 :: Int)
     withResponseObserved (const (modifyIORef' readCount (+ 1))) ordinary $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
@@ -339,7 +339,7 @@ spec = describe "canonical transactions" $ do
         readIORef readCount `shouldReturn` 0
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "pulls rows and borrowed chunks and finishes inside the caller callback" $ do
+  it "pulls rows and borrowed chunks and finishes inside the caller callback" $ do
     owner <- myThreadId
     withResponseObserved (const (myThreadId >>= (`shouldBe` owner))) ordinary $ \context input ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
@@ -357,7 +357,7 @@ spec = describe "canonical transactions" $ do
         run Tx.finishTransaction
         myThreadId `shouldReturn` owner
 
-  xfail "transaction execution follows in the implementation" $ it "preserves owned metadata while the body reuses input" $
+  it "preserves owned metadata while the body reuses input" $
     withResponse (command "BEGIN" <> rows [[Just payload, Just payload]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let query = Tx.Statement "SELECT metadata, body" (const [])
@@ -371,7 +371,7 @@ spec = describe "canonical transactions" $ do
           _ -> failTest "missing metadata row"
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "drains skipped earlier results before pulling a later cursor" $
+  it "drains skipped earlier results before pulling a later cursor" $
     withResponse (command "BEGIN" <> rows [[Just payload]] <> rows [[Just "last"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         (_, cursor) <- run (Tx.pipeline ((,) <$> Tx.statement () bodyStatement <*> Tx.statement () bodyStatement))
@@ -381,7 +381,7 @@ spec = describe "canonical transactions" $ do
           _ -> failTest "missing later row"
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "rejects a field after its row advances" $
+  it "rejects a field after its row advances" $
     withResponse (command "BEGIN" <> rows [[Just "first"], [Just "second"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let query = Tx.Statement "SELECT body" (const []) (Tx.streamingRow @'[] Body) False
@@ -395,7 +395,7 @@ spec = describe "canonical transactions" $ do
           _ -> failTest "missing first field"
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "checks extra-row cardinality while finishing an unconsumed result" $
+  it "checks extra-row cardinality while finishing an unconsumed result" $
     withResponse (command "BEGIN" <> rows [[Just "one"], [Just "two"]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ -> do
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
@@ -404,7 +404,7 @@ spec = describe "canonical transactions" $ do
         Left (PG.QueryError _ (PG.UnexpectedAmountOfRows 2)) -> pure ()
         _ -> failTest "extra row was accepted"
 
-  xfail "transaction execution follows in the implementation" $ it "reports a late server failure after field EOF" $
+  it "reports a late server failure after field EOF" $
     withResponse (command "BEGIN" <> parse <> bind <> dataRow [Just payload] <> lateError <> readyFailed <> command "ROLLBACK" <> ready) $ \context _ -> do
       delivered <- newIORef False
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
@@ -418,32 +418,32 @@ spec = describe "canonical transactions" $ do
       readIORef delivered `shouldReturn` True
       case result of Left (PG.QueryError _ (PG.ServerFailed _)) -> pure (); _ -> failTest "late error was lost"
 
-  xfail "transaction execution follows in the implementation" $ it "reports COMMIT errors synchronously from finishTransaction" $
+  it "reports COMMIT errors synchronously from finishTransaction" $
     withResponse (command "BEGIN" <> rows [[Just payload]] <> readyTx <> parse <> bind <> lateError <> readyFailed <> command "ROLLBACK" <> ready) $ \context _ -> do
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
         run Tx.finishTransaction
       case result of Left (PG.QueryError "COMMIT" (PG.ServerFailed _)) -> pure (); _ -> failTest "COMMIT error was lost"
 
-  xfail "transaction execution follows in the implementation" $ it "observes a final pipeline ending without sending a second ending" $
+  it "observes a final pipeline ending without sending a second ending" $
     withResponse (command "BEGIN" <> rows [[Just payload]] <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         _ <- run (Tx.finalPipeline (Tx.statement () bodyStatement))
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "rolls back a scope that returns without finishing" $
+  it "rolls back a scope that returns without finishing" $
     withResponse (command "BEGIN" <> rows [[Just payload]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run ->
         void (run (Tx.pipeline (Tx.statement () bodyStatement)))
 
-  xfail "transaction execution follows in the implementation" $ it "uses ROLLBACK after condemnation" $
+  it "uses ROLLBACK after condemnation" $
     withResponse (command "BEGIN" <> rows [[Just payload]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
         run Tx.condemn
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "rejects new statements after an explicit finish" $
+  it "rejects new statements after an explicit finish" $
     withResponse ordinary $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
@@ -451,7 +451,7 @@ spec = describe "canonical transactions" $ do
         result <- try @ConnectionError (run (Tx.sql "BEGIN"))
         case result of Left (SessionUnusable _) -> pure (); _ -> failTest "statement ran after finish"
 
-  xfail "transaction execution follows in the implementation" $ it "does not drain again after cancellation while waiting for the first row" $ do
+  it "does not drain again after cancellation while waiting for the first row" $ do
     blocked <- newEmptyMVar
     gate <- newEmptyMVar
     stopped <- newEmptyMVar
@@ -469,7 +469,7 @@ spec = describe "canonical transactions" $ do
       isNothing completed `shouldBe` False)
       `finally` killThread worker
 
-  xfail "transaction execution follows in the implementation" $ it "does not drain again after cancellation during a field refill" $ do
+  it "does not drain again after cancellation during a field refill" $ do
     blocked <- newEmptyMVar
     gate <- newEmptyMVar
     stopped <- newEmptyMVar
@@ -490,7 +490,7 @@ spec = describe "canonical transactions" $ do
       isNothing completed `shouldBe` False)
       `finally` killThread worker
 
-  xfail "transaction execution follows in the implementation" $ it "propagates cancellation while an unfinished scope is being rolled back" $ do
+  it "propagates cancellation while an unfinished scope is being rolled back" $ do
     blocked <- newEmptyMVar
     gate <- newEmptyMVar
     stopped <- newEmptyMVar
@@ -509,7 +509,7 @@ spec = describe "canonical transactions" $ do
         _ -> failTest "rollback cleanup swallowed cancellation")
       `finally` killThread worker
 
-  xfail "transaction execution follows in the implementation" $ it "abandons pending input after a callback IO failure" $ do
+  it "abandons pending input after a callback IO failure" $ do
     readStarted <- newIORef False
     gate <- newEmptyMVar
     stopped <- newEmptyMVar
@@ -530,11 +530,11 @@ spec = describe "canonical transactions" $ do
       readIORef readStarted `shouldReturn` False
       connection <- readIORef connectionRef
       case connection of
-        Just value -> Session.isConnectionUsable value `shouldReturn` False
+        Just value -> Session.isUsable value `shouldReturn` False
         Nothing -> failTest "callback did not start")
       `finally` killThread worker
 
-  xfail "transaction execution follows in the implementation" $ it "preserves a finished transaction after a later callback IO failure" $ do
+  it "preserves a finished transaction after a later callback IO failure" $ do
     connection <- withResponse ordinary $ \context _ -> do
       result <- try @IOException $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
@@ -542,9 +542,9 @@ spec = describe "canonical transactions" $ do
         ioError (userError "HTTP tail send failed")
       case result of Left _ -> pure (); Right () -> failTest "callback failure was lost"
       pure (contextConnection context)
-    Session.isConnectionUsable connection `shouldReturn` True
+    Session.isUsable connection `shouldReturn` True
 
-  xfail "transaction execution follows in the implementation" $ it "rolls back an ordinary callback exception before releasing the session" $ do
+  it "rolls back an ordinary callback exception before releasing the session" $ do
     connection <- withResponse (command "BEGIN" <> rows [[Just payload]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ -> do
       result <- try @ErrorCall $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
@@ -553,9 +553,9 @@ spec = describe "canonical transactions" $ do
         Left (ErrorCall detail) -> detail `shouldBe` "application callback failed"
         Right () -> failTest "callback failure was lost"
       pure (contextConnection context)
-    Session.isConnectionUsable connection `shouldReturn` True
+    Session.isUsable connection `shouldReturn` True
 
-  xfail "transaction execution follows in the implementation" $ it "rolls back an ordinary lifted exception and reuses the same session" $ do
+  it "rolls back an ordinary lifted exception and reuses the same session" $ do
     let rolledBack = command "BEGIN" <> rows [[Just payload]] <> readyTx <> command "ROLLBACK" <> ready
     connection <- withResponse (rolledBack <> ordinary) $ \context _ -> do
       result <- try @ErrorCall $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run ->
@@ -569,9 +569,9 @@ spec = describe "canonical transactions" $ do
         _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
         run Tx.finishTransaction
       pure (contextConnection context)
-    Session.isConnectionUsable connection `shouldReturn` True
+    Session.isUsable connection `shouldReturn` True
 
-  xfail "transaction execution follows in the implementation" $ it "still breaks the session when a parameter source throws an ordinary exception" $ do
+  it "still breaks the session when a parameter source throws an ordinary exception" $ do
     opened <- newIORef Nothing
     let source = ParameterStream (ByteStream 8 (throwIO (ErrorCall "parameter source failed")))
         query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult False
@@ -585,10 +585,10 @@ spec = describe "canonical transactions" $ do
       Right () -> failTest "parameter source failure was lost"
     connection <- readIORef opened
     case connection of
-      Just value -> Session.isConnectionUsable value `shouldReturn` False
+      Just value -> Session.isUsable value `shouldReturn` False
       Nothing -> failTest "connection did not open"
 
-  xfail "transaction execution follows in the implementation" $ it "folds streamed rows by pulling their fields inside the same runner" $
+  it "folds streamed rows by pulling their fields inside the same runner" $
     withResponse (command "BEGIN" <> rows [[Just "first"], [Just "second"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let query = Tx.Statement "SELECT bodies" (const []) (Tx.streamingRow @'[] Body) False
@@ -606,7 +606,7 @@ spec = describe "canonical transactions" $ do
         run (Tx.foldRows step [] cursor) `shouldReturn` ["first", "second"]
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "rejects a runner used on another thread without disturbing its owner" $
+  it "rejects a runner used on another thread without disturbing its owner" $
     withResponse ordinary $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         cursor <- run (Tx.pipeline (Tx.statement () bodyStatement))
@@ -620,7 +620,7 @@ spec = describe "canonical transactions" $ do
           Right _ -> failTest "another thread used the cursor"
         run Tx.finishTransaction
 
-  xfail "transaction execution follows in the implementation" $ it "keeps the session reusable after a server failure and rollback" $ do
+  it "keeps the session reusable after a server failure and rollback" $ do
     let failed = command "BEGIN" <> parse <> bind <> lateError <> readyFailed <> command "ROLLBACK" <> ready
     connection <- withResponse (failed <> ordinary) $ \context _ -> do
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
@@ -631,25 +631,25 @@ spec = describe "canonical transactions" $ do
         _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
         run Tx.finishTransaction
       pure (contextConnection context)
-    Session.isConnectionUsable connection `shouldReturn` True
+    Session.isUsable connection `shouldReturn` True
 
-  xfail "transaction execution follows in the implementation" $ it "does not resurrect a caught transport failure" $ do
+  it "does not resurrect a caught transport failure" $ do
     connection <- withResponse "" $ \context _ -> do
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         cursor <- run (Tx.pipeline (Tx.statement () bodyStatement))
         result <- try @ConnectionError (run (Tx.nextRow cursor))
         case result of Left _ -> pure (); Right _ -> failTest "truncated transport was accepted"
       pure (contextConnection context)
-    Session.isConnectionUsable connection `shouldReturn` False
+    Session.isUsable connection `shouldReturn` False
 
-  xfail "transaction execution follows in the implementation" $ it "keeps lifted IO raw when an unlifted callback outlives its database scope" $ do
+  it "keeps lifted IO raw when an unlifted callback outlives its database scope" $ do
     calls <- newIORef (0 :: Int)
     join $ withResponse "" $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run ->
         pure (run (liftIO (modifyIORef' calls (+ 1))))
     readIORef calls `shouldReturn` 1
 
-  xfail "transaction execution follows in the implementation" $ it "expires an escaped runner" $
+  it "expires an escaped runner" $
     withResponse "" $ \context _ -> do
       escaped <- Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run ->
         pure (run Tx.finishTransaction)
@@ -658,7 +658,7 @@ spec = describe "canonical transactions" $ do
 
 pipelineAllocation :: Int -> IO Integer
 pipelineAllocation count = do
-  output <- newBuffer 16
+  output <- newBuffer (positiveInt @16)
   pipelineAllocationWith output count
 
 pipelineAllocationWith :: Buffer -> Int -> IO Integer
@@ -729,12 +729,12 @@ withDeferredResponse = withResponseCallbacksMode True (const (pure ())) (const (
 
 withResponseCallbacksMode :: Bool -> (Int -> IO ()) -> ([BS.ByteString] -> IO ()) -> BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
 withResponseCallbacksMode defer observe sent response action = do
-  output <- newBuffer 16
+  output <- newBuffer (positiveInt @16)
   withResponseCallbacksBuffer output defer observe sent response action
 
 withResponseCallbacksBuffer :: Buffer -> Bool -> (Int -> IO ()) -> ([BS.ByteString] -> IO ()) -> BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
 withResponseCallbacksBuffer output defer observe sent response action = do
-  input <- newBuffer 16
+  input <- newBuffer (positiveInt @16)
   remaining <- newIORef response
   let receive pointer size = do
         bytes <- readIORef remaining

@@ -20,7 +20,7 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.String (IsString (..))
 import Database.PostgreSQL.Encoders (NullableOrNot)
 import qualified Database.PostgreSQL.Encoders as Encoders
-import Database.PostgreSQL.Transaction (Param, Result, Statement (..))
+import Database.PostgreSQL.Transaction (Param, RowDecoder, Statement (..))
 
 -- | Text and parameters, in order. Appending is cheap, whatever the sizes.
 newtype Snippet = Snippet ([Chunk] -> [Chunk])
@@ -59,7 +59,7 @@ render (Snippet chunks) = finish (foldl' step (1 :: Int, mempty, id) (chunks [])
     finish (_, query, parameters) = (LBS.toStrict (Builder.toLazyByteString query), parameters [])
 
 -- | A statement of the snippet, whose parameters are all in it.
-dynamicallyParameterized :: Snippet -> Result a -> Bool -> Statement () a
+dynamicallyParameterized :: Snippet -> RowDecoder row -> Bool -> Statement () row
 dynamicallyParameterized snippet result preparable =
   let (query, parameters) = render snippet
    in Statement query (const parameters) result preparable

@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Database.PostgreSQL.Internal.Protocol.Messages.FrontendSession
@@ -13,26 +14,26 @@ module Database.PostgreSQL.Internal.Protocol.Messages.FrontendSession
     QueryType (QueryType),
     SyncType (SyncType),
     TerminateType (TerminateType),
-    BindEnvelope,
-    CloseEnvelope,
-    DescribeEnvelope,
-    ExecuteEnvelope,
-    FlushEnvelope,
-    FunctionCallEnvelope,
-    ParseEnvelope,
-    QueryEnvelope,
-    SyncEnvelope,
-    TerminateEnvelope,
-    Bind (Bind),
-    Close (Close),
-    Describe (Describe),
-    Execute (Execute),
-    Flush (Flush),
-    FunctionCall (FunctionCall),
-    Parse (Parse),
-    Query (Query),
-    Sync (Sync),
-    Terminate (Terminate),
+    Bind,
+    pattern Bind,
+    Close,
+    pattern Close,
+    Describe,
+    pattern Describe,
+    Execute,
+    pattern Execute,
+    Flush,
+    pattern Flush,
+    FunctionCall,
+    pattern FunctionCall,
+    Parse,
+    pattern Parse,
+    Query,
+    pattern Query,
+    Sync,
+    pattern Sync,
+    Terminate,
+    pattern Terminate,
   )
 where
 
@@ -47,7 +48,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload
 import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( BindBody,
     BindBodyType (BindBodyType),
-    Envelope,
+    Envelope (..),
     FormatCode,
     FormatCodeType (FormatCodeType),
     NamedObject,
@@ -131,98 +132,111 @@ data TerminateType (payload :: Payload) where
     TerminateType
       (FrontendSessionMessage 'X' Empty)
 
-newtype Bind bytes = Bind (BindBody bytes)
+newtype BindPayload bytes = BindPayload (BindBody bytes)
 
-deriving instance Eq bytes => Eq (Bind bytes)
-deriving instance Show bytes => Show (Bind bytes)
+deriving instance Eq bytes => Eq (BindPayload bytes)
+deriving instance Show bytes => Show (BindPayload bytes)
 
-type BindEnvelope bytes =
-  Envelope
-    (Bind bytes)
-    'BindType
+type Bind bytes = Envelope (BindPayload bytes) 'BindType
+
+pattern Bind :: BindBody bytes -> Bind bytes
+pattern Bind body = Envelope (BindPayload body)
+
+{-# COMPLETE Bind #-}
 
 instance HasConstructor 'BindType (Bind bytes) where
   type ConstructorOf 'BindType (Bind bytes) r = BindBody bytes -> r
   constructorOf = Bind
   destructorOf (Bind body) k = k body
 
-data Close bytes = Close
+data ClosePayload bytes = ClosePayload
   NamedObject
   bytes
 
-deriving instance Eq bytes => Eq (Close bytes)
-deriving instance Show bytes => Show (Close bytes)
+deriving instance Eq bytes => Eq (ClosePayload bytes)
+deriving instance Show bytes => Show (ClosePayload bytes)
 
-type CloseEnvelope bytes =
-  Envelope
-    (Close bytes)
-    'CloseType
+type Close bytes = Envelope (ClosePayload bytes) 'CloseType
+
+pattern Close :: NamedObject -> bytes -> Close bytes
+pattern Close object name = Envelope (ClosePayload object name)
+
+{-# COMPLETE Close #-}
 
 instance HasConstructor 'CloseType (Close bytes) where
   type ConstructorOf 'CloseType (Close bytes) r = NamedObject -> bytes -> r
   constructorOf = Close
   destructorOf (Close object name) k = k object name
 
-data Describe bytes = Describe
+data DescribePayload bytes = DescribePayload
   NamedObject
   bytes
 
-deriving instance Eq bytes => Eq (Describe bytes)
-deriving instance Show bytes => Show (Describe bytes)
+deriving instance Eq bytes => Eq (DescribePayload bytes)
+deriving instance Show bytes => Show (DescribePayload bytes)
 
-type DescribeEnvelope bytes =
-  Envelope
-    (Describe bytes)
-    'DescribeType
+type Describe bytes = Envelope (DescribePayload bytes) 'DescribeType
+
+pattern Describe :: NamedObject -> bytes -> Describe bytes
+pattern Describe object name = Envelope (DescribePayload object name)
+
+{-# COMPLETE Describe #-}
 
 instance HasConstructor 'DescribeType (Describe bytes) where
   type ConstructorOf 'DescribeType (Describe bytes) r = NamedObject -> bytes -> r
   constructorOf = Describe
   destructorOf (Describe object name) k = k object name
 
-data Execute bytes = Execute bytes Int32
+data ExecutePayload bytes = ExecutePayload bytes Int32
 
-deriving instance Eq bytes => Eq (Execute bytes)
-deriving instance Show bytes => Show (Execute bytes)
+deriving instance Eq bytes => Eq (ExecutePayload bytes)
+deriving instance Show bytes => Show (ExecutePayload bytes)
 
-type ExecuteEnvelope bytes =
-  Envelope
-    (Execute bytes)
-    'ExecuteType
+type Execute bytes = Envelope (ExecutePayload bytes) 'ExecuteType
+
+pattern Execute :: bytes -> Int32 -> Execute bytes
+pattern Execute portalName maxRows = Envelope (ExecutePayload portalName maxRows)
+
+{-# COMPLETE Execute #-}
 
 instance HasConstructor 'ExecuteType (Execute bytes) where
   type ConstructorOf 'ExecuteType (Execute bytes) r = bytes -> Int32 -> r
   constructorOf = Execute
   destructorOf (Execute portalName maxRows) k = k portalName maxRows
 
-data Flush = Flush
+data FlushPayload = FlushPayload
 
-deriving instance Eq Flush
-deriving instance Show Flush
+deriving instance Eq FlushPayload
+deriving instance Show FlushPayload
 
-type FlushEnvelope =
-  Envelope
-    Flush
-    'FlushType
+type Flush = Envelope FlushPayload 'FlushType
+
+pattern Flush :: Flush
+pattern Flush = Envelope FlushPayload
+
+{-# COMPLETE Flush #-}
 
 instance HasConstructor 'FlushType Flush where
   type ConstructorOf 'FlushType Flush r = r
   constructorOf = Flush
   destructorOf Flush k = k
 
-data FunctionCall bytes = FunctionCall
+data FunctionCallPayload bytes = FunctionCallPayload
   Oid
   [FormatCode]
   [Maybe bytes]
   FormatCode
 
-deriving instance Eq bytes => Eq (FunctionCall bytes)
-deriving instance Show bytes => Show (FunctionCall bytes)
+deriving instance Eq bytes => Eq (FunctionCallPayload bytes)
+deriving instance Show bytes => Show (FunctionCallPayload bytes)
 
-type FunctionCallEnvelope bytes =
-  Envelope
-    (FunctionCall bytes)
-    'FunctionCallType
+type FunctionCall bytes = Envelope (FunctionCallPayload bytes) 'FunctionCallType
+
+pattern FunctionCall :: Oid -> [FormatCode] -> [Maybe bytes] -> FormatCode -> FunctionCall bytes
+pattern FunctionCall function argumentFormats arguments resultFormat =
+  Envelope (FunctionCallPayload function argumentFormats arguments resultFormat)
+
+{-# COMPLETE FunctionCall #-}
 
 instance HasConstructor 'FunctionCallType (FunctionCall bytes) where
   type ConstructorOf 'FunctionCallType (FunctionCall bytes) r = Oid -> [FormatCode] -> [Maybe bytes] -> FormatCode -> r
@@ -230,60 +244,68 @@ instance HasConstructor 'FunctionCallType (FunctionCall bytes) where
   destructorOf (FunctionCall function argumentFormats arguments resultFormat) k =
     k function argumentFormats arguments resultFormat
 
-data Parse bytes = Parse bytes bytes [OptionalOid]
+data ParsePayload bytes = ParsePayload bytes bytes [OptionalOid]
 
-deriving instance Eq bytes => Eq (Parse bytes)
-deriving instance Show bytes => Show (Parse bytes)
+deriving instance Eq bytes => Eq (ParsePayload bytes)
+deriving instance Show bytes => Show (ParsePayload bytes)
 
-type ParseEnvelope bytes =
-  Envelope
-    (Parse bytes)
-    'ParseType
+type Parse bytes = Envelope (ParsePayload bytes) 'ParseType
+
+pattern Parse :: bytes -> bytes -> [OptionalOid] -> Parse bytes
+pattern Parse statementName query parameterTypes = Envelope (ParsePayload statementName query parameterTypes)
+
+{-# COMPLETE Parse #-}
 
 instance HasConstructor 'ParseType (Parse bytes) where
   type ConstructorOf 'ParseType (Parse bytes) r = bytes -> bytes -> [OptionalOid] -> r
   constructorOf = Parse
   destructorOf (Parse statementName query parameterTypes) k = k statementName query parameterTypes
 
-newtype Query bytes = Query bytes
+newtype QueryPayload bytes = QueryPayload bytes
 
-deriving instance Eq bytes => Eq (Query bytes)
-deriving instance Show bytes => Show (Query bytes)
+deriving instance Eq bytes => Eq (QueryPayload bytes)
+deriving instance Show bytes => Show (QueryPayload bytes)
 
-type QueryEnvelope bytes =
-  Envelope
-    (Query bytes)
-    'QueryType
+type Query bytes = Envelope (QueryPayload bytes) 'QueryType
+
+pattern Query :: bytes -> Query bytes
+pattern Query query = Envelope (QueryPayload query)
+
+{-# COMPLETE Query #-}
 
 instance HasConstructor 'QueryType (Query bytes) where
   type ConstructorOf 'QueryType (Query bytes) r = bytes -> r
   constructorOf = Query
   destructorOf (Query query) k = k query
 
-data Sync = Sync
+data SyncPayload = SyncPayload
 
-deriving instance Eq Sync
-deriving instance Show Sync
+deriving instance Eq SyncPayload
+deriving instance Show SyncPayload
 
-type SyncEnvelope =
-  Envelope
-    Sync
-    'SyncType
+type Sync = Envelope SyncPayload 'SyncType
+
+pattern Sync :: Sync
+pattern Sync = Envelope SyncPayload
+
+{-# COMPLETE Sync #-}
 
 instance HasConstructor 'SyncType Sync where
   type ConstructorOf 'SyncType Sync r = r
   constructorOf = Sync
   destructorOf Sync k = k
 
-data Terminate = Terminate
+data TerminatePayload = TerminatePayload
 
-deriving instance Eq Terminate
-deriving instance Show Terminate
+deriving instance Eq TerminatePayload
+deriving instance Show TerminatePayload
 
-type TerminateEnvelope =
-  Envelope
-    Terminate
-    'TerminateType
+type Terminate = Envelope TerminatePayload 'TerminateType
+
+pattern Terminate :: Terminate
+pattern Terminate = Envelope TerminatePayload
+
+{-# COMPLETE Terminate #-}
 
 instance HasConstructor 'TerminateType Terminate where
   type ConstructorOf 'TerminateType Terminate r = r

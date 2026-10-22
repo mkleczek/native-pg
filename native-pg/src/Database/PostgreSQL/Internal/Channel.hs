@@ -21,7 +21,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Word (Word8)
-import qualified Network.Streaming.Resources.Internal as Buffer
+import qualified Network.Streaming.Buffer as Buffer
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Writer, WriteResult (..), outputWriter, runWriter)
 import Database.PostgreSQL.Internal.Protocol.Codec
   ( ByteStream (..),

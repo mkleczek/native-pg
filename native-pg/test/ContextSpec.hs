@@ -14,6 +14,8 @@ import Database.PostgreSQL.Internal.Buffer
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Protocol (TransactionStatus (..))
 import qualified Database.PostgreSQL.Session as PG
+import qualified Database.PostgreSQL.Internal.Execution as PG
+import qualified Database.PostgreSQL.Internal.Row as PG
 import Database.PostgreSQL.Transport hiding (newChannel)
 import Database.PostgreSQL.Internal.Channel
 import Foreign.ForeignPtr (withForeignPtr, plusForeignPtr)
@@ -55,13 +57,13 @@ spec = describe "explicit operation contexts" $ do
     values `shouldBe` replicate 2 (Right (["abc"], "SELECT 1"), TxIdle)
     readIORef remaining `shouldReturn` BS.empty
     readIORef supplied `shouldReturn` True
-    PG.isConnectionUsable connection `shouldReturn` True
+    PG.isUsable connection `shouldReturn` True
 
-  xfail "completed owned operations must preserve a marked-broken connection" $ it "preserves a connection marked broken inside a completed owned operation" $ do
+  it "preserves a connection marked broken inside a completed owned operation" $ do
     connection <- newConnection idleChannel 16
     context <- newOwnedContext connection
     runContextOperation context (breakConnection connection)
-    PG.isConnectionUsable connection `shouldReturn` False
+    PG.isUsable connection `shouldReturn` False
 
 
   it "expires escaped contexts before the storage can be reused" $ do
@@ -139,7 +141,7 @@ spec = describe "explicit operation contexts" $ do
     rejected input
     rejected overlap
     readIORef entered `shouldReturn` False
-    PG.isConnectionUsable connection `shouldReturn` True
+    PG.isUsable connection `shouldReturn` True
 
 reply :: BS.ByteString
 reply = "2\0\0\0\4D\0\0\0\13\0\1\0\0\0\3abcC\0\0\0\13SELECT 1\0Z\0\0\0\5I"
