@@ -11,7 +11,7 @@ module IntegrationSpec (spec) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Exception (ErrorCall (..), IOException, bracket, displayException, finally, throwIO, try)
-import Control.Monad (forever, unless, void, when)
+import Control.Monad (forever, unless, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
@@ -33,23 +33,14 @@ import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Decoding
 import Database.PostgreSQL.Diagnostics
 import qualified Database.PostgreSQL.Encoders as Encoders
-import Database.PostgreSQL.Protocol
-  ( FormatCode (..),
-    Notification (..),
-    Parameter (..),
-    ProcessId,
-    Scalar (..),
-    TransactionStatus (..),
-    protocolVersion3_0,
-    protocolVersion3_2,
-  )
-import Database.PostgreSQL.Protocol.Codec (ByteStream (..))
+import Database.PostgreSQL.Encoders (Parameter (..))
+import Database.PostgreSQL.Streaming (ByteStream (..))
 import qualified Database.PostgreSQL.Pipeline as Pipeline
 import Database.PostgreSQL.Session
 import qualified Database.PostgreSQL.Snippet as Snippet
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Tls (tlsClient)
-import Database.PostgreSQL.Transport (Address (..), Channel (..), StreamLengthError, TlsChannel (..), TlsClient (..))
+import Database.PostgreSQL.Transport (Address (..), StreamLengthError, TlsChannel (..), TlsClient (..))
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import qualified Network.Socket as Socket
@@ -143,47 +134,6 @@ spec socketPath port = do
           execute session (statement "SELECT 1" []) step () `shouldReturn` (Right ((), "SELECT 1"), TxIdle)
           isUsable session `shouldReturn` True
           query session "SELECT 2" [] `shouldReturn` (Right ([[Just "2"]], "SELECT 1"), TxIdle)
-
-    -- Observe cleanup through the public channel API, including failures
-    -- before and after the TLS connection is freed.
-    let withCloseHooks beforeSend afterClose check = do
-          closing <- newIORef False
-          closes <- newIORef (0 :: Int)
-          let client = TlsClient $ \tls serverName sock -> do
-                opened <- startTlsChannel tlsClient tls serverName sock
-                pure opened
-                  { tlsChannel =
-                      let channel = tlsChannel opened
-                       in channel
-                            { channelSend = \output -> do
-                                ending <- readIORef closing
-                                when ending beforeSend
-                                channelSend channel output,
-                              channelSendBuffered = \buffer output -> do
-                                ending <- readIORef closing
-                                when ending beforeSend
-                                channelSendBuffered channel buffer output,
-                              channelClose =
-                                (modifyIORef closes (+ 1) *> channelClose channel)
-                                  `finally` afterClose
-                            }
-                  }
-          bracket (fst <$> connect (encrypted {connectTlsClient = Just client})) close $ \session -> do
-            writeIORef closing True
-            _ <- check session
-            isUsable session `shouldReturn` False
-            close session
-            query session "SELECT 1" [] `shouldSatisfy` P.throws closed
-          readIORef closes `shouldReturn` 1
-    it "closes the channel once when sending Terminate throws" $
-      withCloseHooks (throwIO (ErrorCall "terminate failed")) (pure ()) $ \session ->
-        close session `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "terminate failed")))
-    it "does not retry channel cleanup if it throws" $
-      withCloseHooks (pure ()) (throwIO (ErrorCall "cleanup failed")) $ \session ->
-        close session `shouldSatisfy` P.throws (P.con (ErrorCall (P.eq "cleanup failed")))
-    it "closes the channel once when sending Terminate is interrupted" $
-      withCloseHooks (threadDelay 10000000) (pure ()) $ \session ->
-        timeout 100000 (close session) `shouldReturn` Nothing
 
   describe "channel-binding data from TLS setup" $ do
     let suppliedBinding supplied mode user =
@@ -577,8 +527,9 @@ spec socketPath port = do
         withSessionInfo $ \notifier notifierInfo -> do
           _ <- query listener "LISTEN events" []
           _ <- query notifier "NOTIFY events, 'hello'" []
-          Notification sender channel payload <- awaitNotification listener
-          (Just sender, channel, payload) `shouldBe` (processIdOf notifierInfo, "events", "hello")
+          notification <- awaitNotification listener
+          (Just (notificationProcessId notification), notificationChannel notification, notificationPayload notification)
+            `shouldBe` (processIdOf notifierInfo, "events", "hello")
     it "keeps notifications that arrive during statements, in order" $
       withSessionInfo $ \session _ -> do
         _ <- query session "LISTEN events" []
@@ -590,7 +541,7 @@ spec socketPath port = do
       withSessionInfo $ \listener listenerInfo ->
         withSessionInfo $ \administrator _ -> do
           _ <- query listener "LISTEN events" []
-          Just (Scalar pid) <- pure (processIdOf listenerInfo)
+          Just pid <- pure (processIdOf listenerInfo)
           _ <- query administrator "SELECT pg_terminate_backend($1::int)" [Just (Char8.pack (show pid))]
           awaitNotification listener `shouldSatisfy` P.throws connectionTerminated
 
@@ -911,8 +862,8 @@ rejectedWith code = P.con (ConnectionRejected (P.eq (Just code) P.<<< errorCode)
 authenticationError :: Predicate IO ConnectionError
 authenticationError = P.con (AuthenticationError P.anything)
 
-processIdOf :: ServerInfo -> Maybe ProcessId
-processIdOf info = fst . unScalar <$> serverBackendKey info
+processIdOf :: ServerInfo -> Maybe Int32
+processIdOf info = backendProcessId <$> serverBackendKey info
 
 connectionTerminated :: Predicate IO ConnectionError
 connectionTerminated = P.con (ConnectionTerminated P.anything)

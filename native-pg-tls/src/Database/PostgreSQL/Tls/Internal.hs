@@ -37,8 +37,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import Data.Foldable (for_)
 import Data.Word (Word16, Word32, Word8)
-import Database.PostgreSQL.Authentication (serverEndPoint)
-import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel)
+import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel, serverEndPoint)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString, withCStringLen)

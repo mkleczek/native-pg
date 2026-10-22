@@ -37,8 +37,7 @@ library
 test-suite native-pg-tls-spec
   default-language:   GHC2021
   type:               exitcode-stdio-1.0
-  -- Compile the private implementation for unit tests; integration tests
-  -- below use the public library.
+  -- Compile the private TLS implementation for unit tests.
   hs-source-dirs:     test/tls
                      src
   other-modules:      TlsSpec
