@@ -2,6 +2,7 @@
 module ResourcesSpec (spec) where
 
 import Control.Exception (try)
+import Control.Monad (forM_)
 import Control.Concurrent (forkFinally, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import System.Timeout (timeout)
@@ -9,10 +10,14 @@ import Control.Concurrent.STM (atomically, retry, orElse)
 import Data.Maybe (isNothing)
 import Data.Tuple (Solo (MkSolo))
 import Foreign.ForeignPtr (withForeignPtr)
+import Foreign.Marshal.Array (peekArray, pokeArray)
 import Foreign.Storable (peek, poke)
+import Foreign.Ptr (plusPtr)
+import System.Mem (performGC)
 import Data.Either (isLeft)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
-import Network.Streaming.Resources.Internal
+import Network.Streaming.Buffer
+import Network.Streaming.Resources
 import Skeletest
 
 spec :: Spec
@@ -31,6 +36,55 @@ spec = do
     almostLargest <- requirePositive (toInteger (maxBound :: Int) - 1)
     isLeft (validateSettings (ResourceSettings largest (positiveInt @1) (positiveInt @1))) `shouldBe` True
     validateSettings (ResourceSettings almostLargest (positiveInt @1) (positiveInt @1)) `shouldBe` Right ()
+
+ describe "buffer initialization" $ do
+  it "allocates initialized storage with the requested capacity" $ do
+    buffer <- newBuffer (positiveInt @8)
+    bufferCapacity buffer `shouldBe` 8
+    withForeignPtr (bufferMemory buffer) $ \pointer ->
+      peekArray 8 pointer `shouldReturn` replicate 8 0
+  it "accepts checked runtime capacities" $ do
+    size <- requirePositive 7
+    buffer <- newBuffer size
+    bufferCapacity buffer `shouldBe` 7
+    withForeignPtr (bufferMemory buffer) $ \pointer ->
+      peekArray 7 pointer `shouldReturn` replicate 7 0
+
+ describe "contiguous buffers" $ do
+  it "returns adjacent initialized slices whose writes remain disjoint" $ do
+    buffers <- newBuffers (positiveInt @21) (positiveInt @7)
+    map bufferCapacity buffers `shouldBe` [7, 7, 7]
+    forM_ buffers $ \buffer -> withForeignPtr (bufferMemory buffer) $ \pointer ->
+      peekArray 7 pointer `shouldReturn` replicate 7 0
+    case buffers of
+      first : _ -> withForeignPtr (bufferMemory first) $ \start ->
+        forM_ (zip [0 ..] buffers) $ \(index, buffer) ->
+          withForeignPtr (bufferMemory buffer) $ \pointer ->
+            pointer `shouldBe` start `plusPtr` (index * 7)
+      [] -> failTest "expected three buffers"
+    forM_ (zip [11, 22, 33] buffers) $ \(value, buffer) ->
+      withForeignPtr (bufferMemory buffer) $ \pointer -> pokeArray pointer (replicate 7 value)
+    forM_ (zip [11, 22, 33] buffers) $ \(value, buffer) ->
+      withForeignPtr (bufferMemory buffer) $ \pointer ->
+        peekArray 7 pointer `shouldReturn` replicate 7 value
+  it "keeps the backing block alive when only a later slice remains" $ do
+    survivor <- do
+      buffers <- newBuffers (positiveInt @8192) (positiveInt @4096)
+      case buffers of
+        [_, second] -> do
+          withForeignPtr (bufferMemory second) $ \pointer -> pokeArray pointer (replicate 4096 73)
+          pure second
+        _ -> failTest "expected two buffers"
+    performGC
+    withForeignPtr (bufferMemory survivor) $ \pointer ->
+      peekArray 4096 pointer `shouldReturn` replicate 4096 73
+  it "leaves trailing budget bytes outside the exposed blocks" $ do
+    buffers <- newBuffers (positiveInt @23) (positiveInt @7)
+    map bufferCapacity buffers `shouldBe` [7, 7, 7]
+  it "returns no slices when the block size exceeds the budget" $ do
+    largest <- requirePositive (toInteger (maxBound :: Int))
+    forM_ [positiveInt @8, largest] $ \size ->
+      length <$> newBuffers (positiveInt @7) size `shouldReturn` 0
 
  describe "storage" $ do
   it "initializes blocks once and reuses their addresses and contents" $
