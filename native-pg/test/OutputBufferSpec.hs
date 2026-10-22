@@ -35,7 +35,7 @@ spec = describe "caller-owned output storage" $ do
       readIORef sent `shouldReturn` wire
       readIORef addresses `shouldReturn` True
 
-  xfail "context output is not bound to supplied storage" $ it "sends through the current context's supplied workspace" $ do
+  it "sends through the current context's supplied workspace" $ do
     input <- newBuffer 16
     output <- newBuffer 16
     supplied <- newIORef True

@@ -8,6 +8,7 @@ module Database.PostgreSQL.Internal.Context
     contextInput,
     contextOutput,
     sendContextOutput,
+    queueContextOutput,
     contextPending,
     contextReadSize,
     contextScoped,
@@ -130,7 +131,18 @@ newOwnedContext connection = do
 sendContextOutput :: Context -> Output -> IO ()
 sendContextOutput context output = do
   ensureContextActive context
-  channelSend (connectionChannel (contextConnection context)) output
+  channelSendBuffered (connectionChannel (contextConnection context)) (contextOutput context) output
+
+-- | Starts a batch without waiting for the peer to consume all of it.
+-- Reads subsequently advance this context's pending writes.
+queueContextOutput :: Context -> Output -> IO ()
+queueContextOutput context output = do
+  ensureContextActive context
+  previous <- readIORef (contextPending context)
+  unless (unsentEmpty previous) (throwIO (SessionUnusable "the operation still has pending output"))
+  pending <- unsent (Just (contextOutput context)) output
+  remaining <- channelSendSome (connectionChannel (contextConnection context)) pending
+  writeIORef (contextPending context) remaining
 
 -- | Binds supplied initialized buffers for the callback. Acquires the
 -- connection before exposing the Context and cancels/joins any operation
