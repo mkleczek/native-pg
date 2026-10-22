@@ -142,7 +142,7 @@ spec = describe "caller-owned input" $ do
           (const (pure "recovered"))
     inputResult (runInput source emptyInputBuffer parser) `shouldReturn` Right "recovered"
 
-  xfail "metadata C strings still require contiguous supplied storage" $ it "assembles long C-string metadata into owned storage" $ do
+  it "assembles long C-string metadata into owned storage" $ do
     storage <- newBuffer 4
     let name = BS.replicate 100 120
     source <- bytesSource 4 (name <> "\0next") (const (pure ()))
@@ -152,7 +152,7 @@ spec = describe "caller-owned input" $ do
       pure [name', next]
     values `shouldBe` [name, "next"]
 
-  xfail "remaining metadata still requires contiguous supplied storage" $ it "assembles bounded authentication metadata across supplied refills" $ do
+  it "assembles bounded authentication metadata across supplied refills" $ do
     storage <- newBuffer 4
     let challenge = BS.replicate 100 99
     source <- bytesSource 4 (challenge <> "next") (const (pure ()))
