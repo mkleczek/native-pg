@@ -114,7 +114,7 @@ The compiler boundary fixtures can be checked from `streaming-io/` with
 
 ## Caller-owned buffers
 
-`Database.PostgreSQL.Buffer` identifies initialized, fixed-capacity storage.
+`Database.PostgreSQL.Internal.Buffer` identifies initialized, fixed-capacity storage.
 The client may allocate it itself and initialize it once before adding it
 to a pool. A loan gives one operation exclusive access; sharing a pool does
 not permit two connections to use the same storage concurrently. TLS can
@@ -364,30 +364,37 @@ any -> Broken | Closed
 ### Socket I/O
 
 - Raw `Network.Socket` (TCP and Unix domain), with `sendMany` for output.
-- Reads are buffered. The socket `InputSource` calls `recvBuf` into the free
-  part of an allocation of the read size the client sets (16 KiB by
-  default). Unconsumed bytes stay for the next message. When a message
-  doesn't fit the rest of an allocation, only its unconsumed bytes are copied
-  to a new one. Filled bytes are never written again, so slices of them stay
-  valid. A client that manages its own buffers can supply its own
-  `InputSource`.
+- The private parser reads through an `InputSource` into initialized storage.
+  An operation's input cursor and output workspace expire with its callback;
+  the persistent connection keeps transport and protocol state. Public clients
+  obtain this scope through `Streaming.withOperation`, or pass two shared
+  initialized buffer descriptors to `Streaming.withBuffers`.
 - The parser monad `Input` passes state in unboxed tuples, allowing its binds
   and schema operations to inline. Refills stay on the slow path. Cursor
   records and owned results can still allocate; an unboxed return tuple alone
-  does not eliminate those allocations.
-- Values the library returns are slices of the read buffer, so it copies
-  nothing. A client that keeps a value for long should copy it, so the value
-  doesn't keep the whole read buffer alive.
-- The parser and serializer expose the wire protocol through `InputSource`
-  and `Output`, without transport-specific operations. Tests can feed plain
-  byte strings.
-- A `Link` supplies a connection's reads and writes, and its `Channel` is
-  made from code specialized to that link. Both require exclusive access
-  to the connection: reads, writes, flushing, readiness waits and closing
-  must not overlap, including reads through the channel's `InputSource`.
-  A read may also send pending output. Ownership may pass to another thread
-  between calls. Session operations enforce exclusive access during query
-  I/O; callers using links or channels directly enforce it themselves.
+  does not eliminate those allocations. Codec tests feed plain byte strings through this private API.
+- Borrowed result chunks expire on the next pull or when their callback ends.
+  Owned field decoders and `streamChunk` return stable values. Applications
+  copy borrowed data if they need to retain it beyond its scope.
+- There is one library. Public modules live in `src/Database/PostgreSQL` and
+  are listed in `exposed-modules`; implementation modules live below its
+  `Internal/` directory and are listed in `other-modules`. Protocol messages,
+  codecs, authentication helpers and buffer constructors cannot be imported
+  by clients. Whitebox unit tests compile the same sources directly to reach
+  hidden modules. Public parameter OIDs are `Maybe Word32` and become protocol
+  scalars only when a Parse message is built.
+- Public modules own their API implementations rather than forwarding whole
+  interfaces to internal counterparts. Shared concrete types live in public
+  `Types`, `Session.Settings`, `ConnectionString.Types`, `Streaming.Types` and
+  `Transport.Link` modules. Private helpers are split by responsibility:
+  `Exchange`, `Startup`, `HostSelection`, `Channel` and `Socket`. Opaque handle
+  and result representations stay private where implementation modules need
+  their constructors; their public operations live in the public modules.
+- `Transport` deliberately exposes `Link` and TLS configuration for alternative
+  transport providers. A provider builds an abstract `Channel` with `newChannel`
+  and supplies it through `TlsClient`. Channel input, pending output and mutable
+  connection state remain private. Session operations enforce exclusive access
+  during query I/O; providers enforce it when operating on their own links.
 - A `Link` exposes `awaitReadable`, `awaitWritable` and
   `awaitReadableOrWritable`, keeping its underlying connection private.
   These interruptible waits suspend the calling thread without doing I/O.
@@ -420,7 +427,7 @@ any -> Broken | Closed
 - Dependencies: `network`, plus `crypton` for SCRAM and MD5. PostgREST
   already trusts `crypton` for verifying JWT signatures, through `jose-jwt`.
   Its hashing and PBKDF2 are C code. All of the library's cryptography is in
-  `Database.PostgreSQL.Authentication`, so it could move to libcrypto through
+  `Database.PostgreSQL.Internal.Authentication`, so it could move to libcrypto through
   FFI without touching anything else.
 
 ### Pull-based reading
