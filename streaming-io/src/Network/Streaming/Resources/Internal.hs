@@ -1,17 +1,20 @@
+{-# LANGUAGE ConstraintKinds #-}
 -- | Integration API. Buffer aliases expire when their lease or resource scope ends.
 module Network.Streaming.Resources.Internal
   ( Resources, ResourceSettings (..), withResources
-  , Buffer (..), Lease, tryAcquire, tryAcquireSetup, release, leaseBuffers
+  , Buffer (..), BufferGrant, Lease, tryAcquire, tryAcquireSetup, release, leaseBuffers
   , withBuffers, withSetupBuffers
   ) where
 
 import Control.Concurrent.STM
-  ( STM, TVar, atomically, newTVar, newTVarIO, readTVar, writeTVar, retry, throwSTM )
+  ( STM, TVar, atomically, newTVar, newTVarIO, readTVar, writeTVar
+  , retry, throwSTM )
 import Control.Exception (bracket)
-import Control.Monad (replicateM)
-import Foreign.Marshal.Utils (fillBytes)
+import Control.Monad (replicateM, when)
 import Data.Word (Word8)
+import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
+import Foreign.Marshal.Utils (fillBytes)
 import Network.Streaming.PositiveInt (PositiveInt, positiveIntValue)
 
 data ResourceSettings = ResourceSettings
@@ -25,64 +28,77 @@ data Buffer = Buffer
   , bufferCapacity :: !Int
   }
 
-data Resources = Resources !Int !(TVar [Buffer]) !(TVar Bool)
-data Lease = Lease !(TVar [Buffer]) [Buffer] !(TVar Bool)
+data Pool = Pool !Int !(TVar [Buffer]) !(TVar Bool)
+data Resources = Resources !Pool !Pool
+type BufferGrant grant = ListPrefix grant Buffer
 
+data Lease grant = Lease !Pool grant !(TVar Bool)
+
+-- | Budgets are rounded down to complete blocks. Every block is initialized
+-- here so admission and return never allocate or clear body storage.
 withResources :: ResourceSettings -> (Resources -> IO a) -> IO a
 withResources settings action
   | streamMemoryBytes settings < ioBufferBytes settings = invalid "stream budget must fit a block"
   | setupMemoryBytes settings < ioBufferBytes settings = invalid "setup budget must fit a block"
-  | otherwise = do
+  | otherwise = bracket create retire action
+  where
+    invalid = ioError . userError
+    create = Resources <$> newPool (streamMemoryBytes settings) <*> newPool (setupMemoryBytes settings)
+    newPool budget = do
       let blockBytes = positiveIntValue (ioBufferBytes settings)
-      buffers <- replicateM (positiveIntValue (streamMemoryBytes settings) `div` blockBytes) $ do
+          count = positiveIntValue budget `div` blockBytes
+      buffers <- replicateM count $ do
         memory <- mallocForeignPtrBytes blockBytes
         withForeignPtr memory $ \pointer -> fillBytes pointer 0 blockBytes
         pure (Buffer memory blockBytes)
-      free <- newTVarIO buffers
-      active <- newTVarIO True
-      bracket (pure (Resources (length buffers) free active))
-        (const $ atomically $ writeTVar active False >> writeTVar free []) action
-  where
-    invalid = ioError . userError
+      Pool count <$> newTVarIO buffers <*> newTVarIO True
+    retire (Resources streams setup) = atomically (close streams >> close setup)
+    close (Pool _ free active) = writeTVar active False >> writeTVar free []
 
-tryAcquire :: Resources -> PositiveInt -> STM (Maybe Lease)
-tryAcquire (Resources capacity free active) requested
-  | count > capacity = throwSTM (userError "buffer count must fit capacity")
+-- | Ownership transfers only when the surrounding transaction commits.
+-- The caller must mask the interval between admission and installing cleanup.
+tryAcquire :: forall grant. BufferGrant grant => Resources -> STM (Maybe (Lease grant))
+tryAcquire (Resources streams _) = acquireFrom streams
+
+tryAcquireSetup :: forall grant. BufferGrant grant => Resources -> STM (Maybe (Lease grant))
+tryAcquireSetup (Resources _ setup) = acquireFrom setup
+
+acquireFrom :: forall grant. BufferGrant grant => Pool -> STM (Maybe (Lease grant))
+acquireFrom pool@(Pool capacity free active)
+  | prefixSize @grant > capacity = throwSTM (userError "buffer count must fit capacity")
   | otherwise = do
       alive <- readTVar active
-      if alive then pure () else throwSTM (userError "resources are retired")
+      when (not alive) $ throwSTM (userError "resources are retired")
       buffers <- readTVar free
-      let (selected, remaining) = splitAt count buffers
-      if length selected < count
-        then pure Nothing
-        else do
+      case takePrefix buffers of
+        Nothing -> pure Nothing
+        Just (selected, remaining) -> do
           writeTVar free remaining
           returned <- newTVar False
-          pure (Just (Lease free selected returned))
-  where
-    count = positiveIntValue requested
+          pure (Just (Lease pool selected returned))
 
-tryAcquireSetup :: Resources -> PositiveInt -> STM (Maybe Lease)
-tryAcquireSetup = tryAcquire
-
-release :: Lease -> STM ()
-release (Lease free buffers returned) = do
+-- | Per-lease state prevents a stale return from duplicating a later loan.
+release :: BufferGrant grant => Lease grant -> STM ()
+release (Lease (Pool _ free active) buffers returned) = do
   alreadyReturned <- readTVar returned
-  if alreadyReturned
-    then pure ()
-    else do
-      writeTVar returned True
+  when (not alreadyReturned) $ do
+    writeTVar returned True
+    alive <- readTVar active
+    when alive $ do
       available <- readTVar free
-      writeTVar free (buffers ++ available)
+      writeTVar free (prepend buffers available)
 
-leaseBuffers :: Lease -> [Buffer]
+leaseBuffers :: Lease grant -> grant
 leaseBuffers (Lease _ buffers _) = buffers
 
-withBuffers :: Resources -> PositiveInt -> ([Buffer] -> IO a) -> IO a
-withBuffers resources count action =
-  bracket acquire (atomically . release) (action . leaseBuffers)
-  where
-    acquire = atomically (tryAcquire resources count >>= maybe retry pure)
+withBuffers :: forall grant a. BufferGrant grant => Resources -> (grant -> IO a) -> IO a
+withBuffers resources = withLease (tryAcquire @grant resources)
 
-withSetupBuffers :: Resources -> PositiveInt -> ([Buffer] -> IO a) -> IO a
-withSetupBuffers = withBuffers
+withSetupBuffers :: forall grant a. BufferGrant grant => Resources -> (grant -> IO a) -> IO a
+withSetupBuffers resources = withLease (tryAcquireSetup @grant resources)
+
+withLease :: BufferGrant grant => STM (Maybe (Lease grant)) -> (grant -> IO a) -> IO a
+withLease acquire action =
+  bracket wait (atomically . release) (action . leaseBuffers)
+  where
+    wait = atomically (acquire >>= maybe retry pure)
