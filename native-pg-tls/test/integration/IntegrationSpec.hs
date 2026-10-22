@@ -152,8 +152,8 @@ spec socketPath port = do
           let client = TlsClient $ \tls serverName sock -> do
                 opened <- startTlsChannel tlsClient tls serverName sock
                 pure opened
-                  { tlsChannel = \pendingOutput size ->
-                      let channel = tlsChannel opened pendingOutput size
+                  { tlsChannel =
+                      let channel = tlsChannel opened
                        in channel
                             { channelSend = \output -> do
                                 ending <- readIORef closing

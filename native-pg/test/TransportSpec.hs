@@ -28,8 +28,8 @@ spec = describe "channels over a link without a socket" $ do
               if count < 2 then pure Nothing else provide "reply" pointer size,
             testReadable = modifyIORef' wakeups (+ 1)
           }
-    channel <- channelWith link mempty
-    timeout 1000000 (readBytes channel) `shouldReturn` Just "reply"
+    (channel, pending) <- channelWith link mempty
+    timeout 1000000 (readBytes channel pending) `shouldReturn` Just "reply"
     readIORef wakeups `shouldReturn` 2
 
   it "waits for sending to resume after the link takes no bytes" $ do
@@ -41,7 +41,7 @@ spec = describe "channels over a link without a socket" $ do
               if writable then collect sent pieces else pure 0,
             testWritable = writeIORef ready True
           }
-    channel <- channelWith link mempty
+    (channel, _) <- channelWith link mempty
     timeout 1000000 (channelSend channel sync) `shouldReturn` Just ()
     readIORef sent `shouldReturn` syncBytes
 
@@ -53,7 +53,7 @@ spec = describe "channels over a link without a socket" $ do
             testFlush = readIORef flushed,
             testWritable = writeIORef flushed True
           }
-    channel <- channelWith link mempty
+    (channel, _) <- channelWith link mempty
     timeout 1000000 (channelSend channel sync) `shouldReturn` Just ()
     readIORef sent `shouldReturn` syncBytes
     readIORef flushed `shouldReturn` True
@@ -67,11 +67,11 @@ spec = describe "channels over a link without a socket" $ do
             testSend = collect sent,
             testEither = pure Writable
           }
-    channel <- channelWith link sync
-    timeout 1000000 (readBytes channel) `shouldReturn` Just "reply"
+    (channel, pending) <- channelWith link sync
+    timeout 1000000 (readBytes channel pending) `shouldReturn` Just "reply"
     readIORef sent `shouldReturn` syncBytes
 
-  xfail "operation-local pending output is not implemented" $ it "uses the current operation's pending output instead of the channel creator's" $ do
+  it "uses the current operation's pending output instead of the channel creator's" $ do
     sent <- newIORef BS.empty
     let link = testLink
           { testReceive = \pointer size -> do
@@ -80,10 +80,10 @@ spec = describe "channels over a link without a socket" $ do
             testSend = collect sent,
             testEither = pure Writable
           }
-    channel <- channelWith link mempty
+    (channel, _) <- channelWith link mempty
     current <- newIORef =<< unsent Nothing sync
     timeout 1000000 (allocaBytes 16 $ \pointer -> do
-      count <- readInputInto (channelInputWith channel current 16) pointer 16
+      count <- readInputInto (channelInput channel current 16) pointer 16
       BS.packCStringLen (castPtr pointer, count)) `shouldReturn` Just "reply"
     readIORef sent `shouldReturn` syncBytes
     (unsentEmpty <$> readIORef current) `shouldReturn` True
@@ -96,8 +96,8 @@ spec = describe "channels over a link without a socket" $ do
               if readable then provide "reply" pointer size else pure Nothing,
             testEither = writeIORef ready True *> pure Readable
           }
-    channel <- channelWith link sync
-    timeout 1000000 (readBytes channel) `shouldReturn` Just "reply"
+    (channel, pending) <- channelWith link sync
+    timeout 1000000 (readBytes channel pending) `shouldReturn` Just "reply"
 
   it "bounds each send even for a single large immutable value" $ do
       let payload = BS.replicate 600000 42
@@ -123,7 +123,7 @@ checkGather output expected = do
             pure (BS.length accepted),
           testWritable = pure ()
         }
-  channel <- channelWith link mempty
+  (channel, _) <- channelWith link mempty
   channelSend channel output
   readIORef sent `shouldReturn` expected
   (all (<= 262144) <$> readIORef calls) `shouldReturn` True
@@ -159,14 +159,14 @@ testLink =
     (fail "unexpected write wait")
     (fail "unexpected combined wait")
 
-channelWith :: TestLink -> Output -> IO Channel
+channelWith :: TestLink -> Output -> IO (Channel, IORef Unsent)
 channelWith link output = do
   pendingOutput <- newIORef =<< unsent Nothing output
-  pure (newChannel link pendingOutput 16)
+  pure (newChannel link, pendingOutput)
 
-readBytes :: Channel -> IO ByteString
-readBytes channel = allocaBytes 16 $ \pointer -> do
-  count <- readInputInto (channelInput channel) pointer 16
+readBytes :: Channel -> IORef Unsent -> IO ByteString
+readBytes channel pending = allocaBytes 16 $ \pointer -> do
+  count <- readInputInto (channelInput channel pending 16) pointer 16
   BS.packCStringLen (castPtr pointer, count)
 
 provide :: ByteString -> Ptr Word8 -> Int -> IO (Maybe Int)

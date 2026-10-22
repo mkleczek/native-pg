@@ -298,7 +298,7 @@ newtype TlsClient = TlsClient
 data TlsChannel = TlsChannel
   { -- | Makes the channel as 'newChannel' does, once the session has allocated
     -- its pending output.
-    tlsChannel :: IORef Unsent -> Int -> Channel,
+    tlsChannel :: Channel,
     -- | The @tls-server-end-point@ binding: the hash of the server's
     -- certificate, or why it couldn't be computed. 'Nothing' means binding
     -- is unavailable. A 'Left' is reported only if authentication selects
@@ -368,9 +368,7 @@ instance Exception TlsError where
 data Channel = Channel
   { -- | Reads input. While output is unsent, waiting for input also sends it
     -- as the link takes it.
-    channelInput :: InputSource,
-    -- | Input associated with the caller's operation-local pending output.
-    channelInputWith :: IORef Unsent -> Int -> InputSource,
+    channelInput :: IORef Unsent -> Int -> InputSource,
     -- | Sends what the link takes without waiting, and gives what's left.
     channelSendSome :: Unsent -> IO Unsent,
     -- | Sends the output, waiting for room as needed.
@@ -379,20 +377,19 @@ data Channel = Channel
     channelClose :: IO ()
   }
 
--- | The channel over a link, given where the output that waits to be sent is
--- kept, and the size of a read.
-newChannel :: Link link => link -> IORef Unsent -> Int -> Channel
-newChannel link pending readSize =
+-- | A channel retains the link; each input operation supplies its own pending
+-- output and read size.
+newChannel :: Link link => link -> Channel
+newChannel link =
   Channel
-    { channelInput = linkInputSource link pending readSize,
-      channelInputWith = \_ _ -> linkInputSource link pending readSize,
+    { channelInput = linkInputSource link,
       channelSendSome = sendSome link,
       channelSend = sendOutput link,
       channelSendBuffered = sendOutputWith link . Just,
       channelClose = closeLink link
     }
 {-# INLINABLE newChannel #-}
-{-# SPECIALIZE newChannel :: Socket -> IORef Unsent -> Int -> Channel #-}
+{-# SPECIALIZE newChannel :: Socket -> Channel #-}
 
 -- | Reads from the link into the parser's buffer, which a new allocation
 -- makes the given size. While output is unsent, waiting for input also sends

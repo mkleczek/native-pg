@@ -33,8 +33,7 @@ spec = describe "borrowed parameter streams" $ do
             prefix <- evaluate (BS.copy (BS.take 7 (BS.concat pieces)))
             modifyIORef' received (<> prefix)
             pure (BS.length prefix)
-      pending <- newIORef =<< unsent Nothing mempty
-      channelSend (newChannel sender pending 16) output
+      channelSend (newChannel sender) output
       readIORef received `shouldReturn` ("\0\0\0`" <> BS.replicate 32 65 <> BS.replicate 32 66 <> BS.replicate 32 67)
       readIORef pulls `shouldReturn` 4
 

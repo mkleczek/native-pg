@@ -30,8 +30,7 @@ spec = describe "caller-owned output storage" $ do
             accepted <- evaluate (BS.copy (BS.concat chunks))
             modifyIORef' sent (<> accepted)
             pure (sum (map BS.length chunks))
-      pending <- newIORef =<< unsent Nothing mempty
-      channelSendBuffered (newChannel link pending 16) (outputBufferFrom buffer) batch
+      channelSendBuffered (newChannel link) (outputBufferFrom buffer) batch
       readIORef sent `shouldReturn` wire
       readIORef addresses `shouldReturn` True
 
@@ -42,8 +41,7 @@ spec = describe "caller-owned output storage" $ do
           prefix <- evaluate (BS.copy (BS.take 3 (BS.concat chunks)))
           modifyIORef' sent (<> prefix)
           pure (BS.length prefix)
-    pending <- newIORef =<< unsent Nothing mempty
-    channelSendBuffered (newChannel link pending 16) (outputBufferFrom buffer) batch
+    channelSendBuffered (newChannel link) (outputBufferFrom buffer) batch
     readIORef sent `shouldReturn` wire
   it "matches contiguous serialization for complete messages at small capacities" $ do
     let output = serialize @(Parse BS.ByteString) @'ParseType (Parse ("" :: BS.ByteString) "SELECT $1" [])
@@ -58,8 +56,7 @@ spec = describe "caller-owned output storage" $ do
             prefix <- evaluate (BS.copy (BS.take 3 (BS.concat chunks)))
             modifyIORef' received (<> prefix)
             pure (BS.length prefix)
-      pending <- newIORef =<< unsent Nothing mempty
-      channelSendBuffered (newChannel sender pending 16) (outputBufferFrom buffer) output
+      channelSendBuffered (newChannel sender) (outputBufferFrom buffer) output
       readIORef received `shouldReturn` expected
 
   where

@@ -309,6 +309,7 @@ instance Accepts 'SyncResult where
 data Connection = Connection
   { -- | Input and output over the socket, or TLS over it.
     connectionChannel :: Channel,
+    connectionReadSize :: Int,
     -- | Bytes read but not consumed yet; the only buffer the library keeps.
     connectionBuffer :: IORef InputBuffer,
     -- | Output of the running batch that the socket hasn't taken yet. Reads
@@ -494,7 +495,7 @@ connect settings = withChannel settings start
       output <- newOutputBuffer outputBufferSize
       state <- newIORef Idle
       notifications <- newIORef []
-      let session = Session (Connection (channel pending (connectReadSize settings)) buffer pending output state notifications)
+      let session = Session (Connection channel (connectReadSize settings) buffer pending output state notifications)
       send @'StartupMessageType session (startupMessage settings)
       (version, initializing) <- authenticate settings binding (connectProtocolVersion settings) session
       initialize version initializing
@@ -502,7 +503,7 @@ connect settings = withChannel settings start
 -- | Connects a socket to the server, starts TLS over it as the settings ask,
 -- and runs the action with its channel builder and optional channel-binding
 -- result. The socket is closed if the action fails.
-withChannel :: ConnectSettings -> ((IORef Unsent -> Int -> Channel) -> Maybe (Either String ByteString) -> IO a) -> IO a
+withChannel :: ConnectSettings -> (Channel -> Maybe (Either String ByteString) -> IO a) -> IO a
 withChannel settings use = case (connectSslMode settings, connectAddress settings, connectTlsClient settings) of
   (SslDisable, _, _) -> attempt Nothing
   (_, UnixAddress _, _) -> attempt Nothing
@@ -630,10 +631,10 @@ instance Exception FailedWithTls
 requestTls :: Socket -> IO Bool
 requestTls sock = do
   pending <- newIORef =<< unsent Nothing mempty
-  let channel = newChannel sock pending 1
+  let channel = newChannel sock
   channelSend channel (serialize @SSLRequest @'SSLRequestType SSLRequest)
   answer <- allocaBytes 1 $ \byte -> do
-    received <- readInputInto (channelInput channel) byte 1
+    received <- readInputInto (channelInput channel pending 1) byte 1
     if received == 0 then pure Nothing else Just <$> peek byte
   case answer of
     Just 83 -> pure True
@@ -925,12 +926,12 @@ cancel :: ConnectSettings -> BackendKey ByteString -> IO ()
 cancel settings key =
   withChannel settings $ \opened _ -> do
     pending <- newIORef =<< unsent Nothing mempty
-    let channel = opened pending 64
+    let channel = opened
     ( do
         channelSend channel (serialize @(CancelRequest ByteString) @'CancelRequestType (CancelRequest key))
         -- The server closes the connection once it has handled the request.
         let waitForClose = do
-              received <- allocaBytes 64 $ \buffer -> readInputInto (channelInput channel) buffer 64
+              received <- allocaBytes 64 $ \buffer -> readInputInto (channelInput channel pending 64) buffer 64
               unless (received == 0) waitForClose
         waitForClose `catch` \(_ :: IOException) -> pure ()
       )
@@ -1341,7 +1342,7 @@ runOn :: Connection -> Int -> Input a -> IO a
 runOn connection limit parse = do
   buffer <- readIORef (connectionBuffer connection)
   (result, buffer') <-
-    runInputUntil (channelInput (connectionChannel connection)) limit buffer parse
+    runInputUntil (channelInput (connectionChannel connection) (connectionUnsent connection) (connectionReadSize connection)) limit buffer parse
       `catch` \(InputError message) -> throwIO (ProtocolError message)
   writeIORef (connectionBuffer connection) buffer'
   pure result
