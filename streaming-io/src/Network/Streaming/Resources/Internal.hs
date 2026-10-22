@@ -25,7 +25,12 @@ data Resources = Resources
 data Lease = Lease [Buffer]
 
 withResources :: ResourceSettings -> (Resources -> IO a) -> IO a
-withResources _ action = action Resources
+withResources settings action
+  | streamMemoryBytes settings < ioBufferBytes settings = invalid "stream budget must fit a block"
+  | setupMemoryBytes settings < ioBufferBytes settings = invalid "setup budget must fit a block"
+  | otherwise = action Resources
+  where
+    invalid = ioError . userError
 
 tryAcquire :: Resources -> PositiveInt -> STM (Maybe Lease)
 tryAcquire _ _ = pure Nothing
