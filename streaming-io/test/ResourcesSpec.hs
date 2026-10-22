@@ -25,7 +25,7 @@ spec = do
     validateSettings (ResourceSettings (positiveInt @25) (positiveInt @9) (positiveInt @8)) `shouldBe` Right ()
     isLeft (validateSettings (ResourceSettings (positiveInt @7) (positiveInt @8) (positiveInt @8))) `shouldBe` True
     isLeft (validateSettings (ResourceSettings (positiveInt @8) (positiveInt @7) (positiveInt @8))) `shouldBe` True
-  xfail "aggregate budget overflow validation is pending" $ it "rejects budgets whose sum exceeds Int without allocating" $ do
+  it "rejects budgets whose sum exceeds Int without allocating" $ do
     largest <- requirePositive (toInteger (maxBound :: Int))
     almostLargest <- requirePositive (toInteger (maxBound :: Int) - 1)
     isLeft (validateSettings (ResourceSettings largest (positiveInt @1) (positiveInt @1))) `shouldBe` True

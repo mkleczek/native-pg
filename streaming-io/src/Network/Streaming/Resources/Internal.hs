@@ -59,6 +59,8 @@ validateSettings :: ResourceSettings -> Either String ()
 validateSettings settings
   | streamMemoryBytes settings < ioBufferBytes settings = Left "stream budget must fit a block"
   | setupMemoryBytes settings < ioBufferBytes settings = Left "setup budget must fit a block"
+  | toInteger (positiveIntValue (streamMemoryBytes settings)) + toInteger (positiveIntValue (setupMemoryBytes settings)) > toInteger (maxBound :: Int) =
+      Left "combined memory budget exceeds Int capacity"
   | otherwise = Right ()
 
 -- | Ownership transfers only when the surrounding transaction commits.
