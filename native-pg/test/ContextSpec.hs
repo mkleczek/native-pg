@@ -91,7 +91,7 @@ spec = describe "explicit operation contexts" $ do
     state <- readIORef (connectionState connection)
     case state of Broken -> pure (); _ -> failTest "an abandoned protocol operation must break the connection"
 
-  xfail "a second async exception can interrupt the scope join" $ it "keeps storage loaned until a cancelled child's cleanup has finished" $ do
+  it "keeps storage loaned until a cancelled child's cleanup has finished" $ do
     connection <- newConnection idleChannel 16
     input <- newBuffer 16
     output <- newBuffer 16
