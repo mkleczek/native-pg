@@ -28,6 +28,7 @@ module Database.PostgreSQL.ConnectionString
     ConnectFailure (..),
     HostFailure (..),
     connectFirst,
+    connectFirstWithBuffers,
   )
 where
 
@@ -46,6 +47,8 @@ import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word8)
+import Database.PostgreSQL.Buffer (Buffer)
+import qualified Database.PostgreSQL.Internal.Context as Context
 import Database.PostgreSQL.Protocol (ProtocolVersion (..), protocolVersion3_0, protocolVersion3_2)
 import Database.PostgreSQL.Protocol.Codec (InputError (..))
 import Database.PostgreSQL.Session
@@ -689,7 +692,24 @@ instance Exception ConnectFailure where
 -- server. The settings for each host can be adjusted, e.g. for a bigger read
 -- buffer. Throws 'ConnectFailure' when no host qualifies.
 connectFirst :: (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Session 'Ready, ServerInfo, Host)
-connectFirst adjust string =
+connectFirst = connectFirstUsing connect close queryValue
+
+-- | Integration-only host selection using initialized setup storage. Each
+-- startup and qualification context expires before this pair is returned.
+connectFirstWithBuffers :: Buffer -> Buffer -> (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Connection, ServerInfo, Host)
+connectFirstWithBuffers input output = connectFirstUsing (connectWithBuffers input output) closeConnection value
+  where
+    value connection query = Context.withContext connection input output $ \context ->
+      queryValue (sessionFromContext context) query
+
+connectFirstUsing
+  :: (ConnectSettings -> IO (connection, ServerInfo))
+  -> (connection -> IO ())
+  -> (connection -> ByteString -> IO (Either ServerError ByteString))
+  -> (ConnectSettings -> ConnectSettings)
+  -> ConnectionString
+  -> IO (connection, ServerInfo, Host)
+connectFirstUsing open dispose value adjust string =
   either (throwIO . ConnectFailure . reverse) pure =<< case connectionTargetSessionAttrs string of
     PreferStandbySession -> attempt StandbySession hosts [] >>= either (attempt AnySession hosts) (pure . Right)
     target -> attempt target hosts []
@@ -710,10 +730,10 @@ connectFirst adjust string =
         Handler (\(InputError why) -> pure (Left (Broke why)))
       ]
     establish target host =
-      bracketOnError (connect (adjust (hostConnectSettings string host))) (close . fst) $ \(session, info) ->
+      bracketOnError (open (adjust (hostConnectSettings string host))) (dispose . fst) $ \(session, info) ->
         qualify target session info >>= \case
           Nothing -> pure (Right (session, info, host))
-          Just failure -> close session $> Left failure
+          Just failure -> dispose session $> Left failure
     qualify target session info
       | serverProtocolVersion info < connectionMinProtocolVersion string =
           pure . Just . Unsuitable $
@@ -732,10 +752,10 @@ connectFirst adjust string =
         -- Servers since 14 report both; for older ones, ask.
         readOnly = case (reported "in_hot_standby", reported "default_transaction_read_only") of
           (Just inStandby, Just readOnlyDefault) -> pure (Right (inStandby == "on" || readOnlyDefault == "on"))
-          _ -> fmap (== "on") <$> queryValue session "SHOW transaction_read_only"
+          _ -> fmap (== "on") <$> value session "SHOW transaction_read_only"
         standby = case reported "in_hot_standby" of
           Just inStandby -> pure (Right (inStandby == "on"))
-          Nothing -> fmap (== "t") <$> queryValue session "SELECT pg_catalog.pg_is_in_recovery()"
+          Nothing -> fmap (== "t") <$> value session "SELECT pg_catalog.pg_is_in_recovery()"
         expect wanted why = \case
           Left failure -> Just (CheckFailed failure)
           Right actual

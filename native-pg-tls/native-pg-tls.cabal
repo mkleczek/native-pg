@@ -64,6 +64,7 @@ test-suite native-pg-integration
   type:               exitcode-stdio-1.0
   hs-source-dirs:     test/integration
   other-modules:      IntegrationSpec
+                      StreamingSetupSpec
                       OperationContextSpec
                       TestCluster
   main-is:            Main.hs
@@ -83,5 +84,6 @@ test-suite native-pg-integration
                     , uuid              >= 1.3 && < 2
                     , native-pg
                     , native-pg-tls
+                    , streaming-io
   if os(windows)
     buildable:        False
