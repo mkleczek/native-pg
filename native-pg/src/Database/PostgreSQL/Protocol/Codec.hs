@@ -51,7 +51,6 @@ import Control.Monad.Except (MonadError (..))
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (ord)
 import Data.Functor (($>))
 import Data.Int (Int16, Int32)
@@ -71,6 +70,9 @@ import Database.PostgreSQL.Protocol.Codec.Input
     withInputSome,
     inputPosition,
     readInputSome,
+    readInputWord8,
+    readInputWord16,
+    readInputWord32,
     runBodyParser,
     runInput,
     runInputUntil,
@@ -169,11 +171,11 @@ parseChoice = parseWithConstructor @('PayloadChoice alternatives)
 -- We keep these instances explicit instead of using a generic `Storable` one,
 -- because that would also admit platform-sized numerics like `Int` and `Word`.
 instance Parsable Word8 ('FixedBytesAtom 1) where
-  parser = (`BSU.unsafeIndex` 0) <$> readInputExactly 1
+  parser = readInputWord8
   {-# INLINE parser #-}
 
 instance Parsable Word16 ('FixedBytesAtom 2) where
-  parser = bigEndianWord16 <$> readInputExactly 2
+  parser = readInputWord16
   {-# INLINE parser #-}
 
 instance Parsable Int16 ('FixedBytesAtom 2) where
@@ -181,7 +183,7 @@ instance Parsable Int16 ('FixedBytesAtom 2) where
   {-# INLINE parser #-}
 
 instance Parsable Word32 ('FixedBytesAtom 4) where
-  parser = bigEndianWord32 <$> readInputExactly 4
+  parser = readInputWord32
   {-# INLINE parser #-}
 
 instance Parsable Int32 ('FixedBytesAtom 4) where
@@ -588,7 +590,8 @@ withBoundedInput inner = do
   unless
     (totalLength >= 4)
     (throwError ("length " <> show totalLength <> " is invalid for PayloadBounded"))
-  withInputLimit (fromIntegral totalLength - 4) inner
+  let bodyLength = fromIntegral totalLength - 4
+  withInputLimit bodyLength inner
 {-# INLINE withBoundedInput #-}
 
 withLengthPrefix :: Output -> Output
@@ -621,22 +624,6 @@ peekBigEndianWord32At offset = do
       .|. shiftL (fromIntegral byte2) 8
       .|. fromIntegral byte3
 {-# INLINE peekBigEndianWord32At #-}
-
--- Callers have checked the length.
-bigEndianWord16 :: ByteString -> Word16
-bigEndianWord16 input =
-  shiftL (fromIntegral (BSU.unsafeIndex input 0)) 8
-    .|. fromIntegral (BSU.unsafeIndex input 1)
-{-# INLINE bigEndianWord16 #-}
-
--- Callers have checked the length.
-bigEndianWord32 :: ByteString -> Word32
-bigEndianWord32 input =
-  shiftL (fromIntegral (BSU.unsafeIndex input 0)) 24
-    .|. shiftL (fromIntegral (BSU.unsafeIndex input 1)) 16
-    .|. shiftL (fromIntegral (BSU.unsafeIndex input 2)) 8
-    .|. fromIntegral (BSU.unsafeIndex input 3)
-{-# INLINE bigEndianWord32 #-}
 
 lengthAsInt32 :: Int -> Int32
 lengthAsInt32 count

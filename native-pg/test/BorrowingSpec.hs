@@ -63,7 +63,7 @@ spec = describe "caller-owned input" $ do
       either show (const "accepted") result `shouldBe` "InputError \"unexpected end of input\""
       readIORef calls `shouldReturn` available + 1
 
-  xfail "direct scalar decoding follows" . it "does not allocate an owned ByteString for every reusable scalar" $ do
+  it "does not allocate an owned ByteString for every reusable scalar" $ do
     storage <- newBuffer 65536
     source <- bytesSource 65536 (BS.replicate 40000 1) (const (pure ()))
     -- Fill before measuring, so this isolates reads from an existing workspace.
@@ -77,7 +77,7 @@ spec = describe "caller-owned input" $ do
       then pure ()
       else failTest ("10000 buffered Word32 reads allocated " <> show allocated <> " bytes (limit 1600000)")
 
-  xfail "reusable storage is not implemented" . it "compacts unread bytes in the same allocation" $ do
+  it "compacts unread bytes in the same allocation" $ do
     storage <- newBuffer 4
     writes <- newIORef []
     source <- bytesSource 3 "abcdefghij" (\pointer -> withForeignPtr (bufferMemory storage) $ \base -> modifyIORef' writes (<> [pointer `minusPtr` base]))
@@ -86,7 +86,7 @@ spec = describe "caller-owned input" $ do
     offsets <- readIORef writes
     all (\offset -> offset >= 0 && offset < 4) offsets `shouldBe` True
 
-  xfail "reusable storage is not implemented" . it "rejects a contiguous request larger than storage before reading" $ do
+  it "rejects a contiguous request larger than storage before reading" $ do
     storage <- newBuffer 4
     readCalls <- newIORef (0 :: Int)
     source <- bytesSource 4 "abcde" (\_ -> modifyIORef' readCalls (+ 1))
@@ -104,7 +104,7 @@ spec = describe "caller-owned input" $ do
       pure [string, exact, chunk]
     values `shouldBe` ["abc", "defg", "hijk"]
 
-  xfail "reusable storage is not implemented" . it "borrows a chunk directly from the supplied storage" $ do
+  it "borrows a chunk directly from the supplied storage" $ do
     storage <- newBuffer 4
     source <- bytesSource 4 "abcdefgh" (const (pure ()))
     chunks <- newIORef []
@@ -124,7 +124,7 @@ spec = describe "caller-owned input" $ do
     (value, _) <- runInput source detached (readInputExactly 2)
     value `shouldBe` "cd"
 
-  xfail "reusable storage is not implemented" . it "does not enter rollback handlers after reusable storage was refilled" $ do
+  it "does not enter rollback handlers after reusable storage was refilled" $ do
     storage <- newBuffer 4
     calls <- newIORef (0 :: Int)
     source <- bytesSource 4 "abcdefgh" (\_ -> modifyIORef' calls (+ 1))

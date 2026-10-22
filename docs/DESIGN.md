@@ -184,6 +184,12 @@ length. It peeks one byte at a time, so it never waits for bytes that a short
 message doesn't have. Input that no alternative accepts is a protocol error
 and marks the connection broken.
 
+Scalar fields decode directly from the input pointer and force their values
+before advancing the cursor. This avoids copying one-, two- and four-byte
+fields into temporary byte strings, while keeping results safe when storage
+is reused. Owned byte-string fields still copy out of reusable storage;
+borrowed body chunks retain their existing lifetime contract.
+
 ### State machine
 
 The state machine is a separate layer and a client of the parser. In each
@@ -271,9 +277,10 @@ any -> Broken | Closed
   to a new one. Filled bytes are never written again, so slices of them stay
   valid. A client that manages its own buffers can supply its own
   `InputSource`.
-- The parser monad `Input` passes the buffer along in unboxed tuples. Once
-  inlined, a parser keeps the buffer in registers and refills it only on a
-  slow path.
+- The parser monad `Input` passes state in unboxed tuples, allowing its binds
+  and schema operations to inline. Refills stay on the slow path. Cursor
+  records and owned results can still allocate; an unboxed return tuple alone
+  does not eliminate those allocations.
 - Values the library returns are slices of the read buffer, so it copies
   nothing. A client that keeps a value for long should copy it, so the value
   doesn't keep the whole read buffer alive.
