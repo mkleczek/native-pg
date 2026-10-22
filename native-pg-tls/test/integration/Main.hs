@@ -1,5 +1,6 @@
 module Main (main) where
 
+import qualified OperationContextSpec
 import qualified IntegrationSpec
 import TestCluster (withCluster)
 import Skeletest.Internal.Paths (setOriginalDirectory)
@@ -14,4 +15,4 @@ main = do
   setOriginalDirectory =<< getCurrentDirectory
   -- Keep setup outside the runner, so cluster failures cannot become XFAILs.
   withCluster $ \socketPath port ->
-    runSkeletest [] [("test/integration/IntegrationSpec.hs", IntegrationSpec.spec socketPath port)]
+    runSkeletest [] [("test/integration/IntegrationSpec.hs", IntegrationSpec.spec socketPath port), ("test/integration/OperationContextSpec.hs", OperationContextSpec.spec port)]

@@ -4,10 +4,11 @@
 module FramingSpec (spec) where
 
 import Control.Exception (try)
-import Control.Monad (replicateM)
-import Database.PostgreSQL.Buffer (newBuffer)
+import Control.Monad (replicateM, replicateM_)
+import Database.PostgreSQL.Buffer (newBuffer, bufferMemory)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BSU
 import Data.Int (Int16, Int32)
 import Data.Word (Word8)
 import Database.PostgreSQL.Protocol
@@ -15,7 +16,8 @@ import Database.PostgreSQL.Protocol.Codec.Payload (Payload (..))
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Database.PostgreSQL.Protocol.Codec
 import Foreign.Marshal.Utils (copyBytes)
-import Foreign.Ptr (castPtr)
+import Foreign.Ptr (castPtr, minusPtr)
+import Foreign.ForeignPtr (withForeignPtr)
 import Skeletest
 
 spec :: Spec
@@ -62,6 +64,20 @@ spec = describe "protocol framing" $ do
     calls <- readIORef requests
     (length calls <= 28) `shouldBe` True
     maximum calls `shouldBe` 16
+
+  xfail "authentication selector lookahead still requires nine contiguous bytes" $ it "restores supplied storage after owned protocol selector lookahead" $ do
+    storage <- newBuffer 4
+    source <- bytesSource ("R\0\0\0\8\0\0\0\0" <> BS.replicate 32 120)
+    inside <- newIORef True
+    let consume chunk = do
+          offset <- BSU.unsafeUseAsCString chunk $ \pointer ->
+            withForeignPtr (bufferMemory storage) (pure . (castPtr pointer `minusPtr`))
+          modifyIORef' inside (&& (offset >= 0 && offset + BS.length chunk <= 4))
+    _ <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
+      parseChoice @'[ 'PayloadField 'AuthenticationOkType, 'PayloadField 'AuthenticationSASLType]
+        ((\AuthenticationOk -> ()) :|: (\(_ :: AuthenticationSASL ByteString) -> ()) :|: NoAlternatives)
+      withInputLimit 32 (replicateM_ 8 (withInputSome 4 consume))
+    readIORef inside `shouldReturn` True
 
 frameHeader :: Word8 -> ByteString -> ByteString
 frameHeader tag body = BS.singleton tag <> outputByteString (serialize @Int32 @('FixedBytesAtom 4) (fromIntegral (BS.length body + 4)))
