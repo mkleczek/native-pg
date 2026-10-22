@@ -2,19 +2,20 @@
 {-# LANGUAGE OverloadedStrings #-}
 module ContextSpec (spec) where
 
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIO, forkFinally, killThread, threadDelay)
 import Control.Concurrent.MVar
 import Control.Exception (SomeException, finally, try)
 import Control.Monad (replicateM)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
+import Data.Maybe (isNothing)
 import Data.IORef
 import Database.PostgreSQL.Buffer
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Protocol (TransactionStatus (..))
 import qualified Database.PostgreSQL.Session as PG
 import Database.PostgreSQL.Transport
-import Foreign.ForeignPtr (withForeignPtr)
+import Foreign.ForeignPtr (withForeignPtr, plusForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
@@ -89,6 +90,48 @@ spec = describe "explicit operation contexts" $ do
     timeout 1000000 (readMVar stopped) `shouldReturn` Just ()
     state <- readIORef (connectionState connection)
     case state of Broken -> pure (); _ -> failTest "an abandoned protocol operation must break the connection"
+
+  it "keeps storage loaned until a cancelled child's cleanup has finished" $ do
+    connection <- newConnection idleChannel 16
+    input <- newBuffer 16
+    output <- newBuffer 16
+    started <- newEmptyMVar
+    cleaning <- newEmptyMVar
+    allowCleanup <- newEmptyMVar
+    finished <- newEmptyMVar
+    owner <- forkFinally
+      (withContext connection input output $ \context -> do
+        _ <- forkIO $ do
+          _ <- try @SomeException $ runContextOperation context $
+            (putMVar started () *> threadDelay 10000000)
+              `finally` (putMVar cleaning () *> readMVar allowCleanup)
+          pure ()
+        readMVar started
+        threadDelay 10000000)
+      (putMVar finished)
+    readMVar started
+    _ <- forkIO (killThread owner)
+    timeout 1000000 (readMVar cleaning) `shouldReturn` Just ()
+    _ <- forkIO (killThread owner)
+    early <- timeout 50000 (readMVar finished)
+    putMVar allowCleanup ()
+    completed <- timeout 1000000 (readMVar finished)
+    isNothing early `shouldBe` True
+    isNothing completed `shouldBe` False
+
+  it "rejects identical and partially overlapping workspaces before callback entry" $ do
+    connection <- newConnection idleChannel 16
+    arena <- newBuffer 32
+    input <- bufferFromInitializedMemory (bufferMemory arena) 16
+    overlap <- bufferFromInitializedMemory (plusForeignPtr (bufferMemory arena) 8) 16
+    entered <- newIORef False
+    let rejected output = do
+          result <- try @ConnectionError (withContext connection input output (\_ -> writeIORef entered True))
+          result `shouldBe` Left (SessionUnusable "input and output storage overlap")
+    rejected input
+    rejected overlap
+    readIORef entered `shouldReturn` False
+    PG.isConnectionUsable connection `shouldReturn` True
 
 reply :: BS.ByteString
 reply = "2\0\0\0\4D\0\0\0\13\0\1\0\0\0\3abcC\0\0\0\13SELECT 1\0Z\0\0\0\5I"
