@@ -78,7 +78,7 @@ spec = describe "borrowed field streams" $ do
       case result of Left (RowMisuse _) -> pure (); _ -> failTest "failed callback left a recoverable row"
 
   it "invalidates a row after a caught materialization failure" $
-    withFields [Just payload] ready $ \context _ -> do
+    withResponse (message 50 "" <> BS.singleton 68 <> number 106 <> "\0\1" <> number 100 <> "short") $ \context _ -> do
       result <- try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
         _ <- try @ConnectionError (PG.columnBytes row)
@@ -137,6 +137,29 @@ spec = describe "borrowed field streams" $ do
       joined <- timeout 1000000 (readMVar stopped)
       isNothing joined `shouldBe` False) `finally` cleanup
 
+  xfail "explicit owned column materialization is still contiguous" $ it "materializes an owned column larger than the supplied block" $
+    withFields [Just payload] ready $ \context _ -> do
+      result <- PG.executeWithContext context execution (\values row -> do
+        _ <- PG.nextColumn row
+        value <- PG.columnBytes row
+        pure (value : values)) []
+      result `shouldBe` (Right ([payload], "SELECT 1"), TxIdle)
+
+  xfail "leading typed owned fields are still contiguous" $ it "assembles leading owned metadata while borrowing the selected body" $
+    withFields [Just payload, Just payload] ready $ \context input -> do
+      inside <- newIORef True
+      received <- newIORef BS.empty
+      let statement = Tx.Statement "SELECT metadata, body" (const [])
+            (Tx.singleRow (Tx.scopedRow $ \current ->
+              Tx.decodeScopedStreamingNullable @'[BS.ByteString] current $ \metadata stream -> do
+                metadata `shouldBe` payload
+                maybe (failTest "unexpected NULL") (\source -> Tx.streamChunks source (collect input inside received)) stream
+                metadata `shouldBe` payload)) True
+          prepare _ _ = pure (Pipeline.PreparedAs "")
+      Pipeline.runPipelineIn context (Just prepare) (Pipeline.statement () statement) `shouldReturn` Right ()
+      readIORef inside `shouldReturn` True
+      readIORef received `shouldReturn` payload
+
 collect :: Buffer -> IORef Bool -> IORef BS.ByteString -> BS.ByteString -> IO ()
 collect input inside received chunk = do
   offset <- BSU.unsafeUseAsCString chunk $ \pointer ->
@@ -161,12 +184,19 @@ withFields = withFieldsObserved (const (pure ()))
 
 withFieldsObserved :: (Int -> IO ()) -> [Maybe BS.ByteString] -> BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
 withFieldsObserved observe columns trailing action = do
-  input <- newBuffer 16
-  output <- newBuffer 16
   let count = length columns
       row = BS.pack [fromIntegral (count `div` 256), fromIntegral count]
         <> foldMap (maybe (number (-1)) (\value -> number (BS.length value) <> value)) columns
       response = message 50 "" <> message 68 row <> message 67 "SELECT 1\0" <> trailing
+  withResponseObserved observe response action
+
+withResponse :: BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
+withResponse = withResponseObserved (const (pure ()))
+
+withResponseObserved :: (Int -> IO ()) -> BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
+withResponseObserved observe response action = do
+  input <- newBuffer 16
+  output <- newBuffer 16
   remaining <- newIORef response
   let receive pointer size = do
         bytes <- readIORef remaining
