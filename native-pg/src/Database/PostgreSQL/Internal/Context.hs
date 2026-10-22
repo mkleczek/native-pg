@@ -29,7 +29,9 @@ import Control.Exception (Exception (..), catch, finally, mask, onException, thr
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
-import Database.PostgreSQL.Buffer (Buffer, bufferCapacity)
+import Database.PostgreSQL.Buffer (Buffer, bufferCapacity, bufferMemory)
+import Foreign.ForeignPtr (withForeignPtr)
+import Foreign.Ptr (plusPtr)
 import Database.PostgreSQL.Diagnostics (ServerError (..))
 import Database.PostgreSQL.Protocol.Codec (Output, Input, InputBuffer, InputError (..), reusableInputBuffer, emptyInputBuffer, runInputUntil, runInputFramedUntil)
 import Database.PostgreSQL.Protocol.Messages (Notification)
@@ -156,6 +158,11 @@ runContextInput context limit parse = do
 -- still running on another thread before the buffers may be reused.
 withContext :: Connection -> Buffer -> Buffer -> (Context -> IO a) -> IO a
 withContext connection input output use = do
+  withForeignPtr (bufferMemory input) $ \inputStart ->
+    withForeignPtr (bufferMemory output) $ \outputStart ->
+      when (inputStart < outputStart `plusPtr` bufferCapacity output &&
+            outputStart < inputStart `plusPtr` bufferCapacity input)
+        (throwIO (SessionUnusable "input and output storage overlap"))
   when (bufferCapacity output < 4) (ioError (userError "output buffer capacity must be at least four bytes"))
   mask $ \restore -> do
     claimConnection connection

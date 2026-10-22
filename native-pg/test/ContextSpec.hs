@@ -119,7 +119,7 @@ spec = describe "explicit operation contexts" $ do
     isNothing early `shouldBe` True
     isNothing completed `shouldBe` False
 
-  xfail "supplied contexts do not yet reject overlapping storage" $ it "rejects identical and partially overlapping workspaces before callback entry" $ do
+  it "rejects identical and partially overlapping workspaces before callback entry" $ do
     connection <- newConnection idleChannel 16
     arena <- newBuffer 32
     input <- bufferFromInitializedMemory (bufferMemory arena) 16
