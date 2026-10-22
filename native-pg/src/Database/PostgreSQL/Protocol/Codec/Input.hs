@@ -26,6 +26,7 @@ module Database.PostgreSQL.Protocol.Codec.Input
     runBodyParser,
     runInput,
     runInputUntil,
+    runInputFramedUntil,
     skipInput,
   )
 where
@@ -222,6 +223,11 @@ runInputUntil source limit buffer (Input parser) = IO $ \s ->
 {-# INLINE runInputUntil #-}
 
 -- | How many bytes were consumed before the first unconsumed one.
+-- | Like 'runInputUntil', batching refills within the current envelope while
+-- preserving the next envelope for a later operation.
+runInputFramedUntil :: InputSource -> Int -> InputBuffer -> Input a -> IO (a, InputBuffer)
+runInputFramedUntil = runInputUntil
+
 inputPosition :: InputBuffer -> Int
 inputPosition = bufferPosition
 

@@ -13,6 +13,8 @@ module Database.PostgreSQL.Session
     Accepts (..),
     Phase (..),
     Session,
+    Context,
+    Connection,
 
     -- * Connecting
     ConnectSettings (..),
@@ -75,6 +77,7 @@ import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import qualified System.Posix.Files as Posix
 import qualified System.Posix.User as Posix
 #endif
+import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..))
 import Database.PostgreSQL.Diagnostics (ServerError (..), diagnostics, isConnectionFatal)
 import Database.PostgreSQL.Authentication
@@ -91,7 +94,6 @@ import Database.PostgreSQL.Protocol.Codec
   ( Alternatives (..),
     ByteStream (..),
     Input,
-    InputBuffer,
     InputError (..),
     InputSource (..),
     MonadInput (..),
@@ -111,7 +113,6 @@ import Database.PostgreSQL.Protocol.Messages
 import Database.PostgreSQL.Transport
   ( Address (..),
     Channel (..),
-    OutputBuffer,
     RootCertificates (..),
     ServerVerification (..),
     TcpOptions,
@@ -120,7 +121,6 @@ import Database.PostgreSQL.Transport
     TlsError,
     TlsSettings (..),
     TlsVersion,
-    Unsent,
     connectSocket,
     defaultTcpOptions,
     newChannel,
@@ -306,34 +306,6 @@ instance Accepts 'SyncResult where
          'PayloadField 'NotificationResponseType
        ]
 
-data Connection = Connection
-  { -- | Input and output over the socket, or TLS over it.
-    connectionChannel :: Channel,
-    connectionReadSize :: Int,
-    -- | Bytes read but not consumed yet; the only buffer the library keeps.
-    connectionBuffer :: IORef InputBuffer,
-    -- | Output of the running batch that the socket hasn't taken yet. Reads
-    -- send it as they wait.
-    connectionUnsent :: IORef Unsent,
-    -- | Where batches are written. The next batch reuses it, since a batch
-    -- has been sent whole by the time its results are read.
-    connectionOutput :: OutputBuffer,
-    connectionState :: IORef SessionState,
-    -- | Notifications that arrived during operations, newest first, until
-    -- 'awaitNotification' takes them.
-    connectionNotifications :: IORef [Notification ByteString]
-  }
-
--- | Session handles can be copied, so the connection tracks at run time
--- whether an operation is in progress, or the session is no longer usable.
-data SessionState
-  = Idle
-  | Busy
-  | -- | An operation failed with an exception, leaving the protocol state
-    -- unknown.
-    Broken
-  | Closed
-
 -- | A connection in a known phase.
 newtype Session (phase :: Phase) = Session Connection
 
@@ -441,40 +413,6 @@ data ServerInfo = ServerInfo
     serverBackendKey :: Maybe (BackendKey ByteString)
   }
   deriving (Eq, Show)
-
-data ConnectionError
-  = -- | The server refused the connection.
-    ConnectionRejected ServerError
-  | -- | The server ended the session with this error, e.g. because an
-    -- administrator terminated it.
-    ConnectionTerminated ServerError
-  | -- | The server's messages don't follow the protocol.
-    ProtocolError String
-  | -- | The server asked for an authentication method this client doesn't
-    -- implement.
-    UnsupportedAuthentication String
-  | -- | Authentication failed on the client's side: a password is needed but
-    -- missing, or the server's SCRAM signature doesn't match.
-    AuthenticationError String
-  | -- | The session is busy with another operation, broke in an earlier
-    -- one, or has been closed.
-    SessionUnusable String
-  | -- | A row or a column stream was used out of turn.
-    RowMisuse String
-  | -- | TLS couldn't be started, e.g. because the server doesn't take it.
-    TlsFailure String
-  deriving (Eq, Show)
-
-instance Exception ConnectionError where
-  displayException failure = case failure of
-    ConnectionRejected rejection -> displayException rejection
-    ConnectionTerminated termination -> displayException termination
-    ProtocolError reason -> "protocol error: " <> reason
-    UnsupportedAuthentication method -> "the server asks for authentication with " <> method <> ", which isn't supported"
-    AuthenticationError reason -> reason
-    SessionUnusable reason -> reason
-    RowMisuse reason -> reason
-    TlsFailure reason -> reason
 
 -- | The size of the buffer a connection writes its batches to. A batch that
 -- copies more bytes gets a buffer of its own.

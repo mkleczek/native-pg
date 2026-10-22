@@ -41,6 +41,7 @@ module Database.PostgreSQL.Protocol.Codec
     runBodyParser,
     runInput,
     runInputUntil,
+    runInputFramedUntil,
     skipInput,
     writeOutput,
   )
@@ -76,6 +77,7 @@ import Database.PostgreSQL.Protocol.Codec.Input
     runBodyParser,
     runInput,
     runInputUntil,
+    runInputFramedUntil,
     skipInput,
   )
 import Database.PostgreSQL.Protocol.Codec.Output
