@@ -12,7 +12,8 @@ import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
-import Database.PostgreSQL.Internal.Buffer
+import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Buffer (Buffer, bufferMemory, bufferCapacity, newBuffer)
 import Database.PostgreSQL.Diagnostics (Diagnostics (..))
 import Database.PostgreSQL.Internal.Context
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
@@ -245,8 +246,8 @@ withResponse = withResponseObserved (const (pure ()))
 
 withResponseObserved :: (Int -> IO ()) -> BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
 withResponseObserved observe response action = do
-  input <- newBuffer 16
-  output <- newBuffer 16
+  input <- newBuffer (positiveInt @16)
+  output <- newBuffer (positiveInt @16)
   remaining <- newIORef response
   let receive pointer size = do
         bytes <- readIORef remaining
