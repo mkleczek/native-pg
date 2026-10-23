@@ -12,7 +12,7 @@ import Skeletest
 import TestSupport
 
 spec :: Spec
-spec = xfail "Waiting API scaffold: delivery and shutdown follow in the next change" $ describe "private delivery" $ do
+spec = describe "private delivery" $ do
   it "defers immediate grant removal until enqueue returns its opaque handle" $ withWaiting $ \waiting -> do
     removed <- newTVarIO ([] :: [String])
     result <- withWait waiting NoDeadline

@@ -12,7 +12,7 @@ import Skeletest
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = xfail "Waiting API scaffold: timer ownership follows in the next change" $ describe "timer key ownership races" $ do
+spec = describe "timer key ownership races" $ do
   it "unregisters a key returned after a concurrent grant, before using the grant" $
     scenario $ \manager waiting ticket detached cleaned -> do
       entered <- newEmptyMVar
