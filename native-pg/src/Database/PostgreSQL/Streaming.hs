@@ -17,15 +17,16 @@ import Database.PostgreSQL.Session (Connection, Session)
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Session.Settings (ConnectSettings, ServerInfo)
 import Database.PostgreSQL.Streaming.Types (ByteStream (..))
-import Network.Streaming.Resources (Resources)
+import Network.Streaming.Resources (Resources, BufferAccess)
 import qualified Network.Streaming.Resources as Resources
 import Network.Streaming.Buffer (Buffer)
 
--- | Borrow an initialized input/output pair for one exclusive connection
--- scope. Borrowed rows and streams expire before the pair is returned.
-withOperation :: Resources -> Connection -> (Session -> IO a) -> IO a
-withOperation resources connection action = Resources.withBuffers @(Buffer, Buffer) resources $ \(input, output) ->
-  withBuffers input output connection action
+-- | Use the request's shared body capability for one exclusive connection
+-- scope. Input borrows only while unread or borrowed bytes remain; streamed
+-- output consumes source chunks without acquiring another body buffer.
+withOperation :: BufferAccess -> Connection -> (Session -> IO a) -> IO a
+withOperation access connection action =
+  Context.withRequestContext connection access (action . Exchange.Session)
 
 -- | Use disjoint, initialized shared storage for one exclusive operation.
 -- Both buffers must remain exclusively owned until the callback returns;

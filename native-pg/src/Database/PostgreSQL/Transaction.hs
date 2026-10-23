@@ -43,6 +43,7 @@ import qualified Database.PostgreSQL.Internal.Row as Row
 import Database.PostgreSQL.Session (Session)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Types (FormatCode (..), TransactionStatus (..))
+import qualified Network.Streaming as Streaming
 
 -- | Work run synchronously on the thread that entered the transaction scope.
 -- 'withRunInIO' supports synchronous IO callbacks. Database operations reject
@@ -241,7 +242,8 @@ statement params (Statement query encode decoder@(RowDecoder cardinality _) prep
 protectParameter :: Runtime -> Parameter -> Parameter
 protectParameter runtime = \case
   ParameterStream stream -> ParameterStream stream {byteStreamNext = untrusted runtime (byteStreamNext stream)}
-  ParameterBorrowedStream stream -> ParameterBorrowedStream stream {byteStreamNext = untrusted runtime (byteStreamNext stream)}
+  ParameterBorrowedStream size source -> ParameterBorrowedStream size
+    (Streaming.Source (untrusted runtime . Streaming.withChunk source))
   parameter -> parameter
 
 -- | Drains the preceding pipeline, then sends these statements and Sync.

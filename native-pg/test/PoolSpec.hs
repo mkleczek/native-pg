@@ -3,6 +3,7 @@
 -- | Tests of the pool, with numbers for connections.
 module PoolSpec (spec) where
 
+import Control.Concurrent.Resource.Waiting qualified as Waiting
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Exception (ErrorCall (..), throwIO, toException)
@@ -22,28 +23,28 @@ import Database.PostgreSQL.Pool.Observation
 spec :: Spec
 spec = do
   describe "use" $ do
-    it "opens a connection, and reuses it" $ do
+    it "opens a connection, and reuses it" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness)
+      pool <- newPool waiting (config harness)
       useOnce pool `shouldReturn` Right 1
       useOnce pool `shouldReturn` Right 1
       readIORef (harnessOpened harness) `shouldReturn` 1
 
-    it "makes a use wait while the pool is full, and gives it the next free connection" $ do
+    it "makes a use wait while the pool is full, and gives it the next free connection" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness)
+      pool <- newPool waiting (config harness)
       (connection, finish) <- hold pool
-      waiting <- newEmptyMVar
-      _ <- forkIO (useOnce pool >>= putMVar waiting)
+      result <- newEmptyMVar
+      _ <- forkIO (useOnce pool >>= putMVar result)
       threadDelay 100_000
-      tryReadMVar waiting `shouldReturn` Nothing
+      tryReadMVar result `shouldReturn` Nothing
       finish
-      takeMVar waiting `shouldReturn` Right connection
+      takeMVar result `shouldReturn` Right connection
       readIORef (harnessOpened harness) `shouldReturn` 1
 
-    it "gives a freed connection to a waiting use rather than a later one" $ do
+    it "gives a freed connection to a waiting use rather than a later one" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness)
+      pool <- newPool waiting (config harness)
       order <- newIORef []
       taken <- newEmptyMVar
       done <- newEmptyMVar
@@ -62,9 +63,9 @@ spec = do
       replicateM_ 2 (takeMVar finished)
       readIORef order `shouldReturn` ["waiting", "later"]
 
-    it "loses neither a connection nor a slot when a waiting use is killed" $ do
+    it "loses neither a connection nor a slot when a waiting use is killed" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness)
+      pool <- newPool waiting (config harness)
       (_, finish) <- hold pool
       waiter <- forkIO (void (useOnce pool))
       threadDelay 20_000
@@ -72,43 +73,43 @@ spec = do
       finish
       useOnce pool `shouldReturn` Right 1
 
-    it "times out waiting for a connection" $ do
+    it "times out waiting for a connection" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness){configAcquisitionTimeout = 0.1}
+      pool <- newPool waiting (config harness){configAcquisitionTimeout = 0.1}
       (_, finish) <- hold pool
       useOnce pool `shouldReturn` Left AcquisitionTimeout
       finish
 
-    it "gives the slot back when opening a connection fails" $ do
+    it "gives the slot back when opening a connection fails" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
       failing <- newIORef True
       let connect =
             readIORef failing >>= \case
               True -> writeIORef failing False $> Left "the server is down"
               False -> configConnect (config harness)
-      pool <- newPool (config harness){configConnect = connect}
+      pool <- newPool waiting (config harness){configConnect = connect}
       useOnce pool `shouldReturn` Left (ConnectionFailed "the server is down")
       useOnce pool `shouldReturn` Right 1
       take 2 . fmap snd <$> readIORef (harnessEvents harness)
         `shouldReturn` ["connecting", "terminated: network error Just \"the server is down\""]
 
-    it "closes a connection that a use broke" $ do
+    it "closes a connection that a use broke" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness)
+      pool <- newPool waiting (config harness)
       use pool (\connection -> pure (Broke (Just (pack "lost")), connection)) `shouldReturn` Right 1
       readIORef (harnessClosed harness) `shouldReturn` [1]
       useOnce pool `shouldReturn` Right 2
 
-    it "keeps a connection after a use that failed" $ do
+    it "keeps a connection after a use that failed" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness)
+      pool <- newPool waiting (config harness)
       use pool (\connection -> pure (Failed (toException (ErrorCall "no rows")), connection)) `shouldReturn` Right 1
       useOnce pool `shouldReturn` Right 1
       readIORef (harnessClosed harness) `shouldReturn` []
 
-    it "replaces a connection past its maximum lifetime" $ do
+    it "replaces a connection past its maximum lifetime" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness){configMaxLifetime = 0.1}
+      pool <- newPool waiting (config harness){configMaxLifetime = 0.1}
       useOnce pool `shouldReturn` Right 1
       threadDelay 200_000
       useOnce pool `shouldReturn` Right 2
@@ -116,40 +117,40 @@ spec = do
       events <- fmap snd <$> readIORef (harnessEvents harness)
       events `shouldSatisfy` P.hasInfix ["terminated: aging"]
 
-    it "replaces a connection that was idle too long when it's taken" $ do
+    it "replaces a connection that was idle too long when it's taken" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness){configMaxIdletime = 0.1}
+      pool <- newPool waiting (config harness){configMaxIdletime = 0.1}
       useOnce pool `shouldReturn` Right 1
       threadDelay 200_000
       useOnce pool `shouldReturn` Right 2
       events <- fmap snd <$> readIORef (harnessEvents harness)
       events `shouldSatisfy` P.hasInfix ["terminated: idleness"]
 
-    it "closes idle connections in the background" $ do
+    it "closes idle connections in the background" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness){configMaxIdletime = 0.3}
+      pool <- newPool waiting (config harness){configMaxIdletime = 0.3}
       useOnce pool `shouldReturn` Right 1
       threadDelay 1_600_000
       readIORef (harnessClosed harness) `shouldReturn` [1]
 
-    it "gives a connection back after a use that threw, if it's still usable" $ do
+    it "gives a connection back after a use that threw, if it's still usable" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness)
+      pool <- newPool waiting (config harness)
       use pool (\_ -> throwIO (ErrorCall "boom") :: IO (Outcome, ())) `shouldSatisfy` P.throws (P.eq (ErrorCall "boom"))
       useOnce pool `shouldReturn` Right 1
       events <- fmap snd <$> readIORef (harnessEvents harness)
       events `shouldSatisfy` P.hasInfix ["in use", "ready: failed"]
 
-    it "closes a connection after a use that threw, if it's not usable" $ do
+    it "closes a connection after a use that threw, if it's not usable" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness){configUsableAfterException = const (pure False)}
+      pool <- newPool waiting (config harness){configUsableAfterException = const (pure False)}
       use pool (\_ -> throwIO (ErrorCall "boom") :: IO (Outcome, ())) `shouldSatisfy` P.throws (P.eq (ErrorCall "boom"))
       readIORef (harnessClosed harness) `shouldReturn` [1]
       useOnce pool `shouldReturn` Right 2
 
-    it "loses neither the connection nor its slot when a use is killed" $ do
+    it "loses neither the connection nor its slot when a use is killed" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness){configUsableAfterException = const (pure False)}
+      pool <- newPool waiting (config harness){configUsableAfterException = const (pure False)}
       started <- newEmptyMVar
       user <- forkIO . void . use pool $ \connection -> putMVar started () *> threadDelay 10_000_000 $> (Succeeded, connection)
       takeMVar started
@@ -157,7 +158,7 @@ spec = do
       useOnce pool `shouldReturn` Right 2
       readIORef (harnessClosed harness) `shouldReturn` [1]
 
-    it "loses no slot when opening a connection is killed" $ do
+    it "loses no slot when opening a connection is killed" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
       started <- newEmptyMVar
       first <- newIORef True
@@ -165,16 +166,16 @@ spec = do
             readIORef first >>= \case
               True -> writeIORef first False *> putMVar started () *> threadDelay 10_000_000 $> Left "never"
               False -> configConnect (config harness)
-      pool <- newPool (config harness){configConnect = connect}
+      pool <- newPool waiting (config harness){configConnect = connect}
       user <- forkIO (void (useOnce pool))
       takeMVar started
       killThread user
       useOnce pool `shouldReturn` Right 1
 
   describe "release" $
-    it "closes the idle connections, and the ones in use when they're done" $ do
+    it "closes the idle connections, and the ones in use when they're done" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness){configSize = 2}
+      pool <- newPool waiting (config harness){configSize = 2}
       (_, finish) <- hold pool
       useOnce pool `shouldReturn` Right 2
       release pool
@@ -186,9 +187,9 @@ spec = do
       useOnce pool `shouldReturn` Right 3
 
   describe "observations" $
-    it "follow a connection from opening to its use" $ do
+    it "follow a connection from opening to its use" $ Waiting.withWaiting $ \waiting -> do
       harness <- newHarness
-      pool <- newPool (config harness)
+      pool <- newPool waiting (config harness)
       useOnce pool `shouldReturn` Right 1
       events <- readIORef (harnessEvents harness)
       snd <$> events `shouldBe` ["connecting", "ready: established", "in use", "ready: succeeded"]

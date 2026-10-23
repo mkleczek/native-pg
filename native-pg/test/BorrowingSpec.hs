@@ -4,6 +4,8 @@
 
 module BorrowingSpec (spec) where
 
+import qualified Control.Concurrent.Resource.Waiting as Waiting
+import qualified Network.Streaming.Resources as Resources
 import Control.Exception (evaluate, try)
 import Control.Monad (forM_)
 import Control.Monad.Except (catchError)
@@ -77,6 +79,23 @@ spec = describe "caller-owned input" $ do
     if allocated < 1600000
       then pure ()
       else failTest ("10000 buffered Word32 reads allocated " <> show allocated <> " bytes (limit 1600000)")
+
+  xfail "request-backed input implementation follows" . it "keeps deferred scalar results valid after returning their buffer loan" $
+    Waiting.withWaiting $ \waiting ->
+      Resources.withResources waiting (Resources.ResourceSettings (positiveInt @32) (positiveInt @32) (positiveInt @4) (positiveInt @1)) $ \resources ->
+        Resources.withRequestBuffers resources $ \access -> do
+          initial <- Resources.borrowBuffer access
+          let memory = bufferMemory (Resources.loanBuffer initial)
+          Resources.releaseBuffer initial
+          source <- bytesSource 4 scalarBytes (const (pure ()))
+          input <- requestInputBuffer access
+          (values, pending) <- runInput source input scalarValues
+          releaseInputBuffer pending
+          loan <- Resources.borrowBuffer access
+          bufferMemory (Resources.loanBuffer loan) `shouldBe` memory
+          withForeignPtr (bufferMemory (Resources.loanBuffer loan)) $ \pointer -> fillBytes pointer 85 4
+          Resources.releaseBuffer loan
+          values `shouldBe` scalarExpected
 
   it "compacts unread bytes in the same allocation" $ do
     storage <- newBuffer (positiveInt @4)

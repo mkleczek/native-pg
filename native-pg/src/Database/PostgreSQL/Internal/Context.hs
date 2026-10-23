@@ -4,6 +4,7 @@
 module Database.PostgreSQL.Internal.Context
   ( Context,
     withContext,
+    withRequestContext,
     contextConnection,
     contextInput,
     runContextInput,
@@ -29,6 +30,7 @@ import Control.Exception (catch, finally, mask, onException, throwIO, uninterrup
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+import Network.Streaming.Resources (BufferAccess)
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (plusPtr)
@@ -210,3 +212,6 @@ claimConnection connection = do
 breakConnection :: Connection -> IO ()
 breakConnection connection = atomicModifyIORef' (connectionState connection) $ \state ->
   (case state of Closed -> Closed; _ -> Broken, ())
+
+withRequestContext :: Connection -> BufferAccess -> (Context -> IO a) -> IO a
+withRequestContext _ _ _ = error "request-backed context implementation follows"

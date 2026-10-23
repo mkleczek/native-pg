@@ -29,6 +29,8 @@ module Database.PostgreSQL.Internal.Protocol.Codec
     Uncopied (..),
     emptyInputBuffer,
     reusableInputBuffer,
+    requestInputBuffer,
+    releaseInputBuffer,
     withInputSome,
     inputPosition,
     outputByteString,
@@ -66,6 +68,8 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Input
     MonadInput (..),
     emptyInputBuffer,
     reusableInputBuffer,
+    requestInputBuffer,
+    releaseInputBuffer,
     withInputSome,
     inputPosition,
     peekInputMetadataByteAt,
@@ -669,7 +673,7 @@ instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
   serializeField (Just (ParameterBytes value)) = int32 (parameterLengthAsInt32 (BS.length value)) <> bytes value
   serializeField (Just (ParameterChunks chunks)) = int32 (parameterLengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
   serializeField (Just (ParameterStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> stream source
-  serializeField (Just (ParameterBorrowedStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> borrowedStream source
+  serializeField (Just (ParameterBorrowedStream count source)) = int32 (parameterLengthAsInt32 count) <> borrowedStream count source
   {-# INLINE serializeField #-}
 
 parameterLengthAsInt32 :: Int -> Int32

@@ -80,6 +80,8 @@ import GHC.Clock (getMonotonicTimeNSec)
 import Data.Text qualified as Text
 import Data.UUID.V4 qualified as UUID
 
+import Control.Concurrent.Resource.Waiting qualified as Waiting
+
 import Database.PostgreSQL.Pool.Observation
 
 -- | What the pool needs to know about its connections, and its limits.
@@ -322,8 +324,8 @@ data Given connection
   | TimedOut
 
 -- | A pool with no connections yet. They're opened as uses need them.
-newPool :: Config connection failure -> IO (Pool connection failure)
-newPool config = do
+newPool :: Waiting.Waiting -> Config connection failure -> IO (Pool connection failure)
+newPool _ config = do
   idle <- newTQueueIO
   capacity <- newTVarIO (configSize config)
   reuse <- newTVarIO =<< newTVarIO True

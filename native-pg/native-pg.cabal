@@ -58,6 +58,7 @@ common implementation
                     , postgresql-binary >= 0.14.2 && < 0.15
                     , stm
                     , streaming-io
+                    , resource-admission
                     , scientific        >= 0.3 && < 0.4
                     , text              >= 1.2.2 && < 2.2
                     , time              >= 1.9 && < 2
@@ -107,6 +108,7 @@ test-suite native-pg-spec
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Transport.Link
                       Database.PostgreSQL.Types
+                      PoolAdmissionSpec
                       PoolSpec
                       PoolReservationSpec
                       BorrowedOutputSpec

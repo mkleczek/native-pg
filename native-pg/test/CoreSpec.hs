@@ -608,7 +608,7 @@ paramView (Tx.Param oid format value) = (oid, format, bytes <$> value)
   where
     bytes (ParameterBytes strict) = strict
     bytes (ParameterStream _) = error "a streamed parameter"
-    bytes (ParameterBorrowedStream _) = error "a borrowed streamed parameter"
+    bytes (ParameterBorrowedStream _ _) = error "a borrowed streamed parameter"
     bytes (ParameterChunks chunks) = BS.concat chunks
 
 failsWith :: String -> Predicate IO (Either String a)

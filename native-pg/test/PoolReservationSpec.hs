@@ -2,6 +2,7 @@
 
 module PoolReservationSpec (spec) where
 
+import Control.Concurrent.Resource.Waiting qualified as Waiting
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, orElse, readTVar, retry, writeTVar)
@@ -19,8 +20,8 @@ spec = readySpec *> openingSpec
 
 readySpec :: Spec
 readySpec = describe "ready connection reservations" $ do
-  it "takes only ready connections and returns one exactly once" $ do
-    (pool, opened, _) <- harness id
+  it "takes only ready connections and returns one exactly once" $ Waiting.withWaiting $ \waiting -> do
+    (pool, opened, _) <- harness waiting id
     isNothing <$> atomically (tryReserveReady pool) `shouldReturn` True
     useOnce pool `shouldReturn` Right 1
     reservation <- ready pool
@@ -35,8 +36,8 @@ readySpec = describe "ready connection reservations" $ do
     readIORef opened `shouldReturn` 1
     release pool
 
-  it "rolls back the ready claim when another STM resource cannot be acquired" $ do
-    (pool, _, _) <- harness id
+  it "rolls back the ready claim when another STM resource cannot be acquired" $ Waiting.withWaiting $ \waiting -> do
+    (pool, _, _) <- harness waiting id
     void (useOnce pool)
     permit <- newTVarIO False
     combined <- atomically $ (do
@@ -50,8 +51,8 @@ readySpec = describe "ready connection reservations" $ do
     finishReservation reservation Succeeded
     release pool
 
-  it "validates idleness at the time of use and frees invalid capacity once" $ do
-    (pool, _, closed) <- harness (\config -> config{configMaxIdletime = 0.01})
+  it "validates idleness at the time of use and frees invalid capacity once" $ Waiting.withWaiting $ \waiting -> do
+    (pool, _, closed) <- harness waiting (\config -> config{configMaxIdletime = 0.01})
     void (useOnce pool)
     reservation <- ready pool
     threadDelay 30_000
@@ -62,8 +63,8 @@ readySpec = describe "ready connection reservations" $ do
     useOnce pool `shouldReturn` Right 2
     release pool
 
-  it "invalidates a tentative claim across pool release" $ do
-    (pool, _, closed) <- harness id
+  it "invalidates a tentative claim across pool release" $ Waiting.withWaiting $ \waiting -> do
+    (pool, _, closed) <- harness waiting id
     void (useOnce pool)
     reservation <- ready pool
     release pool
@@ -73,8 +74,8 @@ readySpec = describe "ready connection reservations" $ do
     useOnce pool `shouldReturn` Right 2
     release pool
 
-  it "keeps validated ownership through release and closes at finish" $ do
-    (pool, _, closed) <- harness id
+  it "keeps validated ownership through release and closes at finish" $ Waiting.withWaiting $ \waiting -> do
+    (pool, _, closed) <- harness waiting id
     void (useOnce pool)
     reservation <- ready pool
     validateReservation reservation `shouldReturn` True
@@ -86,8 +87,8 @@ readySpec = describe "ready connection reservations" $ do
     useOnce pool `shouldReturn` Right 2
     release pool
 
-  it "returns an exception-usable connection and rethrows the action exception" $ do
-    (pool, _, closed) <- harness id
+  it "returns an exception-usable connection and rethrows the action exception" $ Waiting.withWaiting $ \waiting -> do
+    (pool, _, closed) <- harness waiting id
     void (useOnce pool)
     reservation <- ready pool
     validateReservation reservation `shouldReturn` True
@@ -97,8 +98,8 @@ readySpec = describe "ready connection reservations" $ do
     useOnce pool `shouldReturn` Right 1
     release pool
 
-  it "frees capacity even when closing a broken reservation throws" $ do
-    (pool, opened, _) <- harness (\config -> config{configClose = const (throwIO (ErrorCall "close failed"))})
+  it "frees capacity even when closing a broken reservation throws" $ Waiting.withWaiting $ \waiting -> do
+    (pool, opened, _) <- harness waiting (\config -> config{configClose = const (throwIO (ErrorCall "close failed"))})
     void (useOnce pool)
     reservation <- ready pool
     validateReservation reservation `shouldReturn` True
@@ -108,8 +109,8 @@ readySpec = describe "ready connection reservations" $ do
     readIORef opened `shouldReturn` 2
     void (try @SomeException (release pool))
 
-  it "hands the connection to an existing use waiter before a new reservation" $ do
-    (pool, _, _) <- harness id
+  it "hands the connection to an existing use waiter before a new reservation" $ Waiting.withWaiting $ \waiting -> do
+    (pool, _, _) <- harness waiting id
     void (useOnce pool)
     reservation <- ready pool
     validateReservation reservation `shouldReturn` True
@@ -131,11 +132,11 @@ ready pool = atomically (tryReserveReady pool) >>= maybe (fail "expected a ready
 useOnce :: Pool Int String -> IO (Either (UsageError String) Int)
 useOnce pool = use pool (\connection -> pure (Succeeded, connection))
 
-harness :: (Config Int String -> Config Int String) -> IO (Pool Int String, IORef Int, IORef [Int])
-harness configure = do
+harness :: Waiting.Waiting -> (Config Int String -> Config Int String) -> IO (Pool Int String, IORef Int, IORef [Int])
+harness waiting configure = do
   opened <- newIORef 0
   closed <- newIORef []
-  pool <- newPool . configure $ Config
+  pool <- newPool waiting . configure $ Config
     { configSize = 1
     , configAcquisitionTimeout = 1
     , configMaxLifetime = 3600
@@ -153,8 +154,8 @@ opening pool = atomically (tryReserveOpening pool) >>= maybe (fail "expected an 
 
 openingSpec :: Spec
 openingSpec = describe "independent connection startup" $ do
-  it "opens a ready connection without occupying a request reservation" $ do
-    (pool, opened, _) <- harness id
+  it "opens a ready connection without occupying a request reservation" $ Waiting.withWaiting $ \waiting -> do
+    (pool, opened, _) <- harness waiting id
     startup <- opening pool
     isNothing <$> atomically (tryReserveReady pool) `shouldReturn` True
     isNothing <$> atomically (tryReserveOpening pool) `shouldReturn` True
@@ -169,8 +170,8 @@ openingSpec = describe "independent connection startup" $ do
     readIORef opened `shouldReturn` 1
     release pool
 
-  it "abandons an unused opening token exactly once" $ do
-    (pool, _, _) <- harness id
+  it "abandons an unused opening token exactly once" $ Waiting.withWaiting $ \waiting -> do
+    (pool, _, _) <- harness waiting id
     first <- opening pool
     abandonOpening first
     abandonOpening first
@@ -182,9 +183,9 @@ openingSpec = describe "independent connection startup" $ do
     useOnce pool `shouldReturn` Right 1
     release pool
 
-  it "returns capacity after a reported startup failure" $ do
+  it "returns capacity after a reported startup failure" $ Waiting.withWaiting $ \waiting -> do
     failNext <- newIORef True
-    (pool, _, _) <- harness (\config -> config{configConnect = do
+    (pool, _, _) <- harness waiting (\config -> config{configConnect = do
       failing <- atomicModifyIORef' failNext (\value -> (False, value))
       if failing then pure (Left "offline") else configConnect config})
     first <- opening pool
@@ -194,11 +195,11 @@ openingSpec = describe "independent connection startup" $ do
     useOnce pool `shouldReturn` Right 1
     release pool
 
-  it "returns capacity when a connecting thread is cancelled" $ do
+  it "returns capacity when a connecting thread is cancelled" $ Waiting.withWaiting $ \waiting -> do
     started <- newEmptyMVar
     gate <- newEmptyMVar
     finished <- newEmptyMVar
-    (pool, _, _) <- harness (\config -> config{configConnect = putMVar started () *> takeMVar gate *> configConnect config})
+    (pool, _, _) <- harness waiting (\config -> config{configConnect = putMVar started () *> takeMVar gate *> configConnect config})
     startup <- opening pool
     thread <- forkFinally (prepareOpening startup) (putMVar finished)
     takeMVar started
@@ -210,11 +211,11 @@ openingSpec = describe "independent connection startup" $ do
     abandonOpening replacement
     release pool
 
-  it "closes a connection opened across release instead of recycling its old generation" $ do
+  it "closes a connection opened across release instead of recycling its old generation" $ Waiting.withWaiting $ \waiting -> do
     started <- newEmptyMVar
     gate <- newEmptyMVar
     finished <- newEmptyMVar
-    (pool, _, closed) <- harness (\config -> config{configConnect = putMVar started () *> takeMVar gate *> configConnect config})
+    (pool, _, closed) <- harness waiting (\config -> config{configConnect = putMVar started () *> takeMVar gate *> configConnect config})
     startup <- opening pool
     _ <- forkIO (prepareOpening startup >>= putMVar finished)
     takeMVar started
@@ -227,8 +228,8 @@ openingSpec = describe "independent connection startup" $ do
     abandonOpening replacement
     release pool
 
-  it "returns a startup connection to an existing use waiter" $ do
-    (pool, _, _) <- harness id
+  it "returns a startup connection to an existing use waiter" $ Waiting.withWaiting $ \waiting -> do
+    (pool, _, _) <- harness waiting id
     startup <- opening pool
     entered <- newEmptyMVar
     done <- newEmptyMVar

@@ -22,7 +22,7 @@ import Data.ByteString (ByteString)
 import Data.Functor.Const (Const (..))
 import Data.Int (Int64)
 import Data.Word (Word32)
-import Network.Streaming.Resources (Resources)
+import Network.Streaming.Resources (BufferAccess)
 import Network.Streaming.Buffer (Buffer)
 
 prepare :: Transaction.Prepare -> ByteString -> [Maybe Word32] -> IO Transaction.Prepared
@@ -47,7 +47,7 @@ streamed = Transaction.Statement "SELECT 'body'::text" (const [])
 owned :: Transaction.Result tx (Const Int64) -> Transaction.Transaction tx [Int64]
 owned = Transaction.rowList
 
-borrowOperation :: Resources -> Connection -> (Session -> IO a) -> IO a
+borrowOperation :: BufferAccess -> Connection -> (Session -> IO a) -> IO a
 borrowOperation = withOperation
 
 borrowBuffers :: Buffer -> Buffer -> Connection -> (Session -> IO a) -> IO a

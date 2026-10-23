@@ -4,17 +4,25 @@
 module OperationContextSpec (spec) where
 
 import Control.Monad.IO.Unlift (withRunInIO)
+import Control.Concurrent.Resource.Waiting qualified as Waiting
 import Control.Exception (bracket, try)
 import Control.Monad (unless)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BSI
+import Foreign.ForeignPtr (withForeignPtr)
+import Foreign.Marshal.Utils (fillBytes)
+import Network.Streaming (Source (..))
+import Database.PostgreSQL.Streaming.Types (Parameter (..))
+import Database.PostgreSQL.Transaction (Param (..))
+import Database.PostgreSQL.Types (FormatCode (..))
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Database.PostgreSQL.Diagnostics (Diagnostics (..))
 import qualified Database.PostgreSQL.Streaming as Streaming
 import Network.Streaming.PositiveInt (positiveInt)
-import Network.Streaming.Resources (ResourceSettings (..), withResources)
+import Network.Streaming.Resources (ResourceSettings (..))
 import qualified Network.Streaming.Resources as Resources
-import Network.Streaming.Buffer (Buffer)
+import Network.Streaming.Buffer (Buffer, bufferMemory, bufferCapacity)
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Session.Settings as PG
 import qualified Database.PostgreSQL.Diagnostics as PG
@@ -46,6 +54,37 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
       result `shouldBe` (42, BS.replicate 96 104)
       readIORef total `shouldReturn` 256
       PG.isUsable connection `shouldReturn` True
+
+  xfail "Request-context scaffold: shared operation implementation follows" $ it "shares one primary across a borrowed upload and streamed TLS response" $
+    withTestResources (ResourceSettings (positiveInt @512) (positiveInt @512) (positiveInt @256) (positiveInt @1)) $ \resources ->
+      bracket (Streaming.connect resources settings) (PG.close . fst) $ \(connection, _) ->
+        Resources.withRequestBuffers resources $ \access -> do
+          remaining <- newIORef 16385
+          total <- newIORef 0
+          let source = Source $ \consume -> do
+                left <- readIORef remaining
+                if left == 0 then consume BS.empty else Resources.withBuffer access $ \buffer -> do
+                  let count = min left (bufferCapacity buffer)
+                  withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer 120 count
+                  result <- consume (BSI.BS (bufferMemory buffer) count)
+                  writeIORef remaining (left - count)
+                  pure result
+              statement = Tx.Statement "SELECT $1::bytea"
+                (const [Param (Just 17) BinaryFormat (Just (ParameterBorrowedStream 16385 source))])
+                (Tx.singleRow (Tx.streamingRow @'[] Body)) False
+          Streaming.withOperation access connection $ \session ->
+            Tx.runTransaction Tx.ReadCommitted Tx.Read session $ withRunInIO $ \run -> do
+              cursor <- run (Tx.pipeline (Tx.statement () statement))
+              current <- run (Tx.nextRow cursor)
+              case current of
+                Just (Body (Just field)) -> drain (run (Tx.nextChunk field)) $ \chunk -> do
+                  BS.all (== 120) chunk `shouldBe` True
+                  modifyIORef' total (+ BS.length chunk)
+                _ -> failTest "unexpected NULL"
+              run Tx.finishTransaction
+          readIORef total `shouldReturn` 16385
+          readIORef remaining `shouldReturn` 0
+          PG.isUsable connection `shouldReturn` True
 
   it "reports deferred COMMIT failure after a borrowed body was delivered" $
     withConnection $ \connection input output -> do
@@ -126,9 +165,13 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
         PG.connectTlsClient = Just tlsClient
       }
     withConnection use =
-      withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @4)) $ \resources ->
+      withTestResources (ResourceSettings (positiveInt @12) (positiveInt @8) (positiveInt @4) (positiveInt @1)) $ \resources ->
         bracket (Streaming.connect resources settings) (PG.close . fst) $ \(connection, _) ->
-          Resources.withBuffers @(Buffer, Buffer) resources $ \(input, output) -> use connection input output
+          Resources.withBuffers @(Buffer, Buffer) resources $ uncurry (use connection)
+
+withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
+withTestResources settings action = Waiting.withWaiting $ \waiting ->
+  Resources.withResources waiting settings action
 
 newtype Body tx = Body (Maybe (Tx.Field tx))
 data Headers tx = Headers Int64 BS.ByteString (Maybe (Tx.Field tx))
