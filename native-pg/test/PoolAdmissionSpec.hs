@@ -245,6 +245,32 @@ spec = describe "independent request and connection admission" $ do
         timeout 20_000 (BufferPool.withRequestBuffers resources (const (pure ()))) `shouldReturn` Nothing
       Pool.release pool
 
+  it "keeps a request's eventual pool alive while primary admission is queued" $
+    withTestResources settings $ \waiting resources ->
+      BufferPool.withRequestBuffers resources $ \_ ->
+        bracket (startQueuedRequest waiting resources)
+          (\(worker, stopped) -> killThread worker >> readMVar stopped)
+          (\(worker, stopped) -> do
+            awaitBlocked worker
+            performGC
+            performGC
+            isNothing <$> tryReadMVar stopped `shouldReturn` True)
+
+  it "keeps a queued connection pool alive after its request primary becomes available" $
+    withTestResources settings $ \waiting resources -> do
+      queued <- BufferPool.withRequestBuffers resources $ \_ -> do
+        queued@(worker, stopped) <- startQueuedRequest waiting resources
+        awaitBlocked worker
+        performGC
+        performGC
+        isNothing <$> tryReadMVar stopped `shouldReturn` True
+        pure queued
+      let (worker, stopped) = queued
+      (timeout 200_000 (readMVar stopped) >>= \case
+        Just (Right (Right 1)) -> pure ()
+        _ -> failTest "queued request lost its eventual pool during collection")
+        `finally` (killThread worker >> readMVar stopped)
+
   it "returns the request primary when cancellation interrupts connection checkout" $
     withTestResources settings $ \waiting resources -> do
       pool <- newShared waiting
@@ -296,6 +322,17 @@ sharedConfig connect = Pool.Config
 
 useOnce :: Pool.Pool Int String -> IO (Either (Pool.UsageError String) Int)
 useOnce pool = Pool.use pool (\connection -> pure (Pool.Succeeded, connection))
+
+-- Only the worker retains the pool while primary admission waits.
+startQueuedRequest :: Acquire.Context -> BufferPool.BufferPool -> IO (ThreadId, MVar (Either SomeException (Either (Pool.UsageError String) Int)))
+startQueuedRequest waiting resources = do
+  pool <- newShared waiting
+  useOnce pool `shouldReturn` Right 1
+  stopped <- newEmptyMVar
+  worker <- forkFinally
+    (BufferPool.withRequestBuffers resources (const (useOnce pool)))
+    (putMVar stopped)
+  pure (worker, stopped)
 
 awaitBlocked :: ThreadId -> IO ()
 awaitBlocked worker = timeout 1_000_000 loop >>= (`shouldBe` Just ())
