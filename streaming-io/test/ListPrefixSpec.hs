@@ -30,4 +30,4 @@ spec = describe "fixed list prefixes" $ do
     mapM_ (\xs -> takePrefix @(Int, Int, Int, Int) xs `shouldBe` Nothing) [[], [1], [1, 2], [1, 2, 3]]
     mapM_ (\xs -> takePrefix @(Int, Int, Int, Int, Int) xs `shouldBe` Nothing) [[], [1], [1, 2], [1, 2, 3], [1, 2, 3, 4]]
   it "leaves the unconsumed tail lazy" $ do
-    fmap (fst) (takePrefix @(Int, Int) (1 : 2 : error "forced remainder")) `shouldBe` Just (1, 2)
+    fmap fst (takePrefix @(Int, Int) (1 : 2 : error "forced remainder")) `shouldBe` Just (1, 2)

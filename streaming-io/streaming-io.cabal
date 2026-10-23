@@ -16,7 +16,7 @@ library
                    Network.Streaming.Resources
                    Network.Streaming.Buffer
   other-modules: Network.Streaming.Internal.ListPrefix
-  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, stm >=2.5 && <2.6
+  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, stm >=2.5 && <2.6, containers >=0.6 && <0.8, resource-admission
 
 test-suite streaming-io-spec
   type: exitcode-stdio-1.0
@@ -24,14 +24,17 @@ test-suite streaming-io-spec
   hs-source-dirs: test src
   main-is: Main.hs
   other-modules: ListPrefixSpec
+                      AcquisitionTestSupport
+                 AdmissionResourcesSpec
                  Network.Streaming.Internal.ListPrefix
                  Network.Streaming
                  Network.Streaming.PositiveInt
                  Network.Streaming.Resources
                  Network.Streaming.Buffer
                  PositiveIntSpec
+                 RequestBuffersSpec
                  ResourcesSpec
                  StreamingSpec
   ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, bytestring, stm, streaming-io, skeletest >=0.4.2 && <0.5
+  build-depends: base, bytestring, containers, stm, streaming-io, resource-admission, skeletest >=0.4.2 && <0.5
