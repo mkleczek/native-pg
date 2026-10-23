@@ -318,6 +318,9 @@ spec = describe "private delivery" $ do
   it "grant releases its detach callback before a far-future deadline" $ withWaiting $ \waiting -> do
     finalized <- grantedWaitingAnchor waiting
     collected finalized
+  it "cancellation releases its detach callback before a far-future deadline" $ withWaiting $ \waiting -> do
+    finalized <- cancelledWaitingAnchor waiting
+    collected finalized
   it "releases timed grant callbacks before resource use finishes" $ withWaiting $ \waiting ->
     forM_ [True, False] $ \grantDuringEnqueue -> do
       (finalized, release, result) <- activeGrantAnchor waiting grantDuringEnqueue
