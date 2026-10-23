@@ -221,5 +221,6 @@ stream source = Output (byteStreamLength source) 0 $ \rest ->
 
 -- | The source owns each chunk through its synchronous callback.
 borrowedStream :: Int -> Source -> Output
-borrowedStream _ _ = error "scoped output implementation follows"
+borrowedStream count source = Output count 0 $ \rest ->
+  Writer $ \_ _ used -> pure (Yield used (UncopiedBorrowedStream count source) rest)
 {-# INLINE borrowedStream #-}

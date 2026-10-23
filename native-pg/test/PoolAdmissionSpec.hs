@@ -115,7 +115,7 @@ spec = describe "independent request and connection admission" $ do
       timeout 1_000_000 collect `shouldReturn` Just ()
       assertWaitingOpen waiting
 
-  xfail "Shared Waiting constructor scaffold: shared closure and validation follow in the next change" $ it "rejects every queued checkout when the shared deadline service closes" $ do
+  it "rejects every queued checkout when the shared deadline service closes" $ do
     waiting <- Waiting.newWaiting
     pool <- newShared waiting
     held <- newEmptyMVar
@@ -138,7 +138,7 @@ spec = describe "independent request and connection admission" $ do
       `finally` (mapM_ (killThread . fst) queued >> tryPutMVar hold () >> readMVar done >> Waiting.closeWaiting waiting)
     Pool.release pool
 
-  xfail "Shared Waiting constructor scaffold: shared closure and validation follow in the next change" $ it "keeps caller deadlines open after a constructor rejects its settings" $
+  it "keeps caller deadlines open after a constructor rejects its settings" $
     Waiting.withWaiting $ \waiting -> do
       rejected <- try @IOError $ Pool.newPool waiting (sharedConfig (pure (Right 1))) {Pool.configSize = 0}
       isLeft rejected `shouldBe` True

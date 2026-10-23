@@ -21,10 +21,10 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     inputPosition,
     peekInputMetadataByteAt,
     readInputSome,
+    readInputBorrowedSome,
     readInputWord8,
     readInputWord16,
     readInputWord32,
-    readInputBorrowedSome,
     runBodyParser,
     runInput,
     runInputUntil,
@@ -33,8 +33,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
   )
 where
 
-import qualified Network.Streaming.Resources
-import Control.Exception (Exception, evaluate, throwIO, try)
+import Control.Exception (Exception, evaluate, throwIO, try, mask_, onException)
 import Control.Monad (ap, liftM, when)
 import Control.Monad.Except (MonadError (..))
 import Data.Bits (shiftL, (.|.))
@@ -42,6 +41,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Word (Word8, Word16, Word32)
+import Data.IORef (IORef, newIORef, writeIORef, atomicModifyIORef')
+import Network.Streaming.Resources (BufferAccess, BufferLoan, borrowBuffer, loanBuffer, releaseBuffer)
 import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import qualified Network.Streaming.Buffer as Buffer
@@ -86,18 +87,50 @@ data InputBuffer = InputBuffer
     bufferPosition :: {-# UNPACK #-} !Int,
     bufferReusable :: !Bool,
     -- | The supplied workspace while a protocol discriminator uses owned lookahead.
-    bufferHome :: !(Maybe HomeBuffer)
+    bufferHome :: !(Maybe HomeBuffer),
+    bufferRequest :: !(Maybe RequestBuffer)
   }
 
 data HomeBuffer = HomeBuffer !(ForeignPtr Word8) !Int
 
+-- The mutable loan slot also lets exception cleanup find a loan acquired by
+-- a parser that did not return its cursor.
+data RequestBuffer = RequestBuffer BufferAccess (IORef (Maybe BufferLoan))
+
+requestInputBuffer :: BufferAccess -> IO InputBuffer
+requestInputBuffer access = do
+  loan <- newIORef Nothing
+  pure emptyInputBuffer {bufferReusable = True, bufferRequest = Just (RequestBuffer access loan)}
+
+releaseInputBuffer :: InputBuffer -> IO ()
+releaseInputBuffer buffer = case bufferRequest buffer of
+  Nothing -> pure ()
+  Just (RequestBuffer _ slot) -> mask_ $ do
+    loan <- atomicModifyIORef' slot (Nothing,)
+    mapM_ releaseBuffer loan
+
+retireConsumed :: InputBuffer -> IO InputBuffer
+retireConsumed buffer
+  | bufferStart buffer == bufferEnd buffer, Just _ <- bufferRequest buffer = do
+      releaseInputBuffer buffer
+      pure emptyInputBuffer {bufferReusable = True, bufferPosition = bufferPosition buffer, bufferRequest = bufferRequest buffer}
+  | otherwise = pure buffer
+
+acquireInputBuffer :: InputBuffer -> IO InputBuffer
+acquireInputBuffer buffer = case bufferRequest buffer of
+  Just (RequestBuffer access slot) | bufferCapacity buffer == 0 -> mask_ $ do
+    loan <- borrowBuffer access
+    writeIORef slot (Just loan) `onException` releaseBuffer loan
+    pure (reusableInputBuffer (loanBuffer loan)) {bufferPosition = bufferPosition buffer, bufferRequest = bufferRequest buffer}
+  _ -> pure buffer
+
 emptyInputBuffer :: InputBuffer
 emptyInputBuffer = case BS.empty of
-  BSI.BS memory _ -> InputBuffer memory 0 0 0 0 False Nothing
+  BSI.BS memory _ -> InputBuffer memory 0 0 0 0 False Nothing Nothing
 
 -- | Empty input backed by storage lent by the caller.
 reusableInputBuffer :: Buffer -> InputBuffer
-reusableInputBuffer storage = InputBuffer (Buffer.bufferMemory storage) (Buffer.bufferCapacity storage) 0 0 0 True Nothing
+reusableInputBuffer storage = InputBuffer (Buffer.bufferMemory storage) (Buffer.bufferCapacity storage) 0 0 0 True Nothing Nothing
 
 -- | Borrows one chunk until the callback returns, then consumes it.
 -- The callback must not retain the bytes or read this input recursively.
@@ -169,8 +202,9 @@ instance MonadInput Input where
     | count < 0 = throwError ("negative byte count " <> show count <> " is invalid")
     | otherwise = do
         buffer <- ensureAvailable count
+        value <- ownedSlice count buffer
         putBuffer (consume count buffer)
-        ownedSlice count buffer
+        pure value
   {-# INLINE readInputExactly #-}
 
   readInputRemaining = do
@@ -248,7 +282,7 @@ readInputBorrowedSome :: Int -> Input ByteString
 readInputBorrowedSome count = do
   restoreBorrowedWorkspace
   (size, buffer) <- someInput count
-  putBuffer (consume size buffer)
+  putBufferRetained (consume size buffer)
   pure (slice size buffer)
 {-# INLINE readInputBorrowedSome #-}
 
@@ -331,7 +365,7 @@ skipInput count
 runBodyParser :: ByteString -> Input a -> Either String (a, ByteString)
 runBodyParser (BSI.BS memory size) parser =
   unsafeDupablePerformIO $ do
-    result <- try (runInput endOfInput (InputBuffer memory size 0 size 0 False Nothing) parser)
+    result <- try (runInput endOfInput (InputBuffer memory size 0 size 0 False Nothing Nothing) parser)
     pure $ case result of
       Left (InputError message) -> Left message
       Right (a, buffer) -> Right (a, slice (bufferEnd buffer - bufferStart buffer) buffer)
@@ -347,8 +381,14 @@ getBuffer = Input (\_ buffer s -> (# s, buffer, buffer #))
 {-# INLINE getBuffer #-}
 
 putBuffer :: InputBuffer -> Input ()
-putBuffer buffer = Input (\_ _ s -> (# s, buffer, () #))
+putBuffer buffer = do
+  next <- inputIO (retireConsumed buffer)
+  putBufferRetained next
 {-# INLINE putBuffer #-}
+
+putBufferRetained :: InputBuffer -> Input ()
+putBufferRetained buffer = Input (\_ _ s -> (# s, buffer, () #))
+{-# INLINE putBufferRetained #-}
 
 getLimit :: Input Int
 getLimit = Input (\env buffer s -> (# s, buffer, envLimit env #))
@@ -364,7 +404,19 @@ ensureAvailable = ensureAvailableWith False
 {-# INLINE ensureAvailable #-}
 
 ensureAvailableWith :: Bool -> Int -> Input InputBuffer
-ensureAvailableWith metadata count = Input $ \env buffer s ->
+ensureAvailableWith _ 0 = getBuffer
+ensureAvailableWith metadata count = do
+  previous <- getBuffer
+  -- An already-filled buffer has active storage; keep ordinary reads out of
+  -- the loan acquisition path. The checks below still apply to every read.
+  when (bufferEnd previous - bufferStart previous < count) $ do
+    buffer <- inputIO (acquireInputBuffer =<< retireConsumed previous)
+    putBufferRetained buffer
+  ensureActiveAvailable metadata count
+{-# INLINE ensureAvailableWith #-}
+
+ensureActiveAvailable :: Bool -> Int -> Input InputBuffer
+ensureActiveAvailable metadata count = Input $ \env buffer s ->
   if bufferPosition buffer + count > envLimit env
     then unInput (throwError ("unexpected end of a bounded part: needed " <> show count <> " bytes")) env buffer s
     else if bufferReusable buffer && not metadata && count > suppliedCapacity buffer
@@ -374,7 +426,7 @@ ensureAvailableWith metadata count = Input $ \env buffer s ->
         then (# s, buffer, buffer #)
         else case unIO (fill metadata (envSource env) (refillEnd env buffer count) count buffer) s of
           (# s', buffer' #) -> (# s', buffer', buffer' #)
-{-# INLINE ensureAvailableWith #-}
+{-# INLINE ensureActiveAvailable #-}
 
 -- Exact envelope headers establish the bound; body refills can then batch
 -- without pulling bytes that would outlive the current operation.
@@ -413,7 +465,7 @@ fill metadata source end count buffer
       unsafeWithForeignPtr memory $ \target ->
         unsafeWithForeignPtr (bufferMemory buffer) $ \origin ->
           copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
-      pure (InputBuffer memory capacity 0 unconsumed (bufferPosition buffer) False Nothing)
+      pure (InputBuffer memory capacity 0 unconsumed (bufferPosition buffer) False Nothing Nothing)
     readUntilAvailable current
       | bufferEnd current - bufferStart current >= count = pure current
       | otherwise = do
@@ -441,7 +493,7 @@ expandMetadata capacity buffer = do
   withForeignPtr (Buffer.bufferMemory storage) $ \target ->
     withForeignPtr (bufferMemory buffer) $ \origin ->
       copyBytes target (origin `plusPtr` bufferStart buffer) count
-  pure (InputBuffer (Buffer.bufferMemory storage) capacity 0 count (bufferPosition buffer) True home)
+  pure buffer {bufferMemory = Buffer.bufferMemory storage, bufferCapacity = capacity, bufferStart = 0, bufferEnd = count, bufferHome = home}
 
 restoreHome :: InputBuffer -> IO InputBuffer
 restoreHome buffer = case bufferHome buffer of
@@ -452,7 +504,7 @@ restoreHome buffer = case bufferHome buffer of
     withForeignPtr memory $ \target ->
       withForeignPtr (bufferMemory buffer) $ \origin ->
         copyBytes target (origin `plusPtr` bufferStart buffer) count
-    pure (InputBuffer memory capacity 0 count (bufferPosition buffer) True Nothing)
+    pure buffer {bufferMemory = memory, bufferCapacity = capacity, bufferStart = 0, bufferEnd = count, bufferHome = Nothing}
 
 -- Metadata is owned independently from the operation arena. Unlike a field's
 -- contiguous materialization, it may span any number of bounded refills.
@@ -490,8 +542,9 @@ cstringFrom scanned = do
   case BS.elemIndex 0 (BS.drop scanned (slice available buffer)) of
     Just index -> do
       let size = scanned + index
+      value <- ownedSlice size buffer
       putBuffer (consume (size + 1) buffer)
-      ownedSlice size buffer
+      pure value
     Nothing
       | bufferPosition buffer + available >= limit -> throwError "unterminated C-string"
       | otherwise -> ensureAvailable (available + 1) *> cstringFrom available
@@ -516,8 +569,3 @@ ownedSlice count buffer
   | bufferReusable buffer = inputIO (evaluate (BS.copy (slice count buffer)))
   | otherwise = pure (slice count buffer)
 {-# INLINE ownedSlice #-}
-
-requestInputBuffer :: Network.Streaming.Resources.BufferAccess -> IO InputBuffer
-requestInputBuffer _ = error "request-backed input implementation follows"
-releaseInputBuffer :: InputBuffer -> IO ()
-releaseInputBuffer _ = pure ()

@@ -38,7 +38,7 @@ import System.IO.Error (ioeGetErrorString)
 
 spec :: Spec
 spec = describe "shared operation resources" $ do
-  xfail "Request-context scaffold: lazy shared input follows in the next change" $ it "reserves one primary for the request and releases it after teardown" $
+  it "reserves one primary for the request and releases it after teardown" $
     withTestResources settings $ \resources -> do
       withRequestBuffers resources $ \access -> do
         connection <- Context.newConnection idleChannel 16
@@ -46,7 +46,7 @@ spec = describe "shared operation resources" $ do
         unavailable resources `shouldReturn` True
       unavailable resources `shouldReturn` False
 
-  xfail "Request-context scaffold: lazy shared input follows in the next change" $ it "reuses the request primary for upload then response without a body pair" $
+  it "reuses the request primary for upload then response without a body pair" $
     withTestResources settings $ \resources -> withRequestBuffers resources $ \access -> do
       primary <- borrowBuffer access
       let memory = bufferMemory (loanBuffer primary)
@@ -82,7 +82,7 @@ spec = describe "shared operation resources" $ do
       readIORef received `shouldReturn` ("\0\0\0\16" <> BS.replicate 16 65)
       PG.isUsable connection `shouldReturn` True
 
-  xfail "Request-context scaffold: lazy shared input follows in the next change" $ it "keeps unread database bytes loaned while a second owner borrows" $
+  it "keeps unread database bytes loaned while a second owner borrows" $
     withTestResources settings $ \resources -> withRequestBuffers resources $ \access -> do
       wire <- newIORef "abcdefgh"
       let link = Transfer (\pointer size -> do
@@ -102,7 +102,7 @@ spec = describe "shared operation resources" $ do
         releaseBuffer second
         releaseBuffer first
 
-  xfail "Request-context scaffold: lazy shared input follows in the next change" $ it "expires the supplied session without closing its pooled connection" $
+  it "expires the supplied session without closing its pooled connection" $
     withTestResources settings $ \resources -> withRequestBuffers resources $ \access -> do
       connection <- Context.newConnection idleChannel 16
       session <- PG.withOperation access connection $ \session -> do
@@ -115,7 +115,7 @@ spec = describe "shared operation resources" $ do
       PG.isUsable connection `shouldReturn` True
       unavailable resources `shouldReturn` True
 
-  xfail "Request-context scaffold: lazy shared input follows in the next change" $ it "returns storage and invalidates the connection after a callback failure" $ do
+  it "returns storage and invalidates the connection after a callback failure" $ do
     withTestResources settings $ \resources -> withRequestBuffers resources $ \access -> do
       connection <- Context.newConnection idleChannel 16
       result <- try @IOException $ PG.withOperation access connection $ \_ -> ioError (userError "stop")
@@ -123,7 +123,7 @@ spec = describe "shared operation resources" $ do
       unavailable resources `shouldReturn` True
       PG.isUsable connection `shouldReturn` False
 
-  xfail "Request-context scaffold: lazy shared input follows in the next change" $ it "returns a parser loan when a borrowed consumer throws" $
+  it "returns a parser loan when a borrowed consumer throws" $
     withTestResources settings $ \resources -> withRequestBuffers resources $ \access -> do
       let link = Transfer (\pointer size -> do
             let count = min size 8

@@ -31,8 +31,8 @@ import Foreign.Marshal.Utils (fillBytes)
 import Skeletest
 
 spec :: Spec
-spec = xfail "Scoped output scaffold: lifetime-safe producer follows in the next change" $ describe "borrowed parameter streams" $ do
-  it "keeps a reused source buffer unchanged across partial writes" $ bounded $ do
+spec = describe "borrowed parameter streams" $ do
+  it "keeps a reused source buffer unchanged across partial writes" $ do
       buffer <- newBuffer (positiveInt @32)
       pulls <- newIORef (0 :: Int)
       received <- newIORef BS.empty
@@ -52,7 +52,7 @@ spec = xfail "Scoped output scaffold: lifetime-safe producer follows in the next
       readIORef received `shouldReturn` ("\0\0\0`" <> BS.replicate 32 65 <> BS.replicate 32 66 <> BS.replicate 32 67)
       readIORef pulls `shouldReturn` 4
 
-  it "keeps earlier large results moving while a later borrowed upload waits" $ bounded $ do
+  it "keeps earlier large results moving while a later borrowed upload waits" $ do
       let earlierSize = 70000
           uploadSize = 70000
       earlier <- newIORef earlierSize
@@ -112,7 +112,7 @@ spec = xfail "Scoped output scaffold: lifetime-safe producer follows in the next
       readIORef sent `shouldReturn` uploadSize
       readIORef returned `shouldReturn` True
 
-  it "propagates a source error and joins its cleanup" $ bounded $ do
+  it "propagates a source error and joins its cleanup" $ do
       cleaned <- newIORef False
       let source = Streaming.Source $ \_ ->
             ioError (userError "source failed") `finally` writeIORef cleaned True
@@ -120,7 +120,7 @@ spec = xfail "Scoped output scaffold: lifetime-safe producer follows in the next
         `shouldSatisfy` P.throws @IOException P.anything
       readIORef cleaned `shouldReturn` True
 
-  it "joins a cancelled source callback before returning borrowed storage" $ bounded $ do
+  it "joins a cancelled source callback before returning borrowed storage" $ do
       entered <- newEmptyMVar
       cleaning <- newEmptyMVar
       allowCleanup <- newEmptyMVar
@@ -138,7 +138,7 @@ spec = xfail "Scoped output scaffold: lifetime-safe producer follows in the next
       putMVar allowCleanup ()
       timeout 1000000 (readMVar stopped) `shouldReturn` Just ()
 
-  it "rejects a short and an overlong scoped stream" $ bounded $ do
+  it "rejects a short and an overlong scoped stream" $ do
       let one chunk = do
             first <- newIORef True
             pure (Streaming.Source $ \use -> do
@@ -177,6 +177,3 @@ instance Link Duplex where
   awaitReadable (Duplex _ _ readable _) = readable
   awaitReadableOrWritable (Duplex _ _ _ eitherReady) = eitherReady
   closeLink _ = pure ()
-
-bounded :: IO () -> IO ()
-bounded action = timeout 3000000 action >>= maybe (failTest "pending scoped-output implementation") pure

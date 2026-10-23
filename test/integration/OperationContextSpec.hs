@@ -55,7 +55,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
       readIORef total `shouldReturn` 256
       PG.isUsable connection `shouldReturn` True
 
-  xfail "Request-context scaffold: shared operation implementation follows" $ it "shares one primary across a borrowed upload and streamed TLS response" $
+  it "shares one primary across a borrowed upload and streamed TLS response" $
     withTestResources (ResourceSettings (positiveInt @512) (positiveInt @512) (positiveInt @256) (positiveInt @1)) $ \resources ->
       bracket (Streaming.connect resources settings) (PG.close . fst) $ \(connection, _) ->
         Resources.withRequestBuffers resources $ \access -> do
