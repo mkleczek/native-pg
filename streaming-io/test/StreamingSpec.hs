@@ -38,7 +38,7 @@ spec = describe "borrowed stream forwarding" $ do
     readIORef pulls `shouldReturn` 1
     readIORef writes `shouldReturn` 0
 
-  xfail "Callback Source scaffold: return each callback before the next pull" $ it "returns from the chunk callback before pulling the next chunk" $ do
+  it "returns from the chunk callback before pulling the next chunk" $ do
     pulls <- newIORef (0 :: Int)
     inCallback <- newIORef False
     let source = Source $ \use -> do

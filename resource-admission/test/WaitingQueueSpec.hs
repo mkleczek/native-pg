@@ -16,7 +16,7 @@ data Operation = Append | Remove Int
 data Model = Model Int [(Int, Q.Entry Int)]
 
 spec :: Spec
-spec = xfail "FIFO API scaffold: ordered links follow in the next change" $ describe "opaque FIFO" $ do
+spec = describe "opaque FIFO" $ do
   it "preserves FIFO grant order after cancelling a middle opaque registration" $ withWaiting $ \waiting -> do
     queue <- atomically Q.newQueue
     registered <- newEmptyTMVarIO
@@ -55,6 +55,11 @@ spec = xfail "FIFO API scaffold: ordered links follow in the next change" $ desc
     runOperations $ replicate 16 Append
       ++ map Remove [7, 0, 15, 4, 1, 14, 8, 2, 13, 3, 12, 5, 11, 6, 10, 9]
       ++ [Append, Remove 16, Append, Remove 17, Append]
+  it "matches a live-handle model through interleaved cancellation and append after draining" $
+    forM_ [1 .. 8 :: Int] $ \seed ->
+      runOperations $ concat
+        [[Append, Remove ((seed * 48271 + ticket * 17) `mod` (ticket + 1))] | ticket <- [0 .. 159]]
+        ++ map Remove [0 .. 159] ++ replicate 5 Append ++ map Remove [160 .. 164] ++ [Append]
   it "removes entries from independent queues with interleaved head, tail and singleton removal" $ do
     (left, right, a, b, c, x, y) <- atomically $ do
       left <- Q.newQueue

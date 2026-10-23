@@ -19,13 +19,13 @@ import Skeletest
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = xfail "Request capability scaffold: scoped loans follow in the next change" $ describe "shared request buffer capability" $ do
-  it "requires an ordinary block in addition to protected reserve" $ bounded $ do
+spec = describe "shared request buffer capability" $ do
+  it "requires an ordinary block in addition to protected reserve" $ do
     isLeft (validateSettings (settings 1)) `shouldBe` True
     isLeft (validateSettings (ResourceSettings (positiveInt @24) (positiveInt @8) (positiveInt @8) (positiveInt @3))) `shouldBe` True
     validateSettings (settings 2) `shouldBe` Right ()
 
-  it "lends a local primary and one reserve block, rejecting a third overlap" $ bounded $
+  it "lends a local primary and one reserve block, rejecting a third overlap" $
     withTestResources (settings 2) $ \resources -> withRequestBuffers resources $ \access -> do
       primary <- borrowBuffer access
       extra <- borrowBuffer access
@@ -35,7 +35,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       releaseBuffer extra
       releaseBuffer primary
 
-  it "reuses the primary locally and ignores stale releases" $ bounded $
+  it "reuses the primary locally and ignores stale releases" $
     withTestResources (settings 2) $ \resources -> withRequestBuffers resources $ \access -> do
       first <- borrowBuffer access
       releaseBuffer first
@@ -47,14 +47,14 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       releaseBuffer second
       releaseBuffer extra
 
-  it "keeps reserve out of both primary and compatibility admission" $ bounded $
+  it "keeps reserve out of both primary and compatibility admission" $
     withTestResources (settings 2) $ \resources -> withRequestBuffers resources $ \access -> do
       isNothing <$> atomically (tryAcquire @(Solo Buffer) resources) `shouldReturn` True
       blocked <- timeout 20_000 (withRequestBuffers resources (const (pure ())))
       blocked `shouldBe` Nothing
       withBuffer access (const (pure ()))
 
-  it "returns extra capacity promptly while the primary stays local" $ bounded $
+  it "returns extra capacity promptly while the primary stays local" $
     withTestResources (settings 3) $ \resources ->
       withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
         primary <- borrowBuffer first
@@ -65,7 +65,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer otherPrimary
         releaseBuffer primary
 
-  it "reuses a released primary while its extra waits for global inventory" $ bounded $
+  it "reuses a released primary while its extra waits for global inventory" $
     withTestResources (settings 3) $ \resources ->
       withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
         primary <- borrowBuffer first
@@ -86,7 +86,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer heldReserve
         releaseBuffer otherPrimary
 
-  it "cancels a pending extra without consuming a later return" $ bounded $
+  it "cancels a pending extra without consuming a later return" $
     withTestResources (settings 3) $ \resources ->
       withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
         primary <- borrowBuffer first
@@ -103,7 +103,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer otherPrimary
         releaseBuffer primary
 
-  it "serves queued extras in arrival order without a new arrival stealing supply" $ bounded $
+  it "serves queued extras in arrival order without a new arrival stealing supply" $
     withTestResources (settings 4) $ \resources ->
       withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second ->
         withRequestBuffers resources $ \third -> do
@@ -137,7 +137,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
           releaseBuffer otherPrimary
           releaseBuffer primary
 
-  it "delivers reserve to an extra behind many blocked primary arrivals" $ bounded $
+  it "delivers reserve to an extra behind many blocked primary arrivals" $
     withTestResources (settings 3) $ \resources ->
       withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
         primary <- borrowBuffer first
@@ -162,7 +162,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer otherPrimary
         releaseBuffer primary
 
-  it "returns exactly once across cancellation racing an extra grant" $ bounded $
+  it "returns exactly once across cancellation racing an extra grant" $
     withTestResources (settings 3) $ \resources ->
       withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
         primary <- borrowBuffer first
@@ -180,7 +180,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer otherPrimary
         releaseBuffer primary
 
-  it "returns exactly once across cancellation racing local primary delivery" $ bounded $
+  it "returns exactly once across cancellation racing local primary delivery" $
     withTestResources (settings 3) $ \resources ->
       withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
         otherPrimary <- borrowBuffer second
@@ -199,7 +199,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer heldReserve
         releaseBuffer otherPrimary
 
-  it "expires escaped capabilities and returns outstanding loans on teardown" $ bounded $
+  it "expires escaped capabilities and returns outstanding loans on teardown" $
     withTestResources (settings 2) $ \resources -> do
       (access, primary, extra) <- withRequestBuffers resources $ \access -> do
         primary <- borrowBuffer access
@@ -215,7 +215,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer second
         releaseBuffer first) `shouldReturn` Just ()
 
-  it "waits for an active withBuffer callback before request teardown returns" $ bounded $
+  it "waits for an active withBuffer callback before request teardown returns" $
     withTestResources (settings 2) $ \resources -> do
       entered <- newEmptyMVar
       hold <- newEmptyMVar
@@ -235,7 +235,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       fmap isLeft <$> timeout 1_000_000 (takeMVar childDone) `shouldReturn` Just False
       fmap isLeft <$> timeout 1_000_000 (takeMVar requestDone) `shouldReturn` Just False
 
-  it "keeps a callback's loan exclusive if cancellation interrupts request teardown" $ bounded $
+  it "keeps a callback's loan exclusive if cancellation interrupts request teardown" $
     withTestResources (settings 2) $ \resources -> do
       entered <- newEmptyMVar
       hold <- newEmptyMVar
@@ -256,7 +256,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       fmap isLeft <$> timeout 1_000_000 (takeMVar childDone) `shouldReturn` Just False
       timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
 
-  it "keeps an active extra callback exclusive after its request is cancelled" $ bounded $
+  it "keeps an active extra callback exclusive after its request is cancelled" $
     withTestResources (settings 3) $ \resources -> withRequestBuffers resources $ \other -> do
       otherPrimary <- borrowBuffer other
       entered <- newEmptyMVar
@@ -282,7 +282,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
       releaseBuffer otherPrimary
 
-  it "rejects an extra waiter when its request closes" $ bounded $
+  it "rejects an extra waiter when its request closes" $
     withTestResources (settings 3) $ \resources -> withRequestBuffers resources $ \other -> do
       _ <- borrowBuffer other
       pending <- newEmptyMVar
@@ -294,7 +294,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       outcome <- timeout 1_000_000 (takeMVar pending)
       fmap isLeft outcome `shouldBe` Just True
 
-  it "returns the full request after asynchronous cancellation" $ bounded $
+  it "returns the full request after asynchronous cancellation" $
     withTestResources (settings 2) $ \resources -> do
       started <- newEmptyMVar
       hold <- newEmptyMVar
@@ -312,7 +312,7 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       fmap isLeft outcome `shouldBe` Just True
       timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
 
-  it "rejects blocked primary and extra admission on resource shutdown" $ bounded $ do
+  it "rejects blocked primary and extra admission on resource shutdown" $ do
     primaryDone <- newEmptyMVar
     extraDone <- newEmptyMVar
     holder <- withTestResources (settings 3) $ \resources -> do
@@ -352,9 +352,6 @@ awaitBlocked worker = do
       ThreadFinished -> pure ()
       ThreadDied -> pure ()
       _ -> yield >> loop
-
-bounded :: IO () -> IO ()
-bounded action = timeout 2000000 action >>= maybe (failTest "pending request implementation") pure
 
 withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
 withTestResources settings action = Waiting.withWaiting $ \waiting ->

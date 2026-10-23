@@ -18,7 +18,7 @@ import System.Timeout (timeout)
 
 spec :: Spec
 spec = describe "buffer-owned scheduling" $ do
-    xfail "Buffer scheduler scaffold: returned inventory must serve queued demand before bypass" $ it "detaches immediate grants before serving a same-size FIFO" $
+    it "detaches immediate grants before serving a same-size FIFO" $
       withTestResources $ \resources -> do
         timeout 1_000_000 (withBuffers @(Buffer, Buffer) resources (pure . capacities)) `shouldReturn` Just (8, 8)
         timeout 1_000_000 (withBuffers @(Buffer, Buffer) resources (pure . capacities)) `shouldReturn` Just (8, 8)

@@ -254,6 +254,73 @@ spec = describe "private delivery" $ do
     sort <$> readTVarIO removed >>= (`shouldBe` [1 .. 64])
     atomically (forM waiters (\(_, waiter) -> reject waiter Closed)) >>= (`shouldBe` replicate 64 False)
     length <$> readTVarIO removed >>= (`shouldBe` 64)
+  it "expires an earlier waiter while far-future waiters are pending" $ withWaiting $ \waiting -> do
+    capabilities <- getNumCapabilities
+    registered <- newTQueueIO
+    later <- deadlineAfter 60
+    pending <- replicateM capabilities $ forkResult $ withWait waiting later (writeTQueue registered)
+      (const (pure ())) (const (pure ())) (pure @IO @())
+    waiters <- replicateM capabilities (within (atomically (readTQueue registered)))
+    earlier <- deadlineAfter 0.02
+    outcome <- within $ withWait waiting earlier (const (pure ()))
+      (const (pure ())) (const (pure ())) (pure @IO @())
+    outcome `shouldBe` Left TimedOut
+    forM_ waiters $ \waiter -> atomically (tryGrant waiter (pure ())) >>= (`shouldBe` True)
+    forM_ pending $ \(_, result) -> await result >>= expectWaitResult (Right ())
+  it "settles grant and expiry competition with one detach and one cleanup owner" $ withWaiting $ \waiting -> do
+    registered <- newEmptyTMVarIO
+    detached <- newTVarIO (0 :: Int)
+    cleaned <- newTVarIO (0 :: Int)
+    (_, result) <- forkResult $ withWait waiting NoDeadline (putTMVar registered)
+      (const (modifyTVar' detached (+ 1)))
+      (\() -> atomically (modifyTVar' cleaned (+ 1))) (pure @IO @())
+    waiter <- within (atomically (takeTMVar registered))
+    start <- newEmptyTMVarIO
+    (_, granted) <- forkResult $ atomically (readTMVar start >> tryGrant waiter (pure ()))
+    (_, expired) <- forkResult $ atomically (readTMVar start >> reject waiter TimedOut)
+    atomically (putTMVar start ())
+    grantWon <- await granted >>= either throwIO pure
+    expiryWon <- await expired >>= either throwIO pure
+    (grantWon /= expiryWon) `shouldBe` True
+    await result >>= expectWaitResult (if grantWon then Right () else Left TimedOut)
+    readTVarIO detached >>= (`shouldBe` 1)
+    readTVarIO cleaned >>= (`shouldBe` if grantWon then 1 else 0)
+  it "expires many waiters sharing one deadline" $ withWaiting $ \waiting -> do
+    capabilities <- getNumCapabilities
+    let count = 192 * capabilities
+    deadline <- deadlineAfter 1
+    registered <- newTQueueIO
+    detached <- newTVarIO (0 :: Int)
+    workers <- replicateM count $ forkResult $ withWait waiting deadline (writeTQueue registered)
+      (const (modifyTVar' detached (+ 1))) (const (fail "expired waiter acquired a resource")) (pure @IO @())
+    waiters <- replicateM count (within (atomically (readTQueue registered)))
+    forM_ workers $ \(_, result) -> await result >>= expectWaitResult (Left TimedOut)
+    readTVarIO detached >>= (`shouldBe` count)
+    forM_ waiters $ \waiter -> atomically (tryGrant waiter (pure ())) >>= (`shouldBe` False)
+  it "removing the earliest deadline preserves a later same-timestamp survivor" $ withWaiting $ \waiting -> do
+    registered <- newTQueueIO
+    detached <- newTVarIO (0 :: Int)
+    earliest <- deadlineAfter 0.5
+    later <- deadlineAfter 1
+    workers <- forM [earliest, later, later] $ \deadline ->
+      forkResult $ withWait waiting deadline (writeTQueue registered)
+        (const (modifyTVar' detached (+ 1))) (const (pure ())) (pure @IO @())
+    replicateM_ 3 (within (atomically (readTQueue registered)))
+    case workers of
+      [(first, firstResult), (second, secondResult), (_, survivor)] -> do
+        killThread first
+        killThread second
+        await firstResult >>= (\outcome -> isLeft outcome `shouldBe` True)
+        await secondResult >>= (\outcome -> isLeft outcome `shouldBe` True)
+        await survivor >>= expectWaitResult (Left TimedOut)
+      _ -> fail "expected three registered waiters"
+    readTVarIO detached >>= (`shouldBe` 3)
+  it "grant releases its detach callback before a far-future deadline" $ withWaiting $ \waiting -> do
+    finalized <- grantedWaitingAnchor waiting
+    collected finalized
+  it "cancellation releases its detach callback before a far-future deadline" $ withWaiting $ \waiting -> do
+    finalized <- cancelledWaitingAnchor waiting
+    collected finalized
   it "releases timed grant callbacks before resource use finishes" $ withWaiting $ \waiting ->
     forM_ [True, False] $ \grantDuringEnqueue -> do
       (finalized, release, result) <- activeGrantAnchor waiting grantDuringEnqueue
