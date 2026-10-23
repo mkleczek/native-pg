@@ -32,11 +32,13 @@ The library does none of the following:
   decides when to `Parse` and `Close` them. Only the client knows a good
   cache key: PostgREST, for example, can key on the request plan instead of
   generating SQL text just to look a statement up.
-- **Connection pooling.**
-- **Threads.** The library starts none. A session operation sends pending
-  output as it waits for input, in the calling thread. Clients can use
-  different connections concurrently. Direct users of transport links or
-  channels must ensure exclusive access to each connection.
+- **Tenant policy.** Applications choose connection-pool sizes, create tenant
+  pools and decide which requests use them. The optional pool API supplies
+  connection lifecycle and targeted waiting.
+- **Query workers.** A session operation sends pending output as it waits for
+  input, in the calling thread. Pool maintenance and admission use background
+  workers. Clients can use different connections concurrently. Direct users of
+  transport links or channels must ensure exclusive access to each connection.
 
 Pipeline planning completes before `pipeline` queues its output. It retains the
 statement descriptions, parameters and result cursors for that pipeline;
@@ -78,36 +80,54 @@ operation completes; no request-byte leftovers are installed on the connection.
 
 ## Shared operation resources
 
-The independent `streaming-io` package owns fixed initialized blocks, with
-separate body and setup budgets. `withResources` brackets the service; its
-lifetime encloses all connection pools and active operations. Blocks are
-allocated and initialized once, not for each loan. A pool grant is atomic:
-it either supplies all requested blocks or waits without holding a partial set.
-The grant type fixes the number of blocks: `Solo Buffer` for one block, or a
-homogeneous tuple of two through five `Buffer` values. Integration callbacks
-receive that shape directly. `Lease grant` preserves it through STM admission,
-`leaseBuffers` and release; no runtime count or partial list match is needed.
+The independent `streaming-io` package owns initialized blocks, with separate
+body and setup budgets. `withResources waiting settings` encloses active
+requests. The caller owns the supplied `Waiting` and keeps it open through all
+uses of these resources. Each pool allocates one contiguous block with `calloc` at startup;
+loans neither allocate body storage nor clear it again.
 
-`Database.PostgreSQL.Streaming.connect` and `connectFirst` borrow a temporary
-setup pair for startup, authentication and host qualification. The returned
-`Connection` retains no payload buffers. `withOperation resources connection`
-borrows a body pair and supplies an opaque `Session`. These facades are for callers
-whose operation owns its whole grant. An HTTP/database integration instead
-reserves all blocks and a ready connection together, then uses public
-`withBuffers`, avoiding nested acquisitions of the same finite pool.
+`withRequestBuffers` admits one primary, leaving `reserveBufferCount` blocks
+unavailable to ordinary admission. It passes an opaque `BufferAccess`. Warp
+starts this scope after the first request byte arrives and before parsing the
+request. The primary remains owned until response completion and request cleanup;
+idle keep-alive connections hold none. Headers and protocol metadata are copied
+to ordinary owned memory, outside the body budget. Body read-ahead remains
+loan-backed, and body consumption follows application demand.
 
-Connection and operation scopes are distinct. Only one scope may use a
-connection at a time; input and output storage must be disjoint. Contexts,
-rows and borrowed sources expire before storage is returned. A source can
-run on a child thread inside its scope, but teardown cancels and joins an
-unfinished operation before releasing the grant. Transport callbacks must
-therefore be cancellable. These contracts do not introduce a transport mutex.
+`borrowBuffer` lends the free primary first. While it is in use, one additional
+loan may borrow globally, including from the protected reserve. A third
+overlapping acquisition fails promptly. Returning the primary wakes that
+capability's pending borrower directly, even if global inventory is still empty.
+Returning an additional loan makes it globally available immediately. A request
+can hold at most two loans; callbacks must stop accessing bytes before returning
+them. `withBuffer` brackets this contract, while transport adapters can use
+explicit `BufferLoan` lifetimes for unread cursors. Adapters join their readers
+and producers before request teardown.
 
-The fixed budget covers borrowed body workspace. Owned protocol metadata,
-control-plane operations, deliberately materialized values, TLS internal
-allocations and kernel buffers are separate. An application can share the
-same resources across HTTP and database pools; request handlers need only
-connect sources and synchronous sinks.
+The reserve provides progress capacity when a producer holds one block while
+its consumer needs another. This relies on bounded two-loan nesting, prompt
+release, and cancellable I/O; it is neither a latency guarantee nor useful
+concurrency by itself. Slow peers can hold a loan and a database connection.
+
+The WAI streaming request carries this capability alongside ordinary request
+metadata. PostgREST checks out a database connection with `Pool.use`, then calls
+`Streaming.withOperation access connection`. It does not acquire a buffer pair.
+The Session's concrete input cursor borrows on refill and returns exhausted
+storage; a borrowed field chunk keeps its input loan until the next input
+operation. An outgoing borrowed parameter is sent directly from its source
+chunk. Small serialization/protocol metadata remains separately owned.
+Statements describe parameters and rows without knowing how their buffers
+were acquired.
+
+`Streaming.connect` and `connectFirst` borrow a temporary setup pair for startup,
+authentication and qualification. The returned `Connection` retains protocol
+and transport state but no body storage. `withBuffers` retains the explicit
+supplied-descriptor path, including capacity and alias validation. Every path
+requires exclusive connection access and uses the same monomorphic parser.
+
+The fixed budget covers borrowed body workspace. Control-plane operations,
+deliberately materialized values, TLS internal allocations and kernel buffers
+remain separate. Full-body application features are retained.
 
 Resource sizes use opaque `PositiveInt` values. Grant sizes are determined by
 their tuple types.
@@ -172,6 +192,125 @@ trailing command completion and ready messages, and a transaction can still fail
 at `COMMIT`. A streamed write response can withhold one owned final chunk until
 transaction completion. Earlier bytes may already be visible; a failure aborts
 the incomplete HTTP response instead of replacing it with an error response.
+
+## Connection pools and waiting
+
+`Database.PostgreSQL.Pool` owns connection inventory, opening capacity, idle and
+maximum lifetimes, reset generations, observations and reservation cleanup.
+Its connection and error parameters remain generic so the existing Hasql
+control pool can use the same lifecycle implementation. PostgREST retains its
+configuration, statement cache and application error mapping.
+
+Each connection pool owns one FIFO of pending checkouts. `newPool waiting config`
+uses the caller's deadline service, without registering connection inventory
+elsewhere. The application supplies the service explicitly to both connection
+and buffer constructors, choosing which pools share a shutdown scope. Warp
+already owns the request capability before choosing a tenant; waiting for a
+connection does not reserve extra body blocks. Connection startup
+borrows from the separate setup pool. `Pool.release` resets connections without
+retiring the pool.
+
+The `resource-admission` package supplies two resource-independent primitives.
+`Control.Concurrent.Resource.Waiting` provides private delivery and deadlines;
+`Control.Concurrent.Resource.Waiting.Queue` provides an opaque FIFO with direct
+removal handles. Each entry carries its owning queue, so `remove` takes
+only the entry and cannot be directed at another queue. Resource owners decide
+whom to grant. There is no central Admission registry, global connection ordering,
+or dispatcher shared by tenants.
+
+Queue order comes from its links: append adds at the tail, and removal connects
+the predecessor and successor in one STM transaction. The queue stores only head
+and tail; each entry stores its owner, payload and two neighbour links. No
+positions or ordering counter are needed because entries are never reinserted
+or moved. The public operations are `newQueue`, `append`, `first`, `value`,
+`remove` and `isEmpty`. Consumers examine or remove the current head; the API
+does not expose traversal or snapshots of entry handles.
+
+A connection return or newly available opening slot serves that pool's FIFO.
+Registration and cancellation also reconsider its head, so an available resource
+cannot be stranded behind a removed waiter. Reserving inventory, removing the
+waiter and publishing its grant commit in one STM transaction. Waiting threads
+retry on their own mailbox, never on shared resource inventory. A return to one
+tenant does not inspect or mutate another tenant's queue. Creating a pool adds
+no timer or scheduling worker; the existing idle reaper remains per pool.
+
+Buffer pools own their reserve-aware selection policy. An ordinary grant must
+leave the protected reserve available; an extra loan may consume it. A blocked
+ordinary request must therefore not prevent an eligible extra loan from making
+progress. Each required block count has its own FIFO. Selection compares the
+oldest fitting heads, so its cost depends on the number of grant sizes rather
+than the number of blocked requests. Larger grants can wait while smaller
+arrivals fit; eligible grants retain FIFO order.
+Temporary setup grants use a separate inventory and queue. Returning a
+request's primary can deliver directly to that capability's pending borrower
+without returning storage globally.
+Ordinary primary reuse changes only request-local state.
+
+Each pending acquisition has one queue entry, one private mailbox and at most
+one timer registration. Grant, rejection and cancellation detach the queue entry
+in STM. The waiting thread owns its timer key and unregisters it during cleanup,
+before using a grant; unregistering is separate from the grant transaction.
+Cancellation either removes the pending request or cleans up its committed
+grant; exceptions in a callback still return its resource. Removing an entry
+invalidates its handle: callers must neither remove it again nor inspect its
+payload or links. Entries retain their references without a liveness flag or
+duplicate-removal checks. Waiting's once-only removal hook enforces this
+discipline for both pool adapters; its protection remains necessary for competing
+outcomes. Shutdown repeatedly takes the current queue head because rejecting one
+waiter may also remove later entries through scheduling. `value` is a pure
+payload projection, used before an operation that can invalidate the handle.
+
+`withWait` accepts an enqueue hook that returns the resource owner's opaque
+removal handle:
+
+```haskell
+withWait
+  :: Waiting -> Deadline
+  -> (Waiter a -> STM handle)
+  -> (handle -> STM ())
+  -> (a -> IO ())
+  -> (a -> IO r)
+  -> IO (Either WaitError r)
+```
+
+The enqueue hook can return a FIFO entry directly; no waiter IDs, lookup table
+or caller-owned handle slot are needed. It may also grant or reject immediately.
+Waiting marks that delivery terminal first, remembers the removal request, and
+invokes the removal hook once enqueue supplies its handle, before the same STM
+transaction commits. Subsequent grants and cancellations remove immediately in
+their own transactions. Removal is consumed before invoking the hook, so a hook
+can reconsider its queue without granting the same waiter again. Removal hooks
+must not retry or throw; an entry granted during enqueue can remain linked until
+enqueue returns, and scheduling must tolerate its grant operation returning `False`.
+If registration is already closed or expired, neither hook runs. Failed enqueue
+transactions roll back both registration and any immediate reservation.
+
+One waiting scope can serve the body/setup pools and many connection pools. It
+uses GHC's shared runtime `TimerManager`; distinct `Waiting` instances share that
+scheduler automatically. Pending timed waits require an executable linked with
+`-threaded`; untimed waits and creating or closing a scope do not acquire a timer
+manager. A timer callback only sets its waiter's private
+expiration flag. It retains no resource and never calls queue or resource hooks;
+the waiter or resource owner performs detachment and grant selection in STM.
+A callback racing with unregistration can only set that flag, so late callbacks
+are harmless. Untimed waiters need no timer key. Active connection startup and
+validation keep their existing short-lived IO timeouts. Closing the service
+signals a shared closure flag and rejects new registrations and pending grants.
+Pending borrowers detach from their own queues and unregister their own keys;
+there is no service-wide timer registry or synchronous timer drain. This broadcast
+happens only at shutdown, not when any resource changes. Already delivered grants
+retain their cleanup ownership.
+
+The caller's waiting scope encloses every pool use that shares the service.
+Resource scopes enclose request use. Retiring a buffer pool rejects
+its pending acquisitions, and late returns cannot revive its inventory.
+Connection pools retain their own cleanup and lifetime anchors through queued
+checkout. `Pool.release` closes idle connections and marks borrowed connections
+for closure on return, while keeping the pool usable. Construction failure,
+buffer retirement, pool release and pool collection never close the supplied
+service. `Waiting.withWaiting` can bracket the application's chosen group of
+pools. The acquisition timeout bounds queueing, while connection startup belongs
+to the acquired slot.
 
 ## Principles
 
@@ -408,9 +547,12 @@ any -> Broken | Closed
   obtain this scope through `Streaming.withOperation`, or pass two shared
   initialized buffer descriptors to `Streaming.withBuffers`.
 - The parser monad `Input` passes state in unboxed tuples, allowing its binds
-  and schema operations to inline. Refills stay on the slow path. Cursor
-  records and owned results can still allocate; an unboxed return tuple alone
-  does not eliminate those allocations. Codec tests feed plain byte strings through this private API.
+  and schema operations to inline. Reads whose bytes are already available
+  skip loan acquisition, but still check frame and supplied-storage bounds.
+  Refills and loan acquisition stay on the slow path. Cursor records and
+  owned results can still allocate; an unboxed return tuple alone does not
+  eliminate those allocations. Codec tests feed plain byte strings through
+  this private API.
 - Borrowed result chunks from `nextChunk` expire on the next input operation
   or when the transaction scope ends. Owned field decoders return stable
   values. Applications copy borrowed data before retaining it across an
@@ -565,22 +707,14 @@ data ByteStream = ByteStream
   }
 ```
 
-- **Parameters.** The client supplies either strict bytes or a `ByteStream`.
-  A WAI request body with `KnownLength n` becomes
-  `ByteStream n (getRequestBodyChunk req)`. A body without a length (chunked
-  upload) has to be buffered by the client, or rejected.
-- **Callback results.** `Statement.scopedRow` or `foldRows` supplies a scoped row.
-  `decodeScopedStreamingNullable` decodes its leading columns and exposes the
-  last column as a nullable `ScopedStream`. `streamLength` reports its length;
-  `streamChunks` passes slices of the input buffer to a synchronous sink without
-  copying them. `streamChunk` instead returns an owned chunk.
-- **Scope.** The row and stream carry the callback's scope in their types.
-  Borrowed chunks expire when their sink callback returns. Private row
-  operations also check for stale access at runtime. Whatever the client
-  leaves unread is skipped.
-- **Measured.** A 64 MiB column streamed to a slow consumer through the
-  default 16 KiB buffer didn't grow the live heap at all, sampled at 16 major
-  collections on PostgreSQL 14, 17 and 18.
+Owned input uses strict bytes or `ByteStream`. Borrowed input uses
+`ParameterBorrowedStream n source`, whose chunks remain valid during their
+source callback. The PostgreSQL wire length must be known; unknown-length
+uploads remain an explicit materialization case.
+
+A 64 MiB column streamed to a slow consumer through the default 16 KiB buffer
+didn't grow the live heap, sampled at 16 major collections on PostgreSQL 14, 17
+and 18.
 
 ### Typed decoding
 
@@ -671,9 +805,8 @@ chunk and complete the transaction before sending HTTP headers.
 - **Respond inside the DB scope.** Handlers call `respond` inside the
   database scope instead of returning a `Response` after the transaction
   ends.
-- **Pool and statement cache move into PostgREST.** The vendored
-  `Hasql.Pool` logic carries over. The statement cache is keyed on the
-  request plan, so a cache hit skips generating SQL.
+- **Pool and statement cache.** Native-pg owns connection lifecycle; PostgREST
+  owns configuration, the adapter and statement caching keyed on request plans.
 - **JSON keys.** Inserts without `?columns=` parse the JSON body for its keys
   before the SQL can be built. Streaming them needs that moved into SQL, or
   it stays a buffering case.
@@ -716,13 +849,14 @@ serializer remains available when no caller buffer is supplied.
 
 ### Borrowed upload chunks
 
-`ParameterBorrowedStream` accepts a source whose current chunk remains valid
-until its next pull. The sender keeps a barrier after that chunk, so partial
-writes never trigger a pull that overwrites unsent bytes. It may still return
-pending output while reading PostgreSQL replies, avoiding a write-only wait
-that could deadlock a full-duplex exchange. The source and its storage loan
-must stay alive until the operation completes or its session is closed.
-Ordinary `ParameterStream` chunks retain their existing owned-value contract.
+`ParameterBorrowedStream length source` accepts a callback-based `Source`.
+Its producer keeps each callback open while the single protocol driver sends
+partial slices. A one-chunk acknowledgement bridge permits the driver to read
+earlier replies while later upload bytes are pending. The producer never calls
+`Link`, preserving exclusive TLS access. Source readiness and readable transport
+both wake progress; an unfinished producer is cancelled and joined before its
+borrowed storage can return. No next chunk is pulled until the previous callback
+has ended. Ordinary `ParameterStream` retains its owned-value contract.
 
 ### Values outside transport storage
 
