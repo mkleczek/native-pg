@@ -17,7 +17,7 @@ import System.Mem (performGC)
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = xfail "Acquisition scaffold: timer registration follows in the next change" $ describe "timer key ownership races" $ do
+spec = describe "timer key ownership races" $ do
   it "returns an immediate reservation without registering a deadline timer" $
     Timer.withTimerControl $ \manager -> do
       deadline <- deadlineAfter 3600
