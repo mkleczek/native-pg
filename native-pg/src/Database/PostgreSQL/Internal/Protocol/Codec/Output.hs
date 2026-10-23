@@ -29,6 +29,7 @@ where
 
 import Data.Bits (shiftR)
 import Data.ByteString (ByteString)
+import Network.Streaming (Source)
 import Database.PostgreSQL.Streaming.Types (ByteStream (..))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
@@ -73,7 +74,7 @@ outputWriter Output {outputBuild} = outputBuild (Writer (\_ _ used -> pure (Fini
 data Uncopied
   = UncopiedBytes ByteString
   | UncopiedStream ByteStream
-  | UncopiedBorrowedStream ByteStream
+  | UncopiedBorrowedStream Int Source
 
 instance Semigroup Output where
   Output leftLength leftCopied left <> Output rightLength rightCopied right =
@@ -107,7 +108,7 @@ outputByteString output = unsafeDupablePerformIO $ do
   where
     uncopiedBytes (UncopiedBytes value) = value
     uncopiedBytes (UncopiedStream _) = error "an output with streams has no byte string"
-    uncopiedBytes (UncopiedBorrowedStream _) = error "an output with streams has no byte string"
+    uncopiedBytes (UncopiedBorrowedStream _ _) = error "an output with streams has no byte string"
 
 -- | Each value's output, one after another. Compute sizes without retaining
 -- a serializer for every value; build their writers as the sender advances.
@@ -218,8 +219,7 @@ stream source = Output (byteStreamLength source) 0 $ \rest ->
   Writer $ \_ _ used -> pure (Yield used (UncopiedStream source) rest)
 {-# INLINE stream #-}
 
--- | The source may overwrite a chunk on its next pull.
-borrowedStream :: ByteStream -> Output
-borrowedStream source = Output (byteStreamLength source) 0 $ \rest ->
-  Writer $ \_ _ used -> pure (Yield used (UncopiedBorrowedStream source) rest)
+-- | The source owns each chunk through its synchronous callback.
+borrowedStream :: Int -> Source -> Output
+borrowedStream _ _ = error "scoped output implementation follows"
 {-# INLINE borrowedStream #-}

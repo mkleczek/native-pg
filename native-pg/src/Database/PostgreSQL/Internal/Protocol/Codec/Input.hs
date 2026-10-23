@@ -15,6 +15,8 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     MonadInput (..),
     emptyInputBuffer,
     reusableInputBuffer,
+    requestInputBuffer,
+    releaseInputBuffer,
     withInputSome,
     inputPosition,
     peekInputMetadataByteAt,
@@ -31,6 +33,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
   )
 where
 
+import qualified Network.Streaming.BufferPool
 import Control.Exception (Exception, evaluate, throwIO, try)
 import Control.Monad (ap, liftM, when)
 import Control.Monad.Except (MonadError (..))
@@ -513,3 +516,8 @@ ownedSlice count buffer
   | bufferReusable buffer = inputIO (evaluate (BS.copy (slice count buffer)))
   | otherwise = pure (slice count buffer)
 {-# INLINE ownedSlice #-}
+
+requestInputBuffer :: Network.Streaming.BufferPool.BufferAccess -> IO InputBuffer
+requestInputBuffer _ = error "request-backed input implementation follows"
+releaseInputBuffer :: InputBuffer -> IO ()
+releaseInputBuffer _ = pure ()

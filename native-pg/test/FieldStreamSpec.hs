@@ -33,6 +33,22 @@ import Skeletest hiding (context)
 
 spec :: Spec
 spec = describe "borrowed field streams" $ do
+  it "finishes an empty row at the following message boundary" $
+    withFields [] ready $ \context _ -> do
+      result <- PG.executeWithContext context execution (\count row -> do
+        PG.rowColumnCount row `shouldBe` 0
+        PG.nextColumn row `shouldReturn` Nothing
+        pure (count + 1 :: Int)) 0
+      result `shouldBe` (Right (1, "SELECT 1"), TxIdle)
+
+  it "skips unread columns without consuming the following message" $
+    withFields [Just payload, Nothing, Just "tail"] ready $ \context _ -> do
+      result <- PG.executeWithContext context execution (\_ row -> do
+        PG.rowColumnCount row `shouldBe` 3
+        PG.nextColumn row `shouldReturn` Just (PG.Column (BS.length payload))
+        pure ()) ()
+      result `shouldBe` (Right ((), "SELECT 1"), TxIdle)
+
   it "borrows columnChunks directly from the supplied input" $
     withFields [Just payload] ready $ \context input -> do
       inside <- newIORef True

@@ -2,6 +2,7 @@
 module Database.PostgreSQL.Streaming.Types (ByteStream (..), Parameter (..)) where
 
 import Data.ByteString (ByteString)
+import Network.Streaming (Source)
 
 -- | Bytes that arrive in chunks, with their total length known up front.
 data ByteStream = ByteStream
@@ -18,7 +19,6 @@ data Parameter
     -- long one, so that they aren't copied into one first.
     ParameterChunks [ByteString]
   | ParameterStream ByteStream
-  | -- | Each chunk may reuse storage after the next pull. The source and
-    -- its storage must remain exclusively lent until the operation ends.
-    -- The sender accepts the whole chunk before pulling another.
-    ParameterBorrowedStream ByteStream
+  | -- | Declared length and a source whose chunk remains valid only inside
+    -- its callback. The sender finishes the chunk before returning it.
+    ParameterBorrowedStream !Int Source

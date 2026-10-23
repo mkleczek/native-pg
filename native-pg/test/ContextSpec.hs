@@ -12,6 +12,8 @@ import Data.Maybe (isNothing)
 import Data.IORef
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Protocol (TransactionStatus (..))
+import Database.PostgreSQL.Internal.Protocol.Codec.Output (borrowedStream)
+import Network.Streaming (Source (..))
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Internal.Execution as PG
 import qualified Database.PostgreSQL.Internal.Row as PG
@@ -65,6 +67,22 @@ spec = describe "explicit operation contexts" $ do
     context <- newOwnedContext connection
     runContextOperation context (breakConnection connection)
     PG.isUsable connection `shouldReturn` False
+
+  xfail "broken owned operations must release pending source producers" $ it "joins pending sources after a completed owned operation marks itself broken" $ do
+    entered <- newEmptyMVar
+    returned <- newEmptyMVar
+    let source = Source $ \use ->
+          (putMVar entered () *> use "borrowed") `finally` putMVar returned ()
+        channel = newChannel (Scripted (\_ _ -> fail "unexpected receive") (const (pure 0)))
+    connection <- newConnection channel 16
+    context <- newOwnedContext connection
+    (do
+      runContextOperation context $ do
+        queueContextOutput context (borrowedStream 8 source)
+        readMVar entered
+        breakConnection connection
+      timeout 1000000 (readMVar returned) `shouldReturn` Just ())
+      `finally` (discardUnsent =<< readIORef (contextPending context))
 
 
   it "expires escaped contexts before the storage can be reused" $ do

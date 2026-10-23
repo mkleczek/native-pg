@@ -1,5 +1,5 @@
 -- | Operation-scoped byte storage. Connections keep only transport and
--- protocol state between calls; Resources can be shared with an HTTP server.
+-- protocol state between calls; BufferPool can be shared with an HTTP server.
 module Database.PostgreSQL.Streaming
   ( withOperation,
     withBuffers,
@@ -17,15 +17,16 @@ import Database.PostgreSQL.Session (Connection, Session)
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Session.Settings (ConnectSettings, ServerInfo)
 import Database.PostgreSQL.Streaming.Types (ByteStream (..))
-import Network.Streaming.Resources (Resources)
-import qualified Network.Streaming.Resources as Resources
+import Network.Streaming.BufferPool (BufferPool, BufferAccess)
+import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (Buffer)
 
--- | Borrow an initialized input/output pair for one exclusive connection
--- scope. Borrowed rows and streams expire before the pair is returned.
-withOperation :: Resources -> Connection -> (Session -> IO a) -> IO a
-withOperation resources connection action = Resources.withBuffers @(Buffer, Buffer) resources $ \(input, output) ->
-  withBuffers input output connection action
+-- | Use the request's shared body capability for one exclusive connection
+-- scope. Input borrows only while unread or borrowed bytes remain; streamed
+-- output consumes source chunks without acquiring another body buffer.
+withOperation :: BufferAccess -> Connection -> (Session -> IO a) -> IO a
+withOperation access connection action =
+  Context.withRequestContext connection access (action . Exchange.Session)
 
 -- | Use disjoint, initialized shared storage for one exclusive operation.
 -- Both buffers must remain exclusively owned until the callback returns;
@@ -36,13 +37,13 @@ withBuffers input output connection action =
 
 -- | Establish a connection using the separate setup budget. The returned
 -- connection retains no payload workspace.
-connect :: Resources -> ConnectSettings -> IO (Connection, ServerInfo)
-connect resources settings = Resources.withSetupBuffers @(Buffer, Buffer) resources $ \(input, output) ->
+connect :: BufferPool -> ConnectSettings -> IO (Connection, ServerInfo)
+connect resources settings = BufferPool.withSetupBuffers @(Buffer, Buffer) resources $ \(input, output) ->
   Startup.connectWithBuffers input output settings
 
 -- | Try hosts and qualify the connection using temporary setup storage.
-connectFirst :: Resources -> (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Connection, ServerInfo, Host)
-connectFirst resources adjust string = Resources.withSetupBuffers @(Buffer, Buffer) resources $ \(input, output) ->
+connectFirst :: BufferPool -> (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Connection, ServerInfo, Host)
+connectFirst resources adjust string = BufferPool.withSetupBuffers @(Buffer, Buffer) resources $ \(input, output) ->
   HostSelection.connectFirstUsing (Startup.connectWithBuffers input output) Session.close
     (\connection query -> Context.withContext connection input output $ \context ->
       HostSelection.queryValue (Exchange.Session context) query) adjust string
