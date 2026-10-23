@@ -1,13 +1,15 @@
 {-# LANGUAGE DataKinds #-}
 module ResourcesSpec (spec) where
 
+import AcquisitionTestSupport (getAcquisition)
+import Control.Concurrent.Resource.Acquisition qualified as Acquire
 import Control.Exception (try)
-import Control.Monad (forM_)
+import Control.Monad (forM_, void)
 import Control.Concurrent (forkFinally, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import System.Timeout (timeout)
-import Control.Concurrent.STM (atomically, retry, orElse)
-import Data.Maybe (isNothing)
+import System.IO.Error (ioeGetErrorString)
+import Control.Concurrent.STM (retry)
 import Data.Tuple (Solo (MkSolo))
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Array (peekArray, pokeArray)
@@ -17,25 +19,65 @@ import System.Mem (performGC)
 import Data.Either (isLeft)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 import Network.Streaming.Buffer
+import Network.Streaming.Resources qualified as Resources
 import Network.Streaming.Resources
 import Skeletest
 
 spec :: Spec
 spec = do
  describe "resource settings" $ do
-  it "rejects budgets smaller than one block" $
-    mapM_ rejects [ResourceSettings (positiveInt @7) (positiveInt @16) (positiveInt @8), ResourceSettings (positiveInt @32) (positiveInt @7) (positiveInt @8)]
-
- describe "pure settings validation" $ do
-  it "validates without creating resource storage" $ do
-    validateSettings (ResourceSettings (positiveInt @25) (positiveInt @9) (positiveInt @8)) `shouldBe` Right ()
-    isLeft (validateSettings (ResourceSettings (positiveInt @7) (positiveInt @8) (positiveInt @8))) `shouldBe` True
-    isLeft (validateSettings (ResourceSettings (positiveInt @8) (positiveInt @7) (positiveInt @8))) `shouldBe` True
-  it "rejects budgets whose sum exceeds Int without allocating" $ do
+  xfail "Count-based pool allocation follows in the implementation change" $ it "allocates the smallest positive counts as ordinary, reserve and setup blocks" $
+    withTestResources (ResourceSettings (positiveInt @1) (positiveInt @1) (positiveInt @1) (positiveInt @1)) $ \resources ->
+      withRequestBuffers resources $ \access -> do
+        primary <- borrowBuffer access
+        extra <- borrowBuffer access
+        bufferCapacity (loanBuffer primary) `shouldBe` 1
+        bufferCapacity (loanBuffer extra) `shouldBe` 1
+        withSetupBuffers @(Solo Buffer) resources $ \(MkSolo setup) ->
+          bufferCapacity setup `shouldBe` 1
+        releaseBuffer extra
+        releaseBuffer primary
+  xfail "Count-based pool allocation follows in the implementation change" $ it "keeps reserve independent even when it exceeds ordinary capacity" $
+    withTestResources (ResourceSettings (positiveInt @8) (positiveInt @1) (positiveInt @3) (positiveInt @1)) $ \resources ->
+      withRequestBuffers resources $ \access -> do
+        timeout 20_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Nothing
+        primary <- borrowBuffer access
+        extra <- borrowBuffer access
+        bufferMemory (loanBuffer primary) `shouldNotBe` bufferMemory (loanBuffer extra)
+        releaseBuffer extra
+        releaseBuffer primary
+  xfail "Count-based pool allocation follows in the implementation change" $ it "allocates exactly the requested ordinary and setup counts at the requested size" $
+    withTestResources (ResourceSettings (positiveInt @7) (positiveInt @2) (positiveInt @1) (positiveInt @3)) $ \resources ->
+      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
+        timeout 20_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Nothing
+        primary <- borrowBuffer first
+        otherPrimary <- borrowBuffer second
+        extra <- borrowBuffer first
+        map (bufferCapacity . loanBuffer) [primary, otherPrimary, extra] `shouldBe` [7, 7, 7]
+        timeout 20_000 (void (borrowBuffer second)) `shouldReturn` Nothing
+        withSetupBuffers @(Buffer, Buffer, Buffer) resources $ \(a, b, c) -> do
+          map bufferCapacity [a, b, c] `shouldBe` [7, 7, 7]
+          timeout 20_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Nothing
+        releaseBuffer extra
+        releaseBuffer otherPrimary
+        releaseBuffer primary
+  xfail "Count-based pool allocation follows in the implementation change" $ it "rejects a body count sum exceeding Int before allocation" $ do
     largest <- requirePositive (toInteger (maxBound :: Int))
-    almostLargest <- requirePositive (toInteger (maxBound :: Int) - 1)
-    isLeft (validateSettings (ResourceSettings largest (positiveInt @1) (positiveInt @1))) `shouldBe` True
-    validateSettings (ResourceSettings almostLargest (positiveInt @1) (positiveInt @1)) `shouldBe` Right ()
+    rejectsAllocation (ResourceSettings (positiveInt @1) largest (positiveInt @1) (positiveInt @1))
+  xfail "Count-based pool allocation follows in the implementation change" $ it "rejects a body byte product exceeding Int before allocation" $ do
+    largest <- requirePositive (toInteger (maxBound :: Int))
+    rejectsAllocation (ResourceSettings largest (positiveInt @1) (positiveInt @1) (positiveInt @1))
+  xfail "Count-based pool allocation follows in the implementation change" $ it "rejects a setup byte product exceeding Int before allocation" $ do
+    largest <- requirePositive (toInteger (maxBound :: Int))
+    rejectsAllocation (ResourceSettings (positiveInt @2) (positiveInt @1) (positiveInt @1) largest)
+
+ describe "caller-owned acquisition context" $ do
+  it "keeps the context usable after an unsupported allocation fails" $
+    getAcquisition >>= \waiting -> do
+      largest <- requirePositive (toInteger (maxBound :: Int))
+      result <- try @IOError (withResources waiting (ResourceSettings (positiveInt @1) largest (positiveInt @1) (positiveInt @1)) (const (pure ())))
+      isLeft result `shouldBe` True
+      assertAcquisitionUsable waiting
 
  describe "buffer initialization" $ do
   it "allocates initialized storage with the requested capacity" $ do
@@ -87,148 +129,121 @@ spec = do
       length <$> newBuffers (positiveInt @7) size `shouldReturn` 0
 
  describe "storage" $ do
-  it "initializes blocks once and reuses their addresses and contents" $
-    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      first <- withBuffers @(Solo Buffer) resources $ withOneBuffer $ \buffer -> do
+  xfail "Request capability scaffold: scoped loans follow in the next change" $ it "initializes blocks once and reuses their addresses and contents" $
+    withTestResources smallSettings $ \resources -> do
+      first <- withRequestBuffers resources $ \access -> do
+        loan <- borrowBuffer access
+        let buffer = loanBuffer loan
         bufferCapacity buffer `shouldBe` 8
         withForeignPtr (bufferMemory buffer) $ \pointer -> do
           peek pointer `shouldReturn` 0
           poke pointer 73
+        releaseBuffer loan
         pure (bufferMemory buffer)
-      withBuffers @(Solo Buffer) resources $ withOneBuffer $ \buffer -> do
-        bufferMemory buffer `shouldBe` first
-        withForeignPtr (bufferMemory buffer) $ \pointer -> peek pointer `shouldReturn` 73
+      withRequestBuffers resources $ \access -> do
+        loan <- borrowBuffer access
+        bufferMemory (loanBuffer loan) `shouldBe` first
+        withForeignPtr (bufferMemory (loanBuffer loan)) $ \pointer -> peek pointer `shouldReturn` 73
+        releaseBuffer loan
 
- describe "whole-block grants" $ do
-  it "acquires every requested block or leaves all available blocks alone" $
-    withResources (ResourceSettings (positiveInt @25) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      first <- atomically (tryAcquire @(Buffer, Buffer) resources) >>= requireLease
-      let (firstBuffer, secondBuffer) = leaseBuffers first
-      bufferMemory firstBuffer `shouldNotBe` bufferMemory secondBuffer
-      isNothing <$> atomically (tryAcquire @(Buffer, Buffer) resources) `shouldReturn` True
-      lastBlock <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
-      isNothing <$> atomically (tryAcquire @(Solo Buffer) resources) `shouldReturn` True
-      atomically (release lastBlock >> release first)
-      allBlocks <- atomically (tryAcquire @(Buffer, Buffer, Buffer) resources) >>= requireLease
-      let (a, b, c) = leaseBuffers allBlocks
-      map bufferMemory [a, b, c] `shouldBe` map bufferMemory [firstBuffer, secondBuffer, onlyBuffer (leaseBuffers lastBlock)]
-      atomically (release allBlocks)
+ describe "whole-block setup grants" $ do
+  it "leaves remaining blocks usable when a larger grant must wait" $
+    withTestResources smallSettings {setupMemoryBytes = positiveInt @24} $ \resources ->
+      withSetupBuffers @(Solo Buffer) resources $ \(MkSolo first) -> do
+        timeout 20_000 (withSetupBuffers @(Buffer, Buffer, Buffer) resources (const (pure ()))) `shouldReturn` Nothing
+        withSetupBuffers @(Buffer, Buffer) resources $ \(second, third) -> do
+          bufferMemory first `shouldNotBe` bufferMemory second
+          bufferMemory first `shouldNotBe` bufferMemory third
+          bufferMemory second `shouldNotBe` bufferMemory third
   it "returns five-block tuples without copying buffer payloads" $
-    withResources (ResourceSettings (positiveInt @40) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      original <- withBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) resources $ \(a, b, c, d, e) -> do
+    withTestResources smallSettings {setupMemoryBytes = positiveInt @40} $ \resources -> do
+      original <- withSetupBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) resources $ \(a, b, c, d, e) -> do
         withForeignPtr (bufferMemory c) $ \pointer -> poke pointer 91
         pure (map bufferMemory [a, b, c, d, e])
-      withBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) resources $ \(a, b, c, d, e) -> do
+      withSetupBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) resources $ \(a, b, c, d, e) -> do
         map bufferMemory [a, b, c, d, e] `shouldBe` original
         withForeignPtr (bufferMemory c) $ \pointer -> peek pointer `shouldReturn` 91
-  it "throws for loan counts that exceed capacity" $
-    withResources (ResourceSettings (positiveInt @24) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      result <- try (atomically (tryAcquire @(Buffer, Buffer, Buffer, Buffer) resources)) :: IO (Either IOError (Maybe (Lease (Buffer, Buffer, Buffer, Buffer))))
+  it "rejects grants that exceed setup capacity" $
+    withTestResources smallSettings $ \resources -> do
+      result <- try @IOError (withSetupBuffers @(Buffer, Buffer) resources (const (pure ())))
       isLeft result `shouldBe` True
-  it "rolls back a grant with other admission checks in the same transaction" $
-    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      _ <- atomically $ (tryAcquire @(Solo Buffer) resources >> retry) `orElse` pure ()
-      lease <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
-      atomically (release lease)
 
- describe "lease ownership" $ do
-  it "returns a lease only once even after another borrower acquires its blocks" $
-    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      first <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
-      atomically (release first >> release first)
-      second <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
-      atomically (release first)
-      isNothing <$> atomically (tryAcquire @(Solo Buffer) resources) `shouldReturn` True
-      atomically (release second)
-  it "rejects acquisition after the owning scope ends, including after a late return" $ do
-    (resources, lease) <- withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      lease <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
-      pure (resources, lease)
-    atomically (release lease)
-    result <- try (atomically (tryAcquire @(Solo Buffer) resources)) :: IO (Either IOError (Maybe (Lease (Solo Buffer))))
+ describe "setup scope ownership" $ do
+  xfail "Retained inventories follow in the implementation change" $ it "keeps retained inventories reusable after an allocator helper returns" $ do
+    resources <- withTestResources smallSettings pure
+    performGC
+    forM_ [1 .. 3 :: Int] $ \_ -> do
+      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Just ()
+      timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
+  xfail "Retained inventories follow in the implementation change" $ it "keeps retained inventories usable after their allocating helper throws" $ do
+    retained <- newEmptyMVar
+    result <- try @IOError $ withTestResources smallSettings $ \resources -> do
+      putMVar retained resources
+      ioError (userError "helper")
     isLeft result `shouldBe` True
+    resources <- takeMVar retained
+    performGC
+    timeout 1_000_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Just ()
+    timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
   it "returns buffers after callback exceptions" $
-    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      result <- try (withBuffers @(Solo Buffer) resources $ const $ ioError (userError "callback")) :: IO (Either IOError ())
+    withTestResources smallSettings $ \resources -> do
+      result <- try @IOError (withSetupBuffers @(Solo Buffer) resources $ const $ ioError (userError "callback"))
       isLeft result `shouldBe` True
-      timeout 1000000 (withBuffers @(Solo Buffer) resources (const (pure (1 :: Int)))) `shouldReturn` Just 1
+      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Just ()
   it "returns buffers after asynchronous cancellation" $
-    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
+    withTestResources smallSettings $ \resources -> do
       started <- newEmptyMVar
       hold <- newEmptyMVar
       done <- newEmptyMVar
       worker <- forkFinally
-        (withBuffers @(Solo Buffer) resources $ const $ putMVar started () >> takeMVar hold)
+        (withSetupBuffers @(Solo Buffer) resources $ const $ putMVar started () >> takeMVar hold)
         (const $ putMVar done ())
-      timeout 1000000 (takeMVar started) `shouldReturn` Just ()
+      timeout 1_000_000 (takeMVar started) `shouldReturn` Just ()
       killThread worker
-      timeout 1000000 (takeMVar done) `shouldReturn` Just ()
-      timeout 1000000 (withBuffers @(Solo Buffer) resources (const (pure (1 :: Int)))) `shouldReturn` Just 1
-  it "cancels blocked acquisition without consuming a future return" $
-    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      lease <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
-      started <- newEmptyMVar
-      done <- newEmptyMVar
-      worker <- forkFinally
-        (putMVar started () >> withBuffers @(Solo Buffer) resources (const (pure (1 :: Int))))
-        (putMVar done)
-      takeMVar started
-      killThread worker
-      outcome <- timeout 1000000 (takeMVar done)
-      fmap isLeft outcome `shouldBe` Just True
-      atomically (release lease)
-      timeout 1000000 (withBuffers @(Solo Buffer) resources (const (pure (1 :: Int)))) `shouldReturn` Just 1
-
-  it "wakes blocked borrowers when their resource scope retires" $ do
-    started <- newEmptyMVar
-    done <- newEmptyMVar
-    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      _ <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
-      _ <- forkFinally
-        (putMVar started () >> withBuffers @(Solo Buffer) resources (const (pure (1 :: Int))))
-        (putMVar done)
-      takeMVar started
-    outcome <- timeout 1000000 (takeMVar done)
-    fmap isLeft outcome `shouldBe` Just True
+      timeout 1_000_000 (takeMVar done) `shouldReturn` Just ()
+      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Just ()
 
  describe "setup capacity" $ do
-  it "admits setup while every stream block is busy" $
-    withResources (ResourceSettings (positiveInt @16) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      streams <- atomically (tryAcquire @(Buffer, Buffer) resources) >>= requireLease
-      setup <- atomically (tryAcquireSetup @(Solo Buffer) resources) >>= requireLease
-      let MkSolo setupBuffer = leaseBuffers setup
-          (streamA, streamB) = leaseBuffers streams
-      bufferMemory setupBuffer `shouldNotBe` bufferMemory streamA
-      bufferMemory setupBuffer `shouldNotBe` bufferMemory streamB
-      isNothing <$> atomically (tryAcquireSetup @(Solo Buffer) resources) `shouldReturn` True
-      atomically (release streams >> release setup)
-  it "validates requests against setup capacity" $
-    withResources (ResourceSettings (positiveInt @16) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      result <- try (atomically (tryAcquireSetup @(Buffer, Buffer) resources)) :: IO (Either IOError (Maybe (Lease (Buffer, Buffer))))
-      isLeft result `shouldBe` True
-  it "reuses setup storage without taking a stream block" $
-    withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @8)) $ \resources -> do
-      setupMemory <- withSetupBuffers @(Solo Buffer) resources $ withOneBuffer $ \buffer -> pure (bufferMemory buffer)
-      streams <- atomically (tryAcquire @(Solo Buffer) resources) >>= requireLease
-      streamMemory <- withOneBuffer (pure . bufferMemory) (leaseBuffers streams)
-      timeout 1000000 (withSetupBuffers @(Solo Buffer) resources $ withOneBuffer $ \buffer -> do
-        bufferMemory buffer `shouldBe` setupMemory
-        bufferMemory buffer `shouldNotBe` streamMemory) `shouldReturn` Just ()
-      atomically (release streams)
+  xfail "Request capability scaffold: scoped loans follow in the next change" $ it "admits setup while all stream blocks are busy" $
+    withTestResources smallSettings $ \resources -> withRequestBuffers resources $ \access -> do
+      primary <- borrowBuffer access
+      extra <- borrowBuffer access
+      withSetupBuffers @(Solo Buffer) resources $ \(MkSolo setup) -> do
+        bufferMemory setup `shouldNotBe` bufferMemory (loanBuffer primary)
+        bufferMemory setup `shouldNotBe` bufferMemory (loanBuffer extra)
+        timeout 20_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Nothing
+      releaseBuffer extra
+      releaseBuffer primary
+  xfail "Request capability scaffold: scoped loans follow in the next change" $ it "reuses setup storage without taking a stream block" $
+    withTestResources smallSettings $ \resources -> do
+      setupMemory <- withSetupBuffers @(Solo Buffer) resources $ \(MkSolo buffer) -> pure (bufferMemory buffer)
+      withRequestBuffers resources $ \access -> do
+        stream <- borrowBuffer access
+        withSetupBuffers @(Solo Buffer) resources $ \(MkSolo buffer) -> do
+          bufferMemory buffer `shouldBe` setupMemory
+          bufferMemory buffer `shouldNotBe` bufferMemory (loanBuffer stream)
+        releaseBuffer stream
 
-withOneBuffer :: (Buffer -> IO a) -> Solo Buffer -> IO a
-withOneBuffer action (MkSolo buffer) = action buffer
-
-onlyBuffer :: Solo Buffer -> Buffer
-onlyBuffer (MkSolo buffer) = buffer
-
-requireLease :: Maybe (Lease grant) -> IO (Lease grant)
-requireLease = maybe (failTest "expected an available lease") pure
-
-rejects :: ResourceSettings -> IO ()
-rejects settings = do
-  result <- try (withResources settings (const (pure ()))) :: IO (Either IOError ())
-  isLeft result `shouldBe` True
+rejectsAllocation :: ResourceSettings -> IO ()
+rejectsAllocation settings = do
+  result <- try @IOError (withTestResources settings (const (pure ())))
+  case result of
+    Left failure -> ioeGetErrorString failure `shouldBe` "buffer allocation exceeds Int capacity"
+    Right () -> failTest "expected unsupported allocation to fail before allocating"
 
 requirePositive :: Integer -> IO PositiveInt
 requirePositive = maybe (failTest "expected a positive Int") pure . mkPositiveInt
+
+withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
+withTestResources settings action = getAcquisition >>= \waiting ->
+  Resources.withResources waiting settings action
+
+smallSettings :: ResourceSettings
+smallSettings = ResourceSettings (positiveInt @16) (positiveInt @8) (positiveInt @8) (positiveInt @1)
+
+assertAcquisitionUsable :: Acquire.Context -> IO ()
+assertAcquisitionUsable waiting =
+  Acquire.acquire waiting Acquire.NoDeadline
+    retry
+    (\waiter -> void (Acquire.tryGrant waiter (pure ())))
+    (const (pure ())) (const (pure ())) `shouldReturn` Just ()

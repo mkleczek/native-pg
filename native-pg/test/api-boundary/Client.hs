@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Client where
 
@@ -18,11 +19,16 @@ import Database.PostgreSQL.Transport (Channel, Link (..), newChannel, serverEndP
 import Database.PostgreSQL.Transport.Link ()
 import Database.PostgreSQL.Types ()
 import qualified Database.PostgreSQL.Transaction as Transaction
+import Control.Exception (bracket)
 import Data.ByteString (ByteString)
 import Data.Functor.Const (Const (..))
 import Data.Int (Int64)
 import Data.Word (Word32)
-import Network.Streaming.Resources (Resources)
+import Network.Streaming.Resources
+  ( Resources, ResourceSettings (..), withResources
+  , BufferAccess, withRequestBuffers, BufferLoan, borrowBuffer, loanBuffer, releaseBuffer
+  , BufferGrant, withSetupBuffers
+  )
 import Network.Streaming.Buffer (Buffer)
 
 prepare :: Transaction.Prepare -> ByteString -> [Maybe Word32] -> IO Transaction.Prepared
@@ -70,3 +76,15 @@ transaction session = Transaction.runTransaction Transaction.ReadCommitted Trans
   cursor <- Transaction.pipeline (Transaction.statement () responseStatement)
   _ <- Transaction.nextRow cursor
   Transaction.finishTransaction
+
+-- A client can manage short loans while the request owns admission.
+requestBuffer :: Resources -> (Buffer -> IO a) -> IO a
+requestBuffer resources use = withRequestBuffers resources $ \access ->
+  bracket (borrowBuffer access) releaseBuffer (use . loanBuffer)
+
+manualLoan :: BufferAccess -> IO BufferLoan
+manualLoan = borrowBuffer
+
+setupBuffers :: BufferGrant grant => Resources -> (grant -> IO a) -> IO a
+setupBuffers = withSetupBuffers
+

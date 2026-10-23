@@ -33,6 +33,19 @@ reject_module() {
   fi
 }
 
+# Removed admission wrappers and redundant settings validation stay unavailable.
+for removed_export in Lease tryAcquire tryAcquireSetup release leaseBuffers withBuffers withBuffer validateSettings; do
+  printf 'module Hidden where\nimport Network.Streaming.Resources (%s)\n' "$removed_export" >"$output_dir/Hidden.hs"
+  if check "$output_dir/Hidden.hs" >"$output_dir/error.log" 2>&1; then
+    echo "Unexpected public Resources export: $removed_export" >&2
+    exit 1
+  fi
+  if ! grep -Eq 'does not export|not exported' "$output_dir/error.log"; then
+    cat "$output_dir/error.log" >&2
+    exit 1
+  fi
+done
+
 reject_module Database.PostgreSQL.Transaction.Pull
 reject_module Database.PostgreSQL.Pipeline
 reject_module Database.PostgreSQL.Statement

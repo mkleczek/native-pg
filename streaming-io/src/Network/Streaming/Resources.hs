@@ -1,7 +1,9 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ConstraintKinds #-}
 -- | Application-owned storage pools with scoped, exclusive buffer loans.
 module Network.Streaming.Resources
   ( Resources, ResourceSettings (..), withResources
+  , BufferAccess, BufferLoan, withRequestBuffers, borrowBuffer, loanBuffer, releaseBuffer, withBuffer
   , validateSettings
   , BufferGrant, Lease, tryAcquire, tryAcquireSetup, release, leaseBuffers
   , withBuffers, withSetupBuffers
@@ -9,9 +11,15 @@ module Network.Streaming.Resources
 
 import Control.Concurrent.STM
   ( STM, TVar, atomically, newTVar, newTVarIO, readTVar, writeTVar
-  , retry, throwSTM )
-import Control.Exception (bracket)
-import Control.Monad (when)
+  , retry, throwSTM, check )
+import Control.Exception (bracket, mask, mask_, onException)
+import Control.Concurrent.Resource.Queue qualified as Queue
+import Control.Concurrent.Resource.Acquisition (Context)
+import Control.Concurrent.Resource.Acquisition qualified as Acquire
+import Control.Monad (when, unless, void, foldM)
+import Data.IntSet qualified as IntSet
+import Data.Map.Strict qualified as Map
+import Data.Tuple (Solo (MkSolo))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
 import Network.Streaming.Buffer (Buffer, newBuffers)
 import Network.Streaming.PositiveInt (PositiveInt, positiveIntValue)
@@ -19,34 +27,73 @@ import Network.Streaming.PositiveInt (PositiveInt, positiveIntValue)
 data ResourceSettings = ResourceSettings
   { streamMemoryBytes :: !PositiveInt
   , setupMemoryBytes :: !PositiveInt
-  , ioBufferBytes :: !PositiveInt
+  , bufferSize :: !PositiveInt
+  , reserveBufferCount :: !PositiveInt
   } deriving (Eq, Show)
 
-data Pool = Pool !Int !(TVar [Buffer]) !(TVar Bool)
+data Pool = Pool
+  { poolCapacity :: !Int
+  , poolReserve :: !Int
+  , poolFree :: !(TVar (Int, [Buffer]))
+  , poolActive :: !(TVar Bool)
+  , poolAcquisition :: !Context
+  , poolLanes :: !(TVar (Map.Map Int (Queue.Queue Request)))
+  , poolNextArrival :: !(TVar Integer)
+  , poolDispatching :: !(TVar Bool)
+  }
 data Resources = Resources !Pool !Pool
 type BufferGrant grant = ListPrefix grant Buffer
 
 data Lease grant = Lease !Pool grant !(TVar Bool)
 
+-- Each required inventory count has a FIFO. Selecting among eligible heads
+-- costs the number of grant sizes, independently of blocked request count.
+-- Arrival tickets preserve oldest-eligible order across this buffer pool alone.
+data Request = Request !Integer !(STM Bool) !(STM ())
+
+dispatch :: Pool -> STM ()
+dispatch _ = pure ()
+
+-- Validate before queueing: an impossible demand would never be selected.
+checkedGrantSize :: forall grant. BufferGrant grant => Pool -> STM Int
+checkedGrantSize pool = do
+  let count = prefixSize @grant
+  when (count > poolCapacity pool - poolReserve pool) $
+    throwSTM (userError "buffer count must fit capacity")
+  alive <- readTVar (poolActive pool)
+  unless alive $ throwSTM (userError "resources are retired")
+  pure count
+
 -- | Only complete blocks are lent from each budget. Storage is initialized
--- here so admission and return never allocate or clear body storage.
-withResources :: ResourceSettings -> (Resources -> IO a) -> IO a
-withResources settings action = do
+-- here so admission and return never allocate or clear body storage. The
+-- caller cancels or drains its tasks before leaving this scope. Retirement
+-- closes these inventories while sibling inventories remain usable.
+withResources :: Context -> ResourceSettings -> (Resources -> IO a) -> IO a
+withResources acquisition settings action = do
   either (ioError . userError) pure (validateSettings settings)
-  bracket create retire action
+  bracket (newPool (positiveIntValue (reserveBufferCount settings)) (streamMemoryBytes settings)) retire $ \streams ->
+    bracket (newPool 0 (setupMemoryBytes settings)) retire $ \setup ->
+      action (Resources streams setup)
   where
-    create = Resources <$> newPool (streamMemoryBytes settings) <*> newPool (setupMemoryBytes settings)
-    newPool budget = do
-      buffers <- newBuffers budget (ioBufferBytes settings)
-      Pool (length buffers) <$> newTVarIO buffers <*> newTVarIO True
-    retire (Resources streams setup) = atomically (close streams >> close setup)
-    close (Pool _ free active) = writeTVar active False >> writeTVar free []
+    newPool reserve budget = do
+      buffers <- newBuffers budget (bufferSize settings)
+      let capacity = length buffers
+      free <- newTVarIO (capacity, buffers)
+      active <- newTVarIO True
+      lanes <- newTVarIO Map.empty
+      nextArrival <- newTVarIO 0
+      dispatching <- newTVarIO False
+      pure (Pool capacity reserve free active acquisition lanes nextArrival dispatching)
+    retire pool = atomically $ do
+      writeTVar (poolActive pool) False
+      writeTVar (poolFree pool) (0, [])
+
 
 -- | Validate configuration without allocating resource storage.
 validateSettings :: ResourceSettings -> Either String ()
 validateSettings settings
-  | streamMemoryBytes settings < ioBufferBytes settings = Left "stream budget must fit a block"
-  | setupMemoryBytes settings < ioBufferBytes settings = Left "setup budget must fit a block"
+  | streamMemoryBytes settings < bufferSize settings = Left "stream budget must fit a block"
+  | setupMemoryBytes settings < bufferSize settings = Left "setup budget must fit a block"
   | toInteger (positiveIntValue (streamMemoryBytes settings)) + toInteger (positiveIntValue (setupMemoryBytes settings)) > toInteger (maxBound :: Int) =
       Left "combined memory budget exceeds Int capacity"
   | otherwise = Right ()
@@ -60,41 +107,53 @@ tryAcquireSetup :: forall grant. BufferGrant grant => Resources -> STM (Maybe (L
 tryAcquireSetup (Resources _ setup) = acquireFrom setup
 
 acquireFrom :: forall grant. BufferGrant grant => Pool -> STM (Maybe (Lease grant))
-acquireFrom pool@(Pool capacity free active)
-  | prefixSize @grant > capacity = throwSTM (userError "buffer count must fit capacity")
-  | otherwise = do
-      alive <- readTVar active
-      when (not alive) $ throwSTM (userError "resources are retired")
-      buffers <- readTVar free
-      case takePrefix buffers of
-        Nothing -> pure Nothing
-        Just (selected, remaining) -> do
-          writeTVar free remaining
-          returned <- newTVar False
-          pure (Just (Lease pool selected returned))
+acquireFrom pool = do
+  count <- checkedGrantSize @grant pool
+  (available, buffers) <- readTVar (poolFree pool)
+  case if available - count < poolReserve pool then Nothing else takePrefix buffers of
+    Nothing -> pure Nothing
+    Just (selected, remaining) -> do
+      writeTVar (poolFree pool) (available - count, remaining)
+      returned <- newTVar False
+      pure (Just (Lease pool selected returned))
 
 -- | Per-lease state prevents a stale return from duplicating a later loan.
-release :: BufferGrant grant => Lease grant -> STM ()
-release (Lease (Pool _ free active) buffers returned) = do
+release :: forall grant. BufferGrant grant => Lease grant -> STM ()
+release (Lease pool buffers returned) = do
   alreadyReturned <- readTVar returned
-  when (not alreadyReturned) $ do
+  unless alreadyReturned $ do
     writeTVar returned True
-    alive <- readTVar active
+    alive <- readTVar (poolActive pool)
     when alive $ do
-      available <- readTVar free
-      writeTVar free (prepend buffers available)
+      (count, available) <- readTVar (poolFree pool)
+      writeTVar (poolFree pool) (count + prefixSize @grant, prepend buffers available)
+      dispatch pool
 
 leaseBuffers :: Lease grant -> grant
 leaseBuffers (Lease _ buffers _) = buffers
 
 withBuffers :: forall grant a. BufferGrant grant => Resources -> (grant -> IO a) -> IO a
-withBuffers resources = withLease (tryAcquire @grant resources)
+withBuffers (Resources streams _) = withLease @grant streams
 
 withSetupBuffers :: forall grant a. BufferGrant grant => Resources -> (grant -> IO a) -> IO a
-withSetupBuffers resources = withLease (tryAcquireSetup @grant resources)
+withSetupBuffers (Resources _ setup) = withLease @grant setup
 
-withLease :: BufferGrant grant => STM (Maybe (Lease grant)) -> (grant -> IO a) -> IO a
-withLease acquire action =
-  bracket wait (atomically . release) (action . leaseBuffers)
-  where
-    wait = atomically (acquire >>= maybe retry pure)
+withLease :: forall grant a. BufferGrant grant => Pool -> (grant -> IO a) -> IO a
+withLease pool action = bracket
+  (atomically (acquireFrom @grant pool >>= maybe retry pure))
+  (atomically . release)
+  (action . leaseBuffers)
+
+
+data BufferAccess = BufferAccess
+data BufferLoan = BufferLoan Buffer
+withRequestBuffers :: Resources -> (BufferAccess -> IO a) -> IO a
+withRequestBuffers _ _ = error "pending request primary implementation"
+borrowBuffer :: BufferAccess -> IO BufferLoan
+borrowBuffer _ = error "pending request buffer loan"
+loanBuffer :: BufferLoan -> Buffer
+loanBuffer (BufferLoan buffer) = buffer
+releaseBuffer :: BufferLoan -> IO ()
+releaseBuffer _ = error "pending request return"
+withBuffer :: BufferAccess -> (Buffer -> IO a) -> IO a
+withBuffer _ _ = error "pending scoped callback implementation"

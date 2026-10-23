@@ -7,5 +7,5 @@ import Network.Streaming.Buffer (Buffer, newBuffer, newBuffers)
 allocated :: IO Buffer
 allocated = newBuffer (positiveInt @8)
 
-batch :: IO [Buffer]
+batch :: IO (Int, [Buffer])
 batch = newBuffers (positiveInt @16) (positiveInt @8)
