@@ -16,7 +16,7 @@ data Operation = Append | Remove Int
 data Model = Model Int [(Int, Q.Entry Int)]
 
 spec :: Spec
-spec = xfail "FIFO API scaffold: ordered links follow in the next change" $ describe "opaque FIFO" $ do
+spec = describe "opaque FIFO" $ do
   it "preserves FIFO grant order after cancelling a middle opaque registration" $ usingSystemTimer $ \context -> do
     queue <- atomically Q.newQueue
     registered <- newEmptyTMVarIO
