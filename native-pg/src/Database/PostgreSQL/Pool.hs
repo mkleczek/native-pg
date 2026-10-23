@@ -58,6 +58,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 import Data.Text qualified as Text
 import Data.UUID.V4 qualified as UUID
 
+import Database.PostgreSQL.Internal.PoolLifetime (withLifetime)
 import Database.PostgreSQL.Pool.Observation
 
 -- | What the pool needs to know about its connections, and its limits.
@@ -447,4 +448,4 @@ nanoseconds time = fromInteger (max 0 (min (toInteger (maxBound :: Word64) `div`
 -- Optimisation may unpack a pool into inventory fields while a caller waits.
 -- Keep its finalizer key alive until all ownership cleanup has completed.
 withPoolLifetime :: Pool connection failure -> IO a -> IO a
-withPoolLifetime _ action = action
+withPoolLifetime pool = withLifetime (poolReaper pool)
