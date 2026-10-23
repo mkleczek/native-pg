@@ -493,6 +493,8 @@ row construct = RowDecoder AnyRows decode
     decode :: forall tx. Runtime -> Row.Row -> IO (Either DecodingError (row tx))
     decode _ current = Row.decodeRow @columns current (mapRowFunction @columns @(row tx) @(IO (row tx)) pure (construct @tx))
 
+{-# INLINE row #-}
+
 -- | Decodes owned metadata followed by one nullable borrowed field.
 streamingRow :: forall columns row. DecodeRow columns => (forall tx. RowFunction columns (Maybe (Field tx) -> row tx)) -> RowDecoder row
 streamingRow construct = RowDecoder AnyRows decode
@@ -500,6 +502,8 @@ streamingRow construct = RowDecoder AnyRows decode
     decode :: forall tx. Runtime -> Row.Row -> IO (Either DecodingError (row tx))
     decode runtime current = Row.decodeRowStreamingUsing @columns @(Field tx) @(row tx) (fmap (Field runtime) . Row.columnBorrowedStream) current
       (mapRowFunction @columns @(Maybe (Field tx) -> row tx) @(Maybe (Field tx) -> IO (row tx)) (fmap pure) (construct @tx))
+
+{-# INLINE streamingRow #-}
 
 -- | Requires exactly one row, checked when the result is drained.
 singleRow :: RowDecoder row -> RowDecoder row

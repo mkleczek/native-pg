@@ -65,7 +65,7 @@ spec socketPath port = describe "pooled connection setup" $ do
         PG.isUsable connection `shouldReturn` True
         timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
-  xfail "Request-context scaffold: shared operation implementation follows" $ it "streams repeated operations after setup storage has been overwritten and loaned again" $
+  it "streams repeated operations after setup storage has been overwritten and loaned again" $
     withTestResources settings $ \resources ->
       bracket (Streaming.connect resources ((local "postgres" Nothing) { PG.connectParameters = [("application_name", "pooled-setup")] })) (PG.close . fst) $ \(connection, info) ->
         BufferPool.withSetupBuffers @(Buffer, Buffer) resources $ \(input, output) -> do
@@ -141,11 +141,11 @@ spec socketPath port = describe "pooled connection setup" $ do
 
 settings :: PoolSettings
 settings = PoolSettings
-      { bufferSize = positiveInt @16
-      , ordinaryBufferCount = positiveInt @2
-      , reserveBufferCount = positiveInt @1
-      , setupBufferCount = positiveInt @2
-      }
+  { bufferSize = positiveInt @16
+  , ordinaryBufferCount = positiveInt @2
+  , reserveBufferCount = positiveInt @1
+  , setupBufferCount = positiveInt @2
+  }
 
 -- A pre-14 startup omits the reported attributes and must answer a SHOW query.
 withOlderServer :: (Socket.PortNumber -> IO a) -> IO a

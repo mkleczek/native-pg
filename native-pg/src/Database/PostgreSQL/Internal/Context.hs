@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE DataKinds #-}
 -- | Integration-only connection and operation ownership. Do not retain a
 -- supplied Context or any borrowed slices after its callback returns.
 module Database.PostgreSQL.Internal.Context
@@ -30,14 +31,15 @@ import Control.Exception (catch, finally, mask, onException, throwIO, uninterrup
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory, newBuffer)
+import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.BufferPool (BufferAccess)
-import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (plusPtr)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
-import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), reusableInputBuffer, emptyInputBuffer, runInputUntil, runInputFramedUntil)
+import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), reusableInputBuffer, requestInputBuffer, releaseInputBuffer, emptyInputBuffer, runInputUntil, runInputFramedUntil)
 import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
-import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer)
+import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
 
 data Connection = Connection
   { -- | Input and output over the socket, or TLS over it.
@@ -104,6 +106,7 @@ queueContextOutput context output = do
   previous <- readIORef (contextPending context)
   unless (unsentEmpty previous) (throwIO (SessionUnusable "the operation still has pending output"))
   pending <- unsent (Just (contextOutput context)) output
+  writeIORef (contextPending context) pending
   remaining <- channelSendSome (connectionChannel (contextConnection context)) pending
   writeIORef (contextPending context) remaining
 
@@ -134,23 +137,39 @@ withContext connection input output use = do
             outputStart < inputStart `plusPtr` bufferCapacity input)
         (throwIO (SessionUnusable "input and output storage overlap"))
   when (bufferCapacity output < 4) (ioError (userError "output buffer capacity must be at least four bytes"))
-  mask $ \restore -> do
+  withScopedContext connection (pure (reusableInputBuffer input)) (pure (outputBufferFrom output)) (bufferCapacity input) use
+
+-- | Uses one request capability. Body input borrows lazily; output framing
+-- has a separate small workspace and streams retain their source storage.
+withRequestContext :: Connection -> BufferAccess -> (Context -> IO a) -> IO a
+withRequestContext connection access =
+  withScopedContext connection (requestInputBuffer access)
+    (outputBufferFrom <$> newBuffer (positiveInt @256)) (connectionReadSize connection)
+
+withScopedContext :: Connection -> IO InputBuffer -> IO OutputBuffer -> Int -> (Context -> IO a) -> IO a
+withScopedContext connection makeInput makeOutput readSize use = mask $ \restore -> do
     claimConnection connection
     context <- (do
-      cursor <- newIORef (reusableInputBuffer input)
+      cursor <- newIORef =<< makeInput
+      output <- makeOutput
       pending <- newIORef =<< unsent Nothing mempty
       state <- newIORef Available
       finished <- newMVar ()
-      pure (Context connection cursor (outputBufferFrom output) pending (bufferCapacity input) True state finished))
+      pure (Context connection cursor output pending readSize True state finished))
       `onException` writeIORef (connectionState connection) Idle
     result <- restore (use context) `onException` breakConnection connection
-      `finally` expireContext context
+      `finally` (expireContext context `finally` cleanupContext context)
     pending <- readIORef (contextPending context)
     unless (unsentEmpty pending) $ do
       breakConnection connection
       throwIO (SessionUnusable "operation scope ended with unsent output")
     atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
     pure result
+
+cleanupContext :: Context -> IO ()
+cleanupContext context = do
+  discardUnsent =<< readIORef (contextPending context)
+  releaseInputBuffer =<< readIORef (contextInput context)
 
 expireContext :: Context -> IO ()
 expireContext context = do
@@ -193,9 +212,13 @@ runContextOperation context action = mask $ \restore -> do
             Busy -> pure ()
             _ -> throwIO (SessionUnusable "the connection is no longer usable")
           else claimConnection connection
-        result <- restore action `onException` breakConnection connection
-        unless (contextScoped context) $
-          atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
+        result <- restore action `onException` (breakConnection connection *> cleanupContext context)
+        unless (contextScoped context) $ do
+          previous <- atomicModifyIORef' (connectionState connection)
+            (\state -> (case state of Busy -> Idle; other -> other, state))
+          case previous of
+            Broken -> cleanupContext context
+            _ -> pure ()
         pure result
   run `finally` done
 
@@ -212,6 +235,3 @@ claimConnection connection = do
 breakConnection :: Connection -> IO ()
 breakConnection connection = atomicModifyIORef' (connectionState connection) $ \state ->
   (case state of Closed -> Closed; _ -> Broken, ())
-
-withRequestContext :: Connection -> BufferAccess -> (Context -> IO a) -> IO a
-withRequestContext _ _ _ = error "request-backed context implementation follows"

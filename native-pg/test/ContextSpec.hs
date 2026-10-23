@@ -68,7 +68,7 @@ spec = describe "explicit operation contexts" $ do
     runContextOperation context (breakConnection connection)
     PG.isUsable connection `shouldReturn` False
 
-  xfail "broken owned operations must release pending source producers" $ it "joins pending sources after a completed owned operation marks itself broken" $ do
+  it "joins pending sources after a completed owned operation marks itself broken" $ do
     entered <- newEmptyMVar
     returned <- newEmptyMVar
     let source = Source $ \use ->
@@ -83,7 +83,6 @@ spec = describe "explicit operation contexts" $ do
         breakConnection connection
       timeout 1000000 (readMVar returned) `shouldReturn` Just ())
       `finally` (discardUnsent =<< readIORef (contextPending context))
-
 
   it "expires escaped contexts before the storage can be reused" $ do
     connection <- newConnection idleChannel 16
