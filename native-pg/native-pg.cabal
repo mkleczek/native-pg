@@ -11,7 +11,8 @@ maintainer:         michal@kleczek.org
 category:           Database, PostgreSQL
 build-type:         Simple
 tested-with:        GHC == 9.10.3, GHC == 9.12.3
-extra-source-files: test/check-api-boundary.sh
+extra-source-files: THIRD-PARTY-NOTICES
+                    test/check-api-boundary.sh
                     test/api-boundary/Client.hs
 
 common implementation
@@ -55,6 +56,7 @@ common implementation
                     , mtl               >= 2.2.2 && < 2.4
                     , network           >= 3.1 && < 3.3
                     , postgresql-binary >= 0.14.2 && < 0.15
+                    , stm
                     , streaming-io
                     , scientific        >= 0.3 && < 0.4
                     , text              >= 1.2.2 && < 2.2
@@ -73,6 +75,8 @@ library
                       Database.PostgreSQL.Decoding
                       Database.PostgreSQL.Diagnostics
                       Database.PostgreSQL.Encoders
+                      Database.PostgreSQL.Pool
+                      Database.PostgreSQL.Pool.Observation
                       Database.PostgreSQL.Session
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
@@ -92,6 +96,8 @@ test-suite native-pg-spec
                       Database.PostgreSQL.Decoding
                       Database.PostgreSQL.Diagnostics
                       Database.PostgreSQL.Encoders
+                      Database.PostgreSQL.Pool
+                      Database.PostgreSQL.Pool.Observation
                       Database.PostgreSQL.Session
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
@@ -101,6 +107,8 @@ test-suite native-pg-spec
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Transport.Link
                       Database.PostgreSQL.Types
+                      PoolSpec
+                      PoolReservationSpec
                       BorrowedOutputSpec
                       BorrowingSpec
                       CoreSpec
