@@ -8,12 +8,12 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (ErrorCall (..), bracket, finally, throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
-import Database.PostgreSQL.Internal.Protocol (pattern Sync, serialize)
+import Database.PostgreSQL.Internal.Protocol (Parameter (..), pattern Sync, serialize)
 import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), InputSource (..), Output, serializeField)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (RemainingBytesAtom, MaybeBytes32Atom))
-import Database.PostgreSQL.Internal.Protocol (Parameter (..))
 import Database.PostgreSQL.Internal.Context (newConnection, newOwnedContext)
 import qualified Database.PostgreSQL.Session as Session
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
@@ -104,7 +104,7 @@ spec = describe "channels over a link without a socket" $ do
           { testReceive = \pointer size -> do
               readable <- readIORef ready
               if readable then provide "reply" pointer size else pure Nothing,
-            testEither = writeIORef ready True *> pure Readable
+            testEither = writeIORef ready True $> Readable
           }
     (channel, pending) <- channelWith link sync
     timeout 1000000 (readBytes channel pending) `shouldReturn` Just "reply"
@@ -140,7 +140,7 @@ withCloseHooks beforeSend afterClose check = do
             BS.concat pieces `shouldBe` "X\0\0\0\4"
             beforeSend
             pure (sum (map BS.length pieces)),
-          testClose = (modifyIORef' closes (+ 1)) `finally` afterClose
+          testClose = modifyIORef' closes (+ 1) `finally` afterClose
         }
       open = Exchange.Session <$> (newOwnedContext =<< newConnection (newChannel link) 16)
   bracket open (Session.close . Session.connection) $ \session -> do

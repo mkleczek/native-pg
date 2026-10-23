@@ -4,8 +4,10 @@
 
 module BorrowingSpec (spec) where
 
+import AcquisitionTestSupport (getAcquisition)
+import qualified Network.Streaming.BufferPool as BufferPool
 import Control.Exception (evaluate, try)
-import Control.Monad (forM_)
+import Control.Monad (forM_, replicateM)
 import Control.Monad.Except (catchError)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -78,6 +80,42 @@ spec = describe "caller-owned input" $ do
       then pure ()
       else failTest ("10000 buffered Word32 reads allocated " <> show allocated <> " bytes (limit 1600000)")
 
+  xfail "request-backed input implementation follows" . it "keeps deferred scalar results valid after returning their buffer loan" $
+    getAcquisition >>= \waiting ->
+      BufferPool.newBufferPool waiting (BufferPool.PoolSettings
+      { BufferPool.bufferSize = positiveInt @4
+      , BufferPool.ordinaryBufferCount = positiveInt @7
+      , BufferPool.reserveBufferCount = positiveInt @1
+      , BufferPool.setupBufferCount = positiveInt @8
+      }) >>= \resources ->
+        BufferPool.withRequestBuffers resources $ \access -> do
+          initial <- BufferPool.borrowBuffer access
+          let memory = bufferMemory (BufferPool.loanBuffer initial)
+          BufferPool.releaseBuffer initial
+          source <- bytesSource 4 scalarBytes (const (pure ()))
+          input <- requestInputBuffer access
+          (values, pending) <- runInput source input scalarValues
+          releaseInputBuffer pending
+          loan <- BufferPool.borrowBuffer access
+          bufferMemory (BufferPool.loanBuffer loan) `shouldBe` memory
+          withForeignPtr (bufferMemory (BufferPool.loanBuffer loan)) $ \pointer -> fillBytes pointer 85 4
+          BufferPool.releaseBuffer loan
+          values `shouldBe` scalarExpected
+
+  xfail "metadata allocation optimization follows" . it "bounds allocation for buffered metadata strings" $ do
+    storage <- newBuffer (positiveInt @16384)
+    source <- bytesSource 16384 (BS.concat (replicate 1000 "SELECT 1\0")) (const (pure ()))
+    (_, filled) <- runInput source (reusableInputBuffer storage) (peekInputByteAt 0)
+    before <- getAllocationCounter
+    (total, _) <- runInput source filled (sumStrings 1000 0)
+    _ <- evaluate total
+    after <- getAllocationCounter
+    total `shouldBe` 8000
+    let allocated = before - after
+    if allocated < 360000
+      then pure ()
+      else failTest ("1000 buffered C-strings allocated " <> show allocated <> " bytes (limit 360000)")
+
   it "compacts unread bytes in the same allocation" $ do
     storage <- newBuffer (positiveInt @4)
     writes <- newIORef []
@@ -104,6 +142,14 @@ spec = describe "caller-owned input" $ do
       chunk <- readInputSome 4
       pure [string, exact, chunk]
     values `shouldBe` ["abc", "defg", "hijk"]
+
+  it "keeps empty and fragmented C-strings stable after storage reuse" $ do
+    forM_ [1, 4] $ \fragment -> do
+      storage <- newBuffer (positiveInt @4)
+      source <- bytesSource fragment "\0abc\0defgh\0\0" (const (pure ()))
+      (values, _) <- runInput source (reusableInputBuffer storage) (replicateM 4 readInputCStringBytes)
+      withForeignPtr (bufferMemory storage) $ \pointer -> fillBytes pointer 85 4
+      values `shouldBe` ["", "abc", "defgh", ""]
 
   it "borrows a chunk directly from the supplied storage" $ do
     storage <- newBuffer (positiveInt @4)
@@ -206,3 +252,9 @@ sumWords 0 !total = pure total
 sumWords count !total = do
   value <- fieldParser @Word32 @('FixedBytesAtom 4)
   sumWords (count - 1) (total + value)
+
+sumStrings :: Int -> Int -> Input Int
+sumStrings 0 !total = pure total
+sumStrings count !total = do
+  value <- readInputCStringBytes
+  sumStrings (count - 1) (total + BS.length value)

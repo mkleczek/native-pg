@@ -6,6 +6,7 @@ module Database.PostgreSQL.Internal.Channel
   ( Channel (..),
     newChannel,
     Unsent,
+    discardUnsent,
     OutputBuffer,
     newOutputBuffer,
     outputBufferFrom,
@@ -21,6 +22,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Word (Word8)
+import qualified Network.Streaming
 import qualified Network.Streaming.Buffer as Buffer
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Writer, WriteResult (..), outputWriter, runWriter)
 import Database.PostgreSQL.Internal.Protocol.Codec
@@ -153,7 +155,7 @@ unsent reused output = do
     part (Left copied) = PartBytes copied
     part (Right (UncopiedBytes value)) = PartBytes value
     part (Right (UncopiedStream source)) = PartStream source 0
-    part (Right (UncopiedBorrowedStream source)) = PartBorrowedStream source 0
+    part (Right (UncopiedBorrowedStream count source)) = PartBorrowedStream (ByteStream count (Network.Streaming.withChunk source pure)) 0
 
 renderOutput :: OutputBuffer -> Writer -> IO [Part]
 renderOutput buffer@(OutputBuffer memory capacity _) writer =
@@ -165,7 +167,7 @@ renderOutput buffer@(OutputBuffer memory capacity _) writer =
         resume rest = [PartOutput buffer rest]
         uncopied (UncopiedBytes value) = PartBytes value
         uncopied (UncopiedStream source) = PartStream source 0
-        uncopied (UncopiedBorrowedStream source) = PartBorrowedStream source 0
+        uncopied (UncopiedBorrowedStream count source) = PartBorrowedStream (ByteStream count (Network.Streaming.withChunk source pure)) 0
     pure $ case result of
       Finished count -> copied count []
       NeedSpace count rest -> copied count (resume rest)
@@ -243,3 +245,6 @@ sendSome link (Unsent parts) = Unsent <$> go parts
         | otherwise -> BS.drop sent chunk : others
       [] -> []
 {-# INLINABLE sendSome #-}
+
+discardUnsent :: Unsent -> IO ()
+discardUnsent _ = pure ()

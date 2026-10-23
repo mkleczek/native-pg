@@ -7,7 +7,7 @@ module CoreSpec (spec) where
 import Control.Exception (ErrorCall, displayException, evaluate)
 import Data.ByteArray.Encoding (Base (Base16), convertToBase)
 import Data.ByteString (ByteString)
-import Data.Word (Word32)
+import Data.Word (Word32, Word8)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Char8 as Char8
@@ -16,7 +16,6 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text.Encoding (encodeUtf8)
-import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Authentication
 import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Diagnostics
@@ -610,7 +609,7 @@ paramView (Tx.Param oid format value) = (oid, format, bytes <$> value)
   where
     bytes (ParameterBytes strict) = strict
     bytes (ParameterStream _) = error "a streamed parameter"
-    bytes (ParameterBorrowedStream _) = error "a borrowed streamed parameter"
+    bytes (ParameterBorrowedStream _ _) = error "a borrowed streamed parameter"
     bytes (ParameterChunks chunks) = BS.concat chunks
 
 failsWith :: String -> Predicate IO (Either String a)
