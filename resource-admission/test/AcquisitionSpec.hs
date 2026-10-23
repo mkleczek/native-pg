@@ -368,6 +368,9 @@ spec = describe "private acquisition" $ do
   it "grant releases its detach callback before a far-future deadline" $ usingSystemTimer $ \context -> do
     finalized <- grantedContextAnchor context
     collected finalized
+  it "cancellation releases its detach callback before a far-future deadline" $ usingSystemTimer $ \context -> do
+    finalized <- cancelledContextAnchor context
+    collected finalized
   it "releases timed grant callbacks before caller use finishes" $ usingSystemTimer $ \context ->
     forM_ [True, False] $ \grantDuringEnqueue -> do
       (finalized, release, result) <- activeGrantAnchor context grantDuringEnqueue
