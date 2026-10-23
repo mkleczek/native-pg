@@ -1,5 +1,5 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -8,13 +8,13 @@ module OutputBufferSpec (spec) where
 import Control.Exception (evaluate, finally)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
+import qualified Data.ByteString.Internal as BSI
 import Data.Functor (($>))
 import Data.IORef
-import qualified Data.ByteString.Internal as BSI
-import qualified Network.Streaming as Streaming
-import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Control.Monad (forM_)
+import qualified Network.Streaming as Streaming
 import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output
+import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Database.PostgreSQL.Internal.Context
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Buffer (bufferMemory, bufferCapacity, newBuffer)
@@ -87,6 +87,7 @@ spec = describe "caller-owned output storage" $ do
           pure (BS.length prefix)
     channelSendBuffered (newChannel link) (outputBufferFrom buffer) batch
     readIORef sent `shouldReturn` wire
+
   it "matches contiguous serialization for complete messages at small capacities" $ do
     let output = serialize (Parse ("" :: BS.ByteString) "SELECT $1" [])
           <> serialize (Query (BS.replicate 9000 65))
@@ -168,7 +169,7 @@ spec = describe "caller-owned output storage" $ do
           evaluate (BS.copy (BSI.BS (bufferMemory second) 32)) `shouldReturn` BS.replicate 32 0
         _ -> failTest "the byte string did not suspend behind the scalar"
 
-  xfail "scoped output implementation follows" $ it "finishes exact-fit scalars across empty and zero-length stream boundaries" $ do
+  it "finishes exact-fit scalars across empty and zero-length stream boundaries" $ do
     buffer <- newBuffer (positiveInt @4)
     ordinaryPulls <- newIORef (0 :: Int)
     borrowedPulls <- newIORef (0 :: Int)
@@ -197,7 +198,7 @@ spec = describe "caller-owned output storage" $ do
     channelSendBuffered (newChannel sender) (outputBufferFrom buffer) mempty
     readIORef calls `shouldReturn` 16
 
-  xfail "scoped output implementation follows" $ it "resumes mixed fields and scoped streams in four bytes across blocked sends" $ do
+  it "resumes mixed fields and scoped streams in four bytes across blocked sends" $ do
     buffer <- newBuffer (positiveInt @4)
     borrowed <- newBuffer (positiveInt @4)
     ordinary <- newIORef ["stream", "!", ""]

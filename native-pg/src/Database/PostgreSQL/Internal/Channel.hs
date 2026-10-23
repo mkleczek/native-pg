@@ -1,28 +1,33 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | Connection input and output, specialized to its transport link.
 module Database.PostgreSQL.Internal.Channel
   ( Channel (..),
     newChannel,
     Unsent,
-    discardUnsent,
     OutputBuffer,
     newOutputBuffer,
     outputBufferFrom,
     unsent,
     unsentEmpty,
+    discardUnsent,
   )
 where
 
-import Control.Exception (throwIO)
+import Control.Exception (SomeException, bracket, finally, mask, onException, throwIO, try, uninterruptibleMask_)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId)
+import Control.Concurrent.MVar
+import Network.Streaming (Source, withChunk)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
-import Data.IORef (IORef, readIORef, writeIORef)
+import Data.Functor (($>))
+import Data.IORef (IORef, readIORef, writeIORef, newIORef, atomicModifyIORef')
 import Data.Word (Word8)
-import qualified Network.Streaming
 import qualified Network.Streaming.Buffer as Buffer
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Writer, WriteResult (..), outputWriter, runWriter)
 import Database.PostgreSQL.Internal.Protocol.Codec
@@ -86,10 +91,13 @@ linkInputSource link pending readSize =
         Nothing -> do
           left <- readIORef pending
           flushed <- flushReady link
-          case left of
-            Unsent [] | flushed -> awaitReadable link
-            _ ->
-              awaitReadableOrWritable link >>= \case
+          if unsentEmpty left && flushed
+            then awaitReadable link
+            else case waitingSource left of
+              Just pull | flushed -> do
+                waitForSourceOrReadable link pull
+                writeIORef pending =<< sendSome link left
+              _ -> awaitReadableOrWritable link >>= \case
                 Readable -> pure ()
                 Writable -> writeIORef pending =<< sendSome link left
           receive pointer size
@@ -101,30 +109,99 @@ sendOutput link = sendOutputWith link Nothing
 {-# INLINABLE sendOutput #-}
 
 sendOutputWith :: Link link => link -> Maybe OutputBuffer -> Output -> IO ()
-sendOutputWith link buffer output = go =<< unsent buffer output
+sendOutputWith link buffer output = bracket (unsent buffer output) discardUnsent go
   where
-    go left =
-      sendSome link left >>= \case
-        Unsent [] -> do
+    go left = do
+      rest <- sendSome link left
+      if unsentEmpty rest
+        then do
           flushed <- flushReady link
-          unless flushed (awaitWritable link *> go (Unsent []))
-        rest -> awaitWritable link *> go rest
+          unless flushed (awaitWritable link *> go rest)
+        else do
+          case waitingSource rest of
+            Just pull -> readMVar (pullEvent pull) $> ()
+            Nothing -> awaitWritable link
+          go rest
 {-# INLINABLE sendOutputWith #-}
 
 -- | What's left of an output to send. The server may answer the first
 -- messages of an output before it has read the rest, and stop reading until
 -- its answers are read. So output can be sent as the answers are read.
-newtype Unsent = Unsent [Part]
+data Unsent = Unsent [Part] (IORef [(ThreadId, MVar ())])
 
 unsentEmpty :: Unsent -> Bool
-unsentEmpty (Unsent parts) = null parts
+unsentEmpty (Unsent parts _) = null parts
+
+-- Cancel and join producers before request storage can be returned. Only
+-- producers touch Sources; the caller retains exclusive Link I/O ownership.
+discardUnsent :: Unsent -> IO ()
+discardUnsent (Unsent _ registry) = uninterruptibleMask_ $ do
+  active <- atomicModifyIORef' registry ([],)
+  mapM_ (\(thread, finished) -> killThread thread *> readMVar finished) active
+
+data BorrowedPull = BorrowedPull
+  { pullEvent :: MVar (Either SomeException ByteString),
+    pullAccepted :: MVar (),
+    pullFinished :: MVar (Either SomeException ())
+  }
+
+newBorrowedPull :: IORef [(ThreadId, MVar ())] -> Source -> IO BorrowedPull
+newBorrowedPull registry source = mask $ \_ -> do
+  event <- newEmptyMVar
+  accepted <- newEmptyMVar
+  finished <- newEmptyMVar
+  outcomeVar <- newEmptyMVar
+  started <- newEmptyMVar
+  let loop = do
+        ended <- withChunk source $ \chunk -> do
+          putMVar event (Right chunk)
+          takeMVar accepted
+          pure (BS.null chunk)
+        unless ended loop
+      run unmask = do
+        outcome <- try (unmask loop)
+        case outcome of
+          Left failure -> tryPutMVar event (Left failure) $> ()
+          Right () -> pure ()
+        putMVar outcomeVar outcome
+      done = do
+        thread <- myThreadId
+        atomicModifyIORef' registry (\entries -> (filter ((/= thread) . fst) entries, ()))
+        putMVar finished ()
+  thread <- forkIOWithUnmask (\unmask -> (takeMVar started *> run unmask) `finally` done)
+  (atomicModifyIORef' registry (\entries -> ((thread, finished) : entries, ())) *> putMVar started ())
+    `onException` (killThread thread *> readMVar finished)
+  pure (BorrowedPull event accepted outcomeVar)
+
+waitingSource :: Unsent -> Maybe BorrowedPull
+waitingSource (Unsent (PartBorrowedCursor pull _ _ : _) _) = Just pull
+waitingSource _ = Nothing
+
+-- A delayed HTTP chunk must not stop the database from returning an earlier
+-- result. Await source readiness or readable PG bytes, cancelling/joining
+-- both waiters before the single Link owner resumes.
+waitForSourceOrReadable :: Link link => link -> BorrowedPull -> IO ()
+waitForSourceOrReadable link pull = mask $ \restore -> do
+  ready <- newEmptyMVar
+  let waiter action = do
+        finished <- newEmptyMVar
+        thread <- forkIOWithUnmask $ \unmask ->
+          (try (unmask action) >>= \result -> putMVar ready (result :: Either SomeException ()))
+            `finally` putMVar finished ()
+        pure (thread, finished)
+      stop (thread, finished) = uninterruptibleMask_ (killThread thread *> readMVar finished)
+  bracket (waiter (awaitReadable link)) stop $ \_ ->
+    bracket (waiter (readMVar (pullEvent pull) $> ())) stop $ \_ ->
+      restore (takeMVar ready >>= either throwIO pure)
 
 -- | Bytes, or a stream with how many bytes it has given.
 data Part
   = PartBytes ByteString
-  | PartStream ByteStream Int
+  | PartStream ByteStream {-# UNPACK #-} !Int
   | PartOutput OutputBuffer Writer
-  | PartBorrowedStream ByteStream Int
+  | PartBorrowedStream {-# UNPACK #-} !Int Source
+  | PartBorrowedCursor BorrowedPull {-# UNPACK #-} !Int {-# UNPACK #-} !Int
+  | PartBorrowedBytes ByteString BorrowedPull {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 
 -- | Memory that outputs are written to, reused once what was written to it
 -- is sent.
@@ -144,18 +221,18 @@ outputBufferFrom buffer = OutputBuffer (Buffer.bufferMemory buffer) (Buffer.buff
 unsent :: Maybe OutputBuffer -> Output -> IO Unsent
 unsent (Just buffer@(OutputBuffer _ size True)) output
   | size < 4 = ioError (userError "output buffer capacity must be at least four bytes")
-  | otherwise = pure (Unsent [PartOutput buffer (outputWriter output)])
+  | otherwise = Unsent [PartOutput buffer (outputWriter output)] <$> newIORef []
 unsent reused output = do
   memory <- case reused of
     Just (OutputBuffer memory size _) | outputCopied output <= size -> pure memory
     _ -> mallocPlainForeignPtrBytes (outputCopied output)
   parts <- writeOutput memory output
-  pure (Unsent (map part parts))
+  Unsent (map part parts) <$> newIORef []
   where
     part (Left copied) = PartBytes copied
     part (Right (UncopiedBytes value)) = PartBytes value
     part (Right (UncopiedStream source)) = PartStream source 0
-    part (Right (UncopiedBorrowedStream count source)) = PartBorrowedStream (ByteStream count (Network.Streaming.withChunk source pure)) 0
+    part (Right (UncopiedBorrowedStream count source)) = PartBorrowedStream count source
 
 renderOutput :: OutputBuffer -> Writer -> IO [Part]
 renderOutput buffer@(OutputBuffer memory capacity _) writer =
@@ -167,7 +244,7 @@ renderOutput buffer@(OutputBuffer memory capacity _) writer =
         resume rest = [PartOutput buffer rest]
         uncopied (UncopiedBytes value) = PartBytes value
         uncopied (UncopiedStream source) = PartStream source 0
-        uncopied (UncopiedBorrowedStream count source) = PartBorrowedStream (ByteStream count (Network.Streaming.withChunk source pure)) 0
+        uncopied (UncopiedBorrowedStream count source) = PartBorrowedStream count source
     pure $ case result of
       Finished count -> copied count []
       NeedSpace count rest -> copied count (resume rest)
@@ -187,20 +264,27 @@ gatherPieces = 16
 -- bytes before a stream are sent before it's pulled: the server starts on
 -- its statement, and its statement_timeout, as it would without the stream.
 sendSome :: Link link => link -> Unsent -> IO Unsent
-sendSome link (Unsent parts) = Unsent <$> go parts
+sendSome link (Unsent parts registry) = (`Unsent` registry) <$> go parts
   where
+    go (PartBorrowedBytes chunk pull count given : others) = do
+      sent <- sendReady link [BS.take gatherSize chunk]
+      if sent >= BS.length chunk
+        then putMVar (pullAccepted pull) () *> go (PartBorrowedCursor pull count given : others)
+        else pure (PartBorrowedBytes (BS.drop sent chunk) pull count given : others)
     go remaining = do
-      (gathered, rest) <- gather 0 [] remaining
+      (gathered, rest) <- gather 0 0 [] remaining
       if null gathered
-        then pure rest
+        then case rest of
+          PartBorrowedBytes {} : _ -> go rest
+          _ -> pure rest
         else do
           sent <- sendReady link gathered
           case dropSent sent gathered of
             [] -> go rest
             left -> pure (map PartBytes left <> rest)
-    -- the pieces so far, last first, and their size
-    gather size pieces remaining
-      | size >= gatherSize || length pieces >= gatherPieces = pure (reverse pieces, remaining)
+    -- Count pieces as they are gathered instead of traversing them each time.
+    gather !size !pieceCount pieces remaining
+      | size >= gatherSize || pieceCount >= gatherPieces = pure (reverse pieces, remaining)
       | otherwise = case remaining of
           [] -> pure (reverse pieces, [])
           -- Rendering the next buffer would overwrite gathered bytes that
@@ -208,26 +292,34 @@ sendSome link (Unsent parts) = Unsent <$> go parts
           PartOutput _ _ : _ | not (null pieces) -> pure (reverse pieces, remaining)
           PartOutput buffer steps : others -> do
             rendered <- renderOutput buffer steps
-            gather size pieces (rendered <> others)
-          -- The next pull may overwrite the current chunk, including any
-          -- suffix a partial send has left in front of this cursor.
+            gather size pieceCount pieces (rendered <> others)
+          -- Flush preceding metadata before starting a scoped source.
           PartBorrowedStream _ _ : _ | not (null pieces) -> pure (reverse pieces, remaining)
-          PartBorrowedStream source given : others -> do
-            chunk <- byteStreamNext source
-            let delivered = given + BS.length chunk
-            if
-              | BS.null chunk -> do
-                  unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
-                  gather size pieces others
-              | delivered > byteStreamLength source ->
-                  throwIO (StreamLengthError (byteStreamLength source) delivered)
-              | otherwise -> gather size pieces (PartBytes chunk : PartBorrowedStream source delivered : others)
+          PartBorrowedStream count source : others -> do
+            pull <- newBorrowedPull registry source
+            gather size pieceCount pieces (PartBorrowedCursor pull count 0 : others)
+          PartBorrowedCursor {} : _ | not (null pieces) -> pure (reverse pieces, remaining)
+          PartBorrowedCursor pull count given : others ->
+            tryTakeMVar (pullEvent pull) >>= \case
+              Nothing -> pure (reverse pieces, remaining)
+              Just (Left failure) -> throwIO failure
+              Just (Right chunk) -> do
+                let delivered = given + BS.length chunk
+                if
+                  | BS.null chunk -> do
+                      putMVar (pullAccepted pull) ()
+                      readMVar (pullFinished pull) >>= either throwIO pure
+                      unless (given == count) (throwIO (StreamLengthError count given))
+                      gather size pieceCount pieces others
+                  | delivered > count -> throwIO (StreamLengthError count delivered)
+                  | otherwise -> pure (reverse pieces, PartBorrowedBytes chunk pull count delivered : others)
+          PartBorrowedBytes {} : _ -> pure (reverse pieces, remaining)
           PartBytes chunk : others
-            | BS.null chunk -> gather size pieces others
+            | BS.null chunk -> gather size pieceCount pieces others
             | otherwise ->
                 let (prefix, suffix) = BS.splitAt (gatherSize - size) chunk
                     rest = [PartBytes suffix | not (BS.null suffix)] <> others
-                 in gather (size + BS.length prefix) (prefix : pieces) rest
+                 in gather (size + BS.length prefix) (pieceCount + 1) (prefix : pieces) rest
           PartStream _ 0 : _ | not (null pieces) -> pure (reverse pieces, remaining)
           PartStream source given : others -> do
             chunk <- byteStreamNext source
@@ -235,16 +327,13 @@ sendSome link (Unsent parts) = Unsent <$> go parts
             if
               | BS.null chunk -> do
                   unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
-                  gather size pieces others
+                  gather size pieceCount pieces others
               | delivered > byteStreamLength source ->
                   throwIO (StreamLengthError (byteStreamLength source) delivered)
-              | otherwise -> gather size pieces (PartBytes chunk : PartStream source delivered : others)
+              | otherwise -> gather size pieceCount pieces (PartBytes chunk : PartStream source delivered : others)
     dropSent sent = \case
       chunk : others
         | sent >= BS.length chunk -> dropSent (sent - BS.length chunk) others
         | otherwise -> BS.drop sent chunk : others
       [] -> []
 {-# INLINABLE sendSome #-}
-
-discardUnsent :: Unsent -> IO ()
-discardUnsent _ = pure ()

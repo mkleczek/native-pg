@@ -77,9 +77,9 @@ nextRow session@(Session context) = do
 -- it's given to.
 data Row = Row
   { rowContext :: Context,
-    rowColumnCount :: Int,
+    rowColumnCount :: {-# UNPACK #-} !Int,
     -- | The position where the row ends.
-    rowEnd :: Int,
+    rowEnd :: {-# UNPACK #-} !Int,
     rowCursor :: IORef RowCursor
   }
 

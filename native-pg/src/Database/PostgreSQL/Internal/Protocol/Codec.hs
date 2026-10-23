@@ -74,10 +74,10 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Input
     inputPosition,
     peekInputMetadataByteAt,
     readInputSome,
+    readInputBorrowedSome,
     readInputWord8,
     readInputWord16,
     readInputWord32,
-    readInputBorrowedSome,
     runBodyParser,
     runInput,
     runInputUntil,
@@ -614,11 +614,12 @@ expectConstant expected actual =
     (throwError ("unexpected constant " <> show actual <> ", expected " <> show expected))
 {-# INLINE expectConstant #-}
 
+-- Narrow once after combining bytes, as in the consuming scalar readers.
 peekBigEndianWord16At :: Int -> Input Word16
 peekBigEndianWord16At offset = do
   low <- peekInputMetadataByteAt (offset + 1)
   high <- peekInputMetadataByteAt offset
-  pure (shiftL (fromIntegral high) 8 .|. fromIntegral low)
+  pure (fromIntegral (shiftL (fromIntegral high) 8 .|. fromIntegral low :: Word))
 {-# INLINE peekBigEndianWord16At #-}
 
 peekBigEndianWord32At :: Int -> Input Word32
@@ -627,11 +628,13 @@ peekBigEndianWord32At offset = do
   byte0 <- peekInputMetadataByteAt offset
   byte1 <- peekInputMetadataByteAt (offset + 1)
   byte2 <- peekInputMetadataByteAt (offset + 2)
-  pure $
-    shiftL (fromIntegral byte0) 24
-      .|. shiftL (fromIntegral byte1) 16
-      .|. shiftL (fromIntegral byte2) 8
-      .|. fromIntegral byte3
+  pure $ fromIntegral
+    ( shiftL (fromIntegral byte0) 24
+        .|. shiftL (fromIntegral byte1) 16
+        .|. shiftL (fromIntegral byte2) 8
+        .|. fromIntegral byte3
+        :: Word
+    )
 {-# INLINE peekBigEndianWord32At #-}
 
 lengthAsInt32 :: Int -> Int32

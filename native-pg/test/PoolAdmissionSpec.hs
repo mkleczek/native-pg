@@ -183,7 +183,7 @@ spec = describe "independent request and connection admission" $ do
       Pool.release sibling)
       `finally` (mapM_ (killThread . fst) queued >> tryPutMVar hold () >> readMVar done)
 
-  xfail "Acquisition constructor scaffold: validation follows in the next change" $ it "keeps the acquisition context usable after a constructor rejects its settings" $
+  it "keeps the acquisition context usable after a constructor rejects its settings" $
     getAcquisition >>= \waiting -> do
       rejected <- try @IOError $ Pool.newPool waiting (sharedConfig (pure (Right 1))) {Pool.configSize = 0}
       isLeft rejected `shouldBe` True

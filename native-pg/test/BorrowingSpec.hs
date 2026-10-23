@@ -42,6 +42,28 @@ spec = describe "caller-owned input" $ do
     withForeignPtr (bufferMemory storage) $ \pointer -> fillBytes pointer 85 4
     values `shouldBe` scalarExpected
 
+  it "keeps deferred scalar results valid after returning their buffer loan" $
+    getAcquisition >>= \waiting ->
+      BufferPool.newBufferPool waiting (BufferPool.PoolSettings
+        { BufferPool.bufferSize = positiveInt @4
+        , BufferPool.ordinaryBufferCount = positiveInt @7
+        , BufferPool.reserveBufferCount = positiveInt @1
+        , BufferPool.setupBufferCount = positiveInt @8
+        }) >>= \resources ->
+        BufferPool.withRequestBuffers resources $ \access -> do
+          initial <- BufferPool.borrowBuffer access
+          let memory = bufferMemory (BufferPool.loanBuffer initial)
+          BufferPool.releaseBuffer initial
+          source <- bytesSource 4 scalarBytes (const (pure ()))
+          input <- requestInputBuffer access
+          (values, pending) <- runInput source input scalarValues
+          releaseInputBuffer pending
+          loan <- BufferPool.borrowBuffer access
+          bufferMemory (BufferPool.loanBuffer loan) `shouldBe` memory
+          withForeignPtr (bufferMemory (BufferPool.loanBuffer loan)) $ \pointer -> fillBytes pointer 85 4
+          BufferPool.releaseBuffer loan
+          values `shouldBe` scalarExpected
+
   it "rejects bounded scalars before reading outside their frame" $ do
     forM_ [False, True] $ \prefilled -> forM_ scalarParsers $ \(width, parse) -> do
       storage <- newBuffer (positiveInt @4)
@@ -80,29 +102,7 @@ spec = describe "caller-owned input" $ do
       then pure ()
       else failTest ("10000 buffered Word32 reads allocated " <> show allocated <> " bytes (limit 1600000)")
 
-  xfail "request-backed input implementation follows" . it "keeps deferred scalar results valid after returning their buffer loan" $
-    getAcquisition >>= \waiting ->
-      BufferPool.newBufferPool waiting (BufferPool.PoolSettings
-      { BufferPool.bufferSize = positiveInt @4
-      , BufferPool.ordinaryBufferCount = positiveInt @7
-      , BufferPool.reserveBufferCount = positiveInt @1
-      , BufferPool.setupBufferCount = positiveInt @8
-      }) >>= \resources ->
-        BufferPool.withRequestBuffers resources $ \access -> do
-          initial <- BufferPool.borrowBuffer access
-          let memory = bufferMemory (BufferPool.loanBuffer initial)
-          BufferPool.releaseBuffer initial
-          source <- bytesSource 4 scalarBytes (const (pure ()))
-          input <- requestInputBuffer access
-          (values, pending) <- runInput source input scalarValues
-          releaseInputBuffer pending
-          loan <- BufferPool.borrowBuffer access
-          bufferMemory (BufferPool.loanBuffer loan) `shouldBe` memory
-          withForeignPtr (bufferMemory (BufferPool.loanBuffer loan)) $ \pointer -> fillBytes pointer 85 4
-          BufferPool.releaseBuffer loan
-          values `shouldBe` scalarExpected
-
-  xfail "metadata allocation optimization follows" . it "bounds allocation for buffered metadata strings" $ do
+  it "bounds allocation for buffered metadata strings" $ do
     storage <- newBuffer (positiveInt @16384)
     source <- bytesSource 16384 (BS.concat (replicate 1000 "SELECT 1\0")) (const (pure ()))
     (_, filled) <- runInput source (reusableInputBuffer storage) (peekInputByteAt 0)

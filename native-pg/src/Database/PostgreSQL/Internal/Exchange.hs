@@ -16,10 +16,9 @@ import Control.Monad (when, (<=<))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (atomicModifyIORef')
-import Database.PostgreSQL.Diagnostics (ServerError (..))
+import Database.PostgreSQL.Diagnostics (ServerError (..), isConnectionFatal)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
-import Database.PostgreSQL.Diagnostics (isConnectionFatal)
 import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), Input, Output, ParseConstructor, Serializable, parseChoice)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Protocol.Messages

@@ -19,6 +19,7 @@ import Database.PostgreSQL.Transport (Channel, Link (..), newChannel, serverEndP
 import Database.PostgreSQL.Transport.Link ()
 import Database.PostgreSQL.Types ()
 import qualified Database.PostgreSQL.Transaction as Transaction
+import qualified Control.Concurrent.Resource.Acquisition as Acquisition
 import Control.Exception (bracket)
 import Data.ByteString (ByteString)
 import Data.Functor.Const (Const (..))
@@ -96,3 +97,6 @@ resourceSettings = PoolSettings
   , reserveBufferCount = positiveInt @1
   , setupBufferCount = positiveInt @2
   }
+
+createResources :: Acquisition.Context -> IO BufferPool
+createResources acquisition = newBufferPool acquisition resourceSettings

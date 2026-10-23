@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 
 -- | Serialized bytes with their length known before they are written, so a
@@ -113,9 +114,11 @@ outputByteString output = unsafeDupablePerformIO $ do
 -- | Each value's output, one after another. Compute sizes without retaining
 -- a serializer for every value; build their writers as the sender advances.
 outputs :: (a -> Output) -> [a] -> Output
-outputs output values = Output (total outputLength) (total outputCopied) build
+outputs output values = Output size copied build
   where
-    total field = foldl' (\subtotal value -> subtotal + field (output value)) 0 values
+    (!size, !copied) = foldl' addSizes (0, 0) values
+    addSizes (!totalSize, !totalCopied) value = case output value of
+      Output valueSize valueCopied _ -> (totalSize + valueSize, totalCopied + valueCopied)
     build rest = foldr (outputBuild . output) rest values
 {-# INLINE outputs #-}
 
@@ -221,5 +224,6 @@ stream source = Output (byteStreamLength source) 0 $ \rest ->
 
 -- | The source owns each chunk through its synchronous callback.
 borrowedStream :: Int -> Source -> Output
-borrowedStream _ _ = error "scoped output implementation follows"
+borrowedStream count source = Output count 0 $ \rest ->
+  Writer $ \_ _ used -> pure (Yield used (UncopiedBorrowedStream count source) rest)
 {-# INLINE borrowedStream #-}
