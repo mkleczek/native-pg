@@ -1,0 +1,39 @@
+cabal-version: 3.0
+name: resource-admission
+version: 0.1.0.0
+synopsis: Private waiter delivery and opaque STM FIFOs
+license: BSD-3-Clause
+license-file: LICENSE
+build-type: Simple
+
+library
+  default-language: GHC2021
+  hs-source-dirs: src
+  ghc-options: -Wall
+  exposed-modules: Control.Concurrent.Resource.Waiting
+  build-depends: base >=4.18 && <5,
+                 stm >=2.5 && <2.6, time >=1.12 && <1.15
+
+test-suite resource-admission-spec
+  type: exitcode-stdio-1.0
+  default-language: GHC2021
+  hs-source-dirs: test
+  main-is: Main.hs
+  other-modules: WaitingSpec
+                 TestSupport
+  ghc-options: -Wall -threaded -rtsopts -F -pgmF=skeletest-preprocessor
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
+  build-depends: base, stm, time, resource-admission, skeletest >=0.4.2 && <0.5
+
+-- Compile the real implementation against a controlled test-only timer backend.
+test-suite resource-admission-timer-races
+  type: exitcode-stdio-1.0
+  default-language: GHC2021
+  hs-source-dirs: test/timer-races src
+  main-is: Main.hs
+  other-modules: TimerRaceSpec
+                 GHC.Event
+                 Control.Concurrent.Resource.Waiting
+  ghc-options: -Wall -threaded -rtsopts -F -pgmF=skeletest-preprocessor
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
+  build-depends: base, stm, time, skeletest >=0.4.2 && <0.5
