@@ -30,8 +30,8 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (fillBytes)
 import Database.PostgreSQL.Transport (Address (..))
 import Network.Streaming.PositiveInt (positiveInt)
-import Network.Streaming.Resources (ResourceSettings (..))
-import qualified Network.Streaming.Resources as Resources
+import Network.Streaming.BufferPool (PoolSettings (..))
+import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
@@ -50,25 +50,25 @@ spec socketPath port = describe "pooled connection setup" $ do
       encrypted connecting = connecting { PG.connectTlsClient = Just tlsClient }
 
   it "authenticates with tiny setup buffers while body storage is busy" $
-    withTestResources settings $ \resources -> Resources.withBuffers @(Buffer, Buffer) resources $ \_ ->
+    withTestResources settings $ \resources -> BufferPool.withBuffers @(Buffer, Buffer) resources $ \_ ->
       bracket (Streaming.connect resources (local "native_pg_scram" (Just "scram secret"))) (PG.close . fst) $ \(connection, info) -> do
         PG.isUsable connection `shouldReturn` True
         isJust (lookup "server_version" (PG.serverParameters info)) `shouldBe` True
-        timeout 1000000 (Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
+        timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
   it "authenticates SCRAM over TLS with required binding and tiny setup buffers" $
-    withTestResources settings $ \resources -> Resources.withBuffers @(Buffer, Buffer) resources $ \_ -> do
+    withTestResources settings $ \resources -> BufferPool.withBuffers @(Buffer, Buffer) resources $ \_ -> do
       let connecting = encrypted (PG.connectSettings (TcpAddress "127.0.0.1" port) "native_pg_scram")
             { PG.connectDatabase = Just "postgres", PG.connectPassword = Just "scram secret"
             , PG.connectSslMode = PG.SslRequire, PG.connectChannelBinding = PG.ChannelBindingRequire }
       bracket (Streaming.connect resources connecting) (PG.close . fst) $ \(connection, _) -> do
         PG.isUsable connection `shouldReturn` True
-        timeout 1000000 (Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
+        timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
   it "streams repeated operations after setup storage has been overwritten and loaned again" $
     withTestResources settings $ \resources ->
       bracket (Streaming.connect resources ((local "postgres" Nothing) { PG.connectParameters = [("application_name", "pooled-setup")] })) (PG.close . fst) $ \(connection, info) ->
-        Resources.withSetupBuffers @(Buffer, Buffer) resources $ \(input, output) -> do
+        BufferPool.withSetupBuffers @(Buffer, Buffer) resources $ \(input, output) -> do
           traverse_ (\buffer -> withForeignPtr (bufferMemory buffer) $ \pointer ->
             fillBytes pointer 0xaa (bufferCapacity buffer)) [input, output]
           lookup "application_name" (PG.serverParameters info) `shouldBe` Just "pooled-setup"
@@ -84,7 +84,7 @@ spec socketPath port = describe "pooled connection setup" $ do
         Left (PG.ConnectionRejected _) -> pure ()
         Left failure -> failTest (show failure)
         Right (connection, _) -> PG.close connection >> failTest "wrong password was accepted"
-      timeout 1000000 (Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
+      timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
   it "closes an unsuitable TLS host and tries the next host using the same setup pair" $
     withTestResources settings $ \resources -> do
@@ -96,7 +96,7 @@ spec socketPath port = describe "pooled connection setup" $ do
       bracket (Streaming.connectFirst resources adjust adjusted) closeSelected $ \(connection, _, host) -> do
         CS.hostName host `shouldBe` takeDirectory socketPath
         PG.isUsable connection `shouldReturn` True
-        timeout 1000000 (Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
+        timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
   it "retries primary hosts when prefer-standby finds no standby" $
     withTestResources settings $ \resources -> do
@@ -104,7 +104,7 @@ spec socketPath port = describe "pooled connection setup" $ do
       bracket (Streaming.connectFirst resources id string) closeSelected $ \(connection, _, host) -> do
         CS.hostName host `shouldBe` takeDirectory socketPath
         PG.isUsable connection `shouldReturn` True
-      timeout 1000000 (Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
+      timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
   it "reports failed hosts in order and returns setup storage" $
     withTestResources settings $ \resources -> do
@@ -115,10 +115,10 @@ spec socketPath port = describe "pooled connection setup" $ do
       case result of
         Left (CS.ConnectFailure failures) -> map fst failures `shouldBe` missing
         Right connected -> closeSelected connected >> failTest "missing hosts connected"
-      timeout 1000000 (Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
+      timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
   it "uses setup storage for fallback qualification queries when startup omits attributes" $
-    withTestResources settings $ \resources -> Resources.withBuffers @(Buffer, Buffer) resources $ \_ ->
+    withTestResources settings $ \resources -> BufferPool.withBuffers @(Buffer, Buffer) resources $ \_ ->
       withOlderServer $ \scriptedPort -> do
         string <- either failTest pure $
           CS.parseConnectionString (CS.Defaults "/tmp" Nothing) (const Nothing) (Just "postgres")
@@ -126,7 +126,7 @@ spec socketPath port = describe "pooled connection setup" $ do
         bracket (Streaming.connectFirst resources id string) closeSelected $ \(connection, info, _) -> do
           PG.serverParameters info `shouldBe` []
           PG.isUsable connection `shouldReturn` True
-          timeout 1000000 (Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
+          timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
   it "returns setup storage when a silent startup is cancelled" $
     withTestResources settings $ \resources ->
@@ -137,10 +137,15 @@ spec socketPath port = describe "pooled connection setup" $ do
         outcome <- timeout 100000 (Streaming.connect resources (PG.connectSettings (TcpAddress "127.0.0.1" silentPort) "postgres"))
         traverse_ (PG.close . fst) outcome
         isJust outcome `shouldBe` False
-        timeout 1000000 (Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
+        timeout 1000000 (BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure (2 :: Int))) `shouldReturn` Just 2
 
-settings :: ResourceSettings
-settings = ResourceSettings (positiveInt @48) (positiveInt @32) (positiveInt @16) (positiveInt @1)
+settings :: PoolSettings
+settings = PoolSettings
+      { bufferSize = positiveInt @16
+      , ordinaryBufferCount = positiveInt @2
+      , reserveBufferCount = positiveInt @1
+      , setupBufferCount = positiveInt @2
+      }
 
 -- A pre-14 startup omits the reported attributes and must answer a SHOW query.
 withOlderServer :: (Socket.PortNumber -> IO a) -> IO a
@@ -198,6 +203,6 @@ countField count row = PG.nextColumn row >>= \case
         BS.all (== 'x') chunk `shouldBe` True
         drain (total + BS.length chunk) stream
 
-withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
+withTestResources :: PoolSettings -> (BufferPool.BufferPool -> IO a) -> IO a
 withTestResources settings action = getAcquisition >>= \waiting ->
-  Resources.withResources waiting settings action
+  BufferPool.newBufferPool waiting settings >>= action

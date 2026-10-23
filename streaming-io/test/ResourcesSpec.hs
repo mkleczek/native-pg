@@ -19,63 +19,68 @@ import System.Mem (performGC)
 import Data.Either (isLeft)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 import Network.Streaming.Buffer
-import Network.Streaming.Resources qualified as Resources
-import Network.Streaming.Resources
+import Network.Streaming.BufferPool
 import Skeletest
 
 spec :: Spec
 spec = do
  describe "resource settings" $ do
-  xfail "Count-based pool allocation follows in the implementation change" $ it "allocates the smallest positive counts as ordinary, reserve and setup blocks" $
-    withTestResources (ResourceSettings (positiveInt @1) (positiveInt @1) (positiveInt @1) (positiveInt @1)) $ \resources ->
-      withRequestBuffers resources $ \access -> do
+  it "allocates the smallest positive counts as ordinary, reserve and setup blocks" $
+    withTestPool minimumSettings $ \pool ->
+      withRequestBuffers pool $ \access -> do
         primary <- borrowBuffer access
         extra <- borrowBuffer access
         bufferCapacity (loanBuffer primary) `shouldBe` 1
         bufferCapacity (loanBuffer extra) `shouldBe` 1
-        withSetupBuffers @(Solo Buffer) resources $ \(MkSolo setup) ->
+        withSetupBuffers @(Solo Buffer) pool $ \(MkSolo setup) ->
           bufferCapacity setup `shouldBe` 1
         releaseBuffer extra
         releaseBuffer primary
-  xfail "Count-based pool allocation follows in the implementation change" $ it "keeps reserve independent even when it exceeds ordinary capacity" $
-    withTestResources (ResourceSettings (positiveInt @8) (positiveInt @1) (positiveInt @3) (positiveInt @1)) $ \resources ->
-      withRequestBuffers resources $ \access -> do
-        timeout 20_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Nothing
+  it "keeps reserve independent even when it exceeds ordinary capacity" $
+    withTestPool smallSettings {reserveBufferCount = positiveInt @3} $ \pool ->
+      withRequestBuffers pool $ \access -> do
+        timeout 20_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Nothing
         primary <- borrowBuffer access
         extra <- borrowBuffer access
         bufferMemory (loanBuffer primary) `shouldNotBe` bufferMemory (loanBuffer extra)
         releaseBuffer extra
         releaseBuffer primary
-  xfail "Count-based pool allocation follows in the implementation change" $ it "allocates exactly the requested ordinary and setup counts at the requested size" $
-    withTestResources (ResourceSettings (positiveInt @7) (positiveInt @2) (positiveInt @1) (positiveInt @3)) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
-        timeout 20_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Nothing
+  it "allocates exactly the requested ordinary and setup counts at the requested size" $
+    withTestPool smallSettings {bufferSize = positiveInt @7, ordinaryBufferCount = positiveInt @2, setupBufferCount = positiveInt @3} $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
+        timeout 20_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Nothing
         primary <- borrowBuffer first
         otherPrimary <- borrowBuffer second
         extra <- borrowBuffer first
         map (bufferCapacity . loanBuffer) [primary, otherPrimary, extra] `shouldBe` [7, 7, 7]
         timeout 20_000 (void (borrowBuffer second)) `shouldReturn` Nothing
-        withSetupBuffers @(Buffer, Buffer, Buffer) resources $ \(a, b, c) -> do
+        withSetupBuffers @(Buffer, Buffer, Buffer) pool $ \(a, b, c) -> do
           map bufferCapacity [a, b, c] `shouldBe` [7, 7, 7]
-          timeout 20_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Nothing
+          timeout 20_000 (withSetupBuffers @(Solo Buffer) pool (const (pure ()))) `shouldReturn` Nothing
         releaseBuffer extra
         releaseBuffer otherPrimary
         releaseBuffer primary
-  xfail "Count-based pool allocation follows in the implementation change" $ it "rejects a body count sum exceeding Int before allocation" $ do
+  it "rejects a body count sum exceeding Int before allocation" $ do
     largest <- requirePositive (toInteger (maxBound :: Int))
-    rejectsAllocation (ResourceSettings (positiveInt @1) largest (positiveInt @1) (positiveInt @1))
-  xfail "Count-based pool allocation follows in the implementation change" $ it "rejects a body byte product exceeding Int before allocation" $ do
+    rejectsAllocation minimumSettings {ordinaryBufferCount = largest}
+  it "rejects a body byte product exceeding Int before allocation" $ do
     largest <- requirePositive (toInteger (maxBound :: Int))
-    rejectsAllocation (ResourceSettings largest (positiveInt @1) (positiveInt @1) (positiveInt @1))
-  xfail "Count-based pool allocation follows in the implementation change" $ it "rejects a setup byte product exceeding Int before allocation" $ do
+    rejectsAllocation minimumSettings {bufferSize = largest}
+  it "rejects a setup byte product exceeding Int before allocation" $ do
     largest <- requirePositive (toInteger (maxBound :: Int))
-    rejectsAllocation (ResourceSettings (positiveInt @2) (positiveInt @1) (positiveInt @1) largest)
+    rejectsAllocation minimumSettings {bufferSize = positiveInt @2, setupBufferCount = largest}
 
  describe "caller-owned acquisition context" $ do
+  it "keeps sibling inventory and the context usable after allocation" $
+    getAcquisition >>= \waiting -> do
+      sibling <- newBufferPool waiting smallSettings
+      _ <- newBufferPool waiting smallSettings
+      timeout 200_000 (withRequestBuffers sibling (const (pure ()))) `shouldReturn` Just ()
+      assertAcquisitionUsable waiting
   it "keeps the context usable after an unsupported allocation fails" $
     getAcquisition >>= \waiting -> do
       largest <- requirePositive (toInteger (maxBound :: Int))
-      result <- try @IOError (withResources waiting (ResourceSettings (positiveInt @1) largest (positiveInt @1) (positiveInt @1)) (const (pure ())))
+      result <- try @IOError (newBufferPool waiting minimumSettings {ordinaryBufferCount = largest})
       isLeft result `shouldBe` True
       assertAcquisitionUsable waiting
 
@@ -94,7 +99,8 @@ spec = do
 
  describe "contiguous buffers" $ do
   it "returns adjacent initialized slices whose writes remain disjoint" $ do
-    buffers <- newBuffers (positiveInt @21) (positiveInt @7)
+    (count, buffers) <- newBuffers (positiveInt @21) (positiveInt @7)
+    count `shouldBe` 3
     map bufferCapacity buffers `shouldBe` [7, 7, 7]
     forM_ buffers $ \buffer -> withForeignPtr (bufferMemory buffer) $ \pointer ->
       peekArray 7 pointer `shouldReturn` replicate 7 0
@@ -111,7 +117,8 @@ spec = do
         peekArray 7 pointer `shouldReturn` replicate 7 value
   it "keeps the backing block alive when only a later slice remains" $ do
     survivor <- do
-      buffers <- newBuffers (positiveInt @8192) (positiveInt @4096)
+      (count, buffers) <- newBuffers (positiveInt @8192) (positiveInt @4096)
+      count `shouldBe` 2
       case buffers of
         [_, second] -> do
           withForeignPtr (bufferMemory second) $ \pointer -> pokeArray pointer (replicate 4096 73)
@@ -121,17 +128,20 @@ spec = do
     withForeignPtr (bufferMemory survivor) $ \pointer ->
       peekArray 4096 pointer `shouldReturn` replicate 4096 73
   it "leaves trailing budget bytes outside the exposed blocks" $ do
-    buffers <- newBuffers (positiveInt @23) (positiveInt @7)
+    (count, buffers) <- newBuffers (positiveInt @23) (positiveInt @7)
+    count `shouldBe` 3
     map bufferCapacity buffers `shouldBe` [7, 7, 7]
   it "returns no slices when the block size exceeds the budget" $ do
     largest <- requirePositive (toInteger (maxBound :: Int))
-    forM_ [positiveInt @8, largest] $ \size ->
-      length <$> newBuffers (positiveInt @7) size `shouldReturn` 0
+    forM_ [positiveInt @8, largest] $ \size -> do
+      (count, buffers) <- newBuffers (positiveInt @7) size
+      count `shouldBe` 0
+      length buffers `shouldBe` 0
 
  describe "storage" $ do
-  xfail "Request capability scaffold: scoped loans follow in the next change" $ it "initializes blocks once and reuses their addresses and contents" $
-    withTestResources smallSettings $ \resources -> do
-      first <- withRequestBuffers resources $ \access -> do
+  it "initializes blocks once and reuses their addresses and contents" $
+    withTestPool smallSettings $ \pool -> do
+      first <- withRequestBuffers pool $ \access -> do
         loan <- borrowBuffer access
         let buffer = loanBuffer loan
         bufferCapacity buffer `shouldBe` 8
@@ -140,7 +150,7 @@ spec = do
           poke pointer 73
         releaseBuffer loan
         pure (bufferMemory buffer)
-      withRequestBuffers resources $ \access -> do
+      withRequestBuffers pool $ \access -> do
         loan <- borrowBuffer access
         bufferMemory (loanBuffer loan) `shouldBe` first
         withForeignPtr (bufferMemory (loanBuffer loan)) $ \pointer -> peek pointer `shouldReturn` 73
@@ -148,85 +158,85 @@ spec = do
 
  describe "whole-block setup grants" $ do
   it "leaves remaining blocks usable when a larger grant must wait" $
-    withTestResources smallSettings {setupMemoryBytes = positiveInt @24} $ \resources ->
-      withSetupBuffers @(Solo Buffer) resources $ \(MkSolo first) -> do
-        timeout 20_000 (withSetupBuffers @(Buffer, Buffer, Buffer) resources (const (pure ()))) `shouldReturn` Nothing
-        withSetupBuffers @(Buffer, Buffer) resources $ \(second, third) -> do
+    withTestPool smallSettings {setupBufferCount = positiveInt @3} $ \pool ->
+      withSetupBuffers @(Solo Buffer) pool $ \(MkSolo first) -> do
+        timeout 20_000 (withSetupBuffers @(Buffer, Buffer, Buffer) pool (const (pure ()))) `shouldReturn` Nothing
+        withSetupBuffers @(Buffer, Buffer) pool $ \(second, third) -> do
           bufferMemory first `shouldNotBe` bufferMemory second
           bufferMemory first `shouldNotBe` bufferMemory third
           bufferMemory second `shouldNotBe` bufferMemory third
   it "returns five-block tuples without copying buffer payloads" $
-    withTestResources smallSettings {setupMemoryBytes = positiveInt @40} $ \resources -> do
-      original <- withSetupBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) resources $ \(a, b, c, d, e) -> do
+    withTestPool smallSettings {setupBufferCount = positiveInt @5} $ \pool -> do
+      original <- withSetupBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) pool $ \(a, b, c, d, e) -> do
         withForeignPtr (bufferMemory c) $ \pointer -> poke pointer 91
         pure (map bufferMemory [a, b, c, d, e])
-      withSetupBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) resources $ \(a, b, c, d, e) -> do
+      withSetupBuffers @(Buffer, Buffer, Buffer, Buffer, Buffer) pool $ \(a, b, c, d, e) -> do
         map bufferMemory [a, b, c, d, e] `shouldBe` original
         withForeignPtr (bufferMemory c) $ \pointer -> peek pointer `shouldReturn` 91
   it "rejects grants that exceed setup capacity" $
-    withTestResources smallSettings $ \resources -> do
-      result <- try @IOError (withSetupBuffers @(Buffer, Buffer) resources (const (pure ())))
+    withTestPool smallSettings $ \pool -> do
+      result <- try @IOError (withSetupBuffers @(Buffer, Buffer) pool (const (pure ())))
       isLeft result `shouldBe` True
 
  describe "setup scope ownership" $ do
-  xfail "Retained inventories follow in the implementation change" $ it "keeps retained inventories reusable after an allocator helper returns" $ do
-    resources <- withTestResources smallSettings pure
+  it "keeps retained inventories reusable after an allocator helper returns" $ do
+    pool <- withTestPool smallSettings pure
     performGC
     forM_ [1 .. 3 :: Int] $ \_ -> do
-      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Just ()
-      timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
-  xfail "Retained inventories follow in the implementation change" $ it "keeps retained inventories usable after their allocating helper throws" $ do
+      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) pool (const (pure ()))) `shouldReturn` Just ()
+      timeout 1_000_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Just ()
+  it "keeps retained inventories usable after their allocating helper throws" $ do
     retained <- newEmptyMVar
-    result <- try @IOError $ withTestResources smallSettings $ \resources -> do
-      putMVar retained resources
+    result <- try @IOError $ withTestPool smallSettings $ \pool -> do
+      putMVar retained pool
       ioError (userError "helper")
     isLeft result `shouldBe` True
-    resources <- takeMVar retained
+    pool <- takeMVar retained
     performGC
-    timeout 1_000_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Just ()
-    timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
+    timeout 1_000_000 (withSetupBuffers @(Solo Buffer) pool (const (pure ()))) `shouldReturn` Just ()
+    timeout 1_000_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Just ()
   it "returns buffers after callback exceptions" $
-    withTestResources smallSettings $ \resources -> do
-      result <- try @IOError (withSetupBuffers @(Solo Buffer) resources $ const $ ioError (userError "callback"))
+    withTestPool smallSettings $ \pool -> do
+      result <- try @IOError (withSetupBuffers @(Solo Buffer) pool $ const $ ioError (userError "callback"))
       isLeft result `shouldBe` True
-      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Just ()
+      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) pool (const (pure ()))) `shouldReturn` Just ()
   it "returns buffers after asynchronous cancellation" $
-    withTestResources smallSettings $ \resources -> do
+    withTestPool smallSettings $ \pool -> do
       started <- newEmptyMVar
       hold <- newEmptyMVar
       done <- newEmptyMVar
       worker <- forkFinally
-        (withSetupBuffers @(Solo Buffer) resources $ const $ putMVar started () >> takeMVar hold)
+        (withSetupBuffers @(Solo Buffer) pool $ const $ putMVar started () >> takeMVar hold)
         (const $ putMVar done ())
       timeout 1_000_000 (takeMVar started) `shouldReturn` Just ()
       killThread worker
       timeout 1_000_000 (takeMVar done) `shouldReturn` Just ()
-      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Just ()
+      timeout 1_000_000 (withSetupBuffers @(Solo Buffer) pool (const (pure ()))) `shouldReturn` Just ()
 
  describe "setup capacity" $ do
-  xfail "Request capability scaffold: scoped loans follow in the next change" $ it "admits setup while all stream blocks are busy" $
-    withTestResources smallSettings $ \resources -> withRequestBuffers resources $ \access -> do
+  it "admits setup while all stream blocks are busy" $
+    withTestPool smallSettings $ \pool -> withRequestBuffers pool $ \access -> do
       primary <- borrowBuffer access
       extra <- borrowBuffer access
-      withSetupBuffers @(Solo Buffer) resources $ \(MkSolo setup) -> do
+      withSetupBuffers @(Solo Buffer) pool $ \(MkSolo setup) -> do
         bufferMemory setup `shouldNotBe` bufferMemory (loanBuffer primary)
         bufferMemory setup `shouldNotBe` bufferMemory (loanBuffer extra)
-        timeout 20_000 (withSetupBuffers @(Solo Buffer) resources (const (pure ()))) `shouldReturn` Nothing
+        timeout 20_000 (withSetupBuffers @(Solo Buffer) pool (const (pure ()))) `shouldReturn` Nothing
       releaseBuffer extra
       releaseBuffer primary
-  xfail "Request capability scaffold: scoped loans follow in the next change" $ it "reuses setup storage without taking a stream block" $
-    withTestResources smallSettings $ \resources -> do
-      setupMemory <- withSetupBuffers @(Solo Buffer) resources $ \(MkSolo buffer) -> pure (bufferMemory buffer)
-      withRequestBuffers resources $ \access -> do
+  it "reuses setup storage without taking a stream block" $
+    withTestPool smallSettings $ \pool -> do
+      setupMemory <- withSetupBuffers @(Solo Buffer) pool $ \(MkSolo buffer) -> pure (bufferMemory buffer)
+      withRequestBuffers pool $ \access -> do
         stream <- borrowBuffer access
-        withSetupBuffers @(Solo Buffer) resources $ \(MkSolo buffer) -> do
+        withSetupBuffers @(Solo Buffer) pool $ \(MkSolo buffer) -> do
           bufferMemory buffer `shouldBe` setupMemory
           bufferMemory buffer `shouldNotBe` bufferMemory (loanBuffer stream)
         releaseBuffer stream
 
-rejectsAllocation :: ResourceSettings -> IO ()
+rejectsAllocation :: PoolSettings -> IO ()
 rejectsAllocation settings = do
-  result <- try @IOError (withTestResources settings (const (pure ())))
+  result <- try @IOError (withTestPool settings (const (pure ())))
   case result of
     Left failure -> ioeGetErrorString failure `shouldBe` "buffer allocation exceeds Int capacity"
     Right () -> failTest "expected unsupported allocation to fail before allocating"
@@ -234,12 +244,20 @@ rejectsAllocation settings = do
 requirePositive :: Integer -> IO PositiveInt
 requirePositive = maybe (failTest "expected a positive Int") pure . mkPositiveInt
 
-withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
-withTestResources settings action = getAcquisition >>= \waiting ->
-  Resources.withResources waiting settings action
+withTestPool :: PoolSettings -> (BufferPool -> IO a) -> IO a
+withTestPool settings action = getAcquisition >>= \waiting ->
+  newBufferPool waiting settings >>= action
 
-smallSettings :: ResourceSettings
-smallSettings = ResourceSettings (positiveInt @16) (positiveInt @8) (positiveInt @8) (positiveInt @1)
+smallSettings :: PoolSettings
+smallSettings = minimumSettings {bufferSize = positiveInt @8}
+
+minimumSettings :: PoolSettings
+minimumSettings = PoolSettings
+  { bufferSize = positiveInt @1
+  , ordinaryBufferCount = positiveInt @1
+  , reserveBufferCount = positiveInt @1
+  , setupBufferCount = positiveInt @1
+  }
 
 assertAcquisitionUsable :: Acquire.Context -> IO ()
 assertAcquisitionUsable waiting =

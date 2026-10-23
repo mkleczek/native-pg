@@ -13,8 +13,8 @@ import Data.Int (Int64)
 import Database.PostgreSQL.Diagnostics (Diagnostics (..))
 import qualified Database.PostgreSQL.Streaming as Streaming
 import Network.Streaming.PositiveInt (positiveInt)
-import Network.Streaming.Resources (ResourceSettings (..))
-import qualified Network.Streaming.Resources as Resources
+import Network.Streaming.BufferPool (PoolSettings (..))
+import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (Buffer)
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Session.Settings as PG
@@ -128,13 +128,18 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
         PG.connectTlsClient = Just tlsClient
       }
     withConnection use =
-      withTestResources (ResourceSettings (positiveInt @12) (positiveInt @8) (positiveInt @4) (positiveInt @1)) $ \resources ->
+      withTestResources (PoolSettings
+      { bufferSize = positiveInt @4
+      , ordinaryBufferCount = positiveInt @2
+      , reserveBufferCount = positiveInt @1
+      , setupBufferCount = positiveInt @2
+      }) $ \resources ->
         bracket (Streaming.connect resources settings) (PG.close . fst) $ \(connection, _) ->
-          Resources.withBuffers @(Buffer, Buffer) resources $ uncurry (use connection)
+          BufferPool.withBuffers @(Buffer, Buffer) resources $ uncurry (use connection)
 
-withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
+withTestResources :: PoolSettings -> (BufferPool.BufferPool -> IO a) -> IO a
 withTestResources settings action = getAcquisition >>= \waiting ->
-  Resources.withResources waiting settings action
+  BufferPool.newBufferPool waiting settings >>= action
 
 newtype Body tx = Body (Maybe (Tx.Field tx))
 data Headers tx = Headers Int64 BS.ByteString (Maybe (Tx.Field tx))
