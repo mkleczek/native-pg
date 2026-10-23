@@ -4,6 +4,7 @@
 module OperationContextSpec (spec) where
 
 import Control.Monad.IO.Unlift (withRunInIO)
+import Control.Concurrent.Resource.Waiting qualified as Waiting
 import Control.Exception (bracket, try)
 import Control.Monad (unless)
 import qualified Data.ByteString as BS
@@ -12,7 +13,7 @@ import Data.Int (Int64)
 import Database.PostgreSQL.Diagnostics (Diagnostics (..))
 import qualified Database.PostgreSQL.Streaming as Streaming
 import Network.Streaming.PositiveInt (positiveInt)
-import Network.Streaming.Resources (ResourceSettings (..), withResources)
+import Network.Streaming.Resources (ResourceSettings (..))
 import qualified Network.Streaming.Resources as Resources
 import Network.Streaming.Buffer (Buffer)
 import qualified Database.PostgreSQL.Session as PG
@@ -70,6 +71,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
           query `shouldBe` "COMMIT"
           diagnosticCode fields `shouldBe` "23503"
         _ -> failTest "expected the deferred foreign-key failure from COMMIT"
+
   it "pulls metadata and a borrowed body and commits inside its callback" $
     withConnection $ \connection input output -> do
       total <- newIORef 0
@@ -126,9 +128,13 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
         PG.connectTlsClient = Just tlsClient
       }
     withConnection use =
-      withResources (ResourceSettings (positiveInt @8) (positiveInt @8) (positiveInt @4)) $ \resources ->
+      withTestResources (ResourceSettings (positiveInt @12) (positiveInt @8) (positiveInt @4) (positiveInt @1)) $ \resources ->
         bracket (Streaming.connect resources settings) (PG.close . fst) $ \(connection, _) ->
-          Resources.withBuffers @(Buffer, Buffer) resources $ \(input, output) -> use connection input output
+          Resources.withBuffers @(Buffer, Buffer) resources $ uncurry (use connection)
+
+withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
+withTestResources settings action = Waiting.withWaiting $ \waiting ->
+  Resources.withResources waiting settings action
 
 newtype Body tx = Body (Maybe (Tx.Field tx))
 data Headers tx = Headers Int64 BS.ByteString (Maybe (Tx.Field tx))

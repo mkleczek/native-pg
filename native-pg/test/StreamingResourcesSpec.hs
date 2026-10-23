@@ -3,6 +3,7 @@
 {-# LANGUAGE TypeApplications #-}
 module StreamingResourcesSpec (spec) where
 
+import Control.Concurrent.Resource.Waiting qualified as Waiting
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM (atomically)
@@ -29,7 +30,7 @@ import System.Timeout (timeout)
 spec :: Spec
 spec = describe "shared operation resources" $ do
   it "holds exactly a pair only within the operation" $ do
-    withResources settings $ \resources -> do
+    withTestResources settings $ \resources -> do
       connection <- Context.newConnection idleChannel 16
       PG.withOperation resources connection $ \_ -> do
         unavailable resources `shouldReturn` True
@@ -38,7 +39,7 @@ spec = describe "shared operation resources" $ do
       PG.isUsable connection `shouldReturn` True
 
   it "expires the supplied session without closing its pooled connection" $
-    withResources settings $ \resources -> do
+    withTestResources settings $ \resources -> do
       connection <- Context.newConnection idleChannel 16
       session <- PG.withOperation resources connection $ \session -> do
         PG.isUsable (PG.connection session) `shouldReturn` False
@@ -51,7 +52,7 @@ spec = describe "shared operation resources" $ do
       unavailable resources `shouldReturn` False
 
   it "returns storage and invalidates the connection after a callback failure" $ do
-    withResources settings $ \resources -> do
+    withTestResources settings $ \resources -> do
       connection <- Context.newConnection idleChannel 16
       result <- try @IOException $ PG.withOperation resources connection $ \_ -> ioError (userError "stop")
       either (const (pure ())) (const (failTest "callback exception was lost")) result
@@ -75,7 +76,7 @@ spec = describe "shared operation resources" $ do
         "output buffer capacity must be at least four bytes"
 
   it "does not consume a partial pair while waiting or after cancellation" $ do
-    withResources settings $ \resources -> Resources.withBuffers @(Solo Buffer) resources $ \_ -> do
+    withTestResources settings $ \resources -> Resources.withBuffers @(Solo Buffer) resources $ \_ -> do
       connection <- Context.newConnection idleChannel 16
       entered <- newEmptyMVar
       stopped <- newEmptyMVar
@@ -128,7 +129,7 @@ unexpectedTransport (Observed touched) = do
   fail "unexpected transport entry"
 
 settings :: ResourceSettings
-settings = ResourceSettings (positiveInt @32) (positiveInt @32) (positiveInt @16)
+settings = ResourceSettings (positiveInt @48) (positiveInt @32) (positiveInt @16) (positiveInt @1)
 
 unavailable :: Resources -> IO Bool
 unavailable resources = atomically $ do
@@ -149,3 +150,7 @@ instance Link Idle where
 
 idleChannel :: Channel
 idleChannel = newChannel Idle
+
+withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
+withTestResources settings action = Waiting.withWaiting $ \waiting ->
+  Resources.withResources waiting settings action
