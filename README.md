@@ -5,7 +5,11 @@ without libpq. It reads only when asked to, supports borrowed result and
 parameter streams through caller-owned workspace, and sends statements in pipelines.
 
 - **`native-pg`:** connections (libpq's connection strings, SCRAM), statements,
-  pipelines and transactions, with streamed results and parameters.
+  pipelines and transactions, with streamed results and parameters, connection
+  pooling.
+- **`streaming-io`:** borrowed streams, shared request buffer capabilities and bounded body/setup pools.
+- **`resource-admission`:** private waiter delivery, shared deadlines and opaque FIFO
+  queues for independent resource pools.
 - **`native-pg-tls`:** TLS through [rustls-ffi](https://github.com/rustls/rustls-ffi)
   0.15, with libpq's `sslmode`, client certificates and SCRAM channel binding.
   It's a package of its own because it's the only one with C code, and it has
@@ -18,35 +22,66 @@ The design is in [docs/DESIGN.md](docs/DESIGN.md). The API isn't stable yet.
 Bounded integrations use an operation-scoped `Session`. Its input cursor,
 output workspace and pending writes belong to the operation; the persistent
 `Connection` retains transport and protocol state.
-`Database.PostgreSQL.Streaming.withOperation` borrows two initialized buffers
-from shared `Resources` and supplies a `Session` to its callback. Integrations
-that already hold a pair use `Streaming.withBuffers`; it passes the shared descriptors directly without allocating,
-copying or clearing their storage. Resource integrations request fixed shapes,
-such as `(Buffer, Buffer)`, and receive that shape directly; single-buffer grants
-use `Solo Buffer`. The owned connection path through `ConnectionString.connectFirst` remains
-available; `Session.connection` retrieves its persistent handle.
+`Database.PostgreSQL.Streaming.withOperation` receives a request's `BufferAccess`
+and supplies a `Session`. Warp leases the primary before parsing each HTTP/1.1
+request and passes this same capability through `Network.Wai.Streaming.Request`.
+A body operation reuses the primary whenever it is free; overlapping input and
+output may borrow one additional block, including from the protected reserve.
+Additional blocks return promptly, while the primary stays with the request.
+Parsed HTTP/protocol metadata is owned separately. Idle keep-alive and idle
+PostgreSQL connections retain no body-pool lease.
 
-Client code uses `ConnectionString`, `Session`, `Streaming`, `Statement`,
-`Encoders`, `Decoding`, `Diagnostics`, `Snippet`, `Pipeline` and `Transaction`.
-`Statement.Result`, `Session.Session` and `Session.Connection` are abstract;
-statement parameter types and preparation callbacks use ordinary `Word32` OIDs.
-`Encoders.Parameter` and `Streaming.ByteStream` provide streamed parameters.
-The current PostgREST integration determines the supported API. `Session`
-exposes the connection handle, connection closing and usability checks,
-prepared-statement deallocation and cancellation. Queries and result streaming use `Pipeline`,
-`Transaction` and `Statement`; raw execution, batching and row access are private.
-`Session` denotes a ready application session; protocol phases are private.
-Public modules live directly under `src/Database/PostgreSQL`; protocol codecs,
-authentication machinery and mutable buffers live under its `Internal/`
-directory and are not exposed by the library. `Transport` is the extension API
-for TLS providers:
-implement `Link`, build an abstract `Channel` with `newChannel`, and return it
-from a `TlsClient`.
+`Pool.use` checks out only a database connection. The application obtains a
+`GHC.Event.TimerManager`, wraps it with `Acquisition.newContext`, and supplies
+that context to `Pool.newPool acquisition config` and
+`BufferPool.newBufferPool acquisition settings`. Each pool owns its own
+waiting queue. Contexts may share a timer manager; they have no shutdown state
+or lifecycle. Executables using pending timed requests must use `-threaded`.
+Uncontended buffer and connection acquisition reserves directly when its pool's
+queues are empty, without allocating waiting state or queue entries. Contended
+returns update selected requests' private delivery state, avoiding resource-wide
+retry wakeups. Queue adapters return opaque removal
+handles from enqueue; acquisition handles removal even when enqueue grants
+immediately. `Acquisition.acquire` returns `Nothing` on timeout and `Just value`
+when ownership transfers to the caller. Its cleanup callback reclaims
+only grants that never reach the caller; pools use `bracket` or equivalent masking
+for resource use and normal release.
+Setup borrows a temporary pair from its separate inventory. Buffer resources
+remain usable while retained; their foreign storage is reclaimed by garbage
+collection once it is no longer reachable. Request callbacks still bound access
+to their primary buffer and return outstanding loans when they finish.
+Cancellation unregisters each timer and reclaims an unclaimed grant. Connection
+pools explicitly close their sockets; resetting a connection pool leaves it usable.
 
-Public modules contain the API implementations. Shared settings, connection
-string types, stream types and link definitions live in public submodules;
-the existing imports above remain supported. `Internal` contains protocol
-exchange, startup negotiation, host selection and opaque state representations.
+`PoolSettings` takes a positive `bufferSize` size and explicit positive
+`ordinaryBufferCount`, `reserveBufferCount` and `setupBufferCount` values.
+The body pool contains ordinary plus reserve buffers; setup has its own buffer
+count. All four fields use `PositiveInt`, so settings need no separate validation.
+
+The scoped source contract is `Source { withChunk :: forall a.
+(ByteString -> IO a) -> IO a }`: the bytes remain valid through the callback.
+Forwarding finishes that callback before requesting another chunk. Statements
+see streams, not buffer allocation. Native-pg's concrete parser remains
+monomorphic. Explicit supplied-buffer `Streaming.withBuffers` and owned
+sessions remain available for standalone integrations.
+
+Client code uses `ConnectionString`, `Session`, `Streaming`, `Transaction`,
+`Encoders`, `Decoding`, `Diagnostics`, `Snippet` and `Pool`.
+`Database.PostgreSQL.Transaction` implements statements, applicative pipelines,
+prepared-statement selection and transaction-scoped result cursors in one module.
+`Transaction`, `Pipeline`, `Result`, `Field` and `RowDecoder` are abstract;
+`Statement` describes SQL, parameters, its row schema and preparation eligibility.
+Parameter types and preparation callbacks use ordinary `Word32` OIDs.
+`Session` exposes connection controls, prepared-statement deallocation and
+cancellation. Raw execution, batching, row access and protocol phases are private.
+`Transport` is the extension API for TLS providers: implement `Link`, build an
+abstract `Channel` with `newChannel`, and return it from a `TlsClient`.
+
+Public modules contain their API implementations. Shared settings, connection
+string types, stream types and link definitions live in public submodules.
+`Internal` contains protocol exchange, startup negotiation, host selection and
+opaque state representations. There are no separate statement, pipeline or pull
+transaction modules.
 
 `Transaction.runTransaction` runs a scoped `Transaction tx` action. The monad
 supports `MonadIO` and `MonadUnliftIO`; use `withRunInIO` when an external API
@@ -87,21 +122,23 @@ reject overlapping access, including re-entry from a parameter producer.
 Synchronous callbacks between operations are allowed. The transaction driver
 and result consumer run on the same calling thread.
 
-For input parameters, `ParameterBorrowedStream` accepts a length-bearing
-`ByteStream`; the sender consumes each chunk before pulling the next one.
-Keep its source and storage alive throughout the operation.
+For input parameters, `Encoders.Parameter` and `Streaming.ByteStream` provide
+streamed values. `ParameterBorrowedStream` accepts a known length and a
+callback-based `Source`; the sender consumes each chunk before ending its
+callback and pulling the next one. Keep its source and storage alive throughout
+the operation.
 
-Field EOF says only that the selected value ended. The enclosing execution
-still reads `CommandComplete` and `ReadyForQuery`; a transaction succeeds only
-when its completion, including `COMMIT`, succeeds. A late server error remains
-an operation error even after a field was delivered. Applications that require
-commit-safe responses must retain the body until the transaction completes.
+Field EOF says only that the selected value ended. A late server error remains
+an operation error even after a field was delivered. A transaction succeeds only
+when `finishTransaction` succeeds, including the queued ending of a
+`finalPipeline`. Applications that require commit-safe responses must retain the
+body until that completion.
 
-Ordinary row decoding and leading fields of streaming decoders
-produce owned values and can allocate memory proportional to each field.
-`streamChunk` also returns an owned chunk. These paths support materialized
-responses and control values such as headers and counts; they are not a bound
-on application-retained memory. Use the borrowed APIs for body transfer.
+Ordinary row decoding and leading fields of streaming decoders produce owned
+values and can allocate memory proportional to each field. Owned collectors may
+retain all selected rows. These paths support materialized responses and control
+values such as headers and counts; they are not a bound on application-retained
+memory. Use borrowed field chunks for body transfer.
 
 ## Building
 
@@ -133,7 +170,7 @@ No Nix store paths or manual environment selection are needed for HLS.
 cabal test all --test-show-details=direct
 ```
 
-All three suites use skeletest 0.4.2. Cabal builds its preprocessor along with
+All suites use skeletest 0.4.2. Cabal builds its preprocessor along with
 the tests. Select a suite and optionally filter its test names:
 
 ```bash
