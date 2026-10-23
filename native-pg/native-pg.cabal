@@ -27,6 +27,7 @@ common implementation
                       Database.PostgreSQL.Internal.Exchange
                       Database.PostgreSQL.Internal.Execution
                       Database.PostgreSQL.Internal.HostSelection
+                      Database.PostgreSQL.Internal.PoolLifetime
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
                       Database.PostgreSQL.Internal.Protocol.Codec.Input

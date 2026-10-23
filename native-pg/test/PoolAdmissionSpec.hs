@@ -296,11 +296,11 @@ spec = describe "independent request and connection admission" $ do
 
 settings :: BufferPool.PoolSettings
 settings = BufferPool.PoolSettings
-      { BufferPool.bufferSize = positiveInt @16
-      , BufferPool.ordinaryBufferCount = positiveInt @1
-      , BufferPool.reserveBufferCount = positiveInt @1
-      , BufferPool.setupBufferCount = positiveInt @2
-      }
+  { BufferPool.bufferSize = positiveInt @16
+  , BufferPool.ordinaryBufferCount = positiveInt @1
+  , BufferPool.reserveBufferCount = positiveInt @1
+  , BufferPool.setupBufferCount = positiveInt @2
+  }
 
 newShared :: Acquire.Context -> IO (Pool.Pool Int String)
 newShared waiting = do
