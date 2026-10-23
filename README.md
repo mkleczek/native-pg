@@ -69,6 +69,21 @@ on application-retained memory. Use the borrowed APIs for body transfer.
 cabal build all
 ```
 
+### VS Code
+
+Open the repository root with the Haskell extension installed. Workspace settings
+start HLS through `.vscode/hls`, which enters `.vscode/shell.nix` automatically.
+This uses the pinned development shell for native dependencies including rustls
+and `pkg-config`. The launcher uses GHC, Cabal and HLS from GHCup consistently;
+install HLS with support for the selected GHCup GHC version. The optional Nix
+Environment Selector uses the same native-only shell. The launcher also uses
+`cabal exec` to put project build tools, including `skeletest-preprocessor`, on
+HLS's `PATH`; no separate global preprocessor installation is needed. VS Code
+can be launched normally. The first start may download the pinned native
+dependencies and build the test dependencies.
+After changing the shell or editor settings, run **Developer: Reload Window**.
+No Nix store paths or manual environment selection are needed for HLS.
+
 ## Testing
 
 ```bash

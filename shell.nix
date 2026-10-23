@@ -1,3 +1,4 @@
+{ withHaskellTools ? true }:
 let
   nixpkgs = fetchTarball {
     url = "https://github.com/nixos/nixpkgs/archive/35d3407a3816f3b341d8cf1d60abaf2b7b8166ac.tar.gz";
@@ -19,12 +20,14 @@ let
     ]
   );
 in
-pkgs.mkShell {
+# An external GHC must retain its system compiler and SDK environment.
+(if withHaskellTools then pkgs.mkShell else pkgs.mkShellNoCC) {
   packages = [
-    ghc
-    pkgs.cabal-install
     pkgs.pkg-config
     pkgs.postgresql
     pkgs.rustls-ffi
+  ] ++ pkgs.lib.optionals withHaskellTools [
+    ghc
+    pkgs.cabal-install
   ];
 }
