@@ -13,7 +13,7 @@ import Skeletest hiding (context)
 import TestSupport
 
 spec :: Spec
-spec = xfail "Acquisition API scaffold: private delivery follows in the next change" $ describe "private acquisition" $ do
+spec = describe "private acquisition" $ do
   it "reserves immediately without enqueue, removal, or cleanup" $ usingSystemTimer $ \context -> do
     touched <- newTVarIO ([] :: [String])
     result <- acquire context NoDeadline (pure (7 :: Int))
