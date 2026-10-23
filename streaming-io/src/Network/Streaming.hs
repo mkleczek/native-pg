@@ -15,5 +15,7 @@ type Body = Sink -> IO ()
 forward :: Source -> Body
 forward source sink = go
   where
-    go = withChunk source $ \chunk ->
-      when (not (BS.null chunk)) (sink chunk >> go)
+    go = do
+      more <- withChunk source $ \chunk ->
+        if BS.null chunk then pure False else sink chunk >> pure True
+      when more go

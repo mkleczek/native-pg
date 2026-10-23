@@ -323,6 +323,54 @@ spec = describe "private acquisition" $ do
     readTVarIO removed >>= (`shouldBe` [1 .. 64]) . sort
     atomically (forM requests (\(_, request) -> tryGrant request (throwSTM OwnerClosed))) >>= (`shouldBe` replicate 64 False)
     readTVarIO removed >>= (`shouldBe` 64) . length
+  it "expires an earlier waiter while far-future waiters are pending" $ usingSystemTimer $ \context -> do
+    capabilities <- getNumCapabilities
+    registered <- newTQueueIO
+    later <- deadlineAfter 60
+    pending <- replicateM capabilities $ forkResult $ acquire context later retry (writeTQueue registered)
+      (const (pure ())) (const (pure ()))
+    requests <- replicateM capabilities (within (atomically (readTQueue registered)))
+    earlier <- deadlineAfter 0.02
+    outcome <- within $ acquire context earlier retry (const (pure ())) (const (pure ())) (const (pure @IO @() ()))
+    outcome `shouldBe` (Nothing :: Maybe ())
+    forM_ requests $ \request -> atomically (tryGrant request (pure ())) >>= (`shouldBe` True)
+    forM_ pending $ \(_, result) -> await result >>= expectWaitResult (Just ())
+  it "expires many waiters sharing one deadline" $ usingSystemTimer $ \context -> do
+    capabilities <- getNumCapabilities
+    let count = 192 * capabilities
+    deadline <- deadlineAfter 1
+    registered <- newTQueueIO
+    detached <- newTVarIO (0 :: Int)
+    workers <- replicateM count $ forkResult $ acquire context deadline retry (writeTQueue registered)
+      (const (modifyTVar' detached (+ 1))) (const (fail "expired waiter acquired a resource"))
+    requests <- replicateM count (within (atomically (readTQueue registered)))
+    forM_ workers $ \(_, result) -> await result >>= expectWaitResult Nothing
+    readTVarIO detached >>= (`shouldBe` count)
+    forM_ requests $ \request -> atomically (tryGrant request (pure ())) >>= (`shouldBe` False)
+  it "removing the earliest deadline preserves a later same-timestamp survivor" $ usingSystemTimer $ \context -> do
+    registered <- newTQueueIO
+    detached <- newTVarIO (0 :: Int)
+    earliest <- deadlineAfter 0.5
+    later <- deadlineAfter 1
+    workers <- forM [earliest, later, later] $ \deadline ->
+      forkResult $ acquire context deadline retry (writeTQueue registered)
+        (const (modifyTVar' detached (+ 1))) (const (pure @IO @() ()))
+    replicateM_ 3 (within (atomically (readTQueue registered)))
+    case workers of
+      [(first, firstResult), (second, secondResult), (_, survivor)] -> do
+        killThread first
+        killThread second
+        await firstResult >>= (\outcome -> isLeft outcome `shouldBe` True)
+        await secondResult >>= (\outcome -> isLeft outcome `shouldBe` True)
+        await survivor >>= expectWaitResult Nothing
+      _ -> fail "expected three registered waiters"
+    readTVarIO detached >>= (`shouldBe` 3)
+  it "grant releases its detach callback before a far-future deadline" $ usingSystemTimer $ \context -> do
+    finalized <- grantedContextAnchor context
+    collected finalized
+  it "cancellation releases its detach callback before a far-future deadline" $ usingSystemTimer $ \context -> do
+    finalized <- cancelledContextAnchor context
+    collected finalized
   it "releases timed grant callbacks before caller use finishes" $ usingSystemTimer $ \context ->
     forM_ [True, False] $ \grantDuringEnqueue -> do
       (finalized, release, result) <- activeGrantAnchor context grantDuringEnqueue

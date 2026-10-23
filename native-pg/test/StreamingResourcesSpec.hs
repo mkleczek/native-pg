@@ -20,8 +20,8 @@ import qualified Database.PostgreSQL.Streaming as PG
 import Database.PostgreSQL.Transport hiding (newChannel)
 import Database.PostgreSQL.Internal.Channel
 import Network.Streaming.PositiveInt (positiveInt)
-import Network.Streaming.Resources
-import qualified Network.Streaming.Resources as Resources
+import Network.Streaming.BufferPool
+import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (Buffer, bufferCapacity, newBuffer)
 import Skeletest
 import System.IO.Error (ioeGetErrorString)
@@ -34,7 +34,7 @@ spec = describe "shared operation resources" $ do
       connection <- Context.newConnection idleChannel 16
       PG.withOperation resources connection $ \_ -> do
         unavailable resources `shouldReturn` True
-        Resources.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure ())
+        BufferPool.withSetupBuffers @(Buffer, Buffer) resources (\_ -> pure ())
       unavailable resources `shouldReturn` False
       PG.isUsable connection `shouldReturn` True
 
@@ -76,7 +76,7 @@ spec = describe "shared operation resources" $ do
         "output buffer capacity must be at least four bytes"
 
   it "does not consume a partial pair while waiting or after cancellation" $ do
-    withTestResources settings $ \resources -> Resources.withBuffers @(Solo Buffer) resources $ \_ -> do
+    withTestResources settings $ \resources -> BufferPool.withBuffers @(Solo Buffer) resources $ \_ -> do
       connection <- Context.newConnection idleChannel 16
       entered <- newEmptyMVar
       stopped <- newEmptyMVar
@@ -87,7 +87,7 @@ spec = describe "shared operation resources" $ do
           timeout 20000 (readMVar entered) `shouldReturn` Nothing
           timeout 20000 (readMVar stopped) `shouldReturn` Nothing
           -- The other block remains available until the whole pair is free.
-          Resources.withBuffers @(Solo Buffer) resources (\_ -> pure ()))
+          BufferPool.withBuffers @(Solo Buffer) resources (\_ -> pure ()))
       PG.isUsable connection `shouldReturn` True
 
 -- Malformed public descriptors must fail before claiming the connection or
@@ -128,13 +128,18 @@ unexpectedTransport (Observed touched) = do
   writeIORef touched True
   fail "unexpected transport entry"
 
-settings :: ResourceSettings
-settings = ResourceSettings (positiveInt @48) (positiveInt @32) (positiveInt @16) (positiveInt @1)
+settings :: PoolSettings
+settings = PoolSettings
+      { bufferSize = positiveInt @16
+      , ordinaryBufferCount = positiveInt @2
+      , reserveBufferCount = positiveInt @1
+      , setupBufferCount = positiveInt @2
+      }
 
-unavailable :: Resources -> IO Bool
+unavailable :: BufferPool -> IO Bool
 unavailable resources = atomically $ do
-  lease <- Resources.tryAcquire @(Solo Buffer) resources
-  mapM_ Resources.release lease
+  lease <- BufferPool.tryAcquire @(Solo Buffer) resources
+  mapM_ BufferPool.release lease
   pure (isNothing lease)
 
 data Idle = Idle
@@ -151,6 +156,6 @@ instance Link Idle where
 idleChannel :: Channel
 idleChannel = newChannel Idle
 
-withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
+withTestResources :: PoolSettings -> (BufferPool.BufferPool -> IO a) -> IO a
 withTestResources settings action = getAcquisition >>= \waiting ->
-  Resources.withResources waiting settings action
+  BufferPool.newBufferPool waiting settings >>= action

@@ -13,14 +13,7 @@ check() {
 
 # A successful control proves failures come from the bounds, not the environment.
 check PositiveConstants
-if check PositiveBuffers >"$output_dir/PositiveBuffers.log" 2>&1; then
-  echo "Expected the future counted allocation API to fail compilation" >&2
-  exit 1
-fi
-if ! grep -q "Couldn't match type" "$output_dir/PositiveBuffers.log"; then
-  cat "$output_dir/PositiveBuffers.log" >&2
-  exit 1
-fi
+check PositiveBuffers
 for fixture in Zero TooLarge IntBufferCapacity IntBufferBudget IntBlockSize; do
   if check "$fixture" >"$output_dir/$fixture.log" 2>&1; then
     echo "Expected $fixture to fail compilation" >&2

@@ -1,5 +1,6 @@
 -- | Initialized, fixed-capacity storage lent exclusively to one operation.
--- Aliases expire when the loan or owning allocation scope ends.
+-- A borrowed alias expires with its loan. Owned buffers and their slices keep
+-- the backing allocation alive through their ForeignPtr.
 module Network.Streaming.Buffer
   ( Buffer (..), newBuffer, newBuffers ) where
 
@@ -22,11 +23,11 @@ newBuffer size = mask_ $ do
   memory <- newForeignPtr finalizerFree pointer `onException` free pointer
   pure (Buffer memory capacity)
 
--- | Allocate the budget once and expose only complete blocks.
-newBuffers :: PositiveInt -> PositiveInt -> IO [Buffer]
+-- | Allocate the budget once and return the count and complete blocks.
+newBuffers :: PositiveInt -> PositiveInt -> IO (Int, [Buffer])
 newBuffers budget size =
   -- Each view shares the allocation's owner, even after other slices expire.
-  split <$> newBuffer budget
+  (count,) . split <$> newBuffer budget
   where
     capacity = positiveIntValue size
     count = positiveIntValue budget `div` capacity

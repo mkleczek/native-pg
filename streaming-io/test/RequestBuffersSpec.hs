@@ -12,15 +12,14 @@ import Data.Either (isLeft)
 import Data.Maybe (isNothing)
 import Network.Streaming.Buffer (Buffer, bufferMemory)
 import Network.Streaming.PositiveInt (positiveInt)
-import Network.Streaming.Resources qualified as Resources
-import Network.Streaming.Resources
+import Network.Streaming.BufferPool
 import Skeletest
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = xfail "Request capability scaffold: scoped loans follow in the next change" $ describe "shared request buffer capability" $ do
-  it "lends a local primary and one reserve block, rejecting a third overlap" $ bounded $
-    withTestResources (settings 2) $ \resources -> withRequestBuffers resources $ \access -> do
+spec = describe "shared request buffer capability" $ do
+  it "lends a local primary and one reserve block, rejecting a third overlap" $
+    withTestPool (settings 2) $ \pool -> withRequestBuffers pool $ \access -> do
       primary <- borrowBuffer access
       extra <- borrowBuffer access
       bufferMemory (loanBuffer primary) `shouldNotBe` bufferMemory (loanBuffer extra)
@@ -29,8 +28,8 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       releaseBuffer extra
       releaseBuffer primary
 
-  it "reuses the primary locally and ignores stale releases" $ bounded $
-    withTestResources (settings 2) $ \resources -> withRequestBuffers resources $ \access -> do
+  it "reuses the primary locally and ignores stale releases" $
+    withTestPool (settings 2) $ \pool -> withRequestBuffers pool $ \access -> do
       first <- borrowBuffer access
       releaseBuffer first
       second <- borrowBuffer access
@@ -41,15 +40,15 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       releaseBuffer second
       releaseBuffer extra
 
-  it "keeps reserve out of primary admission" $ bounded $
-    withTestResources (settings 2) $ \resources -> withRequestBuffers resources $ \access -> do
-      blocked <- timeout 20_000 (withRequestBuffers resources (const (pure ())))
+  it "keeps reserve out of primary admission" $
+    withTestPool (settings 2) $ \pool -> withRequestBuffers pool $ \access -> do
+      blocked <- timeout 20_000 (withRequestBuffers pool (const (pure ())))
       blocked `shouldBe` Nothing
       withLoan access (const (pure ()))
 
-  it "preserves a multi-block reserve across immediate request and extra loans" $ bounded $
-    withTestResources (ResourceSettings (positiveInt @32) (positiveInt @8) (positiveInt @8) (positiveInt @2)) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
+  it "preserves a multi-block reserve across immediate request and extra loans" $
+    withTestPool ((settings 3) {reserveBufferCount = positiveInt @2}) $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
         firstPrimary <- borrowBuffer first
         secondPrimary <- borrowBuffer second
         firstExtra <- borrowBuffer first
@@ -59,14 +58,14 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
           forM_ (drop (index + 1) memories) (memory `shouldNotBe`)
         releaseBuffer firstExtra
         releaseBuffer secondExtra
-        timeout 20_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Nothing
+        timeout 20_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Nothing
         timeout 1_000_000 (withLoan first (const (pure ()))) `shouldReturn` Just ()
         releaseBuffer firstPrimary
         releaseBuffer secondPrimary
 
-  it "returns extra capacity promptly while the primary stays local" $ bounded $
-    withTestResources (settings 3) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
+  it "returns extra capacity promptly while the primary stays local" $
+    withTestPool (settings 3) $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
         primary <- borrowBuffer first
         otherPrimary <- borrowBuffer second
         extra <- borrowBuffer first
@@ -75,9 +74,9 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer otherPrimary
         releaseBuffer primary
 
-  it "reuses a released primary while its extra waits for global inventory" $ bounded $
-    withTestResources (settings 3) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
+  it "reuses a released primary while its extra waits for global inventory" $
+    withTestPool (settings 3) $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
         primary <- borrowBuffer first
         otherPrimary <- borrowBuffer second
         heldReserve <- borrowBuffer second
@@ -96,9 +95,9 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer heldReserve
         releaseBuffer otherPrimary
 
-  it "cancels a pending extra without consuming a later return" $ bounded $
-    withTestResources (settings 3) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
+  it "cancels a pending extra without consuming a later return" $
+    withTestPool (settings 3) $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
         primary <- borrowBuffer first
         otherPrimary <- borrowBuffer second
         heldReserve <- borrowBuffer second
@@ -113,10 +112,10 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer otherPrimary
         releaseBuffer primary
 
-  it "serves queued extras in arrival order without a new arrival stealing supply" $ bounded $
-    withTestResources (settings 4) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second ->
-        withRequestBuffers resources $ \third -> do
+  it "serves queued extras in arrival order without a new arrival stealing supply" $
+    withTestPool (settings 4) $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second ->
+        withRequestBuffers pool $ \third -> do
           primary <- borrowBuffer first
           otherPrimary <- borrowBuffer second
           thirdPrimary <- borrowBuffer third
@@ -147,15 +146,15 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
           releaseBuffer otherPrimary
           releaseBuffer primary
 
-  it "delivers reserve to an extra behind many blocked primary arrivals" $ bounded $
-    withTestResources (settings 3) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
+  it "delivers reserve to an extra behind many blocked primary arrivals" $
+    withTestPool (settings 3) $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
         primary <- borrowBuffer first
         otherPrimary <- borrowBuffer second
         heldReserve <- borrowBuffer second
         primaries <- replicateM 128 $ do
           done <- newEmptyMVar
-          worker <- forkFinally (withRequestBuffers resources (const (pure ()))) (putMVar done)
+          worker <- forkFinally (withRequestBuffers pool (const (pure ()))) (putMVar done)
           awaitBlocked worker
           pure (worker, done)
         extraDone <- newEmptyMVar
@@ -172,9 +171,9 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer otherPrimary
         releaseBuffer primary
 
-  it "returns exactly once across cancellation racing an extra grant" $ bounded $
-    withTestResources (settings 3) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
+  it "returns exactly once across cancellation racing an extra grant" $
+    withTestPool (settings 3) $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
         primary <- borrowBuffer first
         otherPrimary <- borrowBuffer second
         forM_ [1 .. 100 :: Int] $ \_ -> do
@@ -190,9 +189,9 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer otherPrimary
         releaseBuffer primary
 
-  it "returns exactly once across cancellation racing local primary delivery" $ bounded $
-    withTestResources (settings 3) $ \resources ->
-      withRequestBuffers resources $ \first -> withRequestBuffers resources $ \second -> do
+  it "returns exactly once across cancellation racing local primary delivery" $
+    withTestPool (settings 3) $ \pool ->
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
         otherPrimary <- borrowBuffer second
         heldReserve <- borrowBuffer second
         forM_ [1 .. 100 :: Int] $ \_ -> do
@@ -209,26 +208,26 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         releaseBuffer heldReserve
         releaseBuffer otherPrimary
 
-  it "expires escaped capabilities and returns outstanding loans on teardown" $ bounded $
-    withTestResources (settings 2) $ \resources -> do
-      (access, primary, extra) <- withRequestBuffers resources $ \access -> do
+  it "expires escaped capabilities and returns outstanding loans on teardown" $
+    withTestPool (settings 2) $ \pool -> do
+      (access, primary, extra) <- withRequestBuffers pool $ \access -> do
         primary <- borrowBuffer access
         extra <- borrowBuffer access
         pure (access, primary, extra)
       rejected <- try @IOError (borrowBuffer access)
       isLeft rejected `shouldBe` True
-      timeout 1_000_000 (withRequestBuffers resources $ \fresh -> do
+      timeout 1_000_000 (withRequestBuffers pool $ \fresh -> do
         first <- borrowBuffer fresh
         second <- borrowBuffer fresh
         releaseBuffer primary
         releaseBuffer extra
-        timeout 20_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Nothing
+        timeout 20_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Nothing
         releaseBuffer second
         releaseBuffer first) `shouldReturn` Just ()
 
-  it "lets the caller join children before returning their shared request scope" $ bounded $
-    withTestResources (settings 2) $ \resources -> do
-      withRequestBuffers resources $ \access -> do
+  it "lets the caller join children before returning their shared request scope" $
+    withTestPool (settings 2) $ \pool -> do
+      withRequestBuffers pool $ \access -> do
         entered <- newEmptyMVar
         hold <- newEmptyMVar
         done <- newEmptyMVar
@@ -236,14 +235,14 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
           (withLoan access (const $ putMVar entered () >> takeMVar hold))
           (putMVar done)
         takeMVar entered
-        timeout 20_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Nothing
+        timeout 20_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Nothing
         putMVar hold ()
         fmap isLeft <$> timeout 1_000_000 (takeMVar done) `shouldReturn` Just False
-      timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
+      timeout 1_000_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Just ()
 
-  it "lets the caller cancel and join a child before request teardown" $ bounded $
-    withTestResources (settings 2) $ \resources -> do
-      withRequestBuffers resources $ \access -> do
+  it "lets the caller cancel and join a child before request teardown" $
+    withTestPool (settings 2) $ \pool -> do
+      withRequestBuffers pool $ \access -> do
         entered <- newEmptyMVar
         hold <- newEmptyMVar
         done <- newEmptyMVar
@@ -258,13 +257,13 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
         bufferMemory (loanBuffer first) `shouldNotBe` bufferMemory (loanBuffer second)
         releaseBuffer second
         releaseBuffer first
-      timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
+      timeout 1_000_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Just ()
 
-  it "rejects an extra waiter when its request closes" $ bounded $
-    withTestResources (settings 3) $ \resources -> withRequestBuffers resources $ \other -> do
+  it "rejects an extra waiter when its request closes" $
+    withTestPool (settings 3) $ \pool -> withRequestBuffers pool $ \other -> do
       _ <- borrowBuffer other
       pending <- newEmptyMVar
-      withRequestBuffers resources $ \access -> do
+      withRequestBuffers pool $ \access -> do
         _ <- borrowBuffer access
         _ <- borrowBuffer other
         _ <- forkFinally (borrowBuffer access) (putMVar pending)
@@ -272,25 +271,25 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       outcome <- timeout 1_000_000 (takeMVar pending)
       fmap isLeft outcome `shouldBe` Just True
 
-  it "returns both owned loans when the request callback throws" $ bounded $
-    withTestResources (settings 2) $ \resources -> do
-      outcome <- try @IOError $ withRequestBuffers resources $ \access -> do
+  it "returns both owned loans when the request callback throws" $
+    withTestPool (settings 2) $ \pool -> do
+      outcome <- try @IOError $ withRequestBuffers pool $ \access -> do
         _ <- borrowBuffer access
         _ <- borrowBuffer access
         ioError (userError "callback")
       isLeft outcome `shouldBe` True
-      timeout 1_000_000 (withRequestBuffers resources $ \access -> do
+      timeout 1_000_000 (withRequestBuffers pool $ \access -> do
         primary <- borrowBuffer access
         extra <- borrowBuffer access
         bufferMemory (loanBuffer primary) `shouldNotBe` bufferMemory (loanBuffer extra)) `shouldReturn` Just ()
 
-  it "returns the full request after asynchronous cancellation" $ bounded $
-    withTestResources (settings 2) $ \resources -> do
+  it "returns the full request after asynchronous cancellation" $
+    withTestPool (settings 2) $ \pool -> do
       started <- newEmptyMVar
       hold <- newEmptyMVar
       done <- newEmptyMVar
       worker <- forkFinally
-        (withRequestBuffers resources $ \access -> do
+        (withRequestBuffers pool $ \access -> do
           _ <- borrowBuffer access
           _ <- borrowBuffer access
           putMVar started ()
@@ -300,13 +299,37 @@ spec = xfail "Request capability scaffold: scoped loans follow in the next chang
       killThread worker
       outcome <- timeout 1_000_000 (takeMVar done)
       fmap isLeft outcome `shouldBe` Just True
-      timeout 1_000_000 (withRequestBuffers resources (const (pure ()))) `shouldReturn` Just ()
+      timeout 1_000_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Just ()
 
+  it "lets the caller cancel queued primary and extra admission and reuse the inventory" $
+    withTestPool (settings 3) $ \pool -> do
+      withRequestBuffers pool $ \first -> withRequestBuffers pool $ \second -> do
+        primary <- borrowBuffer first
+        otherPrimary <- borrowBuffer second
+        heldReserve <- borrowBuffer second
+        primaryDone <- newEmptyMVar
+        extraDone <- newEmptyMVar
+        queuedPrimary <- forkFinally (withRequestBuffers pool (const (pure ()))) (putMVar primaryDone)
+        queuedExtra <- forkFinally (borrowBuffer first) (putMVar extraDone)
+        awaitBlocked queuedPrimary
+        awaitBlocked queuedExtra
+        killThread queuedPrimary
+        killThread queuedExtra
+        fmap isLeft <$> timeout 1_000_000 (takeMVar primaryDone) `shouldReturn` Just True
+        fmap isLeft <$> timeout 1_000_000 (takeMVar extraDone) `shouldReturn` Just True
+        releaseBuffer heldReserve
+        timeout 1_000_000 (withLoan first (const (pure ()))) `shouldReturn` Just ()
+        releaseBuffer otherPrimary
+        releaseBuffer primary
+      timeout 1_000_000 (withRequestBuffers pool (const (pure ()))) `shouldReturn` Just ()
 
-settings :: Int -> ResourceSettings
-settings count = ResourceSettings
-  (case count of 1 -> positiveInt @8; 2 -> positiveInt @16; 3 -> positiveInt @24; _ -> positiveInt @32)
-  (positiveInt @8) (positiveInt @8) (positiveInt @1)
+settings :: Int -> PoolSettings
+settings count = PoolSettings
+  { bufferSize = positiveInt @8
+  , ordinaryBufferCount = case count of 2 -> positiveInt @1; 3 -> positiveInt @2; _ -> positiveInt @3
+  , reserveBufferCount = positiveInt @1
+  , setupBufferCount = positiveInt @1
+  }
 
 -- Waiting on private delivery state confirms that admission registration has committed.
 awaitBlocked :: ThreadId -> IO ()
@@ -321,12 +344,9 @@ awaitBlocked worker = do
       ThreadDied -> pure ()
       _ -> yield >> loop
 
-withTestResources :: ResourceSettings -> (Resources.Resources -> IO a) -> IO a
-withTestResources config action = getAcquisition >>= \waiting ->
-  Resources.withResources waiting config action
+withTestPool :: PoolSettings -> (BufferPool -> IO a) -> IO a
+withTestPool config action = getAcquisition >>= \waiting ->
+  newBufferPool waiting config >>= action
 
 withLoan :: BufferAccess -> (Buffer -> IO a) -> IO a
 withLoan access action = bracket (borrowBuffer access) releaseBuffer (action . loanBuffer)
-
-bounded :: IO () -> IO ()
-bounded action = timeout 2000000 action >>= maybe (failTest "pending request implementation") pure
