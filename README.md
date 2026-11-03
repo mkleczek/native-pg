@@ -109,6 +109,29 @@ Tx.runTransaction Tx.ReadCommitted Tx.Read session $ do
   pure value
 ```
 
+Results are read in the order of their statements, and a result that is not
+wanted is dropped with `discard`, which reads and drops the rest of it:
+
+```haskell
+(setting, rows) <- Tx.pipeline ((,) <$> Tx.statement () configure <*> Tx.statement () query)
+Tx.discard setting -- its rows, if any, are dropped on purpose
+Tx.rowList rows
+```
+
+Reading a result, or awaiting a preparation, while an earlier result of the
+transaction is neither finished nor discarded raises `ResultOutOfOrder`. It
+does not read the earlier result and drop its rows. The error aborts the
+transaction: every later read, discard and pipeline raises it again, leaving
+the scope rolls the transaction back, and the connection stays usable. If an
+earlier statement failed, its failure is raised instead, since reading the
+earlier results is how it is found. An unread preparation does not count: it is
+an acknowledgement, kept in the transaction, and a later result is read past
+it. `discard` still reports a server error and a wrong number of rows, and is
+the same as reading a result to its end when that is already done. A result
+that the pipeline does not return, such as the left side of `*>`, cannot be
+discarded, so return it and discard it. `finishTransaction`, the next `pipeline`
+and leaving the scope drain what is unread without complaint.
+
 `statement` parses its SQL as the unnamed statement. The library keeps no cache of
 prepared statements and has no callback for one: a client with its own
 per-connection cache of names picks `prepare name params statement`, which only
@@ -122,8 +145,9 @@ client resolves its cache before it builds the transaction. `params` gives
 `prepare` returns a `Preparation`, which `awaitPreparation` reads in wire order,
 like a result: it returns once the server accepted the Parse, and raises the
 `QueryError` if the server rejected the Parse or skipped it after an earlier
-statement failed. A client reads the preparation before the rows that follow it
-and records the name then:
+statement failed. The results before it must be finished or discarded.
+A client reads the preparation before the rows that follow it and records the
+name then:
 
 ```haskell
 Tx.runTransaction Tx.ReadCommitted Tx.Read session $ do
@@ -138,11 +162,12 @@ Tx.runTransaction Tx.ReadCommitted Tx.Read session $ do
 The server keeps a parsed name even if execution fails or the transaction rolls
 back, and never parses the statements it skips after an error. So an
 `awaitPreparation` that returned means its name exists on the connection, also
-after a later statement failed, and one that raised means it does not: nothing
-needs to be closed. A client removes evicted names with
+after a later statement failed, and one that raised a `QueryError` means it does
+not: nothing needs to be closed. One that raised `ResultOutOfOrder` tells
+nothing, and the client closes the name. A client removes evicted names with
 `Session.closeStatement`; closing a missing name is not an error.
 
-`finishTransaction` drains unread rows, checks statement completion and observes
+`finishTransaction` drains unread results, checks statement completion and observes
 `COMMIT`, or `ROLLBACK` when condemned. An empty transaction sends nothing.
 An unfinished scope drains and rolls back an open transaction. Ordinary
 application exceptions raised through `liftIO` also permit this cleanup and are

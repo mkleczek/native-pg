@@ -9,7 +9,7 @@
 module Database.PostgreSQL.Transaction
   ( Transaction, Pipeline, Result, Preparation, Field, Statement (..), RowDecoder,
     runTransaction, statement, prepare, awaitPreparation, executePrepared, pipeline, finalPipeline,
-    nextRow, fieldLength, nextChunk, finishTransaction, condemn, sql,
+    nextRow, discard, fieldLength, nextChunk, finishTransaction, condemn, sql,
     row, streamingRow, singleRow, rowMaybe, noResult,
     foldRows, rowList, singleRowValue, rowMaybeValue,
     QueryError (..), StatementError (..), FormatCode (..),
@@ -17,7 +17,7 @@ module Database.PostgreSQL.Transaction
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Exception (IOException, SomeAsyncException, SomeException, finally, fromException, mask, onException, throwIO, try)
+import Control.Exception (IOException, SomeAsyncException, SomeException, finally, fromException, mask, onException, throwIO, toException, try)
 import Control.Monad ((>=>), unless, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.IO.Unlift (MonadUnliftIO (..))
@@ -60,8 +60,12 @@ isInterrupted failure = isJust (fromException @SomeAsyncException failure)
 newtype Pipeline (tx :: Type) a = Pipeline (StateT [Pending] (ReaderT Runtime IO) a)
   deriving newtype (Functor, Applicative)
 
--- | A forward cursor belonging to one transaction. Pulling a later cursor
--- drains earlier results and checks their cardinality and server errors.
+-- | A forward cursor belonging to one transaction. Results are consumed in the
+-- order of their statements: a result is read to its end, or dropped with
+-- 'discard', before any later result is read. Reading a later one first raises
+-- 'ResultOutOfOrder' instead of dropping the rows of the earlier one. The
+-- results that a transaction ends with are an exception: 'finishTransaction',
+-- the next 'pipeline' and leaving the scope drain what is unread.
 data Result tx (row :: Type -> Type) = Result Runtime Pending (RowDecoder row)
 -- | The server's answer to a 'prepare', belonging to one transaction.
 data Preparation (tx :: Type) = Preparation Runtime Pending
@@ -100,6 +104,11 @@ data Pending = Pending
   { pendingQuery :: ByteString,
     pendingExecution :: Execution,
     pendingCardinality :: Cardinality,
+    -- | Whether a later result can be read while this one is unread, which
+    -- reads past it. That holds for the acknowledgement of a 'prepare', which
+    -- stays recorded in its state, and for the transaction's own BEGIN and
+    -- ending, which are no result of the client.
+    pendingSkippable :: Bool,
     pendingState :: IORef CursorState,
     pendingCount :: IORef Int,
     pendingRow :: IORef (Maybe Row.Row)
@@ -120,7 +129,7 @@ data Runtime = Runtime
     runtimePending :: IORef [Pending],
     runtimeSync :: IORef Bool,
     runtimeStatus :: IORef TransactionStatus,
-    runtimeFailure :: IORef (Maybe QueryError),
+    runtimeFailure :: IORef (Maybe SomeException),
     runtimeBroken :: IORef Bool
   }
 
@@ -181,6 +190,7 @@ recoverable failure
   | isJust (fromException @QueryError failure) = True
   | otherwise = case fromException @ConnectionError failure of
       Just (RowMisuse _) -> True
+      Just (ResultOutOfOrder _) -> True
       Just (SessionUnusable _) -> True
       _ -> False
 
@@ -210,7 +220,8 @@ contextOf :: Runtime -> Context
 contextOf runtime = case runtimeSession runtime of Exchange.Session context -> context
 
 -- | Adds a statement, parsed as the unnamed statement, and returns its cursor
--- without consuming its rows.
+-- without consuming its rows. Read the cursors of a pipeline in the order of
+-- its statements, or 'discard' the ones not wanted.
 statement :: params -> Statement params row -> Pipeline tx (Result tx row)
 statement = queue Execution.Unprepared
 
@@ -224,11 +235,12 @@ statement = queue Execution.Unprepared
 -- when a later statement fails or the transaction rolls back, and rejects a
 -- name that is already in use (SQLSTATE 42P05). It never parses a statement it
 -- skips after an earlier error, and a Parse it rejects leaves nothing.
--- 'awaitPreparation' tells which of these happened.
+-- 'awaitPreparation' tells which of these happened. The acknowledgement is
+-- not a row result: a later result can be read while it is unread.
 prepare :: ByteString -> params -> Statement params row -> Pipeline tx (Preparation tx)
 prepare name params (Statement query encode _) = Pipeline $ do
   runtime <- ask
-  pending <- enqueue query (Execution (Execution.Parsing name query (paramType <$> encode params)) [] [] []) AnyRows
+  pending <- enqueue query (Execution (Execution.Parsing name query (paramType <$> encode params)) [] [] []) AnyRows True
   pure (Preparation runtime pending)
 
 -- | Waits for the server's answer to a 'prepare'. It returns once the server
@@ -238,13 +250,17 @@ prepare name params (Statement query encode _) = Pipeline $ do
 -- exist and needs no closing. The error is the server's own if it rejected the
 -- Parse, and that of the earlier statement after which it skipped the Parse.
 --
--- The statements before the preparation are drained, but their failures are
--- not reported unless they made the server skip the Parse; their own results
--- report them. A preparation answers the same however often it is awaited, and
--- whether a later result drained it first, even after another statement
--- failed. Await a preparation before the rows that follow it, to learn about
--- the name before they can fail. Like every result, it can only be awaited
--- inside its transaction.
+-- Like reading a result, awaiting a preparation needs the results before it to
+-- be finished or discarded; the preparations before it are answered by
+-- awaiting it. While a result before it is unread, it raises 'ResultOutOfOrder'
+-- and aborts the transaction, as 'nextRow' does, unless the server skipped the
+-- Parse after the failure of one of those statements: that failure is raised
+-- instead. 'ResultOutOfOrder' tells nothing about the name, which the server
+-- may have created: close it. A preparation answers the same however often it
+-- is awaited, and whether a later result drained it first, even after another
+-- statement failed. Await a preparation before the rows that follow it, to
+-- learn about the name before they can fail. Like every result, it can only be
+-- awaited inside its transaction.
 awaitPreparation :: Preparation tx -> Transaction tx ()
 awaitPreparation (Preparation owner pending) = operation $ \runtime -> do
   sameScope owner runtime
@@ -256,7 +272,8 @@ awaitPreparation (Preparation owner pending) = operation $ \runtime -> do
           [] -> throwIO (RowMisuse "a cursor is no longer pending")
           first : _
             | pendingState first == pendingState pending -> void (pullRow runtime pending) *> await
-            | otherwise -> skipResult runtime first False *> await
+            | pendingSkippable first -> skipResult runtime first False *> await
+            | otherwise -> misordered runtime False pending
   await
 
 -- | Like 'statement', but runs the statement that 'prepare' parsed under the
@@ -270,13 +287,13 @@ queue :: (ByteString -> [Maybe Word32] -> Execution.Statement) -> params -> Stat
 queue prepared params (Statement query encode decoder@(RowDecoder cardinality _)) = Pipeline $ do
   runtime <- ask
   let parameters = encode params
-  pending <- enqueue query (Execution (prepared query (paramType <$> parameters)) (paramFormat <$> parameters) (fmap (protectParameter runtime) . paramValue <$> parameters) [BinaryFormat]) cardinality
+  pending <- enqueue query (Execution (prepared query (paramType <$> parameters)) (paramFormat <$> parameters) (fmap (protectParameter runtime) . paramValue <$> parameters) [BinaryFormat]) cardinality False
   pure (Result runtime pending decoder)
 
 -- | Adds the statement to the pipeline, and returns its cursor.
-enqueue :: ByteString -> Execution -> Cardinality -> StateT [Pending] (ReaderT Runtime IO) Pending
-enqueue query execution cardinality = do
-  pending <- liftIO $ Pending query execution cardinality <$> newIORef Queued <*> newIORef 0 <*> newIORef Nothing
+enqueue :: ByteString -> Execution -> Cardinality -> Bool -> StateT [Pending] (ReaderT Runtime IO) Pending
+enqueue query execution cardinality skippable = do
+  pending <- liftIO $ Pending query execution cardinality skippable <$> newIORef Queued <*> newIORef 0 <*> newIORef Nothing
   modify' (pending :)
   pure pending
 
@@ -289,6 +306,8 @@ protectParameter runtime = \case
 
 -- | Drains the preceding pipeline, then sends these statements and Sync.
 -- The first pipeline also sends BEGIN. No results of this pipeline are read.
+-- Results of the preceding pipeline that are unread are dropped, as they are
+-- when the transaction is finished: reading one afterwards finds no rows.
 pipeline :: Pipeline tx a -> Transaction tx a
 pipeline = submit False
 
@@ -324,7 +343,7 @@ submitOn runtime final plan = do
   pure value
 
 command :: Runtime -> ByteString -> IO [Pending]
-command runtime query = snd <$> runPipeline runtime (statement () (Statement query (const []) noResult))
+command runtime query = fmap (\pending -> pending {pendingSkippable = True}) . snd <$> runPipeline runtime (statement () (Statement query (const []) noResult))
 
 sql :: ByteString -> Transaction tx ()
 sql query = void (pipeline (statement () (Statement query (const []) noResult)))
@@ -339,11 +358,11 @@ condemn = operation $ \runtime -> do
 ending :: Runtime -> IO ByteString
 ending runtime = (\commits -> if commits then "COMMIT" else "ROLLBACK") <$> readIORef (runtimeCommits runtime)
 
--- | Drains unread fields and rows, checks cardinality and server errors,
--- then sends and observes COMMIT or ROLLBACK. A final pipeline already has
--- its ending queued. Field EOF alone never establishes transaction success.
--- An empty transaction sends nothing. This action is idempotent after
--- success; further statements are rejected.
+-- | Drains unread results, including their fields and rows, checks cardinality
+-- and server errors, then sends and observes COMMIT or ROLLBACK. A final
+-- pipeline already has its ending queued. Field EOF alone never establishes
+-- transaction success. An empty transaction sends nothing. This action is
+-- idempotent after success; further statements are rejected.
 finishTransaction :: Transaction tx ()
 finishTransaction = operation $ \runtime -> do
   finished <- readIORef (runtimeEnded runtime)
@@ -376,6 +395,15 @@ rollback runtime = do
 -- previous row are skipped and its field expires. Nothing means command
 -- completion, whose cardinality has been checked; call 'finishTransaction'
 -- to establish transaction success.
+--
+-- The first row of a result starts it, and needs the results of the earlier
+-- statements to be finished or discarded. Otherwise it raises
+-- 'ResultOutOfOrder', without dropping their rows. That aborts the
+-- transaction: reading, discarding, sending a pipeline and finishing raise the
+-- same error from then on, and leaving the scope rolls it back, leaving the
+-- connection usable. A failure of an earlier statement comes first: the
+-- earlier results are read, as 'discard' reads them, to find it, and the first
+-- failure found is raised instead.
 nextRow :: Result tx row -> Transaction tx (Maybe (row tx))
 nextRow (Result owner pending (RowDecoder _ decode)) = operation $ \runtime -> do
   sameScope owner runtime
@@ -392,15 +420,62 @@ nextRow (Result owner pending (RowDecoder _ decode)) = operation $ \runtime -> d
           decoded <- decode runtime value
           either (failQuery runtime pending . RowFailed) (pure . Just) decoded
 
+-- | Reads the rest of a result, and drops its rows: it is finished, as when
+-- its rows were read. It still reports what reading them would: a server
+-- error, or a number of rows its statement does not allow. Discarding a result
+-- that is finished, or half read, is fine. Like reading it, discarding it needs
+-- the results before it to be finished or discarded, and raises
+-- 'ResultOutOfOrder' otherwise.
+discard :: Result tx row -> Transaction tx ()
+discard (Result owner pending _) = operation $ \runtime -> do
+  sameScope owner runtime
+  throwFailure runtime
+  state <- readIORef (pendingState pending)
+  case state of
+    Done -> pure ()
+    _ -> seek runtime pending *> skipResult runtime pending True
+
 sameScope :: Runtime -> Runtime -> IO ()
 sameScope owner runtime = unless (runtimeLive owner == runtimeLive runtime)
   (throwIO (RowMisuse "a cursor was used in another transaction scope"))
 
+-- Reads past what the client does not hold, to the target at the head of the
+-- pending results. Every row of a result comes here, but only its first one can
+-- find a result before it: once started, the target stays at the head until it
+-- is finished. So the check of a result runs once, as it starts.
 seek :: Runtime -> Pending -> IO ()
 seek runtime target = readIORef (runtimePending runtime) >>= \case
   [] -> throwIO (RowMisuse "a cursor is no longer pending")
   first : _ | pendingState first == pendingState target -> pure ()
-  first : _ -> skipResult runtime first True *> seek runtime target
+  first : _
+    | pendingSkippable first -> skipResult runtime first True *> seek runtime target
+    | otherwise -> misordered runtime True target
+
+-- The target was reached while a result before it is unread. That is a usage
+-- error, but the failures of the statements before the target are raised in
+-- its place. Reading those results finds them: the server reports a failure at
+-- its statement and skips the rest, so one unread statement can hide it. A
+-- validating read raises the first failure it finds. One that does not, a wait
+-- for a preparation, raises only the failure that made the server skip the
+-- Parse, which is the answer it gives; the usage error tells nothing about the
+-- name. The usage error aborts the transaction, which is left to the scope to
+-- roll back, unless a failure of the transaction is recorded already.
+misordered :: Runtime -> Bool -> Pending -> IO a
+misordered runtime validating target = do
+  let before = takeWhile ((/= pendingState target) . pendingState)
+      unread = length . filter (not . pendingSkippable) . before
+      settle = readIORef (runtimePending runtime) >>= \case
+        first : _ | pendingState first /= pendingState target -> skipResult runtime first validating *> settle
+        _ -> pure ()
+  count <- unread <$> readIORef (runtimePending runtime)
+  settle
+  readIORef (pendingState target) >>= \case
+    Failed -> throwFailure runtime
+    _ -> pure ()
+  let exception = ResultOutOfOrder count
+  recorded <- readIORef (runtimeFailure runtime)
+  when (isNothing recorded) (writeIORef (runtimeFailure runtime) (Just (toException exception)))
+  throwIO exception
 
 pullRow :: Runtime -> Pending -> IO (Maybe Row.Row)
 pullRow runtime pending = do
@@ -452,7 +527,7 @@ drain runtime validating = do
     writeIORef (runtimeStatus runtime) status
     case result of
       Left failure -> do
-        writeIORef (runtimeFailure runtime) (Just failure)
+        writeIORef (runtimeFailure runtime) (Just (toException failure))
         when validating (throwIO failure)
       Right () -> pure ()
 
@@ -465,7 +540,7 @@ serverFailure runtime pending failure = do
 failQuery :: Runtime -> Pending -> StatementError -> IO a
 failQuery runtime pending failure = do
   let exception = QueryError (pendingQuery pending) failure
-  writeIORef (runtimeFailure runtime) (Just exception)
+  writeIORef (runtimeFailure runtime) (Just (toException exception))
   throwIO exception
 
 throwFailure :: Runtime -> IO ()

@@ -747,6 +747,46 @@ driver starts no result worker. The parser remains the concrete `Input`
 implementation; transaction composition adds no `MonadInput` dictionary to
 parsing.
 
+Results are consumed in wire order, which is the order of their statements: the
+server answers them one after the other on one connection, so reading a later
+result means reading the earlier ones first. Doing that silently dropped their
+rows and expired their borrowed fields, so it is a usage error instead. A result is
+finished, or dropped with `discard`, before a later result is read or a later
+preparation awaited; otherwise `ResultOutOfOrder` is raised. The check runs once
+per result, when its first row is requested: the cursor at the head of the
+pending results is the one being read, so every further row finds nothing
+before it, and the per-row path is the same as without the check.
+
+- **Exceptions.** An unread `prepare` answer does not count, because it is an
+  acknowledgement that stays recorded in its state, not rows: a later result is
+  read past it, and it can be awaited afterwards. The transaction's own `BEGIN`
+  and ending are no results of the client and are read past too. A result that
+  was started and not finished does count.
+- **Precedence.** A failure comes before the usage error, because it explains
+  what the client sees: the failure already recorded in the transaction, then
+  the failure of an earlier statement that is found by reading the earlier
+  results (the server reports it at its statement, so one unread statement can
+  hide it), and then the usage error. An await of a preparation raises only the
+  failure that made the server skip its `Parse`, which is the answer it gives;
+  another failure of an earlier statement, such as a wrong row count, stays the
+  failure of the transaction and the await raises the usage error.
+- **State.** The usage error aborts the transaction instead of leaving it open
+  for another attempt: it is recorded like a failure, so that reads, discards and
+  pipelines raise it again and `finishTransaction` cannot commit, and the scope
+  rolls the transaction back. Statements already sent still ran. The error is
+  recoverable for the connection, which stays usable for the next
+  transaction. A client that awaited no acknowledgement of a `prepare` it sent
+  closes that name, as after any attempt it did not see succeed.
+- **`discard`.** It reads the rest of a result and drops its rows, with the
+  validation reading them has: a server error, or a row count that the statement
+  does not allow. A result already finished is left alone. It needs the results
+  before it finished or discarded, as reading does.
+- **Not covered.** `finishTransaction`, the rollback and failure paths, leaving
+  the scope and sending the next pipeline drain what is unread, deliberately:
+  they end the use of the results. A result that a pipeline does not return,
+  e.g. the left side of `*>`, has no handle to discard; a client keeps it in a
+  tuple. The results of a pipeline that was drained by the next one read as empty.
+
 `row` decodes owned metadata. `streamingRow` decodes that metadata followed by
 one nullable `Field tx`; `fieldLength` reports its declared length. `nextChunk`
 returns borrowed bytes until field EOF, represented by an empty chunk. A chunk
@@ -763,7 +803,7 @@ field and send its chunks synchronously before the next row is requested.
 Collectors establish statement completion; successful transaction completion
 still requires `finishTransaction`.
 
-`finishTransaction` drains and validates remaining results, then observes the
+`finishTransaction` drains and validates remaining unread results, then observes the
 transaction ending. With `finalPipeline`, that ending was queued with the batch;
 otherwise it is sent after the results. A condemned transaction rolls back.
 Finishing an empty scope sends nothing. Leaving the scope unfinished drains
@@ -869,12 +909,16 @@ top of them, through typeclass metaprogramming:
   statements it skips after an error, nor does a rejected `Parse` leave
   anything. So awaiting a preparation tells whether its name exists, also
   after an error: a name whose await returned exists on the connection, and one
-  whose await raised doesn't, so no `Close` is needed for either. A
+  whose await raised a `QueryError` doesn't, so no `Close` is needed for either.
+  An await that raised `ResultOutOfOrder` tells nothing, and the client closes
+  the name, as after any attempt it did not see succeed. A
   preparation the server accepted stays accepted whatever happens to the
-  statements around it, and whichever result is read first: reading a later
-  result drains the earlier preparations, which then return at once, and
-  waiting for a preparation drains the statements before it without reporting
-  their failures, except one that made the server skip the `Parse`.
+  statements around it: reading a later result reads past the earlier
+  preparations, which then return at once. Waiting for a preparation reads past
+  the preparations before it, but needs the other results before it to be
+  finished or discarded, like reading a result, and raises `ResultOutOfOrder`
+  while one is unread; a failure of such a statement is raised instead, which is
+  also what an await of the `Parse` it made the server skip raises.
   Preparations are awaited inside their transaction like any result.
 - Parameter OIDs are optional, allowing the server to infer their types.
 

@@ -6,7 +6,7 @@ module Client where
 import Database.PostgreSQL.ConnectionString ()
 import Database.PostgreSQL.ConnectionString.Types ()
 import Database.PostgreSQL.Decoding ()
-import Database.PostgreSQL.Diagnostics ()
+import Database.PostgreSQL.Diagnostics (ConnectionError (..))
 import Database.PostgreSQL.Encoders (Parameter (..))
 import Database.PostgreSQL.Session
   ( Session, Connection, connection, close, isUsable, closeStatement, cancel,
@@ -39,11 +39,22 @@ prepareNamed = Transaction.prepare
 awaitNamed :: Transaction.Preparation tx -> Transaction.Transaction tx ()
 awaitNamed = Transaction.awaitPreparation
 
+-- Results are read in the order of their statements, or discarded.
+discarded :: Transaction.Result tx row -> Transaction.Transaction tx ()
+discarded = Transaction.discard
+
+misordered :: ConnectionError -> Maybe Int
+misordered failure = case failure of
+  ResultOutOfOrder unread -> Just unread
+  _ -> Nothing
+
 -- A client records a name once the server accepted its Parse, before the rows
--- that can still fail.
+-- that can still fail. The result of a statement before them that it does not
+-- want is discarded, not left unread.
 preparedRows :: ByteString -> Transaction.Statement () (Const Int64) -> Transaction.Transaction tx [Int64]
 preparedRows name known = do
-  (preparation, rows) <- Transaction.pipeline ((,) <$> prepareNamed name () known <*> executeNamed name () known)
+  (setting, preparation, rows) <- Transaction.pipeline ((,,) <$> query "SELECT 1" <*> prepareNamed name () known <*> executeNamed name () known)
+  discarded setting
   awaitNamed preparation
   Transaction.rowList rows
 

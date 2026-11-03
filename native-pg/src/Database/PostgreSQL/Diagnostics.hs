@@ -110,6 +110,9 @@ data ConnectionError
     SessionUnusable String
   | -- | A row or a column stream was used out of turn.
     RowMisuse String
+  | -- | A result was read, or a preparation awaited, while this many earlier
+    -- results of the transaction were neither consumed nor discarded.
+    ResultOutOfOrder Int
   | -- | TLS couldn't be started, e.g. because the server doesn't take it.
     TlsFailure String
   deriving (Eq, Show)
@@ -123,6 +126,10 @@ instance Exception ConnectionError where
     AuthenticationError reason -> reason
     SessionUnusable reason -> reason
     RowMisuse reason -> reason
+    ResultOutOfOrder unread ->
+      "a result was read, or a preparation awaited, while " <> show unread
+        <> (if unread == 1 then " earlier result was" else " earlier results were")
+        <> " neither consumed nor discarded"
     TlsFailure reason -> reason
 
 -- | A statement failed: its SQL, and why.

@@ -661,7 +661,7 @@ spec socketPath port = do
         attempt (Tx.awaitPreparation preparation)
       awaitedFirst `shouldSatisfy` skipping
       preparedNames session `shouldReturn` (Right ([], "SELECT 0"), TxIdle)
-    it "answers an unnamed statement, a preparation and its execution in wire order, whichever is read first" $ withSession $ \session -> do
+    it "answers an unnamed statement, a preparation and its execution in wire order, reading the rows or the preparation first" $ withSession $ \session -> do
       let wire name = Tx.pipeline ((,,) <$> Tx.statement "1" answer <*> Tx.prepare name "2" answer <*> Tx.executePrepared name "3" answer)
           inOrder = do
             (unnamed, preparation, named) <- wire "in_order"
@@ -669,13 +669,16 @@ spec socketPath port = do
             Tx.awaitPreparation preparation
             (earlier,) <$> Tx.singleRowValue named
           rowsFirst = do
-            (_, preparation, named) <- wire "rows_first"
+            (unnamed, preparation, named) <- wire "rows_first"
+            -- The result before them is dropped on purpose.
+            Tx.discard unnamed
             rows <- Tx.singleRowValue named
             -- Reading the rows read the preparation before them.
             Tx.awaitPreparation preparation
             pure rows
           preparationFirst = do
-            (_, preparation, named) <- wire "preparation_first"
+            (unnamed, preparation, named) <- wire "preparation_first"
+            Tx.discard unnamed
             Tx.awaitPreparation preparation
             Tx.singleRowValue named
       committed Tx.ReadCommitted Tx.Read inOrder session `shouldReturn` Right (2, 4)
@@ -685,18 +688,25 @@ spec socketPath port = do
     it "prepares and runs named statements in one pipeline with writes, including a name prepared earlier in it" $ withSession $ \session -> do
       createItems session
       let firstTime = do
-            (_, counted, incremented, again, recounted) <- Tx.pipeline $ (,,,,)
+            (inserted, counted, incremented, again, (insertedAgain, recounted)) <- Tx.pipeline $ (,,,,)
               <$> Tx.statement "1" insertItem
               <*> (Tx.prepare "count_items" () countItems *> Tx.executePrepared "count_items" () countItems)
               <*> (Tx.prepare "answer" "41" answer *> Tx.executePrepared "answer" "41" answer)
               <*> Tx.executePrepared "answer" "1" (unrendered answer)
-              <*> (Tx.statement "2" insertItem *> Tx.executePrepared "count_items" () (unrendered countItems))
-            (,,,) <$> Tx.singleRowValue counted <*> Tx.singleRowValue incremented <*> Tx.singleRowValue again <*> Tx.singleRowValue recounted
+              <*> ((,) <$> Tx.statement "2" insertItem <*> Tx.executePrepared "count_items" () (unrendered countItems))
+            Tx.discard inserted
+            countedValue <- Tx.singleRowValue counted
+            incrementedValue <- Tx.singleRowValue incremented
+            againValue <- Tx.singleRowValue again
+            Tx.discard insertedAgain
+            recountedValue <- Tx.singleRowValue recounted
+            pure (countedValue, incrementedValue, againValue, recountedValue)
           later = do
-            (_, counted, incremented) <- Tx.pipeline $ (,,)
+            (inserted, counted, incremented) <- Tx.pipeline $ (,,)
               <$> Tx.statement "3" insertItem
               <*> Tx.executePrepared "count_items" () (unrendered countItems)
               <*> Tx.executePrepared "answer" "9" (unrendered answer)
+            Tx.discard inserted
             (,) <$> Tx.singleRowValue counted <*> Tx.singleRowValue incremented
       committed Tx.ReadCommitted Tx.Write firstTime session `shouldReturn` Right (1, 42, 2, 2)
       committed Tx.ReadCommitted Tx.Write later session `shouldReturn` Right (3, 10)
@@ -709,6 +719,49 @@ spec socketPath port = do
             _ <- Tx.rowList inserted
             ((),) <$> Tx.singleRowValue counted
       committed Tx.ReadCommitted Tx.Write operation session `shouldReturn` Right ((), 1)
+    it "refuses to read a result before the earlier ones, aborts the transaction and leaves the session usable" $ withSession $ \session -> do
+      createItems session
+      let outOfOrder = do
+            (_, counted) <- Tx.pipeline ((,) <$> Tx.statement "1" insertItem <*> Tx.statement () countItems)
+            Tx.singleRowValue counted
+      committed Tx.ReadCommitted Tx.Write outOfOrder session `shouldSatisfy` P.throws (P.eq (ResultOutOfOrder 1))
+      -- The insert before it was rolled back, and the connection is idle.
+      items session `shouldReturn` Right 0
+      query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
+    it "reads the result after one that is discarded, keeping the effect of the discarded statement" $ withSession $ \session -> do
+      let text = Tx.singleRow (Tx.row @'[Text] Const)
+          setting = Tx.Statement "SELECT set_config('native_pg.discarded', 'kept', true)" (const []) text
+          current = Tx.Statement "SELECT current_setting('native_pg.discarded')" (const []) text
+          operation = do
+            (configured, value) <- Tx.pipeline ((,) <$> Tx.statement () setting <*> Tx.statement () current)
+            Tx.discard configured
+            Tx.singleRowValue value
+      committed Tx.ReadCommitted Tx.Read operation session `shouldReturn` Right "kept"
+    it "discards a streamed result that is unread or half read, and reads the one after it" $ withSession $ \session -> do
+      let streamed = Tx.Statement "SELECT 7::int4, repeat('x', 1000000) FROM generate_series(1, 3)" (const []) (Tx.streamingRow @'[Int32] StreamedNumber)
+          operation = do
+            (unread, halfRead, later) <- Tx.pipeline ((,,) <$> Tx.statement () streamed <*> Tx.statement () streamed <*> Tx.statement "1" answer)
+            Tx.discard unread
+            Tx.nextRow halfRead >>= \case
+              Just (StreamedNumber _ (Just body)) -> void (Tx.nextChunk body)
+              _ -> liftIO (failTest "expected a streamed row")
+            Tx.discard halfRead
+            Tx.singleRowValue later
+      committed Tx.ReadCommitted Tx.Read operation session `shouldReturn` Right 2
+    it "reports a failure of an earlier statement, not the usage error, when a later result is read first" $ withSession $ \session -> do
+      let outOfOrder = do
+            (_, later) <- Tx.pipeline ((,) <$> Tx.statement () dividingByZero <*> Tx.statement "1" answer)
+            Tx.singleRowValue later
+      committed Tx.ReadCommitted Tx.Read outOfOrder session >>= (`shouldSatisfy` failsWith (servedCode "22012"))
+      query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
+    it "refuses to await a preparation while an earlier result is unread, and the client closes the name it tried" $ withSession $ \session -> do
+      let outOfOrder = do
+            (_, preparation) <- Tx.pipeline ((,) <$> Tx.statement "1" answer <*> Tx.prepare "refused" "1" answer)
+            Tx.awaitPreparation preparation
+      committed Tx.ReadCommitted Tx.Read outOfOrder session `shouldSatisfy` P.throws (P.eq (ResultOutOfOrder 1))
+      -- The server parsed it, though the client did not see that: it is closed, as after any attempt it did not see succeed.
+      preparedNames session `shouldReturn` (Right ([[Just "refused"]], "SELECT 1"), TxIdle)
+      closeStatement session "refused" `shouldReturn` (Right (), TxIdle)
     it "skips a pipeline's statements after one that fails on the server, and reports that one" $ withSession $ \session -> do
       createItems session
       result <- committed Tx.ReadCommitted Tx.Write

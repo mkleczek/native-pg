@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 module TransactionSpec (spec) where
 import Control.Monad.IO.Unlift (withRunInIO)
@@ -429,14 +430,156 @@ spec = describe "canonical transactions" $ do
           _ -> failTest "missing metadata row"
         run Tx.finishTransaction
 
-  it "drains skipped earlier results before pulling a later cursor" $
+  it "pulls a later cursor after discarding an unread streamed earlier result" $
     withResponse (command "BEGIN" <> rows [[Just payload]] <> rows [[Just "last"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        (_, cursor) <- run (Tx.pipeline ((,) <$> Tx.statement () bodyStatement <*> Tx.statement () bodyStatement))
+        (skipped, cursor) <- run (Tx.pipeline ((,) <$> Tx.statement () bodyStatement <*> Tx.statement () bodyStatement))
+        run (Tx.discard skipped)
         result <- run (Tx.nextRow cursor)
         case result of
           Just (Body (Just field)) -> run (Tx.nextChunk field) `shouldReturn` "last"
           _ -> failTest "missing later row"
+        run Tx.finishTransaction
+
+  it "pulls a later cursor after discarding a partly read earlier result, and discards a finished one without effect" $
+    withResponse (command "BEGIN" <> rows [[Just "one"], [Just "two"], [Just "three"]] <> rows [[Just "last"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        (partly, later) <- run (Tx.pipeline ((,) <$> Tx.statement () (queryOf "SELECT partly") <*> Tx.statement () (queryOf "SELECT later")))
+        (fmap getConst <$> run (Tx.nextRow partly)) `shouldReturn` Just "one"
+        run (Tx.discard partly)
+        run (Tx.discard partly)
+        (fmap getConst <$> run (Tx.nextRow partly)) `shouldReturn` Nothing
+        run (Tx.rowList later) `shouldReturn` ["last"]
+        run (Tx.discard later)
+        run Tx.finishTransaction
+
+  it "refuses to read a later result before the earlier ones were consumed, and aborts the transaction" $ do
+    sent <- newIORef BS.empty
+    let aborted = command "BEGIN" <> rows [[Just "first"]] <> rows [[Just "second"]] <> rows [[Just "third"]] <> readyTx <> command "ROLLBACK" <> ready
+    connection <- withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) (aborted <> ordinary) $ \context _ -> do
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        (_, middle, later) <- run (Tx.pipeline ((,,) <$> Tx.statement () (queryOf "SELECT first") <*> Tx.statement () (queryOf "SELECT second") <*> Tx.statement () (queryOf "SELECT third")))
+        -- Both earlier results are unread.
+        try @ConnectionError (run (Tx.rowList later)) `shouldReturn` Left (ResultOutOfOrder 2)
+        -- Nothing is read or dropped silently: the transaction is aborted, and every operation says so.
+        try @ConnectionError (run (Tx.rowList middle)) `shouldReturn` Left (ResultOutOfOrder 2)
+        try @ConnectionError (run (Tx.discard middle)) `shouldReturn` Left (ResultOutOfOrder 2)
+        try @ConnectionError (run (Tx.sql "SELECT 1")) `shouldReturn` Left (ResultOutOfOrder 2)
+        try @ConnectionError (run Tx.finishTransaction) `shouldReturn` Left (ResultOutOfOrder 2)
+      -- The scope rolled back, and the session serves the next transaction.
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        _ <- run (Tx.pipeline (Tx.statement () bodyStatement))
+        run Tx.finishTransaction
+      pure (contextConnection context)
+    bytes <- readIORef sent
+    BS.isInfixOf "ROLLBACK\0" bytes `shouldBe` True
+    -- The only COMMIT is the one of the next transaction.
+    length (positionsOf "COMMIT\0" bytes) `shouldBe` 1
+    Session.isUsable connection `shouldReturn` True
+
+  it "refuses to read a later result while an earlier one is partly read" $
+    withResponse (command "BEGIN" <> rows [[Just "one"], [Just "two"]] <> rows [[Just "last"]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        (partly, later) <- run (Tx.pipeline ((,) <$> Tx.statement () (queryOf "SELECT partly") <*> Tx.statement () (queryOf "SELECT later")))
+        void (run (Tx.nextRow partly))
+        try @ConnectionError (run (Tx.nextRow later)) `shouldReturn` Left (ResultOutOfOrder 1)
+
+  it "reports the failure of an earlier statement instead of the out-of-order read" $ do
+    let failed = command "BEGIN" <> parse <> bind <> lateError <> readyFailed <> command "ROLLBACK" <> ready
+        cardinality = command "BEGIN" <> rows [[Just "a"], [Just "b"]] <> rows [[Just "c"]] <> readyTx <> command "ROLLBACK" <> ready
+        single = Tx.Statement "SELECT first" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
+    withResponse failed $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        (_, later) <- run (Tx.pipeline ((,) <$> Tx.statement () (queryOf "SELECT first") <*> Tx.statement () (queryOf "SELECT second")))
+        -- The server failed the first statement, which the read of the second one finds.
+        try @PG.QueryError (run (Tx.rowList later)) >>= \case
+          Left (PG.QueryError "SELECT first" (PG.ServerFailed _)) -> pure ()
+          _ -> failTest "the failure of the earlier statement was replaced"
+        -- It stays the failure of the transaction.
+        try @PG.QueryError (run Tx.finishTransaction) >>= \case
+          Left (PG.QueryError "SELECT first" (PG.ServerFailed _)) -> pure ()
+          _ -> failTest "the failure of the earlier statement was lost"
+    withResponse cardinality $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        (_, later) <- run (Tx.pipeline ((,) <$> Tx.statement () single <*> Tx.statement () (queryOf "SELECT second")))
+        try @PG.QueryError (run (Tx.rowList later)) >>= \case
+          Left (PG.QueryError "SELECT first" (PG.UnexpectedAmountOfRows 2)) -> pure ()
+          _ -> failTest "the row count of the earlier statement was replaced"
+
+  it "reports from a discard what reading the result would report" $ do
+    let failed = command "BEGIN" <> parse <> bind <> lateError <> readyFailed <> command "ROLLBACK" <> ready
+        cardinality = command "BEGIN" <> rows [[Just "a"], [Just "b"]] <> readyTx <> command "ROLLBACK" <> ready
+        single = Tx.Statement "SELECT first" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
+    withResponse failed $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        cursor <- run (Tx.pipeline (Tx.statement () (queryOf "SELECT first")))
+        try @PG.QueryError (run (Tx.discard cursor)) >>= \case
+          Left (PG.QueryError "SELECT first" (PG.ServerFailed _)) -> pure ()
+          _ -> failTest "discarding hid the failure of the result"
+    withResponse cardinality $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        cursor <- run (Tx.pipeline (Tx.statement () single))
+        try @PG.QueryError (run (Tx.discard cursor)) >>= \case
+          Left (PG.QueryError "SELECT first" (PG.UnexpectedAmountOfRows 2)) -> pure ()
+          _ -> failTest "discarding hid the row count of the result"
+
+  it "reads a result while an earlier preparation is unread, which stays answered" $
+    withResponse (command "BEGIN" <> rows [[Just "answer"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        let known = Tx.Statement "SELECT prepared" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
+        (preparation, result) <- run (Tx.pipeline ((,) <$> Tx.prepare "stmt" () known <*> Tx.executePrepared "stmt" () known))
+        run (Tx.singleRowValue result) `shouldReturn` "answer"
+        run (Tx.awaitPreparation preparation)
+        run Tx.finishTransaction
+
+  it "awaits a preparation after the earlier results were consumed or discarded" $
+    withResponse (command "BEGIN" <> rows [[Just "first"]] <> rows [[Just "second"]] <> parse <> parse <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        let known = Tx.Statement "SELECT prepared" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
+        (consumed, discarded, earlier, preparation) <- run $ Tx.pipeline $ (,,,)
+          <$> Tx.statement () (queryOf "SELECT first") <*> Tx.statement () (queryOf "SELECT second") <*> Tx.prepare "earlier" () known <*> Tx.prepare "stmt" () known
+        run (Tx.rowList consumed) `shouldReturn` ["first"]
+        run (Tx.discard discarded)
+        -- The preparation before it is read past.
+        run (Tx.awaitPreparation preparation)
+        run (Tx.awaitPreparation earlier)
+        run Tx.finishTransaction
+
+  it "refuses to await a preparation while an earlier result is unread, and aborts the transaction" $
+    withResponse (command "BEGIN" <> rows [[Just "first"]] <> parse <> readyTx <> command "ROLLBACK" <> ready) $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        let known = Tx.Statement "SELECT prepared" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
+        (_, preparation) <- run (Tx.pipeline ((,) <$> Tx.statement () (queryOf "SELECT first") <*> Tx.prepare "stmt" () known))
+        try @ConnectionError (run (Tx.awaitPreparation preparation)) `shouldReturn` Left (ResultOutOfOrder 1)
+        try @ConnectionError (run Tx.finishTransaction) `shouldReturn` Left (ResultOutOfOrder 1)
+
+  it "reports the failure of a statement before a preparation instead of the out-of-order await" $
+    withResponse (command "BEGIN" <> parse <> bind <> lateError <> readyFailed <> command "ROLLBACK" <> ready) $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        let known = Tx.Statement "SELECT prepared" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
+        (_, preparation) <- run (Tx.pipeline ((,) <$> Tx.statement () (queryOf "SELECT first") <*> Tx.prepare "stmt" () known))
+        try @PG.QueryError (run (Tx.awaitPreparation preparation)) >>= \case
+          Left (PG.QueryError "SELECT first" (PG.ServerFailed _)) -> pure ()
+          _ -> failTest "the failure of the earlier statement was replaced"
+
+  it "raises the out-of-order await, and keeps a wrong row count as the failure of the transaction" $
+    withResponse (command "BEGIN" <> rows [[Just "a"], [Just "b"]] <> parse <> readyTx <> command "ROLLBACK" <> ready) $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        let known = Tx.Statement "SELECT prepared" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
+            single = Tx.Statement "SELECT first" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
+        (_, preparation) <- run (Tx.pipeline ((,) <$> Tx.statement () single <*> Tx.prepare "stmt" () known))
+        -- The server parsed the name, so no QueryError may say it did not.
+        try @ConnectionError (run (Tx.awaitPreparation preparation)) `shouldReturn` Left (ResultOutOfOrder 1)
+        try @PG.QueryError (run Tx.finishTransaction) >>= \case
+          Left (PG.QueryError "SELECT first" (PG.UnexpectedAmountOfRows 2)) -> pure ()
+          _ -> failTest "the row count was lost"
+
+  it "still drops the unread results of a pipeline when the next one is sent" $
+    withResponse (command "BEGIN" <> rows [[Just "dropped"]] <> readyTx <> rows [[Just "kept"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        _ <- run (Tx.pipeline (Tx.statement () (queryOf "SELECT dropped")))
+        later <- run (Tx.pipeline (Tx.statement () (queryOf "SELECT kept")))
+        run (Tx.rowList later) `shouldReturn` ["kept"]
         run Tx.finishTransaction
 
   it "rejects a field after its row advances" $
@@ -765,6 +908,10 @@ positionsOf needle = go 0
         | BS.null rest -> []
         | otherwise -> let end = BS.length before + BS.length needle
                         in (offset + BS.length before) : go (offset + end) (BS.drop end haystack)
+
+-- | A statement whose rows are owned values.
+queryOf :: BS.ByteString -> Tx.Statement () (Const BS.ByteString)
+queryOf sql = Tx.Statement sql (const []) (Tx.row @'[BS.ByteString] Const)
 
 dataRow :: [Maybe BS.ByteString] -> BS.ByteString
 dataRow columns = message 68 (BS.pack [0, fromIntegral (length columns)]
