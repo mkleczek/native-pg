@@ -59,7 +59,7 @@ render (Snippet chunks) = finish (foldl' step (1 :: Int, mempty, id) (chunks [])
     finish (_, query, parameters) = (LBS.toStrict (Builder.toLazyByteString query), parameters [])
 
 -- | A statement of the snippet, whose parameters are all in it.
-dynamicallyParameterized :: Snippet -> RowDecoder row -> Bool -> Statement () row
-dynamicallyParameterized snippet result preparable =
+dynamicallyParameterized :: Snippet -> RowDecoder row -> Statement () row
+dynamicallyParameterized snippet result =
   let (query, parameters) = render snippet
-   in Statement query (const parameters) result preparable
+   in Statement query (const parameters) result

@@ -20,7 +20,7 @@ import Data.Functor (($>))
 import Data.Functor.Const (Const (..))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
-import Data.IORef (modifyIORef, newIORef, readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int16, Int32, Int64)
 import Data.List (intercalate)
 import Data.Maybe (isJust)
@@ -553,8 +553,8 @@ spec socketPath port = do
 
   describe "transactions" $ do
     let createItems session = void (query session "CREATE TEMP TABLE tx_items (n int)" [])
-        countItems = Tx.Statement "SELECT count(*) FROM tx_items" (const []) (Tx.singleRow (Tx.row @'[Int64] Const)) False
-        insertItem = Tx.Statement "INSERT INTO tx_items VALUES ($1)" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) Tx.noResult False
+        countItems = Tx.Statement "SELECT count(*) FROM tx_items" (const []) (Tx.singleRow (Tx.row @'[Int64] Const))
+        insertItem = Tx.Statement "INSERT INTO tx_items VALUES ($1)" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) Tx.noResult
         insert value = void (Tx.pipeline (Tx.statement value insertItem))
         items = committed Tx.ReadCommitted Tx.Read (owned () countItems)
         failsWith check = P.left (P.con (Tx.QueryError P.anything check))
@@ -575,30 +575,72 @@ spec socketPath port = do
       committed
         Tx.RepeatableRead
         Tx.Read
-        (owned () (Tx.Statement "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')" (const []) (Tx.singleRow (Tx.row @'[Text, Text] (curry Const))) False))
+        (owned () (Tx.Statement "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')" (const []) (Tx.singleRow (Tx.row @'[Text, Text] (curry Const)))))
         session
         `shouldReturn` Right ("repeatable read", "on")
-    it "prepares a preparable statement as its Prepare says, and runs the others unnamed" $ withSession $ \session -> do
-      asked <- newIORef []
-      parsed <- newIORef []
-      let prepareAs name query' _ = do
-            modifyIORef asked (query' :)
-            pure (Tx.PrepareAs name (modifyIORef parsed (name :)))
-          named = Tx.Statement "SELECT count(*) FROM pg_prepared_statements WHERE name = 'answer'" (const []) (Tx.singleRow (Tx.row @'[Int64] Const)) False
-          answer = Tx.Statement "SELECT $1::int4 + 1" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) (Tx.singleRow (Tx.row @'[Int32] Const)) True
-      committedWith (prepareAs "answer") Tx.ReadCommitted Tx.Read ((,) <$> owned "41" answer <*> owned () named) session
-        `shouldReturn` Right (42, 1)
-      readIORef asked `shouldReturn` ["SELECT $1::int4 + 1"]
-      readIORef parsed `shouldReturn` ["answer"]
-      committedWith (\_ _ -> pure (Tx.PreparedAs "answer")) Tx.ReadCommitted Tx.Read (owned "1" answer) session
+    let textParam value = [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]
+        answer = Tx.Statement "SELECT $1::int4 + 1" textParam (Tx.singleRow (Tx.row @'[Int32] Const))
+        divided = Tx.Statement "SELECT 1 / $1::int4" textParam Tx.noResult
+        dividingByZero = Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult
+        -- A client has no SQL to render for a name it knows.
+        unrendered known = known {Tx.statementSql = error "SQL forced"}
+        preparedNames session = query session "SELECT name FROM pg_prepared_statements ORDER BY name" []
+    it "runs a statement prepared earlier on the connection by its name, without evaluating its SQL" $ withSession $ \session -> do
+      committed Tx.ReadCommitted Tx.Read (resultOf (Tx.prepareAs "answer" "41" answer)) session
+        `shouldReturn` Right 42
+      committed Tx.ReadCommitted Tx.Read (resultOf (Tx.executePrepared "answer" "1" (unrendered answer))) session
         `shouldReturn` Right 2
-      result <- committedWith (prepareAs "broken") Tx.ReadCommitted Tx.Read (void (Tx.pipeline (Tx.statement () (Tx.Statement "SELEC 1" (const []) Tx.noResult True)))) session
-      result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELEC 1") (servedCode "42601")))
-      readIORef parsed `shouldReturn` ["answer"]
-      let divided = Tx.Statement "SELECT 1 / $1::int4" (\value -> [Tx.Param Nothing TextFormat (Just (ParameterBytes value))]) Tx.noResult True
-      failing <- committedWith (prepareAs "divided") Tx.ReadCommitted Tx.Read (void (Tx.pipeline (Tx.statement "0" divided))) session
-      failing `shouldSatisfy` failsWith (servedCode "22012")
-      readIORef parsed `shouldReturn` ["divided", "answer"]
+      let twice = do
+            (left, right) <- Tx.pipeline ((,) <$> Tx.executePrepared "answer" "2" (unrendered answer) <*> Tx.executePrepared "answer" "3" (unrendered answer))
+            (,) <$> Tx.singleRowValue left <*> Tx.singleRowValue right
+      committed Tx.ReadCommitted Tx.Read twice session `shouldReturn` Right (3, 4)
+      preparedNames session `shouldReturn` (Right ([[Just "answer"]], "SELECT 1"), TxIdle)
+      unknown <- committed Tx.ReadCommitted Tx.Read (resultOf (Tx.executePrepared "unknown" "1" (unrendered answer))) session
+      -- A predicate on the error would render it, and so evaluate its SQL.
+      case unknown of
+        Left (Tx.QueryError _ (Tx.ServerFailed failure)) -> errorCode failure `shouldBe` Just "26000"
+        _ -> failTest "expected a server failure"
+      query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
+    it "can close the names of a failed pipeline, whether or not the server parsed them, and prepare again" $ withSession $ \session -> do
+      broken <- inPipeline (Tx.prepareAs "broken" () (Tx.Statement "SELEC 1" (const []) Tx.noResult)) session
+      broken `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELEC 1") (servedCode "42601")))
+      skipped <- inPipeline (Tx.statement () dividingByZero *> Tx.prepareAs "skipped" "1" divided) session
+      skipped `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELECT 1 / 0") (servedCode "22012")))
+      -- The server never parsed these two.
+      preparedNames session `shouldReturn` (Right ([], "SELECT 0"), TxIdle)
+      dividing <- inPipeline (Tx.prepareAs "divided" "0" divided) session
+      dividing `shouldSatisfy` failsWith (servedCode "22012")
+      -- It kept this one, though its execution failed and the transaction rolled back.
+      preparedNames session `shouldReturn` (Right ([[Just "divided"]], "SELECT 1"), TxIdle)
+      again <- inPipeline (Tx.prepareAs "divided" "1" divided) session
+      again `shouldSatisfy` failsWith (servedCode "42P05")
+      -- Closing a name succeeds whether the server has it or not.
+      for_ ["broken", "skipped", "divided"] $ \name ->
+        closeStatement session name `shouldReturn` (Right (), TxIdle)
+      preparedNames session `shouldReturn` (Right ([], "SELECT 0"), TxIdle)
+      committed Tx.ReadCommitted Tx.Read (resultOf (Tx.prepareAs "fresh" "41" answer)) session `shouldReturn` Right 42
+      committed Tx.ReadCommitted Tx.Read (resultOf (Tx.executePrepared "fresh" "1" (unrendered answer))) session `shouldReturn` Right 2
+      inPipeline (Tx.prepareAs "divided" "1" divided) session `shouldReturn` Right ()
+    it "prepares and runs named statements in one pipeline with writes, including a name prepared earlier in it" $ withSession $ \session -> do
+      createItems session
+      let firstTime = do
+            (_, counted, incremented, again, recounted) <- Tx.pipeline $ (,,,,)
+              <$> Tx.statement "1" insertItem
+              <*> Tx.prepareAs "count_items" () countItems
+              <*> Tx.prepareAs "answer" "41" answer
+              <*> Tx.executePrepared "answer" "1" (unrendered answer)
+              <*> (Tx.statement "2" insertItem *> Tx.executePrepared "count_items" () (unrendered countItems))
+            (,,,) <$> Tx.singleRowValue counted <*> Tx.singleRowValue incremented <*> Tx.singleRowValue again <*> Tx.singleRowValue recounted
+          later = do
+            (_, counted, incremented) <- Tx.pipeline $ (,,)
+              <$> Tx.statement "3" insertItem
+              <*> Tx.executePrepared "count_items" () (unrendered countItems)
+              <*> Tx.executePrepared "answer" "9" (unrendered answer)
+            (,) <$> Tx.singleRowValue counted <*> Tx.singleRowValue incremented
+      committed Tx.ReadCommitted Tx.Write firstTime session `shouldReturn` Right (1, 42, 2, 2)
+      committed Tx.ReadCommitted Tx.Write later session `shouldReturn` Right (3, 10)
+      preparedNames session `shouldReturn` (Right ([[Just "answer"], [Just "count_items"]], "SELECT 2"), TxIdle)
+      items session `shouldReturn` Right 3
     it "runs a pipeline's statements in order, and gives their results" $ withSession $ \session -> do
       createItems session
       let operation = do
@@ -609,11 +651,11 @@ spec socketPath port = do
     it "skips a pipeline's statements after one that fails on the server, and reports that one" $ withSession $ \session -> do
       createItems session
       result <- committed Tx.ReadCommitted Tx.Write
-        (void (Tx.pipeline (Tx.statement "1" insertItem *> Tx.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult False) *> Tx.statement "2" insertItem))) session
+        (void (Tx.pipeline (Tx.statement "1" insertItem *> Tx.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult) *> Tx.statement "2" insertItem))) session
       result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELECT 1 / 0") (servedCode "22012")))
       items session `shouldReturn` Right 0
     it "reads a pipeline's results after one that doesn't decode, and stays usable" $ withSession $ \session -> do
-      let number sql' = Tx.statement () (Tx.Statement sql' (const []) (Tx.singleRow (Tx.row @'[Int32] Const)) False)
+      let number sql' = Tx.statement () (Tx.Statement sql' (const []) (Tx.singleRow (Tx.row @'[Int32] Const)))
           operation = do
             (bad, good) <- Tx.pipeline ((,) <$> number "SELECT 'abc'::text" <*> number "SELECT 2::int4")
             (,) <$> Tx.singleRowValue bad <*> Tx.singleRowValue good
@@ -637,14 +679,14 @@ spec socketPath port = do
       items session `shouldReturn` Right 0
     it "rolls back after a statement in the final pipeline fails" $ withSession $ \session -> do
       createItems session
-      let failing = Tx.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult False)
+      let failing = Tx.statement () (Tx.Statement "SELECT 1 / 0" (const []) Tx.noResult)
       result <- committed Tx.ReadCommitted Tx.Write (void (Tx.finalPipeline (Tx.statement "1" insertItem *> failing))) session
       result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELECT 1 / 0") (servedCode "22012")))
       items session `shouldReturn` Right 0
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
     it "reports a failure at commit in the final pipeline, after which the transaction is over" $ withSession $ \session -> do
       void (query session "CREATE TEMP TABLE tx_unique (n int UNIQUE DEFERRABLE INITIALLY DEFERRED)" [])
-      let insertBoth = Tx.statement () (Tx.Statement "INSERT INTO tx_unique VALUES (1)" (const []) Tx.noResult False)
+      let insertBoth = Tx.statement () (Tx.Statement "INSERT INTO tx_unique VALUES (1)" (const []) Tx.noResult)
       result <- committed Tx.ReadCommitted Tx.Write (void (Tx.finalPipeline (insertBoth *> insertBoth))) session
       result `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "COMMIT") (servedCode "23505")))
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
@@ -653,7 +695,7 @@ spec socketPath port = do
         `shouldSatisfy` P.throws (P.eq (SessionUnusable "a statement followed the final pipeline"))
     it "checks how many rows a result has" $ withSession $ \session -> do
       let numbers :: Int -> Tx.RowDecoder row -> Tx.Transaction tx (Tx.Result tx row)
-          numbers count shape = Tx.pipeline (Tx.statement () (Tx.Statement ("SELECT n FROM generate_series(1, " <> Char8.pack (show count) <> ") n") (const []) shape False))
+          numbers count shape = Tx.pipeline (Tx.statement () (Tx.Statement ("SELECT n FROM generate_series(1, " <> Char8.pack (show count) <> ") n") (const []) shape))
           number = Tx.row @'[Int32] Const
           run :: (forall tx. Tx.Transaction tx a) -> IO (Either Tx.QueryError a)
           run operation = committed Tx.ReadCommitted Tx.Read operation session
@@ -664,7 +706,7 @@ spec socketPath port = do
       run (numbers 3 number >>= Tx.rowList) `shouldReturn` Right [1, 2, 3]
       run (void (numbers 3 Tx.noResult)) `shouldReturn` Right ()
     it "reports a row that doesn't decode" $ withSession $ \session -> do
-      result <- committed Tx.ReadCommitted Tx.Read (owned () (Tx.Statement "SELECT 'abc'::text" (const []) (Tx.singleRow (Tx.row @'[Int32] Const)) False)) session
+      result <- committed Tx.ReadCommitted Tx.Read (owned () (Tx.Statement "SELECT 'abc'::text" (const []) (Tx.singleRow (Tx.row @'[Int32] Const)))) session
       result `shouldSatisfy` failsWith (P.con (Tx.RowFailed P.anything))
     it "streams a column larger than the read buffer within the transaction" $ withSession $ \session ->
       committed Tx.ReadCommitted Tx.Read
@@ -697,7 +739,7 @@ spec socketPath port = do
               <> "::text, "
               <> Snippet.encoderAndParam (Encoders.nullable Encoders.bytea) Nothing
               <> " IS NULL"
-          preparedQuery = Snippet.dynamicallyParameterized snippet (Tx.singleRow (Tx.row @'[Int32, Text, Text, Text, Bool] (\n a b c d -> Const (n, a, b, c, d)))) False
+          preparedQuery = Snippet.dynamicallyParameterized snippet (Tx.singleRow (Tx.row @'[Int32, Text, Text, Text, Bool] (\n a b c d -> Const (n, a, b, c, d))))
       committed Tx.ReadCommitted Tx.Read (owned () preparedQuery) session
         `shouldReturn` Right (42, "a,zażółć", "1", "[1, 2]", True)
 
@@ -748,9 +790,13 @@ committed :: Tx.IsolationLevel -> Tx.Mode -> (forall tx. Tx.Transaction tx a) ->
 committed isolation mode action session = try $
   Tx.runTransaction isolation mode session (action <* Tx.finishTransaction)
 
-committedWith :: Tx.Prepare -> Tx.IsolationLevel -> Tx.Mode -> (forall tx. Tx.Transaction tx a) -> Session -> IO (Either Tx.QueryError a)
-committedWith prepareStatement isolation mode action session = try $
-  Tx.runTransactionWith prepareStatement isolation mode session (action <* Tx.finishTransaction)
+-- | A transaction with one pipeline, which is committed unless a statement fails.
+inPipeline :: (forall tx. Tx.Pipeline tx (Tx.Result tx row)) -> Session -> IO (Either Tx.QueryError ())
+inPipeline step = committed Tx.ReadCommitted Tx.Read (void (Tx.pipeline step))
+
+-- | Adds a statement to a pipeline of its own and takes its one row.
+resultOf :: Tx.Pipeline tx (Tx.Result tx (Const value)) -> Tx.Transaction tx value
+resultOf step = Tx.pipeline step >>= Tx.singleRowValue
 
 owned :: parameters -> Tx.Statement parameters (Const value) -> Tx.Transaction tx value
 owned parameters sqlStatement = Tx.pipeline (Tx.statement parameters sqlStatement) >>= Tx.singleRowValue
@@ -759,7 +805,7 @@ data StreamedNumber tx = StreamedNumber Int32 (Maybe (Tx.Field tx))
 
 streamedLengths :: ByteString -> Tx.Transaction tx (Int32, Maybe (Int, Int))
 streamedLengths sqlText = do
-  cursor <- Tx.pipeline (Tx.statement () (Tx.Statement sqlText (const []) (Tx.singleRow (Tx.streamingRow @'[Int32] StreamedNumber)) False))
+  cursor <- Tx.pipeline (Tx.statement () (Tx.Statement sqlText (const []) (Tx.singleRow (Tx.streamingRow @'[Int32] StreamedNumber))))
   Tx.nextRow cursor >>= \case
     Nothing -> liftIO (failTest "expected one streamed row")
     Just (StreamedNumber number stream) -> (number,) <$> traverse lengths stream

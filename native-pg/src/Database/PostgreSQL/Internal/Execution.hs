@@ -13,7 +13,6 @@ module Database.PostgreSQL.Internal.Execution
 
 import Control.Exception (throwIO)
 import Data.Bifunctor (first)
-import Data.Foldable (for_)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef')
 import Data.Int (Int32)
@@ -35,9 +34,8 @@ data Statement
   | -- | A statement prepared earlier under this name.
     Prepared ByteString
   | -- | SQL parsed and prepared under the name, with its parameters' types,
-    -- and run. The action runs once the server has parsed it, e.g. to
-    -- remember that the statement is prepared, even if running it fails.
-    Preparing ByteString ByteString [Maybe Word32] (IO ())
+    -- and run.
+    Preparing ByteString ByteString [Maybe Word32]
 
 data Execution = Execution
   { executionStatement :: Statement,
@@ -115,10 +113,7 @@ startExecution session execution = do
     Prepared _
       | streamsParameter execution -> described
       | otherwise -> pure (Right ())
-    Preparing _ _ _ onParsed -> do
-      parsed <- parseComplete
-      for_ parsed (const onParsed)
-      pure parsed
+    Preparing _ _ _ -> parseComplete
   case parsed of
     Left failure -> pure (Left failure)
     Right () -> do
@@ -181,7 +176,7 @@ executionMessages execution =
       Prepared name
         | streamsParameter execution -> (serialize (Describe PreparedStatement name), name)
         | otherwise -> (mempty, name)
-      Preparing name query parameterTypes _ -> (serialize (Parse name query (map (fmap Scalar) parameterTypes)), name)
+      Preparing name query parameterTypes -> (serialize (Parse name query (map (fmap Scalar) parameterTypes)), name)
 
 -- | Whether a parameter of the execution streams.
 streamsParameter :: Execution -> Bool

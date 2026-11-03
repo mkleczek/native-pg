@@ -31,7 +31,8 @@ The library does none of the following:
 - **Prepared statement caching.** The client names its statements and
   decides when to `Parse` and `Close` them. Only the client knows a good
   cache key: PostgREST, for example, can key on the request plan instead of
-  generating SQL text just to look a statement up.
+  generating SQL text just to look a statement up. The library has no cache
+  and no preparation callback; see [Prepared statements](#prepared-statements).
 - **Tenant policy.** Applications choose connection-pool sizes, create tenant
   pools and decide which requests use them. The optional pool API supplies
   connection lifecycle and targeted waiting.
@@ -720,9 +721,9 @@ any -> Broken | Closed
 ### Transaction and streaming API
 
 `Database.PostgreSQL.Transaction` owns the query API: `Statement`, `Pipeline`,
-`RowDecoder`, `Result`, `Field`, preparation selection and transaction actions.
-Statements describe SQL, parameters, row decoding, cardinality and preparation
-eligibility. They do not refer to HTTP, sinks, sessions or buffer allocation.
+`RowDecoder`, `Result`, `Field`, prepared-statement steps and transaction actions.
+Statements describe SQL, parameters, row decoding and cardinality. They do not
+refer to HTTP, sinks, sessions or buffer allocation.
 There are no separate statement, pipeline or pull transaction modules.
 
 `runTransaction` runs a rank-2 `Transaction tx` action and owns its cleanup.
@@ -831,10 +832,13 @@ top of them, through typeclass metaprogramming:
 ### Prepared statements
 
 - The private execution engine maps operations onto protocol messages.
-  Applications supply a `Prepare` callback to `Transaction.runTransactionWith`
-  and select eligible statements with `statementPreparable`. The callback
-  returns `PreparedAs` for an existing name or `PrepareAs` with an action run
-  after the server accepts its parse, even if execution later fails. Applications
+  The library keeps no cache of prepared statements and has no preparation
+  callback. The client picks one of three pipeline steps for each statement.
+  `statement` parses its SQL as the unnamed statement. `prepareAs name`
+  parses it under `name` with the parameter types, and then binds and executes
+  it. `executePrepared name` binds and executes a statement parsed earlier under
+  that name, and never evaluates `statementSql`, so a client that knows the
+  name need not render the SQL. Applications
   can deallocate with `Session.closeStatement`. Internally, `prepare` sends
   `Parse` and `Sync`, `closeStatement` sends `Close` and `Sync`, and `execute` sends
   `Bind`, `Execute` and `Sync`, all in one write. An `Unprepared` statement
@@ -844,6 +848,22 @@ top of them, through typeclass metaprogramming:
   exists on a connection: prepared statements are per session. The client
   tracks which connections have which statements, and re-prepares when it
   gets SQLSTATE 26000 (`invalid_sql_statement_name`).
+- The steps are queued exactly like `statement`, so they add no round trips
+  and can share a pipeline with other statements and a write. The library
+  offers no hook to look a name up: the client resolves each statement against
+  its cache before it builds the transaction, and passes the chosen step in.
+  A pipeline can `executePrepared` a name that an earlier step of the same
+  pipeline `prepareAs`, because the `Parse` is written before the later `Bind`;
+  it must not `prepareAs` one name twice. The server rejects a name already in
+  use with SQLSTATE 42P05, and an unknown one with 26000, as a `QueryError`
+  that carries `statementSql` unevaluated.
+- The library doesn't report whether the server accepted a `Parse`. The server
+  keeps a parsed name even if its execution failed or the transaction rolled
+  back, and never parses the statements it skips after an error. So a client
+  that records a name only after the transaction attempt completed without
+  error closes every name it tried in a failed attempt with
+  `Session.closeStatement`. That succeeds whether or not the server has the
+  name: the protocol doesn't treat closing a missing statement as an error.
 - Parameter OIDs are optional, allowing the server to infer their types.
 
 ### HTTP/1.1 usage

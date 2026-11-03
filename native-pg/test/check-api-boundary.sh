@@ -84,6 +84,9 @@ for private_symbol in \
   'Session (isConnectionUsable)' \
   'Transaction (withTransaction)' \
   'Transaction (withTransactionWith)' \
+  'Transaction (runTransactionWith)' \
+  'Transaction (Prepare)' \
+  'Transaction (Prepared)' \
   'Transaction (transactionNoRetryIn)' \
   'Transaction (transactionNoRetryWithIn)' \
   'Session (connect)' \

@@ -68,10 +68,10 @@ sessions remain available for standalone integrations.
 Client code uses `ConnectionString`, `Session`, `Streaming`, `Transaction`,
 `Encoders`, `Decoding`, `Diagnostics`, `Snippet` and `Pool`.
 `Database.PostgreSQL.Transaction` implements statements, applicative pipelines,
-prepared-statement selection and transaction-scoped result cursors in one module.
+prepared-statement steps and transaction-scoped result cursors in one module.
 `Transaction`, `Pipeline`, `Result`, `Field` and `RowDecoder` are abstract;
-`Statement` describes SQL, parameters, its row schema and preparation eligibility.
-Parameter types and preparation callbacks use ordinary `Word32` OIDs.
+`Statement` describes SQL, parameters and its row schema.
+Parameter types use ordinary `Word32` OIDs.
 `Session` exposes connection controls, prepared-statement deallocation and
 cancellation. Raw execution, batching, row access and protocol phases are private.
 `Transport` is the extension API for TLS providers: implement `Link`, build an
@@ -101,13 +101,26 @@ returning one owned integer is run as:
 
 ```haskell
 let query = Tx.Statement "SELECT 42::bigint" (const [])
-      (Tx.singleRow (Tx.row @'[Int64] Const)) False
+      (Tx.singleRow (Tx.row @'[Int64] Const))
 Tx.runTransaction Tx.ReadCommitted Tx.Read session $ do
   cursor <- Tx.pipeline (Tx.statement () query)
   value <- Tx.singleRowValue cursor
   Tx.finishTransaction
   pure value
 ```
+
+`statement` parses its SQL as the unnamed statement. The library keeps no cache of
+prepared statements and has no callback for one: a client with its own
+per-connection cache of names picks `prepareAs name params statement`, which
+parses under `name`, or `executePrepared name params statement`, which binds and
+executes a name parsed earlier on that connection and never evaluates
+`statementSql`. All three are pipeline steps and add no round trips, and an
+`executePrepared` may follow a `prepareAs` of the same name in one pipeline. The
+client resolves its cache before it builds the transaction. The server keeps a
+parsed name even if execution fails or the transaction rolls back, so a client
+that did not see its attempt succeed closes the names it tried, and removes
+evicted names, with `Session.closeStatement`; closing a missing name is not an
+error.
 
 `finishTransaction` drains unread rows, checks statement completion and observes
 `COMMIT`, or `ROLLBACK` when condemned. An empty transaction sends nothing.

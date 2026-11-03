@@ -429,10 +429,9 @@ spec = do
       fmap (map paramView) (Snippet.render snippet)
         `shouldBe` ("SELECT $1, $2 WHERE true", [(Just 705, TextFormat, Just "1"), (Just 17, BinaryFormat, Nothing)])
     it "makes a statement of the SQL and the parameters" $ do
-      let statement = Snippet.dynamicallyParameterized snippet Tx.noResult True
+      let statement = Snippet.dynamicallyParameterized snippet Tx.noResult
       Tx.statementSql statement `shouldBe` "SELECT $1, $2 WHERE true"
       map paramView (Tx.statementParams statement ()) `shouldBe` [(Just 705, TextFormat, Just "1"), (Just 17, BinaryFormat, Nothing)]
-      Tx.statementPreparable statement `shouldBe` True
 
   describe "encoders" $ do
     it "sends the type OIDs, formats and bytes of hasql's encoders" $ do

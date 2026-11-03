@@ -39,7 +39,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
     withConnection $ \connection input output -> do
       total <- newIORef 0
       let statement = Tx.Statement "SELECT 42::bigint, repeat('h', 96), repeat('x', 256)" (const [])
-            (Tx.singleRow (Tx.streamingRow @'[Int64, BS.ByteString] Headers)) False
+            (Tx.singleRow (Tx.streamingRow @'[Int64, BS.ByteString] Headers))
       result <- Streaming.withBuffers input output connection $ \session ->
         Tx.runTransaction Tx.ReadCommitted Tx.Read session $ withRunInIO $ \run -> do
           cursor <- run (Tx.pipeline (Tx.statement () statement))
@@ -77,7 +77,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
                   pure result
               statement = Tx.Statement "SELECT $1::bytea"
                 (const [Param (Just 17) BinaryFormat (Just (ParameterBorrowedStream 16385 source))])
-                (Tx.singleRow (Tx.streamingRow @'[] Body)) False
+                (Tx.singleRow (Tx.streamingRow @'[] Body))
           Streaming.withOperation access connection $ \session ->
             Tx.runTransaction Tx.ReadCommitted Tx.Read session $ withRunInIO $ \run -> do
               cursor <- run (Tx.pipeline (Tx.statement () statement))
@@ -96,7 +96,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
     withConnection $ \connection input output -> do
       delivered <- newIORef False
       let statement = Tx.Statement "SELECT repeat('x', 256)" (const [])
-            (Tx.singleRow (Tx.streamingRow @'[] Body)) False
+            (Tx.singleRow (Tx.streamingRow @'[] Body))
       result <- Streaming.withBuffers input output connection $ \session ->
         try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Write session $ withRunInIO $ \run -> do
           run (Tx.sql "CREATE TEMP TABLE context_parent (id int PRIMARY KEY)")
@@ -119,7 +119,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
     withConnection $ \connection input output -> do
       total <- newIORef 0
       let statement = Tx.Statement "SELECT 42::bigint, repeat('x', 256)" (const [])
-            (Tx.singleRow (Tx.streamingRow @'[Int64] PullBody)) False
+            (Tx.singleRow (Tx.streamingRow @'[Int64] PullBody))
       Streaming.withBuffers input output connection $ \session ->
         Tx.runTransaction Tx.ReadCommitted Tx.Read session $ withRunInIO $ \run -> do
           cursor <- run (Tx.pipeline (Tx.statement () statement))
@@ -138,7 +138,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
     withConnection $ \connection input output -> do
       delivered <- newIORef False
       let statement = Tx.Statement "SELECT 42::bigint, repeat('x', 256)" (const [])
-            (Tx.singleRow (Tx.streamingRow @'[Int64] PullBody)) False
+            (Tx.singleRow (Tx.streamingRow @'[Int64] PullBody))
       result <- Streaming.withBuffers input output connection $ \session ->
         try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Write session $ withRunInIO $ \run -> do
           run (Tx.sql "CREATE TEMP TABLE pull_parent (id int PRIMARY KEY)")
@@ -157,7 +157,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
           diagnosticCode fields `shouldBe` "23503"
         _ -> failTest "expected the deferred foreign-key failure from COMMIT"
       PG.isUsable connection `shouldReturn` True
-      let reused = Tx.Statement "SELECT 42::bigint" (const []) (Tx.singleRow (Tx.row @'[Int64] Const)) False
+      let reused = Tx.Statement "SELECT 42::bigint" (const []) (Tx.singleRow (Tx.row @'[Int64] Const))
       Streaming.withBuffers input output connection (\session ->
         Tx.runTransaction Tx.ReadCommitted Tx.Read session $ withRunInIO $ \run -> do
           value <- run (Tx.pipeline (Tx.statement () reused) >>= Tx.singleRowValue)

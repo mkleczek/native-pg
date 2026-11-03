@@ -33,8 +33,11 @@ import Network.Streaming.BufferPool
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.PositiveInt (positiveInt)
 
-prepare :: Transaction.Prepare -> ByteString -> [Maybe Word32] -> IO Transaction.Prepared
-prepare = id
+prepareNamed :: ByteString -> params -> Transaction.Statement params row -> Transaction.Pipeline tx (Transaction.Result tx row)
+prepareNamed = Transaction.prepareAs
+
+executeNamed :: ByteString -> params -> Transaction.Statement params row -> Transaction.Pipeline tx (Transaction.Result tx row)
+executeNamed = Transaction.executePrepared
 
 parameterType :: Transaction.Param -> Maybe Word32
 parameterType = Transaction.paramType
@@ -44,13 +47,13 @@ closeSession = close . connection
 
 query :: ByteString -> Transaction.Pipeline tx (Transaction.Result tx (Const Int64))
 query sql = Transaction.statement () $
-  Transaction.Statement sql (const []) (Transaction.singleRow (Transaction.row @'[Int64] Const)) False
+  Transaction.Statement sql (const []) (Transaction.singleRow (Transaction.row @'[Int64] Const))
 
 newtype MaybeField tx = MaybeField (Maybe (Transaction.Field tx))
 
 streamed :: Transaction.Statement () MaybeField
 streamed = Transaction.Statement "SELECT 'body'::text" (const [])
-  (Transaction.singleRow (Transaction.streamingRow @'[] MaybeField)) False
+  (Transaction.singleRow (Transaction.streamingRow @'[] MaybeField))
 
 owned :: Transaction.Result tx (Const Int64) -> Transaction.Transaction tx [Int64]
 owned = Transaction.rowList
@@ -71,7 +74,7 @@ data Response tx = Response Int64 (Maybe (Transaction.Field tx))
 
 responseStatement :: Transaction.Statement () Response
 responseStatement = Transaction.Statement "SELECT 1::bigint, 'body'::text" (const [])
-  (Transaction.singleRow (Transaction.streamingRow @'[Int64] Response)) False
+  (Transaction.singleRow (Transaction.streamingRow @'[Int64] Response))
 
 transaction :: Session -> IO ()
 transaction session = Transaction.runTransaction Transaction.ReadCommitted Transaction.Read session $ do

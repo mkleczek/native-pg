@@ -125,7 +125,7 @@ spec = describe "borrowed field streams" $ do
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         inside <- newIORef True
         received <- newIORef BS.empty
-        let statement = Tx.Statement "SELECT field" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed)) False
+        let statement = Tx.Statement "SELECT field" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed))
         cursor <- run (Tx.pipeline (Tx.statement () statement))
         result <- run (Tx.nextRow cursor)
         case result of
@@ -138,7 +138,7 @@ spec = describe "borrowed field streams" $ do
   it "keeps NULL handling available through streaming decoders" $
     withTransactionFields [Nothing] $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let statement = Tx.Statement "SELECT NULL" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed)) False
+        let statement = Tx.Statement "SELECT NULL" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed))
         cursor <- run (Tx.pipeline (Tx.statement () statement))
         result <- run (Tx.nextRow cursor)
         case result of
@@ -180,7 +180,7 @@ spec = describe "borrowed field streams" $ do
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         inside <- newIORef True
         received <- newIORef BS.empty
-        let statement = Tx.Statement "SELECT metadata, body" (const []) (Tx.singleRow (Tx.streamingRow @'[BS.ByteString] Metadata)) False
+        let statement = Tx.Statement "SELECT metadata, body" (const []) (Tx.singleRow (Tx.streamingRow @'[BS.ByteString] Metadata))
         cursor <- run (Tx.pipeline (Tx.statement () statement))
         result <- run (Tx.nextRow cursor)
         case result of
@@ -200,7 +200,7 @@ spec = describe "borrowed field streams" $ do
     withResponse response $ \context _ -> do
       delivered <- newIORef False
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let statement = Tx.Statement "SELECT field" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed)) False
+        let statement = Tx.Statement "SELECT field" (const []) (Tx.singleRow (Tx.streamingRow @'[] Streamed))
         cursor <- run (Tx.pipeline (Tx.statement () statement))
         current <- run (Tx.nextRow cursor)
         case current of

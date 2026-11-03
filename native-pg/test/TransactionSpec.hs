@@ -35,7 +35,7 @@ import Skeletest hiding (context)
 newtype Body tx = Body (Maybe (Tx.Field tx))
 
 bodyStatement :: Tx.Statement () Body
-bodyStatement = Tx.Statement "SELECT body" (const []) (Tx.singleRow (Tx.streamingRow @'[] Body)) False
+bodyStatement = Tx.Statement "SELECT body" (const []) (Tx.singleRow (Tx.streamingRow @'[] Body))
 
 spec :: Spec
 spec = describe "canonical transactions" $ do
@@ -91,7 +91,7 @@ spec = describe "canonical transactions" $ do
               bytes <- atomicModifyIORef' remaining (BS.empty,)
               unless (BS.null bytes) (rejectReentry *> rejectReentry)
               pure bytes)
-            query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult False
+            query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
         _ <- run (Tx.pipeline (Tx.statement () query))
         run Tx.finishTransaction
         readIORef attempted `shouldReturn` 2
@@ -112,7 +112,7 @@ spec = describe "canonical transactions" $ do
               bytes <- atomicModifyIORef' remaining (BS.empty,)
               unless (BS.null bytes) (rejectReentry *> rejectReentry)
               pure bytes)
-            query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult False
+            query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
         void (run (Tx.pipeline (Tx.statement () query)))
         readIORef attempted `shouldReturn` 0
       readIORef attempted `shouldReturn` 2
@@ -126,7 +126,7 @@ spec = describe "canonical transactions" $ do
       marker <- newIORef ()
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let source = ParameterStream (ByteStream 1 (throwIO (MarkerFailure marker)))
-            query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult False
+            query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
         result <- try @MarkerFailure (run (Tx.pipeline (Tx.statement () query) *> Tx.finishTransaction))
         case result of
           Left (MarkerFailure actual) -> actual `shouldBe` marker
@@ -147,7 +147,7 @@ spec = describe "canonical transactions" $ do
       writeIORef opened (Just (contextConnection context))
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let source = ParameterStream (ByteStream 1 (throwIO (SessionUnusable "producer marker")))
-            query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult False
+            query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
         _ <- run (Tx.pipeline (Tx.statement () query))
         failure <- try @ConnectionError (run Tx.finishTransaction)
         case failure of
@@ -167,23 +167,6 @@ spec = describe "canonical transactions" $ do
       Just value -> Session.isUsable value `shouldReturn` False
       Nothing -> failTest "transaction context did not open"
 
-  it "poisons a parse observer failure even when it uses a recoverable public exception type" $ do
-    let response = command "BEGIN" <> command "SELECT 1" <> readyTx <> command "ROLLBACK" <> ready
-        prepare _ _ = pure (Tx.PrepareAs "named" (throwIO (SessionUnusable "observer marker")))
-        query = Tx.Statement "SELECT 1" (const []) Tx.noResult True
-    connection <- withResponse response $ \context _ -> do
-      Tx.runTransactionWith prepare Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        failure <- try @ConnectionError (run (Tx.pipeline (Tx.statement () query) *> Tx.finishTransaction))
-        case failure of
-          Left (SessionUnusable detail) -> detail `shouldBe` "observer marker"
-          _ -> failTest "parse observer exception identity was changed"
-        reuse <- try @ConnectionError (run Tx.condemn)
-        case reuse of
-          Left (SessionUnusable _) -> pure ()
-          _ -> failTest "caught parse observer failure allowed another operation"
-      pure (contextConnection context)
-    Session.isUsable connection `shouldReturn` False
-
   it "finishes an empty scope without reading or writing the transport" $ do
     readCalls <- newIORef (0 :: Int)
     writes <- newIORef (0 :: Int)
@@ -193,42 +176,71 @@ spec = describe "canonical transactions" $ do
     readIORef readCalls `shouldReturn` 0
     readIORef writes `shouldReturn` 0
 
-  it "preserves preparation, wire and cursor order across applicative association" $ do
-    prepared <- newIORef []
-    parsed <- newIORef []
+  it "preserves wire and cursor order across applicative association of named statements" $ do
     sent <- newIORef BS.empty
-    let queries = ["SELECT left", "SELECT middle-left", "SELECT middle-right", "SELECT right"]
-        values = ["first", "second", "third", "fourth"]
-        prepare sql _ = do
-          modifyIORef' prepared (<> [sql])
-          pure (Tx.PrepareAs sql (modifyIORef' parsed (<> [sql])))
-        query sql = Tx.statement () (Tx.Statement sql (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const)) True)
+    let values = ["first", "second", "third", "fourth"]
+        query sql = Tx.prepareAs sql () (Tx.Statement sql (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const)))
         response = command "BEGIN" <> foldMap (rows . pure . pure . Just) values <> command "COMMIT" <> ready
     withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) response $ \context _ ->
-      Tx.runTransactionWith prepare Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         (left, middle, right) <- run $ Tx.finalPipeline $
           (,,) <$> query "SELECT left"
             <*> ((,) <$> query "SELECT middle-left" <*> query "SELECT middle-right")
             <*> query "SELECT right"
-        readIORef prepared `shouldReturn` queries
         first <- run (Tx.singleRowValue left)
         second <- run (Tx.singleRowValue (fst middle))
         third <- run (Tx.singleRowValue (snd middle))
         fourth <- run (Tx.singleRowValue right)
         [first, second, third, fourth] `shouldBe` values
         run Tx.finishTransaction
-    readIORef parsed `shouldReturn` queries
     bytes <- readIORef sent
     let wireQueries = ["BEGIN", "SELECT left", "SELECT middle-left", "SELECT middle-right", "SELECT right", "COMMIT\0"]
         positions = map (BS.length . fst . (`BS.breakSubstring` bytes)) wireQueries
     map (`BS.isInfixOf` bytes) wireQueries `shouldBe` replicate 6 True
     positions `shouldBe` sort positions
 
+  it "binds a prepared name without parsing or evaluating the SQL" $ do
+    sent <- newIORef BS.empty
+    let shape = Tx.singleRow (Tx.row @'[BS.ByteString] Const)
+        query = Tx.Statement "SELECT prepared" (const []) shape
+        withoutSql = Tx.Statement (error "SQL forced") (const []) shape
+        response = command "BEGIN" <> rows [[Just "first"]] <> readyTx <> executed [[Just "second"]] <> readyTx
+          <> command "COMMIT" <> ready
+    withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) response $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        first <- run (Tx.pipeline (Tx.prepareAs "stmt" () query) >>= Tx.singleRowValue)
+        second <- run (Tx.pipeline (Tx.executePrepared "stmt" () withoutSql) >>= Tx.singleRowValue)
+        (first, second) `shouldBe` ("first", "second")
+        run Tx.finishTransaction
+    bytes <- readIORef sent
+    -- The name is in the Parse and the first Bind, and in the second Bind alone.
+    length (positionsOf "stmt\0" bytes) `shouldBe` 3
+    length (positionsOf "SELECT prepared" bytes) `shouldBe` 1
+
+  it "writes the Parse of a name before a later Bind of it in the same pipeline" $ do
+    sent <- newIORef BS.empty
+    let shape = Tx.singleRow (Tx.row @'[BS.ByteString] Const)
+        query = Tx.Statement "SELECT prepared" (const []) shape
+        withoutSql = Tx.Statement (error "SQL forced") (const []) shape
+        response = command "BEGIN" <> rows [[Just "first"]] <> executed [[Just "second"]] <> readyTx <> command "COMMIT" <> ready
+    withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) response $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        (first, second) <- run $ Tx.pipeline $
+          (,) <$> Tx.prepareAs "stmt" () query <*> Tx.executePrepared "stmt" () withoutSql
+        values <- (,) <$> run (Tx.singleRowValue first) <*> run (Tx.singleRowValue second)
+        values `shouldBe` ("first", "second")
+        run Tx.finishTransaction
+    bytes <- readIORef sent
+    -- The name is in the Parse before its SQL, then in each Bind.
+    case (positionsOf "stmt\0" bytes, positionsOf "SELECT prepared" bytes) of
+      ([parseName, firstBind, secondBind], [text]) -> (parseName < text, text < firstBind, firstBind < secondBind) `shouldBe` (True, True, True)
+      _ -> failTest "the Parse and Binds were not written once each"
+
   it "isolates pending statements between empty and repeated pipeline plans" $ do
     sent <- newIORef BS.empty
     let response = command "BEGIN" <> readyTx <> rows [[Just "first"]] <> readyTx
           <> rows [[Just "second"]] <> readyTx <> command "COMMIT" <> ready
-        query = Tx.statement () (Tx.Statement "SELECT repeated" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const)) False)
+        query = Tx.statement () (Tx.Statement "SELECT repeated" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const)))
     withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) response $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         run (Tx.pipeline (pure ()))
@@ -262,7 +274,7 @@ spec = describe "canonical transactions" $ do
   it "collects owned and streamed results in one ordered pipeline" $
     withResponse (command "BEGIN" <> rows [[Just payload]] <> rows [[Just payload]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const) False
+        let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const)
         (ownedCursor, streamedCursor) <- run (Tx.pipeline ((,) <$> Tx.statement () owned <*> Tx.statement () bodyStatement))
         run (Tx.rowList ownedCursor) `shouldReturn` [payload]
         streamed <- run (Tx.nextRow streamedCursor)
@@ -279,7 +291,7 @@ spec = describe "canonical transactions" $ do
         record chunks = modifyIORef' sent (<> BS.concat chunks)
     withResponseCallbacks (const (pure ())) record response $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let owned = Tx.Statement "SELECT owned" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const)) False
+        let owned = Tx.Statement "SELECT owned" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
         cursor <- run (Tx.pipeline (Tx.statement () owned))
         run (Tx.singleRowValue cursor) `shouldReturn` payload
     bytes <- readIORef sent
@@ -289,7 +301,7 @@ spec = describe "canonical transactions" $ do
   it "collects owned rows in order" $
     withResponse (command "BEGIN" <> rows [[Just "first"], [Just "second"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const) False
+        let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const)
         cursor <- run (Tx.pipeline (Tx.statement () owned))
         run (Tx.rowList cursor) `shouldReturn` ["first", "second"]
         run Tx.finishTransaction
@@ -297,7 +309,7 @@ spec = describe "canonical transactions" $ do
   it "checks owned cardinality before allowing transaction completion" $
     withResponse (command "BEGIN" <> rows [[Just "first"], [Just "second"]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ -> do
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let owned = Tx.Statement "SELECT owned" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const)) False
+        let owned = Tx.Statement "SELECT owned" (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
         cursor <- run (Tx.pipeline (Tx.statement () owned))
         _ <- run (Tx.singleRowValue cursor)
         run Tx.finishTransaction
@@ -310,7 +322,7 @@ spec = describe "canonical transactions" $ do
       withResponse (command "BEGIN" <> rows [[Just (number 7)], [Just "x"]] <> readyTx <> command "ROLLBACK" <> ready) $ \context _ -> do
         result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
           let shape = if optional then Tx.rowMaybe else Tx.singleRow
-              owned = Tx.Statement "SELECT owned" (const []) (shape (Tx.row @'[Int32] Const)) False
+              owned = Tx.Statement "SELECT owned" (const []) (shape (Tx.row @'[Int32] Const))
           cursor <- run (Tx.pipeline (Tx.statement () owned))
           if optional
             then void (run (Tx.rowMaybeValue cursor))
@@ -323,7 +335,7 @@ spec = describe "canonical transactions" $ do
   it "reports the same late statement failure through an owned collector" $
     withResponse (command "BEGIN" <> parse <> bind <> dataRow [Just payload] <> lateError <> readyFailed <> command "ROLLBACK" <> ready) $ \context _ -> do
       result <- try @PG.QueryError $ Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const) False
+        let owned = Tx.Statement "SELECT owned" (const []) (Tx.row @'[BS.ByteString] Const)
         cursor <- run (Tx.pipeline (Tx.statement () owned))
         _ <- run (Tx.rowList cursor)
         run Tx.finishTransaction
@@ -361,7 +373,7 @@ spec = describe "canonical transactions" $ do
     withResponse (command "BEGIN" <> rows [[Just payload, Just payload]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
         let query = Tx.Statement "SELECT metadata, body" (const [])
-              (Tx.streamingRow @'[BS.ByteString] Metadata) False
+              (Tx.streamingRow @'[BS.ByteString] Metadata)
         cursor <- run (Tx.pipeline (Tx.statement () query))
         result <- run (Tx.nextRow cursor)
         case result of
@@ -384,7 +396,7 @@ spec = describe "canonical transactions" $ do
   it "rejects a field after its row advances" $
     withResponse (command "BEGIN" <> rows [[Just "first"], [Just "second"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let query = Tx.Statement "SELECT body" (const []) (Tx.streamingRow @'[] Body) False
+        let query = Tx.Statement "SELECT body" (const []) (Tx.streamingRow @'[] Body)
         cursor <- run (Tx.pipeline (Tx.statement () query))
         first <- run (Tx.nextRow cursor)
         _ <- run (Tx.nextRow cursor)
@@ -574,7 +586,7 @@ spec = describe "canonical transactions" $ do
   it "still breaks the session when a parameter source throws an ordinary exception" $ do
     opened <- newIORef Nothing
     let source = ParameterStream (ByteStream 8 (throwIO (ErrorCall "parameter source failed")))
-        query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult False
+        query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
     result <- try @ErrorCall $ withResponse ordinary $ \context _ -> do
       writeIORef opened (Just (contextConnection context))
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
@@ -591,7 +603,7 @@ spec = describe "canonical transactions" $ do
   it "folds streamed rows by pulling their fields inside the same runner" $
     withResponse (command "BEGIN" <> rows [[Just "first"], [Just "second"]] <> readyTx <> command "COMMIT" <> ready) $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let query = Tx.Statement "SELECT bodies" (const []) (Tx.streamingRow @'[] Body) False
+        let query = Tx.Statement "SELECT bodies" (const []) (Tx.streamingRow @'[] Body)
             step collected (Body value) = case value of
               Nothing -> liftIO (failTest "unexpected NULL")
               Just field -> do
@@ -663,7 +675,7 @@ pipelineAllocation count = do
 
 pipelineAllocationWith :: Buffer -> Int -> IO Integer
 pipelineAllocationWith output count = do
-  let query = Tx.statement () (Tx.Statement "SELECT allocation" (const []) Tx.noResult False)
+  let query = Tx.statement () (Tx.Statement "SELECT allocation" (const []) Tx.noResult)
       plan = foldl' (*>) (pure ()) (replicate count (void query))
       response = command "BEGIN" <> BS.concat (replicate count (command "SELECT 1")) <> readyTx <> command "COMMIT" <> ready
   withResponseCallbacksBuffer output False (const (pure ())) (const (pure ())) response $ \context _ ->
@@ -693,7 +705,20 @@ command :: BS.ByteString -> BS.ByteString
 command tag = parse <> bind <> message 67 (tag <> "\0")
 
 rows :: [[Maybe BS.ByteString]] -> BS.ByteString
-rows values = parse <> bind <> foldMap dataRow values <> message 67 "SELECT 1\0"
+rows values = parse <> executed values
+
+-- | The answer to a statement that is bound without being parsed.
+executed :: [[Maybe BS.ByteString]] -> BS.ByteString
+executed values = bind <> foldMap dataRow values <> message 67 "SELECT 1\0"
+
+positionsOf :: BS.ByteString -> BS.ByteString -> [Int]
+positionsOf needle = go 0
+  where
+    go offset haystack = case BS.breakSubstring needle haystack of
+      (before, rest)
+        | BS.null rest -> []
+        | otherwise -> let end = BS.length before + BS.length needle
+                        in (offset + BS.length before) : go (offset + end) (BS.drop end haystack)
 
 dataRow :: [Maybe BS.ByteString] -> BS.ByteString
 dataRow columns = message 68 (BS.pack [0, fromIntegral (length columns)]

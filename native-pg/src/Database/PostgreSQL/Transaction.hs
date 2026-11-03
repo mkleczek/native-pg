@@ -8,12 +8,12 @@
 -- | Synchronous cursors that keep a transaction open until explicitly finished.
 module Database.PostgreSQL.Transaction
   ( Transaction, Pipeline, Result, Field, Statement (..), RowDecoder,
-    runTransaction, runTransactionWith, statement, pipeline, finalPipeline,
+    runTransaction, statement, prepareAs, executePrepared, pipeline, finalPipeline,
     nextRow, fieldLength, nextChunk, finishTransaction, condemn, sql,
     row, streamingRow, singleRow, rowMaybe, noResult,
     foldRows, rowList, singleRowValue, rowMaybeValue,
     QueryError (..), StatementError (..), FormatCode (..),
-    IsolationLevel (..), Mode (..), Param (..), Prepare, Prepared (..),
+    IsolationLevel (..), Mode (..), Param (..),
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -71,13 +71,13 @@ data Cardinality = AnyRows | ExactlyOne | AtMostOne
 
 -- | An owned metadata schema, optionally ending in a borrowed field.
 data RowDecoder (row :: Type -> Type) = RowDecoder Cardinality (forall tx. Runtime -> Row.Row -> IO (Either DecodingError (row tx)))
--- | SQL, parameter encoding, result schema and eligibility for preparation.
--- Statements do not capture the session or its input storage.
+-- | SQL, parameter encoding and result schema. Statements do not capture the
+-- session or its input storage. The SQL is evaluated only when it is sent, so
+-- a statement run by 'executePrepared' may leave it undefined.
 data Statement params row = Statement
   { statementSql :: ByteString,
     statementParams :: params -> [Param],
-    statementResult :: RowDecoder row,
-    statementPreparable :: Bool
+    statementResult :: RowDecoder row
   }
 
 -- | One encoded parameter. A missing type asks the server to infer it;
@@ -87,16 +87,6 @@ data Param = Param
     paramFormat :: FormatCode,
     paramValue :: Maybe Parameter
   }
-
--- | Selects a prepared statement name using the connection's existing cache.
-type Prepare = ByteString -> [Maybe Word32] -> IO Prepared
-
-data Prepared
-  = -- | Reuse the statement already parsed under this name.
-    PreparedAs ByteString
-  | -- | Parse under this name. The action runs once the server accepts
-    -- the parse, even when execution fails, so the cache can remember it.
-    PrepareAs ByteString (IO ())
 
 data IsolationLevel = ReadCommitted | RepeatableRead | Serializable
   deriving (Eq, Ord, Show)
@@ -116,7 +106,6 @@ data CursorState = Queued | Reading | Done
 
 data Runtime = Runtime
   { runtimeSession :: Session,
-    runtimePrepare :: Maybe Prepare,
     runtimeThread :: ThreadId,
     runtimeLive :: IORef Bool,
     runtimeRunning :: IORef Bool,
@@ -138,16 +127,9 @@ data Runtime = Runtime
 -- queued by 'finalPipeline' cannot be changed. Broken input is discarded.
 -- Query failures retain their original SQL and leave the scope after cleanup.
 runTransaction :: IsolationLevel -> Mode -> Session -> (forall tx. Transaction tx a) -> IO a
-runTransaction = scoped Nothing
-
--- | Like 'runTransaction', using the existing prepared-statement cache hook.
-runTransactionWith :: Prepare -> IsolationLevel -> Mode -> Session -> (forall tx. Transaction tx a) -> IO a
-runTransactionWith prepare = scoped (Just prepare)
-
-scoped :: Maybe Prepare -> IsolationLevel -> Mode -> Session -> (forall tx. Transaction tx a) -> IO a
-scoped prepare isolation mode session (Transaction action) = do
+runTransaction isolation mode session (Transaction action) = do
   outcome <- Exchange.operation session $ mask $ \resume -> do
-    runtime <- Runtime session prepare <$> myThreadId <*> newIORef True <*> newIORef False
+    runtime <- Runtime session <$> myThreadId <*> newIORef True <*> newIORef False
       <*> newIORef (Just (beginning isolation mode)) <*> newIORef True <*> newIORef False
       <*> newIORef False <*> newIORef [] <*> newIORef False <*> newIORef TxIdle <*> newIORef Nothing <*> newIORef False
     let cleanup = do
@@ -223,18 +205,33 @@ checkOwner runtime = do
 contextOf :: Runtime -> Context
 contextOf runtime = case runtimeSession runtime of Exchange.Session context -> context
 
--- | Adds a statement and returns its cursor without consuming its rows.
+-- | Adds a statement, parsed as the unnamed statement, and returns its cursor
+-- without consuming its rows.
 statement :: params -> Statement params row -> Pipeline tx (Result tx row)
-statement params (Statement query encode decoder@(RowDecoder cardinality _) preparable) = Pipeline $ do
+statement = queue Execution.Unprepared
+
+-- | Like 'statement', but parses the SQL under the given name, with the
+-- parameter types, and keeps it for 'executePrepared'. The server keeps the
+-- name on the connection once it accepted the parse, even when execution fails
+-- or the transaction rolls back; it rejects a name that is already in use.
+-- Nothing reports whether the parse was accepted: after a failure, a caller
+-- that must be sure the name is free can close it with
+-- 'Database.PostgreSQL.Session.closeStatement', which succeeds for a missing name.
+prepareAs :: ByteString -> params -> Statement params row -> Pipeline tx (Result tx row)
+prepareAs name = queue (Execution.Preparing name)
+
+-- | Like 'statement', but runs the statement that 'prepareAs' parsed under the
+-- given name on this connection, which only the caller knows. It never
+-- evaluates 'statementSql'. The server rejects an unknown name with
+-- SQLSTATE 26000, as a 'QueryError' that carries 'statementSql' unevaluated.
+executePrepared :: ByteString -> params -> Statement params row -> Pipeline tx (Result tx row)
+executePrepared name = queue (\_ _ -> Execution.Prepared name)
+
+queue :: (ByteString -> [Maybe Word32] -> Execution.Statement) -> params -> Statement params row -> Pipeline tx (Result tx row)
+queue prepared params (Statement query encode decoder@(RowDecoder cardinality _)) = Pipeline $ do
   runtime <- ask
   let parameters = encode params
-      types = paramType <$> parameters
-  prepared <- liftIO $ case runtimePrepare runtime of
-    Just prepare | preparable -> untrusted runtime (prepare query types) >>= \case
-      PreparedAs name -> pure (Execution.Prepared name)
-      PrepareAs name parsed -> pure (Execution.Preparing name query types (untrusted runtime parsed))
-    _ -> pure (Execution.Unprepared query types)
-  pending <- liftIO $ Pending query (Execution prepared (paramFormat <$> parameters) (fmap (protectParameter runtime) . paramValue <$> parameters) [BinaryFormat]) cardinality
+  pending <- liftIO $ Pending query (Execution (prepared query (paramType <$> parameters)) (paramFormat <$> parameters) (fmap (protectParameter runtime) . paramValue <$> parameters) [BinaryFormat]) cardinality
     <$> newIORef Queued <*> newIORef 0 <*> newIORef Nothing
   modify' (pending :)
   pure (Result runtime pending decoder)
@@ -283,10 +280,10 @@ submitOn runtime final plan = do
   pure value
 
 command :: Runtime -> ByteString -> IO [Pending]
-command runtime query = snd <$> runPipeline runtime (statement () (Statement query (const []) noResult False))
+command runtime query = snd <$> runPipeline runtime (statement () (Statement query (const []) noResult))
 
 sql :: ByteString -> Transaction tx ()
-sql query = void (pipeline (statement () (Statement query (const []) noResult False)))
+sql query = void (pipeline (statement () (Statement query (const []) noResult)))
 
 -- | Chooses rollback for an ending that has not yet been queued.
 condemn :: Transaction tx ()
@@ -313,7 +310,7 @@ finishTransaction = operation $ \runtime -> do
     unstarted <- isJust <$> readIORef (runtimeBegin runtime)
     unless (final || unstarted) $ do
       query <- ending runtime
-      void (submitOn runtime False (statement () (Statement query (const []) noResult False)))
+      void (submitOn runtime False (statement () (Statement query (const []) noResult)))
       drain runtime True
     status <- readIORef (runtimeStatus runtime)
     unless (status == TxIdle) (throwIO (ProtocolError "the transaction ending did not leave an idle session"))
