@@ -13,6 +13,7 @@ import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Exception (ErrorCall (..), IOException, bracket, displayException, finally, throwIO, try)
 import Control.Monad (forever, unless, void)
 import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Unlift (withRunInIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.Foldable (for_)
@@ -586,7 +587,7 @@ spec socketPath port = do
         unrendered known = known {Tx.statementSql = error "SQL forced"}
         preparedNames session = query session "SELECT name FROM pg_prepared_statements ORDER BY name" []
     it "runs a statement prepared earlier on the connection by its name, without evaluating its SQL" $ withSession $ \session -> do
-      committed Tx.ReadCommitted Tx.Read (resultOf (Tx.prepareAs "answer" "41" answer)) session
+      committed Tx.ReadCommitted Tx.Read (preparedResult "answer" "41" answer) session
         `shouldReturn` Right 42
       committed Tx.ReadCommitted Tx.Read (resultOf (Tx.executePrepared "answer" "1" (unrendered answer))) session
         `shouldReturn` Right 2
@@ -601,33 +602,93 @@ spec socketPath port = do
         Left (Tx.QueryError _ (Tx.ServerFailed failure)) -> errorCode failure `shouldBe` Just "26000"
         _ -> failTest "expected a server failure"
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
-    it "can close the names of a failed pipeline, whether or not the server parsed them, and prepare again" $ withSession $ \session -> do
-      broken <- inPipeline (Tx.prepareAs "broken" () (Tx.Statement "SELEC 1" (const []) Tx.noResult)) session
-      broken `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELEC 1") (servedCode "42601")))
-      skipped <- inPipeline (Tx.statement () dividingByZero *> Tx.prepareAs "skipped" "1" divided) session
-      skipped `shouldSatisfy` P.left (P.con (Tx.QueryError (P.eq "SELECT 1 / 0") (servedCode "22012")))
-      -- The server never parsed these two.
-      preparedNames session `shouldReturn` (Right ([], "SELECT 0"), TxIdle)
-      dividing <- inPipeline (Tx.prepareAs "divided" "0" divided) session
-      dividing `shouldSatisfy` failsWith (servedCode "22012")
-      -- It kept this one, though its execution failed and the transaction rolled back.
+    it "keeps a name whose preparation was awaited when its execution fails and the transaction rolls back" $ withSession $ \session -> do
+      acknowledged <- newIORef False
+      let dividing = do
+            (preparation, result) <- Tx.pipeline ((,) <$> Tx.prepare "divided" "0" divided <*> Tx.executePrepared "divided" "0" divided)
+            Tx.awaitPreparation preparation
+            liftIO (writeIORef acknowledged True)
+            Tx.rowList result
+      outcome <- committed Tx.ReadCommitted Tx.Read dividing session
+      outcome `shouldSatisfy` failsWith (servedCode "22012")
+      -- The client learned of the name before the rows failed, and it outlives the rollback.
+      readIORef acknowledged `shouldReturn` True
       preparedNames session `shouldReturn` (Right ([[Just "divided"]], "SELECT 1"), TxIdle)
-      again <- inPipeline (Tx.prepareAs "divided" "1" divided) session
+      committed Tx.ReadCommitted Tx.Read (void (Tx.pipeline (Tx.executePrepared "divided" "1" (unrendered divided)) >>= Tx.rowList)) session
+        `shouldReturn` Right ()
+      -- It is in use, so preparing it again is rejected until the client closes it.
+      again <- committed Tx.ReadCommitted Tx.Read (Tx.pipeline (Tx.prepare "divided" "1" divided) >>= Tx.awaitPreparation) session
       again `shouldSatisfy` failsWith (servedCode "42P05")
-      -- Closing a name succeeds whether the server has it or not.
-      for_ ["broken", "skipped", "divided"] $ \name ->
-        closeStatement session name `shouldReturn` (Right (), TxIdle)
+      closeStatement session "divided" `shouldReturn` (Right (), TxIdle)
       preparedNames session `shouldReturn` (Right ([], "SELECT 0"), TxIdle)
-      committed Tx.ReadCommitted Tx.Read (resultOf (Tx.prepareAs "fresh" "41" answer)) session `shouldReturn` Right 42
-      committed Tx.ReadCommitted Tx.Read (resultOf (Tx.executePrepared "fresh" "1" (unrendered answer))) session `shouldReturn` Right 2
-      inPipeline (Tx.prepareAs "divided" "1" divided) session `shouldReturn` Right ()
+      committed Tx.ReadCommitted Tx.Read (Tx.pipeline (Tx.prepare "divided" "1" divided) >>= Tx.awaitPreparation) session
+        `shouldReturn` Right ()
+      preparedNames session `shouldReturn` (Right ([[Just "divided"]], "SELECT 1"), TxIdle)
+    it "keeps a preparation acknowledged when the rows that follow it were read first and failed" $ withSession $ \session -> do
+      (dividing, acknowledged) <- unfinished session $ do
+        (preparation, result) <- Tx.pipeline ((,) <$> Tx.prepare "divided" "0" divided <*> Tx.executePrepared "divided" "0" divided)
+        (,) <$> attempt (Tx.rowList result) <*> attempt (Tx.awaitPreparation preparation)
+      dividing `shouldSatisfy` failsWith (servedCode "22012")
+      acknowledged `shouldSatisfy` P.right P.anything
+      preparedNames session `shouldReturn` (Right ([[Just "divided"]], "SELECT 1"), TxIdle)
+    it "reports a Parse the server rejects when its preparation is awaited, and prepares nothing" $ withSession $ \session -> do
+      let broken = Tx.Statement "SELEC 1" (const []) Tx.noResult
+          rejected = P.left (P.con (Tx.QueryError (P.eq "SELEC 1") (servedCode "42601")))
+      alone <- unfinished session (Tx.pipeline (Tx.prepare "broken" () broken) >>= attempt . Tx.awaitPreparation)
+      alone `shouldSatisfy` rejected
+      -- The error comes first, whichever result of the pipeline is read.
+      viaRows <- unfinished session (Tx.pipeline (Tx.prepare "broken" () broken *> Tx.executePrepared "broken" () broken) >>= attempt . Tx.rowList)
+      viaRows `shouldSatisfy` rejected
+      preparedNames session `shouldReturn` (Right ([], "SELECT 0"), TxIdle)
+      -- A rejected Parse does not undo the one before it, whichever is awaited first.
+      (rejectedFirst, acceptedAfter) <- unfinished session $ do
+        (accepted, rejecting) <- Tx.pipeline ((,) <$> Tx.prepare "accepted" "1" answer <*> Tx.prepare "broken" () broken)
+        (,) <$> attempt (Tx.awaitPreparation rejecting) <*> attempt (Tx.awaitPreparation accepted)
+      rejectedFirst `shouldSatisfy` rejected
+      acceptedAfter `shouldSatisfy` P.right P.anything
+      preparedNames session `shouldReturn` (Right ([[Just "accepted"]], "SELECT 1"), TxIdle)
+    it "skips the Parse after a statement that fails on the server, so that its preparation is not acknowledged" $ withSession $ \session -> do
+      let skipping = P.left (P.con (Tx.QueryError (P.eq "SELECT 1 / 0") (servedCode "22012")))
+          pipelineOf = Tx.pipeline ((,,) <$> Tx.statement () dividingByZero <*> Tx.prepare "skipped" "1" divided <*> Tx.executePrepared "skipped" "1" divided)
+      (failing, skipped) <- unfinished session $ do
+        (earlier, preparation, _) <- pipelineOf
+        (,) <$> attempt (Tx.rowList earlier) <*> attempt (Tx.awaitPreparation preparation)
+      failing `shouldSatisfy` skipping
+      skipped `shouldSatisfy` skipping
+      -- Awaiting it first reaches the same failure.
+      awaitedFirst <- unfinished session $ do
+        (_, preparation, _) <- pipelineOf
+        attempt (Tx.awaitPreparation preparation)
+      awaitedFirst `shouldSatisfy` skipping
+      preparedNames session `shouldReturn` (Right ([], "SELECT 0"), TxIdle)
+    it "answers an unnamed statement, a preparation and its execution in wire order, whichever is read first" $ withSession $ \session -> do
+      let wire name = Tx.pipeline ((,,) <$> Tx.statement "1" answer <*> Tx.prepare name "2" answer <*> Tx.executePrepared name "3" answer)
+          inOrder = do
+            (unnamed, preparation, named) <- wire "in_order"
+            earlier <- Tx.singleRowValue unnamed
+            Tx.awaitPreparation preparation
+            (earlier,) <$> Tx.singleRowValue named
+          rowsFirst = do
+            (_, preparation, named) <- wire "rows_first"
+            rows <- Tx.singleRowValue named
+            -- Reading the rows read the preparation before them.
+            Tx.awaitPreparation preparation
+            pure rows
+          preparationFirst = do
+            (_, preparation, named) <- wire "preparation_first"
+            Tx.awaitPreparation preparation
+            Tx.singleRowValue named
+      committed Tx.ReadCommitted Tx.Read inOrder session `shouldReturn` Right (2, 4)
+      committed Tx.ReadCommitted Tx.Read rowsFirst session `shouldReturn` Right 4
+      committed Tx.ReadCommitted Tx.Read preparationFirst session `shouldReturn` Right 4
+      preparedNames session `shouldReturn` (Right ([[Just "in_order"], [Just "preparation_first"], [Just "rows_first"]], "SELECT 3"), TxIdle)
     it "prepares and runs named statements in one pipeline with writes, including a name prepared earlier in it" $ withSession $ \session -> do
       createItems session
       let firstTime = do
             (_, counted, incremented, again, recounted) <- Tx.pipeline $ (,,,,)
               <$> Tx.statement "1" insertItem
-              <*> Tx.prepareAs "count_items" () countItems
-              <*> Tx.prepareAs "answer" "41" answer
+              <*> (Tx.prepare "count_items" () countItems *> Tx.executePrepared "count_items" () countItems)
+              <*> (Tx.prepare "answer" "41" answer *> Tx.executePrepared "answer" "41" answer)
               <*> Tx.executePrepared "answer" "1" (unrendered answer)
               <*> (Tx.statement "2" insertItem *> Tx.executePrepared "count_items" () (unrendered countItems))
             (,,,) <$> Tx.singleRowValue counted <*> Tx.singleRowValue incremented <*> Tx.singleRowValue again <*> Tx.singleRowValue recounted
@@ -790,9 +851,23 @@ committed :: Tx.IsolationLevel -> Tx.Mode -> (forall tx. Tx.Transaction tx a) ->
 committed isolation mode action session = try $
   Tx.runTransaction isolation mode session (action <* Tx.finishTransaction)
 
--- | A transaction with one pipeline, which is committed unless a statement fails.
-inPipeline :: (forall tx. Tx.Pipeline tx (Tx.Result tx row)) -> Session -> IO (Either Tx.QueryError ())
-inPipeline step = committed Tx.ReadCommitted Tx.Read (void (Tx.pipeline step))
+-- | Prepares a name and runs it in a pipeline of its own, and takes its one row
+-- after the server acknowledged the preparation.
+preparedResult :: ByteString -> params -> Tx.Statement params (Const value) -> Tx.Transaction tx value
+preparedResult name params known = do
+  (preparation, result) <- Tx.pipeline ((,) <$> Tx.prepare name params known <*> Tx.executePrepared name params known)
+  Tx.awaitPreparation preparation
+  Tx.singleRowValue result
+
+-- | Runs the action in a transaction that is left unfinished, so that it rolls
+-- back, and gives what the action observed, not the failure that finishing it
+-- would report.
+unfinished :: Session -> (forall tx. Tx.Transaction tx a) -> IO a
+unfinished session action = Tx.runTransaction Tx.ReadCommitted Tx.Read session action
+
+-- | Runs a step, and gives the failure it raises, so that the transaction can go on.
+attempt :: Tx.Transaction tx a -> Tx.Transaction tx (Either Tx.QueryError a)
+attempt step = withRunInIO (\run -> try (run step))
 
 -- | Adds a statement to a pipeline of its own and takes its one row.
 resultOf :: Tx.Pipeline tx (Tx.Result tx (Const value)) -> Tx.Transaction tx value

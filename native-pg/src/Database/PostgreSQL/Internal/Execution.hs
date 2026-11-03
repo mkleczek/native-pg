@@ -4,7 +4,7 @@
 -- | Private raw statement execution, batching and asynchronous notifications.
 module Database.PostgreSQL.Internal.Execution
   ( Statement (..), Execution (..), Batch,
-    prepare, execute, batched, runBatch, readExecution, startExecution, executionMessages, awaitNotification,
+    prepare, execute, batched, runBatch, readExecution, startExecution, executionMessages, parsesOnly, awaitNotification,
     prepareWithContext, closeStatementWithContext, executeWithContext,
     runBatchWithContext, awaitNotificationWithContext,
     backendProcessId, notificationProcessId, notificationChannel,
@@ -33,9 +33,9 @@ data Statement
     Unprepared ByteString [Maybe Word32]
   | -- | A statement prepared earlier under this name.
     Prepared ByteString
-  | -- | SQL parsed and prepared under the name, with its parameters' types,
-    -- and run.
-    Preparing ByteString ByteString [Maybe Word32]
+  | -- | SQL parsed and prepared under the name, with its parameters' types.
+    -- Nothing is bound or run, so there are no rows.
+    Parsing ByteString ByteString [Maybe Word32]
 
 data Execution = Execution
   { executionStatement :: Statement,
@@ -104,6 +104,7 @@ readExecution session execution step initial = do
   started <- startExecution session execution
   case started of
     Left failure -> pure (Left failure)
+    Right () | parsesOnly execution -> pure (Right (initial, ""))
     Right () -> readRows (continueIn session) step initial
 
 startExecution :: Session 'Ready -> Execution -> IO (Either ServerError ())
@@ -113,9 +114,10 @@ startExecution session execution = do
     Prepared _
       | streamsParameter execution -> described
       | otherwise -> pure (Right ())
-    Preparing _ _ _ -> parseComplete
+    Parsing _ _ _ -> parseComplete
   case parsed of
     Left failure -> pure (Left failure)
+    Right () | parsesOnly execution -> pure (Right ())
     Right () -> do
       bound <- pullEither (continueIn session :: Session 'BindResult) ((\BindComplete -> Reply ()) :|: sessionTail)
       case bound of
@@ -152,31 +154,42 @@ awaitNotification session = operation session $ do
             :|: NoAlternatives
       either (\failure -> throwIO (ProtocolError ("an error while idle: " <> show failure))) pure reply
 
--- | Parse (unless the statement is prepared already), Bind and Execute. A
--- prepared statement is described instead if a parameter streams: the server
--- starts @statement_timeout@ at a Parse or a Describe, and reads a Bind whole
--- before it runs it, so a slow stream counts either way.
+-- | Parse (unless the statement is prepared already), Bind and Execute; only
+-- the Parse of a statement that is 'parsesOnly'. A prepared statement is
+-- described instead if a parameter streams: the server starts
+-- @statement_timeout@ at a Parse or a Describe, and reads a Bind whole before
+-- it runs it, so a slow stream counts either way.
 executionMessages :: Execution -> Output
 executionMessages execution =
   preamble
-    <> serialize
-      ( Bind
-          BindBody
-            { bindPortalName = "",
-              bindStatementName = statementName,
-              bindParameterFormats = executionParameterFormats execution,
-              bindParameterValues = executionParameters execution,
-              bindResultFormats = executionResultFormats execution
-            }
-      )
-    <> serialize (Execute "" 0 :: Execute ByteString)
+    <> if parsesOnly execution
+      then mempty
+      else
+        serialize
+          ( Bind
+              BindBody
+                { bindPortalName = "",
+                  bindStatementName = statementName,
+                  bindParameterFormats = executionParameterFormats execution,
+                  bindParameterValues = executionParameters execution,
+                  bindResultFormats = executionResultFormats execution
+                }
+          )
+          <> serialize (Execute "" 0 :: Execute ByteString)
   where
     (preamble, statementName) = case executionStatement execution of
       Unprepared query parameterTypes -> (serialize (Parse "" query (map (fmap Scalar) parameterTypes)), "")
       Prepared name
         | streamsParameter execution -> (serialize (Describe PreparedStatement name), name)
         | otherwise -> (mempty, name)
-      Preparing name query parameterTypes -> (serialize (Parse name query (map (fmap Scalar) parameterTypes)), name)
+      Parsing name query parameterTypes -> (serialize (Parse name query (map (fmap Scalar) parameterTypes)), name)
+
+-- | Whether the execution only parses its statement: it sends no Bind or
+-- Execute, and has no rows.
+parsesOnly :: Execution -> Bool
+parsesOnly execution = case executionStatement execution of
+  Parsing {} -> True
+  _ -> False
 
 -- | Whether a parameter of the execution streams.
 streamsParameter :: Execution -> Bool

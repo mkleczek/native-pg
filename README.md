@@ -111,16 +111,36 @@ Tx.runTransaction Tx.ReadCommitted Tx.Read session $ do
 
 `statement` parses its SQL as the unnamed statement. The library keeps no cache of
 prepared statements and has no callback for one: a client with its own
-per-connection cache of names picks `prepareAs name params statement`, which
+per-connection cache of names picks `prepare name params statement`, which only
 parses under `name`, or `executePrepared name params statement`, which binds and
 executes a name parsed earlier on that connection and never evaluates
 `statementSql`. All three are pipeline steps and add no round trips, and an
-`executePrepared` may follow a `prepareAs` of the same name in one pipeline. The
-client resolves its cache before it builds the transaction. The server keeps a
-parsed name even if execution fails or the transaction rolls back, so a client
-that did not see its attempt succeed closes the names it tried, and removes
-evicted names, with `Session.closeStatement`; closing a missing name is not an
-error.
+`executePrepared` may follow a `prepare` of the same name in one pipeline. The
+client resolves its cache before it builds the transaction. `params` gives
+`prepare` only the parameters' types.
+
+`prepare` returns a `Preparation`, which `awaitPreparation` reads in wire order,
+like a result: it returns once the server accepted the Parse, and raises the
+`QueryError` if the server rejected the Parse or skipped it after an earlier
+statement failed. A client reads the preparation before the rows that follow it
+and records the name then:
+
+```haskell
+Tx.runTransaction Tx.ReadCommitted Tx.Read session $ do
+  (preparation, rows) <- Tx.pipeline
+    ((,) <$> Tx.prepare "answer" params answer <*> Tx.executePrepared "answer" params answer)
+  Tx.awaitPreparation preparation -- the server accepted the Parse: record the name
+  value <- Tx.singleRowValue rows -- may still fail
+  Tx.finishTransaction
+  pure value
+```
+
+The server keeps a parsed name even if execution fails or the transaction rolls
+back, and never parses the statements it skips after an error. So an
+`awaitPreparation` that returned means its name exists on the connection, also
+after a later statement failed, and one that raised means it does not: nothing
+needs to be closed. A client removes evicted names with
+`Session.closeStatement`; closing a missing name is not an error.
 
 `finishTransaction` drains unread rows, checks statement completion and observes
 `COMMIT`, or `ROLLBACK` when condemned. An empty transaction sends nothing.

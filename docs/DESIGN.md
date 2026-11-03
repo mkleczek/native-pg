@@ -834,11 +834,11 @@ top of them, through typeclass metaprogramming:
 - The private execution engine maps operations onto protocol messages.
   The library keeps no cache of prepared statements and has no preparation
   callback. The client picks one of three pipeline steps for each statement.
-  `statement` parses its SQL as the unnamed statement. `prepareAs name`
-  parses it under `name` with the parameter types, and then binds and executes
-  it. `executePrepared name` binds and executes a statement parsed earlier under
-  that name, and never evaluates `statementSql`, so a client that knows the
-  name need not render the SQL. Applications
+  `statement` parses its SQL as the unnamed statement. `prepare name`
+  only parses it under `name`, with the parameter types, and `executePrepared
+  name` binds and executes a statement parsed earlier under that name. The
+  second never evaluates `statementSql`, so a client that knows the name need
+  not render the SQL. Applications
   can deallocate with `Session.closeStatement`. Internally, `prepare` sends
   `Parse` and `Sync`, `closeStatement` sends `Close` and `Sync`, and `execute` sends
   `Bind`, `Execute` and `Sync`, all in one write. An `Unprepared` statement
@@ -853,17 +853,29 @@ top of them, through typeclass metaprogramming:
   offers no hook to look a name up: the client resolves each statement against
   its cache before it builds the transaction, and passes the chosen step in.
   A pipeline can `executePrepared` a name that an earlier step of the same
-  pipeline `prepareAs`, because the `Parse` is written before the later `Bind`;
-  it must not `prepareAs` one name twice. The server rejects a name already in
+  pipeline `prepare`s, because the `Parse` is written before the later `Bind`;
+  it must not `prepare` one name twice. The server rejects a name already in
   use with SQLSTATE 42P05, and an unknown one with 26000, as a `QueryError`
   that carries `statementSql` unevaluated.
-- The library doesn't report whether the server accepted a `Parse`. The server
-  keeps a parsed name even if its execution failed or the transaction rolled
-  back, and never parses the statements it skips after an error. So a client
-  that records a name only after the transaction attempt completed without
-  error closes every name it tried in a failed attempt with
-  `Session.closeStatement`. That succeeds whether or not the server has the
-  name: the protocol doesn't treat closing a missing statement as an error.
+- The `Parse` is a pipeline step of its own, so that the client learns what the
+  server accepted even when a later statement fails. `prepare` returns a
+  `Preparation` that stands for the `ParseComplete`, and `awaitPreparation` reads
+  it in wire order, like a result: it returns once the server accepted the
+  `Parse`, and raises a `QueryError` if the server rejected it (the server's own
+  error) or skipped it after an earlier statement failed (that statement's
+  error). The client reads the preparation before the rows of the execution that
+  follows it, and records the name then. The server keeps a parsed name even if
+  the execution failed or the transaction rolled back, and never parses the
+  statements it skips after an error, nor does a rejected `Parse` leave
+  anything. So awaiting a preparation tells whether its name exists, also
+  after an error: a name whose await returned exists on the connection, and one
+  whose await raised doesn't, so no `Close` is needed for either. A
+  preparation the server accepted stays accepted whatever happens to the
+  statements around it, and whichever result is read first: reading a later
+  result drains the earlier preparations, which then return at once, and
+  waiting for a preparation drains the statements before it without reporting
+  their failures, except one that made the server skip the `Parse`.
+  Preparations are awaited inside their transaction like any result.
 - Parameter OIDs are optional, allowing the server to infer their types.
 
 ### HTTP/1.1 usage

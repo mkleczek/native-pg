@@ -7,8 +7,8 @@
 
 -- | Synchronous cursors that keep a transaction open until explicitly finished.
 module Database.PostgreSQL.Transaction
-  ( Transaction, Pipeline, Result, Field, Statement (..), RowDecoder,
-    runTransaction, statement, prepareAs, executePrepared, pipeline, finalPipeline,
+  ( Transaction, Pipeline, Result, Preparation, Field, Statement (..), RowDecoder,
+    runTransaction, statement, prepare, awaitPreparation, executePrepared, pipeline, finalPipeline,
     nextRow, fieldLength, nextChunk, finishTransaction, condemn, sql,
     row, streamingRow, singleRow, rowMaybe, noResult,
     foldRows, rowList, singleRowValue, rowMaybeValue,
@@ -63,6 +63,8 @@ newtype Pipeline (tx :: Type) a = Pipeline (StateT [Pending] (ReaderT Runtime IO
 -- | A forward cursor belonging to one transaction. Pulling a later cursor
 -- drains earlier results and checks their cardinality and server errors.
 data Result tx (row :: Type -> Type) = Result Runtime Pending (RowDecoder row)
+-- | The server's answer to a 'prepare', belonging to one transaction.
+data Preparation (tx :: Type) = Preparation Runtime Pending
 -- | A trailing field borrowed from the current row. Advancing its row,
 -- sending another pipeline or finishing the transaction expires the field.
 data Field (tx :: Type) = Field Runtime ByteStream
@@ -102,7 +104,9 @@ data Pending = Pending
     pendingCount :: IORef Int,
     pendingRow :: IORef (Maybe Row.Row)
   }
-data CursorState = Queued | Reading | Done
+-- | 'Failed' is a cursor the server reported a failure on, or skipped after
+-- an earlier one; 'Done' is one that completed.
+data CursorState = Queued | Reading | Done | Failed
 
 data Runtime = Runtime
   { runtimeSession :: Session,
@@ -210,17 +214,52 @@ contextOf runtime = case runtimeSession runtime of Exchange.Session context -> c
 statement :: params -> Statement params row -> Pipeline tx (Result tx row)
 statement = queue Execution.Unprepared
 
--- | Like 'statement', but parses the SQL under the given name, with the
--- parameter types, and keeps it for 'executePrepared'. The server keeps the
--- name on the connection once it accepted the parse, even when execution fails
--- or the transaction rolls back; it rejects a name that is already in use.
--- Nothing reports whether the parse was accepted: after a failure, a caller
--- that must be sure the name is free can close it with
--- 'Database.PostgreSQL.Session.closeStatement', which succeeds for a missing name.
-prepareAs :: ByteString -> params -> Statement params row -> Pipeline tx (Result tx row)
-prepareAs name = queue (Execution.Preparing name)
+-- | Adds a Parse of the statement's SQL under the given name, with the
+-- parameter types, and keeps it for 'executePrepared'. It sends nothing else,
+-- so it can share a pipeline with an 'executePrepared' of the name, which
+-- follows it on the wire. Only the types of the parameters are taken from
+-- @params@; their values are never encoded or sent.
+--
+-- The server keeps the name on the connection once it accepted the Parse, even
+-- when a later statement fails or the transaction rolls back, and rejects a
+-- name that is already in use (SQLSTATE 42P05). It never parses a statement it
+-- skips after an earlier error, and a Parse it rejects leaves nothing.
+-- 'awaitPreparation' tells which of these happened.
+prepare :: ByteString -> params -> Statement params row -> Pipeline tx (Preparation tx)
+prepare name params (Statement query encode _) = Pipeline $ do
+  runtime <- ask
+  pending <- enqueue query (Execution (Execution.Parsing name query (paramType <$> encode params)) [] [] []) AnyRows
+  pure (Preparation runtime pending)
 
--- | Like 'statement', but runs the statement that 'prepareAs' parsed under the
+-- | Waits for the server's answer to a 'prepare'. It returns once the server
+-- accepted the Parse: the name exists on the connection from then on, whatever
+-- happens to the statements after it or to the transaction. It raises a
+-- 'QueryError' if the server did not accept it, and then the name does not
+-- exist and needs no closing. The error is the server's own if it rejected the
+-- Parse, and that of the earlier statement after which it skipped the Parse.
+--
+-- The statements before the preparation are drained, but their failures are
+-- not reported unless they made the server skip the Parse; their own results
+-- report them. A preparation answers the same however often it is awaited, and
+-- whether a later result drained it first, even after another statement
+-- failed. Await a preparation before the rows that follow it, to learn about
+-- the name before they can fail. Like every result, it can only be awaited
+-- inside its transaction.
+awaitPreparation :: Preparation tx -> Transaction tx ()
+awaitPreparation (Preparation owner pending) = operation $ \runtime -> do
+  sameScope owner runtime
+  let await = readIORef (pendingState pending) >>= \case
+        Done -> pure ()
+        -- A failure of the server, which skipped this Parse, is on record.
+        Failed -> throwFailure runtime
+        _ -> readIORef (runtimePending runtime) >>= \case
+          [] -> throwIO (RowMisuse "a cursor is no longer pending")
+          first : _
+            | pendingState first == pendingState pending -> void (pullRow runtime pending) *> await
+            | otherwise -> skipResult runtime first False *> await
+  await
+
+-- | Like 'statement', but runs the statement that 'prepare' parsed under the
 -- given name on this connection, which only the caller knows. It never
 -- evaluates 'statementSql'. The server rejects an unknown name with
 -- SQLSTATE 26000, as a 'QueryError' that carries 'statementSql' unevaluated.
@@ -231,10 +270,15 @@ queue :: (ByteString -> [Maybe Word32] -> Execution.Statement) -> params -> Stat
 queue prepared params (Statement query encode decoder@(RowDecoder cardinality _)) = Pipeline $ do
   runtime <- ask
   let parameters = encode params
-  pending <- liftIO $ Pending query (Execution (prepared query (paramType <$> parameters)) (paramFormat <$> parameters) (fmap (protectParameter runtime) . paramValue <$> parameters) [BinaryFormat]) cardinality
-    <$> newIORef Queued <*> newIORef 0 <*> newIORef Nothing
-  modify' (pending :)
+  pending <- enqueue query (Execution (prepared query (paramType <$> parameters)) (paramFormat <$> parameters) (fmap (protectParameter runtime) . paramValue <$> parameters) [BinaryFormat]) cardinality
   pure (Result runtime pending decoder)
+
+-- | Adds the statement to the pipeline, and returns its cursor.
+enqueue :: ByteString -> Execution -> Cardinality -> StateT [Pending] (ReaderT Runtime IO) Pending
+enqueue query execution cardinality = do
+  pending <- liftIO $ Pending query execution cardinality <$> newIORef Queued <*> newIORef 0 <*> newIORef Nothing
+  modify' (pending :)
+  pure pending
 
 protectParameter :: Runtime -> Parameter -> Parameter
 protectParameter runtime = \case
@@ -370,7 +414,7 @@ pullRow runtime pending = do
     Left failure -> serverFailure runtime pending failure
     Right () -> do
       writeIORef (pendingState pending) Reading
-      reply <- Row.nextRow (Exchange.continueIn (runtimeSession runtime))
+      reply <- if Execution.parsesOnly (pendingExecution pending) then pure (Right Nothing) else Row.nextRow (Exchange.continueIn (runtimeSession runtime))
       case reply of
         Left failure -> serverFailure runtime pending failure
         Right Nothing -> do
@@ -415,7 +459,7 @@ drain runtime validating = do
 serverFailure :: Runtime -> Pending -> ServerError -> IO a
 serverFailure runtime pending failure = do
   waiting <- atomicModifyIORef' (runtimePending runtime) ([],)
-  traverse_ (\cursor -> writeIORef (pendingState cursor) Done) waiting
+  traverse_ (\cursor -> writeIORef (pendingState cursor) Failed) waiting
   failQuery runtime pending (ServerFailed failure)
 
 failQuery :: Runtime -> Pending -> StatementError -> IO a

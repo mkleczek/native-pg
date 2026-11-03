@@ -179,7 +179,8 @@ spec = describe "canonical transactions" $ do
   it "preserves wire and cursor order across applicative association of named statements" $ do
     sent <- newIORef BS.empty
     let values = ["first", "second", "third", "fourth"]
-        query sql = Tx.prepareAs sql () (Tx.Statement sql (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const)))
+        query sql = Tx.prepare sql () known *> Tx.executePrepared sql () known
+          where known = Tx.Statement sql (const []) (Tx.singleRow (Tx.row @'[BS.ByteString] Const))
         response = command "BEGIN" <> foldMap (rows . pure . pure . Just) values <> command "COMMIT" <> ready
     withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) response $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
@@ -208,7 +209,7 @@ spec = describe "canonical transactions" $ do
           <> command "COMMIT" <> ready
     withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) response $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        first <- run (Tx.pipeline (Tx.prepareAs "stmt" () query) >>= Tx.singleRowValue)
+        first <- run (Tx.pipeline (Tx.prepare "stmt" () query *> Tx.executePrepared "stmt" () query) >>= Tx.singleRowValue)
         second <- run (Tx.pipeline (Tx.executePrepared "stmt" () withoutSql) >>= Tx.singleRowValue)
         (first, second) `shouldBe` ("first", "second")
         run Tx.finishTransaction
@@ -225,8 +226,8 @@ spec = describe "canonical transactions" $ do
         response = command "BEGIN" <> rows [[Just "first"]] <> executed [[Just "second"]] <> readyTx <> command "COMMIT" <> ready
     withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) response $ \context _ ->
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        (first, second) <- run $ Tx.pipeline $
-          (,) <$> Tx.prepareAs "stmt" () query <*> Tx.executePrepared "stmt" () withoutSql
+        (_, first, second) <- run $ Tx.pipeline $
+          (,,) <$> Tx.prepare "stmt" () query <*> Tx.executePrepared "stmt" () withoutSql <*> Tx.executePrepared "stmt" () withoutSql
         values <- (,) <$> run (Tx.singleRowValue first) <*> run (Tx.singleRowValue second)
         values `shouldBe` ("first", "second")
         run Tx.finishTransaction
@@ -235,6 +236,51 @@ spec = describe "canonical transactions" $ do
     case (positionsOf "stmt\0" bytes, positionsOf "SELECT prepared" bytes) of
       ([parseName, firstBind, secondBind], [text]) -> (parseName < text, text < firstBind, firstBind < secondBind) `shouldBe` (True, True, True)
       _ -> failTest "the Parse and Binds were not written once each"
+
+  it "sends only the Parse for a preparation, and awaits its answer in wire order" $ do
+    sent <- newIORef BS.empty
+    let shape = Tx.singleRow (Tx.row @'[BS.ByteString] Const)
+        query = Tx.Statement "SELECT prepared" (const []) shape
+        response = command "BEGIN" <> parse <> readyTx <> command "COMMIT" <> ready
+    withResponseCallbacks (const (pure ())) (\chunks -> modifyIORef' sent (<> BS.concat chunks)) response $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        preparation <- run (Tx.pipeline (Tx.prepare "stmt" () query))
+        run (Tx.awaitPreparation preparation)
+        -- It stays answered.
+        run (Tx.awaitPreparation preparation)
+        run Tx.finishTransaction
+    bytes <- readIORef sent
+    -- The name is only in the Parse: no Bind refers to it.
+    length (positionsOf "stmt\0" bytes) `shouldBe` 1
+    length (positionsOf "SELECT prepared" bytes) `shouldBe` 1
+
+  it "reports a rejected Parse when its preparation is awaited, and the skipped statements after it" $ do
+    let shape = Tx.singleRow (Tx.row @'[BS.ByteString] Const)
+        query = Tx.Statement "SELECT prepared" (const []) shape
+        syntaxError = message 69 "SERROR\0C42601\0Msyntax error\0\0"
+        response = command "BEGIN" <> syntaxError <> readyFailed <> command "ROLLBACK" <> ready
+        rejected outcome = case outcome of
+          Left (PG.QueryError "SELECT prepared" (PG.ServerFailed _)) -> pure ()
+          _ -> failTest "the rejected Parse was not reported"
+    withResponse response $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        (preparation, result) <- run (Tx.pipeline ((,) <$> Tx.prepare "stmt" () query <*> Tx.executePrepared "stmt" () query))
+        try @PG.QueryError (run (Tx.awaitPreparation preparation)) >>= rejected
+        -- The statement after it was skipped, and it stays rejected.
+        try @PG.QueryError (run (Tx.singleRowValue result)) >>= rejected
+        try @PG.QueryError (run (Tx.awaitPreparation preparation)) >>= rejected
+
+  it "keeps a preparation answered when the statement after it fails" $ do
+    let shape = Tx.singleRow (Tx.row @'[BS.ByteString] Const)
+        query = Tx.Statement "SELECT prepared" (const []) shape
+        response = command "BEGIN" <> parse <> lateError <> readyFailed <> command "ROLLBACK" <> ready
+    withResponse response $ \context _ ->
+      Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+        (preparation, result) <- run (Tx.pipeline ((,) <$> Tx.prepare "stmt" () query <*> Tx.executePrepared "stmt" () query))
+        -- Reading the rows first reads the answer before them.
+        failure <- try @PG.QueryError (run (Tx.singleRowValue result))
+        either (const (pure ())) (const (failTest "the failing statement succeeded")) failure
+        run (Tx.awaitPreparation preparation)
 
   it "isolates pending statements between empty and repeated pipeline plans" $ do
     sent <- newIORef BS.empty

@@ -116,6 +116,8 @@ for private_symbol in \
   'Transaction (Transaction(Transaction))' \
   'Transaction (Pipeline(Pipeline))' \
   'Transaction (Result(Result))' \
+  'Transaction (Preparation(Preparation))' \
+  'Transaction (prepareAs)' \
   'Transaction (Field(Field))' \
   'Transaction (RowDecoder(RowDecoder))' \
   'Transaction (Runtime)' \

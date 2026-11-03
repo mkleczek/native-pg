@@ -33,8 +33,19 @@ import Network.Streaming.BufferPool
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.PositiveInt (positiveInt)
 
-prepareNamed :: ByteString -> params -> Transaction.Statement params row -> Transaction.Pipeline tx (Transaction.Result tx row)
-prepareNamed = Transaction.prepareAs
+prepareNamed :: ByteString -> params -> Transaction.Statement params row -> Transaction.Pipeline tx (Transaction.Preparation tx)
+prepareNamed = Transaction.prepare
+
+awaitNamed :: Transaction.Preparation tx -> Transaction.Transaction tx ()
+awaitNamed = Transaction.awaitPreparation
+
+-- A client records a name once the server accepted its Parse, before the rows
+-- that can still fail.
+preparedRows :: ByteString -> Transaction.Statement () (Const Int64) -> Transaction.Transaction tx [Int64]
+preparedRows name known = do
+  (preparation, rows) <- Transaction.pipeline ((,) <$> prepareNamed name () known <*> executeNamed name () known)
+  awaitNamed preparation
+  Transaction.rowList rows
 
 executeNamed :: ByteString -> params -> Transaction.Statement params row -> Transaction.Pipeline tx (Transaction.Result tx row)
 executeNamed = Transaction.executePrepared
