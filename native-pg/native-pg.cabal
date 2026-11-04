@@ -119,6 +119,7 @@ test-suite native-pg-spec
                       PasswordFileSpec
                       ContextSpec
                       FramingSpec
+                      BatchedReadsSpec
                       StreamingResourcesSpec
                       FieldStreamSpec
                       TransactionSpec
