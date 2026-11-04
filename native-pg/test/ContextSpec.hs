@@ -167,12 +167,12 @@ spec = describe "explicit operation contexts" $ do
     connection <- newConnection (newChannel (Scripted (\_ _ -> pure Nothing) (\_ -> fail "unexpected send"))) 16
     PG.checkIdle connection `shouldReturn` Right ()
     PG.isUsable connection `shouldReturn` True
-  xfail "checkIdle only checks the session's state" $ it "breaks an idle connection that the server closed or sent a message to" $ do
+  it "breaks an idle connection that the server closed or sent a message to" $ do
     for_ [Just 0, Just 1] $ \received -> do
       connection <- newConnection (newChannel (Scripted (\_ _ -> pure received) (\_ -> fail "unexpected send"))) 16
       PG.checkIdle connection `shouldSatisfy` P.returns (P.left P.anything)
       PG.isUsable connection `shouldReturn` False
-  xfail "checkIdle only checks the session's state" $ it "breaks an idle connection whose link fails, without throwing" $ do
+  it "breaks an idle connection whose link fails, without throwing" $ do
     connection <- newConnection (newChannel (Scripted (\_ _ -> ioError (userError "reset")) (\_ -> fail "unexpected send"))) 16
     PG.checkIdle connection `shouldSatisfy` P.returns (P.left P.anything)
     PG.isUsable connection `shouldReturn` False

@@ -40,6 +40,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec
   )
 import Database.PostgreSQL.Transport.Link
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
+import Foreign.Ptr (Ptr)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 
 -- | A connection's input and output over its link. It's made with the
@@ -59,6 +60,9 @@ data Channel = Channel
     -- | Sends the output, waiting for room as needed.
     channelSend :: Output -> IO (),
     channelSendBuffered :: OutputBuffer -> Output -> IO (),
+    -- | Reads what's ready into the buffer, up to its size, without waiting:
+    -- 'Nothing' if nothing is, and 0 at the end of the stream.
+    channelReceiveReady :: Ptr Word8 -> Int -> IO (Maybe Int),
     channelClose :: IO ()
   }
 
@@ -71,6 +75,7 @@ newChannel link =
       channelSendSome = sendSome link,
       channelSend = sendOutput link,
       channelSendBuffered = sendOutputWith link . Just,
+      channelReceiveReady = receiveReady link,
       channelClose = closeLink link
     }
 {-# INLINABLE newChannel #-}

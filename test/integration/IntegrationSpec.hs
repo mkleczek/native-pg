@@ -141,7 +141,7 @@ spec socketPath port = do
           execute session (statement "SELECT 1" []) step () `shouldReturn` (Right ((), "SELECT 1"), TxIdle)
           isUsable session `shouldReturn` True
           query session "SELECT 2" [] `shouldReturn` (Right ([[Just "2"]], "SELECT 1"), TxIdle)
-        xfail "checkIdle only checks the session's state" $ it "finds out without waiting that the server ended the idle session" $ bracket (fst <$> connectOwned connecting) close $ \session -> withSession $ \admin -> do
+        it "finds out without waiting that the server ended the idle session" $ bracket (fst <$> connectOwned connecting) close $ \session -> withSession $ \admin -> do
           checkIdle (Session.connection session) `shouldReturn` Right ()
           (Right ([[pid]], _), _) <- query session "SELECT pg_backend_pid()" []
           -- with a timeout, it returns once the backend has exited

@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -9,10 +10,12 @@ module Database.PostgreSQL.Session
     closeStatement, cancel,
   ) where
 
-import Control.Exception (IOException, catch, finally, mask, throwIO)
+import Control.Exception (IOException, SomeAsyncException, SomeException, catch, displayException, finally, fromException, mask, mask_, throwIO, try)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
+import Data.Functor (($>))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.Maybe (isJust)
 import Database.PostgreSQL.Diagnostics (ServerError)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange hiding (Session)
@@ -73,9 +76,31 @@ isUsable opened = do
 -- given. Use it on connections that don't listen. A connection that isn't
 -- idle isn't read, and why is given.
 checkIdle :: Connection -> IO (Either String ())
-checkIdle opened = do
-  usable <- isUsable opened
-  pure (if usable then Right () else Left "the session isn't idle")
+checkIdle opened = mask_ $ do
+  claimed <- atomicModifyIORef' (connectionState opened) $ \case
+    Idle -> (Busy, Nothing)
+    Busy -> (Busy, Just "the session is busy with another operation")
+    Broken -> (Broken, Just "the session broke during an earlier operation")
+    Closed -> (Closed, Just "the session is closed")
+  case claimed of
+    Just reason -> pure (Left reason)
+    Nothing ->
+      readReady >>= \case
+        Right Nothing -> atomicModifyIORef' (connectionState opened) (\state -> (case state of Busy -> Idle; other -> other, Right ()))
+        Right (Just 0) -> broken "the server closed the connection"
+        Right (Just _) -> broken "the server sent a message to the idle session, as it does before ending it"
+        Left failure
+          | isJust (fromException @SomeAsyncException failure) -> breakConnection opened *> throwIO failure
+          | otherwise -> broken (displayException failure)
+  where
+    broken reason = breakConnection opened $> Left reason
+#if defined(mingw32_HOST_OS)
+    -- Sockets block on Windows, so reading would wait: only the state is
+    -- checked.
+    readReady = pure (Right Nothing)
+#else
+    readReady = try @SomeException (allocaBytes 1 $ \buffer -> channelReceiveReady (connectionChannel opened) buffer 1)
+#endif
 
 -- | Closes a named statement. Closing one that doesn't exist isn't an
 -- error.
