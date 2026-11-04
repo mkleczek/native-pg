@@ -5,7 +5,7 @@
 -- | Persistent connection controls and operation-scoped query sessions.
 module Database.PostgreSQL.Session
   ( Session, Connection,
-    connection, close, isUsable,
+    connection, close, isUsable, checkIdle,
     closeStatement, cancel,
   ) where
 
@@ -63,6 +63,19 @@ isUsable opened = do
   pure $ case state of
     Idle -> True
     _ -> False
+
+-- | Checks, without waiting, that the server hasn't ended an idle
+-- connection. The server sends an idle session nothing, except
+-- notifications to one that listens, unless it ends the session, e.g. when it
+-- shuts down or an administrator terminates its backend: it then sends the
+-- error and closes the connection. So if anything has arrived, or the
+-- connection has been closed, it's broken from then on, and the reason is
+-- given. Use it on connections that don't listen. A connection that isn't
+-- idle isn't read, and why is given.
+checkIdle :: Connection -> IO (Either String ())
+checkIdle opened = do
+  usable <- isUsable opened
+  pure (if usable then Right () else Left "the session isn't idle")
 
 -- | Closes a named statement. Closing one that doesn't exist isn't an
 -- error.

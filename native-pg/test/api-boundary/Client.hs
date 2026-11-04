@@ -9,7 +9,7 @@ import Database.PostgreSQL.Decoding ()
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
 import Database.PostgreSQL.Encoders (Parameter (..))
 import Database.PostgreSQL.Session
-  ( Session, Connection, connection, close, isUsable, closeStatement, cancel,
+  ( Session, Connection, connection, close, isUsable, checkIdle, closeStatement, cancel,
   )
 import Database.PostgreSQL.Session.Settings ()
 import Database.PostgreSQL.Snippet ()
@@ -91,6 +91,9 @@ closeConnection = close
 
 connectionUsable :: Connection -> IO Bool
 connectionUsable = isUsable
+
+connectionIdle :: Connection -> IO (Either String ())
+connectionIdle = checkIdle
 
 data Response tx = Response Int64 (Maybe (Transaction.Field tx))
 
