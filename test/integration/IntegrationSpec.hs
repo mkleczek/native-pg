@@ -141,6 +141,13 @@ spec socketPath port = do
           execute session (statement "SELECT 1" []) step () `shouldReturn` (Right ((), "SELECT 1"), TxIdle)
           isUsable session `shouldReturn` True
           query session "SELECT 2" [] `shouldReturn` (Right ([[Just "2"]], "SELECT 1"), TxIdle)
+        xfail "checkIdle only checks the session's state" $ it "finds out without waiting that the server ended the idle session" $ bracket (fst <$> connectOwned connecting) close $ \session -> withSession $ \admin -> do
+          checkIdle (Session.connection session) `shouldReturn` Right ()
+          (Right ([[pid]], _), _) <- query session "SELECT pg_backend_pid()" []
+          -- with a timeout, it returns once the backend has exited
+          query admin "SELECT pg_terminate_backend($1::int, 10000)" [pid] `shouldReturn` (Right ([[Just "t"]], "SELECT 1"), TxIdle)
+          checkIdle (Session.connection session) `shouldSatisfy` P.returns (P.left P.anything)
+          isUsable session `shouldReturn` False
 
   describe "channel-binding data from TLS setup" $ do
     let suppliedBinding supplied mode user =

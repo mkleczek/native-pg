@@ -6,6 +6,8 @@ import Control.Concurrent (forkIO, forkFinally, killThread, threadDelay)
 import Control.Concurrent.MVar
 import Control.Exception (SomeException, finally, try)
 import Control.Monad (replicateM)
+import Data.Foldable (for_)
+import Data.Functor (($>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Maybe (isNothing)
@@ -26,6 +28,7 @@ import Data.Word (Word8)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Buffer (Buffer (..), newBuffer)
 import Skeletest hiding (context)
+import qualified Skeletest.Predicate as P
 import System.Timeout (timeout)
 
 spec :: Spec
@@ -160,6 +163,25 @@ spec = describe "explicit operation contexts" $ do
     rejected overlap
     readIORef entered `shouldReturn` False
     PG.isUsable connection `shouldReturn` True
+  it "finds an idle connection usable when nothing has arrived" $ do
+    connection <- newConnection (newChannel (Scripted (\_ _ -> pure Nothing) (\_ -> fail "unexpected send"))) 16
+    PG.checkIdle connection `shouldReturn` Right ()
+    PG.isUsable connection `shouldReturn` True
+  xfail "checkIdle only checks the session's state" $ it "breaks an idle connection that the server closed or sent a message to" $ do
+    for_ [Just 0, Just 1] $ \received -> do
+      connection <- newConnection (newChannel (Scripted (\_ _ -> pure received) (\_ -> fail "unexpected send"))) 16
+      PG.checkIdle connection `shouldSatisfy` P.returns (P.left P.anything)
+      PG.isUsable connection `shouldReturn` False
+  xfail "checkIdle only checks the session's state" $ it "breaks an idle connection whose link fails, without throwing" $ do
+    connection <- newConnection (newChannel (Scripted (\_ _ -> ioError (userError "reset")) (\_ -> fail "unexpected send"))) 16
+    PG.checkIdle connection `shouldSatisfy` P.returns (P.left P.anything)
+    PG.isUsable connection `shouldReturn` False
+  it "doesn't read a connection that isn't idle" $ do
+    wasRead <- newIORef False
+    connection <- newConnection (newChannel (Scripted (\_ _ -> writeIORef wasRead True $> Nothing) (\_ -> fail "unexpected send"))) 16
+    writeIORef (connectionState connection) Busy
+    PG.checkIdle connection `shouldSatisfy` P.returns (P.left P.anything)
+    readIORef wasRead `shouldReturn` False
 
 reply :: BS.ByteString
 reply = "2\0\0\0\4D\0\0\0\13\0\1\0\0\0\3abcC\0\0\0\13SELECT 1\0Z\0\0\0\5I"
