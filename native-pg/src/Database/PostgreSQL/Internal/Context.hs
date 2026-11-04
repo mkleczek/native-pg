@@ -30,14 +30,17 @@ import Control.Concurrent.MVar (MVar, newMVar, takeMVar, putMVar, readMVar)
 import Control.Exception (catch, finally, mask, onException, throwIO, uninterruptibleMask_)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BSU
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory, newBuffer)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.BufferPool (BufferAccess)
 import Foreign.ForeignPtr (withForeignPtr)
-import Foreign.Ptr (plusPtr)
+import Foreign.Marshal.Utils (copyBytes)
+import Foreign.Ptr (castPtr, plusPtr)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
-import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), reusableInputBuffer, requestInputBuffer, releaseInputBuffer, emptyInputBuffer, runInputUntil, runInputFramedUntil)
+import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedInput, emptyInputBuffer, runInputUntil)
 import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
 import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
 
@@ -48,7 +51,11 @@ data Connection = Connection
     connectionState :: IORef SessionState,
     -- | Notifications that arrived during operations, newest first, until
     -- 'awaitNotification' takes them.
-    connectionNotifications :: IORef [Notification ByteString]
+    connectionNotifications :: IORef [Notification ByteString],
+    -- | What a scope read past its last reply, for the next read of the
+    -- connection to take before the link's bytes: asynchronous messages,
+    -- whole or cut. At most one block, and normally empty.
+    connectionCarryOver :: IORef ByteString
   }
 
 -- | Session handles can be copied, so the connection tracks at run time
@@ -66,7 +73,8 @@ newConnection :: Channel -> Int -> IO Connection
 newConnection channel readSize = do
   state <- newIORef Idle
   notifications <- newIORef []
-  pure (Connection channel readSize state notifications)
+  carry <- newIORef BS.empty
+  pure (Connection channel readSize state notifications carry)
 
 -- | Mutable byte ownership for one operation scope, separate from protocol
 -- state. The public module exports only the type.
@@ -111,18 +119,35 @@ queueContextOutput context output = do
   writeIORef (contextPending context) remaining
 
 -- | Runs a concrete parser against this operation's cursor and pending
--- output. Supplied scopes never read beyond a known protocol envelope.
+-- output. The parser consumes no further than the limit, but a read fills
+-- the free space of the cursor's buffer, so it may bring in what follows.
 runContextInput :: Context -> Int -> Input a -> IO a
 runContextInput context limit parse = do
   ensureContextActive context
   input <- readIORef (contextInput context)
   let connection = contextConnection context
-      source = channelInput (connectionChannel connection) (contextPending context) (contextReadSize context)
-      run = if contextScoped context then runInputFramedUntil else runInputUntil
-  (result, input') <- run source limit input parse
+      source = carriedInput (connectionCarryOver connection)
+        (channelInput (connectionChannel connection) (contextPending context) (contextReadSize context))
+  (result, input') <- runInputUntil source limit input parse
     `catch` \(InputError reason) -> throwIO (ProtocolError reason)
   writeIORef (contextInput context) input'
   pure result
+
+-- | Reads the connection's carried-over bytes before the link's. A read takes
+-- no more than it asks for, and leaves the rest for the next one.
+carriedInput :: IORef ByteString -> InputSource -> InputSource
+carriedInput carry source =
+  source
+    { readInputInto = \pointer size -> do
+        carried <- readIORef carry
+        if BS.null carried
+          then readInputInto source pointer size
+          else do
+            let (taken, left) = BS.splitAt size carried
+            BSU.unsafeUseAsCStringLen taken $ \(origin, count) -> copyBytes pointer (castPtr origin) count
+            writeIORef carry left
+            pure (BS.length taken)
+    }
 
 -- | Binds supplied initialized buffers for the callback. Acquires the
 -- connection before exposing the Context and cancels/joins any operation
@@ -169,7 +194,20 @@ withScopedContext connection makeInput makeOutput readSize use = mask $ \restore
 cleanupContext :: Context -> IO ()
 cleanupContext context = do
   discardUnsent =<< readIORef (contextPending context)
-  releaseInputBuffer =<< readIORef (contextInput context)
+  input <- readIORef (contextInput context)
+  carryOver (contextConnection context) input
+  releaseInputBuffer input
+
+-- | Keeps the bytes a finished scope read but didn't consume, before its block
+-- goes back to its owner. They were read before what the link or an earlier
+-- carry-over still holds, which a smaller block may have taken only in part.
+-- A scope that failed keeps nothing: its connection is broken.
+carryOver :: Connection -> InputBuffer -> IO ()
+carryOver connection input = readIORef (connectionState connection) >>= \case
+  Busy -> do
+    leftover <- unconsumedInput input
+    unless (BS.null leftover) $ modifyIORef' (connectionCarryOver connection) (leftover <>)
+  _ -> pure ()
 
 expireContext :: Context -> IO ()
 expireContext context = do

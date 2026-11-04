@@ -32,15 +32,17 @@ import qualified Skeletest.Predicate as P
 
 spec :: Spec
 spec = describe "batched scoped reads" $ do
-  xfail "a scope reads each message's header and body separately" $ it "reads a reply of many small messages with one read" $
+  it "reads a reply of many small messages with one read" $
     withScopes (positiveInt @256) $ \scopes -> forM_ scopes $ \scope -> do
       server <- newServer [reply]
       connection <- connectionTo server
       scopeRun scope connection run `shouldReturn` expected
       readSizes server `shouldReturn` [256]
       readsStayInBlock scope server
+      -- A reply that ends the read leaves nothing to carry over.
+      readIORef (connectionCarryOver connection) `shouldReturn` BS.empty
 
-  xfail "a scope reads each message's header and body separately" $ it "reads a second reply with one more read" $
+  it "reads a second reply with one more read" $
     withScopes (positiveInt @256) $ \scopes -> forM_ scopes $ \scope -> do
       server <- newServer [reply, reply]
       connection <- connectionTo server
@@ -48,7 +50,7 @@ spec = describe "batched scoped reads" $ do
         replicateM 2 (run context) `shouldReturn` replicate 2 expected
       length <$> readSizes server `shouldReturn` 2
 
-  xfail "a scope reads each message's header and body separately" $ it "streams a row larger than the block in block-sized reads" $
+  it "streams a row larger than the block in block-sized reads" $
     withScopes (positiveInt @64) $ \scopes -> forM_ scopes $ \scope -> do
       let column = BS.replicate 1000 120
           wire = parseComplete <> bindComplete <> dataRow [column] <> commandComplete "SELECT 1" <> ready
@@ -81,7 +83,7 @@ spec = describe "batched scoped reads" $ do
 
   describe "bytes after the last ReadyForQuery" $ do
     forM_ [("whole", maxBound), ("cut inside its header", 3), ("cut after its header", 5), ("cut inside its body", 12)] $ \(label, cut) ->
-      xfail "a scope never reads past its last message and carries nothing over" $ it ("go to the next operation when a notification is " <> label) $
+      it ("go to the next operation when a notification is " <> label) $
         withScopes (positiveInt @256) $ \scopes -> forM_ scopes $ \scope -> do
           let (before, after) = BS.splitAt cut (notification "one")
           server <- newServer [reply <> before, after <> reply]
@@ -96,7 +98,7 @@ spec = describe "batched scoped reads" $ do
           length <$> readSizes server `shouldReturn` 2
           readsStayInBlock scope server
 
-    xfail "a scope never reads past its last message and carries nothing over" $ it "are served to awaitNotification without reading the link" $
+    it "are served to awaitNotification without reading the link" $
       withScopes (positiveInt @256) $ \scopes -> forM_ scopes $ \scope -> do
         server <- newServer [reply <> notification "one"]
         connection <- connectionTo server
@@ -107,7 +109,7 @@ spec = describe "batched scoped reads" $ do
         readSizes server `shouldReturn` [256]
         PG.isUsable connection `shouldReturn` True
 
-    xfail "a scope never reads past its last message and carries nothing over" $ it "keep their order across messages, one of them cut" $
+    it "keep their order across messages, one of them cut" $
       withScopes (positiveInt @256) $ \scopes -> forM_ scopes $ \scope -> do
         let (before, after) = BS.splitAt 9 (notification "two")
         server <- newServer [reply <> notification "one" <> before, after <> reply]
@@ -120,7 +122,7 @@ spec = describe "batched scoped reads" $ do
         map PG.notificationPayload kept `shouldBe` ["two", "one"]
         length <$> readSizes server `shouldReturn` 2
 
-    xfail "a scope never reads past its last message and carries nothing over" $ it "go to an owned context before the link" $ do
+    it "go to an owned context before the link" $ do
       input <- newBuffer (positiveInt @256)
       output <- newBuffer (positiveInt @256)
       let (before, after) = BS.splitAt 7 (notification "one")
@@ -133,7 +135,7 @@ spec = describe "batched scoped reads" $ do
       kept <- readIORef (connectionNotifications connection)
       map PG.notificationPayload kept `shouldBe` ["one"]
 
-    xfail "a scope never reads past its last message and carries nothing over" $ it "keep their order when a smaller block takes them in pieces" $ do
+    it "keep their order when a smaller block takes them in pieces" $ do
       large <- newBuffer (positiveInt @256)
       small <- newBuffer (positiveInt @16)
       output <- newBuffer (positiveInt @256)
@@ -150,7 +152,7 @@ spec = describe "batched scoped reads" $ do
       readSizes server `shouldReturn` [256]
 
   describe "a lent chunk" $
-    xfail "a scope never reads past its last message and carries nothing over" $ it "stays valid while its callback runs and the rest of the reply is already read" $
+    it "stays valid while its callback runs and the rest of the reply is already read" $
       withTestPool (positiveInt @256) $ \access -> do
         let payload = BS.replicate 31 65 <> BS.replicate 31 66
         server <- newServer [parseComplete <> bindComplete <> dataRow [payload] <> dataRow [payload] <> commandComplete "SELECT 2" <> ready]
@@ -183,6 +185,7 @@ spec = describe "batched scoped reads" $ do
           PG.executeWithContext context execution (\_ _ -> throwIO (userError "step failed")) ()
         result `shouldSatisfy` P.left P.anything
         PG.isUsable connection `shouldReturn` False
+        readIORef (connectionCarryOver connection) `shouldReturn` BS.empty
         requests <- readSizes server
         scopeRun scope connection (const (pure ()))
           `shouldSatisfy` P.throws (P.eq (SessionUnusable "the session broke during an earlier operation"))
@@ -196,6 +199,7 @@ spec = describe "batched scoped reads" $ do
           run context `shouldReturn` expected
           breakConnection connection
         PG.isUsable connection `shouldReturn` False
+        readIORef (connectionCarryOver connection) `shouldReturn` BS.empty
         scopeRun scope connection (const (pure ()))
           `shouldSatisfy` P.throws (P.eq (SessionUnusable "the session broke during an earlier operation"))
 

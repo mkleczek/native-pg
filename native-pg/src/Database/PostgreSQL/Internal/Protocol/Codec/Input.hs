@@ -17,6 +17,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     reusableInputBuffer,
     requestInputBuffer,
     releaseInputBuffer,
+    unconsumedInput,
     withInputSome,
     inputPosition,
     peekInputMetadataByteAt,
@@ -28,7 +29,6 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     runBodyParser,
     runInput,
     runInputUntil,
-    runInputFramedUntil,
     skipInput,
   )
 where
@@ -109,6 +109,13 @@ releaseInputBuffer buffer = case bufferRequest buffer of
     loan <- atomicModifyIORef' slot (Nothing,)
     mapM_ releaseBuffer loan
 
+-- | A copy of the bytes read but not consumed yet, which outlives the buffer's
+-- storage. Without such bytes it allocates nothing.
+unconsumedInput :: InputBuffer -> IO ByteString
+unconsumedInput buffer
+  | bufferStart buffer == bufferEnd buffer = pure BS.empty
+  | otherwise = evaluate (BS.copy (slice (bufferEnd buffer - bufferStart buffer) buffer))
+
 retireConsumed :: InputBuffer -> IO InputBuffer
 retireConsumed buffer
   | bufferStart buffer == bufferEnd buffer, Just _ <- bufferRequest buffer = do
@@ -145,8 +152,7 @@ withInputSome count use = do
 data InputEnv = InputEnv
   { envSource :: InputSource,
     -- | The position where the innermost bounded part ends.
-    envLimit :: {-# UNPACK #-} !Int,
-    envFramed :: !Bool
+    envLimit :: {-# UNPACK #-} !Int
   }
 
 -- | The input is malformed, or ended early.
@@ -245,20 +251,14 @@ runInput :: InputSource -> InputBuffer -> Input a -> IO (a, InputBuffer)
 runInput source = runInputUntil source unbounded
 {-# INLINE runInput #-}
 
--- | Like 'runInput', but the parser can't read past the given position.
+-- | Like 'runInput', but the parser can't consume past the given position.
+-- Reads still fill the free space of the buffer, so they may bring in bytes
+-- from beyond it.
 runInputUntil :: InputSource -> Int -> InputBuffer -> Input a -> IO (a, InputBuffer)
 runInputUntil source limit buffer (Input parser) = IO $ \s ->
-  case parser (InputEnv source limit False) buffer s of
+  case parser (InputEnv source limit) buffer s of
     (# s', buffer', a #) -> (# s', (a, buffer') #)
 {-# INLINE runInputUntil #-}
-
--- | Like 'runInputUntil', batching refills within the current envelope while
--- preserving the next envelope for a later operation.
-runInputFramedUntil :: InputSource -> Int -> InputBuffer -> Input a -> IO (a, InputBuffer)
-runInputFramedUntil source limit buffer (Input parser) = IO $ \s ->
-  case parser (InputEnv source limit True) buffer s of
-    (# s', buffer', a #) -> (# s', (a, buffer') #)
-{-# INLINE runInputFramedUntil #-}
 
 -- | How many bytes were consumed before the first unconsumed one.
 inputPosition :: InputBuffer -> Int
@@ -427,30 +427,23 @@ ensureActiveAvailable metadata count = Input $ \env buffer s ->
     else
       if bufferEnd buffer - bufferStart buffer >= count
         then (# s, buffer, buffer #)
-        else case unIO (fill metadata (envSource env) (refillEnd env buffer count) count buffer) s of
+        else case unIO (fill metadata (envSource env) count buffer) s of
           (# s', buffer' #) -> (# s', buffer', buffer' #)
 {-# INLINE ensureActiveAvailable #-}
-
--- Exact envelope headers establish the bound; body refills can then batch
--- without pulling bytes that would outlive the current operation.
-refillEnd :: InputEnv -> InputBuffer -> Int -> Int
-refillEnd env buffer count
-  | not (envFramed env) = maxBound
-  | envLimit env == maxBound = bufferPosition buffer + count
-  | otherwise = envLimit env
-{-# INLINE refillEnd #-}
 
 -- | Reads until the given number of bytes is available. Reads go to the free
 -- part of the current allocation if the bytes fit there, and otherwise to a
 -- new initialized allocation. Caller-owned input compacts in place instead.
-fill :: Bool -> InputSource -> Int -> Int -> InputBuffer -> IO InputBuffer
-fill metadata source end count buffer
+-- A read asks for no more than that free part, so it may also bring in bytes
+-- after the ones needed.
+fill :: Bool -> InputSource -> Int -> InputBuffer -> IO InputBuffer
+fill metadata source count buffer
   | bufferReusable buffer && count > bufferCapacity buffer =
       if metadata
         then readUntilAvailable =<< expandMetadata count buffer
         else throwIO (InputError ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (suppliedCapacity buffer)))
   | Just (HomeBuffer _ capacity) <- bufferHome buffer,
-    count <= capacity = fill metadata source end count =<< restoreHome buffer
+    count <= capacity = fill metadata source count =<< restoreHome buffer
   | bufferStart buffer + count <= bufferCapacity buffer = readUntilAvailable buffer
   | bufferReusable buffer = readUntilAvailable =<< compact
   | otherwise = readUntilAvailable =<< reallocate
@@ -474,9 +467,7 @@ fill metadata source end count buffer
       | otherwise = do
           received <-
             withForeignPtr (bufferMemory current) $ \pointer ->
-              readInputInto source (pointer `plusPtr` bufferEnd current)
-                (min (bufferCapacity current - bufferEnd current)
-                  (end - bufferPosition current - (bufferEnd current - bufferStart current)))
+              readInputInto source (pointer `plusPtr` bufferEnd current) (bufferCapacity current - bufferEnd current)
           when (received <= 0) (throwIO (InputError "unexpected end of input"))
           readUntilAvailable current {bufferEnd = bufferEnd current + received}
 {-# NOINLINE fill #-}

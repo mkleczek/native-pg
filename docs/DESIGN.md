@@ -60,8 +60,8 @@ for the outbound TLS staging dimension of bounded-memory streaming.
 ## State
 
 A persistent `Connection` retains the transport channel, protocol usability
-state and owned notification metadata. It does not retain an operation's input
-cursor, pending output or output scratch allocation.
+state, owned notification metadata and a carry-over of input bytes. It does not
+retain an operation's input cursor, pending output or output scratch allocation.
 
 A private `Context` binds that connection to its input cursor, output workspace
 and pending writes. The private supplied-buffer constructor claims the
@@ -73,10 +73,16 @@ paths share the same state machine and concrete `Input` parser.
 
 A channel's input-source constructor receives the current context's pending
 writes explicitly. It can advance output while waiting for input without
-capturing another operation's output reference. Supplied input reads only the
-header needed to learn a protocol envelope, then batches refills up to that
-envelope's boundary. The following envelope remains in the transport when an
-operation completes; no request-byte leftovers are installed on the connection.
+capturing another operation's output reference. Input is buffered: a read
+fills at most the free space of the operation's block, across message
+boundaries, so a reply of many small messages takes about one read. A parser
+still consumes only within its protocol limits. The server answers only what
+the client sent, so after a scope's last ReadyForQuery its block can hold only
+asynchronous messages, whole or cut. Before the block returns to the pool, the
+scope copies them into the connection's carry-over, at most one block and
+normally empty. The connection's next reader, scoped or owned, takes the
+carry-over before the link, so message order is kept; a broken connection
+drops it.
 
 ## Shared operation resources
 
