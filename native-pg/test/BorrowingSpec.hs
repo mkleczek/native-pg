@@ -75,7 +75,7 @@ spec = describe "caller-owned input" $ do
         else pure empty
       -- A full workspace must still respect a shorter enclosing frame.
       before <- readIORef calls
-      result <- try @InputError (runInputFramedUntil source maxBound input (withInputLimit (width - 1) parse))
+      result <- try @InputError (runInputUntil source maxBound input (withInputLimit (width - 1) parse))
       either show (const "accepted") result `shouldBe` "InputError \"unexpected end of a bounded part: needed " <> show width <> " bytes\""
       readIORef calls `shouldReturn` before
 
@@ -184,7 +184,7 @@ spec = describe "caller-owned input" $ do
     storage <- newBuffer (positiveInt @4)
     let name = BS.replicate 100 120
     source <- bytesSource 4 (name <> "\0next") (const (pure ()))
-    (values, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
+    (values, _) <- runInputUntil source maxBound (reusableInputBuffer storage) $ do
       name' <- withInputLimit 101 readInputCStringBytes
       next <- readInputExactly 4
       pure [name', next]
@@ -194,7 +194,7 @@ spec = describe "caller-owned input" $ do
     storage <- newBuffer (positiveInt @4)
     let challenge = BS.replicate 100 99
     source <- bytesSource 4 (challenge <> "next") (const (pure ()))
-    (values, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
+    (values, _) <- runInputUntil source maxBound (reusableInputBuffer storage) $ do
       value <- withInputLimit 100 readInputRemaining
       next <- readInputExactly 4
       pure [value, next]

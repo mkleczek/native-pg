@@ -38,7 +38,7 @@ spec = describe "protocol framing" $ do
         command = CommandComplete "SELECT 1" :: CommandComplete ByteString
     source <- bytesSource (outputByteString (serialize ready <> serialize command))
     storage <- newBuffer (positiveInt @4)
-    (messages, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $
+    (messages, _) <- runInputUntil source maxBound (reusableInputBuffer storage) $
       (,) <$> parser @ReadyForQuery <*> parser @(CommandComplete ByteString)
     messages `shouldBe` (ready, command)
 
@@ -52,7 +52,7 @@ spec = describe "protocol framing" $ do
       skipInput (fromIntegral size)
       pure "streamed") `shouldReturn` Right "streamed"
 
-  it "batches primitive reads inside a frame without pulling its successor" $ do
+  it "batches primitive reads inside a frame, reading ahead only into free storage" $ do
     let body = outputByteString (mconcat (replicate 100 (serializeField @Int32 @('FixedBytesAtom 4) 7)))
         envelope = outputByteString (serializeField @Int32 @('FixedBytesAtom 4) 400) <> body
         bytes = envelope <> "next"
@@ -66,11 +66,13 @@ spec = describe "protocol framing" $ do
           BS.useAsCString chunk $ \origin -> copyBytes pointer (castPtr origin) (BS.length chunk)
           modifyIORef' offset (+ BS.length chunk)
           pure (BS.length chunk)) 16
-    (values, _) <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
+    (values, rest) <- runInputUntil source maxBound (reusableInputBuffer storage) $ do
       length' <- fieldParser @Int32 @('FixedBytesAtom 4)
       withInputLimit (fromIntegral length') (replicateM 100 (fieldParser @Int32 @('FixedBytesAtom 4)))
     values `shouldBe` replicate 100 7
-    readIORef offset `shouldReturn` BS.length envelope
+    -- The parser consumed its frame and no more, though the last read may
+    -- have taken the start of the next one.
+    inputPosition rest `shouldBe` BS.length envelope
     calls <- readIORef requests
     (length calls <= 28) `shouldBe` True
     maximum calls `shouldBe` 16
@@ -83,7 +85,7 @@ spec = describe "protocol framing" $ do
           offset <- BSU.unsafeUseAsCString chunk $ \pointer ->
             withForeignPtr (bufferMemory storage) (pure . (castPtr pointer `minusPtr`))
           modifyIORef' inside (&& (offset >= 0 && offset + BS.length chunk <= 4))
-    _ <- runInputFramedUntil source maxBound (reusableInputBuffer storage) $ do
+    _ <- runInputUntil source maxBound (reusableInputBuffer storage) $ do
       parseChoice @'[ 'PayloadField 'AuthenticationOkType, 'PayloadField 'AuthenticationSASLType]
         ((\AuthenticationOk -> ()) :|: (\(_ :: AuthenticationSASL ByteString) -> ()) :|: NoAlternatives)
       withInputLimit 32 (replicateM_ 8 (withInputSome 4 consume))

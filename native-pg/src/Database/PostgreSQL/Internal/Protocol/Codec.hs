@@ -31,6 +31,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec
     reusableInputBuffer,
     requestInputBuffer,
     releaseInputBuffer,
+    unconsumedInput,
     withInputSome,
     inputPosition,
     outputByteString,
@@ -42,7 +43,6 @@ module Database.PostgreSQL.Internal.Protocol.Codec
     runBodyParser,
     runInput,
     runInputUntil,
-    runInputFramedUntil,
     skipInput,
     writeOutput,
   )
@@ -70,6 +70,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Input
     reusableInputBuffer,
     requestInputBuffer,
     releaseInputBuffer,
+    unconsumedInput,
     withInputSome,
     inputPosition,
     peekInputMetadataByteAt,
@@ -81,7 +82,6 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Input
     runBodyParser,
     runInput,
     runInputUntil,
-    runInputFramedUntil,
     skipInput,
   )
 import Database.PostgreSQL.Internal.Protocol.Codec.Output

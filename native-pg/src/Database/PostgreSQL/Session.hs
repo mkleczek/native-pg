@@ -13,6 +13,7 @@ module Database.PostgreSQL.Session
 import Control.Exception (IOException, SomeAsyncException, SomeException, catch, displayException, finally, fromException, mask, mask_, throwIO, try)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Data.Functor (($>))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
@@ -85,7 +86,7 @@ checkIdle opened = mask_ $ do
   case claimed of
     Just reason -> pure (Left reason)
     Nothing ->
-      readReady >>= \case
+      arrived >>= \case
         Right Nothing -> atomicModifyIORef' (connectionState opened) (\state -> (case state of Busy -> Idle; other -> other, Right ()))
         Right (Just 0) -> broken "the server closed the connection"
         Right (Just _) -> broken "the server sent a message to the idle session, as it does before ending it"
@@ -94,6 +95,10 @@ checkIdle opened = mask_ $ do
           | otherwise -> broken (displayException failure)
   where
     broken reason = breakConnection opened $> Left reason
+    -- What a scope read past its last reply has arrived as much as what the
+    -- link holds.
+    arrived = readIORef (connectionCarryOver opened) >>= \carried ->
+      if BS.null carried then readReady else pure (Right (Just (BS.length carried)))
 #if defined(mingw32_HOST_OS)
     -- Sockets block on Windows, so reading would wait: only the state is
     -- checked.
