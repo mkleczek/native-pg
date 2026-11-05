@@ -126,7 +126,8 @@ metadata. PostgREST checks out a database connection with `Pool.use`, then calls
 The Session's concrete input cursor borrows on refill and returns exhausted
 storage; a borrowed field chunk keeps its input loan until the next input
 operation. An outgoing borrowed parameter is sent directly from its source
-chunk. Small serialization/protocol metadata remains separately owned.
+chunk. Small serialization/protocol metadata remains separately owned: each
+output's framing is rendered in new memory of its own, not in a pool block.
 Statements describe parameters and rows without knowing how their buffers
 were acquired.
 
@@ -1002,12 +1003,20 @@ scalar. Copied fields fill that storage incrementally; a partial send keeps
 the current slice alive and unchanged before the next fill. The sender resumes
 with the remaining writer, without rebuilding the already emitted fields.
 After running out of space, it resumes in an empty buffer of at least four
-bytes; the replacement may have a different capacity. The contiguous serializer
-instead resumes after a direct part at its existing scratch offset.
+bytes; the replacement may have a different capacity. After a direct part it
+resumes at the offset where it stopped, behind the bytes already gathered, so
+the copied bytes on both sides go in the same send. With nothing gathered,
+nothing is unsent, and it restarts at the start of the buffer.
 Existing immutable
 byte strings may be sent directly. This bounds serialization scratch space,
 not the caller-owned message values or pipeline metadata. The legacy allocating
 serializer remains available when no caller buffer is supplied.
+
+A request scope has no supplied buffer. Each output gets new memory, as large
+as its copied bytes up to 64 KiB (at least four), filled in the same way. A
+pipeline then goes to the link in one send, within the gather limits,
+whatever the sizes of its parameters, and one more send takes each further
+64 KiB of copied bytes.
 
 List serialization computes wire size and copied size together, then builds
 writers as the sender advances. It does not retain a serializer per element.

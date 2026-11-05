@@ -11,6 +11,7 @@ module Database.PostgreSQL.Internal.Channel
     OutputBuffer,
     newOutputBuffer,
     outputBufferFrom,
+    outputBufferPerOutput,
     unsent,
     unsentEmpty,
     discardUnsent,
@@ -39,7 +40,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec
     writeOutput,
   )
 import Database.PostgreSQL.Transport.Link
-import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
 import Foreign.Ptr (Ptr)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 
@@ -203,14 +204,20 @@ waitForSourceOrReadable link pull = mask $ \restore -> do
 data Part
   = PartBytes ByteString
   | PartStream ByteStream {-# UNPACK #-} !Int
-  | PartOutput OutputBuffer Writer
+  | -- | Output rendering on in the memory from an offset, past the bytes
+    -- before the part that was sent from where it is.
+    PartOutput (ForeignPtr Word8) {-# UNPACK #-} !Int {-# UNPACK #-} !Int Writer
+  | -- | Output that ran out of room, to go on in the memory once it is empty.
+    PartOutputEmpty (ForeignPtr Word8) {-# UNPACK #-} !Int Writer
   | PartBorrowedStream {-# UNPACK #-} !Int Source
   | PartBorrowedCursor BorrowedPull {-# UNPACK #-} !Int {-# UNPACK #-} !Int
   | PartBorrowedBytes ByteString BorrowedPull {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 
 -- | Memory that outputs are written to, reused once what was written to it
--- is sent.
-data OutputBuffer = OutputBuffer (ForeignPtr Word8) Int Bool
+-- is sent; or new memory for each output.
+data OutputBuffer
+  = OutputBuffer (ForeignPtr Word8) Int Bool
+  | PerOutputBuffer Int
 
 newOutputBuffer :: Int -> IO OutputBuffer
 newOutputBuffer size = (\memory -> OutputBuffer memory size False) <$> mallocPlainForeignPtrBytes size
@@ -219,14 +226,24 @@ newOutputBuffer size = (\memory -> OutputBuffer memory size False) <$> mallocPla
 outputBufferFrom :: Buffer.Buffer -> OutputBuffer
 outputBufferFrom buffer = OutputBuffer (Buffer.bufferMemory buffer) (Buffer.bufferCapacity buffer) True
 
+-- | New memory for each output, as large as its copied bytes, or the limit
+-- if less, so that an output goes in one send unless it is longer than that.
+outputBufferPerOutput :: Int -> OutputBuffer
+outputBufferPerOutput = PerOutputBuffer
+
 -- | All of the output. Caller-supplied buffers are filled incrementally and
--- reused only after their bytes have been sent. Legacy buffers may grow to
--- fit the copied output. Long byte strings and streams retain their own
--- storage until accepted by the link.
+-- reused only after their bytes have been sent. Per-output buffers are filled
+-- in the same way, in memory of their own. Legacy buffers may grow to fit the
+-- copied output. Long byte strings and streams retain their own storage until
+-- accepted by the link.
 unsent :: Maybe OutputBuffer -> Output -> IO Unsent
-unsent (Just buffer@(OutputBuffer _ size True)) output
+unsent (Just (OutputBuffer memory size True)) output
   | size < 4 = ioError (userError "output buffer capacity must be at least four bytes")
-  | otherwise = Unsent [PartOutput buffer (outputWriter output)] <$> newIORef []
+  | otherwise = Unsent [PartOutput memory size 0 (outputWriter output)] <$> newIORef []
+unsent (Just (PerOutputBuffer limit)) output = do
+  let size = max 4 (min limit (outputCopied output))
+  memory <- mallocPlainForeignPtrBytes size
+  Unsent [PartOutput memory size 0 (outputWriter output)] <$> newIORef []
 unsent reused output = do
   memory <- case reused of
     Just (OutputBuffer memory size _) | outputCopied output <= size -> pure memory
@@ -239,21 +256,21 @@ unsent reused output = do
     part (Right (UncopiedStream source)) = PartStream source 0
     part (Right (UncopiedBorrowedStream count source)) = PartBorrowedStream count source
 
-renderOutput :: OutputBuffer -> Writer -> IO [Part]
-renderOutput buffer@(OutputBuffer memory capacity _) writer =
+-- | Renders from the offset in the memory.
+renderOutput :: ForeignPtr Word8 -> Int -> Int -> Writer -> IO [Part]
+renderOutput memory capacity offset writer =
   withForeignPtr memory $ \pointer -> do
-    result <- runWriter writer pointer capacity 0
+    result <- runWriter writer pointer capacity offset
     let copied count parts
-          | count > 0 = PartBytes (BSI.BS memory count) : parts
+          | count > offset = PartBytes (BSI.BS (plusForeignPtr memory offset) (count - offset)) : parts
           | otherwise = parts
-        resume rest = [PartOutput buffer rest]
         uncopied (UncopiedBytes value) = PartBytes value
         uncopied (UncopiedStream source) = PartStream source 0
         uncopied (UncopiedBorrowedStream count source) = PartBorrowedStream count source
     pure $ case result of
       Finished count -> copied count []
-      NeedSpace count rest -> copied count (resume rest)
-      Yield count part rest -> copied count (uncopied part : resume rest)
+      NeedSpace count rest -> copied count [PartOutputEmpty memory capacity rest]
+      Yield count part rest -> copied count [uncopied part, PartOutput memory capacity count rest]
 
 -- | Bytes gathered for one send, and how many pieces at most. A client's
 -- stream comes in chunks of up to 16 KiB from warp, and sending each on its
@@ -292,11 +309,17 @@ sendSome link (Unsent parts registry) = (`Unsent` registry) <$> go parts
       | size >= gatherSize || pieceCount >= gatherPieces = pure (reverse pieces, remaining)
       | otherwise = case remaining of
           [] -> pure (reverse pieces, [])
-          -- Rendering the next buffer would overwrite gathered bytes that
+          -- Rendering in an empty buffer would overwrite gathered bytes that
           -- a partial send still owns.
-          PartOutput _ _ : _ | not (null pieces) -> pure (reverse pieces, remaining)
-          PartOutput buffer steps : others -> do
-            rendered <- renderOutput buffer steps
+          PartOutputEmpty {} : _ | not (null pieces) -> pure (reverse pieces, remaining)
+          PartOutputEmpty memory capacity steps : others -> do
+            rendered <- renderOutput memory capacity 0 steps
+            gather size pieceCount pieces (rendered <> others)
+          -- Past a direct part the output goes on after the gathered bytes.
+          -- With none gathered, none are unsent: a partial send leaves its
+          -- bytes ahead of the output.
+          PartOutput memory capacity offset steps : others -> do
+            rendered <- renderOutput memory capacity (if null pieces then 0 else offset) steps
             gather size pieceCount pieces (rendered <> others)
           -- Flush preceding metadata before starting a scoped source.
           PartBorrowedStream _ _ : _ | not (null pieces) -> pure (reverse pieces, remaining)

@@ -1,5 +1,4 @@
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE DataKinds #-}
 -- | Integration-only connection and operation ownership. Do not retain a
 -- supplied Context or any borrowed slices after its callback returns.
 module Database.PostgreSQL.Internal.Context
@@ -33,8 +32,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
-import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory, newBuffer)
-import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Network.Streaming.BufferPool (BufferAccess)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
@@ -42,7 +40,7 @@ import Foreign.Ptr (castPtr, plusPtr)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
 import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedInput, emptyInputBuffer, runInputUntil)
 import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
-import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
+import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, outputBufferPerOutput, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
 
 data Connection = Connection
   { -- | Input and output over the socket, or TLS over it.
@@ -165,11 +163,17 @@ withContext connection input output use = do
   withScopedContext connection (pure (reusableInputBuffer input)) (pure (outputBufferFrom output)) (bufferCapacity input) use
 
 -- | Uses one request capability. Body input borrows lazily; output framing
--- has a separate small workspace and streams retain their source storage.
+-- is rendered in memory of its own for each output, as large as its copied
+-- bytes up to a limit, and streams retain their source storage.
 withRequestContext :: Connection -> BufferAccess -> (Context -> IO a) -> IO a
 withRequestContext connection access =
   withScopedContext connection (requestInputBuffer access)
-    (outputBufferFrom <$> newBuffer (positiveInt @256)) (connectionReadSize connection)
+    (pure (outputBufferPerOutput requestOutputLimit)) (connectionReadSize connection)
+
+-- | The most memory for one output's framing. A pipeline that copies more
+-- takes one more send for each of this many bytes.
+requestOutputLimit :: Int
+requestOutputLimit = 65536
 
 withScopedContext :: Connection -> IO InputBuffer -> IO OutputBuffer -> Int -> (Context -> IO a) -> IO a
 withScopedContext connection makeInput makeOutput readSize use = mask $ \restore -> do

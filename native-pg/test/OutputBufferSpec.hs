@@ -243,18 +243,17 @@ spec = describe "caller-owned output storage" $ do
 
   describe "a request's pipeline" $ do
     forM_ [("sendContextOutput", sendContextOutput), ("queueContextOutput", queueContextOutput)] $ \(label, send) ->
-      xfail "framing is rendered in 256 bytes, and every parameter longer than that ends the batch" $
-        it ("goes to the link in one send through " <> label) $
-          withTestPool (positiveInt @256) $ \access -> do
-            sends <- newIORef []
-            let link = Sender $ \chunks -> do
-                  accepted <- evaluate (BS.copy (BS.concat chunks))
-                  modifyIORef' sends (accepted :)
-                  pure (BS.length accepted)
-            connection <- newConnection (newChannel link) 16
-            withRequestContext connection access $ \context ->
-              runContextOperation context (send context pipeline)
-            reverse <$> readIORef sends `shouldReturn` [Output.outputByteString pipeline]
+      it ("goes to the link in one send through " <> label) $
+        withTestPool (positiveInt @256) $ \access -> do
+          sends <- newIORef []
+          let link = Sender $ \chunks -> do
+                accepted <- evaluate (BS.copy (BS.concat chunks))
+                modifyIORef' sends (accepted :)
+                pure (BS.length accepted)
+          connection <- newConnection (newChannel link) 16
+          withRequestContext connection access $ \context ->
+            runContextOperation context (send context pipeline)
+          reverse <$> readIORef sends `shouldReturn` [Output.outputByteString pipeline]
 
     it "arrives intact through a link that takes a few bytes at a time" $
       forM_ [1, 7, 4096] $ \accepts -> forM_ [pipeline, bigPipeline] $ \output ->
@@ -266,20 +265,19 @@ spec = describe "caller-owned output storage" $ do
           readIORef received `shouldReturn` Output.outputByteString output
 
   describe "output continued after a direct value" $ do
-    xfail "rendering resumes at the start of the buffer, so the batch ends at the direct value" $
-      it "goes to the link in one send, from the supplied buffer after what came before" $ do
-        buffer <- newBuffer (positiveInt @64)
-        sends <- newIORef ([] :: [[(Ptr Word8, Int)]])
-        let link = Sender $ \chunks -> do
-              pieces <- mapM (\chunk -> BSU.unsafeUseAsCStringLen chunk (\(pointer, size) -> pure (castPtr pointer, size))) chunks
-              modifyIORef' sends (pieces :)
-              pure (sum (map BS.length chunks))
-        channelSendBuffered (newChannel link) (outputBufferFrom buffer) directValue
-        calls <- readIORef sends
-        map (map snd) calls `shouldBe` [[10, 9000, 6]]
-        withForeignPtr (bufferMemory buffer) $ \start -> case calls of
-          [[(first, size), _, (second, _)]] -> (first, second) `shouldBe` (start, start `plusPtr` size)
-          _ -> failTest "the output did not go in one send of three pieces"
+    it "goes to the link in one send, from the supplied buffer after what came before" $ do
+      buffer <- newBuffer (positiveInt @64)
+      sends <- newIORef ([] :: [[(Ptr Word8, Int)]])
+      let link = Sender $ \chunks -> do
+            pieces <- mapM (\chunk -> BSU.unsafeUseAsCStringLen chunk (\(pointer, size) -> pure (castPtr pointer, size))) chunks
+            modifyIORef' sends (pieces :)
+            pure (sum (map BS.length chunks))
+      channelSendBuffered (newChannel link) (outputBufferFrom buffer) directValue
+      calls <- readIORef sends
+      map (map snd) calls `shouldBe` [[10, 9000, 6]]
+      withForeignPtr (bufferMemory buffer) $ \start -> case calls of
+        [[(first, size), _, (second, _)]] -> (first, second) `shouldBe` (start, start `plusPtr` size)
+        _ -> failTest "the output did not go in one send of three pieces"
 
     it "arrives intact through a link that takes a few bytes at a time" $
       forM_ [1, 3, 7, 64] $ \accepts ->
