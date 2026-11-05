@@ -5,24 +5,30 @@
 
 module OutputBufferSpec (spec) where
 
+import AcquisitionTestSupport (getAcquisition)
 import Control.Exception (evaluate, finally)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import qualified Data.ByteString.Internal as BSI
 import Data.Functor (($>))
 import Data.IORef
+import Data.Word (Word8)
 import Control.Monad (forM_)
 import qualified Network.Streaming as Streaming
+import Database.PostgreSQL.Internal.Execution (Execution (..), Statement (..), executionMessages)
 import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Database.PostgreSQL.Internal.Context
-import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.PositiveInt (PositiveInt, positiveInt)
 import Network.Streaming.Buffer (bufferMemory, bufferCapacity, newBuffer)
+import Network.Streaming.BufferPool (PoolSettings (..))
+import qualified Network.Streaming.BufferPool as BufferPool
 import Database.PostgreSQL.Internal.Protocol (pattern Sync, pattern Parse, pattern Execute, pattern Query, serialize)
 import Database.PostgreSQL.Transport hiding (newChannel)
 import Database.PostgreSQL.Internal.Channel
+import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Foreign.ForeignPtr (withForeignPtr)
-import Foreign.Ptr (castPtr, plusPtr)
+import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Skeletest hiding (context)
 
 spec :: Spec
@@ -234,9 +240,90 @@ spec = describe "caller-owned output storage" $ do
     channelSendBuffered (newChannel sender) (outputBufferFrom buffer) output
     readIORef received `shouldReturn` expected
     readIORef pulls `shouldReturn` 2
+
+  describe "a request's pipeline" $ do
+    forM_ [("sendContextOutput", sendContextOutput), ("queueContextOutput", queueContextOutput)] $ \(label, send) ->
+      xfail "framing is rendered in 256 bytes, and every parameter longer than that ends the batch" $
+        it ("goes to the link in one send through " <> label) $
+          withTestPool (positiveInt @256) $ \access -> do
+            sends <- newIORef []
+            let link = Sender $ \chunks -> do
+                  accepted <- evaluate (BS.copy (BS.concat chunks))
+                  modifyIORef' sends (accepted :)
+                  pure (BS.length accepted)
+            connection <- newConnection (newChannel link) 16
+            withRequestContext connection access $ \context ->
+              runContextOperation context (send context pipeline)
+            reverse <$> readIORef sends `shouldReturn` [Output.outputByteString pipeline]
+
+    it "arrives intact through a link that takes a few bytes at a time" $
+      forM_ [1, 7, 4096] $ \accepts -> forM_ [pipeline, bigPipeline] $ \output ->
+        withTestPool (positiveInt @256) $ \access -> do
+          received <- newIORef BS.empty
+          connection <- newConnection (newChannel (takingUpTo accepts received)) 16
+          withRequestContext connection access $ \context ->
+            runContextOperation context (sendContextOutput context output)
+          readIORef received `shouldReturn` Output.outputByteString output
+
+  describe "output continued after a direct value" $ do
+    xfail "rendering resumes at the start of the buffer, so the batch ends at the direct value" $
+      it "goes to the link in one send, from the supplied buffer after what came before" $ do
+        buffer <- newBuffer (positiveInt @64)
+        sends <- newIORef ([] :: [[(Ptr Word8, Int)]])
+        let link = Sender $ \chunks -> do
+              pieces <- mapM (\chunk -> BSU.unsafeUseAsCStringLen chunk (\(pointer, size) -> pure (castPtr pointer, size))) chunks
+              modifyIORef' sends (pieces :)
+              pure (sum (map BS.length chunks))
+        channelSendBuffered (newChannel link) (outputBufferFrom buffer) directValue
+        calls <- readIORef sends
+        map (map snd) calls `shouldBe` [[10, 9000, 6]]
+        withForeignPtr (bufferMemory buffer) $ \start -> case calls of
+          [[(first, size), _, (second, _)]] -> (first, second) `shouldBe` (start, start `plusPtr` size)
+          _ -> failTest "the output did not go in one send of three pieces"
+
+    it "arrives intact through a link that takes a few bytes at a time" $
+      forM_ [1, 3, 7, 64] $ \accepts ->
+        forM_ [directValue, directValue <> mconcat (replicate 40 (serialize Sync))] $ \output -> do
+          buffer <- newBuffer (positiveInt @64)
+          received <- newIORef BS.empty
+          channelSendBuffered (newChannel (takingUpTo accepts received)) (outputBufferFrom buffer) output
+          readIORef received `shouldReturn` Output.outputByteString output
   where
     batch = mconcat (replicate 40 (serialize Sync))
     wire = BS.concat (replicate 40 "S\0\0\0\4")
+
+-- | Framing (10 bytes), a direct value, framing again (6 bytes).
+directValue :: Output.Output
+directValue = serialize Sync <> serialize (Query (BS.replicate 9000 65)) <> serialize Sync
+
+-- | A request's messages: Parse, Bind with parameters of the given sizes, Execute, and Sync.
+request :: [Int] -> Output.Output
+request sizes = executionMessages (Execution (Unprepared "SELECT $1" []) [] parameters []) <> serialize Sync
+  where
+    parameters = [Just (ParameterBytes (BS.replicate size 120)) | size <- sizes]
+
+pipeline, bigPipeline :: Output.Output
+pipeline = request [300, 1000, 4000]
+-- | More bytes to copy than a request's framing buffer holds.
+bigPipeline = request (replicate 12 8000)
+
+-- | A link that takes at most so many bytes per send.
+takingUpTo :: Int -> IORef BS.ByteString -> Sender
+takingUpTo count received = Sender $ \chunks -> do
+  prefix <- evaluate (BS.copy (BS.take count (BS.concat chunks)))
+  modifyIORef' received (<> prefix)
+  pure (BS.length prefix)
+
+withTestPool :: PositiveInt -> (BufferPool.BufferAccess -> IO a) -> IO a
+withTestPool size use = do
+  waiting <- getAcquisition
+  resources <- BufferPool.newBufferPool waiting PoolSettings
+    { bufferSize = size,
+      ordinaryBufferCount = positiveInt @1,
+      reserveBufferCount = positiveInt @1,
+      setupBufferCount = positiveInt @2
+    }
+  BufferPool.withRequestBuffers resources use
 
 newtype Sender = Sender ([BS.ByteString] -> IO Int)
 
