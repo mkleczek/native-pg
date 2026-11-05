@@ -11,7 +11,8 @@ import Data.Word (Word32, Word8)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Char8 as Char8
-import Data.Foldable (toList)
+import qualified Data.ByteString.Unsafe as BSU
+import Data.Foldable (forM_, toList)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List.NonEmpty (NonEmpty (..))
@@ -439,6 +440,16 @@ spec = do
       paramView (Encoders.param (Encoders.nonNullable Encoders.jsonLazyBytes) "{}") `shouldBe` (Just 114, BinaryFormat, Just "{}")
       paramView (Encoders.param (Encoders.nonNullable Encoders.jsonbLazyBytes) "{}") `shouldBe` (Just 3802, BinaryFormat, Just "\1{}")
       paramView (Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes) Nothing) `shouldBe` (Just 3802, BinaryFormat, Nothing)
+    forM_ [("unknown", Encoders.unknown, 705, TextFormat), ("bytea", Encoders.bytea, 17, BinaryFormat)] $ \(label, encoder, oid, format) ->
+      xfail "param encodes every value through postgresql-binary, which copies the bytes" $
+        it ("sends strict bytes as they are through " <> label) $ do
+          let value = BS.replicate 100 65
+              sentAsIs (Tx.Param _ _ (Just (ParameterBytes sent))) = sharesMemory sent value
+              sentAsIs _ = pure False
+          sentAsIs (Encoders.param (Encoders.nonNullable encoder) value) `shouldReturn` True
+          sentAsIs (Encoders.param (Encoders.nullable encoder) (Just value)) `shouldReturn` True
+          paramView (Encoders.param (Encoders.nonNullable encoder) value) `shouldBe` (Just oid, format, Just value)
+          paramView (Encoders.param (Encoders.nullable encoder) Nothing) `shouldBe` (Just oid, format, Nothing)
     it "sends bytes as they are, at hand or streamed" $ do
       paramView (Encoders.rawParam Encoders.rawJson (Just (ParameterBytes "{}"))) `shouldBe` (Just 114, BinaryFormat, Just "{}")
       paramView (Encoders.rawParam Encoders.rawJsonb (Just (ParameterBytes "{}"))) `shouldBe` (Just 3802, TextFormat, Just "{}")
@@ -452,6 +463,12 @@ spec = do
         `shouldBe` ( Just 1009,
                      BinaryFormat,
                      Just (int32 1 <> int32 0 <> int32 25 <> int32 2 <> int32 1 <> int32 1 <> "a" <> int32 2 <> "bc")
+                   )
+    it "sends an array of bytea elements, NULL ones too" $
+      paramView (Encoders.param (Encoders.nonNullable (Encoders.foldableArray (Encoders.nullable Encoders.bytea))) [Just "a", Nothing, Just "bc"])
+        `shouldBe` ( Just 1001,
+                     BinaryFormat,
+                     Just (int32 1 <> int32 1 <> int32 17 <> int32 3 <> int32 1 <> int32 1 <> "a" <> int32 (-1) <> int32 2 <> "bc")
                    )
 
 rfc7677ServerFirst :: ByteString
@@ -601,6 +618,13 @@ defaultsFrom environment = Defaults "/tmp" ((<> "/.postgresql") <$> lookup "HOME
 
 hosts :: Either String ConnectionString -> Either String [Host]
 hosts = fmap (toList . connectionHosts)
+
+-- | Whether the byte strings are the same memory, not copies of each other.
+sharesMemory :: ByteString -> ByteString -> IO Bool
+sharesMemory left right =
+  BSU.unsafeUseAsCStringLen left $ \(leftStart, leftSize) ->
+    BSU.unsafeUseAsCStringLen right $ \(rightStart, rightSize) ->
+      pure (leftStart == rightStart && leftSize == rightSize)
 
 -- | A parameter's type, format and bytes, which can be compared.
 paramView :: Tx.Param -> (Maybe Word32, FormatCode, Maybe ByteString)
