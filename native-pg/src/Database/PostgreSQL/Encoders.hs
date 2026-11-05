@@ -43,48 +43,54 @@ import Database.PostgreSQL.Transaction (Param (..))
 import qualified PostgreSQL.Binary.Encoding as Binary
 
 -- | How a value of type @a@ is encoded: its type's OID, the OID of the
--- arrays of that type, its format, and its bytes.
-data Value a = Value Word32 Word32 FormatCode (a -> Binary.Encoding)
+-- arrays of that type, its format, its parameter's bytes, and its encoding as
+-- an element of an array. Both are the same bytes, but where the value already
+-- is strict bytes, the parameter is the value itself, not a copy.
+data Value a = Value Word32 Word32 FormatCode (a -> ByteString) (a -> Binary.Encoding)
 
 -- | A value that can be NULL, or one that can't.
-data NullableOrNot a = NullableOrNot Word32 Word32 FormatCode (a -> Maybe Binary.Encoding)
+data NullableOrNot a = NullableOrNot Word32 Word32 FormatCode (a -> Maybe ByteString) (a -> Maybe Binary.Encoding)
+
+-- | A value whose parameter is the bytes of its encoding.
+encoded :: Word32 -> Word32 -> FormatCode -> (a -> Binary.Encoding) -> Value a
+encoded oid arrayOid format encode = Value oid arrayOid format (Binary.encodingBytes . encode) encode
 
 nonNullable :: Value a -> NullableOrNot a
-nonNullable (Value oid arrayOid format encode) = NullableOrNot oid arrayOid format (Just . encode)
+nonNullable (Value oid arrayOid format bytes encode) = NullableOrNot oid arrayOid format (Just . bytes) (Just . encode)
 
 nullable :: Value a -> NullableOrNot (Maybe a)
-nullable (Value oid arrayOid format encode) = NullableOrNot oid arrayOid format (fmap encode)
+nullable (Value oid arrayOid format bytes encode) = NullableOrNot oid arrayOid format (fmap bytes) (fmap encode)
 
 -- | The parameter for the value.
 param :: NullableOrNot a -> a -> Param
-param (NullableOrNot oid _ format encode) value =
+param (NullableOrNot oid _ format bytes _) value =
   Param
     { paramType = Just oid,
       paramFormat = format,
-      paramValue = ParameterBytes . Binary.encodingBytes <$> encode value
+      paramValue = ParameterBytes <$> bytes value
     }
 
 -- | Bytes of PostgreSQL's @unknown@ type, which leaves inferring their type
 -- to the server.
 unknown :: Value ByteString
-unknown = Value 705 705 TextFormat Binary.bytea_strict
+unknown = Value 705 705 TextFormat id Binary.bytea_strict
 
 bytea :: Value ByteString
-bytea = Value 17 1001 BinaryFormat Binary.bytea_strict
+bytea = Value 17 1001 BinaryFormat id Binary.bytea_strict
 
 text :: Value Text
-text = Value 25 1009 BinaryFormat Binary.text_strict
+text = encoded 25 1009 BinaryFormat Binary.text_strict
 
 jsonLazyBytes :: Value LBS.ByteString
-jsonLazyBytes = Value 114 199 BinaryFormat Binary.json_bytes_lazy
+jsonLazyBytes = encoded 114 199 BinaryFormat Binary.json_bytes_lazy
 
 jsonbLazyBytes :: Value LBS.ByteString
-jsonbLazyBytes = Value 3802 3807 BinaryFormat Binary.jsonb_bytes_lazy
+jsonbLazyBytes = encoded 3802 3807 BinaryFormat Binary.jsonb_bytes_lazy
 
 -- | A one-dimensional array of the elements.
 foldableArray :: Foldable foldable => NullableOrNot element -> Value (foldable element)
-foldableArray (NullableOrNot oid arrayOid _ encode) =
-  Value arrayOid arrayOid BinaryFormat $
+foldableArray (NullableOrNot oid arrayOid _ _ encode) =
+  encoded arrayOid arrayOid BinaryFormat $
     Binary.array oid . Binary.dimensionArray foldl' (maybe Binary.nullArray Binary.encodingArray . encode)
 
 -- | Bytes sent as a value of a type as they are, in the format in which they

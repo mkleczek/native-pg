@@ -441,15 +441,14 @@ spec = do
       paramView (Encoders.param (Encoders.nonNullable Encoders.jsonbLazyBytes) "{}") `shouldBe` (Just 3802, BinaryFormat, Just "\1{}")
       paramView (Encoders.param (Encoders.nullable Encoders.jsonbLazyBytes) Nothing) `shouldBe` (Just 3802, BinaryFormat, Nothing)
     forM_ [("unknown", Encoders.unknown, 705, TextFormat), ("bytea", Encoders.bytea, 17, BinaryFormat)] $ \(label, encoder, oid, format) ->
-      xfail "param encodes every value through postgresql-binary, which copies the bytes" $
-        it ("sends strict bytes as they are through " <> label) $ do
-          let value = BS.replicate 100 65
-              sentAsIs (Tx.Param _ _ (Just (ParameterBytes sent))) = sharesMemory sent value
-              sentAsIs _ = pure False
-          sentAsIs (Encoders.param (Encoders.nonNullable encoder) value) `shouldReturn` True
-          sentAsIs (Encoders.param (Encoders.nullable encoder) (Just value)) `shouldReturn` True
-          paramView (Encoders.param (Encoders.nonNullable encoder) value) `shouldBe` (Just oid, format, Just value)
-          paramView (Encoders.param (Encoders.nullable encoder) Nothing) `shouldBe` (Just oid, format, Nothing)
+      it ("sends strict bytes as they are through " <> label) $ do
+        let value = BS.replicate 100 65
+            sentAsIs (Tx.Param _ _ (Just (ParameterBytes sent))) = sharesMemory sent value
+            sentAsIs _ = pure False
+        sentAsIs (Encoders.param (Encoders.nonNullable encoder) value) `shouldReturn` True
+        sentAsIs (Encoders.param (Encoders.nullable encoder) (Just value)) `shouldReturn` True
+        paramView (Encoders.param (Encoders.nonNullable encoder) value) `shouldBe` (Just oid, format, Just value)
+        paramView (Encoders.param (Encoders.nullable encoder) Nothing) `shouldBe` (Just oid, format, Nothing)
     it "sends bytes as they are, at hand or streamed" $ do
       paramView (Encoders.rawParam Encoders.rawJson (Just (ParameterBytes "{}"))) `shouldBe` (Just 114, BinaryFormat, Just "{}")
       paramView (Encoders.rawParam Encoders.rawJsonb (Just (ParameterBytes "{}"))) `shouldBe` (Just 3802, TextFormat, Just "{}")
