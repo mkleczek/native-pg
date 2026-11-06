@@ -18,6 +18,7 @@ library
                    Network.Streaming.PositiveInt
                    Network.Streaming.BufferPool
                    Network.Streaming.Buffer
+                   Network.Streaming.Watch
   other-modules: Network.Streaming.Internal.ListPrefix
   build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, network >=3.1 && <3.3, stm >=2.5 && <2.6, containers >=0.6 && <0.8, resource-admission
 
@@ -36,10 +37,12 @@ test-suite streaming-io-spec
                  Network.Streaming.PositiveInt
                  Network.Streaming.BufferPool
                  Network.Streaming.Buffer
+                 Network.Streaming.Watch
                  PositiveIntSpec
                  RequestBuffersSpec
                  ResourcesSpec
                  StreamingSpec
+                 WatchSpec
   ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, containers, network, stm, streaming-io, resource-admission, skeletest >=0.4.2 && <0.5

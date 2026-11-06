@@ -29,6 +29,7 @@ import Foreign.Ptr (Ptr, castPtr, minusPtr)
 import Data.Word (Word8)
 import Database.PostgreSQL.Transport hiding (newChannel)
 import Database.PostgreSQL.Internal.Channel
+import Network.Streaming.Watch (readyNow)
 import Skeletest hiding (context)
 
 spec :: Spec
@@ -280,9 +281,8 @@ instance Link Scripted where
   receiveReady (Scripted receive) = receive
   sendReady _ = pure . sum . map BS.length
   flushReady _ = pure True
-  awaitReadable _ = fail "unexpected read wait"
-  awaitWritable _ = pure ()
-  awaitReadableOrWritable _ = fail "unexpected combined wait"
+  watchReadable _ = fail "unexpected read wait"
+  watchWritable _ = pure readyNow
   closeLink _ = pure ()
 
 message :: Word8 -> BS.ByteString -> BS.ByteString

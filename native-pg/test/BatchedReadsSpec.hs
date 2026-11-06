@@ -27,6 +27,7 @@ import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory, newBuffer
 import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.PositiveInt (PositiveInt, positiveInt)
+import Network.Streaming.Watch (readyNow)
 import Skeletest hiding (context)
 import qualified Skeletest.Predicate as P
 
@@ -261,9 +262,8 @@ instance Link Server where
       [] -> pure ()
     pure sent
   flushReady _ = pure True
-  awaitReadable _ = fail "unexpected read wait"
-  awaitWritable _ = pure ()
-  awaitReadableOrWritable _ = fail "unexpected combined wait"
+  watchReadable _ = fail "unexpected read wait"
+  watchWritable _ = pure readyNow
   closeLink _ = pure ()
 
 connectionTo :: Server -> IO Connection

@@ -31,6 +31,7 @@ import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.BufferPool
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory, newBuffer)
+import Network.Streaming.Watch (readyNow)
 import Skeletest hiding (context)
 import System.IO.Error (ioeGetErrorString)
 import System.Timeout (timeout)
@@ -184,9 +185,8 @@ instance Link Observed where
   receiveReady link _ _ = unexpectedTransport link
   sendReady link _ = unexpectedTransport link
   flushReady = unexpectedTransport
-  awaitReadable = unexpectedTransport
-  awaitWritable = unexpectedTransport
-  awaitReadableOrWritable = unexpectedTransport
+  watchReadable = unexpectedTransport
+  watchWritable = unexpectedTransport
   closeLink = unexpectedTransport
 
 unexpectedTransport :: Observed -> IO a
@@ -214,9 +214,8 @@ instance Link Idle where
   receiveReady _ _ _ = fail "unexpected receive"
   sendReady _ _ = fail "unexpected send"
   flushReady _ = pure True
-  awaitReadable _ = fail "unexpected read wait"
-  awaitWritable _ = fail "unexpected write wait"
-  awaitReadableOrWritable _ = fail "unexpected combined wait"
+  watchReadable _ = fail "unexpected read wait"
+  watchWritable _ = fail "unexpected write wait"
   closeLink _ = pure ()
 
 idleChannel :: Channel
@@ -230,9 +229,8 @@ instance Link Transfer where
   receiveReady (Transfer receive _) = receive
   sendReady (Transfer _ send) = send
   flushReady _ = pure True
-  awaitReadable _ = fail "unexpected read wait"
-  awaitWritable _ = pure ()
-  awaitReadableOrWritable _ = fail "unexpected combined wait"
+  watchReadable _ = fail "unexpected read wait"
+  watchWritable _ = pure readyNow
   closeLink _ = pure ()
 
 withTestResources :: PoolSettings -> (BufferPool.BufferPool -> IO a) -> IO a

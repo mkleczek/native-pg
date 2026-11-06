@@ -39,7 +39,7 @@ import qualified Data.ByteString.Unsafe as BS
 import Data.Foldable (for_)
 import Data.Int (Int64)
 import Data.Word (Word16, Word32, Word8)
-import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel, serverEndPoint)
+import Database.PostgreSQL.Transport (Blocked (..), Interest (..), Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel, serverEndPoint)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString, withCStringLen)
@@ -186,12 +186,12 @@ data TlsConnection = TlsConnection
   }
 
 instance Link TlsConnection where
-  awaitReadable = awaitReadable . tlsSocket
-  {-# INLINE awaitReadable #-}
-  awaitWritable = awaitWritable . tlsSocket
-  {-# INLINE awaitWritable #-}
-  awaitReadableOrWritable = awaitReadableOrWritable . tlsSocket
-  {-# INLINE awaitReadableOrWritable #-}
+  watchReadable = watchReadable . tlsSocket
+  {-# NOINLINE watchReadable #-}
+  watchWritable = watchWritable . tlsSocket
+  {-# NOINLINE watchWritable #-}
+  awaitAny = awaitAny . tlsSocket
+  {-# INLINE awaitAny #-}
   receiveReady = receiveTls
   {-# INLINE receiveReady #-}
   sendReady = sendTls
@@ -234,12 +234,12 @@ handshake tls = do
   flushed <- flushTls tls
   handshaking <- withConnection tls c_connection_is_handshaking
   if
-    | not flushed -> awaitWritable tls *> handshake tls
+    | not flushed -> awaitAny tls (Interest False OnWritable) *> handshake tls
     | handshaking == CBool 0 -> pure ()
     | otherwise ->
         readRecords tls >>= \case
           Read -> handshake tls
-          WouldBlock -> awaitReadable tls *> handshake tls
+          WouldBlock -> awaitAny tls (Interest True Done) *> handshake tls
           Ended -> throwIO (TlsError "the connection closed during the handshake")
 
 -- | Reads what's ready into the buffer, up to its size, without waiting:

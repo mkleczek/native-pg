@@ -27,6 +27,7 @@ import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Buffer (Buffer (..), newBuffer)
+import Network.Streaming.Watch (readyNow)
 import Skeletest hiding (context)
 import qualified Skeletest.Predicate as P
 import System.Timeout (timeout)
@@ -194,9 +195,8 @@ instance Link Scripted where
   receiveReady (Scripted receive _) = receive
   sendReady (Scripted _ send) = send
   flushReady _ = pure True
-  awaitReadable _ = fail "unexpected read wait"
-  awaitWritable _ = pure ()
-  awaitReadableOrWritable _ = fail "unexpected combined wait"
+  watchReadable _ = fail "unexpected read wait"
+  watchWritable _ = pure readyNow
   closeLink _ = pure ()
 
 idleChannel :: Channel

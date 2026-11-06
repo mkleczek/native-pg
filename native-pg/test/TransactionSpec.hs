@@ -31,6 +31,8 @@ import Foreign.Ptr (Ptr, castPtr, minusPtr)
 import Data.Word (Word8)
 import Database.PostgreSQL.Transport hiding (newChannel)
 import Database.PostgreSQL.Internal.Channel
+import GHC.Conc (retry)
+import Network.Streaming.Watch (Watch (..), readyNow)
 import Skeletest hiding (context)
 
 newtype Body tx = Body (Maybe (Tx.Field tx))
@@ -977,11 +979,11 @@ instance Link Scripted where
       sent chunks
       pure count
   flushReady _ = pure True
-  awaitReadable _ = fail "unexpected read wait"
-  awaitWritable _ = pure ()
-  awaitReadableOrWritable (Scripted _ _ blocked) = do
+  -- While output is blocked, waiting for either direction goes to writing.
+  watchReadable (Scripted _ _ blocked) = do
     state <- readIORef blocked
-    if state > 0 then pure Writable else fail "unexpected combined wait"
+    if state > 0 then pure (Watch retry (pure ())) else fail "unexpected read wait"
+  watchWritable _ = pure readyNow
   closeLink _ = pure ()
 
 message :: Word8 -> BS.ByteString -> BS.ByteString

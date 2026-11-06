@@ -21,12 +21,15 @@ where
 import Control.Exception (SomeException, bracket, finally, mask, onException, throwIO, try, uninterruptibleMask_)
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId)
 import Control.Concurrent.MVar
+import Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, putTMVar, readTMVar, tryPutTMVar, tryTakeTMVar)
 import Network.Streaming (Source, withChunk)
-import Control.Monad (unless)
+import Network.Streaming.Watch (Watch (..))
+import Control.Monad (unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Functor (($>))
+import GHC.Conc (atomically)
 import Data.IORef (IORef, readIORef, writeIORef, newIORef, atomicModifyIORef')
 import Data.Word (Word8)
 import qualified Network.Streaming.Buffer as Buffer
@@ -98,14 +101,12 @@ linkInputSource link pending readSize =
           left <- readIORef pending
           flushed <- flushReady link
           if unsentEmpty left && flushed
-            then awaitReadable link
-            else case waitingSource left of
-              Just pull | flushed -> do
-                waitForSourceOrReadable link pull
-                writeIORef pending =<< sendSome link left
-              _ -> awaitReadableOrWritable link >>= \case
-                Readable -> pure ()
-                Writable -> writeIORef pending =<< sendSome link left
+            then awaitAny link (Interest True Done)
+            else do
+              case waitingSource left of
+                Just pull | flushed -> waitForSourceOrReadable link pull
+                _ -> awaitAny link (Interest True OnWritable)
+              writeIORef pending =<< sendSome link left
           receive pointer size
 {-# INLINABLE linkInputSource #-}
 
@@ -122,11 +123,11 @@ sendOutputWith link buffer output = bracket (unsent buffer output) discardUnsent
       if unsentEmpty rest
         then do
           flushed <- flushReady link
-          unless flushed (awaitWritable link *> go rest)
+          unless flushed (awaitAny link (Interest False OnWritable) *> go rest)
         else do
           case waitingSource rest of
-            Just pull -> readMVar (pullEvent pull) $> ()
-            Nothing -> awaitWritable link
+            Just pull -> void (atomically (readTMVar (pullEvent pull)))
+            Nothing -> awaitAny link (Interest False OnWritable)
           go rest
 {-# INLINABLE sendOutputWith #-}
 
@@ -146,28 +147,28 @@ discardUnsent (Unsent _ registry) = uninterruptibleMask_ $ do
   mapM_ (\(thread, finished) -> killThread thread *> readMVar finished) active
 
 data BorrowedPull = BorrowedPull
-  { pullEvent :: MVar (Either SomeException ByteString),
+  { pullEvent :: TMVar (Either SomeException ByteString),
     pullAccepted :: MVar (),
     pullFinished :: MVar (Either SomeException ())
   }
 
 newBorrowedPull :: IORef [(ThreadId, MVar ())] -> Source -> IO BorrowedPull
 newBorrowedPull registry source = mask $ \_ -> do
-  event <- newEmptyMVar
+  event <- newEmptyTMVarIO
   accepted <- newEmptyMVar
   finished <- newEmptyMVar
   outcomeVar <- newEmptyMVar
   started <- newEmptyMVar
   let loop = do
         ended <- withChunk source $ \chunk -> do
-          putMVar event (Right chunk)
+          atomically (putTMVar event (Right chunk))
           takeMVar accepted
           pure (BS.null chunk)
         unless ended loop
       run unmask = do
         outcome <- try (unmask loop)
         case outcome of
-          Left failure -> tryPutMVar event (Left failure) $> ()
+          Left failure -> atomically (tryPutTMVar event (Left failure)) $> ()
           Right () -> pure ()
         putMVar outcomeVar outcome
       done = do
@@ -184,21 +185,11 @@ waitingSource (Unsent (PartBorrowedCursor pull _ _ : _) _) = Just pull
 waitingSource _ = Nothing
 
 -- A delayed HTTP chunk must not stop the database from returning an earlier
--- result. Await source readiness or readable PG bytes, cancelling/joining
--- both waiters before the single Link owner resumes.
+-- result. Await readable PG bytes or source readiness in one STM wait, with
+-- readable first, on the caller's thread.
 waitForSourceOrReadable :: Link link => link -> BorrowedPull -> IO ()
-waitForSourceOrReadable link pull = mask $ \restore -> do
-  ready <- newEmptyMVar
-  let waiter action = do
-        finished <- newEmptyMVar
-        thread <- forkIOWithUnmask $ \unmask ->
-          (try (unmask action) >>= \result -> putMVar ready (result :: Either SomeException ()))
-            `finally` putMVar finished ()
-        pure (thread, finished)
-      stop (thread, finished) = uninterruptibleMask_ (killThread thread *> readMVar finished)
-  bracket (waiter (awaitReadable link)) stop $ \_ ->
-    bracket (waiter (readMVar (pullEvent pull) $> ())) stop $ \_ ->
-      restore (takeMVar ready >>= either throwIO pure)
+waitForSourceOrReadable link pull =
+  awaitAny link (Interest True (OnSource (pure (Watch (void (readTMVar (pullEvent pull))) (pure ())))))
 
 -- | Bytes, or a stream with how many bytes it has given.
 data Part
@@ -328,7 +319,7 @@ sendSome link (Unsent parts registry) = (`Unsent` registry) <$> go parts
             gather size pieceCount pieces (PartBorrowedCursor pull count 0 : others)
           PartBorrowedCursor {} : _ | not (null pieces) -> pure (reverse pieces, remaining)
           PartBorrowedCursor pull count given : others ->
-            tryTakeMVar (pullEvent pull) >>= \case
+            atomically (tryTakeTMVar (pullEvent pull)) >>= \case
               Nothing -> pure (reverse pieces, remaining)
               Just (Left failure) -> throwIO failure
               Just (Right chunk) -> do

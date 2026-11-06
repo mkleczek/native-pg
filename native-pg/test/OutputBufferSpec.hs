@@ -29,6 +29,7 @@ import Database.PostgreSQL.Internal.Channel
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
+import Network.Streaming.Watch (readyNow)
 import Skeletest hiding (context)
 
 spec :: Spec
@@ -328,8 +329,7 @@ newtype Sender = Sender ([BS.ByteString] -> IO Int)
 instance Link Sender where
   sendReady (Sender send) = send
   flushReady _ = pure True
-  awaitWritable _ = pure ()
+  watchWritable _ = pure readyNow
   receiveReady _ _ _ = fail "unexpected receive"
-  awaitReadable _ = fail "unexpected read wait"
-  awaitReadableOrWritable _ = fail "unexpected readiness wait"
+  watchReadable _ = fail "unexpected read wait"
   closeLink _ = pure ()

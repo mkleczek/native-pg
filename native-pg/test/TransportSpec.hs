@@ -24,6 +24,8 @@ import Database.PostgreSQL.Internal.Channel
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr)
+import GHC.Conc (retry)
+import Network.Streaming.Watch (Watch (..), readyNow)
 import System.Timeout (timeout)
 import Skeletest
 import qualified Skeletest.Predicate as P
@@ -36,7 +38,7 @@ spec = describe "channels over a link without a socket" $ do
           { testReceive = \pointer size -> do
               count <- readIORef wakeups
               if count < 2 then pure Nothing else provide "reply" pointer size,
-            testReadable = modifyIORef' wakeups (+ 1)
+            testReadable = modifyIORef' wakeups (+ 1) $> readyNow
           }
     (channel, pending) <- channelWith link mempty
     timeout 1000000 (readBytes channel pending) `shouldReturn` Just "reply"
@@ -49,7 +51,7 @@ spec = describe "channels over a link without a socket" $ do
           { testSend = \pieces -> do
               writable <- readIORef ready
               if writable then collect sent pieces else pure 0,
-            testWritable = writeIORef ready True
+            testWritable = writeIORef ready True $> readyNow
           }
     (channel, _) <- channelWith link mempty
     timeout 1000000 (channelSend channel sync) `shouldReturn` Just ()
@@ -61,7 +63,7 @@ spec = describe "channels over a link without a socket" $ do
     let link = testLink
           { testSend = collect sent,
             testFlush = readIORef flushed,
-            testWritable = writeIORef flushed True
+            testWritable = writeIORef flushed True $> readyNow
           }
     (channel, _) <- channelWith link mempty
     timeout 1000000 (channelSend channel sync) `shouldReturn` Just ()
@@ -75,7 +77,8 @@ spec = describe "channels over a link without a socket" $ do
               request <- readIORef sent
               if request == syncBytes then provide "reply" pointer size else pure Nothing,
             testSend = collect sent,
-            testEither = pure Writable
+            testReadable = pure neverReady,
+            testWritable = pure readyNow
           }
     (channel, pending) <- channelWith link sync
     timeout 1000000 (readBytes channel pending) `shouldReturn` Just "reply"
@@ -88,7 +91,8 @@ spec = describe "channels over a link without a socket" $ do
               request <- readIORef sent
               if request == syncBytes then provide "reply" pointer size else pure Nothing,
             testSend = collect sent,
-            testEither = pure Writable
+            testReadable = pure neverReady,
+            testWritable = pure readyNow
           }
     (channel, _) <- channelWith link mempty
     current <- newIORef =<< unsent Nothing sync
@@ -104,7 +108,10 @@ spec = describe "channels over a link without a socket" $ do
           { testReceive = \pointer size -> do
               readable <- readIORef ready
               if readable then provide "reply" pointer size else pure Nothing,
-            testEither = writeIORef ready True $> Readable
+            -- The link isn't writable: it takes nothing of what's pending.
+            testSend = \_ -> pure 0,
+            testReadable = writeIORef ready True $> readyNow,
+            testWritable = pure neverReady
           }
     (channel, pending) <- channelWith link sync
     timeout 1000000 (readBytes channel pending) `shouldReturn` Just "reply"
@@ -162,7 +169,7 @@ checkGather output expected = do
             modifyIORef' calls (BS.length offered :)
             modifyIORef' sent (<> accepted)
             pure (BS.length accepted),
-          testWritable = pure ()
+          testWritable = pure readyNow
         }
   (channel, _) <- channelWith link mempty
   channelSend channel output
@@ -176,9 +183,8 @@ data TestLink = TestLink
   { testReceive :: Ptr Word8 -> Int -> IO (Maybe Int),
     testSend :: [ByteString] -> IO Int,
     testFlush :: IO Bool,
-    testReadable :: IO (),
-    testWritable :: IO (),
-    testEither :: IO Readiness,
+    testReadable :: IO Watch,
+    testWritable :: IO Watch,
     testClose :: IO ()
   }
 
@@ -186,9 +192,8 @@ instance Link TestLink where
   receiveReady = testReceive
   sendReady = testSend
   flushReady = testFlush
-  awaitReadable = testReadable
-  awaitWritable = testWritable
-  awaitReadableOrWritable = testEither
+  watchReadable = testReadable
+  watchWritable = testWritable
   closeLink = testClose
 
 testLink :: TestLink
@@ -199,8 +204,11 @@ testLink =
     (pure True)
     (fail "unexpected read wait")
     (fail "unexpected write wait")
-    (fail "unexpected combined wait")
     (pure ())
+
+-- | A watch that never fires, for the direction a peer doesn't permit.
+neverReady :: Watch
+neverReady = Watch retry (pure ())
 
 channelWith :: TestLink -> Output -> IO (Channel, IORef Unsent)
 channelWith link output = do

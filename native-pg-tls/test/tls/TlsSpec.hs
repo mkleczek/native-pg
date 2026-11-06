@@ -16,7 +16,7 @@ import qualified Data.ByteString.Unsafe as BS
 import Data.Int (Int64)
 import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Tls.Internal
-import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..))
+import Database.PostgreSQL.Transport (Blocked (..), Interest (..), Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..))
 import Foreign.C.Types (CSize (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (withArray)
@@ -45,7 +45,7 @@ spec = do
         let serve = do
               -- The client has built its native connection and is now waiting
               -- for the server. The constructor's temporary storage is gone.
-              awaitReadable server
+              awaitAny server (Interest True Done)
               reclaimTemporaryBuffers
               handshake server
         void $ concurrently (startTls config sock) serve
@@ -236,7 +236,7 @@ sendAll tls pieces = do
   flushed <- flushReady tls
   let rest = dropBytes taken pieces
   unless (null rest && flushed) $ do
-    awaitWritable tls
+    awaitAny tls (Interest False OnWritable)
     sendAll tls rest
   where
     dropBytes taken = \case
@@ -260,7 +260,7 @@ receiveExactly tls count = BS.concat . reverse <$> go 0 []
                 chunk <- BS.packCStringLen (castPtr buffer, received)
                 go (got + received) (chunk : chunks)
               Nothing -> do
-                awaitReadable tls
+                awaitAny tls (Interest True Done)
                 go got chunks
 
 -- | Waits for a receive to give bytes, or 0 at the end of the stream. It
@@ -271,7 +271,7 @@ awaitReceive tls buffer size = maybe (fail "the receive gave nothing for too lon
     go =
       receiveReady tls buffer size >>= \case
         Just received -> pure received
-        Nothing -> awaitReadable tls *> go
+        Nothing -> awaitAny tls (Interest True Done) *> go
 
 -- | The pieces that receives into a buffer of the size give, waiting for them
 -- as needed, until they make up the count or the stream ends.
@@ -302,7 +302,7 @@ receiveCosts tls buffer = go
           let cost = before - after
           case received of
             Just got -> (cost :) <$> go (count - got)
-            Nothing -> awaitReadable tls *> ((cost :) <$> go count)
+            Nothing -> awaitAny tls (Interest True Done) *> ((cost :) <$> go count)
 
 -- | The client's connection to the test server, once their handshake is done.
 connect :: Socket.Socket -> TlsConnection -> IO TlsConnection
