@@ -376,6 +376,73 @@ spec = describe "private acquisition" $ do
       (finalized, release, result) <- activeGrantAnchor context grantDuringEnqueue
       collected finalized `finally` putMVar release ()
       await result >>= expectWaitResult (Just ())
+  it "enrolls an immediate reservation as a delivered request without enqueue or removal" $ do
+    touched <- newTVarIO ([] :: [String])
+    request <- atomically $ enroll (pure 7)
+      (\_ -> modifyTVar' touched ("enqueue" :))
+      (const (modifyTVar' touched ("remove" :)))
+    -- Looking does not take the value.
+    atomically (delivered request) >>= expectDelivered 7
+    atomically (delivered request) >>= expectDelivered 7
+    atomically (withdraw request) >>= (`shouldBe` Just 7)
+    atomically (delivered request) >>= (\outcome -> isNothing outcome `shouldBe` True)
+    atomically (withdraw request) >>= (`shouldBe` Nothing)
+    atomically (tryGrant request (pure 9)) >>= (`shouldBe` False)
+    readTVarIO touched >>= (`shouldBe` [])
+  it "delivers a later grant to an enrolled request and keeps it until withdrawn" $ do
+    removed <- newTVarIO (0 :: Int)
+    request <- atomically $ enroll retry (\_ -> pure ()) (const (modifyTVar' removed (+ 1)))
+    atomically (delivered request) >>= (\outcome -> isNothing outcome `shouldBe` True)
+    atomically (tryGrant request (pure 7)) >>= (`shouldBe` True)
+    readTVarIO removed >>= (`shouldBe` 1)
+    atomically (delivered request) >>= expectDelivered 7
+    atomically (tryGrant request (pure 8)) >>= (`shouldBe` False)
+    atomically (withdraw request) >>= (`shouldBe` Just 7)
+    atomically (withdraw request) >>= (`shouldBe` Nothing)
+    readTVarIO removed >>= (`shouldBe` 1)
+  it "withdraws a pending enrolled request by detaching it exactly once" $ do
+    removed <- newTVarIO (0 :: Int)
+    request <- atomically $ enroll retry (\_ -> pure ()) (const (modifyTVar' removed (+ 1)))
+    atomically (withdraw request) >>= (\value -> value `shouldBe` (Nothing :: Maybe Int))
+    atomically (withdraw request) >>= (\value -> value `shouldBe` (Nothing :: Maybe Int))
+    readTVarIO removed >>= (`shouldBe` 1)
+    atomically (tryGrant request (pure 9)) >>= (`shouldBe` False)
+    atomically (delivered request) >>= (\outcome -> isNothing outcome `shouldBe` True)
+  it "delivers a reservation exception to an enrolled request" $ do
+    request <- atomically $ enroll retry (\_ -> pure ()) (const (pure ()))
+    atomically (tryGrant request (throwSTM OwnerClosed :: STM Int)) >>= (`shouldBe` True)
+    atomically (delivered request) >>= (\outcome -> case outcome of
+      Just (Left exception) -> fromException exception `shouldBe` Just OwnerClosed
+      _ -> fail "expected the delivered exception")
+    atomically (withdraw request) >>= (`shouldBe` Nothing)
+  it "falls back to registration when the immediate reservation retries, rolling it back" $ do
+    touched <- newTVarIO False
+    registered <- newTVarIO False
+    request <- atomically $ enroll (writeTVar touched True >> retry :: STM Int)
+      (\_ -> writeTVar registered True) (const (pure ()))
+    readTVarIO touched >>= (`shouldBe` False)
+    readTVarIO registered >>= (`shouldBe` True)
+    atomically (delivered request) >>= (\outcome -> isNothing outcome `shouldBe` True)
+  it "rolls back an enroll whose immediate reservation throws without registering" $ do
+    reserved <- newTVarIO False
+    registered <- newTVarIO False
+    outcome <- try @OwnerClosed $ atomically $ enroll (writeTVar reserved True >> throwSTM OwnerClosed :: STM Int)
+      (\_ -> writeTVar registered True) (const (pure ()))
+    either Just (const Nothing) outcome `shouldBe` Just OwnerClosed
+    readTVarIO reserved >>= (`shouldBe` False)
+    readTVarIO registered >>= (`shouldBe` False)
+  it "defers removal of a request granted during enqueue until the handle is returned" $ do
+    removed <- newTVarIO (0 :: Int)
+    request <- atomically $ enroll retry
+      (\request -> do
+        granted <- tryGrant request (pure 9)
+        unless granted (throwSTM (userError "synchronous grant failed"))
+        removals <- readTVar removed
+        unless (removals == 0) (throwSTM (userError "removed before handle return")))
+      (const (modifyTVar' removed (+ 1)))
+    readTVarIO removed >>= (`shouldBe` 1)
+    atomically (delivered request) >>= expectDelivered 9
+    atomically (withdraw request) >>= (`shouldBe` Just 9)
 
 -- Callers protect acquisition handoff and own normal release with bracket.
 withAcquired :: Context -> Deadline -> STM a -> (Request a -> STM handle) -> (handle -> STM ()) -> (a -> IO ()) -> (a -> IO b) -> IO (Maybe b)
@@ -446,3 +513,8 @@ activeGrantAnchor context grantDuringEnqueue = do
     atomically (tryGrant request (pure ())) >>= (`shouldBe` True)
   await entered
   pure (done, release, result)
+
+expectDelivered :: Int -> Maybe (Either SomeException Int) -> IO ()
+expectDelivered expected outcome = case outcome of
+  Just (Right value) -> value `shouldBe` expected
+  _ -> fail "expected a delivered value"

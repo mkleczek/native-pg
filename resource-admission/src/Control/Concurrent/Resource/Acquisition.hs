@@ -9,6 +9,7 @@ module Control.Concurrent.Resource.Acquisition
   ( Context, Request, Deadline(..)
   , newContext, deadlineAfter, deadlineExpired
   , acquire, tryGrant
+  , enroll, delivered, withdraw
   ) where
 
 import Control.Concurrent.STM
@@ -68,16 +69,7 @@ acquire (Context manager) deadline reserveNow enqueue remove cleanup = mask $ \r
     case reservation of
       Left value -> handoff value
       Right waiter -> do
-        let abandon = do
-              assigned <- atomically $ do
-                delivery <- readTVar (deliveryState waiter)
-                case delivery of
-                  Pending -> writeTVar (deliveryState waiter) Taken >> detach waiter >> pure Nothing
-                  Offered value -> writeTVar (deliveryState waiter) Taken >> pure (Just value)
-                  _ -> pure Nothing
-              case assigned of
-                Just (Right value) -> cleanup value
-                _ -> pure ()
+        let abandon = atomically (withdraw waiter) >>= mapM_ cleanup
             await = do
               delivery <- readTVar (deliveryState waiter)
               case delivery of
@@ -107,6 +99,42 @@ acquire (Context manager) deadline reserveNow enqueue remove cleanup = mask $ \r
       expiredAtDelivery <- deadlineExpired deadline
       if expiredAtDelivery then cleanup value >> pure Nothing
       else pure (Just value)
+
+-- | The first half of 'acquire' without the wait, for callers that cannot
+-- block: reserve now, or register in the same transaction, so a release
+-- cannot be missed. The caller owns the request: 'delivered' shows its outcome
+-- and 'withdraw' gives it up. There is no deadline and no cleanup hook; a
+-- delivered value stays with the request until 'withdraw' returns it, so
+-- whoever abandons the request must release that value. An immediate
+-- reservation is a request that has been delivered already, and never runs
+-- the enqueue or removal hooks. A grant or error during enqueue defers
+-- removal as it does for 'acquire'. An exception thrown by the immediate
+-- reservation propagates and registers nothing.
+enroll :: STM a -> (Request a -> STM handle) -> (handle -> STM ()) -> STM (Request a)
+enroll reserveNow enqueue remove = (reserveNow >>= offered) `orElse` registerRequest enqueue remove
+  where
+    offered value = Request <$> newTVar (Offered (Right value)) <*> newTVar False <*> pure (pure ())
+
+-- | What the request has been given, without taking it: the value, or the
+-- exception that the reservation raised in 'tryGrant'. Nothing while the
+-- request is pending, and after 'withdraw'.
+delivered :: Request a -> STM (Maybe (Either SomeException a))
+delivered waiter = do
+  state <- readTVar (deliveryState waiter)
+  pure $ case state of
+    Offered result -> Just result
+    _ -> Nothing
+
+-- | Gives up the request. A pending one is detached and can no longer be
+-- granted; a delivered one returns its value, which the caller must now
+-- release. Withdrawing twice, or after expiry, does nothing.
+withdraw :: Request a -> STM (Maybe a)
+withdraw waiter = do
+  state <- readTVar (deliveryState waiter)
+  case state of
+    Pending -> writeTVar (deliveryState waiter) Taken >> detach waiter >> pure Nothing
+    Offered result -> writeTVar (deliveryState waiter) Taken >> pure (either (const Nothing) Just result)
+    _ -> pure Nothing
 
 registerRequest :: (Request a -> STM handle) -> (handle -> STM ()) -> STM (Request a)
 registerRequest enqueue remove = do
