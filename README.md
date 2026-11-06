@@ -58,9 +58,10 @@ pools explicitly close their sockets; resetting a connection pool leaves it usab
 The body pool contains ordinary plus reserve buffers; setup has its own buffer
 count. All four fields use `PositiveInt`, so settings need no separate validation.
 
-The scoped source contract is `Source { withChunk :: forall a.
-(ByteString -> IO a) -> IO a }`: the bytes remain valid through the callback.
-Forwarding finishes that callback before requesting another chunk. Statements
+Borrowed uploads take a pull source (`Network.Streaming.Source`): `pullReady`
+gives a chunk, `Pending` or `Ended` without waiting, and `watchSource` says
+when to try again. A chunk remains valid until the next pull, and the sender
+pulls again only once the link has taken it. Statements
 see streams, not buffer allocation. Native-pg's concrete parser remains
 monomorphic. Explicit supplied-buffer `Streaming.withBuffers` and owned
 sessions remain available for standalone integrations.
@@ -75,7 +76,9 @@ Parameter types use ordinary `Word32` OIDs.
 `Session` exposes connection controls, prepared-statement deallocation and
 cancellation. Raw execution, batching, row access and protocol phases are private.
 `Transport` is the extension API for TLS providers: implement `Link`, build an
-abstract `Channel` with `newChannel`, and return it from a `TlsClient`.
+abstract `Channel` with `newChannel`, and return it from a `TlsClient`. A
+`Link` has one wait, `awaitAny`, for what the caller is blocked on; by default
+it waits on the link's watches, and a link may wait more directly.
 
 Public modules contain their API implementations. Shared settings, connection
 string types, stream types and link definitions live in public submodules.

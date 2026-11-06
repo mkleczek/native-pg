@@ -109,7 +109,10 @@ loan may borrow globally, including from the protected reserve. A third
 overlapping acquisition fails promptly. Returning the primary wakes that
 capability's pending borrower directly, even if global inventory is still empty.
 Returning an additional loan makes it globally available immediately. A request
-can hold at most two loans, including a pending borrow. Callers use explicit
+can hold at most two loans, including a pending borrow. `tryBorrowBuffer`
+takes a loan only if it overtakes no waiting borrower, and `watchBorrow`
+registers in the same FIFO order without waiting, so a pull source can wait
+for a loan together with its other watches. Callers use explicit
 `BufferLoan` lifetimes for unread cursors and stop accessing every alias before
 returning a loan. They cancel or drain their readers and producers and wait for
 those children to finish before request teardown. Teardown expires access and
@@ -409,7 +412,8 @@ belongs to the acquired slot.
 4. **Every layer pulls from the one below.** The application pulls from the
    protocol state machine, the state machine is a client of the parser and
    pulls messages from it, and the parser pulls bytes from its input source.
-   Every pull blocks until data is available.
+   A pull takes what is ready or reports that nothing is; a blocking pull is
+   that try followed by a wait. Nothing is read without a pull.
 
 ## Ideas from the original code
 
@@ -677,15 +681,31 @@ any -> Broken | Closed
   and supplies it through `TlsClient`. Channel input, pending output and mutable
   connection state remain private. Session operations enforce exclusive access
   during query I/O; providers enforce it when operating on their own links.
-- A `Link` exposes `awaitReadable`, `awaitWritable` and
-  `awaitReadableOrWritable`, keeping its underlying connection private.
-  These interruptible waits suspend the calling thread without doing I/O.
-  The combined wait returns `Readable` or `Writable`, preferring input when
-  both events have been observed. It lets a channel send pending output
-  while waiting for responses, so neither peer has to finish sending before
-  reading. Socket event registrations are released even if waiting throws.
-  After waking, the channel retries the nonblocking operation: readiness
-  needn't mean progress, e.g. when only part of a TLS record has arrived.
+- `Link`, its socket instance, the generic `Output` serializer and the
+  gathering sender live in `streaming-io` (`Network.Streaming.Link`, `.Output`,
+  `.Sender`), shared with Warp's streaming responses; `Transport.Link`
+  re-exports them. See `STREAMING-IO.md`.
+- A `Link` exposes `watchReadable` and `watchWritable`, keeping its underlying
+  connection private. A watch registers interest without doing I/O: an STM
+  readiness action plus an idempotent release. `awaitFirst` waits for the
+  first of several watches in one transaction, on the calling thread, and
+  releases all of them, also when the wait is interrupted.
+- There is one wait, the `Link` method `awaitAny`. Its `Interest` is what the
+  caller can react to: input, and what its output waits for (nothing, the link
+  being writable, or a source). It returns when any of it may be retried, and
+  the caller then retries every blocked operation, input first. A channel that
+  has just sent the rest of its output reads before waiting, since the server
+  may have answered meanwhile. Readiness is a
+  hint, so it needn't mean progress, e.g. when only part of a TLS record has
+  arrived. By default it waits on the watches of the interest. The socket
+  chooses a cheaper wait for the interest's shape: `threadWaitRead` or
+  `threadWaitWrite` for one direction, one IO-manager registration for both,
+  and watches only for a source. TLS delegates to its socket. Waiting for both
+  lets a channel send pending output while waiting for responses, so neither
+  peer has to finish sending before reading.
+- `pushOutput` sends what the link takes and then flushes it, so that the wait
+  it reports is enough: records a TLS link took but hasn't written are waited
+  for as writability, not behind the wait for a source.
 - native-pg-tls supplies a TLS `Link` through rustls-ffi. Its public API is
   just `tlsClient`, which a client gives native-pg as a `TlsClient`.
   TLS configuration construction, connection operations and FFI helpers
@@ -714,11 +734,12 @@ any -> Broken | Closed
 
 ### Pull-based reading
 
-- All reading is blocking and driven by client requests: the next message,
-  the next column of a row, the next chunk of a stream. A request reads the
-  socket only when the read buffer can't satisfy it, and blocks until it
-  can. Without a request nothing is read; a read made for a request may fill
-  the read buffer up to its size.
+- All reading is driven by client requests: the next message, the next
+  column of a row, the next chunk of a stream. A request reads the socket
+  only when the read buffer can't satisfy it, and waits until it can; a
+  pull source tries the read and reports `Pending` instead of waiting.
+  Without a request nothing is read; a read made for a request may fill the
+  read buffer up to its size.
 - The parser reads only what it needs to advance: tags, lengths and the
   fields of the message being parsed.
 - Row values are produced on request. The client sees a value's length
@@ -1029,14 +1050,18 @@ unchanged.
 
 ### Borrowed upload chunks
 
-`ParameterBorrowedStream length source` accepts a callback-based `Source`.
-Its producer keeps each callback open while the single protocol driver sends
-partial slices. A one-chunk acknowledgement bridge permits the driver to read
-earlier replies while later upload bytes are pending. The producer never calls
-`Link`, preserving exclusive TLS access. Source readiness and readable transport
-both wake progress; an unfinished producer is cancelled and joined before its
-borrowed storage can return. No next chunk is pulled until the previous callback
-has ended. Ordinary `ParameterStream` retains its owned-value contract.
+`ParameterBorrowedStream length source` accepts a pull `Source`
+(`Network.Streaming.Source`). The sender pulls a chunk only when it can send
+it: a ready chunk goes in the same send as the framing before it, and a
+`Pending` pull cuts the batch, so the framing is sent at once and the driver
+waits for the source's watch or readable transport in one STM wait, reading
+earlier replies meanwhile. A chunk stays valid until the next pull, so a
+partially sent chunk is held and its source isn't pulled again until the
+link has taken the rest. No thread is forked: the request thread drives both
+the link and the source, preserving exclusive TLS access, and teardown only
+releases watches. A source that delivers more or fewer bytes than declared
+fails with `StreamLengthError`. Ordinary `ParameterStream` retains its
+owned-value contract.
 
 ### Values outside transport storage
 
