@@ -192,6 +192,29 @@ pushOutput :: Link link => link -> Unsent -> IO (Unsent, Blocked)
   the thread registry in `Unsent` go away; `discardUnsent` only drops
   references.
 
+### Drive: the loop around a step
+
+```haskell
+data Progress s a = Ready a | Again s | Blocked s Interest
+
+-- | Runs the step until it is ready, and waits for the link when it is blocked.
+drive :: Link link => link -> (s -> IO (Progress s a)) -> s -> IO a
+```
+
+- **One loop.** `drive` is the only recursion and the only `awaitAny` of its
+  users. A step tries what it can and never waits: it gives the result, or
+  says whether it made progress, or what it is blocked on.
+- **`Again` goes before a wait.** It means "made progress, try again before
+  waiting", for example when the rest of the output was sent and the server
+  may have answered meanwhile. `Blocked` waits once for the interest and
+  steps again from the state it gave. Readiness is a hint, so the step tries
+  every operation it is blocked on again, whichever fired.
+- **No cost.** `drive` is `INLINE`, so a step that is known where it is run
+  becomes part of the loop: `Progress` is matched where it is made and never
+  allocated, and the wait stays the known call it is without `drive`.
+- **Exceptions** from a step or a wait propagate. `drive` holds nothing to
+  release.
+
 ## Drivers
 
 - **native-pg input** (`linkInputSource`). After `receiveReady` returns
