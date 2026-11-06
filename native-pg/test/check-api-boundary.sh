@@ -59,7 +59,7 @@ for private_module in \
   Internal.ConnectionString Internal.Statement Internal.Diagnostics Internal.Some \
   Internal.Channel Internal.Exchange Internal.HostSelection Internal.Result \
   Internal.Execution Internal.Row \
-  Internal.Socket Internal.Socket.Link Internal.Startup \
+  Internal.Socket Internal.Startup \
   Protocol Protocol.Codec Protocol.Codec.Input Protocol.Codec.Output \
   Protocol.Codec.Payload Protocol.Messages Protocol.Messages.AuthBackend \
   Protocol.Messages.AuthFrontend Protocol.Messages.BackendSession \

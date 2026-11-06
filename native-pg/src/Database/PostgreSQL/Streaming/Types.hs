@@ -3,13 +3,7 @@ module Database.PostgreSQL.Streaming.Types (ByteStream (..), Parameter (..)) whe
 
 import Data.ByteString (ByteString)
 import Network.Streaming (Source)
-
--- | Bytes that arrive in chunks, with their total length known up front.
-data ByteStream = ByteStream
-  { byteStreamLength :: !Int,
-    -- | The next chunk. An empty one means the end.
-    byteStreamNext :: IO ByteString
-  }
+import Network.Streaming.Output (ByteStream (..))
 
 -- | A parameter value the client sends: bytes at hand, whole or in chunks,
 -- or a stream it supplies while the value is sent.

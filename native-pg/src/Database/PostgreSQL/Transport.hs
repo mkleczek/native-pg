@@ -32,7 +32,6 @@ import Data.List (intercalate)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Channel (Channel)
 import qualified Database.PostgreSQL.Internal.Channel as Channel
-import Database.PostgreSQL.Internal.Socket.Link ()
 import Database.PostgreSQL.Transport.Link
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
 import GHC.IO.Exception (IOException (..))
