@@ -6,6 +6,7 @@ module StreamingResourcesSpec (spec) where
 import AcquisitionTestSupport (getAcquisition)
 import Control.Exception (IOException, bracket, try)
 import Control.Monad (forM_)
+import Data.Foldable (traverse_)
 import Data.Functor (($>))
 import Data.IORef
 import Data.Maybe (isNothing)
@@ -15,7 +16,6 @@ import Database.PostgreSQL.Internal.Protocol.Codec (readInputSome, withInputSome
 import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
-import qualified Network.Streaming as Streaming
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (castPtr)
@@ -31,7 +31,9 @@ import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.BufferPool
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory, newBuffer)
+import Network.Streaming.Source (Pulled (..))
 import Network.Streaming.Watch (readyNow)
+import PullSourceTestSupport (PullSource (..), noWatch)
 import Skeletest hiding (context)
 import System.IO.Error (ioeGetErrorString)
 import System.Timeout (timeout)
@@ -53,15 +55,21 @@ spec = describe "shared operation resources" $ do
       releaseBuffer primary
       received <- newIORef BS.empty
       returned <- newIORef False
-      let source = Streaming.Source $ \use -> do
+      held <- newIORef Nothing
+      let -- The chunk's loan is kept until the next pull.
+          pulling = do
+            traverse_ releaseBuffer =<< readIORef held
+            writeIORef held Nothing
             done <- readIORef returned
-            if done then use BS.empty else bracket (borrowBuffer access) releaseBuffer $ \loan -> do
+            if done then pure Ended else do
+              loan <- borrowBuffer access
+              writeIORef held (Just loan)
               let buffer = loanBuffer loan
               bufferMemory buffer `shouldBe` memory
               withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer 65 16
-              result <- use (BSI.BS (bufferMemory buffer) 16)
               writeIORef returned True
-              pure result
+              pure (Pulled (BSI.BS (bufferMemory buffer) 16))
+          source = PullSource pulling noWatch
           link = Transfer (\pointer size -> do
             loan <- borrowBuffer access
             -- The parser owns only the primary during this refill. This
@@ -77,8 +85,8 @@ spec = describe "shared operation resources" $ do
         Context.sendContextOutput context (Output.word32 16 <> Output.borrowedStream 16 source)
         Context.runContextInput context 8 (withInputSome 8 $ \chunk -> do
           chunk `shouldBe` "response")
-        -- Consuming a callback chunk releases input immediately, even though
-        -- the operation remains open.
+        -- Pulling the end of the upload released its loan, even though the
+        -- operation remains open.
         bracket (borrowBuffer access) releaseBuffer $ \loan ->
           bufferMemory (loanBuffer loan) `shouldBe` memory
       readIORef received `shouldReturn` ("\0\0\0\16" <> BS.replicate 16 65)

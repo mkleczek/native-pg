@@ -34,7 +34,6 @@ import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Foreign.Storable (pokeByteOff)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
-import Network.Streaming (Source)
 import Network.Streaming.Source (AnySource)
 import System.IO.Unsafe (unsafeDupablePerformIO)
 
@@ -78,9 +77,6 @@ data Uncopied
   | UncopiedStream ByteStream
   | -- | A pull source, and how many bytes it declares it will give.
     UncopiedSource !Int !AnySource
-  | -- | A callback source, for native-pg until it switches to 'UncopiedSource'.
-    -- "Network.Streaming.Sender" doesn't send it.
-    UncopiedBorrowedStream Int Source
 
 instance Semigroup Output where
   Output leftLength leftCopied left <> Output rightLength rightCopied right =
@@ -115,7 +111,6 @@ outputByteString output = unsafeDupablePerformIO $ do
     uncopiedBytes (UncopiedBytes value) = value
     uncopiedBytes (UncopiedStream _) = error "an output with streams has no byte string"
     uncopiedBytes (UncopiedSource _ _) = error "an output with streams has no byte string"
-    uncopiedBytes (UncopiedBorrowedStream _ _) = error "an output with streams has no byte string"
 
 -- | Each value's output, one after another. Compute sizes without retaining
 -- a serializer for every value; build their writers as the sender advances.

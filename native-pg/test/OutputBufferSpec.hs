@@ -6,7 +6,7 @@
 module OutputBufferSpec (spec) where
 
 import AcquisitionTestSupport (getAcquisition)
-import Control.Exception (evaluate, finally)
+import Control.Exception (evaluate)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import qualified Data.ByteString.Internal as BSI
@@ -14,7 +14,6 @@ import Data.Functor (($>))
 import Data.IORef
 import Data.Word (Word8)
 import Control.Monad (forM_)
-import qualified Network.Streaming as Streaming
 import Database.PostgreSQL.Internal.Execution (Execution (..), Statement (..), executionMessages)
 import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
@@ -29,7 +28,9 @@ import Database.PostgreSQL.Internal.Channel
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
+import Network.Streaming.Source (Pulled (..))
 import Network.Streaming.Watch (readyNow)
+import PullSourceTestSupport (PullSource (..), noWatch)
 import Skeletest hiding (context)
 
 spec :: Spec
@@ -183,8 +184,7 @@ spec = describe "caller-owned output storage" $ do
     received <- newIORef BS.empty
     calls <- newIORef (0 :: Int)
     let next = modifyIORef' ordinaryPulls (+ 1) $> BS.empty
-        source = Streaming.Source $ \use ->
-          modifyIORef' borrowedPulls (+ 1) *> use BS.empty
+        source = PullSource (modifyIORef' borrowedPulls (+ 1) $> Ended) noWatch
         output = Output.bytes BS.empty
           <> Output.word32 0x01020304
           <> Output.stream (Output.ByteStream 0 next)
@@ -217,15 +217,20 @@ spec = describe "caller-owned output storage" $ do
         next = atomicModifyIORef' ordinary $ \case
           [] -> ([], BS.empty)
           chunk : rest -> (rest, chunk)
-        source = Streaming.Source $ \use -> do
+        -- The chunk ends with the next pull, by when the link has taken it.
+        source = PullSource pullChunk noWatch
+        pullChunk = do
           count <- atomicModifyIORef' pulls (\n -> (n + 1, n))
-          if count > 0 then use BS.empty else do
-            withForeignPtr (bufferMemory borrowed) $ \pointer ->
-              BS.useAsCString "loan" $ \origin -> copyBytes pointer (castPtr origin) 4
-            use (BSI.BS (bufferMemory borrowed) 4) `finally` do
+          if count > 0
+            then do
               accepted <- readIORef received
               BS.length accepted >= BS.length beforeBorrowed + 4 `shouldBe` True
               withForeignPtr (bufferMemory borrowed) (\pointer -> fillBytes pointer 0 4)
+              pure Ended
+            else do
+              withForeignPtr (bufferMemory borrowed) $ \pointer ->
+                BS.useAsCString "loan" $ \origin -> copyBytes pointer (castPtr origin) 4
+              pure (Pulled (BSI.BS (bufferMemory borrowed) 4))
         output = Output.word32 0x01020304 <> Output.bytes "xy" <> Output.bytes "spill" <> Output.word16 0x0506
           <> Output.stream (Output.ByteStream 7 next) <> Output.word8 7
           <> Output.borrowedStream 4 source <> Output.word32 0x08090a0b

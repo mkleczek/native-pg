@@ -3,15 +3,18 @@
 {-# OPTIONS_GHC -F -pgmF=skeletest-preprocessor #-}
 module OperationContextSpec (spec) where
 
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Monad.IO.Unlift (withRunInIO)
 import AcquisitionTestSupport (getAcquisition)
 import Control.Exception (bracket, try)
 import Control.Monad (unless)
+import Data.Foldable (traverse_)
+import Data.Functor (($>))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (fillBytes)
-import Network.Streaming (Source (..))
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Transaction (Param (..))
 import Database.PostgreSQL.Types (FormatCode (..))
@@ -23,6 +26,8 @@ import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (bufferMemory, bufferCapacity)
+import Network.Streaming.Source (Pulled (..), Source (..))
+import Network.Streaming.Watch (Watch (..))
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Session.Settings as PG
 import qualified Database.PostgreSQL.Diagnostics as PG
@@ -66,15 +71,20 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
         BufferPool.withRequestBuffers resources $ \access -> do
           remaining <- newIORef 16385
           total <- newIORef 0
-          let source = Source $ \consume -> do
+          held <- newIORef Nothing
+          let -- A chunk's loan is kept until the next pull.
+              source = ChunkSource (fail "unexpected source watch") $ do
+                traverse_ BufferPool.releaseBuffer =<< readIORef held
+                writeIORef held Nothing
                 left <- readIORef remaining
-                if left == 0 then consume BS.empty else bracket (BufferPool.borrowBuffer access) BufferPool.releaseBuffer $ \loan -> do
+                if left == 0 then pure Ended else do
+                  loan <- BufferPool.borrowBuffer access
+                  writeIORef held (Just loan)
                   let buffer = BufferPool.loanBuffer loan
                       count = min left (bufferCapacity buffer)
                   withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer 120 count
-                  result <- consume (BSI.BS (bufferMemory buffer) count)
                   writeIORef remaining (left - count)
-                  pure result
+                  pure (Pulled (BSI.BS (bufferMemory buffer) count))
               statement = Tx.Statement "SELECT $1::bytea"
                 (const [Param (Just 17) BinaryFormat (Just (ParameterBorrowedStream 16385 source))])
                 (Tx.singleRow (Tx.streamingRow @'[] Body))
@@ -90,6 +100,57 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
               run Tx.finishTransaction
           readIORef total `shouldReturn` 16385
           readIORef remaining `shouldReturn` 0
+          PG.isUsable connection `shouldReturn` True
+
+  it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $
+    withTestResources (PoolSettings
+      { bufferSize = positiveInt @256
+      , ordinaryBufferCount = positiveInt @1
+      , reserveBufferCount = positiveInt @1
+      , setupBufferCount = positiveInt @2
+      }) $ \resources ->
+      bracket (Streaming.connect resources settings) (PG.close . fst) $ \(connection, _) ->
+        BufferPool.withRequestBuffers resources $ \access -> do
+          remaining <- newIORef 16385
+          total <- newIORef 0
+          held <- newIORef Nothing
+          waits <- newIORef (0 :: Int)
+          ready <- newTVarIO False
+          let -- Each chunk is ready a moment after the source was found empty.
+              watching = do
+                _ <- forkIO (threadDelay 1000 *> atomically (writeTVar ready True))
+                pure (Watch (readTVar ready >>= check) (pure ()))
+              source = ChunkSource watching $ do
+                traverse_ BufferPool.releaseBuffer =<< readIORef held
+                writeIORef held Nothing
+                left <- readIORef remaining
+                open <- readTVarIO ready
+                if left == 0 then pure Ended else if not open then modifyIORef' waits (+ 1) $> Pending else do
+                  atomically (writeTVar ready False)
+                  loan <- BufferPool.borrowBuffer access
+                  writeIORef held (Just loan)
+                  let buffer = BufferPool.loanBuffer loan
+                      count = min left (bufferCapacity buffer)
+                  withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer 120 count
+                  writeIORef remaining (left - count)
+                  pure (Pulled (BSI.BS (bufferMemory buffer) count))
+              statement = Tx.Statement "SELECT $1::bytea"
+                (const [Param (Just 17) BinaryFormat (Just (ParameterBorrowedStream 16385 source))])
+                (Tx.singleRow (Tx.streamingRow @'[] Body))
+          Streaming.withOperation access connection $ \session ->
+            Tx.runTransaction Tx.ReadCommitted Tx.Read session $ withRunInIO $ \run -> do
+              cursor <- run (Tx.pipeline (Tx.statement () statement))
+              current <- run (Tx.nextRow cursor)
+              case current of
+                Just (Body (Just field)) -> drain (run (Tx.nextChunk field)) $ \chunk -> do
+                  BS.all (== 120) chunk `shouldBe` True
+                  modifyIORef' total (+ BS.length chunk)
+                _ -> failTest "unexpected NULL"
+              run Tx.finishTransaction
+          readIORef total `shouldReturn` 16385
+          readIORef remaining `shouldReturn` 0
+          -- 65 chunks, each found not ready at least once.
+          (>= 65) <$> readIORef waits `shouldReturn` True
           PG.isUsable connection `shouldReturn` True
 
   it "reports deferred COMMIT failure after a borrowed body was delivered" $
@@ -186,6 +247,13 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
 withTestResources :: PoolSettings -> (BufferPool.BufferPool -> IO a) -> IO a
 withTestResources settings action = getAcquisition >>= \waiting ->
   BufferPool.newBufferPool waiting settings >>= action
+
+-- | A source that pulls and watches as its actions say.
+data ChunkSource = ChunkSource (IO Watch) (IO Pulled)
+
+instance Source ChunkSource where
+  pullReady (ChunkSource _ pulling) = pulling
+  watchSource (ChunkSource watching _) = watching
 
 newtype Body tx = Body (Maybe (Tx.Field tx))
 data Headers tx = Headers Int64 BS.ByteString (Maybe (Tx.Field tx))

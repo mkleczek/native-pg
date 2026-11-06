@@ -43,7 +43,7 @@ import qualified Database.PostgreSQL.Internal.Row as Row
 import Database.PostgreSQL.Session (Session)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Types (FormatCode (..), TransactionStatus (..))
-import qualified Network.Streaming as Streaming
+import Network.Streaming.Source (Source (..))
 
 -- | Work run synchronously on the thread that entered the transaction scope.
 -- 'withRunInIO' supports synchronous IO callbacks. Database operations reject
@@ -300,9 +300,16 @@ enqueue query execution cardinality skippable = do
 protectParameter :: Runtime -> Parameter -> Parameter
 protectParameter runtime = \case
   ParameterStream stream -> ParameterStream stream {byteStreamNext = untrusted runtime (byteStreamNext stream)}
-  ParameterBorrowedStream size source -> ParameterBorrowedStream size
-    (Streaming.Source (untrusted runtime . Streaming.withChunk source))
+  ParameterBorrowedStream size source -> ParameterBorrowedStream size (Untrusted runtime source)
   parameter -> parameter
+
+-- | A parameter's source, whose failures abandon the transaction, like those
+-- of a stream's callback.
+data Untrusted source = Untrusted Runtime source
+
+instance Source source => Source (Untrusted source) where
+  pullReady (Untrusted runtime source) = untrusted runtime (pullReady source)
+  watchSource (Untrusted runtime source) = untrusted runtime (watchSource source)
 
 -- | Drains the preceding pipeline, then sends these statements and Sync.
 -- The first pipeline also sends BEGIN. No results of this pipeline are read.

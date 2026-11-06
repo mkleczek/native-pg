@@ -27,8 +27,8 @@ where
 
 import qualified Data.ByteString as BS
 import Data.ByteString (ByteString)
-import Network.Streaming (Source)
 import Network.Streaming.Output
+import Network.Streaming.Source (AnySource (..), Source)
 
 -- | A zero byte inside the value would end the string early on the server,
 -- so it is rejected.
@@ -38,8 +38,9 @@ cstring value
   | otherwise = bytes value <> word8 0
 {-# INLINE cstring #-}
 
--- | The source owns each chunk through its synchronous callback.
-borrowedStream :: Int -> Source -> Output
+-- | Bytes pulled from the source as they're sent, which declares how many
+-- there are. A chunk stays valid until the source is pulled again.
+borrowedStream :: Source s => Int -> s -> Output
 borrowedStream count source = Output count 0 $ \rest ->
-  Writer $ \_ _ used -> pure (Yield used (UncopiedBorrowedStream count source) rest)
+  Writer $ \_ _ used -> pure (Yield used (UncopiedSource count (AnySource source)) rest)
 {-# INLINE borrowedStream #-}

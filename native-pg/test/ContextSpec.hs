@@ -15,7 +15,6 @@ import Data.IORef
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Protocol (TransactionStatus (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (borrowedStream)
-import Network.Streaming (Source (..))
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Internal.Execution as PG
 import qualified Database.PostgreSQL.Internal.Row as PG
@@ -27,7 +26,9 @@ import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Buffer (Buffer (..), newBuffer)
+import Network.Streaming.Source (Pulled (..))
 import Network.Streaming.Watch (readyNow)
+import PullSourceTestSupport
 import Skeletest hiding (context)
 import qualified Skeletest.Predicate as P
 import System.Timeout (timeout)
@@ -72,21 +73,22 @@ spec = describe "explicit operation contexts" $ do
     runContextOperation context (breakConnection connection)
     PG.isUsable connection `shouldReturn` False
 
-  it "joins pending sources after a completed owned operation marks itself broken" $ do
-    entered <- newEmptyMVar
-    returned <- newEmptyMVar
-    let source = Source $ \use ->
-          (putMVar entered () *> use "borrowed") `finally` putMVar returned ()
+  it "drops pending sources after a completed owned operation marks itself broken, with no thread to join" $ do
+    pulls <- newIORef (0 :: Int)
+    let source = PullSource (modifyIORef' pulls (+ 1) $> Pulled "borrowed") noWatch
         channel = newChannel (Scripted (\_ _ -> fail "unexpected receive") (const (pure 0)))
     connection <- newConnection channel 16
     context <- newOwnedContext connection
+    threads <- liveThreads
     (do
       runContextOperation context $ do
         queueContextOutput context (borrowedStream 8 source)
-        readMVar entered
         breakConnection connection
-      timeout 1000000 (readMVar returned) `shouldReturn` Just ())
+      -- The chunk is held, and nothing runs on its behalf.
+      readIORef pulls `shouldReturn` 1
+      liveThreads `shouldReturn` threads)
       `finally` (discardUnsent =<< readIORef (contextPending context))
+    readIORef pulls `shouldReturn` 1
 
   it "expires escaped contexts before the storage can be reused" $ do
     connection <- newConnection idleChannel 16

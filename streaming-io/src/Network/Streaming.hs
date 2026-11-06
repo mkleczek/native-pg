@@ -1,4 +1,6 @@
--- | Synchronous streams with borrowed chunks.
+-- | Synchronous streams with borrowed chunks. This callback-scoped 'Source'
+-- remains for the Warp fork until Warp moves to the pull sources of
+-- "Network.Streaming.Source"; native-pg no longer uses it.
 module Network.Streaming (Source (..), Sink, Body, forward) where
 
 import Control.Monad (when)

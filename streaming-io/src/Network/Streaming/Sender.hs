@@ -127,7 +127,6 @@ uncopiedPart = \case
   UncopiedBytes value -> PartBytes value
   UncopiedStream source -> PartStream source 0
   UncopiedSource count source -> PartSource count source 0
-  UncopiedBorrowedStream {} -> error "a callback source can't be sent without a helper thread; use UncopiedSource"
 
 -- | Renders from the offset in the memory.
 renderOutput :: ForeignPtr Word8 -> Int -> Int -> Writer -> IO [Part]
