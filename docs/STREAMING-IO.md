@@ -217,12 +217,15 @@ drive :: Link link => link -> (s -> IO (Progress s a)) -> s -> IO a
 
 ## Drivers
 
-- **native-pg input** (`linkInputSource`). After `receiveReady` returns
-  `Nothing`: `pushOutput`, then `awaitAny link (Interest True blocked)` with
-  what it reports, and receive again. Input is tried first, as today, on the
-  request thread. When `pushOutput` has sent the rest of the output (`Done`),
+- **native-pg input** (`linkInputSource`), a step run by `drive`. After
+  `receiveReady` returns `Nothing`: `pushOutput`, then blocked on
+  `Interest True blocked` with what it reports, and receive again. Input is
+  tried first, as today, on the request thread. When `pushOutput` has sent the
+  rest of the output (`Done`), the step makes progress instead of blocking, so
   it receives again without waiting, since the server may have answered
-  meanwhile: nothing waits while a read could succeed.
+  meanwhile: nothing waits while a read could succeed. Sending output is the
+  same step without input: ready once `pushOutput` reports `Done`, otherwise
+  blocked on `Interest False blocked`.
 - **Warp response.** Loop `pushOutput` on the client link and
   `awaitAny link (Interest False blocked)` until it reports `Done`. The
   timeout is resumed only around waits for the link, as `sendFragment` does

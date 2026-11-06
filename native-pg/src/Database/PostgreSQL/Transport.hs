@@ -1,4 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
+-- At -O2, liberate-case copies the receive loop once for each place it calls
+-- itself, and one loop is enough. At -O1 the flag does nothing.
+{-# OPTIONS_GHC -fno-liberate-case #-}
 
 -- | Public transport API.
 module Database.PostgreSQL.Transport

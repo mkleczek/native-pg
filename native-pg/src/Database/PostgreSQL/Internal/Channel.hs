@@ -1,4 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
+-- At -O2, liberate-case copies the receive loop once for each place it calls
+-- itself, and one loop is enough. At -O1 the flag does nothing.
+{-# OPTIONS_GHC -fno-liberate-case #-}
 
 -- | Connection input and output, specialized to its transport link.
 module Database.PostgreSQL.Internal.Channel
@@ -21,6 +24,7 @@ import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol.Codec (InputSource (..), Output)
 import Database.PostgreSQL.Transport.Link
 import Foreign.Ptr (Ptr)
+import Network.Streaming.Drive (Progress (..), drive)
 import Network.Streaming.Sender
   ( OutputBuffer,
     Unsent,
@@ -78,24 +82,24 @@ newChannel link =
 linkInputSource :: Link link => link -> IORef Unsent -> Int -> InputSource
 linkInputSource link pending readSize =
   InputSource
-    { readInputInto = receive,
+    { readInputInto = \pointer size -> drive link (receive pointer size) (),
       inputReadSize = readSize
     }
   where
-    receive pointer size =
+    receive pointer size () =
       receiveReady link pointer size >>= \case
-        Just received -> pure received
+        Just received -> pure (Ready received)
         Nothing -> do
           left <- readIORef pending
           (rest, blocked) <- pushOutput link left
           writeIORef pending rest
-          case blocked of
+          pure $ case blocked of
             -- The server may have answered while the rest was sent, so input
             -- is read before waiting for it.
-            Done | not (unsentEmpty left) -> pure ()
-            _ -> awaitAny link (Interest True blocked)
-          -- Input is first, so that an answer is read before more is sent.
-          receive pointer size
+            Done | not (unsentEmpty left) -> Again ()
+            -- Input is tried first after the wait, so that an answer is read
+            -- before more is sent.
+            _ -> Blocked () (Interest True blocked)
 {-# INLINABLE linkInputSource #-}
 
 -- | Sends the output, waiting for the link to become writable as needed.
@@ -104,10 +108,10 @@ sendOutput link = sendOutputWith link Nothing
 {-# INLINABLE sendOutput #-}
 
 sendOutputWith :: Link link => link -> Maybe OutputBuffer -> Output -> IO ()
-sendOutputWith link buffer output = bracket (unsent buffer output) discardUnsent go
+sendOutputWith link buffer output = bracket (unsent buffer output) discardUnsent (drive link step)
   where
-    go left =
+    step left =
       pushOutput link left >>= \case
-        (_, Done) -> pure ()
-        (rest, blocked) -> awaitAny link (Interest False blocked) *> go rest
+        (_, Done) -> pure (Ready ())
+        (rest, blocked) -> pure (Blocked rest (Interest False blocked))
 {-# INLINABLE sendOutputWith #-}

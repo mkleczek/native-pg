@@ -3,6 +3,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
+-- At -O2, liberate-case copies the receive loop once for each place it calls
+-- itself, and one loop is enough. At -O1 the flag does nothing.
+{-# OPTIONS_GHC -fno-liberate-case #-}
 
 -- | The private TLS 'Link' implementation, through rustls-ffi. The handshake
 -- drives its own I/O. Reads and writes take what's ready;
