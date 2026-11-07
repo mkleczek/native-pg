@@ -50,7 +50,7 @@ ended = \case
 spec :: Spec
 spec = describe "a scope" $ do
   describe "releases" $ do
-    xfail "scope: nothing is registered, so no release runs yet" $ it "run last in, first out when the body returns" $ do
+    it "run last in, first out when the body returns" $ do
       logRef <- newLog
       result <- withScope $ \scope -> do
         _ <- resource scope logRef "a"
@@ -64,7 +64,7 @@ spec = describe "a scope" $ do
                          "release c completed", "release b completed", "release a completed"
                        ]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "run once each, and not before the scope closes" $ do
+    it "run once each, and not before the scope closes" $ do
       counts <- newIORef (0 :: Int, 0 :: Int)
       withScope $ \scope -> do
         _ <- acquireIn scope (pure ()) (\_ _ -> modifyIORef' counts (\(first, second) -> (first + 1, second)))
@@ -72,13 +72,13 @@ spec = describe "a scope" $ do
         readIORef counts `shouldReturn` (0, 0)
       readIORef counts `shouldReturn` (1, 1)
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "give the resource they release back to the release" $ do
+    it "give the resource they release back to the release" $ do
       seen <- newIORef ([] :: [String])
       withScope $ \scope ->
         void $ acquireIn scope (pure "the resource") (\_ held -> modifyIORef' seen (held :))
       readIORef seen `shouldReturn` ["the resource"]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "run when the body throws, learn of the exception, and let it propagate" $ do
+    it "run when the body throws, learn of the exception, and let it propagate" $ do
       logRef <- newLog
       result <- thrown $ withScope $ \scope -> do
         _ <- resource scope logRef "a"
@@ -90,7 +90,7 @@ spec = describe "a scope" $ do
                          "release b aborted Boom \"body\"", "release a aborted Boom \"body\""
                        ]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "run when the body is interrupted, and learn of it" $ do
+    it "run when the body is interrupted, and learn of it" $ do
       logRef <- newLog
       inside <- newEmptyMVar
       finished <- newEmptyMVar
@@ -108,13 +108,13 @@ spec = describe "a scope" $ do
         fmap (either show (const "returned")) outcome `shouldBe` Just "interrupted"
       entries logRef `shouldReturn` ["acquire a", "release a aborted interrupted"]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "run masked" $ do
+    it "run masked" $ do
       states <- newIORef []
       withScope $ \scope ->
         void $ acquireIn scope getMaskingState (\_ _ -> getMaskingState >>= \state -> modifyIORef' states (state :))
       readIORef states `shouldReturn` [MaskedInterruptible]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "all run when one of them throws, and the last failure is the one that propagates" $ do
+    it "all run when one of them throws, and the last failure is the one that propagates" $ do
       logRef <- newLog
       result <- thrown $ withScope $ \scope -> do
         _ <- resource scope logRef "a"
@@ -131,13 +131,13 @@ spec = describe "a scope" $ do
                          "release a aborted Boom \"b\""
                        ]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "replace the body's exception with the failure of a release, as a bracket's do" $ do
+    it "replace the body's exception with the failure of a release, as a bracket's do" $ do
       result <- thrown $ withScope $ \scope -> do
         _ <- acquireIn scope (pure ()) (\_ _ -> throwIO (Boom "release"))
         throwIO (Boom "body")
       result `shouldBe` Left (Boom "release")
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "tell the releases after a failed one that the scope aborted, though its body returned" $ do
+    it "tell the releases after a failed one that the scope aborted, though its body returned" $ do
       logRef <- newLog
       result <- thrown $ withScope $ \scope -> do
         _ <- resource scope logRef "a"
@@ -146,7 +146,7 @@ spec = describe "a scope" $ do
       result `shouldBe` Left (Boom "b")
       entries logRef `shouldReturn` ["acquire a", "release a aborted Boom \"b\""]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "see an asynchronous exception that arrives while one runs, and still all run" $ do
+    it "see an asynchronous exception that arrives while one runs, and still all run" $ do
       logRef <- newLog
       releasing <- newEmptyMVar
       finished <- newEmptyMVar
@@ -166,13 +166,13 @@ spec = describe "a scope" $ do
       entries logRef `shouldReturn` ["acquire a", "release a aborted during release"]
 
   describe "acquisitions" $ do
-    xfail "scope: an acquisition is not masked yet" $ it "run masked" $ do
+    it "run masked" $ do
       states <- newIORef []
       withScope $ \scope ->
         void $ acquireIn scope (getMaskingState >>= \state -> modifyIORef' states (state :)) (\_ _ -> pure ())
       readIORef states `shouldReturn` [MaskedInterruptible]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "register nothing when the acquisition throws, and the releases before it still run" $ do
+    it "register nothing when the acquisition throws, and the releases before it still run" $ do
       logRef <- newLog
       result <- thrown $ withScope $ \scope -> do
         _ <- resource scope logRef "a"
@@ -181,7 +181,7 @@ spec = describe "a scope" $ do
       result `shouldBe` Left (Boom "acquire")
       entries logRef `shouldReturn` ["acquire a", "release a aborted Boom \"acquire\""]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "register nothing when interrupted while blocked, and the releases before it still run" $ do
+    it "register nothing when interrupted while blocked, and the releases before it still run" $ do
       logRef <- newLog
       blocked <- newEmptyMVar
       finished <- newEmptyMVar
@@ -198,7 +198,7 @@ spec = describe "a scope" $ do
         fmap (either show (const "returned")) outcome `shouldBe` Just "during acquisition"
       entries logRef `shouldReturn` ["acquire a", "release a aborted during acquisition"]
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "fail in a scope that has closed, without acquiring" $ do
+    it "fail in a scope that has closed, without acquiring" $ do
       logRef <- newLog
       result <- thrownClosed $ withScope $ \scope -> do
         _ <- acquireIn scope (pure ()) $ \_ _ -> do
@@ -212,7 +212,7 @@ spec = describe "a scope" $ do
     it "runs a body that acquires nothing" $
       withScope (\_ -> pure 'x') `shouldReturn` 'x'
 
-    xfail "scope: nothing is registered, so no release runs yet" $ it "gives each scope its own releases" $ do
+    it "gives each scope its own releases" $ do
       logRef <- newLog
       withScope $ \outer -> do
         _ <- resource outer logRef "outer"
