@@ -32,6 +32,11 @@ module Database.PostgreSQL.Pool
   , poolPolicyStats
   , use
   , useChecked
+  , Checkout
+  , checkoutIn
+  , checkoutConnection
+  , markFailed
+  , markBroken
   , Reservation
   , ReservationError (..)
   , tryReserveReady
@@ -73,6 +78,7 @@ import Data.UUID.V4 qualified as UUID
 
 import Database.PostgreSQL.Internal.PoolLifetime (withLifetime)
 import Database.PostgreSQL.Pool.Observation
+import Network.Streaming.Scope (Scope)
 
 -- | What the pool needs to know about its connections, and its limits.
 data Config connection failure = Config
@@ -586,6 +592,20 @@ useChecked pool@Pool{..} preflight action = withPoolLifetime pool $ mask $ \rest
           Right () -> Just . Right <$> useReservation reservation (restore . action)
   closed <- readTVarIO poolClosed
   if closed then pure (Left PoolClosed) else claim
+
+data Checkout s connection = Checkout connection
+
+checkoutIn :: Scope s -> Pool connection failure -> (connection -> IO (Either (Maybe Text) ())) -> IO (Either (UsageError failure) (Checkout s connection))
+checkoutIn _ _ _ = pure (Left AcquisitionTimeout)
+
+checkoutConnection :: Checkout s connection -> connection
+checkoutConnection (Checkout connection) = connection
+
+markFailed :: Checkout s connection -> SomeException -> IO ()
+markFailed _ _ = pure ()
+
+markBroken :: Checkout s connection -> Maybe Text -> IO ()
+markBroken _ _ = pure ()
 
 -- | Return ownership before observations, so an observer exception cannot leak.
 putPoolEntryBack :: Pool connection failure -> TVar Bool -> Entry connection -> IO Bool

@@ -112,6 +112,7 @@ test-suite native-pg-spec
                       PoolAdmissionSpec
                       PoolSpec
                       PoolReservationSpec
+                      PoolScopeSpec
                       PullSourceTestSupport
                       BorrowedOutputSpec
                       BorrowingSpec
