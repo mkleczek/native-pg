@@ -58,12 +58,12 @@ import Control.Concurrent.STM
   )
 import Control.Concurrent.Resource.Acquisition qualified as Acquire
 import Control.Concurrent.Resource.Queue qualified as Queue
-import Control.Exception (Exception, SomeException, bracket, displayException, finally, mask, mask_, onException, throwIO, try)
+import Control.Exception (Exception, SomeException, bracket, catch, displayException, finally, mask, mask_, onException, throwIO, try)
 import Control.Monad (forever, unless, void, when)
 import Data.Either (fromRight)
 import Data.Foldable (for_, traverse_)
 import Data.Functor (($>))
-import Data.IORef (IORef, mkWeakIORef, newIORef)
+import Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef, readIORef)
 import Data.List (partition)
 import Data.Maybe (isNothing)
 import Data.Text (Text)
@@ -78,7 +78,7 @@ import Data.UUID.V4 qualified as UUID
 
 import Database.PostgreSQL.Internal.PoolLifetime (withLifetime)
 import Database.PostgreSQL.Pool.Observation
-import Network.Streaming.Scope (Scope)
+import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
 
 -- | What the pool needs to know about its connections, and its limits.
 data Config connection failure = Config
@@ -322,6 +322,20 @@ finishReservation Reservation{..} outcome = withPoolLifetime reservationPool $ m
 -- A tentative or finished claim throws 'ReservationError' before the action.
 useReservation :: Reservation connection failure -> (connection -> IO (Outcome, a)) -> IO a
 useReservation reservation@Reservation{..} action = withPoolLifetime reservationPool $ mask $ \restore -> do
+  startUse reservation
+  let config = poolConfig reservationPool
+  result <- try @SomeException $ do
+    configObserve config (ConnectionObservation (entryId reservationEntry) InUseConnectionStatus)
+    restore (action (entryConnection reservationEntry))
+  case result of
+    Right (outcome, value) -> finishReservation reservation outcome $> value
+    Left exception -> do
+      finishAfterException reservation exception
+      throwIO exception
+
+-- | Takes a validated reservation into use, or throws 'ReservationError'.
+startUse :: Reservation connection failure -> IO ()
+startUse Reservation{..} = do
   rejected <- atomically $ readTVar reservationState >>= \case
     Finished -> pure (Just ReservationFinished)
     Tentative -> pure (Just ReservationNotValidated)
@@ -330,17 +344,14 @@ useReservation reservation@Reservation{..} action = withPoolLifetime reservation
       modifyTVar' (poolInUse reservationPool) (+ 1)
       writeTVar reservationState (InUse taken) $> Nothing
   traverse_ throwIO rejected
-  let config = poolConfig reservationPool
-  result <- try @SomeException $ do
-    configObserve config (ConnectionObservation (entryId reservationEntry) InUseConnectionStatus)
-    restore (action (entryConnection reservationEntry))
-  case result of
-    Right (outcome, value) -> finishReservation reservation outcome $> value
-    Left exception -> do
-      usable <- fromRight False <$> try @SomeException (configUsableAfterException config (entryConnection reservationEntry))
-      finishReservation reservation $
-        if usable then Failed exception else Broke (Just (Text.pack (displayException exception)))
-      throwIO exception
+
+-- | Finishes a reservation after a use threw: it goes back to the pool if its
+-- connection is still usable, and is closed if not.
+finishAfterException :: Reservation connection failure -> SomeException -> IO ()
+finishAfterException reservation@Reservation{..} exception = do
+  usable <- fromRight False <$> try @SomeException (configUsableAfterException (poolConfig reservationPool) (entryConnection reservationEntry))
+  finishReservation reservation $
+    if usable then Failed exception else Broke (Just (Text.pack (displayException exception)))
 
 -- | Claims spare inventory when the connection policy allows it. A delayed
 -- attempt returns Nothing and schedules one pool-level wakeup. Startup can then
@@ -557,7 +568,80 @@ use pool = useChecked pool (const $ pure $ Right ())
 -- ownership and timeout boundaries. A thrown preflight exception retires the
 -- connection and propagates without running the callback.
 useChecked :: Pool connection failure -> (connection -> IO (Either (Maybe Text) ())) -> (connection -> IO (Outcome, a)) -> IO (Either (UsageError failure) a)
-useChecked pool@Pool{..} preflight action = withPoolLifetime pool $ mask $ \restore -> do
+useChecked pool preflight action = withPoolLifetime pool $ mask $ \restore ->
+  claimChecked pool preflight restore (\reservation -> useReservation reservation (restore . action))
+
+-- | A connection checked out in a scope, which the scope gives back to the
+-- pool when it closes. The scope's type tags the checkout, so it can't be
+-- returned from the scope; the connection that 'checkoutConnection' takes out
+-- of it is as plain as the pool's connections are, and must not be used once
+-- the scope has closed, since another use may have it by then.
+data Checkout s connection = Checkout connection (IORef Verdict)
+
+-- | What the scope's code decided about the connection, which the release
+-- goes by when it doesn't depend on how the scope ended.
+data Verdict
+  = Unmarked
+  | Faulted SomeException
+  | Wrecked (Maybe Text)
+
+-- | Checks a connection out of the pool in the scope, as 'useChecked' does:
+-- under the same admission deadline, with the same check of the connection
+-- before it is used. A connection that couldn't be had is given as 'Left'.
+-- Otherwise the connection is the scope's until it closes, and then goes back
+-- to the pool with the outcome that the ending gives it, as 'use' gives one
+-- to the use that threw, unless 'markFailed' or 'markBroken' decided it
+-- earlier: 'Succeeded' if the scope completed, 'Failed' if it aborted and the
+-- connection is usable, and 'Broke' if it isn't.
+checkoutIn :: Scope s -> Pool connection failure -> (connection -> IO (Either (Maybe Text) ())) -> IO (Either (UsageError failure) (Checkout s connection))
+checkoutIn scope pool preflight = mask $ \restore -> do
+  verdict <- newIORef Unmarked
+  claimed <- owned <$> acquireIn scope (withPoolLifetime pool (claimChecked pool preflight restore claimReservation)) (finishCheckout verdict)
+  pure (fmap (\Reservation{reservationEntry} -> Checkout (entryConnection reservationEntry) verdict) claimed)
+  where
+    -- The reservation is in use from here on, and the scope finishes it.
+    claimReservation reservation@Reservation{..} = do
+      startUse reservation
+      configObserve (poolConfig reservationPool) (ConnectionObservation (entryId reservationEntry) InUseConnectionStatus)
+        `catch` \(exception :: SomeException) -> finishAfterException reservation exception *> throwIO exception
+      pure reservation
+
+finishCheckout :: IORef Verdict -> Ending -> Either (UsageError failure) (Reservation connection failure) -> IO ()
+finishCheckout _ _ (Left _) = pure ()
+finishCheckout verdict ending (Right reservation) = readIORef verdict >>= \case
+  Wrecked details -> finishReservation reservation (Broke details)
+  Faulted exception -> finishReservation reservation (Failed exception)
+  Unmarked -> case ending of
+    Completed -> finishReservation reservation Succeeded
+    Aborted exception -> finishAfterException reservation exception
+
+-- | The connection of a checkout.
+checkoutConnection :: Checkout s connection -> connection
+checkoutConnection (Checkout connection _) = connection
+
+-- | Decides that the scope's use failed though the connection is fine, so that
+-- it goes back to the pool as 'Failed' with this exception, whether or not the
+-- scope aborts. Doesn't change an earlier 'markFailed' or 'markBroken'.
+markFailed :: Checkout s connection -> SomeException -> IO ()
+markFailed (Checkout _ verdict) exception = atomicModifyIORef' verdict $ \case
+  Unmarked -> (Faulted exception, ())
+  other -> (other, ())
+
+-- | Decides that the connection is broken, e.g. because its operation was
+-- abandoned in the middle of a stream, so that the pool closes it when the
+-- scope closes, with the details, whether or not the scope aborts. Doesn't
+-- change an earlier 'markBroken', and overrides a 'markFailed'.
+markBroken :: Checkout s connection -> Maybe Text -> IO ()
+markBroken (Checkout _ verdict) details = atomicModifyIORef' verdict $ \case
+  Wrecked earlier -> (Wrecked earlier, ())
+  _ -> (Wrecked details, ())
+
+-- | Claims a connection under the admission deadline, and checks it: the part
+-- of 'useChecked' that doesn't depend on what the connection is used for.
+-- The claimed reservation goes to the function, under the same mask, which
+-- takes it into use, or the claim gives it back.
+claimChecked :: Pool connection failure -> (connection -> IO (Either (Maybe Text) ())) -> (forall b. IO b -> IO b) -> (Reservation connection failure -> IO a) -> IO (Either (UsageError failure) a)
+claimChecked pool@Pool{..} preflight restore handOver = do
   deadline <- Acquire.deadlineAfter (configAcquisitionTimeout poolConfig)
   let claim = do
         -- Preserve the existing public timeout result for finalizer rejection.
@@ -572,7 +656,11 @@ useChecked pool@Pool{..} preflight action = withPoolLifetime pool $ mask $ \rest
       reserve = tryReserveReady pool >>= \case
         Just reservation -> pure (Left reservation)
         Nothing -> Right <$> (tryReserveOpening pool >>= maybe retry pure)
-      cleanup = either (`finishReservation` Succeeded) abandonOpening
+      -- A reservation that the function took into use is its to finish.
+      cleanup = either unclaimed abandonOpening
+      unclaimed reservation = readTVarIO (reservationState reservation) >>= \case
+        InUse _ -> pure ()
+        _ -> finishReservation reservation Succeeded
       run = \case
         Left reservation -> do
           valid <- validateReservation reservation
@@ -589,23 +677,9 @@ useChecked pool@Pool{..} preflight action = withPoolLifetime pool $ mask $ \rest
           `onException` finishReservation reservation (Broke Nothing)
         case ready of
           Left details -> finishReservation reservation (Broke details) $> Nothing
-          Right () -> Just . Right <$> useReservation reservation (restore . action)
+          Right () -> Just . Right <$> handOver reservation
   closed <- readTVarIO poolClosed
   if closed then pure (Left PoolClosed) else claim
-
-data Checkout s connection = Checkout connection
-
-checkoutIn :: Scope s -> Pool connection failure -> (connection -> IO (Either (Maybe Text) ())) -> IO (Either (UsageError failure) (Checkout s connection))
-checkoutIn _ _ _ = pure (Left AcquisitionTimeout)
-
-checkoutConnection :: Checkout s connection -> connection
-checkoutConnection (Checkout connection) = connection
-
-markFailed :: Checkout s connection -> SomeException -> IO ()
-markFailed _ _ = pure ()
-
-markBroken :: Checkout s connection -> Maybe Text -> IO ()
-markBroken _ _ = pure ()
 
 -- | Return ownership before observations, so an observer exception cannot leak.
 putPoolEntryBack :: Pool connection failure -> TVar Bool -> Entry connection -> IO Bool

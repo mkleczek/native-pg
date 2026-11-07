@@ -26,7 +26,7 @@ thrown = try
 spec :: Spec
 spec = describe "checking out in a scope" $ do
   describe "giving the connection back" $ do
-    xfail "checkoutIn: it is not implemented yet" $ it "gives it back as succeeded when the scope completes, and reuses it" $ getAcquisition >>= \waiting -> do
+    it "gives it back as succeeded when the scope completes, and reuses it" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       withScope $ \scope -> do
@@ -38,7 +38,7 @@ spec = describe "checking out in a scope" $ do
         fmap checkoutConnection checked `shouldBe` Right 1
       readIORef (harnessOpened harness) `shouldReturn` 1
 
-    xfail "checkoutIn: it is not implemented yet" $ it "keeps the connection until the scope closes, and counts it in use" $ getAcquisition >>= \waiting -> do
+    it "keeps the connection until the scope closes, and counts it in use" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       during <- withScope $ \scope -> do
@@ -47,7 +47,7 @@ spec = describe "checking out in a scope" $ do
       during `shouldBe` Stats {statsIdle = 0, statsInUse = 1, statsOpening = 0}
       stats pool `shouldReturn` Stats {statsIdle = 1, statsInUse = 0, statsOpening = 0}
 
-    xfail "checkoutIn: it is not implemented yet" $ it "gives the connection to a use that waits once the scope closes, and not before" $ getAcquisition >>= \waiting -> do
+    it "gives the connection to a use that waits once the scope closes, and not before" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness) {configAcquisitionTimeout = 10}
       holding <- newEmptyMVar
@@ -64,7 +64,7 @@ spec = describe "checking out in a scope" $ do
       putMVar closing ()
       timeout 2_000_000 (takeMVar later) `shouldReturn` Just (Right 1)
 
-    xfail "checkoutIn: it is not implemented yet" $ it "gives it back as failed when the scope aborts and the connection is usable" $ getAcquisition >>= \waiting -> do
+    it "gives it back as failed when the scope aborts and the connection is usable" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       result <- thrown $ withScope $ \scope -> do
@@ -76,7 +76,7 @@ spec = describe "checking out in a scope" $ do
         checked <- checkoutIn scope pool (const (pure (Right ())))
         fmap checkoutConnection checked `shouldBe` Right 1
 
-    xfail "checkoutIn: it is not implemented yet" $ it "closes it when the scope aborts and the connection isn't usable" $ getAcquisition >>= \waiting -> do
+    it "closes it when the scope aborts and the connection isn't usable" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness) {configUsableAfterException = const (pure False)}
       result <- thrown $ withScope $ \scope -> do
@@ -90,7 +90,7 @@ spec = describe "checking out in a scope" $ do
         checked <- checkoutIn scope pool (const (pure (Right ())))
         fmap checkoutConnection checked `shouldBe` Right 2
 
-    xfail "checkoutIn: it is not implemented yet" $ it "gives it back when the scope's thread is interrupted" $ getAcquisition >>= \waiting -> do
+    it "gives it back when the scope's thread is interrupted" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       holding <- newEmptyMVar
@@ -110,7 +110,7 @@ spec = describe "checking out in a scope" $ do
       lastName harness `shouldReturn` Just "ready: failed"
       stats pool `shouldReturn` Stats {statsIdle = 1, statsInUse = 0, statsOpening = 0}
 
-    xfail "checkoutIn: it is not implemented yet" $ it "gives back the connections of several checkouts, last in, first out" $ getAcquisition >>= \waiting -> do
+    it "gives back the connections of several checkouts, last in, first out" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness) {configSize = 2}
       withScope $ \scope -> do
@@ -122,7 +122,7 @@ spec = describe "checking out in a scope" $ do
       reverse (ofStatus "ready: succeeded") `shouldBe` ofStatus "ready: established"
 
   describe "deciding how the connection goes back" $ do
-    xfail "checkoutIn: it is not implemented yet" $ it "closes a connection that was marked broken though the scope completed, with the details" $ getAcquisition >>= \waiting -> do
+    it "closes a connection that was marked broken though the scope completed, with the details" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       withScope $ \scope -> do
@@ -131,7 +131,7 @@ spec = describe "checking out in a scope" $ do
       lastName harness `shouldReturn` Just "terminated: network error Just \"lost\""
       readIORef (harnessClosed harness) `shouldReturn` [1]
 
-    xfail "checkoutIn: it is not implemented yet" $ it "gives back as failed a connection that was marked failed though the scope completed" $ getAcquisition >>= \waiting -> do
+    it "gives back as failed a connection that was marked failed though the scope completed" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       withScope $ \scope -> do
@@ -140,7 +140,7 @@ spec = describe "checking out in a scope" $ do
       lastName harness `shouldReturn` Just "ready: failed"
       readIORef (harnessClosed harness) `shouldReturn` []
 
-    xfail "checkoutIn: it is not implemented yet" $ it "keeps what the use decided when the scope aborts and the connection isn't usable" $ getAcquisition >>= \waiting -> do
+    it "keeps what the use decided when the scope aborts and the connection isn't usable" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness) {configUsableAfterException = const (pure False)}
       void . thrown $ withScope $ \scope -> do
@@ -149,7 +149,7 @@ spec = describe "checking out in a scope" $ do
         throwIO (ErrorCall "the scope failed")
       lastName harness `shouldReturn` Just "ready: failed"
 
-    xfail "checkoutIn: it is not implemented yet" $ it "lets a mark of broken override a mark of failed, and not the other way round" $ getAcquisition >>= \waiting -> do
+    it "lets a mark of broken override a mark of failed, and not the other way round" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness) {configSize = 2}
       withScope $ \scope -> do
@@ -166,7 +166,7 @@ spec = describe "checking out in a scope" $ do
         `shouldBe` ["terminated: network error Just \"second\"", "terminated: network error Just \"first\""]
 
   describe "not getting a connection" $ do
-    xfail "checkoutIn: it is not implemented yet" $ it "gives the timeout as a value when the pool stays full, and keeps what it holds" $ getAcquisition >>= \waiting -> do
+    it "gives the timeout as a value when the pool stays full, and keeps what it holds" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness) {configAcquisitionTimeout = 0.1}
       withScope $ \scope -> do
@@ -176,7 +176,7 @@ spec = describe "checking out in a scope" $ do
           either Just (const Nothing) checked `shouldBe` Just AcquisitionTimeout
         stats pool `shouldReturn` Stats {statsIdle = 0, statsInUse = 1, statsOpening = 0}
 
-    xfail "checkoutIn: it is not implemented yet" $ it "gives a failure to connect as a value, and frees the slot" $ getAcquisition >>= \waiting -> do
+    it "gives a failure to connect as a value, and frees the slot" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness) {configConnect = pure (Left "refused")}
       withScope $ \scope -> do
@@ -184,7 +184,7 @@ spec = describe "checking out in a scope" $ do
         either Just (const Nothing) checked `shouldBe` Just (ConnectionFailed "refused")
       stats pool `shouldReturn` Stats {statsIdle = 0, statsInUse = 0, statsOpening = 0}
 
-    xfail "checkoutIn: it is not implemented yet" $ it "gives a pool that was destroyed as a value" $ getAcquisition >>= \waiting -> do
+    it "gives a pool that was destroyed as a value" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       destroy pool
@@ -192,7 +192,7 @@ spec = describe "checking out in a scope" $ do
         checked <- checkoutIn scope pool (const (pure (Right ())))
         either Just (const Nothing) checked `shouldBe` Just PoolClosed
 
-    xfail "checkoutIn: it is not implemented yet" $ it "retires a connection that fails the check, and tries again under the same deadline" $ getAcquisition >>= \waiting -> do
+    it "retires a connection that fails the check, and tries again under the same deadline" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       checks <- newIORef (0 :: Int)
@@ -207,7 +207,7 @@ spec = describe "checking out in a scope" $ do
       readIORef (harnessClosed harness) `shouldReturn` [1]
       readIORef checks `shouldReturn` 2
 
-    xfail "checkoutIn: it is not implemented yet" $ it "gives up a connection whose check throws, and propagates the exception" $ getAcquisition >>= \waiting -> do
+    it "gives up a connection whose check throws, and propagates the exception" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
       result <- thrown $ withScope $ \scope -> void (checkoutIn scope pool (const (throwIO (ErrorCall "check failed"))))
