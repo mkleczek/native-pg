@@ -13,7 +13,8 @@ import Database.PostgreSQL.Session
   )
 import Database.PostgreSQL.Session.Settings ()
 import Database.PostgreSQL.Snippet ()
-import Database.PostgreSQL.Streaming (ByteStream (..), withBuffers, withOperation)
+import Database.PostgreSQL.Pool (Pool, UsageError, checkoutConnection, checkoutIn, markBroken)
+import Database.PostgreSQL.Streaming (ByteStream (..), operationIn, withBuffers, withOperation)
 import Database.PostgreSQL.Streaming.Types ()
 import Database.PostgreSQL.Transport (Channel, Link (..), newChannel, serverEndPoint)
 import Database.PostgreSQL.Transport.Link ()
@@ -32,6 +33,9 @@ import Network.Streaming.BufferPool
   )
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Scope (withScope)
+import Network.Streaming.Source (pull)
+import Network.Streaming.Watch (watchCancel)
 
 prepareNamed :: ByteString -> params -> Transaction.Statement params row -> Transaction.Pipeline tx (Transaction.Preparation tx)
 prepareNamed = Transaction.prepare
@@ -128,3 +132,24 @@ resourceSettings = PoolSettings
 
 createResources :: Acquisition.Context -> IO BufferPool
 createResources acquisition = newBufferPool acquisition resourceSettings
+
+-- A request in a scope: a connection checked out, the request's buffers bound
+-- to it, a transaction, a field read as a source, and the ending's reply.
+inScope :: BufferAccess -> Pool Connection failure -> IO (Either (UsageError failure) (Maybe ByteString))
+inScope access pool = withScope $ \scope -> do
+  checked <- checkoutIn scope pool (const (pure (Right ())))
+  case checked of
+    Left failure -> pure (Left failure)
+    Right checkout -> do
+      session <- operationIn scope access (checkoutConnection checkout)
+      tx <- Transaction.transactionIn scope Transaction.ReadCommitted Transaction.Read session
+      current <- Transaction.runIn tx $ do
+        cursor <- Transaction.finalPipeline (Transaction.statement () streamed)
+        Transaction.nextRow cursor
+      case current of
+        Just (MaybeField (Just field)) -> do
+          chunk <- pull (Transaction.fieldSource field)
+          _ <- Transaction.endingReady tx
+          Transaction.endingWatch tx >>= watchCancel
+          pure (Right chunk)
+        _ -> Right Nothing <$ markBroken checkout Nothing

@@ -119,6 +119,9 @@ for private_symbol in \
   'Transaction (Preparation(Preparation))' \
   'Transaction (prepareAs)' \
   'Transaction (Field(Field))' \
+  'Transaction (Tx(Tx))' \
+  'Transaction (FieldSource(FieldSource))' \
+  'Pool (Checkout(Checkout))' \
   'Transaction (RowDecoder(RowDecoder))' \
   'Transaction (Runtime)' \
   'Transaction (ApplicationFailure)'; do
