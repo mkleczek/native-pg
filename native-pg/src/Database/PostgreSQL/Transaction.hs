@@ -142,26 +142,34 @@ data Runtime = Runtime
 runTransaction :: IsolationLevel -> Mode -> Session -> (forall tx. Transaction tx a) -> IO a
 runTransaction isolation mode session (Transaction action) = do
   outcome <- Exchange.operation session $ mask $ \resume -> do
-    runtime <- Runtime session <$> myThreadId <*> newIORef True <*> newIORef False
-      <*> newIORef (Just (beginning isolation mode)) <*> newIORef True <*> newIORef False
-      <*> newIORef False <*> newIORef [] <*> newIORef False <*> newIORef TxIdle <*> newIORef Nothing <*> newIORef False
-    let cleanup = do
-          complete <- readIORef (runtimeEnded runtime)
-          broken <- readIORef (runtimeBroken runtime)
-          unless (complete || broken) $ do
-            recovered <- try @SomeException (runOperation runtime (drain runtime False *> rollback runtime))
-            case recovered of
-              Left failure -> do
-                breakConnection (Exchange.sessionConnection session)
-                when (isJust (fromException @SomeAsyncException failure)) (throwIO failure)
-              Right () -> pure ()
+    runtime <- newRuntime isolation mode session
     (do
       result <- try @SomeException (resume (runReaderT action runtime))
       case result of
         Left failure | isInterrupted failure -> abandon runtime
         _ -> pure ()
-      pure result) `finally` (cleanup `finally` writeIORef (runtimeLive runtime) False)
+      pure result) `finally` (cleanupRuntime runtime `finally` writeIORef (runtimeLive runtime) False)
   either throwIO pure outcome
+
+newRuntime :: IsolationLevel -> Mode -> Session -> IO Runtime
+newRuntime isolation mode session =
+  Runtime session <$> myThreadId <*> newIORef True <*> newIORef False
+    <*> newIORef (Just (beginning isolation mode)) <*> newIORef True <*> newIORef False
+    <*> newIORef False <*> newIORef [] <*> newIORef False <*> newIORef TxIdle <*> newIORef Nothing <*> newIORef False
+
+-- | Drains and rolls back a transaction that was not finished, unless it is
+-- broken.
+cleanupRuntime :: Runtime -> IO ()
+cleanupRuntime runtime = do
+  complete <- readIORef (runtimeEnded runtime)
+  broken <- readIORef (runtimeBroken runtime)
+  unless (complete || broken) $ do
+    recovered <- try @SomeException (runOperation runtime (drain runtime False *> rollback runtime))
+    case recovered of
+      Left failure -> do
+        breakConnection (Exchange.sessionConnection (runtimeSession runtime))
+        when (isJust (fromException @SomeAsyncException failure)) (throwIO failure)
+      Right () -> pure ()
 
 -- The runtime is shared by synchronous unlifted callbacks. Only protocol
 -- operations claim it: application callbacks may enter another callback, but
@@ -371,7 +379,10 @@ ending runtime = (\commits -> if commits then "COMMIT" else "ROLLBACK") <$> read
 -- transaction success. An empty transaction sends nothing. This action is
 -- idempotent after success; further statements are rejected.
 finishTransaction :: Transaction tx ()
-finishTransaction = operation $ \runtime -> do
+finishTransaction = operation finishRuntime
+
+finishRuntime :: Runtime -> IO ()
+finishRuntime runtime = do
   finished <- readIORef (runtimeEnded runtime)
   unless finished $ do
     drain runtime True
