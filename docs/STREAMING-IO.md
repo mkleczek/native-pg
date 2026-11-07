@@ -17,7 +17,10 @@ Mix M at 3,000 req/s, 1,500 keep-alive connections:
   chunk (`Response.hs:380-409`). That is 1.00 header-only send per request,
   2.19 sends in all. A chunked response would take three sends per chunk
   (size line, data, CRLF). Warp sends the header at once on purpose: the
-  client sees a response while the body is slow.
+  client sees a response while the body is slow. Only the fork's
+  `ResponseBytes` does; the legacy `ResponseStream` keeps the header in its
+  builder until the first flush or 16 KiB. The answer loop of the runner
+  design keeps the former behaviour.
 - **native-pg cuts its gather at every borrowed stream.** `sendSome` sends the
   bytes before a stream before pulling it, "so the server starts on its
   statement" (`Channel.hs:282-287`), and sends each borrowed upload chunk
@@ -95,6 +98,10 @@ data Blocked = Done | OnWritable | OnSource (IO Watch)
 - **Watches.** The socket instance builds them from
   `threadWaitReadSTM`/`threadWaitWriteSTM` (`Socket/Link.hs:37-40`); that
   stops being private.
+- **Sends take at most 16 pieces.** `sendReady` offers the pieces to one
+  `writev`, and the socket link uses the iovec limit of 16, so a caller
+  offers no more, in as many sends as it needs. It offers at least one: an
+  empty `sendReady` fails with `EINVAL` on macOS.
 - **Try before watching.** A watch is only valid after the matching try
   returned `Nothing`, as today. That keeps the TLS link correct without
   TLS-aware watches: rustls may hold plaintext while the socket is quiet,
@@ -137,22 +144,59 @@ data Pulled = Pulled !ByteString | Pending | Ended
   exit", `DESIGN.md:200-204`). A consumer can hold a chunk across a partial
   send and return to its event loop; it pulls again only once the chunk has
   been accepted, which is the backpressure rule anyway.
-- **What "ready" means.** Bytes already buffered, or a nonblocking read into
-  the source's own loan that returned some. A `Pending` pull has read
-  nothing beyond its loan's free space.
-- **Warp's request body.** `pullReady` serves read-ahead, then tries
-  `recvBufNoWait` into the request's loan. The Content-Length and chunked
-  decoders (`Conduit.hs`) keep their state between pulls and report
-  `Pending` when a size line or data is incomplete. The watch is the client
-  socket's readable watch `orElse` graceful shutdown (today's give-up action
-  in `makeGracefulRecvInto`).
-- **native-pg's response column.** `pullReady` returns the field bytes
-  already in the input buffer, or tries one receive into the input loan's
-  free tail. The watch is the PostgreSQL link's readable watch.
+- **What "ready" means.** A chunk as large as a blocking read of the same
+  source would give: bytes already buffered, and nonblocking reads into the
+  source's own loan, for as long as bytes keep arriving, until it holds that
+  many. A `Pending` pull may hold the bytes it has received, in its loan, and
+  keeps them for the next pull.
+- **Warp's request body.** `pullReady` serves read-ahead, then tries a
+  receive that doesn't wait into the request's loan. The Content-Length and
+  chunked decoders (`Conduit.hs`) were not resumable; since step 3 of the
+  runner `lengthStep` and `chunkStep` keep their state as data between pulls,
+  and a pull that finds no bytes is `Pending`. Its watch is the link's
+  readable watch. The graceful-shutdown give-up of `makeGracefulRecvInto` is
+  not part of a pull: `Interest` has no slot for a give-up, so the runner's
+  idle receive waits with `OnSource` of a shutdown watch.
+- **native-pg's response column.** `fieldSource` is the field of a row as a
+  `Source`: `pullReady` gives a chunk as large as `nextChunk`'s, which is the
+  field's rest or the room the input buffer has up to its end, whichever is
+  less. It takes the bytes the input holds and receives, without waiting, for
+  as long as bytes arrive, until it has that many; with fewer, when nothing
+  more arrives, it is `Pending` and keeps them. One receive brings only what
+  the sender sent at once, about 8 KiB from PostgreSQL, so a pull that gave
+  what one receive brought gave twice the chunks of a 16 KiB blocking read.
+  The watch is one watch of what the pull was stalled on (`watchInterest`):
+  the link readable, and, while output is unsent, the link writable or the
+  upload's source, so that a pull never waits for the answer to a request that
+  is not fully sent. It sends unsent output as far as the link takes it before
+  it is `Pending`, after it has tried to receive. `watchInterest` has one
+  copy for each link type, made where the instance is (`SPECIALIZE`, not
+  inlined), so the channel's watch picks the link's watches at compile time
+  and passes no `Link` dictionary at run time.
 - **Buffer loans.** A pull that needs a loan while none is free returns
   `Pending` with a watch on the pending borrow. `BufferAccess` gets a
   registering borrow: it joins the FIFO lane as `borrowBuffer` does today, so
-  fairness is unchanged, and the next pull takes the granted loan.
+  fairness is unchanged, and the next pull takes the granted loan. A request
+  buffer returns its loan whenever it is fully consumed, so a pull of the
+  next chunk, and `endingReady` too, may find none.
+- **`watchBorrow` and the waits that cancel.** `watchBorrow`'s docs say to
+  cancel its watch on exceptions, as `awaitWatch` does. But `awaitWatch`,
+  `awaitFirst` and native-pg's `awaitAny` also cancel after the watch fired,
+  before the consumer pulls again, and `watchBorrow`'s cancel returns a loan
+  that was granted to the registration, and gives up its place in the queue.
+  A source that hands out `watchBorrow` therefore keeps the registration
+  itself and hands out a watch whose cancel does nothing and which fires
+  once the registration is granted; its next pull claims the loan with
+  `tryBorrowBuffer`, which takes the registration's loan first. The request
+  body does so (runner design §5). So do `fieldSource` and `endingReady`: the
+  input keeps the registration, the next pull or `endingReady` takes the loan
+  with `tryBorrowBuffer`, and one that finds the registration still pending
+  doesn't try, since a pending registration holds the place of the second loan.
+  The stall of such a pull is `StallOnLoan`, which also says what unsent output
+  waits for, so that the watch includes the link writable or the upload's
+  source and the output keeps moving. The registration is withdrawn when the
+  input's buffer is released, which gives back the loan it holds, and before
+  any blocking borrow of the loan, as a blocking read takes or a scope's drain.
 - **Old callback sources.** `Network.Streaming.Source` becomes
   `ScopedSource` for the transition and is removed when its last user is.
   Nothing implements the new class from a callback, because that's exactly
@@ -226,15 +270,84 @@ drive :: Link link => link -> (s -> IO (Progress s a)) -> s -> IO a
   meanwhile: nothing waits while a read could succeed. Sending output is the
   same step without input: ready once `pushOutput` reports `Done`, otherwise
   blocked on `Interest False blocked`.
-- **Warp response.** Loop `pushOutput` on the client link and
-  `awaitAny link (Interest False blocked)` until it reports `Done`. The
-  timeout is resumed only around waits for the link, as `sendFragment` does
-  today, so a slow database never times the client out.
+- **Warp response.** The application returns an `Answer`: a status, headers
+  and a body source. Warp sends it in its own loop, with `pushOutput` on the
+  client link and `awaitAny link (Interest input blocked)`, where `blocked` is
+  the link writable or the source's watch, until `pushOutput` reports `Done`.
+  The timeout is resumed only around waits for the link, so a slow database
+  never times the client out. The runner design describes it.
 - **PostgREST.** Instead of pushing chunks into a sink (`consumeNext`,
   `App.hs:390-392`), it hands Warp the column's source with the advertised
   length. Write mode's rule that the final chunk waits for COMMIT becomes a
-  source wrapper that reports `Pending` for the final chunk until the
-  transaction has finished; `retainFinalChunk` moves into it.
+  source wrapper that copies the final chunk, reports `Pending` until
+  `endingReady` has the ending's reply, and gives the chunk then, or throws
+  the failure of COMMIT; `retainFinalChunk` moves into it.
+
+## Scope: resources that learn how a request ended
+
+`Network.Streaming.Scope` is a bracket for any number of resources, shared by
+Warp's request and native-pg's connections.
+
+```haskell
+withScope :: (forall s. Scope s -> IO a) -> IO a
+acquireIn :: Scope s -> IO a -> (Ending -> a -> IO ()) -> IO (Owned s a)
+data Ending = Completed | Aborted SomeException
+```
+
+- **Releases run last in, first out, once each,** when the scope closes, on
+  success, on an exception and on an asynchronous one. Every release runs even
+  if one throws. As with nested brackets, the exception of the last release
+  to throw replaces those before it, and the body's; a release after a failed
+  one learns `Aborted` with it.
+- **A release learns how the scope ended,** so that it can give back what it
+  holds when all went well, and discard it when it didn't. `Ending` is
+  streaming-io's own type: IO has no abort case, and `Aborted` carries the
+  exception, so a release can tell an interruption from an error.
+- **`acquireIn` acquires under `mask_`** and registers the release, so no
+  asynchronous exception comes between them; the acquisition can be
+  interrupted where it blocks. One that throws registers nothing.
+- **No early release.** An `Owned` lives as long as the scope. A resource that
+  has to go earlier has a scope or a bracket of its own.
+- **A scope belongs to the thread that opened it,** as an `STRef` does: releases
+  are registered and run without synchronization, which keeps a scope with two
+  resources as cheap as two nested brackets (about 750 bytes allocated at
+  `-O2`, where a synchronized registry took about a third more).
+- **The type parameter is rank-2,** as `runST`'s is: neither a `Scope s` nor
+  an `Owned s a`, nor anything whose type mentions `s`, can leave `withScope`.
+  The tag protects only what carries it: `owned` takes the `a` out as plain
+  as its library made it. So native-pg's handles carry the tag (`Checkout s`,
+  `Tx s`, `Field s`, `FieldSource s`), and what is plain, the `Session`, is
+  rejected at run time once its operation has ended.
+  `streaming-io/test/check-scope-escape.sh` checks the escapes fail to compile.
+
+### native-pg in a scope
+
+The pieces compose, since the pool is generic over its connections and
+PostgREST wraps its own:
+
+- **`Pool.checkoutIn`** checks a connection out as `useChecked` does, with the
+  same admission deadline and check; acquisition failures are values. The
+  connection goes back when the scope closes: `Succeeded` if it completed, and
+  if it aborted `Failed` or `Broke` by `configUsableAfterException`, as `use`
+  decides. `markFailed` and `markBroken` decide earlier for the code in the
+  scope.
+- **`Streaming.operationIn`** binds the request's `BufferAccess` to the
+  connection, as `withOperation` does. When the scope aborted, the
+  transaction decides what becomes of the connection.
+- **`Transaction.transactionIn`** begins a transaction on that session, and
+  `runIn` runs a `Transaction s a` against it. Completed, it finishes the
+  transaction as `finishTransaction` does (a failure the code handled is
+  rolled back instead). Aborted, an interruption or a field left unread in the
+  middle of its stream abandons it and breaks the connection; any other failure
+  drains and rolls back. A connection never goes back in an unknown state.
+- **`Transaction.fieldSource`** is a field as a `Source` that never waits, as
+  described above.
+- **`Transaction.endingReady`** reads what follows the body and the ending's
+  reply when all of it is in the input, or arrives in receives that don't wait;
+  `Nothing` until then, `Right` once the ending was observed, `Left` for its
+  failure (a deferred constraint at COMMIT). `endingWatch` is the watch for
+  it. The replies after the field have to fit the input, which is checked and
+  raised instead of waiting forever.
 
 ## Invariants
 
@@ -254,6 +367,8 @@ drive :: Link link => link -> (s -> IO (Progress s a)) -> s -> IO a
 - **One owner per link.** Only the request thread calls a link, as
   native-pg requires today; the waiter threads that broke this briefly are
   gone.
+- **Scopes:** every acquisition in a scope is released exactly once, when the
+  scope closes, and nothing tagged with the scope outlives it.
 - **Teardown releases without joining.** With no producer or waiter
   threads, scope exit cancels watches and returns loans; there is nothing
   to kill and join.

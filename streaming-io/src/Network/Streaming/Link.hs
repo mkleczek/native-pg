@@ -74,7 +74,10 @@ class Link link where
   receiveReady :: link -> Ptr Word8 -> Int -> IO (Maybe Int)
 
   -- | Takes what it can of the pieces without waiting, and gives how many
-  -- bytes it took.
+  -- bytes it took. The socket link sends them with one @writev@, whose
+  -- iovec limit it uses, so it takes at most 16 pieces at a time: a caller
+  -- offers no more. It offers at least one piece, since an empty send fails
+  -- with @EINVAL@ on macOS.
   sendReady :: link -> [ByteString] -> IO Int
 
   -- | Writes what it took but hasn't written yet, without waiting. True if

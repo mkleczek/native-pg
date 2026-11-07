@@ -294,6 +294,14 @@ tryBorrowBuffer access@(BufferAccess pool _ state) = atomically $ do
 -- the extra slot, so an access has at most one, and a third overlapping loan
 -- fails promptly. Register under a mask and cancel on exceptions, as
 -- 'Network.Streaming.Watch.awaitWatch' does.
+--
+-- Cancelling returns a granted loan and gives up the place in the queue, and
+-- 'Network.Streaming.Watch.awaitWatch', 'Network.Streaming.Watch.awaitFirst'
+-- and native-pg's wait cancel their watches also after one has fired, before
+-- the caller pulls again. So a source that hands out this watch keeps the
+-- registration itself, hands out a watch whose cancel does nothing and which
+-- fires when the registration is granted, and takes the loan with
+-- 'tryBorrowBuffer' on its next pull.
 watchBorrow :: BufferAccess -> IO Watch
 watchBorrow access@(BufferAccess pool _ state) = do
   registration@(Registration request _) <- atomically $ do

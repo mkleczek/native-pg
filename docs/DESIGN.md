@@ -820,6 +820,9 @@ before it, and the per-row path is the same as without the check.
   e.g. the left side of `*>`, has no handle to discard; a client keeps it in a
   tuple. The results of a pipeline that was drained by the next one read as empty.
 
+A transaction can also be held by a scope (see "Transactions in a scope"
+below), where the scope ends it as how the request ended.
+
 `row` decodes owned metadata. `streamingRow` decodes that metadata followed by
 one nullable `Field tx`; `fieldLength` reports its declared length. `nextChunk`
 returns borrowed bytes until field EOF, represented by an empty chunk. A chunk
@@ -851,6 +854,80 @@ reusable. Interrupted I/O and asynchronous exceptions escaping an unfinished
 scope discard the connection without waiting to drain, as do unsafe parser and
 parameter-source failures. A successfully finished transaction remains usable
 if later HTTP output fails.
+
+### Transactions in a scope
+
+`Network.Streaming.Scope` (streaming-io) is a bracket for any number of
+resources: `withScope` runs a body, and `acquireIn` registers the release of
+what it acquired under `mask`. The releases run last in, first out, once each,
+on every path, and each learns how the scope ended (`Completed`, or `Aborted`
+with the exception). If a release throws, the others still run and the last
+exception to be thrown wins, as with nested brackets. The scope's type parameter
+is rank-2, so a handle that carries it cannot leave the scope; native-pg's
+handles carry it, and the plain `Session` is rejected at run time once its
+operation has ended. There is no early release.
+
+native-pg's acquisitions in a scope compose, since the pool is generic over its
+connections and PostgREST wraps its own with a statement cache:
+
+```haskell
+checkoutIn    :: Scope s -> Pool c f -> (c -> IO (Either (Maybe Text) ())) -> IO (Either (UsageError f) (Checkout s c))
+operationIn   :: Scope s -> BufferAccess -> Connection -> IO Session
+transactionIn :: Scope s -> IsolationLevel -> Mode -> Session -> IO (Tx s)
+runIn         :: Tx s -> Transaction s a -> IO a
+fieldSource   :: Field s -> FieldSource s
+endingReady   :: Tx s -> IO (Maybe (Either QueryError ()))
+```
+
+- **`checkoutIn`** claims a connection as `useChecked` does, under the same
+  admission deadline, with the same check of the connection before use; a
+  connection that couldn't be had comes back as a value. When the scope closes
+  the connection goes back as `Succeeded` if it completed, and if it aborted as
+  `Failed` or `Broke` by `configUsableAfterException`, as `use` decides. `markFailed`
+  and `markBroken` decide earlier, for the code in the scope that knows.
+- **`operationIn`** binds a request's buffers to the connection until the
+  scope closes, as `withOperation` does for a callback. It doesn't break the
+  connection because the scope aborted: the transaction, which knows where in
+  the protocol it stopped, does. Output that is unsent breaks it.
+- **`transactionIn`** begins a transaction on the session, on the calling thread,
+  and `runIn` runs a `Transaction s a` against it with the checks that
+  `runTransaction`'s action has. Its release learns the ending. When the scope
+  completed, the transaction is finished as `finishTransaction` finishes it:
+  what is unread is drained, the ending's reply is observed (queued by
+  `finalPipeline`, or sent now), and the session must be idle; a transaction
+  that failed on the server and whose failure the code handled is rolled back
+  instead. When it aborted, an interruption, or a field left unread in the
+  middle of its stream, abandons the transaction and breaks the connection;
+  any other failure drains and rolls back. A failing release makes the releases
+  after it learn that the scope aborted, so a connection is never given back in
+  an unknown state. `runTransaction` is unchanged: it rolls back a scope that
+  returns without finishing, where a scope that completes commits.
+- **`fieldSource`** is a field as a pull `Source` of streaming-io. A pull gives a
+  chunk of the field as large as `nextChunk`'s: it takes the input's bytes and
+  receives without waiting, for as long as bytes arrive, until it has that many,
+  or is pending, keeping what it has; the end of the field is `Ended`. Unsent
+  output is sent as the link takes it before a pull is pending, after it has
+  tried to receive. The watch of a pending pull is one watch of what it was
+  stalled on: the link readable, and while output is unsent the link writable or
+  the upload's source, since otherwise a pull could wait for the answer to a
+  request that is not fully sent. A chunk is borrowed until the next pull. The
+  thread, scope and row rules are `nextChunk`'s. A pull never waits for a loan
+  either: when the request has none free, it is pending, and its watch is the
+  registration for one, which the input keeps, since the waits that cancel a
+  watch after it fired would give the granted loan back; the next pull takes
+  it. The registration is withdrawn when the input is released.
+- **`endingReady`** reads what follows the body and the ending's reply when
+  all of it is in the input, or arrives in receives that don't wait, and says
+  nothing is there yet otherwise. It finds the ReadyForQuery that ends the
+  statements that were sent in the buffered bytes, and only then reads them,
+  with the code `finishTransaction` reads with, which then waits for nothing. It
+  gives `Right` once the ending was observed and `Left` for a failure of the
+  ending, e.g. a deferred constraint at COMMIT; an ending that was not queued is
+  queued by the call. The replies after the field must fit the input, or it
+  raises `RowMisuse`. `endingWatch` is the watch for what it waits for: the
+  server's bytes, or the registration for a loan when none was free to receive
+  into, as for a pull. It may move the input's bytes, so the field's last chunk
+  must be copied before it.
 
 A streamed input parameter has this shape:
 
@@ -956,6 +1033,12 @@ top of them, through typeclass metaprogramming:
 - Parameter OIDs are optional, allowing the server to infer their types.
 
 ### HTTP/1.1 usage
+
+With the request's scope (see "Transactions in a scope"), the application
+returns an answer whose body is the field's source, and Warp sends it before it
+closes the scope, so the connection stays claimed while the body is pulled and
+the transaction's release observes the ending. The description below is that of
+the callback API, which PostgREST still uses.
 
 PostgREST connects request-body input to a streamed statement parameter and
 pulls the result's last column within the database transaction scope. It calls
