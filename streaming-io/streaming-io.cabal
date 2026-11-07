@@ -20,6 +20,7 @@ library
                    Network.Streaming.BufferPool
                    Network.Streaming.Buffer
                    Network.Streaming.Sender
+                   Network.Streaming.Scope
                    Network.Streaming.Source
                    Network.Streaming.Watch
   other-modules: Network.Streaming.Internal.ListPrefix
@@ -43,12 +44,14 @@ test-suite streaming-io-spec
                  Network.Streaming.PositiveInt
                  Network.Streaming.BufferPool
                  Network.Streaming.Buffer
+                 Network.Streaming.Scope
                  Network.Streaming.Sender
                  Network.Streaming.Source
                  Network.Streaming.Watch
                  PositiveIntSpec
                  RequestBuffersSpec
                  ResourcesSpec
+                 ScopeSpec
                  SenderSpec
                  SourceSpec
                  StreamingSpec
