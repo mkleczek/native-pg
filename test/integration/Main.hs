@@ -1,6 +1,7 @@
 module Main (main) where
 
 import qualified OperationContextSpec
+import qualified ScopeTransactionSpec
 import qualified IntegrationSpec
 import qualified StreamingSetupSpec
 import TestCluster (withCluster)
@@ -20,4 +21,5 @@ main = do
       [ ("test/integration/IntegrationSpec.hs", IntegrationSpec.spec socketPath port)
       , ("test/integration/StreamingSetupSpec.hs", StreamingSetupSpec.spec socketPath port)
       , ("test/integration/OperationContextSpec.hs", OperationContextSpec.spec port)
+      , ("test/integration/ScopeTransactionSpec.hs", ScopeTransactionSpec.spec port)
       ]

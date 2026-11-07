@@ -64,6 +64,7 @@ test-suite native-pg-integration
                       IntegrationSpec
                       StreamingSetupSpec
                       OperationContextSpec
+                      ScopeTransactionSpec
                       TestCluster
   main-is: Main.hs
   ghc-options: -Wall -threaded "-with-rtsopts=-T"

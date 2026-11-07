@@ -2,6 +2,7 @@
 -- protocol state between calls; BufferPool can be shared with an HTTP server.
 module Database.PostgreSQL.Streaming
   ( withOperation,
+    operationIn,
     withBuffers,
     ByteStream (..),
     connect,
@@ -20,6 +21,7 @@ import Database.PostgreSQL.Streaming.Types (ByteStream (..))
 import Network.Streaming.BufferPool (BufferPool, BufferAccess)
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (Buffer)
+import Network.Streaming.Scope (Scope)
 
 -- | Use the request's shared body capability for one exclusive connection
 -- scope. Input borrows only while unread or borrowed bytes remain; streamed
@@ -27,6 +29,9 @@ import Network.Streaming.Buffer (Buffer)
 withOperation :: BufferAccess -> Connection -> (Session -> IO a) -> IO a
 withOperation access connection action =
   Context.withRequestContext connection access (action . Exchange.Session)
+
+operationIn :: Scope s -> BufferAccess -> Connection -> IO Session
+operationIn _ _ _ = ioError (userError "operationIn is not implemented yet")
 
 -- | Use disjoint, initialized shared storage for one exclusive operation.
 -- Both buffers must remain exclusively owned until the callback returns;

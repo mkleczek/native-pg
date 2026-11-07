@@ -8,6 +8,7 @@
 -- | Synchronous cursors that keep a transaction open until explicitly finished.
 module Database.PostgreSQL.Transaction
   ( Transaction, Pipeline, Result, Preparation, Field, Statement (..), RowDecoder,
+    Tx, transactionIn, runIn,
     runTransaction, statement, prepare, awaitPreparation, executePrepared, pipeline, finalPipeline,
     nextRow, discard, fieldLength, nextChunk, finishTransaction, condemn, sql,
     row, streamingRow, singleRow, rowMaybe, noResult,
@@ -43,6 +44,7 @@ import qualified Database.PostgreSQL.Internal.Row as Row
 import Database.PostgreSQL.Session (Session)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Types (FormatCode (..), TransactionStatus (..))
+import Network.Streaming.Scope (Scope)
 import Network.Streaming.Source (Source (..))
 
 -- | Work run synchronously on the thread that entered the transaction scope.
@@ -150,6 +152,14 @@ runTransaction isolation mode session (Transaction action) = do
         _ -> pure ()
       pure result) `finally` (cleanupRuntime runtime `finally` writeIORef (runtimeLive runtime) False)
   either throwIO pure outcome
+
+newtype Tx (s :: Type) = Tx Runtime
+
+transactionIn :: Scope s -> IsolationLevel -> Mode -> Session -> IO (Tx s)
+transactionIn _ _ _ _ = ioError (userError "transactionIn is not implemented yet")
+
+runIn :: Tx s -> Transaction s a -> IO a
+runIn _ _ = ioError (userError "runIn is not implemented yet")
 
 newRuntime :: IsolationLevel -> Mode -> Session -> IO Runtime
 newRuntime isolation mode session =
