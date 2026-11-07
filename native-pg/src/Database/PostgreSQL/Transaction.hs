@@ -8,7 +8,7 @@
 -- | Synchronous cursors that keep a transaction open until explicitly finished.
 module Database.PostgreSQL.Transaction
   ( Transaction, Pipeline, Result, Preparation, Field, Statement (..), RowDecoder,
-    Tx, transactionIn, runIn, FieldSource, fieldSource,
+    Tx, transactionIn, runIn, FieldSource, fieldSource, endingReady, endingWatch,
     runTransaction, statement, prepare, awaitPreparation, executePrepared, pipeline, finalPipeline,
     nextRow, discard, fieldLength, nextChunk, finishTransaction, condemn, sql,
     row, streamingRow, singleRow, rowMaybe, noResult,
@@ -49,6 +49,7 @@ import Network.Streaming.Link (Interest (..))
 import qualified Network.Streaming.Link as Link (Blocked (Done))
 import Network.Streaming.Source (Pulled (Ended, Pulled), Source (..))
 import qualified Network.Streaming.Source as Source
+import Network.Streaming.Watch (Watch, readyNow)
 
 -- | Work run synchronously on the thread that entered the transaction scope.
 -- 'withRunInIO' supports synchronous IO callbacks. Database operations reject
@@ -259,6 +260,12 @@ instance Source (FieldSource s) where
     checkOwner runtime
     stall <- readIORef (runtimeStalled runtime)
     contextWatchStall (contextOf runtime) stall
+
+endingReady :: Tx s -> IO (Maybe (Either QueryError ()))
+endingReady _ = pure Nothing
+
+endingWatch :: Tx s -> IO Watch
+endingWatch _ = pure readyNow
 
 newRuntime :: IsolationLevel -> Mode -> Session -> IO Runtime
 newRuntime isolation mode session =

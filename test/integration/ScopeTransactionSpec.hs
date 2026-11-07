@@ -35,6 +35,7 @@ import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Source (Source, pull)
+import Network.Streaming.Watch (awaitWatch)
 import Network.Streaming.Scope (withScope)
 import Skeletest hiding (context)
 import System.Timeout (timeout)
@@ -169,6 +170,34 @@ spec port = describe "operations and transactions in a scope" $ do
       result `shouldBe` Left (ErrorCall "the client went away")
       brokenAfter env
 
+  describe "the ending's reply" $ do
+    xfail "endingReady: it is not implemented yet" $ it "gives COMMIT's success once the body was pulled, and the scope has nothing left to do" $ withEnv port 1 $ \env -> do
+      run env "CREATE TEMP TABLE reply_commit (id int)"
+      outcome <- inRequest env Tx.Write $ \_ tx -> do
+        Tx.runIn tx (Tx.sql "INSERT INTO reply_commit VALUES (1)")
+        field <- Tx.runIn tx (firstField =<< Tx.finalPipeline (Tx.statement () (numbersOf 3000)))
+        _ <- pullAll (Tx.fieldSource field)
+        awaitEnding tx
+      isRight' outcome `shouldBe` True
+      lastNames env 1 `shouldReturn` ["ready: succeeded"]
+      count env "reply_commit" `shouldReturn` 1
+
+    xfail "endingReady: it is not implemented yet" $ it "gives the failure of a deferred constraint at COMMIT as a value, after the body was pulled" $ withEnv port 1 $ \env -> do
+      outcome <- inRequest env Tx.Write $ \_ tx -> do
+        Tx.runIn tx (Tx.sql "CREATE TEMP TABLE reply_parent (id int PRIMARY KEY)")
+        Tx.runIn tx (Tx.sql "CREATE TEMP TABLE reply_child (id int REFERENCES reply_parent(id) DEFERRABLE INITIALLY DEFERRED)")
+        Tx.runIn tx (Tx.sql "INSERT INTO reply_child VALUES (1)")
+        field <- Tx.runIn tx (firstField =<< Tx.finalPipeline (Tx.statement () (numbersOf 3000)))
+        delivered <- pullAll (Tx.fieldSource field)
+        delivered `shouldBe` numbers 3000
+        awaitEnding tx
+      case outcome of
+        Left (Tx.QueryError "COMMIT" (Tx.ServerFailed (PG.ServerError fields))) -> PG.diagnosticCode fields `shouldBe` "23503"
+        _ -> failTest "expected the deferred foreign-key failure from COMMIT"
+      -- The failure was seen, and the connection is fine
+      lastNames env 1 `shouldReturn` ["ready: succeeded"]
+      opened env `shouldReturn` 1
+
   describe "use after the scope" $ do
     it "rejects a transaction run from another thread" $ withEnv port 1 $ \env -> do
       inRequest env Tx.Read $ \_ tx -> do
@@ -251,6 +280,16 @@ pullAll source = go []
       Nothing -> pure (BS.concat (reverse chunks))
       Just chunk -> evaluate (BS.copy chunk) >>= \copied -> go (copied : chunks)
 
+-- | Asks for the ending's reply, and waits for what it is blocked on until it
+-- has it, but not for ever: a reply that is not given, or a watch that fires
+-- without one, fails the test instead of keeping it waiting.
+awaitEnding :: Tx.Tx s -> IO (Either Tx.QueryError ())
+awaitEnding tx = timeout 5_000_000 loop >>= maybe (failTest "the ending's reply was not given in time") pure
+  where
+    loop = Tx.endingReady tx >>= \case
+      Just outcome -> pure outcome
+      Nothing -> awaitWatch (Tx.endingWatch tx) *> loop
+
 -- | The numbers from 1 to this one, separated by commas: a field of that size.
 numbers :: Int -> BS.ByteString
 numbers n = BC.intercalate "," (map (BC.pack . show) [1 .. n])
@@ -320,6 +359,9 @@ divisionByZero = Tx.Statement "SELECT 1 / 0" (const []) (Tx.singleRow (Tx.row @'
 
 sleeping :: Tx.Statement () (Const Int64)
 sleeping = Tx.Statement "SELECT 1 FROM pg_sleep(30)" (const []) (Tx.singleRow (Tx.row @'[Int64] Const))
+
+isRight' :: Either a b -> Bool
+isRight' = either (const False) (const True)
 
 isLeft' :: Either a b -> Bool
 isLeft' = either (const True) (const False)
