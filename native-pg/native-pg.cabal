@@ -122,6 +122,8 @@ test-suite native-pg-spec
                       FramingSpec
                       BatchedReadsSpec
                       StreamingResourcesSpec
+                      FeedSupport
+                      FieldSourceSpec
                       FieldStreamSpec
                       TransactionSpec
                       OutputBufferSpec

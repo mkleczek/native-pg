@@ -8,7 +8,7 @@
 -- | Synchronous cursors that keep a transaction open until explicitly finished.
 module Database.PostgreSQL.Transaction
   ( Transaction, Pipeline, Result, Preparation, Field, Statement (..), RowDecoder,
-    Tx, transactionIn, runIn,
+    Tx, transactionIn, runIn, FieldSource, fieldSource,
     runTransaction, statement, prepare, awaitPreparation, executePrepared, pipeline, finalPipeline,
     nextRow, discard, fieldLength, nextChunk, finishTransaction, condemn, sql,
     row, streamingRow, singleRow, rowMaybe, noResult,
@@ -45,7 +45,9 @@ import Database.PostgreSQL.Session (Session)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Types (FormatCode (..), TransactionStatus (..))
 import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
-import Network.Streaming.Source (Source (..))
+import Network.Streaming.Source (Pulled (Pulled), Source (..))
+import qualified Network.Streaming.Source as Source
+import Network.Streaming.Watch (readyNow)
 
 -- | Work run synchronously on the thread that entered the transaction scope.
 -- 'withRunInIO' supports synchronous IO callbacks. Database operations reject
@@ -219,6 +221,15 @@ fieldUnread :: Runtime -> IO Bool
 fieldUnread runtime = readIORef (runtimePending runtime) >>= \case
   first : _ -> readIORef (pendingRow first) >>= maybe (pure False) Row.rowValueUnread
   [] -> pure False
+
+newtype FieldSource (s :: Type) = FieldSource (Field s)
+
+fieldSource :: Field s -> FieldSource s
+fieldSource = FieldSource
+
+instance Source (FieldSource s) where
+  pullReady _ = pure Source.Pending
+  watchSource _ = pure readyNow
 
 newRuntime :: IsolationLevel -> Mode -> Session -> IO Runtime
 newRuntime isolation mode session =

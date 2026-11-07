@@ -10,7 +10,7 @@ module ScopeTransactionSpec (spec) where
 import AcquisitionTestSupport (getAcquisition)
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (ErrorCall (..), SomeException, finally, throwIO, try)
+import Control.Exception (ErrorCall (..), SomeException, evaluate, finally, throwIO, try)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
@@ -34,6 +34,7 @@ import Network.Socket (PortNumber)
 import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Source (Source, pull)
 import Network.Streaming.Scope (withScope)
 import Skeletest hiding (context)
 import System.Timeout (timeout)
@@ -151,6 +152,23 @@ spec port = describe "operations and transactions in a scope" $ do
       timeout 5_000_000 (takeMVar finished) >>= \outcome -> fmap (either (const "interrupted") (const "returned")) outcome `shouldBe` Just "interrupted"
       brokenAfter env
 
+  describe "a field as a pull source" $ do
+    xfail "fieldSource: it is not implemented yet" $ it "pulls a field larger than the buffers to its end, exactly" $ withEnv port 1 $ \env -> do
+      collected <- inRequest env Tx.Read $ \_ tx -> do
+        field <- Tx.runIn tx (firstField =<< Tx.pipeline (Tx.statement () (numbersOf 20000)))
+        pullAll (Tx.fieldSource field)
+      collected `shouldBe` numbers 20000
+      lastNames env 1 `shouldReturn` ["ready: succeeded"]
+      opened env `shouldReturn` 1
+
+    xfail "fieldSource: it is not implemented yet" $ it "gives up the connection of a request that stopped pulling in the middle" $ withEnv port 1 $ \env -> do
+      result <- try @ErrorCall $ inRequest env Tx.Read $ \_ tx -> do
+        field <- Tx.runIn tx (firstField =<< Tx.pipeline (Tx.statement () (numbersOf 20000)))
+        _ <- pull (Tx.fieldSource field)
+        throwIO (ErrorCall "the client went away") :: IO ()
+      result `shouldBe` Left (ErrorCall "the client went away")
+      brokenAfter env
+
   describe "use after the scope" $ do
     it "rejects a transaction run from another thread" $ withEnv port 1 $ \env -> do
       inRequest env Tx.Read $ \_ tx -> do
@@ -224,6 +242,22 @@ inRequest env mode body =
     session <- Streaming.operationIn scope access (Pool.checkoutConnection checkout)
     tx <- Tx.transactionIn scope Tx.ReadCommitted mode session
     body checkout tx
+
+-- | Pulls the source to its end, with the blocking pull, copying each chunk.
+pullAll :: Source source => source -> IO BS.ByteString
+pullAll source = go []
+  where
+    go chunks = pull source >>= \case
+      Nothing -> pure (BS.concat (reverse chunks))
+      Just chunk -> evaluate (BS.copy chunk) >>= \copied -> go (copied : chunks)
+
+-- | The numbers from 1 to this one, separated by commas: a field of that size.
+numbers :: Int -> BS.ByteString
+numbers n = BC.intercalate "," (map (BC.pack . show) [1 .. n])
+
+numbersOf :: Int -> Tx.Statement () Body
+numbersOf n = Tx.Statement ("SELECT string_agg(n::text, ',') FROM generate_series(1, " <> BC.pack (show n) <> ") n") (const [])
+  (Tx.singleRow (Tx.streamingRow @'[] Body))
 
 -- | The field of the first row.
 firstField :: Tx.Result tx Body -> Tx.Transaction tx (Tx.Field tx)
