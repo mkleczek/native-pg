@@ -8,6 +8,10 @@ module Database.PostgreSQL.Internal.Context
     contextConnection,
     contextInput,
     runContextInput,
+    runContextBorrowReady,
+    contextBuffered,
+    contextReceiveMore,
+    contextWatchStall,
     contextOutput,
     sendContextOutput,
     queueContextOutput,
@@ -41,9 +45,14 @@ import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Network.Streaming.BufferPool (BufferAccess)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
-import Foreign.Ptr (castPtr, plusPtr)
+import Foreign.Ptr (Ptr, castPtr, plusPtr)
+import Data.Word (Word8)
+import Network.Streaming.Drive (Polled (..))
+import Network.Streaming.Link (Interest (..))
+import qualified Network.Streaming.Link as Link (Blocked (Done))
+import Network.Streaming.Watch (Watch, anyWatch)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
-import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedInput, emptyInputBuffer, runInputUntil)
+import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), Poll, Receiver (..), Stall (..), Taken, borrowInputReady, pollInput, reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedBytes, unconsumedInput, emptyInputBuffer, runInputUntil, watchInputLoan)
 import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
 import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, outputBufferPerOutput, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
 
@@ -135,6 +144,76 @@ runContextInput context limit parse = do
     `catch` \(InputError reason) -> throwIO (ProtocolError reason)
   writeIORef (contextInput context) input'
   pure result
+
+-- | Takes the next bytes of a value of this many bytes that lies in the input,
+-- as a borrowed chunk, without waiting: as many as a blocking read takes, of
+-- what the input holds and what receives that don't wait bring, or else what
+-- to wait for. Pending output is sent as the link takes it, as a read sends
+-- it.
+runContextBorrowReady :: Context -> Int -> IO Taken
+runContextBorrowReady context count = do
+  ensureContextActive context
+  input <- readIORef (contextInput context)
+  (taken, input') <-
+    borrowInputReady (contextReceiver context) (contextReadSize context) count input
+      `catch` \(InputError reason) -> throwIO (ProtocolError reason)
+  writeIORef (contextInput context) input'
+  pure taken
+
+-- | The bytes that the input holds and nothing has consumed.
+contextBuffered :: Context -> IO ByteString
+contextBuffered context = unconsumedBytes <$> readIORef (contextInput context)
+
+-- | Receives once into the input, without waiting and without consuming
+-- anything, as 'runContextBorrowReady' does.
+contextReceiveMore :: Context -> IO Poll
+contextReceiveMore context = do
+  ensureContextActive context
+  input <- readIORef (contextInput context)
+  (polled, input') <-
+    pollInput (contextReceiver context) (contextReadSize context) input
+      `catch` \(InputError reason) -> throwIO (ProtocolError reason)
+  writeIORef (contextInput context) input'
+  pure polled
+
+-- | What reads that don't wait ask of the link: its receive, after the
+-- connection's carried-over bytes, and the push of unsent output.
+contextReceiver :: Context -> Receiver
+contextReceiver context =
+  Receiver
+    { receiveNow = carriedPoll (connectionCarryOver connection) (channelPoll channel pending),
+      receivePush = channelPush channel pending
+    }
+  where
+    connection = contextConnection context
+    channel = connectionChannel connection
+    pending = contextPending context
+
+-- | One watch for what a read that didn't wait was stalled on, which fires
+-- when it may be retried. For a loan it is the input's registration for one,
+-- and while output is unsent also what the output waits for, so that it keeps
+-- moving. The caller releases it.
+contextWatchStall :: Context -> Stall -> IO Watch
+contextWatchStall context = \case
+  StallOnLink interest -> channelWatch channel interest
+  StallOnLoan Link.Done -> loan
+  StallOnLoan blocked -> anyWatch [loan, channelWatch channel (Interest False blocked)]
+  where
+    channel = connectionChannel (contextConnection context)
+    loan = readIORef (contextInput context) >>= watchInputLoan
+
+-- | Takes the connection's carried-over bytes before the link's, as
+-- 'carriedInput' does.
+carriedPoll :: IORef ByteString -> (Ptr Word8 -> Int -> IO (Polled Int)) -> Ptr Word8 -> Int -> IO (Polled Int)
+carriedPoll carry poll pointer size = do
+  carried <- readIORef carry
+  if BS.null carried
+    then poll pointer size
+    else do
+      let (taken, left) = BS.splitAt size carried
+      BSU.unsafeUseAsCStringLen taken $ \(origin, count) -> copyBytes pointer (castPtr origin) count
+      writeIORef carry left
+      pure (Got (BS.length taken))
 
 -- | Reads the connection's carried-over bytes before the link's. A read takes
 -- no more than it asks for, and leaves the rest for the next one.

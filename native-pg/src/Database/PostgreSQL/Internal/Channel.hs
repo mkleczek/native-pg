@@ -24,7 +24,9 @@ import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol.Codec (InputSource (..), Output)
 import Database.PostgreSQL.Transport.Link
 import Foreign.Ptr (Ptr)
-import Network.Streaming.Drive (Progress (..), drive)
+import Network.Streaming.Drive (Polled, Progress (..), drive, poll)
+import Network.Streaming.Link (watchInterest)
+import Network.Streaming.Watch (Watch)
 import Network.Streaming.Sender
   ( OutputBuffer,
     Unsent,
@@ -58,6 +60,16 @@ data Channel = Channel
     -- | Reads what's ready into the buffer, up to its size, without waiting:
     -- 'Nothing' if nothing is, and 0 at the end of the stream.
     channelReceiveReady :: Ptr Word8 -> Int -> IO (Maybe Int),
+    -- | Reads as 'channelInput' does, but where that waits it gives up, and
+    -- says what it would have waited for. It sends output that is unsent, as
+    -- far as the link takes it, before it gives up.
+    channelPoll :: IORef Unsent -> Ptr Word8 -> Int -> IO (Polled Int),
+    -- | Sends output that is unsent, as far as the link takes it, without
+    -- reading, for a read that has nowhere to read to. It says what the output
+    -- waits for.
+    channelPush :: IORef Unsent -> IO Blocked,
+    -- | One watch for an interest, which fires when any of it may be retried.
+    channelWatch :: Interest -> IO Watch,
     channelClose :: IO ()
   }
 
@@ -71,6 +83,12 @@ newChannel link =
       channelSend = sendOutput link,
       channelSendBuffered = sendOutputWith link . Just,
       channelReceiveReady = receiveReady link,
+      channelPoll = \pending pointer size -> poll (receiveStep link pending pointer size) (),
+      channelPush = \pending -> do
+        (rest, blocked) <- pushOutput link =<< readIORef pending
+        writeIORef pending rest
+        pure blocked,
+      channelWatch = watchInterest link,
       channelClose = closeLink link
     }
 {-# INLINABLE newChannel #-}
@@ -82,25 +100,29 @@ newChannel link =
 linkInputSource :: Link link => link -> IORef Unsent -> Int -> InputSource
 linkInputSource link pending readSize =
   InputSource
-    { readInputInto = \pointer size -> drive link (receive pointer size) (),
+    { readInputInto = \pointer size -> drive link (receiveStep link pending pointer size) (),
       inputReadSize = readSize
     }
-  where
-    receive pointer size () =
-      receiveReady link pointer size >>= \case
-        Just received -> pure (Ready received)
-        Nothing -> do
-          left <- readIORef pending
-          (rest, blocked) <- pushOutput link left
-          writeIORef pending rest
-          pure $ case blocked of
-            -- The server may have answered while the rest was sent, so input
-            -- is read before waiting for it.
-            Done | not (unsentEmpty left) -> Again ()
-            -- Input is tried first after the wait, so that an answer is read
-            -- before more is sent.
-            _ -> Blocked () (Interest True blocked)
 {-# INLINABLE linkInputSource #-}
+
+-- | One try to read: what the link has, or else what's left of the output sent
+-- as the link takes it, and what to wait for.
+receiveStep :: Link link => link -> IORef Unsent -> Ptr Word8 -> Int -> () -> IO (Progress () Int)
+receiveStep link pending pointer size () =
+  receiveReady link pointer size >>= \case
+    Just received -> pure (Ready received)
+    Nothing -> do
+      left <- readIORef pending
+      (rest, blocked) <- pushOutput link left
+      writeIORef pending rest
+      pure $ case blocked of
+        -- The server may have answered while the rest was sent, so input
+        -- is read before waiting for it.
+        Done | not (unsentEmpty left) -> Again ()
+        -- Input is tried first after the wait, so that an answer is read
+        -- before more is sent.
+        _ -> Blocked () (Interest True blocked)
+{-# INLINE receiveStep #-}
 
 -- | Sends the output, waiting for the link to become writable as needed.
 sendOutput :: Link link => link -> Output -> IO ()

@@ -38,16 +38,17 @@ import Database.PostgreSQL.Internal.Context
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Internal.Execution (Execution (..))
 import qualified Database.PostgreSQL.Internal.Execution as Execution
-import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), Stall (..))
 import Database.PostgreSQL.Internal.Row (DecodeRow (..))
 import qualified Database.PostgreSQL.Internal.Row as Row
 import Database.PostgreSQL.Session (Session)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Types (FormatCode (..), TransactionStatus (..))
 import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
-import Network.Streaming.Source (Pulled (Pulled), Source (..))
+import Network.Streaming.Link (Interest (..))
+import qualified Network.Streaming.Link as Link (Blocked (Done))
+import Network.Streaming.Source (Pulled (Ended, Pulled), Source (..))
 import qualified Network.Streaming.Source as Source
-import Network.Streaming.Watch (readyNow)
 
 -- | Work run synchronously on the thread that entered the transaction scope.
 -- 'withRunInIO' supports synchronous IO callbacks. Database operations reject
@@ -75,7 +76,7 @@ data Result tx (row :: Type -> Type) = Result Runtime Pending (RowDecoder row)
 data Preparation (tx :: Type) = Preparation Runtime Pending
 -- | A trailing field borrowed from the current row. Advancing its row,
 -- sending another pipeline or finishing the transaction expires the field.
-data Field (tx :: Type) = Field Runtime ByteStream
+data Field (tx :: Type) = Field Runtime ByteStream (IO Row.ColumnPull)
 
 data Cardinality = AnyRows | ExactlyOne | AtMostOne
 
@@ -134,7 +135,10 @@ data Runtime = Runtime
     runtimeSync :: IORef Bool,
     runtimeStatus :: IORef TransactionStatus,
     runtimeFailure :: IORef (Maybe SomeException),
-    runtimeBroken :: IORef Bool
+    runtimeBroken :: IORef Bool,
+    -- | What the last pull or read that didn't wait was stalled on, which
+    -- the next watch is for.
+    runtimeStalled :: IORef Stall
   }
 
 -- | Holds exclusive session ownership while the transaction action runs on
@@ -222,20 +226,46 @@ fieldUnread runtime = readIORef (runtimePending runtime) >>= \case
   first : _ -> readIORef (pendingRow first) >>= maybe (pure False) Row.rowValueUnread
   [] -> pure False
 
+-- | A field as a pull source: each pull takes the next chunk of the field, from
+-- what the input holds and the receives that don't wait, or is pending, and the
+-- field's end is 'Ended'. A chunk is as large as the one 'nextChunk' gives: a
+-- pull gives it once the input holds that many bytes, receiving again without
+-- waiting for as long as bytes arrive, and is pending when fewer have arrived,
+-- keeping the bytes it has. A pull never waits, neither for the server nor for
+-- a buffer: it sends what the link takes of unsent output, and says what it
+-- is stalled on. A chunk is borrowed until the next pull, as 'nextChunk''s is,
+-- and a pull may move the input's bytes. The watch of a pending pull fires when
+-- the server has sent something, or, if the pull found no buffer to receive
+-- into, when one is granted, and, while output is unsent, when the link is
+-- writable or the source of an upload is ready.
+--
+-- The rules are those of 'nextChunk': the thread that began the transaction
+-- pulls, while its scope is live, and a field expires when its row advances.
+-- Reading something else of the transaction ends the field's turn, as it does
+-- for 'nextChunk'.
 newtype FieldSource (s :: Type) = FieldSource (Field s)
 
 fieldSource :: Field s -> FieldSource s
 fieldSource = FieldSource
 
 instance Source (FieldSource s) where
-  pullReady _ = pure Source.Pending
-  watchSource _ = pure readyNow
+  pullReady (FieldSource (Field runtime _ ready)) = runOperation runtime $ do
+    throwFailure runtime
+    ready >>= \case
+      Row.ColumnChunk chunk -> pure (Pulled chunk)
+      Row.ColumnEnd -> pure Ended
+      Row.ColumnStalled stall -> Source.Pending <$ writeIORef (runtimeStalled runtime) stall
+  watchSource (FieldSource (Field runtime _ _)) = do
+    checkOwner runtime
+    stall <- readIORef (runtimeStalled runtime)
+    contextWatchStall (contextOf runtime) stall
 
 newRuntime :: IsolationLevel -> Mode -> Session -> IO Runtime
 newRuntime isolation mode session =
   Runtime session <$> myThreadId <*> newIORef True <*> newIORef False
     <*> newIORef (Just (beginning isolation mode)) <*> newIORef True <*> newIORef False
     <*> newIORef False <*> newIORef [] <*> newIORef False <*> newIORef TxIdle <*> newIORef Nothing <*> newIORef False
+    <*> newIORef (StallOnLink (Interest True Link.Done))
 
 -- | Drains and rolls back a transaction that was not finished, unless it is
 -- broken.
@@ -688,14 +718,14 @@ unexpectedRows (Result owner pending _) count = operation $ \runtime -> do
 
 -- | The field's declared byte length, independent of how much was consumed.
 fieldLength :: Field tx -> Int
-fieldLength (Field _ stream) = byteStreamLength stream
+fieldLength (Field _ stream _) = byteStreamLength stream
 
 -- | Pulls one borrowed chunk, or an empty chunk at field EOF. Its bytes are
 -- valid until the next input operation (including nextChunk, nextRow,
 -- pipeline or finishTransaction) or the enclosing scope ends. Copy before
 -- retaining them across such an operation. EOF does not imply success.
 nextChunk :: Field tx -> Transaction tx ByteString
-nextChunk (Field owner stream) = operation $ \runtime -> do
+nextChunk (Field owner stream _) = operation $ \runtime -> do
   sameScope owner runtime
   throwFailure runtime
   byteStreamNext stream
@@ -714,7 +744,7 @@ streamingRow :: forall columns row. DecodeRow columns => (forall tx. RowFunction
 streamingRow construct = RowDecoder AnyRows decode
   where
     decode :: forall tx. Runtime -> Row.Row -> IO (Either DecodingError (row tx))
-    decode runtime current = Row.decodeRowStreamingUsing @columns @(Field tx) @(row tx) (fmap (Field runtime) . Row.columnBorrowedStream) current
+    decode runtime current = Row.decodeRowStreamingUsing @columns @(Field tx) @(row tx) (fmap (\(stream, ready) -> Field runtime stream ready) . Row.columnBorrowedStream) current
       (mapRowFunction @columns @(Maybe (Field tx) -> row tx) @(Maybe (Field tx) -> IO (row tx)) (fmap pure) (construct @tx))
 
 {-# INLINE streamingRow #-}

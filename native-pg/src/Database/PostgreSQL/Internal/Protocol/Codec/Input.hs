@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnboxedTuples #-}
 
@@ -26,6 +27,14 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     readInputWord8,
     readInputWord16,
     readInputWord32,
+    Poll (..),
+    Receiver (..),
+    Stall (..),
+    Taken (..),
+    borrowInputReady,
+    pollInput,
+    watchInputLoan,
+    unconsumedBytes,
     runBodyParser,
     runInput,
     runInputUntil,
@@ -41,10 +50,13 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Word (Word8, Word16, Word32)
-import Data.IORef (IORef, newIORef, writeIORef, atomicModifyIORef')
-import Network.Streaming.BufferPool (BufferAccess, BufferLoan, borrowBuffer, loanBuffer, releaseBuffer)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+import Network.Streaming.BufferPool (BufferAccess, BufferLoan, borrowBuffer, loanBuffer, releaseBuffer, tryBorrowBuffer, watchBorrow)
 import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Buffer (Buffer, newBuffer)
+import Network.Streaming.Drive (Polled (..))
+import Network.Streaming.Link (Blocked, Interest)
+import Network.Streaming.Watch (Watch (..), readyNow)
 import qualified Network.Streaming.Buffer as Buffer
 import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, moveBytes)
@@ -52,6 +64,7 @@ import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peekByteOff)
 import GHC.Exts (RealWorld, State#)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
+import GHC.Conc (atomically, orElse)
 import GHC.IO (IO (..), unIO, unsafeDupablePerformIO)
 
 class MonadError String m => MonadInput m where
@@ -94,20 +107,52 @@ data InputBuffer = InputBuffer
 data HomeBuffer = HomeBuffer !(ForeignPtr Word8) !Int
 
 -- The mutable loan slot also lets exception cleanup find a loan acquired by
--- a parser that did not return its cursor.
-data RequestBuffer = RequestBuffer BufferAccess (IORef (Maybe BufferLoan))
+-- a parser that did not return its cursor. The input's wait for a loan is
+-- kept with it, since it outlasts the reads that find no loan.
+data RequestBuffer = RequestBuffer BufferAccess (IORef (Maybe BufferLoan)) (IORef LoanWait)
+
+-- | What a read that didn't wait found when it had no loan to receive into.
+data LoanWait
+  = -- | Nothing: no read found none, or the input has taken one since.
+    NotWaiting
+  | -- | A read found none free, and nothing is registered for one yet.
+    NoLoan
+  | -- | The registration for a loan. It holds the loan from when it's granted
+    -- until the next read takes it, however often a watch that was handed out
+    -- is released, so the input keeps its place in the queue.
+    Registered !Watch
 
 requestInputBuffer :: BufferAccess -> IO InputBuffer
 requestInputBuffer access = do
   loan <- newIORef Nothing
-  pure emptyInputBuffer {bufferReusable = True, bufferRequest = Just (RequestBuffer access loan)}
+  waiting <- newIORef NotWaiting
+  pure emptyInputBuffer {bufferReusable = True, bufferRequest = Just (RequestBuffer access loan waiting)}
 
+-- | Gives back the loan, and withdraws the registration for one, if there is
+-- any, which gives back the loan it holds.
 releaseInputBuffer :: InputBuffer -> IO ()
 releaseInputBuffer buffer = case bufferRequest buffer of
   Nothing -> pure ()
-  Just (RequestBuffer _ slot) -> mask_ $ do
-    loan <- atomicModifyIORef' slot (Nothing,)
-    mapM_ releaseBuffer loan
+  Just request@(RequestBuffer _ _ waiting) -> mask_ $ do
+    returnLoan request
+    withdrawRegistration waiting
+
+returnLoan :: RequestBuffer -> IO ()
+returnLoan (RequestBuffer _ slot _) = do
+  loan <- atomicModifyIORef' slot (Nothing,)
+  mapM_ releaseBuffer loan
+
+-- | Looks before it swaps: an input that no read left waiting, which is the
+-- usual one when a refill takes a loan, has nothing to withdraw, and the swap
+-- allocates.
+withdrawRegistration :: IORef LoanWait -> IO ()
+withdrawRegistration waiting =
+  readIORef waiting >>= \case
+    NotWaiting -> pure ()
+    _ ->
+      atomicModifyIORef' waiting (NotWaiting,) >>= \case
+        Registered registered -> watchCancel registered
+        _ -> pure ()
 
 -- | A copy of the bytes read but not consumed yet, which outlives the buffer's
 -- storage. Without such bytes it allocates nothing.
@@ -118,18 +163,67 @@ unconsumedInput buffer
 
 retireConsumed :: InputBuffer -> IO InputBuffer
 retireConsumed buffer
-  | bufferStart buffer == bufferEnd buffer, Just _ <- bufferRequest buffer = do
-      releaseInputBuffer buffer
+  | bufferStart buffer == bufferEnd buffer, Just request <- bufferRequest buffer = do
+      mask_ (returnLoan request)
       pure emptyInputBuffer {bufferReusable = True, bufferPosition = bufferPosition buffer, bufferRequest = bufferRequest buffer}
   | otherwise = pure buffer
 
+-- | Takes a loan for a buffer that has none, waiting for one as long as it
+-- takes. A registration for one that a read left behind is withdrawn first,
+-- since a wait can't overlap it.
 acquireInputBuffer :: InputBuffer -> IO InputBuffer
 acquireInputBuffer buffer = case bufferRequest buffer of
-  Just (RequestBuffer access slot) | bufferCapacity buffer == 0 -> mask_ $ do
+  Just (RequestBuffer access slot waiting) | bufferCapacity buffer == 0 -> mask_ $ do
+    withdrawRegistration waiting
     loan <- borrowBuffer access
     writeIORef slot (Just loan) `onException` releaseBuffer loan
-    pure (reusableInputBuffer (loanBuffer loan)) {bufferPosition = bufferPosition buffer, bufferRequest = bufferRequest buffer}
+    pure (loaned buffer loan)
   _ -> pure buffer
+
+-- | Takes a loan for a buffer that has none, if one is available now, and
+-- otherwise gives 'Nothing'. It never waits. A registration for a loan that a
+-- read left behind is claimed once it has been granted; until then no try is
+-- made, since the registration holds the place of the second loan.
+tryAcquireInputBuffer :: InputBuffer -> IO (Maybe InputBuffer)
+tryAcquireInputBuffer buffer = case bufferRequest buffer of
+  Just (RequestBuffer access slot waiting) | bufferCapacity buffer == 0 -> mask_ $ do
+    state <- readIORef waiting
+    granted <- case state of
+      Registered registered -> atomically ((True <$ watchReady registered) `orElse` pure False)
+      _ -> pure True
+    if not granted
+      then pure Nothing
+      else
+        tryBorrowBuffer access >>= \case
+          Nothing -> Nothing <$ writeIORef waiting NoLoan
+          Just loan -> do
+            writeIORef slot (Just loan) `onException` releaseBuffer loan
+            writeIORef waiting NotWaiting
+            pure (Just (loaned buffer loan))
+  _ -> pure (Just buffer)
+
+loaned :: InputBuffer -> BufferLoan -> InputBuffer
+loaned buffer loan = (reusableInputBuffer (loanBuffer loan)) {bufferPosition = bufferPosition buffer, bufferRequest = bufferRequest buffer}
+
+-- | A watch that fires when a read that found no loan may find one: the
+-- registration for it, which the input keeps. Its release does nothing, so
+-- that a wait that releases it after it fires doesn't give the loan back and
+-- lose its place; the next read takes the loan, and the input's release
+-- withdraws the registration. A read that had a loan, or hasn't found none,
+-- has nothing to wait for, so the watch fires at once.
+watchInputLoan :: InputBuffer -> IO Watch
+watchInputLoan buffer = case bufferRequest buffer of
+  Just (RequestBuffer access _ waiting) -> mask_ $
+    readIORef waiting >>= \case
+      NotWaiting -> pure readyNow
+      NoLoan -> do
+        registered <- watchBorrow access
+        writeIORef waiting (Registered registered)
+        pure (keeps registered)
+      Registered registered -> pure (keeps registered)
+  Nothing -> pure readyNow
+  where
+    keeps registered = registered {watchCancel = pure ()}
 
 emptyInputBuffer :: InputBuffer
 emptyInputBuffer = case BS.empty of
@@ -138,6 +232,124 @@ emptyInputBuffer = case BS.empty of
 -- | Empty input backed by storage lent by the caller.
 reusableInputBuffer :: Buffer -> InputBuffer
 reusableInputBuffer storage = InputBuffer (Buffer.bufferMemory storage) (Buffer.bufferCapacity storage) 0 0 0 True Nothing Nothing
+
+-- | The bytes that were read from the source and aren't consumed yet, without
+-- copying them. They are valid until the next read.
+unconsumedBytes :: InputBuffer -> ByteString
+unconsumedBytes buffer = slice (bufferEnd buffer - bufferStart buffer) buffer
+
+-- | What a read that doesn't wait is stalled on.
+data Stall
+  = -- | The link has nothing: wait for the interest, and try again.
+    StallOnLink !Interest
+  | -- | No loan was free to receive into. Output that is still unsent is what
+    -- the read waits for as well, so that it keeps moving.
+    StallOnLoan !Blocked
+
+-- | What a read that doesn't wait found.
+data Poll
+  = -- | Bytes arrived, and are in the buffer after the ones that were there.
+    Arrived
+  | -- | Nothing arrived: wait for what it is stalled on, and try again.
+    NotArrived !Stall
+  | -- | The buffer is full of bytes that are not consumed, so nothing can be
+    -- received into it.
+    NoRoom
+
+-- | What a read that doesn't wait asks of the connection's link.
+data Receiver = Receiver
+  { -- | Receives into the address, up to the size, without waiting: how many
+    -- bytes, or what the link is stalled on.
+    receiveNow :: Ptr Word8 -> Int -> IO (Polled Int),
+    -- | Sends output that is unsent, as far as the link takes it, and gives
+    -- what it still waits for. For a read that has nowhere to receive to.
+    receivePush :: IO Blocked
+  }
+
+-- | The bytes that 'borrowInputReady' took, or what to wait for.
+data Taken
+  = -- | Not empty, and valid until the next read, as 'readInputBorrowedSome''s are.
+    Taken !ByteString
+  | NotReady !Stall
+
+-- | Like 'readInputBorrowedSome' for a value of this many bytes, but it never
+-- waits. It gives the bytes that 'readInputBorrowedSome' gives, once the
+-- buffer holds that many: it receives, without waiting, for as long as bytes
+-- arrive, and if it has fewer when none do, it says what to wait for, and
+-- keeps what it has received for the next try. So its chunks are as large as
+-- the blocking read's, and not as small as what one receive brings. The count
+-- has to be the bytes that remain of a value that lies within the input. The
+-- read size is the size of a new buffer, as 'inputReadSize' is.
+borrowInputReady :: Receiver -> Int -> Int -> InputBuffer -> IO (Taken, InputBuffer)
+borrowInputReady receiver readSize count previous = restoreWorkspace previous >>= retireConsumed >>= go
+  where
+    go buffer
+      | buffered > 0 && buffered >= size = pure (Taken (slice size buffer), consume size buffer)
+      | otherwise =
+          pollInput receiver readSize buffer >>= \case
+            (Arrived, filled) -> go filled
+            (NotArrived stalled, kept) -> pure (NotReady stalled, kept)
+            (NoRoom, _) -> throwIO (InputError "an empty buffer has no room")
+      where
+        buffered = bufferEnd buffer - bufferStart buffer
+        -- as 'someInput' takes it: the count, or what the buffer has room for
+        size = min count (bufferCapacity buffer - bufferStart buffer)
+
+-- | Receives once, without waiting, into the free part of the buffer, after
+-- it takes a loan if it has none, and makes room if none is free. The
+-- consumed bytes make way for them, in a reusable buffer by moving the
+-- unconsumed ones to its start, which ends the validity of slices that were
+-- borrowed before; an allocating buffer is replaced by a larger one instead.
+-- Without a loan to take, nothing is received, and it is 'StallOnLoan'
+-- instead, after unsent output was sent as far as the link takes it.
+pollInput :: Receiver -> Int -> InputBuffer -> IO (Poll, InputBuffer)
+pollInput receiver readSize previous = do
+  retired <- retireConsumed =<< restoreWorkspace previous
+  tryAcquireInputBuffer retired >>= \case
+    Nothing -> do
+      blocked <- receivePush receiver
+      pure (NotArrived (StallOnLoan blocked), retired)
+    Just buffer ->
+      makeRoom readSize buffer >>= \case
+        Nothing -> pure (NoRoom, buffer)
+        Just roomy -> do
+          polled <-
+            withForeignPtr (bufferMemory roomy) $ \pointer ->
+              receiveNow receiver (pointer `plusPtr` bufferEnd roomy) (bufferCapacity roomy - bufferEnd roomy)
+          case polled of
+            Stalled interest -> pure (NotArrived (StallOnLink interest), roomy)
+            Got received
+              | received <= 0 -> throwIO (InputError "unexpected end of input")
+              | otherwise -> pure (Arrived, roomy {bufferEnd = bufferEnd roomy + received})
+
+makeRoom :: Int -> InputBuffer -> IO (Maybe InputBuffer)
+makeRoom readSize buffer
+  | bufferEnd buffer < bufferCapacity buffer = pure (Just buffer)
+  | bufferReusable buffer =
+      if bufferStart buffer == 0
+        then pure Nothing
+        else do
+          withForeignPtr (bufferMemory buffer) $ \pointer ->
+            moveBytes pointer (pointer `plusPtr` bufferStart buffer) unconsumed
+          pure (Just buffer {bufferStart = 0, bufferEnd = unconsumed})
+  | otherwise = do
+      let capacity = max readSize (2 * bufferCapacity buffer)
+      storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
+      let memory = Buffer.bufferMemory storage
+      unsafeWithForeignPtr memory $ \target ->
+        unsafeWithForeignPtr (bufferMemory buffer) $ \origin ->
+          copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
+      pure (Just (InputBuffer memory capacity 0 unconsumed (bufferPosition buffer) False Nothing Nothing))
+  where
+    unconsumed = bufferEnd buffer - bufferStart buffer
+
+restoreWorkspace :: InputBuffer -> IO InputBuffer
+restoreWorkspace buffer = case bufferHome buffer of
+  Nothing -> pure buffer
+  Just (HomeBuffer _ capacity) -> do
+    when (bufferEnd buffer - bufferStart buffer > capacity) $
+      throwIO (InputError "borrowed input cannot expose unconsumed protocol lookahead")
+    restoreHome buffer
 
 -- | Borrows one chunk until the callback returns, then consumes it.
 -- The callback must not retain the bytes or read this input recursively.

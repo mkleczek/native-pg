@@ -135,7 +135,7 @@ starvedWith queued taker link context body use = do
 
 spec :: Spec
 spec = describe "a field as a pull source" $ do
-  xfail "fieldSource: it is not implemented yet" $ it "gives the bytes that the input holds without receiving, and ends at the field's end" $
+  it "gives the bytes that the input holds without receiving, and ends at the field's end" $
     withFeed 4096 $ \link context -> do
       let body = bodyOf 300
       feed link (answer [body])
@@ -147,7 +147,7 @@ spec = describe "a field as a pull source" $ do
         -- Everything came from the one receive that read the row
         emptyReceives link `shouldReturn` emptyBefore
 
-  xfail "fieldSource: it is not implemented yet" $ it "is pending when it holds less than a blocking read gives and nothing can be received" $
+  it "is pending when it holds less than a blocking read gives and nothing can be received" $
     withFeed 64 $ \link context -> do
       let body = bodyOf 300
           response = answer [body]
@@ -164,7 +164,7 @@ spec = describe "a field as a pull source" $ do
         ended `shouldBe` True
         BS.concat (first <> rest) `shouldBe` body
 
-  xfail "fieldSource: it is not implemented yet" $ it "is never pending while the link has the bytes, though the buffer is smaller than the field" $
+  it "is never pending while the link has the bytes, though the buffer is smaller than the field" $
     withFeed 64 $ \link context -> do
       let body = bodyOf 5000
       feed link (answer [body])
@@ -180,7 +180,7 @@ spec = describe "a field as a pull source" $ do
         go [] `shouldReturn` body
         readIORef pendings `shouldReturn` 0
 
-  xfail "fieldSource: it is not implemented yet" $ it "pulls a field larger than the buffer to its end, exactly, as the bytes arrive" $
+  it "pulls a field larger than the buffer to its end, exactly, as the bytes arrive" $
     withFeed 1024 $ \link context -> do
       let body = bodyOf 100000
           response = answer [body]
@@ -192,7 +192,7 @@ spec = describe "a field as a pull source" $ do
               Nothing -> pure (BS.concat (reverse chunks))
         timeout 5_000_000 (go []) `shouldReturn` Just body
 
-  xfail "fieldSource: it is not implemented yet" $ it "gives a chunk that lasts until the next pull" $
+  it "gives a chunk that lasts until the next pull" $
     withFeed 128 $ \link context -> do
       let body = bodyOf 1000
       feed link (answer [body])
@@ -207,7 +207,7 @@ spec = describe "a field as a pull source" $ do
               _ -> failTest "the second pull gave no chunk"
           _ -> failTest "the first pull gave no chunk"
 
-  xfail "fieldSource: it is not implemented yet" $ it "fires the watch of a pending pull when the server sends, and releases it" $
+  it "fires the watch of a pending pull when the server sends, and releases it" $
     withFeed 64 $ \link context -> do
       let response = answer [bodyOf 300]
           (early, late) = BS.splitAt (BS.length response - 100) response
@@ -221,7 +221,7 @@ spec = describe "a field as a pull source" $ do
         timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
         watchCancel watch
 
-  xfail "fieldSource: it is not implemented yet" $ it "expires when its row advances" $
+  it "expires when its row advances" $
     withFeed 4096 $ \link context -> do
       feed link (answer [bodyOf 100, bodyOf 50])
       outcome <- Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
@@ -238,7 +238,7 @@ spec = describe "a field as a pull source" $ do
         Left other -> failTest ("unexpected failure: " <> show other)
         Right _ -> failTest "a field of a row that advanced was pulled"
 
-  xfail "fieldSource: it is not implemented yet" $ it "rejects a pull and a watch from another thread" $
+  it "rejects a pull and a watch from another thread" $
     withFeed 4096 $ \link context -> do
       feed link (answer [bodyOf 100])
       withField context $ \field -> liftIO $ do
@@ -255,7 +255,7 @@ spec = describe "a field as a pull source" $ do
           other -> failTest ("another thread watched: " <> show (either show (const "ok") other))
 
   describe "chunks" $ do
-    xfail "fieldSource: it is not implemented yet" $ it "are as large as a blocking read's, though the link delivers 8 KiB with each receive" $ do
+    it "are as large as a blocking read's, though the link delivers 8 KiB with each receive" $ do
       let body = bodyOf 60000
       pulled <- withFeed 16384 $ \link context -> do
         setReceiveLimit link 8192
@@ -269,7 +269,7 @@ spec = describe "a field as a pull source" $ do
       pulled `shouldBe` [16384 - fieldStart body, 16384, 16384, 60000 - 16384 * 3 + fieldStart body]
       pulled `shouldBe` blocking
 
-    xfail "fieldSource: it is not implemented yet" $ it "are not given before the input holds as much as a blocking read would give, and the bytes are kept" $
+    it "are not given before the input holds as much as a blocking read would give, and the bytes are kept" $
       withFeed 16384 $ \link context -> do
         setReceiveLimit link 8192
         let body = bodyOf 60000
@@ -287,7 +287,7 @@ spec = describe "a field as a pull source" $ do
           -- what the transaction's end drains
           feed link (BS.drop 8192 late)
 
-    xfail "fieldSource: it is not implemented yet" $ it "end with the field's tail, when all of it has arrived, and not before" $
+    it "end with the field's tail, when all of it has arrived, and not before" $
       withFeed 16384 $ \link context -> do
         setReceiveLimit link 8192
         let body = bodyOf 20000
@@ -305,7 +305,7 @@ spec = describe "a field as a pull source" $ do
           step source `shouldReturn` Over
 
   describe "without a buffer to receive into" $ do
-    xfail "fieldSource: it is not implemented yet" $ it "is pending without waiting, and its watch fires when a buffer is returned" $
+    it "is pending without waiting, and its watch fires when a buffer is returned" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
         withRequestFeed reader $ \link context -> do
@@ -320,7 +320,7 @@ spec = describe "a field as a pull source" $ do
             timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
             watchCancel watch
 
-    xfail "fieldSource: it is not implemented yet" $ it "keeps its place in the queue and its buffer when a wait releases the watch after it fired" $
+    it "keeps its place in the queue and its buffer when a wait releases the watch after it fired" $
       withScarceRequests $ \reader taker rival -> do
         _ <- borrowBuffer reader
         withRequestFeed reader $ \link context -> do
@@ -338,7 +338,7 @@ spec = describe "a field as a pull source" $ do
             timeout 50_000 (atomically (watchReady rivalRegistration)) `shouldReturn` Nothing
             step source `shouldReturn` Chunk (BS.take scarceSize (BS.drop (scarceSize - fieldStart body) body))
 
-    xfail "fieldSource: it is not implemented yet" $ it "withdraws its registration for a buffer when its scope ends" $
+    it "withdraws its registration for a buffer when its scope ends" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
         registration <- withRequestFeed reader $ \link context ->
@@ -351,7 +351,7 @@ spec = describe "a field as a pull source" $ do
         watchCancel registration
         isJust <$> tryBorrowBuffer reader `shouldReturn` True
 
-    xfail "fieldSource: it is not implemented yet" $ it "gives back the buffer that was granted to its registration, when its scope ends without a pull taking it" $
+    it "gives back the buffer that was granted to its registration, when its scope ends without a pull taking it" $
       withScarceRequests $ \reader taker rival -> do
         _ <- borrowBuffer reader
         rivalRegistration <- withRequestFeed reader $ \link context ->
@@ -365,7 +365,7 @@ spec = describe "a field as a pull source" $ do
         timeout 2_000_000 (atomically (watchReady rivalRegistration)) `shouldReturn` Just ()
 
   describe "with output that is unsent" $ do
-    xfail "fieldSource: it is not implemented yet" $ it "watches what the output waits for as well while no buffer is free, so that it keeps moving" $ do
+    it "watches what the output waits for as well while no buffer is free, so that it keeps moving" $ do
       flag <- newTVarIO False
       let uploading =
             Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just (ParameterBorrowedStream 4 (UploadSource flag)))]) Tx.noResult
@@ -386,7 +386,7 @@ spec = describe "a field as a pull source" $ do
           Left (SessionUnusable _) -> pure ()
           other -> failTest ("the request ended differently: " <> either show (const "no failure") other)
 
-    xfail "fieldSource: it is not implemented yet" $ it "watches the upload's source as well, so that its readiness is noticed" $ do
+    it "watches the upload's source as well, so that its readiness is noticed" $ do
       ready' <- newTVarIO False
       let upload = UploadSource ready'
           uploading =
@@ -412,7 +412,7 @@ spec = describe "a field as a pull source" $ do
           liftIO (ioError (userError "done"))
       isLeft' result `shouldBe` True
 
-    xfail "fieldSource: it is not implemented yet" $ it "watches for the link to be writable while it takes nothing" $ do
+    it "watches for the link to be writable while it takes nothing" $ do
       flag <- newTVarIO False
       let uploading =
             Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just (ParameterBorrowedStream 4 (UploadSource flag)))]) Tx.noResult

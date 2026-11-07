@@ -153,7 +153,7 @@ spec port = describe "operations and transactions in a scope" $ do
       brokenAfter env
 
   describe "a field as a pull source" $ do
-    xfail "fieldSource: it is not implemented yet" $ it "pulls a field larger than the buffers to its end, exactly" $ withEnv port 1 $ \env -> do
+    it "pulls a field larger than the buffers to its end, exactly" $ withEnv port 1 $ \env -> do
       collected <- inRequest env Tx.Read $ \_ tx -> do
         field <- Tx.runIn tx (firstField =<< Tx.pipeline (Tx.statement () (numbersOf 20000)))
         pullAll (Tx.fieldSource field)
@@ -161,7 +161,7 @@ spec port = describe "operations and transactions in a scope" $ do
       lastNames env 1 `shouldReturn` ["ready: succeeded"]
       opened env `shouldReturn` 1
 
-    xfail "fieldSource: it is not implemented yet" $ it "gives up the connection of a request that stopped pulling in the middle" $ withEnv port 1 $ \env -> do
+    it "gives up the connection of a request that stopped pulling in the middle" $ withEnv port 1 $ \env -> do
       result <- try @ErrorCall $ inRequest env Tx.Read $ \_ tx -> do
         field <- Tx.runIn tx (firstField =<< Tx.pipeline (Tx.statement () (numbersOf 20000)))
         _ <- pull (Tx.fieldSource field)

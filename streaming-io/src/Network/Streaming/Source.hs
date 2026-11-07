@@ -22,8 +22,9 @@ class Source source where
   -- | Takes the next chunk if it's available without waiting. The chunk stays
   -- valid until the next pull from the same source, or the end of the
   -- source's scope, so a consumer that has not finished with it must not pull
-  -- again. A 'Pending' pull reads nothing beyond the source's own free space,
-  -- so it holds no data that a wait would have to account for.
+  -- again. A source that gives chunks of a size may hold bytes it has
+  -- received, in its own space, until it has that many, so a 'Pending' pull
+  -- may hold some, and keeps them for the pull that follows.
   pullReady :: source -> IO Pulled
 
   -- | Registers interest in a pull succeeding after 'pullReady' returned

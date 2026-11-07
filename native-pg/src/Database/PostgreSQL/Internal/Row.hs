@@ -8,7 +8,7 @@
 module Database.PostgreSQL.Internal.Row
   ( Row, Column (..), DecodeRow (..),
     readRows, nextRow, startRow, finishRow, invalidateRow,
-    rowColumnCount, rowValueUnread, nextColumn, columnBytes, columnStream,
+    rowColumnCount, rowValueUnread, nextColumn, columnBytes, columnStream, ColumnPull (..),
     columnStreamWithChunks, columnBorrowedStream, columnChunks, withColumnStream,
     decodeRow, decodeRowStreaming, decodeRowStreamingNullable,
     decodeRowStreamingUsing,
@@ -30,7 +30,7 @@ import Database.PostgreSQL.Diagnostics (ServerError)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange
 import Database.PostgreSQL.Internal.Protocol.Codec
-  ( Alternatives (..), ByteStream (..), Input, Parsable (..),
+  ( Alternatives (..), ByteStream (..), Input, Parsable (..), Stall, Taken (..),
     inputPosition, readInputSome, readInputBorrowedSome, withInputSome, skipInput,
   )
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
@@ -185,21 +185,46 @@ columnStreamWithChunks row = do
       chunks use = currentCursor >>= \current -> borrowColumnChunks row current use
   pure (ByteStream (cursorValueLeft cursor) next, chunks)
 
-columnBorrowedStream :: Row -> IO ByteStream
+-- | What a pull of a borrowed column that doesn't wait found.
+data ColumnPull
+  = -- | The next chunk, not empty, borrowed until the next pull.
+    ColumnChunk !ByteString
+  | -- | The column's end.
+    ColumnEnd
+  | -- | Nothing is there yet: what to wait for.
+    ColumnStalled !Stall
+
+-- | The current column's value as chunks borrowed until the next pull, with
+-- the pull that waits, and the one that doesn't. Both expire when the row or
+-- its column advances.
+columnBorrowedStream :: Row -> IO (ByteStream, IO ColumnPull)
 columnBorrowedStream row = do
   cursor <- untakenCursor row
   writeIORef (rowCursor row) cursor {cursorValueTaken = True}
-  let next = do
-        current <- activeCursor row
-        unless (cursorColumn current == cursorColumn cursor) $
+  let current = do
+        now <- activeCursor row
+        unless (cursorColumn now == cursorColumn cursor) $
           throwIO (RowMisuse "a field was read after the next column was pulled")
-        if cursorValueLeft current == 0
+        pure now
+      next = do
+        now <- current
+        if cursorValueLeft now == 0
           then pure BS.empty
           else do
-            chunk <- inRow row (readInputBorrowedSome (cursorValueLeft current))
-            writeIORef (rowCursor row) current {cursorValueLeft = cursorValueLeft current - BS.length chunk}
+            chunk <- inRow row (readInputBorrowedSome (cursorValueLeft now))
+            writeIORef (rowCursor row) now {cursorValueLeft = cursorValueLeft now - BS.length chunk}
             pure chunk
-  pure (ByteStream (cursorValueLeft cursor) next)
+      ready = do
+        now <- current
+        if cursorValueLeft now == 0
+          then pure ColumnEnd
+          else
+            runContextBorrowReady (rowContext row) (cursorValueLeft now) `onException` invalidateRow row >>= \case
+              NotReady stall -> pure (ColumnStalled stall)
+              Taken chunk -> do
+                writeIORef (rowCursor row) now {cursorValueLeft = cursorValueLeft now - BS.length chunk}
+                pure (ColumnChunk chunk)
+  pure (ByteStream (cursorValueLeft cursor) next, ready)
 
 -- | Calls the consumer with successive borrowed chunks of this column.
 -- Chunks are valid only until their callback returns; copy retained bytes.
