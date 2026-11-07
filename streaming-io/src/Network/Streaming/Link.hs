@@ -18,7 +18,7 @@ import Data.ByteString (ByteString)
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr)
 import Network.Socket (Socket, close)
-import Network.Streaming.Watch (Watch (..), awaitFirst, awaitWatch, fdReadable, fdWritable, readyNow)
+import Network.Streaming.Watch (Watch (..), anyWatch, awaitFirst, awaitWatch, fdReadable, fdWritable, readyNow)
 import System.Posix.Types (Fd (..))
 #if defined(mingw32_HOST_OS)
 import qualified Data.ByteString as BS
@@ -118,8 +118,35 @@ awaitWatches readable writable (Interest input output) = case output of
     | otherwise -> awaitWatch watch
 {-# NOINLINE awaitWatches #-}
 
+-- | One watch for what the interest includes, which fires once any of it may
+-- be retried: 'awaitAny' without the wait, for a caller that waits as it likes,
+-- e.g. with other events. The caller releases the watch, which releases the
+-- ones it registered. It fires at once for an interest in nothing. It goes
+-- through the link's watches, also where 'awaitAny' waits more directly.
 watchInterest :: Link link => link -> Interest -> IO Watch
-watchInterest _ _ = pure readyNow
+watchInterest link = watchInterestOf (watchReadable link) (watchWritable link)
+-- Inlined, so that the link's own watches are called, and no 'Link' dictionary
+-- is passed or searched at run time. The code that registers them is one
+-- function for all links: a specialization of it for each link type would be
+-- a copy in each package that compiles a channel, since a function that
+-- returns 'IO' is called through a cast alias that callers inline, and a rule
+-- for the alias never fires.
+{-# INLINE watchInterest #-}
+
+-- | 'watchInterest' of the actions that register the watches for input and
+-- for output.
+watchInterestOf :: IO Watch -> IO Watch -> Interest -> IO Watch
+watchInterestOf readable writable (Interest input output) = case output of
+  Done
+    | input -> readable
+    | otherwise -> pure readyNow
+  OnWritable
+    | input -> anyWatch [readable, writable]
+    | otherwise -> writable
+  OnSource watch
+    | input -> anyWatch [readable, watch]
+    | otherwise -> watch
+{-# NOINLINE watchInterestOf #-}
 
 -- | A parameter stream gave a different number of bytes than it declared.
 -- The message it belongs to is incomplete, so the connection is unusable.

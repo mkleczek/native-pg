@@ -204,7 +204,7 @@ spec = do
       registered (Interest True . OnSource) `shouldReturn` ((1, 1), (0, 0), (1, 1))
 
   describe "one watch for several" $ do
-    xfail "anyWatch: it is not implemented yet" $ it "fires once any of the watches has" $ do
+    it "fires once any of the watches has" $ do
       counts <- newCounts
       first <- newTVarIO False
       second <- newTVarIO False
@@ -221,7 +221,7 @@ spec = do
       timeout 2000000 (atomically (watchReady watch)) `shouldReturn` Just ()
       watchCancel watch
 
-    xfail "anyWatch: it is not implemented yet" $ it "registers each watch once, in order, and releases each when it is released" $ do
+    it "registers each watch once, in order, and releases each when it is released" $ do
       counts <- newCounts
       fired <- newTVarIO False
       order <- newIORef []
@@ -232,20 +232,20 @@ spec = do
       watchCancel watch
       readCounts counts `shouldReturn` (3, 3)
 
-    xfail "anyWatch: it is not implemented yet" $ it "releases the registered watches when registering another fails" $ do
+    it "releases the registered watches when registering another fails" $ do
       counts <- newCounts
       fired <- newTVarIO False
       try @ErrorCall (anyWatch [fake counts fired, fake counts fired, throwIO (ErrorCall "no registration")])
         `shouldSatisfy` P.returns (P.left (P.eq (ErrorCall "no registration")))
       readCounts counts `shouldReturn` (2, 2)
 
-    xfail "anyWatch: it is not implemented yet" $ it "never fires when it has no watches" $ do
+    it "never fires when it has no watches" $ do
       watch <- anyWatch []
       timeout 50000 (atomically (watchReady watch)) `shouldReturn` Nothing
       watchCancel watch
 
   describe "a watch for an interest" $ do
-    xfail "watchInterest: it is not implemented yet" $ it "registers the watches of what the interest includes, and releases them with its own release" $ do
+    it "registers the watches of what the interest includes, and releases them with its own release" $ do
       let registered interest = do
             readable <- newCounts
             writable <- newCounts
@@ -271,7 +271,7 @@ spec = do
       watchCancel watch
       (,) <$> readCounts readable <*> readCounts writable `shouldReturn` ((0, 0), (0, 0))
 
-    xfail "watchInterest: it is not implemented yet" $ it "fires when the input is ready, or the output is, or the source is, and not before" $ do
+    it "fires when the input is ready, or the output is, or the source is, and not before" $ do
       let firing :: (IO Watch -> Interest) -> [String] -> IO (Maybe (), Maybe ())
           firing interest flags = do
             readable <- newTVarIO False

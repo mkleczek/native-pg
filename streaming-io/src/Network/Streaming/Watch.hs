@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
 
 -- | Readiness as STM, so that waiting for one of several events needs no
@@ -90,6 +91,20 @@ awaitCallback register unregister = mask_ $ do
   takeMVar called `onException` unregister key
 {-# NOINLINE awaitCallback #-}
 
+-- | Registers the events in order, and gives one watch that fires when any of
+-- them has, and whose release releases them all. If registering one fails, the
+-- ones before it are released. With none, it never fires.
+anyWatch :: [IO Watch] -> IO Watch
+anyWatch = mask_ . go []
+  where
+    -- The registered watches, the latest first
+    go registered = \case
+      [] -> pure (Watch (foldr (orElse . watchReady) retry (reverse registered)) (releaseWatches registered))
+      make : others -> do
+        watch <- make `onException` releaseWatches registered
+        go (watch : registered) others
+{-# NOINLINE anyWatch #-}
+
 -- | Releases the watches, the latest registration first, each even if the
 -- one before it fails to be.
 releaseWatches :: [Watch] -> IO ()
@@ -98,6 +113,3 @@ releaseWatches = uninterruptibleMask_ . go
     go [] = pure ()
     go (watch : earlier) = (watchCancel watch `onException` go earlier) *> go earlier
 {-# NOINLINE releaseWatches #-}
-
-anyWatch :: [IO Watch] -> IO Watch
-anyWatch _ = pure readyNow
