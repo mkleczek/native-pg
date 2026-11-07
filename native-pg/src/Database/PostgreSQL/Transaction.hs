@@ -26,6 +26,7 @@ import Control.Monad.Reader (ReaderT (..), ask)
 import Control.Monad.State.Strict (StateT, modify', runStateT)
 import qualified Data.Bifunctor as Bifunctor
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Data.Foldable (traverse_)
 import Data.Functor.Const (Const (..))
 import Data.IORef
@@ -38,18 +39,18 @@ import Database.PostgreSQL.Internal.Context
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Internal.Execution (Execution (..))
 import qualified Database.PostgreSQL.Internal.Execution as Execution
-import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), Stall (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), Poll (..), Stall (..))
 import Database.PostgreSQL.Internal.Row (DecodeRow (..))
 import qualified Database.PostgreSQL.Internal.Row as Row
 import Database.PostgreSQL.Session (Session)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Types (FormatCode (..), TransactionStatus (..))
 import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
+import Network.Streaming.Watch (Watch)
 import Network.Streaming.Link (Interest (..))
 import qualified Network.Streaming.Link as Link (Blocked (Done))
 import Network.Streaming.Source (Pulled (Ended, Pulled), Source (..))
 import qualified Network.Streaming.Source as Source
-import Network.Streaming.Watch (Watch, readyNow)
 
 -- | Work run synchronously on the thread that entered the transaction scope.
 -- 'withRunInIO' supports synchronous IO callbacks. Database operations reject
@@ -256,16 +257,121 @@ instance Source (FieldSource s) where
       Row.ColumnChunk chunk -> pure (Pulled chunk)
       Row.ColumnEnd -> pure Ended
       Row.ColumnStalled stall -> Source.Pending <$ writeIORef (runtimeStalled runtime) stall
-  watchSource (FieldSource (Field runtime _ _)) = do
-    checkOwner runtime
-    stall <- readIORef (runtimeStalled runtime)
-    contextWatchStall (contextOf runtime) stall
+  watchSource (FieldSource (Field runtime _ _)) = watchStalled runtime
 
+-- | A watch for what the last pull or read that didn't wait was stalled on.
+watchStalled :: Runtime -> IO Watch
+watchStalled runtime = do
+  checkOwner runtime
+  stall <- readIORef (runtimeStalled runtime)
+  contextWatchStall (contextOf runtime) stall
+
+-- | Reads what follows the body, and the ending's reply, if all of it has
+-- arrived, and otherwise gives 'Nothing' without waiting: the rest of the
+-- result, the replies of the statements that follow it, and the reply to
+-- COMMIT, or to ROLLBACK if the transaction was condemned. It reads them when
+-- they are all in the input, or arrive in receives that don't wait, up to the
+-- ReadyForQuery that ends them. It waits neither for the server nor for a
+-- buffer to receive into: with none free, it gives 'Nothing', and
+-- 'endingWatch' fires when one is granted. Then the transaction is over: it
+-- gives 'Right' if it was committed, and the failure of the ending, e.g. a
+-- deferred constraint that fails at COMMIT, or of a statement before it, as
+-- 'Left'. Asking again after it gave 'Just' gives the same.
+--
+-- The ending is the one that 'finalPipeline' queued with the statements. If
+-- none was queued, it's queued now, without waiting for what was sent before
+-- it, and its reply is waited for as a reply that hasn't arrived. A pull that
+-- is pending, and a watch for it, are for 'endingWatch'.
+--
+-- What it reads is in the input, which it may move: a chunk of the field
+-- that was borrowed before is not valid any more, and the last one has to be
+-- copied. The replies that follow the field have to fit what the input holds,
+-- unread bytes of the field included, and it raises 'RowMisuse' if they don't:
+-- read the field to its end, which is what 'Ended' says, first.
 endingReady :: Tx s -> IO (Maybe (Either QueryError ()))
-endingReady _ = pure Nothing
+endingReady (Tx runtime) = runOperation runtime (settleEnding runtime)
 
+-- | A watch that fires when 'endingReady' may give more than 'Nothing' next,
+-- as 'watchSource' does for a pull: when the server has sent something, or,
+-- if there was no buffer to receive into, when one is granted, and while output
+-- is unsent also when the link is writable or the source of an upload is
+-- ready. The caller releases it.
 endingWatch :: Tx s -> IO Watch
-endingWatch _ = pure readyNow
+endingWatch (Tx runtime) = watchStalled runtime
+
+settleEnding :: Runtime -> IO (Maybe (Either QueryError ()))
+settleEnding runtime = do
+  ended <- readIORef (runtimeEnded runtime)
+  if ended
+    then pure (Just (Right ()))
+    else do
+      outstanding <- readIORef (runtimeSync runtime)
+      arrived <- if outstanding then repliesBuffered runtime else pure True
+      if not arrived
+        then pure Nothing
+        else
+          try @QueryError (finishBuffered runtime) >>= \case
+            Left failure -> pure (Just (Left failure))
+            Right True -> pure (Just (Right ()))
+            -- The ending was queued, and its reply has to come
+            Right False -> settleEnding runtime
+
+-- | Finishes the transaction from replies that are all in the input, so that
+-- reading them waits for nothing. False if the ending was queued, and True if
+-- it was observed.
+finishBuffered :: Runtime -> IO Bool
+finishBuffered runtime = do
+  drain runtime True
+  throwFailure runtime
+  final <- readIORef (runtimeFinal runtime)
+  unstarted <- isJust <$> readIORef (runtimeBegin runtime)
+  if final || unstarted
+    then do
+      status <- readIORef (runtimeStatus runtime)
+      unless (status == TxIdle) (throwIO (ProtocolError "the transaction ending did not leave an idle session"))
+      writeIORef (runtimeEnded runtime) True
+      pure True
+    else do
+      void (submitOn runtime True (pure ()))
+      pure False
+
+-- | Whether the replies up to the ReadyForQuery that ends the statements that
+-- were sent are all in the input, after receiving, without waiting, while
+-- they are not.
+repliesBuffered :: Runtime -> IO Bool
+repliesBuffered runtime = do
+  skip <- readIORef (runtimePending runtime) >>= \case
+    first : _ -> readIORef (pendingRow first) >>= maybe (pure 0) Row.rowUnreadBytes
+    [] -> pure 0
+  buffered <- contextBuffered context
+  case repliesEnd skip buffered of
+    RepliesEnd -> pure True
+    RepliesMalformed -> throwIO (ProtocolError "a message of the server has an invalid length")
+    RepliesIncomplete ->
+      contextReceiveMore context >>= \case
+        Arrived -> repliesBuffered runtime
+        NotArrived stall -> False <$ writeIORef (runtimeStalled runtime) stall
+        NoRoom -> throwIO (RowMisuse "the replies that follow the field do not fit the input buffer: read the field to its end first")
+  where
+    context = contextOf runtime
+
+data RepliesEnd = RepliesEnd | RepliesIncomplete | RepliesMalformed
+
+-- | Whether the bytes hold the messages of the server up to a ReadyForQuery,
+-- after the first bytes, which are those that the current row has left.
+repliesEnd :: Int -> BS.ByteString -> RepliesEnd
+repliesEnd skip bytes
+  | BS.length bytes < skip = RepliesIncomplete
+  | otherwise = messages (BS.drop skip bytes)
+  where
+    messages rest
+      | BS.length rest < 5 = RepliesIncomplete
+      | size < 4 = RepliesMalformed
+      | BS.length rest < 1 + size = RepliesIncomplete
+      | BS.head rest == 90 = RepliesEnd
+      | otherwise = messages (BS.drop (1 + size) rest)
+      where
+        size = BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0 (BS.take 4 (BS.drop 1 rest))
 
 newRuntime :: IsolationLevel -> Mode -> Session -> IO Runtime
 newRuntime isolation mode session =

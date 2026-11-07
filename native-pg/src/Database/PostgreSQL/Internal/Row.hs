@@ -8,7 +8,7 @@
 module Database.PostgreSQL.Internal.Row
   ( Row, Column (..), DecodeRow (..),
     readRows, nextRow, startRow, finishRow, invalidateRow,
-    rowColumnCount, rowValueUnread, nextColumn, columnBytes, columnStream, ColumnPull (..),
+    rowColumnCount, rowValueUnread, rowUnreadBytes, nextColumn, columnBytes, columnStream, ColumnPull (..),
     columnStreamWithChunks, columnBorrowedStream, columnChunks, withColumnStream,
     decodeRow, decodeRowStreaming, decodeRowStreamingNullable,
     decodeRowStreamingUsing,
@@ -124,6 +124,15 @@ rowValueUnread :: Row -> IO Bool
 rowValueUnread row = do
   cursor <- readIORef (rowCursor row)
   pure (cursorActive cursor && cursorValueTaken cursor && cursorValueLeft cursor > 0)
+
+-- | How many bytes of the row nothing has consumed: what the columns have left
+-- and the columns that weren't pulled. None for a row that was finished.
+rowUnreadBytes :: Row -> IO Int
+rowUnreadBytes row = do
+  cursor <- readIORef (rowCursor row)
+  if cursorActive cursor
+    then (\input -> rowEnd row - inputPosition input) <$> readIORef (contextInput (rowContext row))
+    else pure 0
 
 -- | Pulls the next column, skipping what's left unread of the current one.
 -- 'Nothing' after the last column.

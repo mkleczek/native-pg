@@ -171,7 +171,7 @@ spec port = describe "operations and transactions in a scope" $ do
       brokenAfter env
 
   describe "the ending's reply" $ do
-    xfail "endingReady: it is not implemented yet" $ it "gives COMMIT's success once the body was pulled, and the scope has nothing left to do" $ withEnv port 1 $ \env -> do
+    it "gives COMMIT's success once the body was pulled, and the scope has nothing left to do" $ withEnv port 1 $ \env -> do
       run env "CREATE TEMP TABLE reply_commit (id int)"
       outcome <- inRequest env Tx.Write $ \_ tx -> do
         Tx.runIn tx (Tx.sql "INSERT INTO reply_commit VALUES (1)")
@@ -182,7 +182,7 @@ spec port = describe "operations and transactions in a scope" $ do
       lastNames env 1 `shouldReturn` ["ready: succeeded"]
       count env "reply_commit" `shouldReturn` 1
 
-    xfail "endingReady: it is not implemented yet" $ it "gives the failure of a deferred constraint at COMMIT as a value, after the body was pulled" $ withEnv port 1 $ \env -> do
+    it "gives the failure of a deferred constraint at COMMIT as a value, after the body was pulled" $ withEnv port 1 $ \env -> do
       outcome <- inRequest env Tx.Write $ \_ tx -> do
         Tx.runIn tx (Tx.sql "CREATE TEMP TABLE reply_parent (id int PRIMARY KEY)")
         Tx.runIn tx (Tx.sql "CREATE TEMP TABLE reply_child (id int REFERENCES reply_parent(id) DEFERRABLE INITIALLY DEFERRED)")

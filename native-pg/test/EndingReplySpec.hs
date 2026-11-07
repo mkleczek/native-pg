@@ -87,7 +87,7 @@ starved taker link context use = do
 
 spec :: Spec
 spec = describe "the reply to the transaction's ending" $ do
-  xfail "endingReady: it is not implemented yet" $ it "gives success once COMMIT's reply is in the input, and sent COMMIT once" $
+  it "gives success once COMMIT's reply is in the input, and sent COMMIT once" $
     withFeed 4096 $ \link context -> do
       feed link committed
       afterBody True context $ \tx -> do
@@ -101,7 +101,7 @@ spec = describe "the reply to the transaction's ending" $ do
       sent <- sentBytes link
       occurrences "COMMIT" sent `shouldBe` 1
 
-  xfail "endingReady: it is not implemented yet" $ it "gives the failure of COMMIT, e.g. a deferred constraint, as a value" $
+  it "gives the failure of COMMIT, e.g. a deferred constraint, as a value" $
     withFeed 4096 $ \link context -> do
       feed link (command "BEGIN" <> rows [[Just body]] <> message 49 "" <> message 50 "" <> errorMessage "23503" <> ready)
       afterBody True context $ \tx ->
@@ -112,7 +112,7 @@ spec = describe "the reply to the transaction's ending" $ do
           Just (Right ()) -> failTest "COMMIT's failure was lost"
           Nothing -> failTest "the reply had arrived"
 
-  xfail "endingReady: it is not implemented yet" $ it "gives nothing while the reply hasn't arrived, and doesn't wait" $
+  it "gives nothing while the reply hasn't arrived, and doesn't wait" $
     withFeed 4096 $ \link context -> do
       let (early, late) = BS.splitAt (BS.length committed - 3) committed
       feed link early
@@ -126,7 +126,7 @@ spec = describe "the reply to the transaction's ending" $ do
           Just (Right ()) -> pure ()
           _ -> failTest "the reply that arrived was not taken"
 
-  xfail "endingReady: it is not implemented yet" $ it "fires its watch when the server sends the rest" $
+  it "fires its watch when the server sends the rest" $
     withFeed 4096 $ \link context -> do
       let (early, late) = BS.splitAt (BS.length committed - 20) committed
       feed link early
@@ -141,7 +141,7 @@ spec = describe "the reply to the transaction's ending" $ do
           Just (Right ()) -> pure ()
           _ -> failTest "the reply that arrived was not taken"
 
-  xfail "endingReady: it is not implemented yet" $ it "receives the reply in receives that don't wait, when the input is smaller than the rest" $
+  it "receives the reply in receives that don't wait, when the input is smaller than the rest" $
     withFeed 64 $ \link context -> do
       feed link committed
       afterBody True context $ \tx ->
@@ -149,7 +149,7 @@ spec = describe "the reply to the transaction's ending" $ do
           Just (Right ()) -> pure ()
           _ -> failTest "the reply was not taken"
 
-  xfail "endingReady: it is not implemented yet" $ it "queues an ending that wasn't queued, and gives nothing until its reply arrives" $
+  it "queues an ending that wasn't queued, and gives nothing until its reply arrives" $
     withFeed 4096 $ \link context -> do
       feed link (command "BEGIN" <> rows [[Just body]] <> readyTx)
       afterBody False context $ \tx -> do
@@ -161,7 +161,7 @@ spec = describe "the reply to the transaction's ending" $ do
           Just (Right ()) -> pure ()
           _ -> failTest "the reply that arrived was not taken"
 
-  xfail "endingReady: it is not implemented yet" $ it "rejects replies that don't fit the input, while the field is unread" $
+  it "rejects replies that don't fit the input, while the field is unread" $
     withFeed 64 $ \link context -> do
       feed link committed
       withScope $ \scope -> do
@@ -175,7 +175,7 @@ spec = describe "the reply to the transaction's ending" $ do
           Left (RowMisuse _) -> pure ()
           other -> failTest ("unread bytes that don't fit were accepted: " <> either show (const "no failure") other)
   describe "without a buffer to receive into" $ do
-    xfail "endingReady: it is not implemented yet" $ it "gives nothing without waiting, and its watch fires when a buffer is returned" $
+    it "gives nothing without waiting, and its watch fires when a buffer is returned" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
         withRequestFeed reader $ \link context ->
@@ -193,7 +193,7 @@ spec = describe "the reply to the transaction's ending" $ do
               Just (Right ()) -> pure ()
               _ -> failTest "the reply that arrived was not taken"
 
-    xfail "endingReady: it is not implemented yet" $ it "withdraws its registration for a buffer when its scope ends" $
+    it "withdraws its registration for a buffer when its scope ends" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
         registration <- withRequestFeed reader $ \link context ->
