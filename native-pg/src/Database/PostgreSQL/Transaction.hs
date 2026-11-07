@@ -44,7 +44,7 @@ import qualified Database.PostgreSQL.Internal.Row as Row
 import Database.PostgreSQL.Session (Session)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Types (FormatCode (..), TransactionStatus (..))
-import Network.Streaming.Scope (Scope)
+import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
 import Network.Streaming.Source (Source (..))
 
 -- | Work run synchronously on the thread that entered the transaction scope.
@@ -153,13 +153,72 @@ runTransaction isolation mode session (Transaction action) = do
       pure result) `finally` (cleanupRuntime runtime `finally` writeIORef (runtimeLive runtime) False)
   either throwIO pure outcome
 
+-- | A transaction that a scope holds open, in the operation of a session. Its
+-- tag is the scope's, so neither the transaction nor what is read from it, the
+-- cursors and fields that carry the same tag, can be returned from the scope.
 newtype Tx (s :: Type) = Tx Runtime
 
+-- | Begins a transaction on the session, which belongs to it, on the calling
+-- thread, until the scope closes. Nothing is sent until the first pipeline.
+-- The scope ends the transaction as how it ended:
+--
+-- * When it completed, the transaction is finished as 'finishTransaction'
+--   finishes it: what is unread is drained, the ending is observed, whether it
+--   was queued by 'finalPipeline' or is sent now, and the session has to be
+--   idle. If the transaction failed on the server, and the code handled the
+--   failure, it is rolled back instead, and the scope completes.
+-- * When it aborted, the transaction is abandoned, and the connection broken,
+--   if an interruption aborted it, or a field was left unread in the middle of
+--   its stream, since the state of the connection is unknown. Otherwise what
+--   is unread is drained, the transaction is rolled back, and the connection
+--   is as it was.
+--
+-- The release fails if the ending's reply is an error, such as a deferred
+-- constraint failing at COMMIT, and then the releases after it learn that the
+-- scope aborted.
 transactionIn :: Scope s -> IsolationLevel -> Mode -> Session -> IO (Tx s)
-transactionIn _ _ _ _ = ioError (userError "transactionIn is not implemented yet")
+transactionIn scope isolation mode session@(Exchange.Session context) =
+  Tx . owned <$> acquireIn scope begin release
+  where
+    begin = do
+      beginContextOperation context
+      newRuntime isolation mode session `onException` endContextOperation context True
+    release ending runtime = do
+      outcome <- try @SomeException (settleTransaction runtime ending)
+      writeIORef (runtimeLive runtime) False
+      -- A failure of the server doesn't break the connection, and one of the
+      -- rest does, as an operation that fails decides.
+      endContextOperation context (either (not . recoverable) (const False) outcome)
+      either throwIO pure outcome
 
+-- | Runs transaction work in the transaction of a scope, on the thread that
+-- began it, as the action of 'runTransaction' runs. An interruption of the
+-- work abandons the transaction.
 runIn :: Tx s -> Transaction s a -> IO a
-runIn _ _ = ioError (userError "runIn is not implemented yet")
+runIn (Tx runtime) (Transaction action) = do
+  result <- try @SomeException (runReaderT action runtime)
+  case result of
+    Left failure -> do
+      when (isInterrupted failure) (abandon runtime)
+      throwIO failure
+    Right value -> pure value
+
+settleTransaction :: Runtime -> Ending -> IO ()
+settleTransaction runtime = \case
+  Completed -> do
+    failed <- isJust <$> readIORef (runtimeFailure runtime)
+    if failed then cleanupRuntime runtime else runOperation runtime (finishRuntime runtime)
+  Aborted failure
+    | isInterrupted failure -> abandon runtime
+    | otherwise -> do
+        unread <- fieldUnread runtime
+        if unread then abandon runtime else cleanupRuntime runtime
+
+-- | Whether a field is borrowed, and has bytes left that nothing has read.
+fieldUnread :: Runtime -> IO Bool
+fieldUnread runtime = readIORef (runtimePending runtime) >>= \case
+  first : _ -> readIORef (pendingRow first) >>= maybe (pure False) Row.rowValueUnread
+  [] -> pure False
 
 newRuntime :: IsolationLevel -> Mode -> Session -> IO Runtime
 newRuntime isolation mode session =

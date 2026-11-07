@@ -41,32 +41,32 @@ import System.Timeout (timeout)
 spec :: PortNumber -> Spec
 spec port = describe "operations and transactions in a scope" $ do
   describe "when the scope completes" $ do
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "commits the transaction, and gives the connection back as succeeded" $ withEnv port 1 $ \env -> do
+    it "commits the transaction, and gives the connection back as succeeded" $ withEnv port 1 $ \env -> do
       run env "CREATE TEMP TABLE scope_commit (id int)"
       inRequest env Tx.Write $ \_ tx -> Tx.runIn tx (Tx.sql "INSERT INTO scope_commit VALUES (1)")
       lastNames env 2 `shouldReturn` ["in use", "ready: succeeded"]
       count env "scope_commit" `shouldReturn` 1
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "sends nothing for a transaction that did nothing" $ withEnv port 1 $ \env -> do
+    it "sends nothing for a transaction that did nothing" $ withEnv port 1 $ \env -> do
       inRequest env Tx.Read $ \_ _ -> pure ()
       lastNames env 2 `shouldReturn` ["in use", "ready: succeeded"]
       (PG.isUsable =<< connectionOf env) `shouldReturn` True
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "is done with a transaction that finished itself" $ withEnv port 1 $ \env -> do
+    it "is done with a transaction that finished itself" $ withEnv port 1 $ \env -> do
       run env "CREATE TEMP TABLE scope_finished (id int)"
       inRequest env Tx.Write $ \_ tx -> do
         Tx.runIn tx (Tx.sql "INSERT INTO scope_finished VALUES (1)" *> Tx.finishTransaction)
       lastNames env 1 `shouldReturn` ["ready: succeeded"]
       count env "scope_finished" `shouldReturn` 1
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "drains a field that was not read, and keeps the connection" $ withEnv port 1 $ \env -> do
+    it "drains a field that was not read, and keeps the connection" $ withEnv port 1 $ \env -> do
       inRequest env Tx.Read $ \_ tx -> Tx.runIn tx $ do
         field <- firstField =<< Tx.pipeline (Tx.statement () (bodyOf 5000))
         liftIO (Tx.fieldLength field `shouldBe` 5000)
       lastNames env 1 `shouldReturn` ["ready: succeeded"]
       opened env `shouldReturn` 1
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "rolls back a transaction whose failure the code handled, without failing the scope" $ withEnv port 1 $ \env -> do
+    it "rolls back a transaction whose failure the code handled, without failing the scope" $ withEnv port 1 $ \env -> do
       run env "CREATE TEMP TABLE scope_handled (id int)"
       inRequest env Tx.Write $ \_ tx -> do
         Tx.runIn tx (Tx.sql "INSERT INTO scope_handled VALUES (1)")
@@ -77,7 +77,7 @@ spec port = describe "operations and transactions in a scope" $ do
       count env "scope_handled" `shouldReturn` 0
 
   describe "when the scope aborts" $ do
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "rolls the transaction back, and gives the connection back as failed" $ withEnv port 1 $ \env -> do
+    it "rolls the transaction back, and gives the connection back as failed" $ withEnv port 1 $ \env -> do
       run env "CREATE TEMP TABLE scope_rollback (id int)"
       result <- try @ErrorCall $ inRequest env Tx.Write $ \_ tx -> do
         Tx.runIn tx (Tx.sql "INSERT INTO scope_rollback VALUES (1)")
@@ -87,7 +87,7 @@ spec port = describe "operations and transactions in a scope" $ do
       opened env `shouldReturn` 1
       count env "scope_rollback" `shouldReturn` 0
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "rolls back after a query error, and keeps the connection" $ withEnv port 1 $ \env -> do
+    it "rolls back after a query error, and keeps the connection" $ withEnv port 1 $ \env -> do
       run env "CREATE TEMP TABLE scope_error (id int)"
       result <- try @Tx.QueryError $ inRequest env Tx.Write $ \_ tx -> do
         Tx.runIn tx (Tx.sql "INSERT INTO scope_error VALUES (1)")
@@ -97,7 +97,7 @@ spec port = describe "operations and transactions in a scope" $ do
       opened env `shouldReturn` 1
       count env "scope_error" `shouldReturn` 0
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "rolls back when the failure comes after a field was read to its end" $ withEnv port 1 $ \env -> do
+    it "rolls back when the failure comes after a field was read to its end" $ withEnv port 1 $ \env -> do
       result <- try @ErrorCall $ inRequest env Tx.Read $ \_ tx -> do
         Tx.runIn tx $ do
           field <- firstField =<< Tx.pipeline (Tx.statement () (bodyOf 5000))
@@ -107,7 +107,7 @@ spec port = describe "operations and transactions in a scope" $ do
       lastNames env 1 `shouldReturn` ["ready: failed"]
       opened env `shouldReturn` 1
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "breaks the connection when a field was left in the middle of its stream" $ withEnv port 1 $ \env -> do
+    it "breaks the connection when a field was left in the middle of its stream" $ withEnv port 1 $ \env -> do
       result <- try @ErrorCall $ inRequest env Tx.Read $ \_ tx -> do
         Tx.runIn tx $ do
           field <- firstField =<< Tx.pipeline (Tx.statement () (bodyOf 50000))
@@ -117,7 +117,7 @@ spec port = describe "operations and transactions in a scope" $ do
       result `shouldBe` Left (ErrorCall "the client went away")
       brokenAfter env
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "breaks the connection when the thread is interrupted while a result is read" $ withEnv port 1 $ \env -> do
+    it "breaks the connection when the thread is interrupted while a result is read" $ withEnv port 1 $ \env -> do
       started <- newEmptyMVar
       finished <- newEmptyMVar
       worker <- forkIO $
@@ -134,7 +134,7 @@ spec port = describe "operations and transactions in a scope" $ do
       timeout 5_000_000 (takeMVar finished) >>= \outcome -> fmap (either (const "interrupted") (const "returned")) outcome `shouldBe` Just "interrupted"
       brokenAfter env
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "breaks the connection when the thread is interrupted between operations, and doesn't wait for the answer" $ withEnv port 1 $ \env -> do
+    it "breaks the connection when the thread is interrupted between operations, and doesn't wait for the answer" $ withEnv port 1 $ \env -> do
       started <- newEmptyMVar
       finished <- newEmptyMVar
       worker <- forkIO $
@@ -152,7 +152,7 @@ spec port = describe "operations and transactions in a scope" $ do
       brokenAfter env
 
   describe "use after the scope" $ do
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "rejects a transaction run from another thread" $ withEnv port 1 $ \env -> do
+    it "rejects a transaction run from another thread" $ withEnv port 1 $ \env -> do
       inRequest env Tx.Read $ \_ tx -> do
         outcome <- newEmptyMVar
         _ <- forkIO (try @PG.ConnectionError (Tx.runIn tx (Tx.sql "SELECT 1")) >>= putMVar outcome)
@@ -160,7 +160,7 @@ spec port = describe "operations and transactions in a scope" $ do
           Left (PG.SessionUnusable _) -> pure ()
           _ -> failTest "another thread ran the transaction"
 
-    xfail "scope: operationIn and transactionIn are not implemented yet" $ it "rejects the session of a scope that has closed" $ withEnv port 1 $ \env -> do
+    it "rejects the session of a scope that has closed" $ withEnv port 1 $ \env -> do
       kept <- newIORef Nothing
       BufferPool.withRequestBuffers (envResources env) $ \access -> withScope $ \scope -> do
         Right checkout <- Pool.checkoutIn scope (envPool env) preflight

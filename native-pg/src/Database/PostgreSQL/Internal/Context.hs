@@ -21,6 +21,7 @@ module Database.PostgreSQL.Internal.Context
     endContextOperation,
     openRequestContext,
     closeScopedContext,
+    closeAbortedContext,
     ensureContextActive,
     breakConnection,
     Connection (..),
@@ -218,6 +219,20 @@ closeScopedContext context failed = do
         breakConnection connection
         throwIO (SessionUnusable "operation scope ended with unsent output")
       atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
+  where
+    connection = contextConnection context
+
+-- | Gives the connection back after a scope aborted, as the operations in the
+-- scope left it: broken if one broke it, or if output is unsent, which isn't
+-- reported, since the scope's own failure is. The operations decide the
+-- connection's fate, as they are the ones that know where in the protocol
+-- they stopped; each of them breaks it when it fails unsafely.
+closeAbortedContext :: Context -> IO ()
+closeAbortedContext context = do
+    expireContext context `finally` cleanupContext context
+    pending <- readIORef (contextPending context)
+    unless (unsentEmpty pending) (breakConnection connection)
+    atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
   where
     connection = contextConnection context
 

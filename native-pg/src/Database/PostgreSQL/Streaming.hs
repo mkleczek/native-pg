@@ -21,7 +21,7 @@ import Database.PostgreSQL.Streaming.Types (ByteStream (..))
 import Network.Streaming.BufferPool (BufferPool, BufferAccess)
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (Buffer)
-import Network.Streaming.Scope (Scope)
+import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
 
 -- | Use the request's shared body capability for one exclusive connection
 -- scope. Input borrows only while unread or borrowed bytes remain; streamed
@@ -30,8 +30,19 @@ withOperation :: BufferAccess -> Connection -> (Session -> IO a) -> IO a
 withOperation access connection action =
   Context.withRequestContext connection access (action . Exchange.Session)
 
+-- | 'withOperation' for a scope: the request's buffers are bound to the
+-- connection until the scope closes, as they are for the callback. The
+-- session expires with the scope, and is rejected after it. What the
+-- operations in the scope did decides the state of the connection, also when
+-- the scope aborted: a transaction in it is rolled back, or breaks the
+-- connection, as it ends. Unsent output breaks it, and fails the scope if it
+-- completed.
 operationIn :: Scope s -> BufferAccess -> Connection -> IO Session
-operationIn _ _ _ = ioError (userError "operationIn is not implemented yet")
+operationIn scope access connection =
+  Exchange.Session . owned <$> acquireIn scope (Context.openRequestContext connection access) (\ending context ->
+    case ending of
+      Completed -> Context.closeScopedContext context False
+      Aborted _ -> Context.closeAbortedContext context)
 
 -- | Use disjoint, initialized shared storage for one exclusive operation.
 -- Both buffers must remain exclusively owned until the callback returns;
