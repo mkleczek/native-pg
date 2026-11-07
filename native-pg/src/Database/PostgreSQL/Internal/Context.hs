@@ -17,6 +17,10 @@ module Database.PostgreSQL.Internal.Context
     newOwnedContext,
     newConnection,
     runContextOperation,
+    beginContextOperation,
+    endContextOperation,
+    openRequestContext,
+    closeScopedContext,
     ensureContextActive,
     breakConnection,
     Connection (..),
@@ -170,6 +174,14 @@ withRequestContext connection access =
   withScopedContext connection (requestInputBuffer access)
     (pure (outputBufferPerOutput requestOutputLimit)) (connectionReadSize connection)
 
+-- | Claims the connection for one request capability, which stays claimed
+-- until 'closeScopedContext'. The caller masks the claim and what it does with
+-- it.
+openRequestContext :: Connection -> BufferAccess -> IO Context
+openRequestContext connection access =
+  openScopedContext connection (requestInputBuffer access)
+    (pure (outputBufferPerOutput requestOutputLimit)) (connectionReadSize connection)
+
 -- | The most memory for one output's framing. A pipeline that copies more
 -- takes one more send for each of this many bytes.
 requestOutputLimit :: Int
@@ -177,8 +189,15 @@ requestOutputLimit = 65536
 
 withScopedContext :: Connection -> IO InputBuffer -> IO OutputBuffer -> Int -> (Context -> IO a) -> IO a
 withScopedContext connection makeInput makeOutput readSize use = mask $ \restore -> do
+    context <- openScopedContext connection makeInput makeOutput readSize
+    result <- restore (use context) `onException` closeScopedContext context True
+    closeScopedContext context False
+    pure result
+
+openScopedContext :: Connection -> IO InputBuffer -> IO OutputBuffer -> Int -> IO Context
+openScopedContext connection makeInput makeOutput readSize = do
     claimConnection connection
-    context <- (do
+    (do
       cursor <- newIORef =<< makeInput
       output <- makeOutput
       pending <- newIORef =<< unsent Nothing mempty
@@ -186,14 +205,21 @@ withScopedContext connection makeInput makeOutput readSize use = mask $ \restore
       finished <- newMVar ()
       pure (Context connection cursor output pending readSize True state finished))
       `onException` writeIORef (connectionState connection) Idle
-    result <- restore (use context) `onException` breakConnection connection
+
+-- | Gives the connection back: after a failure it is broken. Unsent output
+-- breaks it too, and is reported.
+closeScopedContext :: Context -> Bool -> IO ()
+closeScopedContext context failed = do
+    when failed (breakConnection connection)
       `finally` (expireContext context `finally` cleanupContext context)
-    pending <- readIORef (contextPending context)
-    unless (unsentEmpty pending) $ do
-      breakConnection connection
-      throwIO (SessionUnusable "operation scope ended with unsent output")
-    atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
-    pure result
+    unless failed $ do
+      pending <- readIORef (contextPending context)
+      unless (unsentEmpty pending) $ do
+        breakConnection connection
+        throwIO (SessionUnusable "operation scope ended with unsent output")
+      atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
+  where
+    connection = contextConnection context
 
 cleanupContext :: Context -> IO ()
 cleanupContext context = do
@@ -237,6 +263,16 @@ ensureContextActive context = readIORef (contextUse context) >>= \case
 -- acquire connection ownership for each operation instead.
 runContextOperation :: Context -> IO a -> IO a
 runContextOperation context action = mask $ \restore -> do
+  beginContextOperation context
+  result <- restore action `onException` endContextOperation context True
+  endContextOperation context False
+  pure result
+
+-- | Claims the context for the calling thread, which must hold it until
+-- 'endContextOperation', with nothing else claiming it meanwhile. The
+-- caller masks the claim and what it does with it.
+beginContextOperation :: Context -> IO ()
+beginContextOperation context = do
   thread <- myThreadId
   failure <- atomicModifyIORef' (contextUse context) $ \case
     Available -> (Using thread, Nothing)
@@ -245,24 +281,31 @@ runContextOperation context action = mask $ \restore -> do
   maybe (pure ()) (throwIO . SessionUnusable) failure
   takeMVar (contextFinished context)
   let connection = contextConnection context
-      done = do
-        putMVar (contextFinished context) ()
-        atomicModifyIORef' (contextUse context) (\state -> (case state of Using _ -> Available; other -> other, ()))
-      run = do
-        if contextScoped context
-          then readIORef (connectionState connection) >>= \case
-            Busy -> pure ()
-            _ -> throwIO (SessionUnusable "the connection is no longer usable")
-          else claimConnection connection
-        result <- restore action `onException` (breakConnection connection *> cleanupContext context)
-        unless (contextScoped context) $ do
-          previous <- atomicModifyIORef' (connectionState connection)
-            (\state -> (case state of Busy -> Idle; other -> other, state))
-          case previous of
-            Broken -> cleanupContext context
-            _ -> pure ()
-        pure result
-  run `finally` done
+  (if contextScoped context
+    then readIORef (connectionState connection) >>= \case
+      Busy -> pure ()
+      _ -> throwIO (SessionUnusable "the connection is no longer usable")
+    else claimConnection connection)
+    `onException` finishOperation context
+
+-- | Ends the operation that 'beginContextOperation' began. After a failure
+-- the connection is broken, and the context cleaned up.
+endContextOperation :: Context -> Bool -> IO ()
+endContextOperation context failed = (if failed then failure else success) `finally` finishOperation context
+  where
+    connection = contextConnection context
+    failure = breakConnection connection *> cleanupContext context
+    success = unless (contextScoped context) $ do
+      previous <- atomicModifyIORef' (connectionState connection)
+        (\state -> (case state of Busy -> Idle; other -> other, state))
+      case previous of
+        Broken -> cleanupContext context
+        _ -> pure ()
+
+finishOperation :: Context -> IO ()
+finishOperation context = do
+  putMVar (contextFinished context) ()
+  atomicModifyIORef' (contextUse context) (\state -> (case state of Using _ -> Available; other -> other, ()))
 
 claimConnection :: Connection -> IO ()
 claimConnection connection = do
