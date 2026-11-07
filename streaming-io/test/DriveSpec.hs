@@ -103,6 +103,43 @@ spec = describe "driving a step" $ do
     readIORef steps `shouldReturn` 1
     waits link `shouldReturn` [(True, "done")]
 
+  describe "polling a step" $ do
+    xfail "poll: it is not implemented yet" $ it "gives what a ready step gives" $ do
+      poll (\() -> pure (Ready 'x')) () >>= \case
+        Got 'x' -> pure ()
+        _ -> failTest "a ready step gave nothing"
+
+    xfail "poll: it is not implemented yet" $ it "steps again from the state it made progress to" $ do
+      seen <- newIORef []
+      let step n = do
+            modifyIORef' seen (n :)
+            pure (if n < 3 then Again (n + 1) else Ready (n * 10))
+      poll step (0 :: Int) >>= \case
+        Got 30 -> pure ()
+        _ -> failTest "the step did not get to its result"
+      readIORef seen `shouldReturn` [3, 2, 1, 0]
+
+    xfail "poll: it is not implemented yet" $ it "makes progress without growing the stack" $ do
+      let step n = pure (if n == (1000000 :: Int) then Ready n else Again (n + 1))
+      poll step 0 >>= \case
+        Got 1000000 -> pure ()
+        _ -> failTest "the step did not get to its result"
+
+    xfail "poll: it is not implemented yet" $ it "gives up where drive would wait, with what it is blocked on, and doesn't wait" $ do
+      seen <- newIORef []
+      let step n = do
+            modifyIORef' seen (n :)
+            pure (if n == 0 then Again (n + 1) else Blocked (n + 1) (Interest True OnWritable) :: Progress Int ())
+      poll step (0 :: Int) >>= \case
+        Stalled (Interest input output) -> (input, name output) `shouldBe` (True, "writable")
+        Got () -> failTest "a blocked step was ready"
+      -- It gave up at the block, and didn't try again from the state it gave
+      readIORef seen `shouldReturn` [1, 0]
+
+    xfail "poll: it is not implemented yet" $ it "lets the exception of a step propagate" $
+      poll (\() -> throwIO (Boom "step") :: IO (Progress () ())) ()
+        `shouldSatisfy` P.throws (P.con (Boom (P.eq "step")))
+
 name :: Blocked -> String
 name = \case
   Done -> "done"

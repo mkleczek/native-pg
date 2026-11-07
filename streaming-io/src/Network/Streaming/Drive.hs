@@ -4,11 +4,13 @@
 -- is blocked.
 module Network.Streaming.Drive
   ( Progress (..),
+    Polled (..),
     drive,
+    poll,
   )
 where
 
-import Network.Streaming.Link (Interest, Link (..))
+import Network.Streaming.Link (Blocked (..), Interest (..), Link (..))
 
 -- | What a step made of a try.
 data Progress s a
@@ -35,3 +37,11 @@ drive link step = loop
         Again s' -> loop s'
         Blocked s' interest -> awaitAny link interest *> loop s'
 {-# INLINE drive #-}
+
+-- | What 'poll' found.
+data Polled a
+  = Got a
+  | Stalled Interest
+
+poll :: (s -> IO (Progress s a)) -> s -> IO (Polled a)
+poll _ _ = pure (Stalled (Interest False Done))

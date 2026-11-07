@@ -8,7 +8,8 @@ import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, wri
 import Control.Exception (ErrorCall (..), IOException, SomeException, bracket, throwIO, try)
 import Control.Monad (replicateM_, void, when)
 import qualified Data.ByteString as BS
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Foldable (traverse_)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Foreign.Marshal.Alloc (allocaBytes)
 import GHC.Conc (retry)
 import qualified Network.Socket as Socket
@@ -202,6 +203,94 @@ spec = do
       registered (Interest False . OnSource) `shouldReturn` ((0, 0), (0, 0), (1, 1))
       registered (Interest True . OnSource) `shouldReturn` ((1, 1), (0, 0), (1, 1))
 
+  describe "one watch for several" $ do
+    xfail "anyWatch: it is not implemented yet" $ it "fires once any of the watches has" $ do
+      counts <- newCounts
+      first <- newTVarIO False
+      second <- newTVarIO False
+      watch <- anyWatch [fake counts first, fake counts second]
+      timeout 50000 (atomically (watchReady watch)) `shouldReturn` Nothing
+      atomically (writeTVar second True)
+      timeout 2000000 (atomically (watchReady watch)) `shouldReturn` Just ()
+      watchCancel watch
+
+    it "fires at once when one of the watches has fired already" $ do
+      counts <- newCounts
+      fired <- newTVarIO False
+      watch <- anyWatch [fake counts fired, pure readyNow]
+      timeout 2000000 (atomically (watchReady watch)) `shouldReturn` Just ()
+      watchCancel watch
+
+    xfail "anyWatch: it is not implemented yet" $ it "registers each watch once, in order, and releases each when it is released" $ do
+      counts <- newCounts
+      fired <- newTVarIO False
+      order <- newIORef []
+      let registering name = modifyIORef' order (name :) *> fake counts fired
+      watch <- anyWatch [registering 'a', registering 'b', registering 'c']
+      readIORef order `shouldReturn` "cba"
+      readCounts counts `shouldReturn` (3, 0)
+      watchCancel watch
+      readCounts counts `shouldReturn` (3, 3)
+
+    xfail "anyWatch: it is not implemented yet" $ it "releases the registered watches when registering another fails" $ do
+      counts <- newCounts
+      fired <- newTVarIO False
+      try @ErrorCall (anyWatch [fake counts fired, fake counts fired, throwIO (ErrorCall "no registration")])
+        `shouldSatisfy` P.returns (P.left (P.eq (ErrorCall "no registration")))
+      readCounts counts `shouldReturn` (2, 2)
+
+    xfail "anyWatch: it is not implemented yet" $ it "never fires when it has no watches" $ do
+      watch <- anyWatch []
+      timeout 50000 (atomically (watchReady watch)) `shouldReturn` Nothing
+      watchCancel watch
+
+  describe "a watch for an interest" $ do
+    xfail "watchInterest: it is not implemented yet" $ it "registers the watches of what the interest includes, and releases them with its own release" $ do
+      let registered interest = do
+            readable <- newCounts
+            writable <- newCounts
+            source <- newCounts
+            fired <- newTVarIO False
+            watch <- watchInterest (WatchedLink readable writable fired) (interest (fake source fired))
+            during <- (,,) <$> readCounts readable <*> readCounts writable <*> readCounts source
+            watchCancel watch
+            after <- (,,) <$> readCounts readable <*> readCounts writable <*> readCounts source
+            pure (during, after)
+      registered (const (Interest True Done)) `shouldReturn` (((1, 0), (0, 0), (0, 0)), ((1, 1), (0, 0), (0, 0)))
+      registered (const (Interest False OnWritable)) `shouldReturn` (((0, 0), (1, 0), (0, 0)), ((0, 0), (1, 1), (0, 0)))
+      registered (const (Interest True OnWritable)) `shouldReturn` (((1, 0), (1, 0), (0, 0)), ((1, 1), (1, 1), (0, 0)))
+      registered (Interest False . OnSource) `shouldReturn` (((0, 0), (0, 0), (1, 0)), ((0, 0), (0, 0), (1, 1)))
+      registered (Interest True . OnSource) `shouldReturn` (((1, 0), (0, 0), (1, 0)), ((1, 1), (0, 0), (1, 1)))
+
+    it "fires at once for an interest in nothing, and registers nothing" $ do
+      readable <- newCounts
+      writable <- newCounts
+      fired <- newTVarIO False
+      watch <- watchInterest (WatchedLink readable writable fired) (Interest False Done)
+      timeout 2000000 (atomically (watchReady watch)) `shouldReturn` Just ()
+      watchCancel watch
+      (,) <$> readCounts readable <*> readCounts writable `shouldReturn` ((0, 0), (0, 0))
+
+    xfail "watchInterest: it is not implemented yet" $ it "fires when the input is ready, or the output is, or the source is, and not before" $ do
+      let firing :: (IO Watch -> Interest) -> [String] -> IO (Maybe (), Maybe ())
+          firing interest flags = do
+            readable <- newTVarIO False
+            writable <- newTVarIO False
+            source <- newTVarIO False
+            counts <- newCounts
+            watch <- watchInterest (SplitLink counts counts readable writable) (interest (fake counts source))
+            before <- timeout 50000 (atomically (watchReady watch))
+            atomically (traverse_ (\(name, flag) -> when (name `elem` flags) (writeTVar flag True)) [("readable", readable), ("writable", writable), ("source", source)])
+            after <- timeout 50000 (atomically (watchReady watch))
+            watchCancel watch
+            pure (before, after)
+      firing (const (Interest True OnWritable)) ["readable"] `shouldReturn` (Nothing, Just ())
+      firing (const (Interest True OnWritable)) ["writable"] `shouldReturn` (Nothing, Just ())
+      firing (const (Interest False OnWritable)) ["readable"] `shouldReturn` (Nothing, Nothing)
+      firing (Interest True . OnSource) ["source"] `shouldReturn` (Nothing, Just ())
+      firing (Interest False . OnSource) ["readable", "writable"] `shouldReturn` (Nothing, Nothing)
+      firing (const (Interest True Done)) ["writable", "source"] `shouldReturn` (Nothing, Nothing)
+
   describe "awaiting a callback" $ do
     it "gives what the callback is called with, and registers nothing more" $ do
       unregistered <- newIORef (0 :: Int)
@@ -251,6 +340,17 @@ data WatchedLink = WatchedLink Counts Counts (TVar Bool)
 instance Link WatchedLink where
   watchReadable (WatchedLink readable _ fired) = fake readable fired
   watchWritable (WatchedLink _ writable fired) = fake writable fired
+  receiveReady _ _ _ = fail "unexpected receive"
+  sendReady _ _ = fail "unexpected send"
+  flushReady _ = fail "unexpected flush"
+  closeLink _ = pure ()
+
+-- | A link whose watches register in the counts, and fire on their own flags.
+data SplitLink = SplitLink Counts Counts (TVar Bool) (TVar Bool)
+
+instance Link SplitLink where
+  watchReadable (SplitLink readable _ flag _) = fake readable flag
+  watchWritable (SplitLink _ writable _ flag) = fake writable flag
   receiveReady _ _ _ = fail "unexpected receive"
   sendReady _ _ = fail "unexpected send"
   flushReady _ = fail "unexpected flush"

@@ -11,6 +11,7 @@ module Network.Streaming.Watch
     awaitFirst,
     awaitWatch,
     awaitCallback,
+    anyWatch,
   )
 where
 
@@ -97,3 +98,6 @@ releaseWatches = uninterruptibleMask_ . go
     go [] = pure ()
     go (watch : earlier) = (watchCancel watch `onException` go earlier) *> go earlier
 {-# NOINLINE releaseWatches #-}
+
+anyWatch :: [IO Watch] -> IO Watch
+anyWatch _ = pure readyNow

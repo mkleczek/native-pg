@@ -9,6 +9,7 @@ module Network.Streaming.Link
     Interest (..),
     Blocked (..),
     StreamLengthError (..),
+    watchInterest,
   )
 where
 
@@ -17,13 +18,12 @@ import Data.ByteString (ByteString)
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr)
 import Network.Socket (Socket, close)
-import Network.Streaming.Watch (Watch (..), awaitFirst, awaitWatch, fdReadable, fdWritable)
+import Network.Streaming.Watch (Watch (..), awaitFirst, awaitWatch, fdReadable, fdWritable, readyNow)
 import System.Posix.Types (Fd (..))
 #if defined(mingw32_HOST_OS)
 import qualified Data.ByteString as BS
 import Network.Socket (recvBuf)
 import Network.Socket.ByteString (sendMany)
-import Network.Streaming.Watch (readyNow)
 #else
 import Control.Concurrent (threadWaitRead, threadWaitWrite)
 import Control.Monad (when)
@@ -117,6 +117,9 @@ awaitWatches readable writable (Interest input output) = case output of
     | input -> awaitFirst [(readable, ()), (watch, ())]
     | otherwise -> awaitWatch watch
 {-# NOINLINE awaitWatches #-}
+
+watchInterest :: Link link => link -> Interest -> IO Watch
+watchInterest _ _ = pure readyNow
 
 -- | A parameter stream gave a different number of bytes than it declared.
 -- The message it belongs to is incomplete, so the connection is unusable.
