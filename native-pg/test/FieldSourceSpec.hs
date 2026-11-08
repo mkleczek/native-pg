@@ -6,7 +6,7 @@
 module FieldSourceSpec (spec) where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), IOException, evaluate, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, void, when)
@@ -25,7 +25,7 @@ import qualified Database.PostgreSQL.Transaction as Tx
 import FeedSupport
 import Foreign.Marshal.Alloc (allocaBytes)
 import GHC.Conc (getAllocationCounter)
-import Network.Streaming.BufferPool (BufferAccess, borrowBuffer, tryBorrowBuffer)
+import Network.Streaming.BufferPool (BufferAccess, borrowBuffer, tryBorrowBuffer, watchBorrow)
 import Network.Streaming.Scope (withScope)
 import Network.Streaming.Source (Pulled (..), Source (..), pull)
 import Network.Streaming.Watch (Watch (..), awaitWatch)
@@ -33,6 +33,12 @@ import Skeletest hiding (context)
 import System.Timeout (timeout)
 
 newtype Body tx = Body (Maybe (Tx.Field tx))
+
+-- | A row of an owned column and a field.
+data Tagged tx = Tagged BS.ByteString (Maybe (Tx.Field tx))
+
+taggedStatement :: Tx.Statement () Tagged
+taggedStatement = Tx.Statement "SELECT tag, body" (const []) (Tx.streamingRow @'[BS.ByteString] Tagged)
 
 bodyStatement :: Tx.Statement () Body
 bodyStatement = Tx.Statement "SELECT body" (const []) (Tx.streamingRow @'[] Body)
@@ -415,6 +421,69 @@ spec = describe "a field as a pull source" $ do
             timeout 50_000 (atomically (watchReady rivalRegistration)) `shouldReturn` Nothing
             step source `shouldReturn` Chunk (BS.take scarceSize (BS.drop (scarceSize - fieldStart body) body))
 
+    it "gives an additional loan back at the pull after each consumed buffer, though the field is armed, and a queued request gets it" $
+      withScarceRequests $ \reader taker _ -> do
+        _ <- borrowBuffer reader
+        withRequestFeed reader $ \link context -> do
+          let body = bodyOf 10000
+              response = answer [body]
+          feed link (BS.take scarceSize response)
+          ended <- try @AsyncException $ withScope $ \scope -> do
+            tx <- Tx.transactionIn scope Tx.ReadCommitted Tx.Read (Exchange.Session context)
+            field <- Tx.runIn tx $ do
+              cursor <- Tx.pipeline (Tx.statement () bodyStatement)
+              Tx.nextRow cursor >>= \case
+                Just (Body (Just found)) -> pure found
+                _ -> liftIO (failTest "the row has no field")
+            let source = Tx.fieldSource field
+            -- the first pull takes the whole block, and leaves bytes of the field
+            step source `shouldReturn` Chunk (BS.take (scarceSize - fieldStart body) body)
+            first <- queueFor taker
+            -- the buffer is consumed: the pull gives the loan back, and the request that waits for it gets it
+            step source `shouldReturn` Waits
+            timeout 2_000_000 (atomically (watchReady first)) `shouldReturn` Just ()
+            watchCancel first
+            -- and the same at the next consumed buffer
+            feed link (BS.take scarceSize (BS.drop scarceSize response))
+            step source `shouldReturn` Chunk (BS.take scarceSize (BS.drop (scarceSize - fieldStart body) body))
+            second <- watchBorrow taker
+            step source `shouldReturn` Waits
+            timeout 2_000_000 (atomically (watchReady second)) `shouldReturn` Just ()
+            watchCancel second
+            throwIO ThreadKilled :: IO ()
+          ended `shouldBe` Left ThreadKilled
+
+    it "holds the request's primary loan across chunks while the field is armed, and gives it back at the first pull after another operation" $
+      withScarceRequests $ \reader taker _ -> do
+        -- the pool's spare is taken, so that only the primary can serve another use of the request's buffers
+        _ <- borrowBuffer taker
+        _ <- borrowBuffer taker
+        withRequestFeed reader $ \link context -> do
+          let body = bodyOf 10000
+          feed link (BS.take scarceSize (answer [body]))
+          ended <- try @AsyncException $ withScope $ \scope -> do
+            tx <- Tx.transactionIn scope Tx.ReadCommitted Tx.Read (Exchange.Session context)
+            field <- Tx.runIn tx $ do
+              cursor <- Tx.pipeline (Tx.statement () bodyStatement)
+              Tx.nextRow cursor >>= \case
+                Just (Body (Just found)) -> pure found
+                _ -> liftIO (failTest "the row has no field")
+            let source = Tx.fieldSource field
+            -- the first pull takes the whole block, and leaves bytes of the field
+            step source `shouldReturn` Chunk (BS.take (scarceSize - fieldStart body) body)
+            waiting <- newEmptyMVar
+            _ <- forkIO (try @IOError (borrowBuffer reader) >>= putMVar waiting)
+            threadDelay 20_000
+            -- the pull that follows retries at the receive, and keeps the primary
+            step source `shouldReturn` Waits
+            isNothing <$> timeout 50_000 (readMVar waiting) `shouldReturn` True
+            -- after another operation the buffer is consumed for the pull that gives the primary back
+            Tx.runIn tx Tx.condemn
+            step source `shouldReturn` Waits
+            isJust <$> timeout 2_000_000 (readMVar waiting) `shouldReturn` True
+            throwIO ThreadKilled :: IO ()
+          ended `shouldBe` Left ThreadKilled
+
     it "withdraws its registration for a buffer when its scope ends" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
@@ -694,6 +763,23 @@ spec = describe "a field as a pull source" $ do
           feed link late
           timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
           watchCancel watch
+
+  describe "storage that allocates" $ do
+    it "keeps the owned columns of its row, though the field is pulled on in storage that is replaced as it grows" $
+      withOwnedFeed 1024 $ \link context -> do
+        let body = bodyOf 20000
+        feed link (command "BEGIN" <> rows [[Just "tag-one", Just body]] <> readyTx <> command "COMMIT" <> ready)
+        Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
+          cursor <- Tx.pipeline (Tx.statement () taggedStatement)
+          Tx.nextRow cursor >>= \case
+            Just (Tagged tag (Just field)) -> do
+              liftIO $ do
+                (chunks, ended) <- pullAvailable (Tx.fieldSource field)
+                ended `shouldBe` True
+                BS.concat chunks `shouldBe` body
+                tag `shouldBe` "tag-one"
+              Tx.finishTransaction
+            _ -> liftIO (failTest "the row has no field")
 
   describe "chunks that arrive in pieces, with a pull after each" $ do
     it "are as large as a blocking read's" $ do

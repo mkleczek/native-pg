@@ -13,6 +13,7 @@ module FeedSupport
     sentBytes,
     emptyReceives,
     withFeed,
+    withOwnedFeed,
     scarceSize,
     withScarceRequests,
     queueFor,
@@ -35,7 +36,7 @@ import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Channel (newChannel)
-import Database.PostgreSQL.Internal.Context (Context, newConnection, withContext, withRequestContext)
+import Database.PostgreSQL.Internal.Context (Context, newConnection, newOwnedContext, withContext, withRequestContext)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import Network.Streaming.Buffer (newBuffer)
@@ -134,6 +135,15 @@ withFeed size action = do
   withContext connection input output (action link)
   where
     buffer count = maybe (ioError (userError "no buffer")) newBuffer (mkPositiveInt (toInteger count))
+
+-- | A connection over a new link, and the owned context that allocates its input
+-- as it needs it, with a first allocation of this size, for the action.
+withOwnedFeed :: Int -> (FeedLink -> Context -> IO a) -> IO a
+withOwnedFeed size action = do
+  link <- newFeedLink
+  connection <- newConnection (newChannel link) size
+  context <- newOwnedContext connection
+  action link context
 
 -- | A connection over a new link, whose input is a loan of the request's
 -- buffers, for the action.

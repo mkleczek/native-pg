@@ -54,7 +54,7 @@ import qualified Data.ByteString.Internal as BSI
 import Data.Word (Word8, Word16, Word32)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Data.Maybe (isJust)
-import Network.Streaming.BufferPool (BufferAccess, BufferLoan, borrowBuffer, loanBuffer, releaseBuffer, tryBorrowBuffer, watchBorrow)
+import Network.Streaming.BufferPool (BufferAccess, BufferLoan, borrowBuffer, isPrimaryLoan, loanBuffer, releaseBuffer, tryBorrowBuffer, watchBorrow)
 import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Drive (Polled (..))
@@ -348,10 +348,11 @@ data Retry
 -- is stalled on what the caller kept.
 --
 -- It holds the loan the input has, as a read does while it waits for the link.
--- When nothing is left of a buffer that has taken bytes, it falls back, as it
--- does for anything that it would have to reshape or replace, so that
--- 'borrowInputReady' gives the loan back, which another request may be waiting
--- for, as it does after every chunk.
+-- When nothing is left of the buffer, and the loan is the request's primary, it
+-- does not give it back and take it again, as 'borrowInputReady' does: it
+-- rewinds the buffer in place, which is the layout that a new loan has, so the
+-- chunks are the same. An additional loan, and anything else that it would have
+-- to reshape or replace, it leaves to 'borrowInputReady'.
 --
 -- The caller must know that nothing has touched the input since the read that
 -- it retries. The count has to be the bytes that remain of a value that lies
@@ -360,8 +361,26 @@ retryInput :: Receiver -> IORef InputBuffer -> Int -> Stall -> IO Retry
 retryInput Receiver {receiveNow = receive} reference !count known = readIORef reference >>= start
   where
     start buffer
-      | isJust (bufferHome buffer) || bufferCapacity buffer == 0 || consumed buffer = pure FallBack
+      | isJust (bufferHome buffer) || bufferCapacity buffer == 0 = pure FallBack
+      | consumed buffer = do
+          held <- holdable buffer
+          if held
+            then do
+              let rewound = buffer {bufferStart = 0, bufferEnd = 0}
+              writeIORef reference rewound
+              go rewound
+            else pure FallBack
       | otherwise = go buffer
+    -- Whether a consumed buffer may be reused where it is: it is not storage
+    -- that allocates, which is never written over, since the values it gave out
+    -- are slices of it, and it holds no loan, or the request's own, which no
+    -- other request waits for. An additional loan goes back, as it does after
+    -- every chunk.
+    holdable buffer
+      | not (bufferReusable buffer) = pure False
+      | otherwise = case bufferRequest buffer of
+          Nothing -> pure True
+          Just (RequestBuffer _ slot _) -> maybe False isPrimaryLoan <$> readIORef slot
     -- What 'retireConsumed' gives the loan back for, and 'makeRoom' makes room
     -- of by moving nothing.
     consumed buffer =

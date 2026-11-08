@@ -919,10 +919,11 @@ endingReady   :: Tx s -> IO (Maybe (Either QueryError ()))
   follows one that was pending on the link, or left bytes of the field, retries
   at the receive when nothing else has touched the transaction since, which
   every operation of it tells by disarming the field first, and takes the same
-  chunks in the same sizes. It holds the loan as a wait does, and leaves a
-  buffer that is consumed to the full pull, which gives the loan back. A field
-  that is not the one armed, such as one of a row that has advanced, takes the
-  full pull, which refuses it.
+  chunks in the same sizes. It holds the loan as a wait does, and rewinds a
+  consumed buffer in place when the loan is the request's primary, where the
+  full pull gives it back and takes it again; an additional loan goes back, as
+  after every chunk. A field that is not the one armed, such as one of a row
+  that has advanced, takes the full pull, which refuses it.
 - **`endingReady`** reads what follows the body and the ending's reply when
   all of it is in the input, or arrives in receives that don't wait, and says
   nothing is there yet otherwise. It finds the ReadyForQuery that ends the
