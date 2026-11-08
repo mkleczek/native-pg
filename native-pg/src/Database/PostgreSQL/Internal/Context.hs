@@ -98,7 +98,11 @@ data Context = Context
     contextReadSize :: Int,
     contextScoped :: Bool,
     contextUse :: IORef ContextUse,
-    contextFinished :: MVar ()
+    contextFinished :: MVar (),
+    -- | What reads that don't wait ask of the link, made once: its closures
+    -- read only the connection's and the context's own references, which are
+    -- never replaced.
+    contextReceiver :: Receiver
   }
 
 data ContextUse = Available | Using ThreadId | Expired
@@ -110,7 +114,7 @@ newOwnedContext connection = do
   output <- newOutputBuffer 16384
   use <- newIORef Available
   finished <- newMVar ()
-  pure (Context connection input output pending (connectionReadSize connection) False use finished)
+  pure (Context connection input output pending (connectionReadSize connection) False use finished (receiverOf connection pending))
 
 -- | Sends output for this context.
 sendContextOutput :: Context -> Output -> IO ()
@@ -178,16 +182,14 @@ contextReceiveMore context = do
 
 -- | What reads that don't wait ask of the link: its receive, after the
 -- connection's carried-over bytes, and the push of unsent output.
-contextReceiver :: Context -> Receiver
-contextReceiver context =
+receiverOf :: Connection -> IORef Unsent -> Receiver
+receiverOf connection pending =
   Receiver
     { receiveNow = carriedPoll (connectionCarryOver connection) (channelPoll channel pending),
       receivePush = channelPush channel pending
     }
   where
-    connection = contextConnection context
     channel = connectionChannel connection
-    pending = contextPending context
 
 -- | One watch for what a read that didn't wait was stalled on, which fires
 -- when it may be retried. For a loan it is the input's registration for one,
@@ -283,7 +285,7 @@ openScopedContext connection makeInput makeOutput readSize = do
       pending <- newIORef =<< unsent Nothing mempty
       state <- newIORef Available
       finished <- newMVar ()
-      pure (Context connection cursor output pending readSize True state finished))
+      pure (Context connection cursor output pending readSize True state finished (receiverOf connection pending)))
       `onException` writeIORef (connectionState connection) Idle
 
 -- | Gives the connection back: after a failure it is broken. Unsent output
