@@ -8,11 +8,12 @@
 module TlsSpec (spec) where
 
 import Control.Concurrent.Async (concurrently)
-import Control.Exception (bracket, displayException, throwIO, try)
-import Control.Monad (replicateM_, unless, void)
+import Control.Exception (IOException, bracket, displayException, throwIO, try)
+import Control.Monad (replicateM, replicateM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
+import Data.Int (Int64)
 import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Tls.Internal
 import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..))
@@ -22,10 +23,13 @@ import Foreign.Marshal.Array (withArray)
 import Foreign.Marshal.Utils (fillBytes)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peek)
+import GHC.Conc (getAllocationCounter)
 import qualified Network.Socket as Socket
+import qualified Network.Socket.ByteString as Socket
 import Skeletest
 import qualified Skeletest.Predicate as P
 import System.Mem (performMajorGC)
+import System.Timeout (timeout)
 
 spec :: Spec
 spec = do
@@ -132,6 +136,67 @@ spec = do
         closeLink client
         receiveExactly server 1 `shouldReturn` BS.empty
 
+  describe "a receive" $ do
+    it "gives nothing while the server sends nothing" $
+      withServer "server" $ \sock server -> do
+        client <- connect sock server
+        allocaBytes 16384 $ \buffer ->
+          replicateM_ 2 (receiveReady client buffer 16384 `shouldReturn` Nothing)
+
+    it "hands out a record bigger than the buffer in order, over several receives" $
+      withServer "server" $ \sock server -> do
+        client <- connect sock server
+        let payload = BS.pack (take 1000 (cycle [0 .. 250]))
+        sendAll server [payload]
+        pieces <- receivePieces 100 client (BS.length payload)
+        BS.concat pieces `shouldBe` payload
+        (length pieces > 1, all ((<= 100) . BS.length) pieces) `shouldBe` (True, True)
+
+    it "gives 0 after the server's close_notify" $
+      withServer "server" $ \sock server -> do
+        client <- connect sock server
+        closeLink server
+        allocaBytes 16384 $ \buffer -> awaitReceive client buffer 16384 `shouldReturn` 0
+
+    it "gives 0 when the server's socket closes without a close_notify" $
+      withServerSocket "server" $ \sock serverSocket server -> do
+        client <- connect sock server
+        Socket.close serverSocket
+        allocaBytes 16384 $ \buffer -> awaitReceive client buffer 16384 `shouldReturn` 0
+
+    it "throws TlsError for a record that can't be decrypted, after sending the alert for it" $
+      withServerSocket "server" $ \sock serverSocket server -> do
+        client <- connect sock server
+        -- An application data record of 16 zero bytes, which can be no more than
+        -- the authentication tag of an empty message, and not the right one.
+        Socket.sendAll serverSocket (BS.pack [23, 3, 3, 0, 16] <> BS.replicate 16 0)
+        allocaBytes 16384 $ \buffer -> do
+          awaitReceive client buffer 16384
+            `shouldSatisfy` P.throws (P.con (TlsError (P.hasInfix "cannot decrypt peer's message")))
+          awaitReceive server buffer 16384
+            `shouldSatisfy` P.throws (P.con (TlsError (P.hasInfix "BadRecordMac")))
+
+    it "throws the socket's error as an IOException" $
+      withServer "server" $ \sock server -> do
+        client <- connect sock server
+        Socket.close sock
+        allocaBytes 16384 $ \buffer ->
+          receiveReady client buffer 16384
+            `shouldSatisfy` P.throws (displayException @IOException P.>>> P.eq "recv: invalid argument (Bad file descriptor)")
+
+    -- All that a receive needs to allocate is its result, a 'Just' and an 'Int'.
+    -- The bound leaves room for what measuring it adds, and for what the
+    -- optimiser may not remove.
+    xfail "the receive takes a foreign call for each step of its loop, and allocates around each of them" $
+      it "allocates next to nothing for bytes that are ready" $
+        withServer "server" $ \sock server -> do
+          client <- connect sock server
+          allocaBytes 16384 $ \buffer -> do
+            -- The session tickets come first, and the first receive takes them.
+            receiveReady client buffer 16384 `shouldReturn` Nothing
+            costs <- replicateM 5 $ snd <$> concurrently (sendAll server [BS.replicate 8192 42]) (receiveCosts client buffer 8192)
+            maximum (concat costs) `shouldSatisfy` P.lte 128
+
   describe "a configuration" $ do
     it "keeps cached server names alive after a connection closes" $ do
       config <- newTlsConfig (settings (VerifyFull (RootCertificateFile (certificate "ca.crt")))) "localhost"
@@ -199,6 +264,53 @@ receiveExactly tls count = BS.concat . reverse <$> go 0 []
                 awaitReadable tls
                 go got chunks
 
+-- | Waits for a receive to give bytes, or 0 at the end of the stream. It
+-- gives up after a while, as a broken receive that gives nothing would hang.
+awaitReceive :: TlsConnection -> Ptr Word8 -> Int -> IO Int
+awaitReceive tls buffer size = maybe (fail "the receive gave nothing for too long") pure =<< timeout 10000000 go
+  where
+    go =
+      receiveReady tls buffer size >>= \case
+        Just received -> pure received
+        Nothing -> awaitReadable tls *> go
+
+-- | The pieces that receives into a buffer of the size give, waiting for them
+-- as needed, until they make up the count or the stream ends.
+receivePieces :: Int -> TlsConnection -> Int -> IO [ByteString]
+receivePieces size tls count = allocaBytes size $ \buffer -> go buffer 0
+  where
+    go buffer got
+      | got >= count = pure []
+      | otherwise = do
+          received <- awaitReceive tls buffer size
+          if received == 0
+            then pure []
+            else do
+              piece <- BS.packCStringLen (castPtr buffer, received)
+              (piece :) <$> go buffer (got + received)
+
+-- | The bytes that each receive allocated on this thread, while waiting for
+-- the count of bytes: a receive that gives bytes, or nothing yet.
+receiveCosts :: TlsConnection -> Ptr Word8 -> Int -> IO [Int64]
+receiveCosts tls buffer = go
+  where
+    go count
+      | count <= 0 = pure []
+      | otherwise = do
+          before <- getAllocationCounter
+          received <- receiveReady tls buffer 16384
+          after <- getAllocationCounter
+          let cost = before - after
+          case received of
+            Just got -> (cost :) <$> go (count - got)
+            Nothing -> awaitReadable tls *> ((cost :) <$> go count)
+
+-- | The client's connection to the test server, once their handshake is done.
+connect :: Socket.Socket -> TlsConnection -> IO TlsConnection
+connect sock server = do
+  config <- newTlsConfig (settings (VerifyFull (RootCertificateFile (certificate "ca.crt")))) "localhost"
+  fst <$> concurrently (startTls config sock) (handshake server)
+
 -- | The settings with the verification, and rustls's defaults otherwise.
 settings :: ServerVerification -> TlsSettings
 settings verification = TlsSettings verification Nothing [] [minBound .. maxBound] True False
@@ -215,12 +327,16 @@ refusal config sock server = do
 -- | A connected pair of sockets: the client's, and the server's TLS
 -- connection with the named certificate, before its handshake.
 withServer :: String -> (Socket.Socket -> TlsConnection -> IO a) -> IO a
-withServer name action =
+withServer name action = withServerSocket name $ \sock _ server -> action sock server
+
+-- | 'withServer' that also gives the server's socket.
+withServerSocket :: String -> (Socket.Socket -> Socket.Socket -> TlsConnection -> IO a) -> IO a
+withServerSocket name action =
   bracket (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) closeBoth $ \(clientSocket, serverSocket) -> do
     chain <- BS.readFile (certificate (name <> ".crt"))
     key <- BS.readFile (certificate (name <> ".key"))
     server <- newTlsConnection serverSocket =<< serverConnection chain key
-    action clientSocket server
+    action clientSocket serverSocket server
   where
     closeBoth (a, b) = Socket.close a *> Socket.close b
 
