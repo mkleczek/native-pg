@@ -31,6 +31,19 @@ spec = describe "shared request buffer capability" $ do
       releaseBuffer extra
       releaseBuffer primary
 
+  it "tells the primary loan from an extra one" $
+    withTestPool (settings 2) $ \pool -> withRequestBuffers pool $ \access -> do
+      primary <- borrowBuffer access
+      extra <- borrowBuffer access
+      isPrimaryLoan primary `shouldBe` True
+      isPrimaryLoan extra `shouldBe` False
+      releaseBuffer extra
+      releaseBuffer primary
+      -- the primary is lent again when it is free, and it is still the primary
+      again <- borrowBuffer access
+      isPrimaryLoan again `shouldBe` True
+      releaseBuffer again
+
   it "reuses the primary locally and ignores stale releases" $
     withTestPool (settings 2) $ \pool -> withRequestBuffers pool $ \access -> do
       first <- borrowBuffer access

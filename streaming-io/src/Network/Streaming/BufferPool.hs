@@ -4,7 +4,7 @@
 module Network.Streaming.BufferPool
   ( BufferPool, PoolSettings (..), newBufferPool
   , BufferAccess, withRequestBuffers
-  , BufferLoan, borrowBuffer, tryBorrowBuffer, watchBorrow, loanBuffer, releaseBuffer
+  , BufferLoan, borrowBuffer, tryBorrowBuffer, watchBorrow, loanBuffer, isPrimaryLoan, releaseBuffer
   , BufferGrant, withSetupBuffers
   ) where
 
@@ -214,6 +214,13 @@ data BufferLoan = BufferLoan !BufferAccess !LoanKind !Buffer !(TVar Bool)
 
 loanBuffer :: BufferLoan -> Buffer
 loanBuffer (BufferLoan _ _ buffer _) = buffer
+
+-- | Whether the loan is the request's own buffer, which only this request can
+-- take, and not an additional one, which another request may be waiting for.
+isPrimaryLoan :: BufferLoan -> Bool
+isPrimaryLoan (BufferLoan _ kind _ _) = case kind of
+  Primary -> True
+  Extra _ -> False
 
 -- | Every loan and buffer alias expires with this scope. Callers must finish
 -- their children and stop accessing those aliases before returning.
