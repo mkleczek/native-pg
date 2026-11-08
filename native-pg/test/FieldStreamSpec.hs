@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 module FieldStreamSpec (spec) where
 
@@ -107,6 +108,20 @@ spec = describe "borrowed field streams" $ do
         _ <- try @ConnectionError (PG.columnBytes row)
         pure ()) ()
       case result of Left (RowMisuse _) -> pure (); _ -> failTest "failed parser left a recoverable row"
+
+  it "invalidates a row after a pull that doesn't wait fails" $
+    withResponse (message 50 "" <> BS.singleton 68 <> number 106 <> "\0\1" <> number 100 <> "short") $ \context _ -> do
+      -- The stream ends inside the field
+      _ <- try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
+        _ <- PG.nextColumn row
+        (_, pullNow) <- PG.columnBorrowedStream row
+        try @ConnectionError pullNow >>= \case
+          Left (ProtocolError _) -> pure ()
+          other -> failTest ("the pull gave " <> either show (const "a result") other)
+        try @ConnectionError pullNow >>= \case
+          Left (RowMisuse _) -> pure ()
+          other -> failTest ("the row was usable after a failed pull: " <> either show (const "a result") other)) ()
+      pure ()
 
   it "reports protocol failure after field EOF instead of treating EOF as query success" $
     withFields [Just payload] (lateError <> ready) $ \context _ -> do

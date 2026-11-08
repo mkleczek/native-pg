@@ -9,6 +9,7 @@ module FeedSupport
     feed,
     setWritable,
     setReceiveLimit,
+    endFeed,
     sentBytes,
     emptyReceives,
     withFeed,
@@ -31,7 +32,7 @@ import AcquisitionTestSupport (getAcquisition)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Channel (newChannel)
 import Database.PostgreSQL.Internal.Context (Context, newConnection, withContext, withRequestContext)
@@ -51,11 +52,12 @@ data FeedLink = FeedLink
     feedWritable :: TVar Bool,
     feedSent :: IORef BS.ByteString,
     feedEmpty :: IORef Int,
-    feedLimit :: IORef Int
+    feedLimit :: IORef Int,
+    feedEnded :: TVar Bool
   }
 
 newFeedLink :: IO FeedLink
-newFeedLink = FeedLink <$> newTVarIO BS.empty <*> newTVarIO True <*> newIORef BS.empty <*> newIORef 0 <*> newIORef maxBound
+newFeedLink = FeedLink <$> newTVarIO BS.empty <*> newTVarIO True <*> newIORef BS.empty <*> newIORef 0 <*> newIORef maxBound <*> newTVarIO False
 
 -- | The most that one receive gives, as a socket gives what one segment of
 -- the sender holds, however much is ready.
@@ -69,6 +71,11 @@ feed link bytes = atomically $ readTVar (feedInput link) >>= writeTVar (feedInpu
 setWritable :: FeedLink -> Bool -> IO ()
 setWritable link = atomically . writeTVar (feedWritable link)
 
+-- | The server's connection is lost: once what was fed is received, a receive
+-- gives the end of the stream, as a socket does.
+endFeed :: FeedLink -> IO ()
+endFeed = atomically . flip writeTVar True . feedEnded
+
 -- | What the link took.
 sentBytes :: FeedLink -> IO BS.ByteString
 sentBytes = readIORef . feedSent
@@ -79,15 +86,20 @@ emptyReceives = readIORef . feedEmpty
 
 instance Link FeedLink where
   receiveReady link pointer size = do
-    limit <- readIORef (feedLimit link)
-    taken <- atomically $ do
-      bytes <- readTVar (feedInput link)
-      let (now, later) = BS.splitAt (min size limit) bytes
-      writeTVar (feedInput link) later
-      pure now
-    if BS.null taken
-      then atomicModifyIORef' (feedEmpty link) (\n -> (n + 1, ())) *> pure Nothing
+    -- Looking before it takes keeps a receive that finds nothing cheap, which
+    -- a spec of what such a receive costs a pull relies on.
+    available <- readTVarIO (feedInput link)
+    if BS.null available
+      then do
+        ended <- readTVarIO (feedEnded link)
+        if ended then pure (Just 0) else Nothing <$ modifyIORef' (feedEmpty link) (+ 1)
       else do
+        limit <- readIORef (feedLimit link)
+        taken <- atomically $ do
+          bytes <- readTVar (feedInput link)
+          let (now, later) = BS.splitAt (min size limit) bytes
+          writeTVar (feedInput link) later
+          pure now
         BSU.unsafeUseAsCStringLen taken $ \(origin, count) -> copyBytes pointer (castPtr origin) count
         pure (Just (BS.length taken))
   sendReady link pieces = do
@@ -99,7 +111,15 @@ instance Link FeedLink where
         atomicModifyIORef' (feedSent link) (\sent -> (sent <> bytes, ()))
         pure (BS.length bytes)
   flushReady _ = pure True
-  watchReadable link = pure (Watch (readTVar (feedInput link) >>= check . not . BS.null) (pure ()))
+  watchReadable link =
+    pure $
+      Watch
+        ( do
+            bytes <- readTVar (feedInput link)
+            ended <- readTVar (feedEnded link)
+            check (not (BS.null bytes) || ended)
+        )
+        (pure ())
   watchWritable link = pure (Watch (readTVar (feedWritable link) >>= check) (pure ()))
   closeLink _ = pure ()
 
