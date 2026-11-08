@@ -187,15 +187,14 @@ spec = do
     -- All that a receive needs to allocate is its result, a 'Just' and an 'Int'.
     -- The bound leaves room for what measuring it adds, and for what the
     -- optimiser may not remove.
-    xfail "the receive takes a foreign call for each step of its loop, and allocates around each of them" $
-      it "allocates next to nothing for bytes that are ready" $
-        withServer "server" $ \sock server -> do
-          client <- connect sock server
-          allocaBytes 16384 $ \buffer -> do
-            -- The session tickets come first, and the first receive takes them.
-            receiveReady client buffer 16384 `shouldReturn` Nothing
-            costs <- replicateM 5 $ snd <$> concurrently (sendAll server [BS.replicate 8192 42]) (receiveCosts client buffer 8192)
-            maximum (concat costs) `shouldSatisfy` P.lte 128
+    it "allocates next to nothing for bytes that are ready" $
+      withServer "server" $ \sock server -> do
+        client <- connect sock server
+        allocaBytes 16384 $ \buffer -> do
+          -- The session tickets come first, and the first receive takes them.
+          receiveReady client buffer 16384 `shouldReturn` Nothing
+          costs <- replicateM 5 $ snd <$> concurrently (sendAll server [BS.replicate 8192 42]) (receiveCosts client buffer 8192)
+          maximum (concat costs) `shouldSatisfy` P.lte 128
 
   describe "a configuration" $ do
     it "keeps cached server names alive after a connection closes" $ do

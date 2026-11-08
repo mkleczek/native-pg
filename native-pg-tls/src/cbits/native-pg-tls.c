@@ -9,13 +9,13 @@
 
 #include "native-pg-tls.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
 #else
-#include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -55,6 +55,51 @@ static rustls_io_result send_vectored(void *userdata, const struct rustls_iovec 
 rustls_io_result native_pg_tls_read(struct rustls_connection *connection, int socket, size_t *received)
 {
   return rustls_connection_read_tls(connection, receive, (void *)(intptr_t)socket, received);
+}
+
+#define RECEIVE_FAILED(kind, value) (-(int64_t)(((uint64_t)(kind) << 32) | (uint32_t)(value)))
+
+/* How many times it reads the socket before it gives AGAIN. */
+#define RECEIVE_ROUNDS 16
+
+/*
+ * Reads what the connection has into the buffer, up to its size, and what the
+ * socket has into the connection first if it has none, all in one call.
+ * Gives the bytes read, 0 at the end of the stream, or WOULD_BLOCK, AGAIN
+ * after RECEIVE_ROUNDS reads that gave records without plaintext, to be called
+ * again, or an error.
+ */
+int64_t native_pg_tls_receive(struct rustls_connection *connection, int socket, uint8_t *buffer, size_t size)
+{
+  int ended = 0, rounds = 0;
+  for (;;) {
+    size_t count = 0;
+    rustls_result result = rustls_connection_read(connection, buffer, size, &count);
+    if (result == RUSTLS_RESULT_OK)
+      return (int64_t)count;
+    if (result == RUSTLS_RESULT_UNEXPECTED_EOF || (result == RUSTLS_RESULT_PLAINTEXT_EMPTY && ended))
+      return 0;
+    if (result != RUSTLS_RESULT_PLAINTEXT_EMPTY)
+      return RECEIVE_FAILED(NATIVE_PG_TLS_RECEIVE_READ_FAILED, result);
+    rustls_io_result error;
+    count = 0;
+    while ((error = native_pg_tls_read(connection, socket, &count)) == EINTR)
+      ;
+    if (error == EAGAIN || error == EWOULDBLOCK)
+      return NATIVE_PG_TLS_RECEIVE_WOULD_BLOCK;
+    if (error != 0)
+      return RECEIVE_FAILED(NATIVE_PG_TLS_RECEIVE_RECV_FAILED, error);
+    if (count == 0) {
+      ended = 1;
+      continue;
+    }
+    ended = 0;
+    result = rustls_connection_process_new_packets(connection);
+    if (result != RUSTLS_RESULT_OK)
+      return RECEIVE_FAILED(NATIVE_PG_TLS_RECEIVE_PACKETS_FAILED, result);
+    if (++rounds == RECEIVE_ROUNDS)
+      return NATIVE_PG_TLS_RECEIVE_AGAIN;
+  }
 }
 
 /* Writes what the socket takes of the connection's records. */

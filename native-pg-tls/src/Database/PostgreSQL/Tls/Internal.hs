@@ -32,10 +32,12 @@ where
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
 import Control.Exception (IOException, bracket, catch, finally, mask, mask_, onException, throwIO)
 import Control.Monad (unless, void, when)
+import Data.Bits (shiftR, (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import Data.Foldable (for_)
+import Data.Int (Int64)
 import Data.Word (Word16, Word32, Word8)
 import Database.PostgreSQL.Transport (Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel, serverEndPoint)
 import Foreign.C.ConstPtr (ConstPtr (..))
@@ -49,6 +51,7 @@ import Foreign.Marshal.Array (withArrayLen)
 import Foreign.Marshal.Utils (copyBytes, fromBool, with)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (Storable, peek, pokeByteOff)
+import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Socket (Socket, close, withFdSocket)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -240,25 +243,36 @@ handshake tls = do
           Ended -> throwIO (TlsError "the connection closed during the handshake")
 
 -- | Reads what's ready into the buffer, up to its size, without waiting:
--- 'Nothing' if nothing is, and 0 at the end of the stream.
+-- 'Nothing' if nothing is, and 0 at the end of the stream. One foreign call
+-- does it all, so that this allocates only its result.
 receiveTls :: TlsConnection -> Ptr Word8 -> Int -> IO (Maybe Int)
-receiveTls tls pointer size = go False
+receiveTls tls pointer size = do
+  -- The call neither blocks nor calls back, so the connection needs no more
+  -- than 'unsafeWithForeignPtr' to stay alive.
+  status <- withFdSocket (tlsSocket tls) $ \fd ->
+    unsafeWithForeignPtr (tlsConnection tls) $ \connection ->
+      c_receive connection fd pointer (fromIntegral size)
+  if
+    | status >= 0 -> pure (Just (fromIntegral status))
+    | status == -1 -> pure Nothing
+    | otherwise -> receiveFailed tls pointer size status
+
+-- | What a receive that gave no bytes and isn't a wait did. The statuses are
+-- native-pg-tls.h's: -2 asks to call again, and an error is
+-- @-(kind << 32 | value)@. A record that fails, or a certificate the verifier
+-- rejects, throws 'TlsError', after the alert rustls sends for it if the
+-- socket takes it at once.
+receiveFailed :: TlsConnection -> Ptr Word8 -> Int -> Int64 -> IO (Maybe Int)
+receiveFailed tls pointer size status = case negate status `shiftR` 32 of
+  0 -> receiveTls tls pointer size
+  1 -> throwIO . TlsError =<< describe value
+  2 -> do
+    void (flushTls tls) `catch` \(_ :: IOException) -> pure ()
+    throwIO . TlsError =<< describe value
+  _ -> throwIO (errnoToIOError "recv" (Errno (fromIntegral value)) Nothing Nothing)
   where
-    -- rustls asks for initialized memory, for reasons internal to Rust, but
-    -- only writes to it.
-    go ended = do
-      (result, received) <- withConnection tls $ \connection ->
-        alloca $ \out -> (,) <$> c_connection_read connection pointer (fromIntegral size) out <*> peek out
-      if
-        | result == resultOk -> pure (Just (fromIntegral received))
-        | result == resultUnexpectedEof -> pure (Just 0)
-        | result == resultPlaintextEmpty && ended -> pure (Just 0)
-        | result == resultPlaintextEmpty ->
-            readRecords tls >>= \case
-              Read -> go False
-              WouldBlock -> pure Nothing
-              Ended -> go True
-        | otherwise -> throwIO . TlsError =<< describe result
+    value = fromIntegral (negate status .&. 0xffffffff) :: Word32
+{-# NOINLINE receiveFailed #-}
 
 -- | Encrypts what it can of the pieces, and writes what the socket takes,
 -- without waiting. Gives how many bytes of the pieces it took: those not
@@ -360,10 +374,8 @@ describe result =
       len <- peek out
       peekCStringLen (buffer, fromIntegral len)
 
-resultOk, resultUnexpectedEof, resultPlaintextEmpty :: Word32
+resultOk :: Word32
 resultOk = 7000
-resultUnexpectedEof = 7010
-resultPlaintextEmpty = 7011
 
 data ClientConfigBuilder
 
@@ -475,9 +487,6 @@ foreign import capi unsafe "rustls.h rustls_connection_wants_write"
 foreign import capi unsafe "rustls.h rustls_connection_process_new_packets"
   c_connection_process_new_packets :: Ptr RustlsConnection -> IO Word32
 
-foreign import capi unsafe "rustls.h rustls_connection_read"
-  c_connection_read :: Ptr RustlsConnection -> Ptr Word8 -> CSize -> Ptr CSize -> IO Word32
-
 foreign import capi unsafe "rustls.h rustls_connection_write"
   c_connection_write :: Ptr RustlsConnection -> Ptr Word8 -> CSize -> Ptr CSize -> IO Word32
 
@@ -507,12 +516,18 @@ foreign import capi unsafe "native-pg-tls.h native_pg_tls_offer_postgresql"
 
 #if defined(mingw32_HOST_OS)
 -- Sockets block on Windows.
+foreign import capi safe "native-pg-tls.h native_pg_tls_receive"
+  c_receive :: Ptr RustlsConnection -> CInt -> Ptr Word8 -> CSize -> IO Int64
+
 foreign import capi safe "native-pg-tls.h native_pg_tls_read"
   c_read :: Ptr RustlsConnection -> CInt -> Ptr CSize -> IO CInt
 
 foreign import capi safe "native-pg-tls.h native_pg_tls_write"
   c_write :: Ptr RustlsConnection -> CInt -> Ptr CSize -> IO CInt
 #else
+foreign import capi unsafe "native-pg-tls.h native_pg_tls_receive"
+  c_receive :: Ptr RustlsConnection -> CInt -> Ptr Word8 -> CSize -> IO Int64
+
 foreign import capi unsafe "native-pg-tls.h native_pg_tls_read"
   c_read :: Ptr RustlsConnection -> CInt -> Ptr CSize -> IO CInt
 
