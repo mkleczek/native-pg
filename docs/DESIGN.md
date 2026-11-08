@@ -915,7 +915,14 @@ endingReady   :: Tx s -> IO (Maybe (Either QueryError ()))
   either: when the request has none free, it is pending, and its watch is the
   registration for one, which the input keeps, since the waits that cancel a
   watch after it fired would give the granted loan back; the next pull takes
-  it. The registration is withdrawn when the input is released.
+  it. The registration is withdrawn when the input is released. A pull that
+  follows one that was pending on the link, or left bytes of the field, retries
+  at the receive when nothing else has touched the transaction since, which
+  every operation of it tells by disarming the field first, and takes the same
+  chunks in the same sizes. It holds the loan as a wait does, and leaves a
+  buffer that is consumed to the full pull, which gives the loan back. A field
+  that is not the one armed, such as one of a row that has advanced, takes the
+  full pull, which refuses it.
 - **`endingReady`** reads what follows the body and the ending's reply when
   all of it is in the input, or arrives in receives that don't wait, and says
   nothing is there yet otherwise. It finds the ReadyForQuery that ends the

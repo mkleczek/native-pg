@@ -9,6 +9,7 @@ module Database.PostgreSQL.Internal.Context
     contextInput,
     runContextInput,
     runContextBorrowReady,
+    retryContextBorrow,
     contextBuffered,
     contextReceiveMore,
     contextWatchStall,
@@ -52,7 +53,7 @@ import Network.Streaming.Link (Interest (..))
 import qualified Network.Streaming.Link as Link (Blocked (Done))
 import Network.Streaming.Watch (Watch, anyWatch)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
-import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), Poll, Receiver (..), Stall (..), Taken, borrowInputReady, pollInput, reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedBytes, unconsumedInput, emptyInputBuffer, runInputUntil, watchInputLoan)
+import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), Poll, Receiver (..), Retry (..), Stall (..), Taken, borrowInputReady, pollInput, retryInput, reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedBytes, unconsumedInput, emptyInputBuffer, runInputUntil, watchInputLoan)
 import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
 import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, outputBufferPerOutput, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
 
@@ -163,6 +164,18 @@ runContextBorrowReady context count = do
       `catch` \(InputError reason) -> throwIO (ProtocolError reason)
   writeIORef (contextInput context) input'
   pure taken
+
+-- | Retries what 'runContextBorrowReady' found nothing to take for, or took a
+-- chunk that left bytes of the value, at the receive, as 'retryInput' does. The
+-- caller must know that nothing has touched the input since. With unsent
+-- output, which a receive moves on, it falls back.
+retryContextBorrow :: Context -> Int -> Stall -> IO Retry
+retryContextBorrow context count known = do
+  ensureContextActive context
+  previous <- readIORef (contextPending context)
+  if unsentEmpty previous
+    then retryInput (contextReceiver context) (contextInput context) count known
+    else pure FallBack
 
 -- | The bytes that the input holds and nothing has consumed.
 contextBuffered :: Context -> IO ByteString

@@ -9,7 +9,7 @@ module Database.PostgreSQL.Internal.Row
   ( Row, Column (..), DecodeRow (..),
     readRows, nextRow, startRow, finishRow, invalidateRow,
     rowColumnCount, rowValueUnread, rowUnreadBytes, nextColumn, columnBytes, columnStream, ColumnPull (..),
-    columnStreamWithChunks, columnBorrowedStream, columnChunks, withColumnStream,
+    columnStreamWithChunks, columnBorrowedStream, ColumnRetry (..), retryColumn, columnChunks, withColumnStream,
     decodeRow, decodeRowStreaming, decodeRowStreamingNullable,
     decodeRowStreamingUsing,
   ) where
@@ -30,7 +30,7 @@ import Database.PostgreSQL.Diagnostics (ServerError)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange
 import Database.PostgreSQL.Internal.Protocol.Codec
-  ( Alternatives (..), ByteStream (..), Input, Parsable (..), Stall, Taken (..),
+  ( Alternatives (..), ByteStream (..), Input, Parsable (..), Retry (..), Stall, Taken (..),
     inputPosition, readInputSome, readInputBorrowedSome, withInputSome, skipInput,
   )
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
@@ -234,6 +234,40 @@ columnBorrowedStream row = do
                 writeIORef (rowCursor row) now {cursorValueLeft = cursorValueLeft now - BS.length chunk}
                 pure (ColumnChunk chunk)
   pure (ByteStream (cursorValueLeft cursor) next, ready)
+
+-- | What the retry of a pull that was stalled on the link found.
+data ColumnRetry
+  = -- | The next chunk, not empty, borrowed until the next pull. The column has
+    -- more.
+    RetryChunk !ByteString
+  | -- | The column's last chunk.
+    RetryLast !ByteString
+  | -- | Nothing is there yet, and what to wait for is not what it was.
+    RetryStalled !Stall
+  | -- | Nothing is there yet, and what to wait for is what it was.
+    RetryWaits
+  | -- | The input is not in a state that a retry is for: the pull that goes
+    -- through every layer decides.
+    RetryFallBack
+
+-- | Retries, at the receive, the pull that a column's 'columnBorrowedStream'
+-- left stalled on the link, with what the stall was, or left bytes of the
+-- column. It takes the chunk that the pull takes. It relies on its caller
+-- knowing that nothing has touched the row or the input since that pull: it
+-- reads the cursor of the row as the pull left it, without the checks that the
+-- pull makes, and the column's end is for the pull to give. Its failures are not
+-- its own to handle: the caller invalidates the row.
+retryColumn :: Row -> Stall -> IO ColumnRetry
+retryColumn row known = do
+  now <- readIORef (rowCursor row)
+  retryContextBorrow (rowContext row) (cursorValueLeft now) known >>= \case
+    Retaken chunk -> do
+      let !left = cursorValueLeft now - BS.length chunk
+      writeIORef (rowCursor row) $! now {cursorValueLeft = left}
+      pure $! if left == 0 then RetryLast chunk else RetryChunk chunk
+    Restalled stall -> pure (RetryStalled stall)
+    StillStalled -> pure RetryWaits
+    FallBack -> pure RetryFallBack
 
 -- | Calls the consumer with successive borrowed chunks of this column.
 -- Chunks are valid only until their callback returns; copy retained bytes.

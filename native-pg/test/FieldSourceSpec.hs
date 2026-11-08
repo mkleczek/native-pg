@@ -161,11 +161,14 @@ rawWakeup size = do
 
 -- | What a pull may allocate beyond its receives: the closures of the handler
 -- it installs, the values that the receive's interface boxes and gives back,
--- and the buffer's new bounds when bytes arrived. About a tenth of what the
--- layers above the receive allocate when each of them runs again.
+-- and the buffer's new bounds when bytes arrived. Retried at the receive, a
+-- pull measures between -40 and 44 bytes more than the bare receive, in the
+-- optimised build that the suite gets; through every layer above the receive it
+-- is 248 to 1,272 bytes more, and 372 when bytes arrived. The bounds are
+-- between the two.
 extraWhenNothing, extraWhenPartial :: Int64
-extraWhenNothing = 256
-extraWhenPartial = 256
+extraWhenNothing = 128
+extraWhenPartial = 192
 
 checkExtra :: String -> Int64 -> Int64 -> IO ()
 checkExtra label extra bound =
@@ -774,41 +777,39 @@ spec = describe "a field as a pull source" $ do
     -- what these specs bound is what a pull adds to it. Pulls that are pending
     -- are repeated at every wake-up of a response, so what they add is paid
     -- many times for a large body.
-    xfail "a pull that is retried goes through every layer above the receive again, and allocates a kilobyte more than the receive" $
-      it "that received nothing allocates little more than the receive does" $ do
-        raw <- rawEmptyReceive
-        forM_ [("an empty buffer", 0), ("the start of a chunk in the buffer", 2000)] $ \(label, inBuffer) ->
-          withScarceRequests $ \_ taker _ -> withRequestFeed taker $ \link context -> do
-            let body = bodyOf 20000
-                (early, late) = BS.splitAt (fieldStart body + inBuffer) (answer [body])
-            feed link early
-            withField context $ \field -> liftIO $ do
-              let source = Tx.fieldSource field
-              (_, ended) <- pullAvailable source
-              ended `shouldBe` False
-              pulled <- allocatedBy 1000 (void (pullReady source))
-              checkExtra label (pulled - raw) extraWhenNothing
-              feed link late
-
-    xfail "a pull that is retried goes through every layer above the receive again, and allocates half a kilobyte more than its receives" $
-      it "that received bytes, but not a whole chunk, allocates little more than its receives do" $ do
-        rawEmpty <- rawEmptyReceive
-        rawBytes <- rawWakeup 64
+    it "that received nothing allocates little more than the receive does" $ do
+      raw <- rawEmptyReceive
+      forM_ [("an empty buffer", 0), ("the start of a chunk in the buffer", 2000)] $ \(label, inBuffer) ->
         withScarceRequests $ \_ taker _ -> withRequestFeed taker $ \link context -> do
           let body = bodyOf 20000
-              (early, late) = BS.splitAt (fieldStart body + 2000) (answer [body])
-              pieces = take 20 (slices 64 late)
+              (early, late) = BS.splitAt (fieldStart body + inBuffer) (answer [body])
           feed link early
           withField context $ \field -> liftIO $ do
             let source = Tx.fieldSource field
             (_, ended) <- pullAvailable source
             ended `shouldBe` False
-            pulled <- forM pieces $ \piece -> do
-              feed link piece
-              allocatedOnce (pullReady source)
-            -- the receive of the bytes, and the one after it, that finds nothing
-            checkExtra "bytes that make no chunk" (sum pulled `div` fromIntegral (length pulled) - rawBytes - rawEmpty) extraWhenPartial
-            feed link (BS.drop (sum (map BS.length pieces)) late)
+            pulled <- allocatedBy 1000 (void (pullReady source))
+            checkExtra label (pulled - raw) extraWhenNothing
+            feed link late
+
+    it "that received bytes, but not a whole chunk, allocates little more than its receives do" $ do
+      rawEmpty <- rawEmptyReceive
+      rawBytes <- rawWakeup 64
+      withScarceRequests $ \_ taker _ -> withRequestFeed taker $ \link context -> do
+        let body = bodyOf 20000
+            (early, late) = BS.splitAt (fieldStart body + 2000) (answer [body])
+            pieces = take 20 (slices 64 late)
+        feed link early
+        withField context $ \field -> liftIO $ do
+          let source = Tx.fieldSource field
+          (_, ended) <- pullAvailable source
+          ended `shouldBe` False
+          pulled <- forM pieces $ \piece -> do
+            feed link piece
+            allocatedOnce (pullReady source)
+          -- the receive of the bytes, and the one after it, that finds nothing
+          checkExtra "bytes that make no chunk" (sum pulled `div` fromIntegral (length pulled) - rawBytes - rawEmpty) extraWhenPartial
+          feed link (BS.drop (sum (map BS.length pieces)) late)
   where
     isLeft' = either (const True) (const False)
 
