@@ -18,7 +18,7 @@ module Database.PostgreSQL.Transaction
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Exception (IOException, SomeAsyncException, SomeException, finally, fromException, mask, onException, throwIO, toException, try)
+import Control.Exception (IOException, SomeAsyncException, SomeException, catch, finally, fromException, mask, onException, throwIO, toException, try)
 import Control.Monad ((>=>), unless, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.IO.Unlift (MonadUnliftIO (..))
@@ -251,7 +251,7 @@ fieldSource :: Field s -> FieldSource s
 fieldSource = FieldSource
 
 instance Source (FieldSource s) where
-  pullReady (FieldSource (Field runtime _ ready)) = runOperation runtime $ do
+  pullReady (FieldSource (Field runtime _ ready)) = runPull runtime $ do
     throwFailure runtime
     ready >>= \case
       Row.ColumnChunk chunk -> pure (Pulled chunk)
@@ -289,7 +289,7 @@ watchStalled runtime = do
 -- unread bytes of the field included, and it raises 'RowMisuse' if they don't:
 -- read the field to its end, which is what 'Ended' says, first.
 endingReady :: Tx s -> IO (Maybe (Either QueryError ()))
-endingReady (Tx runtime) = runOperation runtime (settleEnding runtime)
+endingReady (Tx runtime) = runPull runtime (settleEnding runtime)
 
 -- | A watch that fires when 'endingReady' may give more than 'Nothing' next,
 -- as 'watchSource' does for a pull: when the server has sent something, or,
@@ -415,6 +415,31 @@ runOperation runtime action = mask $ \restore -> do
         throwIO failure
       Right value -> pure value)
     `finally` writeIORef (runtimeRunning runtime) False
+
+-- | 'runOperation' for a pull or a read that never waits, which a loop repeats
+-- while it is pending, so it takes fewer steps: the same checks and the same
+-- failures, with the handler installed first, and no mask, no atomic update of
+-- the flag, and no @try@ or @finally@. One thread owns the runtime, as
+-- 'checkOwner' enforces, so plain reads and writes of the flag are enough. An
+-- exception anywhere inside is caught by the handler, which runs masked, so the
+-- flag cannot stay set. The one difference is that an asynchronous exception
+-- that arrives after the action succeeded, and before the flag is cleared,
+-- breaks the connection, as one during the action does: it can only come when
+-- the request is being aborted.
+runPull :: Runtime -> IO a -> IO a
+runPull runtime action = do
+  checkOwner runtime
+  occupied <- readIORef (runtimeRunning runtime)
+  when occupied (throwIO (SessionUnusable "a transaction operation is already active"))
+  (do
+    writeIORef (runtimeRunning runtime) True
+    result <- action
+    writeIORef (runtimeRunning runtime) False
+    pure result)
+    `catch` \(failure :: SomeException) -> do
+      writeIORef (runtimeRunning runtime) False
+      unless (recoverable failure) (abandon runtime)
+      throwIO failure
 
 recoverable :: SomeException -> Bool
 recoverable failure
