@@ -30,6 +30,7 @@ import qualified Database.PostgreSQL.Streaming as Streaming
 import Database.PostgreSQL.Transport (Address (..))
 import Database.PostgreSQL.Tls (tlsClient)
 import qualified Database.PostgreSQL.Transaction as Tx
+import GHC.Clock (getMonotonicTime)
 import Network.Socket (PortNumber)
 import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
@@ -77,6 +78,65 @@ spec port = describe "operations and transactions in a scope" $ do
       lastNames env 1 `shouldReturn` ["ready: succeeded"]
       opened env `shouldReturn` 1
       count env "scope_handled" `shouldReturn` 0
+
+    -- The failure comes after the row of the field, and nothing read it before the scope
+    -- closed, so the ending is what finds it, with the ReadyForQuery still unread.
+    xfail "the release throws the failure of the ending without rolling back, so the connection goes back to the pool with its transaction aborted" $
+      it "rolls back when the ending finds a failure after a field was read to its end, and keeps the connection" $ withEnv port 1 $ \env -> withEnv port 1 $ \admin -> do
+        pid <- backendPid env
+        kept <- newIORef Nothing
+        result <- try @Tx.QueryError $ inRequest env Tx.Read $ \checkout tx -> do
+          writeIORef kept (Just (Pool.checkoutConnection checkout))
+          Tx.runIn tx $ do
+            field <- firstField =<< Tx.pipeline (Tx.statement () failingAfterFirstRow)
+            drain (Tx.nextChunk field) (const (pure ()))
+        case result of
+          Left (Tx.QueryError _ (Tx.ServerFailed (PG.ServerError fields))) -> PG.diagnosticCode fields `shouldBe` "22012"
+          _ -> failTest "expected the division by zero of the second row"
+        lastNames env 1 `shouldReturn` ["ready: failed"]
+        stateOf admin pid `shouldReturn` Just "idle"
+        Just connection <- readIORef kept
+        PG.checkIdle connection `shouldReturn` Right ()
+        opened env `shouldReturn` 1
+        backendPid env `shouldReturn` pid
+
+    -- The server's reply to COMMIT is the failure, and the status that follows it is
+    -- idle: there is nothing to roll back, but the ReadyForQuery has to be read.
+    xfail "the release throws the failure of COMMIT without reading the ReadyForQuery that follows it, so the connection goes back to the pool with a reply unread" $
+      it "keeps the connection when the ending's COMMIT fails on a deferred constraint, as the scope closes" $ withEnv port 1 $ \env -> do
+        pid <- backendPid env
+        kept <- newIORef Nothing
+        result <- try @Tx.QueryError $ inRequest env Tx.Write $ \checkout tx -> do
+          writeIORef kept (Just (Pool.checkoutConnection checkout))
+          Tx.runIn tx $ do
+            Tx.sql "CREATE TEMP TABLE closing_parent (id int PRIMARY KEY)"
+            Tx.sql "CREATE TEMP TABLE closing_child (id int REFERENCES closing_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+            Tx.sql "INSERT INTO closing_child VALUES (1)"
+        case result of
+          Left (Tx.QueryError _ (Tx.ServerFailed (PG.ServerError fields))) -> PG.diagnosticCode fields `shouldBe` "23503"
+          _ -> failTest "expected the deferred foreign-key failure from COMMIT"
+        lastNames env 1 `shouldReturn` ["ready: failed"]
+        Just connection <- readIORef kept
+        PG.checkIdle connection `shouldReturn` Right ()
+        opened env `shouldReturn` 1
+        backendPid env `shouldReturn` pid
+
+    -- The release runs masked, but a wait for the server is interruptible: the
+    -- thread of a request that times out is interrupted in it.
+    it "breaks the connection when the thread is interrupted while the ending drains, without waiting for the rest" $ withEnv port 1 $ \env -> do
+      bodyDone <- newIORef False
+      started <- getMonotonicTime
+      outcome <- timeout 2_000_000 $ inRequest env Tx.Read $ \_ tx -> do
+        Tx.runIn tx $ do
+          field <- firstField =<< Tx.pipeline (Tx.statement () sleepingAtTheEnd)
+          drain (Tx.nextChunk field) (const (pure ()))
+        writeIORef bodyDone True
+      -- the scope was closing, and not the body running, when the timeout came
+      readIORef bodyDone `shouldReturn` True
+      outcome `shouldBe` Nothing
+      elapsed <- subtract started <$> getMonotonicTime
+      (elapsed < 10) `shouldBe` True
+      brokenAfter env
 
   describe "when the scope aborts" $ do
     it "rolls the transaction back, and gives the connection back as failed" $ withEnv port 1 $ \env -> do
@@ -317,6 +377,20 @@ count env table = inRequest env Tx.Read $ \_ tx -> Tx.runIn tx $
 connectionOf :: Env -> IO PG.Connection
 connectionOf env = inRequest env Tx.Read $ \checkout _ -> pure (Pool.checkoutConnection checkout)
 
+-- | The backend of the connection that a request runs on.
+backendPid :: Env -> IO Int64
+backendPid env = inRequest env Tx.Read $ \_ tx ->
+  Tx.runIn tx $
+    Tx.pipeline (Tx.statement () (Tx.Statement "SELECT pg_backend_pid()::bigint" (const []) (Tx.singleRow (Tx.row @'[Int64] Const))))
+      >>= Tx.singleRowValue
+
+-- | What the server says a backend is doing, as pg_stat_activity does.
+stateOf :: Env -> Int64 -> IO (Maybe Text)
+stateOf env pid = inRequest env Tx.Read $ \_ tx ->
+  Tx.runIn tx $
+    Tx.pipeline (Tx.statement () (Tx.Statement ("SELECT state FROM pg_stat_activity WHERE pid = " <> BC.pack (show pid)) (const []) (Tx.rowMaybe (Tx.row @'[Text] Const))))
+      >>= Tx.rowMaybeValue
+
 -- | The connection was closed, and the pool opens a new one for the next request.
 brokenAfter :: Env -> IO ()
 brokenAfter env = do
@@ -356,6 +430,22 @@ bodyOf size = Tx.Statement ("SELECT repeat('x', " <> BC.pack (show size) <> ")")
 
 divisionByZero :: Tx.Statement () (Const Int64)
 divisionByZero = Tx.Statement "SELECT 1 / 0" (const []) (Tx.singleRow (Tx.row @'[Int64] Const))
+
+-- | A field of the first row, and then the server's failure, which comes with the row after it.
+failingAfterFirstRow :: Tx.Statement () Body
+failingAfterFirstRow =
+  Tx.Statement
+    "SELECT (1 / (2 - s))::text FROM generate_series(1, 2) s"
+    (const [])
+    (Tx.streamingRow @'[] Body)
+
+-- | Enough rows for the server to send most of them, and then a wait of 30 seconds before the last.
+sleepingAtTheEnd :: Tx.Statement () Body
+sleepingAtTheEnd =
+  Tx.Statement
+    "SELECT (CASE WHEN s < 3000 THEN 1 ELSE (SELECT 1 FROM pg_sleep(30)) END)::text FROM generate_series(1, 3000) s"
+    (const [])
+    (Tx.streamingRow @'[] Body)
 
 sleeping :: Tx.Statement () (Const Int64)
 sleeping = Tx.Statement "SELECT 1 FROM pg_sleep(30)" (const []) (Tx.singleRow (Tx.row @'[Int64] Const))
