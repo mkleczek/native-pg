@@ -81,45 +81,43 @@ spec port = describe "operations and transactions in a scope" $ do
 
     -- The failure comes after the row of the field, and nothing read it before the scope
     -- closed, so the ending is what finds it, with the ReadyForQuery still unread.
-    xfail "the release throws the failure of the ending without rolling back, so the connection goes back to the pool with its transaction aborted" $
-      it "rolls back when the ending finds a failure after a field was read to its end, and keeps the connection" $ withEnv port 1 $ \env -> withEnv port 1 $ \admin -> do
-        pid <- backendPid env
-        kept <- newIORef Nothing
-        result <- try @Tx.QueryError $ inRequest env Tx.Read $ \checkout tx -> do
-          writeIORef kept (Just (Pool.checkoutConnection checkout))
-          Tx.runIn tx $ do
-            field <- firstField =<< Tx.pipeline (Tx.statement () failingAfterFirstRow)
-            drain (Tx.nextChunk field) (const (pure ()))
-        case result of
-          Left (Tx.QueryError _ (Tx.ServerFailed (PG.ServerError fields))) -> PG.diagnosticCode fields `shouldBe` "22012"
-          _ -> failTest "expected the division by zero of the second row"
-        lastNames env 1 `shouldReturn` ["ready: failed"]
-        stateOf admin pid `shouldReturn` Just "idle"
-        Just connection <- readIORef kept
-        PG.checkIdle connection `shouldReturn` Right ()
-        opened env `shouldReturn` 1
-        backendPid env `shouldReturn` pid
+    it "rolls back when the ending finds a failure after a field was read to its end, and keeps the connection" $ withEnv port 1 $ \env -> withEnv port 1 $ \admin -> do
+      pid <- backendPid env
+      kept <- newIORef Nothing
+      result <- try @Tx.QueryError $ inRequest env Tx.Read $ \checkout tx -> do
+        writeIORef kept (Just (Pool.checkoutConnection checkout))
+        Tx.runIn tx $ do
+          field <- firstField =<< Tx.pipeline (Tx.statement () failingAfterFirstRow)
+          drain (Tx.nextChunk field) (const (pure ()))
+      case result of
+        Left (Tx.QueryError _ (Tx.ServerFailed (PG.ServerError fields))) -> PG.diagnosticCode fields `shouldBe` "22012"
+        _ -> failTest "expected the division by zero of the second row"
+      lastNames env 1 `shouldReturn` ["ready: failed"]
+      stateOf admin pid `shouldReturn` Just "idle"
+      Just connection <- readIORef kept
+      PG.checkIdle connection `shouldReturn` Right ()
+      opened env `shouldReturn` 1
+      backendPid env `shouldReturn` pid
 
     -- The server's reply to COMMIT is the failure, and the status that follows it is
     -- idle: there is nothing to roll back, but the ReadyForQuery has to be read.
-    xfail "the release throws the failure of COMMIT without reading the ReadyForQuery that follows it, so the connection goes back to the pool with a reply unread" $
-      it "keeps the connection when the ending's COMMIT fails on a deferred constraint, as the scope closes" $ withEnv port 1 $ \env -> do
-        pid <- backendPid env
-        kept <- newIORef Nothing
-        result <- try @Tx.QueryError $ inRequest env Tx.Write $ \checkout tx -> do
-          writeIORef kept (Just (Pool.checkoutConnection checkout))
-          Tx.runIn tx $ do
-            Tx.sql "CREATE TEMP TABLE closing_parent (id int PRIMARY KEY)"
-            Tx.sql "CREATE TEMP TABLE closing_child (id int REFERENCES closing_parent(id) DEFERRABLE INITIALLY DEFERRED)"
-            Tx.sql "INSERT INTO closing_child VALUES (1)"
-        case result of
-          Left (Tx.QueryError _ (Tx.ServerFailed (PG.ServerError fields))) -> PG.diagnosticCode fields `shouldBe` "23503"
-          _ -> failTest "expected the deferred foreign-key failure from COMMIT"
-        lastNames env 1 `shouldReturn` ["ready: failed"]
-        Just connection <- readIORef kept
-        PG.checkIdle connection `shouldReturn` Right ()
-        opened env `shouldReturn` 1
-        backendPid env `shouldReturn` pid
+    it "keeps the connection when the ending's COMMIT fails on a deferred constraint, as the scope closes" $ withEnv port 1 $ \env -> do
+      pid <- backendPid env
+      kept <- newIORef Nothing
+      result <- try @Tx.QueryError $ inRequest env Tx.Write $ \checkout tx -> do
+        writeIORef kept (Just (Pool.checkoutConnection checkout))
+        Tx.runIn tx $ do
+          Tx.sql "CREATE TEMP TABLE closing_parent (id int PRIMARY KEY)"
+          Tx.sql "CREATE TEMP TABLE closing_child (id int REFERENCES closing_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+          Tx.sql "INSERT INTO closing_child VALUES (1)"
+      case result of
+        Left (Tx.QueryError _ (Tx.ServerFailed (PG.ServerError fields))) -> PG.diagnosticCode fields `shouldBe` "23503"
+        _ -> failTest "expected the deferred foreign-key failure from COMMIT"
+      lastNames env 1 `shouldReturn` ["ready: failed"]
+      Just connection <- readIORef kept
+      PG.checkIdle connection `shouldReturn` Right ()
+      opened env `shouldReturn` 1
+      backendPid env `shouldReturn` pid
 
     -- The release runs masked, but a wait for the server is interruptible: the
     -- thread of a request that times out is interrupted in it.

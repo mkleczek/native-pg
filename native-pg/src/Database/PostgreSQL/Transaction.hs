@@ -208,8 +208,10 @@ newtype Tx (s :: Type) = Tx Runtime
 --   is unread is drained, the transaction is rolled back, and the connection
 --   is as it was.
 --
--- The release fails if the ending's reply is an error, such as a deferred
--- constraint failing at COMMIT, and then the releases after it learn that the
+-- The release fails if the ending finds an error, such as a deferred constraint
+-- failing at COMMIT, or a failure of the server after the rows that were read.
+-- The transaction is rolled back first, as when the scope aborted, or abandoned
+-- if an interruption ended it, and then the releases after it learn that the
 -- scope aborted.
 transactionIn :: Scope s -> IsolationLevel -> Mode -> Session -> IO (Tx s)
 transactionIn scope isolation mode session@(Exchange.Session context) =
@@ -242,12 +244,24 @@ settleTransaction :: Runtime -> Ending -> IO ()
 settleTransaction runtime = \case
   Completed -> do
     failed <- isJust <$> readIORef (runtimeFailure runtime)
-    if failed then cleanupRuntime runtime else runOperation runtime (finishRuntime runtime)
+    if failed then cleanupRuntime runtime else finish
   Aborted failure
     | isInterrupted failure -> abandon runtime
     | otherwise -> do
         unread <- fieldUnread runtime
         if unread then abandon runtime else cleanupRuntime runtime
+  where
+    -- The first drain of the ending throws a failure that nothing has read
+    -- before it reads the ReadyForQuery that follows, so, as when the scope
+    -- aborted, the transaction is rolled back, or abandoned if an interruption
+    -- ended it.
+    finish = do
+      ended <- try @SomeException (runOperation runtime (finishRuntime runtime))
+      case ended of
+        Left failure -> do
+          if isInterrupted failure then abandon runtime else cleanupRuntime runtime
+          throwIO failure
+        Right () -> pure ()
 
 -- | Whether a field is borrowed, and has bytes left that nothing has read.
 fieldUnread :: Runtime -> IO Bool

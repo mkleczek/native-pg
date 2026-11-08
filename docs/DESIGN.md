@@ -896,12 +896,16 @@ endingReady   :: Tx s -> IO (Maybe (Either QueryError ()))
   what is unread is drained, the ending's reply is observed (queued by
   `finalPipeline`, or sent now), and the session must be idle; a transaction
   that failed on the server and whose failure the code handled is rolled back
-  instead. When it aborted, an interruption, or a field left unread in the
-  middle of its stream, abandons the transaction and breaks the connection;
-  any other failure drains and rolls back. A failing release makes the releases
-  after it learn that the scope aborted, so a connection is never given back in
-  an unknown state. `runTransaction` is unchanged: it rolls back a scope that
-  returns without finishing, where a scope that completes commits.
+  instead. An ending that finds an error that nothing had read, such as a
+  failure of the server after the rows that were read, or a deferred constraint
+  at COMMIT, fails the release; the transaction is rolled back first, as when
+  the scope aborted, and abandoned if an interruption ended it. When it
+  aborted, an interruption, or a field left unread in the middle of its stream,
+  abandons the transaction and breaks the connection; any other failure drains
+  and rolls back. A failing release makes the releases after it learn that the
+  scope aborted, so a connection is never given back in an unknown state.
+  `runTransaction` is unchanged: it rolls back a scope that returns without
+  finishing, where a scope that completes commits.
 - **`fieldSource`** is a field as a pull `Source` of streaming-io. A pull gives a
   chunk of the field as large as `nextChunk`'s: it takes the input's bytes and
   receives without waiting, for as long as bytes arrive, until it has that many,
