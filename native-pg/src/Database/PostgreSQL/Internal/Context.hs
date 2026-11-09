@@ -47,9 +47,6 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
-import Network.Streaming.Drive (Polled (..))
-import Network.Streaming.Link (Interest (..))
-import qualified Network.Streaming.Link as Link (Blocked (Done))
 import Network.Streaming.Watch (Watch, anyWatch)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
 import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), Poll, Receiver (..), Stall (..), borrowInputWaiting, pollInput, reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedBytes, unconsumedInput, emptyInputBuffer, runInputUntil, watchInputLoan)
@@ -199,16 +196,15 @@ receiverOf connection pending =
 -- moving. The caller releases it.
 contextWatchStall :: Context -> Stall -> IO Watch
 contextWatchStall context = \case
-  StallOnLink interest -> channelWatch channel interest
-  StallOnLoan Link.Done -> loan
-  StallOnLoan blocked -> anyWatch [loan, channelWatch channel (Interest False blocked)]
+  StallOnLink watch -> watch
+  StallOnLoan Nothing -> loan
+  StallOnLoan (Just output) -> anyWatch [loan, output]
   where
-    channel = connectionChannel (contextConnection context)
     loan = readIORef (contextInput context) >>= watchInputLoan
 
 -- | Takes the connection's carried-over bytes before the link's, as
 -- 'carriedInput' does.
-carriedPoll :: IORef ByteString -> (Ptr Word8 -> Int -> IO (Polled Int)) -> Ptr Word8 -> Int -> IO (Polled Int)
+carriedPoll :: IORef ByteString -> (Ptr Word8 -> Int -> IO (Either (IO Watch) Int)) -> Ptr Word8 -> Int -> IO (Either (IO Watch) Int)
 carriedPoll carry poll pointer size = do
   carried <- readIORef carry
   if BS.null carried
@@ -217,7 +213,7 @@ carriedPoll carry poll pointer size = do
       let (taken, left) = BS.splitAt size carried
       BSU.unsafeUseAsCStringLen taken $ \(origin, count) -> copyBytes pointer (castPtr origin) count
       writeIORef carry left
-      pure (Got (BS.length taken))
+      pure (Right (BS.length taken))
 
 -- | Reads the connection's carried-over bytes before the link's. A read takes
 -- no more than it asks for, and leaves the rest for the next one.

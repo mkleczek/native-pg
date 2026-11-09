@@ -53,8 +53,6 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Network.Streaming.BufferPool (BufferAccess, BufferLoan, borrowBuffer, isPrimaryLoan, loanBuffer, releaseBuffer, tryBorrowBuffer, watchBorrow)
 import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Buffer (Buffer, newBuffer)
-import Network.Streaming.Drive (Polled (..))
-import Network.Streaming.Link (Blocked (..), Interest (..))
 import Network.Streaming.Watch (Watch (..), readyNow)
 import qualified Network.Streaming.Buffer as Buffer
 import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
@@ -237,13 +235,15 @@ reusableInputBuffer storage = InputBuffer (Buffer.bufferMemory storage) (Buffer.
 unconsumedBytes :: InputBuffer -> ByteString
 unconsumedBytes buffer = slice (bufferEnd buffer - bufferStart buffer) buffer
 
--- | What a read that doesn't wait is stalled on.
+-- | What a read that doesn't wait is stalled on: the registration of a watch
+-- that fires when it may be retried.
 data Stall
-  = -- | The link has nothing: wait for the interest, and try again.
-    StallOnLink !Interest
+  = -- | The link has nothing: the watch for it and for what unsent output
+    -- waits for.
+    StallOnLink !(IO Watch)
   | -- | No loan was free to receive into. Output that is still unsent is what
     -- the read waits for as well, so that it keeps moving.
-    StallOnLoan !Blocked
+    StallOnLoan !(Maybe (IO Watch))
 
 -- | What a read that doesn't wait found.
 data Poll
@@ -259,10 +259,11 @@ data Poll
 data Receiver = Receiver
   { -- | Receives into the address, up to the size, without waiting: how many
     -- bytes, or what the link is stalled on.
-    receiveNow :: Ptr Word8 -> Int -> IO (Polled Int),
+    receiveNow :: Ptr Word8 -> Int -> IO (Either (IO Watch) Int),
     -- | Sends output that is unsent, as far as the link takes it, and gives
-    -- what it still waits for. For a read that has nowhere to receive to.
-    receivePush :: IO Blocked
+    -- a watch for what it still waits for, if it does. For a read that has
+    -- nowhere to receive to.
+    receivePush :: IO (Maybe (IO Watch))
   }
 
 -- | Like 'readInputBorrowedSome' for a value of this many bytes, but a receive
@@ -316,8 +317,8 @@ pollRetired :: Receiver -> Int -> InputBuffer -> IO (Poll, InputBuffer)
 pollRetired receiver readSize retired =
   tryAcquireInputBuffer retired >>= \case
     Nothing -> do
-      blocked <- receivePush receiver
-      pure (NotArrived (StallOnLoan blocked), retired)
+      waiting <- receivePush receiver
+      pure (NotArrived (StallOnLoan waiting), retired)
     Just buffer ->
       makeRoom readSize buffer >>= \case
         Nothing -> pure (NoRoom, buffer)
@@ -326,8 +327,8 @@ pollRetired receiver readSize retired =
             withForeignPtr (bufferMemory roomy) $ \pointer ->
               receiveNow receiver (pointer `plusPtr` bufferEnd roomy) (bufferCapacity roomy - bufferEnd roomy)
           case polled of
-            Stalled interest -> pure (NotArrived (StallOnLink interest), roomy)
-            Got received
+            Left watch -> pure (NotArrived (StallOnLink watch), roomy)
+            Right received
               | received <= 0 -> throwIO (InputError "unexpected end of input")
               | otherwise -> pure (Arrived, roomy {bufferEnd = bufferEnd roomy + received})
 

@@ -195,6 +195,8 @@ instance Link TlsConnection where
   {-# NOINLINE watchWritable #-}
   awaitAny = awaitAny . tlsSocket
   {-# INLINE awaitAny #-}
+  awaitReadOrWrite = awaitReadOrWrite . tlsSocket
+  {-# INLINE awaitReadOrWrite #-}
   receiveReady = receiveTls
   {-# INLINE receiveReady #-}
   sendReady = sendTls

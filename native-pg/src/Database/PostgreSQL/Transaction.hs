@@ -46,9 +46,7 @@ import Database.PostgreSQL.Session (Session)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Types (FormatCode (..), TransactionStatus (..))
 import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
-import Network.Streaming.Watch (Watch)
-import Network.Streaming.Link (Interest (..))
-import qualified Network.Streaming.Link as Link (Blocked (Done))
+import Network.Streaming.Watch (Watch, readyNow)
 import Network.Streaming.Source (Source (..), WaitingSource (..))
 
 -- | Work run synchronously on the thread that entered the transaction scope.
@@ -392,7 +390,7 @@ newRuntime isolation mode session =
   Runtime session <$> myThreadId <*> newIORef True <*> newIORef False
     <*> newIORef (Just (beginning isolation mode)) <*> newIORef True <*> newIORef False
     <*> newIORef False <*> newIORef [] <*> newIORef False <*> newIORef TxIdle <*> newIORef Nothing <*> newIORef False
-    <*> newIORef (StallOnLink (Interest True Link.Done))
+    <*> newIORef (StallOnLink (pure readyNow))
 
 -- | Drains and rolls back a transaction that was not finished, unless it is
 -- broken.
@@ -578,8 +576,7 @@ protectParameter runtime = \case
 data Untrusted source = Untrusted Runtime source
 
 instance Source source => Source (Untrusted source) where
-  pullReady (Untrusted runtime source) = untrusted runtime (pullReady source)
-  watchSource (Untrusted runtime source) = untrusted runtime (watchSource source)
+  pullWith (Untrusted runtime source) ready stall = untrusted runtime (pullWith source ready stall)
 
 -- | Drains the preceding pipeline, then sends these statements and Sync.
 -- The first pipeline also sends BEGIN. No results of this pipeline are read.
