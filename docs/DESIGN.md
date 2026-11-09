@@ -876,7 +876,7 @@ operationIn   :: Scope s -> BufferAccess -> Connection -> IO Session
 transactionIn :: Scope s -> IsolationLevel -> Mode -> Session -> IO (Tx s)
 runIn         :: Tx s -> Transaction s a -> IO a
 fieldSource   :: Field s -> FieldSource s
-endingReady   :: Tx s -> IO (Maybe (Either QueryError ()))
+endingWaiting :: Tx s -> (IO Watch -> IO ()) -> IO (Either QueryError ())
 ```
 
 - **`checkoutIn`** claims a connection as `useChecked` does, under the same
@@ -906,40 +906,38 @@ endingReady   :: Tx s -> IO (Maybe (Either QueryError ()))
   scope aborted, so a connection is never given back in an unknown state.
   `runTransaction` is unchanged: it rolls back a scope that returns without
   finishing, where a scope that completes commits.
-- **`fieldSource`** is a field as a pull `Source` of streaming-io. A pull gives a
+- **`fieldSource`** is a field as a `WaitingSource` of streaming-io, which is not a
+  `Source`: a pull waits in place, with the wait that its caller gives, and so
+  can't be given where a pull must give up, such as an upload. A pull gives a
   chunk of the field as large as `nextChunk`'s: it takes the input's bytes and
-  receives without waiting, for as long as bytes arrive, until it has that many,
-  or is pending, keeping what it has; the end of the field is `Ended`. Unsent
-  output is sent as the link takes it before a pull is pending, after it has
-  tried to receive. The watch of a pending pull is one watch of what it was
-  stalled on: the link readable, and while output is unsent the link writable or
-  the upload's source, since otherwise a pull could wait for the answer to a
-  request that is not fully sent. A chunk is borrowed until the next pull. The
-  thread, scope and row rules are `nextChunk`'s. A pull never waits for a loan
-  either: when the request has none free, it is pending, and its watch is the
-  registration for one, which the input keeps, since the waits that cancel a
-  watch after it fired would give the granted loan back; the next pull takes
-  it. The registration is withdrawn when the input is released. A pull that
-  follows one that was pending on the link, or left bytes of the field, retries
-  at the receive when nothing else has touched the transaction since, which
-  every operation of it tells by disarming the field first, and takes the same
-  chunks in the same sizes. It holds the loan as a wait does, and rewinds a
-  consumed buffer in place when the loan is the request's primary, where the
-  full pull gives it back and takes it again; an additional loan goes back, as
-  after every chunk. A field that is not the one armed, such as one of a row
-  that has advanced, takes the full pull, which refuses it.
-- **`endingReady`** reads what follows the body and the ending's reply when
-  all of it is in the input, or arrives in receives that don't wait, and says
-  nothing is there yet otherwise. It finds the ReadyForQuery that ends the
-  statements that were sent in the buffered bytes, and only then reads them,
-  with the code `finishTransaction` reads with, which then waits for nothing. It
-  gives `Right` once the ending was observed and `Left` for a failure of the
-  ending, e.g. a deferred constraint at COMMIT; an ending that was not queued is
-  queued by the call. The replies after the field must fit the input, or it
-  raises `RowMisuse`. `endingWatch` is the watch for what it waits for: the
-  server's bytes, or the registration for a loan when none was free to receive
-  into, as for a pull. It may move the input's bytes, so the field's last chunk
-  must be copied before it.
+  receives, for as long as bytes arrive, until it has that many, and the end of
+  the field is `Nothing`. When it has fewer and the link has nothing, it calls the
+  wait with an action that registers one watch of what it is stalled on, and tries
+  again from where it is, keeping what it has: the link readable, and while
+  output is unsent the link writable or the upload's source, since otherwise a
+  pull could wait for the answer to a request that is not fully sent. Unsent
+  output is sent as the link takes it at every try. A chunk is borrowed until
+  the next pull. The thread, scope and row rules are `nextChunk`'s. A pull waits
+  for a loan too: when the request has none free, the watch is the registration
+  for one, which the input keeps, since the waits that cancel a watch after it
+  fired would give the granted loan back; the next try takes it. The
+  registration is withdrawn when the input is released. The input holds the
+  request's primary loan across the waits and the chunks, and rewinds a consumed
+  buffer in place; an additional loan goes back before the wait, as after every
+  chunk. The wait is a part of the pull: a failure of it, like any failure of a
+  pull that is not the transaction's own, abandons the transaction and
+  invalidates the row, since the buffer that the pull was filling is not the
+  input's yet.
+- **`endingWaiting`** reads what follows the body and the ending's reply: when
+  all of it is in the input, or arrives in receives, it reads them, and otherwise
+  it waits in place, as a pull does, with the watch of what it is stalled on. It
+  finds the ReadyForQuery that ends the statements that were sent in the
+  buffered bytes, and only then reads them, with the code `finishTransaction`
+  reads with, which then waits for nothing. It gives `Right` once the ending was
+  observed and `Left` for a failure of the ending, e.g. a deferred constraint at
+  COMMIT; an ending that was not queued is queued by the call. The replies after
+  the field must fit the input, or it raises `RowMisuse`. It may move the
+  input's bytes, so the field's last chunk must be copied before it.
 
 A streamed input parameter has this shape:
 
