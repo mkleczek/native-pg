@@ -17,6 +17,7 @@ module FakeStreams
     pullCount,
     watchCounts,
     sourceOutput,
+    waitingOutput,
     sendAll,
   )
 where
@@ -36,7 +37,7 @@ import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import Network.Streaming.Link (Blocked (..), Interest (..), Link (..))
 import Network.Streaming.Output (Output (..), Uncopied (..), WriteResult (..), Writer (..))
 import Network.Streaming.Sender (Unsent, sendSome)
-import Network.Streaming.Source (AnySource (..), Pulled (..), Source (..))
+import Network.Streaming.Source (AnySource (..), AnyWaitingSource (..), Pulled (..), Source (..), WaitingSource (..))
 import Network.Streaming.Watch (Watch (..), readyNow)
 
 -- | A link that takes as many bytes from each send as it's told to, and then
@@ -162,6 +163,24 @@ instance Source FakeSource where
 sourceOutput :: Source source => Int -> source -> Output
 sourceOutput count source = Output count 0 $ \rest ->
   Writer $ \_ _ used -> pure (Yield used (UncopiedSource count (AnySource source)) rest)
+
+-- | A source that is waited for in place, which gives up what it is told to
+-- wait for: it pulls, and when it finds nothing, it calls the wait with its
+-- watch and pulls again.
+instance WaitingSource FakeSource where
+  pullWaiting source wait = loop
+    where
+      loop =
+        pullReady source >>= \case
+          Pulled chunk -> pure (Just chunk)
+          Ended -> pure Nothing
+          Pending -> wait (watchSource source) *> loop
+
+-- | An output that sends the source, which declares to give this many bytes, to
+-- be waited for in place.
+waitingOutput :: Int -> FakeSource -> Output
+waitingOutput count source = Output count 0 $ \rest ->
+  Writer $ \_ _ used -> pure (Yield used (UncopiedWaiting count (AnyWaitingSource source)) rest)
 
 -- | Sends everything, waiting on sources as the sender asks. The link is
 -- always writable.
