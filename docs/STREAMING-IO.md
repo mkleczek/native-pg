@@ -80,7 +80,7 @@ data Watch = Watch {watchReady :: STM (), watchCancel :: IO ()}
 -- | What a caller is blocked on: input, and what its output waits for.
 data Interest = Interest {interestInput :: !Bool, interestOutput :: !Blocked}
 
-data Blocked = Done | OnWritable | OnSource (IO Watch)
+data Blocked = Done | OnWritable
 ```
 
 - **One wait.** A caller works out from its state what it can react to,
@@ -93,8 +93,10 @@ data Blocked = Done | OnWritable | OnSource (IO Watch)
   registers the watches of the interest, waits on them with one `atomically`
   over their `orElse`, and releases them. The socket instance waits for one
   direction in `threadWaitRead` or `threadWaitWrite`, for both in one
-  registration with the IO manager, and on watches only for a source; with
-  nothing to wait for it returns at once. TLS delegates to its socket.
+  registration with the IO manager; with nothing to wait for it returns at once.
+  TLS delegates to its socket. `awaitReadOrWrite` is the wait for both that
+  says which fired (True if input may be retried, also when both may), for a
+  push that waits for the link and stops when the server has sent something.
 - **Watches.** The socket instance builds them from
   `threadWaitReadSTM`/`threadWaitWriteSTM` (`Socket/Link.hs:37-40`); that
   stops being private.
@@ -126,18 +128,31 @@ threshold, `outputs`. The resume rules stay as in "Bounded serialization".
 - **New in Warp:** the status line, headers, and chunked framing (size line
   and CRLF around a slice, and the final `0\r\n\r\n`) as `Output`s.
 
-### Source: pull without a callback
+### Source: a pull whose consumer decides where it stalls
 
 ```haskell
 class Source source where
-  -- | Takes the next chunk if it's available without waiting. A chunk stays
-  -- valid until the next pull from the same source or the end of its scope.
-  pullReady :: source -> IO Pulled
-  -- | After 'Pending': fires when a pull may succeed.
-  watchSource :: source -> IO Watch
+  -- | Takes the next chunk, or sees the end, and gives it to the first
+  -- continuation. With none ready it calls the stall, with the registration
+  -- of a watch and the same pull to run again. A chunk stays valid until the
+  -- next pull from the same source or the end of its scope.
+  pullWith :: source -> (Pulled -> IO a) -> (IO Watch -> IO a -> IO a) -> IO a
 
-data Pulled = Pulled !ByteString | Pending | Ended
+data Pulled = Pulled !ByteString | Ended
 ```
+
+- **The consumer decides at the stall.** It waits for the watch and runs
+  `again`, which may stall again, or it doesn't run `again` and gives its own
+  result: the next pull starts from the top. The result is returned, not passed
+  on, so a pull is one call with the source's handlers around all of it:
+  `Untrusted`'s abandon of a transaction, Warp's gate and `runPull`. Two rules
+  keep it so. A stall runs `again` before it returns, or not at all, and never
+  keeps it. The first continuation does only what has to be done with what the
+  pull found (`pure . Got`), and the consumer does the rest after it returns.
+- **Waiting for the source is a stall.** `pull` is a stall that waits and runs
+  again; `Waited` is a `WaitingSource` of a `Source` with such a wait, and has no
+  case for a pull that stopped, since its stall never does. `retrying` is
+  `pullWith` of a source made of a pull that doesn't wait and a watch.
 
 - **Lifetime by pull, not by callback.** This is the rule native-pg's
   `nextChunk` already has ("valid until the next input operation or scope
@@ -147,16 +162,16 @@ data Pulled = Pulled !ByteString | Pending | Ended
 - **What "ready" means.** A chunk as large as a blocking read of the same
   source would give: bytes already buffered, and nonblocking reads into the
   source's own loan, for as long as bytes keep arriving, until it holds that
-  many. A `Pending` pull may hold the bytes it has received, in its loan, and
+  many. A pull that stalled may hold the bytes it has received, in its loan, and
   keeps them for the next pull.
-- **Warp's request body.** `pullReady` serves read-ahead, then tries a
+- **Warp's request body.** `pullWith` serves read-ahead, then tries a
   receive that doesn't wait into the request's loan. The Content-Length and
   chunked decoders (`Conduit.hs`) were not resumable; since step 3 of the
   runner `lengthStep` and `chunkStep` keep their state as data between pulls,
-  and a pull that finds no bytes is `Pending`. Its watch is the link's
+  and a pull that finds no bytes calls the stall. Its watch is the link's
   readable watch. The graceful-shutdown give-up of `makeGracefulRecvInto` is
-  not part of a pull: `Interest` has no slot for a give-up, so the runner's
-  idle receive waits with `OnSource` of a shutdown watch.
+  not part of a pull: the runner's idle receive waits for the link's readable
+  watch and a shutdown watch directly.
 - **native-pg's response column.** `fieldSource` is the field of a row as a
   `WaitingSource` (see below), not a `Source`: `pullWaiting` gives a chunk as
   large as `nextChunk`'s, which is the field's rest or the room the input buffer
@@ -166,13 +181,11 @@ data Pulled = Pulled !ByteString | Pending | Ended
   what it has. One receive brings only what the sender sent at once, about 8 KiB
   from PostgreSQL, so a pull that gave what one receive brought gave twice the
   chunks of a 16 KiB blocking read. The watch is one watch of what the pull is
-  stalled on (`watchInterest`): the link readable, and, while output is unsent,
-  the link writable or the upload's source, so that a pull never waits for the
-  answer to a request that is not fully sent. It sends unsent output as far as
-  the link takes it at every try. `watchInterest` has one copy for each link
-  type, made where the instance is (`SPECIALIZE`, not inlined), so the
-  channel's watch picks the link's watches at compile time and passes no `Link`
-  dictionary at run time.
+  stalled on: the link readable, and, while output is unsent, the link writable
+  or the upload's source, so that a pull never waits for the answer to a request
+  that is not fully sent. The channel's poll sends unsent output as far as the
+  link takes it at every try, with stalls that stop, and gives the watch that the
+  push stopped on.
 - **Buffer loans.** A pull that needs a loan while none is free waits for it,
   with a watch on the pending borrow. `BufferAccess` gets a registering borrow:
   it joins the FIFO lane as `borrowBuffer` does today, so fairness is unchanged,
@@ -231,48 +244,48 @@ class WaitingSource source where
 
 ### Sender: gathering and partial sends
 
-Moved from `Channel.hs`: `Part`, `Unsent`, `renderOutput`, `sendSome` and
-the gather limits (16 pieces, 256 KiB).
+Moved from `Channel.hs`: `Part`, `Unsent`, `renderOutput`, and the gather limits
+(16 pieces, 256 KiB).
 
 ```haskell
--- | Sends what the link takes without waiting and says what to wait for.
-sendSome :: Link link => link -> Unsent -> IO (Unsent, Blocked)
+data Resume = Again | Stop
+data Stalls = Stalls
+  { stallWritable :: IO Resume
+  , stallSource :: IO Watch -> IO Resume }   -- the registration of the source's watch
 
--- | 'sendSome' and then 'flushReady', so that the wait it reports is enough.
-pushOutput :: Link link => link -> Unsent -> IO (Unsent, Blocked)
+data Pushed = Pushed | Stopped Unsent (IO Watch)   -- what is left, and the watch it stopped on
 
--- | Sends all of it, waiting in place with the caller's waits, and pulling a
--- 'WaitingSource' with them.
-pushAnswer :: Link link => link -> Waits -> Unsent -> IO ()
+pushWith :: Link link => link -> Stalls -> Unsent -> IO Pushed
 ```
 
-`sendSome` and `pushAnswer` are one gather. A part is a source that gives up
-(`PartSource`) or one that is waited for (`PartWaiting`); the gather is told
-how to meet what it can't go on without, by giving up and saying what to wait
-for, or by waiting where it is, and is inlined into each, so a send that gives
-up has nothing of the other. A source that is waited for can't be sent by one
-that gives up, which has nothing to wait with: that is an error at run time.
+One gather serves every caller; what differs is the stalls. Each waits and says
+`Again` or `Stop`. `stopping` never waits, `waitingStalls` waits for the link and
+the uploads as long as it takes, native-pg's read stops for the server's input,
+and Warp's answer waits with the client's input and timeout and never stops. A
+part is a source that is pulled with a stall (`PartSource`) or one that is
+waited for (`PartWaiting`), which can't be stopped: a stall that stops it is an
+error.
 
-- **Gather rule.** At a source part, pull it: `Pulled` gathers the chunk
-  behind the bytes already gathered; `Ended` checks the declared length and
-  continues; `Pending` cuts the batch, sends what was gathered, and reports
-  `OnSource` once the link has taken it. So a ready first chunk leaves with
-  the HTTP header or PostgreSQL framing in front of it, and a slow one never
-  holds them back. A source that is waited for is pulled with a wait that
-  does the same before it waits: it sends the pieces gathered before the
-  source, and flushes, waiting for the link as long as it takes, and then waits
-  for the source.
+- **Gather rule.** At a source part, pull it: a chunk is gathered behind the
+  bytes already gathered, the end checks the declared length. A pull that
+  finds nothing calls a stall that first sends what was gathered and flushes,
+  waiting for the link as its stall says, and only then calls the stall for the
+  source. So a ready first chunk leaves with the HTTP header or PostgreSQL
+  framing in front of it, and a slow one never holds them back. The pieces
+  gathered before the source are in a reference made for the pull; a stop
+  leaves in it what the link did not take.
 - **Partial sends.** The unsent tail keeps pointing at the held chunk; the
   source isn't pulled again until the chunk is fully accepted. A TLS link
   accepts by copying into rustls, so its chunks are released at once.
 - **Length checks.** A source that delivers more or fewer bytes than
   declared fails with `StreamLengthError`, for both protocols (Warp's
   "exceeded" and "ended before Content-Length" errors become this one).
-- **Flush before waiting for a source.** `pushOutput` owns the rule that
-  records the link took but hasn't written (TLS) go out before any wait for a
-  source, which they would stay behind: it reports `OnWritable` instead of
-  `OnSource` until the link is flushed, and `Done` only when nothing is
-  unsent and all is flushed. Callers don't flush.
+- **Flush.** Records the link took but hasn't written (TLS) go out before the
+  stall for a source and at the end of the push, so `Pushed` means that all is
+  sent and flushed. Callers don't flush.
+- **Stopped.** It gives back what is left, ahead of the part that stopped, and
+  the registration of the watch that it stopped on: the link writable, or the
+  source's. A push that stopped at the flush gives back nothing.
 - **No registry, no threads.** `BorrowedPull`, `waitForSourceOrReadable` and
   the thread registry in `Unsent` go away; `discardUnsent` only drops
   references.
@@ -287,8 +300,10 @@ drive :: Link link => link -> (s -> IO (Progress s a)) -> s -> IO a
 ```
 
 - **One loop.** `drive` is the only recursion and the only `awaitAny` of its
-  users. A step tries what it can and never waits: it gives the result, or
-  says whether it made progress, or what it is blocked on.
+  users. A step tries what it can and waits for nothing but what it says it is
+  blocked on: it gives the result, or says whether it made progress, or what it
+  is blocked on. (native-pg's read step waits for an upload in the stalls of its
+  push, which is part of a try, and stops it for the server's input.)
 - **`Again` goes before a wait.** It means "made progress, try again before
   waiting", for example when the rest of the output was sent and the server
   may have answered meanwhile. `Blocked` waits once for the interest and
@@ -303,18 +318,21 @@ drive :: Link link => link -> (s -> IO (Progress s a)) -> s -> IO a
 ## Drivers
 
 - **native-pg input** (`linkInputSource`), a step run by `drive`. After
-  `receiveReady` returns `Nothing`: `pushOutput`, then blocked on
-  `Interest True blocked` with what it reports, and receive again. Input is
-  tried first, as today, on the request thread. When `pushOutput` has sent the
-  rest of the output (`Done`), the step makes progress instead of blocking, so
-  it receives again without waiting, since the server may have answered
-  meanwhile: nothing waits while a read could succeed. Sending output is the
-  same step without input: ready once `pushOutput` reports `Done`, otherwise
-  blocked on `Interest False blocked`.
+  `receiveReady` returns `Nothing`: `pushWith` with the read's stalls, and
+  receive again. The stall for the link waits for it to be writable or the server
+  to have sent something (`awaitReadOrWrite`), and goes on if only the link is
+  writable; the stall for an upload waits for its watch or the server's input,
+  and goes on if the upload is ready. When the server has sent something, the
+  push stops and the step receives again: input is tried first, on the request
+  thread, so an answer is read before more is sent. When the push has sent the
+  rest of the output, the step makes progress instead of blocking, since the
+  server may have answered meanwhile. With nothing unsent the step blocks on the
+  link's input. Sending output without reading is `pushWith` with
+  `waitingStalls`.
 - **Warp response.** The application returns an `Answer`: a status, headers
-  and a body, which is a `WaitingSource`. Warp sends it with `pushAnswer` on the
-  client link, and gives it waits that do `awaitAny link (Interest input blocked)`,
-  where `blocked` is the link writable or the source's watch. The pull of the body
+  and a body, which is a `WaitingSource`. Warp sends it with `pushWith` on the
+  client link, and gives it stalls that wait for the link writable, or for the
+  source's watch and the client's input, and always go on. The pull of the body
   makes the waits, in the middle of the call, and nothing returns to a loop of
   Warp's to wait. The timeout is resumed only around waits for the link, so a
   slow database never times the client out. The runner design describes it.

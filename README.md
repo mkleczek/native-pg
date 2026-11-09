@@ -58,9 +58,11 @@ pools explicitly close their sockets; resetting a connection pool leaves it usab
 The body pool contains ordinary plus reserve buffers; setup has its own buffer
 count. All four fields use `PositiveInt`, so settings need no separate validation.
 
-Borrowed uploads take a pull source (`Network.Streaming.Source`): `pullReady`
-gives a chunk, `Pending` or `Ended` without waiting, and `watchSource` says
-when to try again. A chunk remains valid until the next pull, and the sender
+Borrowed uploads take a pull source (`Network.Streaming.Source`): `pullWith`
+gives a chunk or the end to a continuation, and when none is ready it calls a
+stall with a watch registration and the pull to run again. The consumer decides
+there: it waits and runs the pull again, in place, or it stops and gives its own
+result. A chunk remains valid until the next pull, and the sender
 pulls again only once the link has taken it. A field of a response is the other
 kind of source, a `WaitingSource`: its pull waits in place, with the wait that
 its caller gives, and it can't be given as an upload. Statements

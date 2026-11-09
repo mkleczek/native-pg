@@ -700,12 +700,17 @@ any -> Broken | Closed
   arrived. By default it waits on the watches of the interest. The socket
   chooses a cheaper wait for the interest's shape: `threadWaitRead` or
   `threadWaitWrite` for one direction, one IO-manager registration for both,
-  and watches only for a source. TLS delegates to its socket. Waiting for both
-  lets a channel send pending output while waiting for responses, so neither
-  peer has to finish sending before reading.
-- `pushOutput` sends what the link takes and then flushes it, so that the wait
-  it reports is enough: records a TLS link took but hasn't written are waited
-  for as writability, not behind the wait for a source.
+  and watches only where two events are waited for on a link without one.
+  TLS delegates to its socket. Waiting for both lets a channel send pending
+  output while waiting for responses, so neither peer has to finish sending
+  before reading. `awaitReadOrWrite` is that wait, and says which fired, so a
+  push that waits for the link can stop when the server has sent something.
+- `pushWith` sends what the link takes and flushes it, and calls the caller's
+  stalls where it can't go on: for the link, and for a source that has nothing
+  ready. A stall waits, and says whether to go on or to stop, and a stop gives
+  back what is left and the watch it stopped on. Records a TLS link took but
+  hasn't written are flushed before the wait for a source, so they don't stay
+  behind it.
 - Loops that wait are steps run by `drive` (`Network.Streaming.Drive`). A step
   tries without waiting and gives `Ready` with the result, `Again` when it made
   progress and should try again before waiting, or `Blocked` with its
@@ -742,7 +747,8 @@ any -> Broken | Closed
 - All reading is driven by client requests: the next message, the next
   column of a row, the next chunk of a stream. A request reads the socket
   only when the read buffer can't satisfy it, and waits until it can; a
-  pull source tries the read and reports `Pending` instead of waiting.
+  pull source tries the read, and when nothing is ready calls the stall of its
+  consumer, which waits and pulls again in place, or stops.
   Without a request nothing is read; a read made for a request may fill the
   read buffer up to its size.
 - The parser reads only what it needs to advance: tags, lengths and the
@@ -1151,9 +1157,11 @@ unchanged.
 `ParameterBorrowedStream length source` accepts a pull `Source`
 (`Network.Streaming.Source`). The sender pulls a chunk only when it can send
 it: a ready chunk goes in the same send as the framing before it, and a
-`Pending` pull cuts the batch, so the framing is sent at once and the driver
-waits for the source's watch or readable transport in one STM wait, reading
-earlier replies meanwhile. A chunk stays valid until the next pull, so a
+pull that finds nothing ready calls the stall of the sender, which first sends
+what is gathered, so the framing is sent at once, and then waits for the
+source's watch or readable transport in one STM wait, reading earlier replies
+meanwhile: it runs the pull again if the source fired, and stops if the server
+has sent something. A chunk stays valid until the next pull, so a
 partially sent chunk is held and its source isn't pulled again until the
 link has taken the rest. No thread is forked: the request thread drives both
 the link and the source, preserving exclusive TLS access, and teardown only
