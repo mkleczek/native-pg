@@ -8,15 +8,15 @@
 module Database.PostgreSQL.Internal.Row
   ( Row, Column (..), DecodeRow (..),
     readRows, nextRow, startRow, finishRow, invalidateRow,
-    rowColumnCount, rowValueUnread, rowUnreadBytes, nextColumn, columnBytes, columnStream, ColumnPull (..),
-    columnStreamWithChunks, columnBorrowedStream, ColumnRetry (..), retryColumn, columnChunks, withColumnStream,
+    rowColumnCount, rowValueUnread, rowUnreadBytes, nextColumn, columnBytes, columnStream,
+    columnStreamWithChunks, columnBorrowedStream, columnChunks, withColumnStream,
     decodeRow, decodeRowStreaming, decodeRowStreamingNullable,
     decodeRowStreamingUsing,
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (newMVar, takeMVar, putMVar, readMVar)
-import Control.Exception (finally, mask, onException, throwIO, uninterruptibleMask_)
+import Control.Exception (SomeException, catch, finally, fromException, mask, onException, throwIO, toException, uninterruptibleMask_)
 import Control.Monad.Except (throwError)
 import Control.Monad (join, unless, when)
 import Data.Foldable (for_)
@@ -30,7 +30,7 @@ import Database.PostgreSQL.Diagnostics (ServerError)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange
 import Database.PostgreSQL.Internal.Protocol.Codec
-  ( Alternatives (..), ByteStream (..), Input, Parsable (..), Retry (..), Stall, Taken (..),
+  ( Alternatives (..), ByteStream (..), Input, InputError (..), Parsable (..),
     inputPosition, readInputSome, readInputBorrowedSome, withInputSome, skipInput,
   )
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
@@ -195,20 +195,10 @@ columnStreamWithChunks row = do
       chunks use = currentCursor >>= \current -> borrowColumnChunks row current use
   pure (ByteStream (cursorValueLeft cursor) next, chunks)
 
--- | What a pull of a borrowed column that doesn't wait found.
-data ColumnPull
-  = -- | The next chunk, not empty, borrowed until the next pull.
-    ColumnChunk !ByteString
-  | -- | The column's end.
-    ColumnEnd
-  | -- | Nothing is there yet: what to wait for.
-    ColumnStalled !Stall
-
 -- | The current column's value as chunks borrowed until the next pull, with
--- the pull that waits, the one that doesn't, and the one that waits in place
--- with the wait it is given and gives 'Nothing' at the column's end. All
--- expire when the row or its column advances.
-columnBorrowedStream :: Row -> IO (ByteStream, IO ColumnPull, (IO Watch -> IO ()) -> IO (Maybe ByteString))
+-- the pull that waits in place with the wait it is given, and gives 'Nothing'
+-- at the column's end. Both expire when the row or its column advances.
+columnBorrowedStream :: Row -> IO (ByteStream, (IO Watch -> IO ()) -> IO (Maybe ByteString))
 columnBorrowedStream row = do
   cursor <- untakenCursor row
   writeIORef (rowCursor row) cursor {cursorValueTaken = True}
@@ -225,59 +215,24 @@ columnBorrowedStream row = do
             chunk <- inRow row (readInputBorrowedSome (cursorValueLeft now))
             writeIORef (rowCursor row) now {cursorValueLeft = cursorValueLeft now - BS.length chunk}
             pure chunk
-      ready = do
-        now <- current
-        if cursorValueLeft now == 0
-          then pure ColumnEnd
-          else
-            runContextBorrowReady (rowContext row) (cursorValueLeft now) `onException` invalidateRow row >>= \case
-              NotReady stall -> pure (ColumnStalled stall)
-              Taken chunk -> do
-                writeIORef (rowCursor row) now {cursorValueLeft = cursorValueLeft now - BS.length chunk}
-                pure (ColumnChunk chunk)
       waiting wait = do
         now <- current
         if cursorValueLeft now == 0
           then pure Nothing
           else do
-            chunk <- runContextBorrowWaiting (rowContext row) wait (cursorValueLeft now) `onException` invalidateRow row
+            chunk <- runContextBorrowWaiting (rowContext row) wait (cursorValueLeft now) `catch` failedRead row
             writeIORef (rowCursor row) now {cursorValueLeft = cursorValueLeft now - BS.length chunk}
             pure (Just chunk)
-  pure (ByteStream (cursorValueLeft cursor) next, ready, waiting)
+  pure (ByteStream (cursorValueLeft cursor) next, waiting)
 
--- | What the retry of a pull that was stalled on the link found.
-data ColumnRetry
-  = -- | The next chunk, not empty, borrowed until the next pull. The column has
-    -- more.
-    RetryChunk !ByteString
-  | -- | The column's last chunk.
-    RetryLast !ByteString
-  | -- | Nothing is there yet, and what to wait for is not what it was.
-    RetryStalled !Stall
-  | -- | Nothing is there yet, and what to wait for is what it was.
-    RetryWaits
-  | -- | The input is not in a state that a retry is for: the pull that goes
-    -- through every layer decides.
-    RetryFallBack
-
--- | Retries, at the receive, the pull that a column's 'columnBorrowedStream'
--- left stalled on the link, with what the stall was, or left bytes of the
--- column. It takes the chunk that the pull takes. It relies on its caller
--- knowing that nothing has touched the row or the input since that pull: it
--- reads the cursor of the row as the pull left it, without the checks that the
--- pull makes, and the column's end is for the pull to give. Its failures are not
--- its own to handle: the caller invalidates the row.
-retryColumn :: Row -> Stall -> IO ColumnRetry
-retryColumn row known = do
-  now <- readIORef (rowCursor row)
-  retryContextBorrow (rowContext row) (cursorValueLeft now) known >>= \case
-    Retaken chunk -> do
-      let !left = cursorValueLeft now - BS.length chunk
-      writeIORef (rowCursor row) $! now {cursorValueLeft = left}
-      pure $! if left == 0 then RetryLast chunk else RetryChunk chunk
-    Restalled stall -> pure (RetryStalled stall)
-    StillStalled -> pure RetryWaits
-    FallBack -> pure RetryFallBack
+-- | The failure of a read of the column: the row is invalid, since input may
+-- have been refilled, and an error of the input is a failure of the protocol.
+failedRead :: Row -> SomeException -> IO a
+failedRead row failure = do
+  invalidateRow row
+  throwIO $ case fromException failure of
+    Just (InputError reason) -> toException (ProtocolError reason)
+    Nothing -> failure
 
 -- | Calls the consumer with successive borrowed chunks of this column.
 -- Chunks are valid only until their callback returns; copy retained bytes.

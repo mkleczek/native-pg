@@ -8,7 +8,7 @@
 -- | Synchronous cursors that keep a transaction open until explicitly finished.
 module Database.PostgreSQL.Transaction
   ( Transaction, Pipeline, Result, Preparation, Field, Statement (..), RowDecoder,
-    Tx, transactionIn, runIn, FieldSource, fieldSource, endingReady, endingWatch, endingWaiting,
+    Tx, transactionIn, runIn, FieldSource, fieldSource, endingWaiting,
     runTransaction, statement, prepare, awaitPreparation, executePrepared, pipeline, finalPipeline,
     nextRow, discard, fieldLength, nextChunk, finishTransaction, condemn, sql,
     row, streamingRow, singleRow, rowMaybe, noResult,
@@ -39,7 +39,7 @@ import Database.PostgreSQL.Internal.Context
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Internal.Execution (Execution (..))
 import qualified Database.PostgreSQL.Internal.Execution as Execution
-import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), InputError (..), Poll (..), Stall (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), Poll (..), Stall (..))
 import Database.PostgreSQL.Internal.Row (DecodeRow (..))
 import qualified Database.PostgreSQL.Internal.Row as Row
 import Database.PostgreSQL.Session (Session)
@@ -49,8 +49,7 @@ import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
 import Network.Streaming.Watch (Watch)
 import Network.Streaming.Link (Interest (..))
 import qualified Network.Streaming.Link as Link (Blocked (Done))
-import Network.Streaming.Source (Pulled (Ended, Pulled), Source (..), WaitingSource (..))
-import qualified Network.Streaming.Source as Source
+import Network.Streaming.Source (Source (..), WaitingSource (..))
 
 -- | Work run synchronously on the thread that entered the transaction scope.
 -- 'withRunInIO' supports synchronous IO callbacks. Database operations reject
@@ -78,7 +77,7 @@ data Result tx (row :: Type -> Type) = Result Runtime Pending (RowDecoder row)
 data Preparation (tx :: Type) = Preparation Runtime Pending
 -- | A trailing field borrowed from the current row. Advancing its row,
 -- sending another pipeline or finishing the transaction expires the field.
-data Field (tx :: Type) = Field Runtime ByteStream (IO Row.ColumnPull) ((IO Watch -> IO ()) -> IO (Maybe ByteString)) Retry
+data Field (tx :: Type) = Field Runtime ByteStream ((IO Watch -> IO ()) -> IO (Maybe ByteString))
 
 data Cardinality = AnyRows | ExactlyOne | AtMostOne
 
@@ -138,36 +137,9 @@ data Runtime = Runtime
     runtimeStatus :: IORef TransactionStatus,
     runtimeFailure :: IORef (Maybe SomeException),
     runtimeBroken :: IORef Bool,
-    -- | What the last pull or read that didn't wait was stalled on, which
-    -- the next watch is for.
-    runtimeStalled :: IORef Stall,
-    -- | The field whose pull may retry at the receive, if any.
-    runtimeArmed :: IORef Armed
-  }
-
--- | A field's pull that was stalled on the link, or left bytes of the field,
--- arms the field: the next pull of it retries at the receive, and skips the
--- layers above it. That is only right while nothing has touched the
--- transaction since, as then the cursor of the field's row and the input are as
--- that pull left them, so every operation disarms first: 'runOperation', and
--- 'runPull', which the full pull itself arms at the end of. So do what ends the
--- transaction: 'abandon', 'cleanupRuntime' and 'endLife', and a retry's own
--- failure, which also leaves the row invalid. The arming holds the field's token,
--- which is its own: a field that is not the armed one, such as one of a row that
--- has advanced, takes the full pull, which refuses it.
-data Armed = Disarmed | Armed !(IORef ())
-
--- | What a field's pulls use to retry at the receive, made once with the field,
--- so that arming and a retry that finds nothing build nothing.
-data Retry = Retry
-  { retryRow :: Row.Row,
-    retryToken :: IORef (),
-    -- | The arming that holds the token.
-    retryArmed :: Armed,
-    -- | What a failure of the retry does, which always throws.
-    retryFailed :: SomeException -> IO (Maybe Pulled),
-    -- | One attempt of the retry, which a pull's handler protects.
-    retryAttempt :: IO (Maybe Pulled)
+    -- | What the last read that didn't wait was stalled on, which the next
+    -- watch is for.
+    runtimeStalled :: IORef Stall
   }
 
 -- | Holds exclusive session ownership while the transaction action runs on
@@ -269,165 +241,70 @@ fieldUnread runtime = readIORef (runtimePending runtime) >>= \case
   first : _ -> readIORef (pendingRow first) >>= maybe (pure False) Row.rowValueUnread
   [] -> pure False
 
--- | A field as a pull source: each pull takes the next chunk of the field, from
--- what the input holds and the receives that don't wait, or is pending, and the
--- field's end is 'Ended'. A chunk is as large as the one 'nextChunk' gives: a
--- pull gives it once the input holds that many bytes, receiving again without
--- waiting for as long as bytes arrive, and is pending when fewer have arrived,
--- keeping the bytes it has. A pull never waits, neither for the server nor for
--- a buffer: it sends what the link takes of unsent output, and says what it
--- is stalled on. A chunk is borrowed until the next pull, as 'nextChunk''s is,
--- and a pull may move the input's bytes. The watch of a pending pull fires when
--- the server has sent something, or, if the pull found no buffer to receive
--- into, when one is granted, and, while output is unsent, when the link is
--- writable or the source of an upload is ready.
+-- | A field as a source that is waited for in place: each pull takes the next
+-- chunk of the field, from what the input holds and the receives that follow,
+-- or 'Nothing' at the field's end. A chunk is as large as the one 'nextChunk'
+-- gives: a pull gives it once the input holds that many bytes, receiving
+-- again for as long as bytes arrive, and when fewer have arrived and the link has
+-- nothing, it calls the wait it is given, in the middle of the pull, with an
+-- action that registers a watch for what it is stalled on. That is when the
+-- server has sent something, or, if the pull found no buffer to receive into,
+-- when one is granted, and, while output is unsent, when the link is writable
+-- or the source of an upload is ready. The wait releases the watch. A chunk is
+-- borrowed until the next pull, as 'nextChunk''s is, and a pull may move the
+-- input's bytes.
 --
 -- The rules are those of 'nextChunk': the thread that began the transaction
 -- pulls, while its scope is live, and a field expires when its row advances.
 -- Reading something else of the transaction ends the field's turn, as it does
--- for 'nextChunk'.
+-- for 'nextChunk'. A failure of the wait, like any other failure of a pull
+-- that is not the transaction's own, abandons the transaction.
 newtype FieldSource (s :: Type) = FieldSource (Field s)
 
 fieldSource :: Field s -> FieldSource s
 fieldSource = FieldSource
 
-instance Source (FieldSource s) where
-  pullReady (FieldSource (Field runtime _ ready _ retry)) = do
-    armed <- readIORef (runtimeArmed runtime)
-    retried <- case armed of
-      Armed token | token == retryToken retry -> retryPull runtime retry
-      _ -> pure Nothing
-    case retried of
-      Just pulled -> pure pulled
-      Nothing -> pullThrough runtime ready retry
-  watchSource (FieldSource (Field runtime _ _ _ _)) = watchStalled runtime
-
--- | The pulls of a field that wait in place, with the rules of 'nextChunk':
--- the wait is the caller's, and a failure of it, like any other failure of
--- the pull, abandons the transaction. Nothing is armed, as nothing returns to
--- be retried, and 'runPull' disarms.
 instance WaitingSource (FieldSource s) where
-  pullWaiting (FieldSource (Field runtime _ _ waiting _)) wait =
+  pullWaiting (FieldSource (Field runtime _ waiting)) wait =
     runPull runtime (throwFailure runtime *> waiting wait)
-
--- | The pull through every layer, which arms the field's retry when what comes
--- next can be retried at the receive.
-pullThrough :: Runtime -> IO Row.ColumnPull -> Retry -> IO Pulled
-pullThrough runtime ready retry = runPull runtime $ do
-  throwFailure runtime
-  ready >>= \case
-    Row.ColumnChunk chunk -> do
-      more <- Row.rowValueUnread (retryRow retry)
-      when more (arm runtime retry)
-      pure (Pulled chunk)
-    Row.ColumnEnd -> pure Ended
-    Row.ColumnStalled stall -> do
-      writeIORef (runtimeStalled runtime) stall
-      case stall of
-        StallOnLink _ -> arm runtime retry
-        StallOnLoan _ -> pure ()
-      pure Source.Pending
-
--- | The pull of an armed field, which retries at the receive: the checks of
--- 'runPull', and the handler of the field's retry. It gives 'Nothing', having
--- changed nothing, when the input is not in a state for it.
-retryPull :: Runtime -> Retry -> IO (Maybe Pulled)
-retryPull runtime retry = do
-  checkOwner runtime
-  occupied <- readIORef (runtimeRunning runtime)
-  when occupied (throwIO (SessionUnusable "a transaction operation is already active"))
-  retryAttempt retry `catch` retryFailed retry
-
--- | What 'retryPull' protects, which is made once with the field.
-attemptRetry :: Runtime -> Retry -> IO (Maybe Pulled)
-attemptRetry runtime retry = do
-  writeIORef (runtimeRunning runtime) True
-  known <- readIORef (runtimeStalled runtime)
-  pulled <-
-    Row.retryColumn (retryRow retry) known >>= \case
-      Row.RetryChunk chunk -> pure (Just (Pulled chunk))
-      -- Nothing is left of the field: its end is for the full pull to give
-      Row.RetryLast chunk -> Just (Pulled chunk) <$ disarm runtime
-      Row.RetryStalled stall -> Just Source.Pending <$ writeIORef (runtimeStalled runtime) stall
-      Row.RetryWaits -> pure (Just Source.Pending)
-      Row.RetryFallBack -> pure Nothing
-  writeIORef (runtimeRunning runtime) False
-  pure pulled
-
--- | A field with what its pulls use to retry at the receive.
-fieldOf :: Runtime -> Row.Row -> (ByteStream, IO Row.ColumnPull, (IO Watch -> IO ()) -> IO (Maybe ByteString)) -> IO (Field tx)
-fieldOf runtime current (stream, ready, waiting) = do
-  token <- newIORef ()
-  let retry = Retry current token (Armed token) failed (attemptRetry runtime retry)
-  pure (Field runtime stream ready waiting retry)
-  where
-    -- as a failure of the full pull is handled: the row is invalid, the failure
-    -- of the input is a protocol error, and the transaction is abandoned
-    failed failure = do
-      disarm runtime
-      writeIORef (runtimeRunning runtime) False
-      Row.invalidateRow current
-      let raised = case fromException failure of
-            Just (InputError reason) -> toException (ProtocolError reason)
-            Nothing -> failure
-      unless (recoverable raised) (abandon runtime)
-      throwIO raised
-
-arm :: Runtime -> Retry -> IO ()
-arm runtime retry = writeIORef (runtimeArmed runtime) (retryArmed retry)
-
-disarm :: Runtime -> IO ()
-disarm runtime = writeIORef (runtimeArmed runtime) Disarmed
 
 -- | The transaction is over, and nothing can pull from it.
 endLife :: Runtime -> IO ()
-endLife runtime = disarm runtime *> writeIORef (runtimeLive runtime) False
+endLife runtime = writeIORef (runtimeLive runtime) False
 
--- | A watch for what the last pull or read that didn't wait was stalled on.
+-- | A watch for what the last read that didn't wait was stalled on.
 watchStalled :: Runtime -> IO Watch
 watchStalled runtime = do
   checkOwner runtime
   stall <- readIORef (runtimeStalled runtime)
   contextWatchStall (contextOf runtime) stall
 
--- | Reads what follows the body, and the ending's reply, if all of it has
--- arrived, and otherwise gives 'Nothing' without waiting: the rest of the
+-- | Reads what follows the body, and the ending's reply: the rest of the
 -- result, the replies of the statements that follow it, and the reply to
--- COMMIT, or to ROLLBACK if the transaction was condemned. It reads them when
--- they are all in the input, or arrive in receives that don't wait, up to the
--- ReadyForQuery that ends them. It waits neither for the server nor for a
--- buffer to receive into: with none free, it gives 'Nothing', and
--- 'endingWatch' fires when one is granted. Then the transaction is over: it
--- gives 'Right' if it was committed, and the failure of the ending, e.g. a
--- deferred constraint that fails at COMMIT, or of a statement before it, as
--- 'Left'. Asking again after it gave 'Just' gives the same.
+-- COMMIT, or to ROLLBACK if the transaction was condemned, up to the
+-- ReadyForQuery that ends them. When they are not all in the input, and the
+-- receives that follow bring no more, or there is no buffer to receive into, it
+-- calls the wait with an action that registers a watch for what it is stalled
+-- on, which the wait releases, and tries again, in the middle of the call, as
+-- long as it takes. That is when the server has sent something, or, if there was
+-- no buffer to receive into, when one is granted, and while output is unsent
+-- also when the link is writable or the source of an upload is ready. Then the
+-- transaction is over: it gives 'Right' if it was committed, and the failure of
+-- the ending, e.g. a deferred constraint that fails at COMMIT, or of a
+-- statement before it, as 'Left'. Asking again after it gave an outcome gives
+-- the same.
 --
 -- The ending is the one that 'finalPipeline' queued with the statements. If
 -- none was queued, it's queued now, without waiting for what was sent before
--- it, and its reply is waited for as a reply that hasn't arrived. A pull that
--- is pending, and a watch for it, are for 'endingWatch'.
+-- it, and its reply is waited for as a reply that hasn't arrived.
 --
 -- What it reads is in the input, which it may move: a chunk of the field
 -- that was borrowed before is not valid any more, and the last one has to be
 -- copied. The replies that follow the field have to fit what the input holds,
 -- unread bytes of the field included, and it raises 'RowMisuse' if they don't:
--- read the field to its end, which is what 'Ended' says, first.
-endingReady :: Tx s -> IO (Maybe (Either QueryError ()))
-endingReady (Tx runtime) = runPull runtime (settleEnding runtime)
-
--- | A watch that fires when 'endingReady' may give more than 'Nothing' next,
--- as 'watchSource' does for a pull: when the server has sent something, or,
--- if there was no buffer to receive into, when one is granted, and while output
--- is unsent also when the link is writable or the source of an upload is
--- ready. The caller releases it.
-endingWatch :: Tx s -> IO Watch
-endingWatch (Tx runtime) = watchStalled runtime
-
--- | 'endingReady' that waits for the reply in place: when it has not arrived, or
--- there is no buffer to receive into, it calls the wait with an action that
--- registers a watch for what the pull is stalled on, which the wait releases,
--- and tries again, so it always gives the outcome of the ending. A failure of the
--- wait, like any other failure of the pull, abandons the transaction.
+-- read the field to its end, which is what 'pullWaiting' says first. A failure
+-- of the wait, like any other failure of a pull that is not the transaction's
+-- own, abandons the transaction.
 endingWaiting :: Tx s -> (IO Watch -> IO ()) -> IO (Either QueryError ())
 endingWaiting (Tx runtime) wait = runPull runtime loop
   where
@@ -516,13 +393,11 @@ newRuntime isolation mode session =
     <*> newIORef (Just (beginning isolation mode)) <*> newIORef True <*> newIORef False
     <*> newIORef False <*> newIORef [] <*> newIORef False <*> newIORef TxIdle <*> newIORef Nothing <*> newIORef False
     <*> newIORef (StallOnLink (Interest True Link.Done))
-    <*> newIORef Disarmed
 
 -- | Drains and rolls back a transaction that was not finished, unless it is
 -- broken.
 cleanupRuntime :: Runtime -> IO ()
 cleanupRuntime runtime = do
-  disarm runtime
   complete <- readIORef (runtimeEnded runtime)
   broken <- readIORef (runtimeBroken runtime)
   unless (complete || broken) $ do
@@ -543,7 +418,6 @@ operation action = Transaction (ReaderT (\runtime -> runOperation runtime (actio
 
 runOperation :: Runtime -> IO a -> IO a
 runOperation runtime action = mask $ \restore -> do
-  disarm runtime
   checkOwner runtime
   occupied <- atomicModifyIORef' (runtimeRunning runtime) (True,)
   when occupied (throwIO (SessionUnusable "a transaction operation is already active"))
@@ -568,7 +442,6 @@ runOperation runtime action = mask $ \restore -> do
 -- the request is being aborted.
 runPull :: Runtime -> IO a -> IO a
 runPull runtime action = do
-  disarm runtime
   checkOwner runtime
   occupied <- readIORef (runtimeRunning runtime)
   when occupied (throwIO (SessionUnusable "a transaction operation is already active"))
@@ -593,7 +466,6 @@ recoverable failure
 
 abandon :: Runtime -> IO ()
 abandon runtime = do
-  disarm runtime
   complete <- readIORef (runtimeEnded runtime)
   unless complete $ do
     writeIORef (runtimeBroken runtime) True
@@ -998,14 +870,14 @@ unexpectedRows (Result owner pending _) count = operation $ \runtime -> do
 
 -- | The field's declared byte length, independent of how much was consumed.
 fieldLength :: Field tx -> Int
-fieldLength (Field _ stream _ _ _) = byteStreamLength stream
+fieldLength (Field _ stream _) = byteStreamLength stream
 
 -- | Pulls one borrowed chunk, or an empty chunk at field EOF. Its bytes are
 -- valid until the next input operation (including nextChunk, nextRow,
 -- pipeline or finishTransaction) or the enclosing scope ends. Copy before
 -- retaining them across such an operation. EOF does not imply success.
 nextChunk :: Field tx -> Transaction tx ByteString
-nextChunk (Field owner stream _ _ _) = operation $ \runtime -> do
+nextChunk (Field owner stream _) = operation $ \runtime -> do
   sameScope owner runtime
   throwFailure runtime
   byteStreamNext stream
@@ -1024,8 +896,11 @@ streamingRow :: forall columns row. DecodeRow columns => (forall tx. RowFunction
 streamingRow construct = RowDecoder AnyRows decode
   where
     decode :: forall tx. Runtime -> Row.Row -> IO (Either DecodingError (row tx))
-    decode runtime current = Row.decodeRowStreamingUsing @columns @(Field tx) @(row tx) (\column -> Row.columnBorrowedStream column >>= fieldOf runtime column) current
+    decode runtime current = Row.decodeRowStreamingUsing @columns @(Field tx) @(row tx) borrowed current
       (mapRowFunction @columns @(Maybe (Field tx) -> row tx) @(Maybe (Field tx) -> IO (row tx)) (fmap pure) (construct @tx))
+      where
+        borrowed column = field <$> Row.columnBorrowedStream column
+        field (stream, waiting) = Field runtime stream waiting
 
 {-# INLINE streamingRow #-}
 

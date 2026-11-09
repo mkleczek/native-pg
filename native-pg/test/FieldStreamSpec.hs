@@ -109,16 +109,16 @@ spec = describe "borrowed field streams" $ do
         pure ()) ()
       case result of Left (RowMisuse _) -> pure (); _ -> failTest "failed parser left a recoverable row"
 
-  it "invalidates a row after a pull that doesn't wait fails" $
+  it "invalidates a row after a pull in place fails" $
     withResponse (message 50 "" <> BS.singleton 68 <> number 106 <> "\0\1" <> number 100 <> "short") $ \context _ -> do
       -- The stream ends inside the field
       _ <- try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
-        (_, pullNow, _) <- PG.columnBorrowedStream row
-        try @ConnectionError pullNow >>= \case
+        (_, pullNow) <- PG.columnBorrowedStream row
+        try @ConnectionError (pullNow (\_ -> pure ())) >>= \case
           Left (ProtocolError _) -> pure ()
           other -> failTest ("the pull gave " <> either show (const "a result") other)
-        try @ConnectionError pullNow >>= \case
+        try @ConnectionError (pullNow (\_ -> pure ())) >>= \case
           Left (RowMisuse _) -> pure ()
           other -> failTest ("the row was usable after a failed pull: " <> either show (const "a result") other)) ()
       pure ()

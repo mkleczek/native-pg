@@ -8,9 +8,7 @@ module Database.PostgreSQL.Internal.Context
     contextConnection,
     contextInput,
     runContextInput,
-    runContextBorrowReady,
     runContextBorrowWaiting,
-    retryContextBorrow,
     contextBuffered,
     contextReceiveMore,
     contextWatchStall,
@@ -54,7 +52,7 @@ import Network.Streaming.Link (Interest (..))
 import qualified Network.Streaming.Link as Link (Blocked (Done))
 import Network.Streaming.Watch (Watch, anyWatch)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
-import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), Poll, Receiver (..), Retry (..), Stall (..), Taken, borrowInputReady, borrowInputWaiting, pollInput, retryInput, reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedBytes, unconsumedInput, emptyInputBuffer, runInputUntil, watchInputLoan)
+import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), Poll, Receiver (..), Stall (..), borrowInputWaiting, pollInput, reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedBytes, unconsumedInput, emptyInputBuffer, runInputUntil, watchInputLoan)
 import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
 import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, outputBufferPerOutput, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
 
@@ -152,52 +150,28 @@ runContextInput context limit parse = do
   pure result
 
 -- | Takes the next bytes of a value of this many bytes that lies in the input,
--- as a borrowed chunk, without waiting: as many as a blocking read takes, of
--- what the input holds and what receives that don't wait bring, or else what
--- to wait for. Pending output is sent as the link takes it, as a read sends
--- it.
-runContextBorrowReady :: Context -> Int -> IO Taken
-runContextBorrowReady context count = do
-  ensureContextActive context
-  input <- readIORef (contextInput context)
-  (taken, input') <-
-    borrowInputReady (contextReceiver context) (contextReadSize context) count input
-      `catch` \(InputError reason) -> throwIO (ProtocolError reason)
-  writeIORef (contextInput context) input'
-  pure taken
-
--- | 'runContextBorrowReady' that waits in place: when nothing is ready, it
--- calls the wait with a watch for what the read is stalled on, and tries again,
--- as long as it takes. The wait is the caller's, and it runs with the read in
--- the middle of its work, so it must not touch the connection.
+-- as a borrowed chunk, as many as a blocking read takes, of what the input holds
+-- and what receives bring. When nothing is ready, it calls the wait with a
+-- watch for what the read is stalled on, and tries again, as long as it takes.
+-- Pending output is sent as the link takes it, as a read sends it. The wait is
+-- the caller's, and it runs with the read in the middle of its work, so it
+-- must not touch the connection. An error of the input is an 'InputError',
+-- which the caller makes a failure of the protocol.
 runContextBorrowWaiting :: Context -> (IO Watch -> IO ()) -> Int -> IO ByteString
 runContextBorrowWaiting context wait count = do
   ensureContextActive context
   input <- readIORef (contextInput context)
   (chunk, input') <-
     borrowInputWaiting (contextReceiver context) (wait . contextWatchStall context) (contextReadSize context) count input
-      `catch` \(InputError reason) -> throwIO (ProtocolError reason)
   writeIORef (contextInput context) input'
   pure chunk
-
--- | Retries what 'runContextBorrowReady' found nothing to take for, or took a
--- chunk that left bytes of the value, at the receive, as 'retryInput' does. The
--- caller must know that nothing has touched the input since. With unsent
--- output, which a receive moves on, it falls back.
-retryContextBorrow :: Context -> Int -> Stall -> IO Retry
-retryContextBorrow context count known = do
-  ensureContextActive context
-  previous <- readIORef (contextPending context)
-  if unsentEmpty previous
-    then retryInput (contextReceiver context) (contextInput context) count known
-    else pure FallBack
 
 -- | The bytes that the input holds and nothing has consumed.
 contextBuffered :: Context -> IO ByteString
 contextBuffered context = unconsumedBytes <$> readIORef (contextInput context)
 
 -- | Receives once into the input, without waiting and without consuming
--- anything, as 'runContextBorrowReady' does.
+-- anything.
 contextReceiveMore :: Context -> IO Poll
 contextReceiveMore context = do
   ensureContextActive context

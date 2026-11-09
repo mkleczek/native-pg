@@ -9,7 +9,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), IOException, evaluate, throwIO, try)
-import Control.Monad (forM_, void)
+import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -21,7 +21,7 @@ import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import FeedSupport
-import Network.Streaming.BufferPool (BufferAccess, borrowBuffer, tryBorrowBuffer, watchBorrow)
+import Network.Streaming.BufferPool (BufferAccess, borrowBuffer, tryBorrowBuffer)
 import Network.Streaming.Scope (withScope)
 import Network.Streaming.Source (Pulled (..), Source (..), WaitingSource (..))
 import Network.Streaming.Watch (Watch (..), awaitWatch)

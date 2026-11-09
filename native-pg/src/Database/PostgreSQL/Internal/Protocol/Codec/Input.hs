@@ -29,13 +29,9 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     readInputWord32,
     Poll (..),
     Receiver (..),
-    Retry (..),
     Stall (..),
-    Taken (..),
-    borrowInputReady,
     borrowInputWaiting,
     pollInput,
-    retryInput,
     watchInputLoan,
     unconsumedBytes,
     runBodyParser,
@@ -54,7 +50,6 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Word (Word8, Word16, Word32)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
-import Data.Maybe (isJust)
 import Network.Streaming.BufferPool (BufferAccess, BufferLoan, borrowBuffer, isPrimaryLoan, loanBuffer, releaseBuffer, tryBorrowBuffer, watchBorrow)
 import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Buffer (Buffer, newBuffer)
@@ -270,45 +265,20 @@ data Receiver = Receiver
     receivePush :: IO Blocked
   }
 
--- | The bytes that 'borrowInputReady' took, or what to wait for.
-data Taken
-  = -- | Not empty, and valid until the next read, as 'readInputBorrowedSome''s are.
-    Taken !ByteString
-  | NotReady !Stall
-
--- | Like 'readInputBorrowedSome' for a value of this many bytes, but it never
--- waits. It gives the bytes that 'readInputBorrowedSome' gives, once the
--- buffer holds that many: it receives, without waiting, for as long as bytes
--- arrive, and if it has fewer when none do, it says what to wait for, and
--- keeps what it has received for the next try. So its chunks are as large as
--- the blocking read's, and not as small as what one receive brings. The count
--- has to be the bytes that remain of a value that lies within the input. The
--- read size is the size of a new buffer, as 'inputReadSize' is.
-borrowInputReady :: Receiver -> Int -> Int -> InputBuffer -> IO (Taken, InputBuffer)
-borrowInputReady receiver readSize count previous = restoreWorkspace previous >>= retireConsumed >>= go
-  where
-    go buffer
-      | buffered > 0 && buffered >= size = pure (Taken (slice size buffer), consume size buffer)
-      | otherwise =
-          pollInput receiver readSize buffer >>= \case
-            (Arrived, filled) -> go filled
-            (NotArrived stalled, kept) -> pure (NotReady stalled, kept)
-            (NoRoom, _) -> throwIO (InputError "an empty buffer has no room")
-      where
-        buffered = bufferEnd buffer - bufferStart buffer
-        -- as 'someInput' takes it: the count, or what the buffer has room for
-        size = min count (bufferCapacity buffer - bufferStart buffer)
-
--- | 'borrowInputReady' that waits in place: when a receive finds nothing, it
--- calls the wait with what the read is stalled on, and tries again from where
--- it is, as long as it takes, so it always gives the bytes. The wait must
--- leave the input as it is.
+-- | Like 'readInputBorrowedSome' for a value of this many bytes, but a receive
+-- that finds nothing calls the wait with what the read is stalled on, and tries
+-- again from where it is, as long as it takes, so it always gives the bytes.
+-- The chunks are as large as the blocking read's: it receives for as long as
+-- bytes arrive and the chunk is not complete, and keeps what it has received
+-- while it waits. The count has to be the bytes that remain of a value that
+-- lies within the input. The read size is the size of a new buffer, as
+-- 'inputReadSize' is. The wait must leave the input as it is.
 --
--- As 'retryInput' does, it keeps the loan across the waits, and across the
--- chunks: when nothing is left of the buffer, and the loan is the request's
--- primary, or there is none, it rewinds the buffer in place, which is the
--- layout that a new loan has, and does not give the loan back and take it
--- again. An additional loan goes back.
+-- It keeps the loan across the waits, and across the chunks: when nothing is
+-- left of the buffer, and the loan is the request's primary, or there is none,
+-- it rewinds the buffer in place, which is the layout that a new loan has, and
+-- does not give the loan back and take it again. An additional loan goes back
+-- before the wait, for a request that waits for it.
 borrowInputWaiting :: Receiver -> (Stall -> IO ()) -> Int -> Int -> InputBuffer -> IO (ByteString, InputBuffer)
 borrowInputWaiting receiver wait readSize count previous = restoreWorkspace previous >>= start >>= go
   where
@@ -361,88 +331,6 @@ pollRetired receiver readSize retired =
               | received <= 0 -> throwIO (InputError "unexpected end of input")
               | otherwise -> pure (Arrived, roomy {bufferEnd = bufferEnd roomy + received})
 
--- | What 'retryInput' found.
-data Retry
-  = -- | The bytes that 'borrowInputReady' would take: not empty, and valid until
-    -- the next read.
-    Retaken !ByteString
-  | -- | Nothing arrived, and the link is stalled on something other than what
-    -- the caller kept: this is what it is stalled on now.
-    Restalled !Stall
-  | -- | Nothing arrived, and the link is stalled on what the caller kept.
-    StillStalled
-  | -- | The input is not in a state that a retry is for: the caller does what
-    -- 'borrowInputReady' does.
-    FallBack
-
--- | Retries a read that 'borrowInputReady' left stalled on the link, or that
--- took a chunk and left bytes of the value, at the receive, in the input that
--- the reference holds, which it keeps up to date. It takes the chunk that
--- 'borrowInputReady' takes, of the same size, and receives, without waiting,
--- for as long as bytes arrive and the chunk is not complete. A retry that finds
--- nothing allocates only what the receive does, and writes nothing when the link
--- is stalled on what the caller kept.
---
--- It holds the loan the input has, as a read does while it waits for the link.
--- When nothing is left of the buffer, and the loan is the request's primary, it
--- does not give it back and take it again, as 'borrowInputReady' does: it
--- rewinds the buffer in place, which is the layout that a new loan has, so the
--- chunks are the same. An additional loan, and anything else that it would have
--- to reshape or replace, it leaves to 'borrowInputReady'.
---
--- The caller must know that nothing has touched the input since the read that
--- it retries. The count has to be the bytes that remain of a value that lies
--- within the input, as for 'borrowInputReady'.
-retryInput :: Receiver -> IORef InputBuffer -> Int -> Stall -> IO Retry
-retryInput Receiver {receiveNow = receive} reference !count known = readIORef reference >>= start
-  where
-    start buffer
-      | isJust (bufferHome buffer) || bufferCapacity buffer == 0 = pure FallBack
-      | consumed buffer = do
-          held <- holdable buffer
-          if held
-            then do
-              let rewound = buffer {bufferStart = 0, bufferEnd = 0}
-              writeIORef reference rewound
-              go rewound
-            else pure FallBack
-      | otherwise = go buffer
-    -- What 'retireConsumed' gives the loan back for, and 'makeRoom' makes room
-    -- of by moving nothing.
-    consumed buffer =
-      bufferStart buffer == bufferEnd buffer
-        && bufferStart buffer > 0
-        && (isJust (bufferRequest buffer) || bufferEnd buffer == bufferCapacity buffer)
-    go buffer
-      | buffered > 0 && buffered >= size = do
-          writeIORef reference (consume size buffer)
-          pure (Retaken (slice size buffer))
-      -- it would have to grow, or move what it holds
-      | bufferEnd buffer == bufferCapacity buffer = pure FallBack
-      | otherwise = do
-          -- The receive is an unknown call that may throw, so the storage is
-          -- kept alive by the reference, which holds it until the buffer is
-          -- replaced, and not by 'withForeignPtr', which would allocate. The
-          -- receive is taken from its record where the function begins, so that
-          -- the optimiser has no case of the record in the loop to copy it for.
-          polled <-
-            unsafeWithForeignPtr (bufferMemory buffer) $ \pointer ->
-              receive (pointer `plusPtr` bufferEnd buffer) (bufferCapacity buffer - bufferEnd buffer)
-          case polled of
-            Stalled !interest -> case known of
-              StallOnLink previous | sameInterest previous interest -> pure StillStalled
-              _ -> pure (Restalled (StallOnLink interest))
-            Got received
-              | received <= 0 -> throwIO (InputError "unexpected end of input")
-              | otherwise -> do
-                  let filled = buffer {bufferEnd = bufferEnd buffer + received}
-                  writeIORef reference filled
-                  go filled
-      where
-        buffered = bufferEnd buffer - bufferStart buffer
-        -- as 'borrowInputReady' takes it
-        size = min count (bufferCapacity buffer - bufferStart buffer)
-
 -- | Whether a consumed buffer may be reused where it is: it is not storage
 -- that allocates, which is never written over, since the values it gave out
 -- are slices of it, and it holds no loan, or the request's own, which no
@@ -454,15 +342,6 @@ holdable buffer
   | otherwise = case bufferRequest buffer of
       Nothing -> pure True
       Just (RequestBuffer _ slot _) -> maybe False isPrimaryLoan <$> readIORef slot
-
--- | Whether two interests are the same wait. An interest in what a source
--- offers is never the same as another, as its watch is made anew.
-sameInterest :: Interest -> Interest -> Bool
-sameInterest (Interest input blocked) (Interest input' blocked') =
-  input == input' && case (blocked, blocked') of
-    (Done, Done) -> True
-    (OnWritable, OnWritable) -> True
-    _ -> False
 
 makeRoom :: Int -> InputBuffer -> IO (Maybe InputBuffer)
 makeRoom readSize buffer
