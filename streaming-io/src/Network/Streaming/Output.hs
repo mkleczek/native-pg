@@ -34,7 +34,7 @@ import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Foreign.Storable (pokeByteOff)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
-import Network.Streaming.Source (AnySource)
+import Network.Streaming.Source (AnySource, AnyWaitingSource)
 import System.IO.Unsafe (unsafeDupablePerformIO)
 
 -- | Bytes that arrive in chunks, with their total length known up front.
@@ -77,6 +77,9 @@ data Uncopied
   | UncopiedStream ByteStream
   | -- | A pull source, and how many bytes it declares it will give.
     UncopiedSource !Int !AnySource
+  | -- | A source that is waited for in place, and how many bytes it declares
+    -- it will give.
+    UncopiedWaiting !Int !AnyWaitingSource
 
 instance Semigroup Output where
   Output leftLength leftCopied left <> Output rightLength rightCopied right =
@@ -111,6 +114,7 @@ outputByteString output = unsafeDupablePerformIO $ do
     uncopiedBytes (UncopiedBytes value) = value
     uncopiedBytes (UncopiedStream _) = error "an output with streams has no byte string"
     uncopiedBytes (UncopiedSource _ _) = error "an output with streams has no byte string"
+    uncopiedBytes (UncopiedWaiting _ _) = error "an output with streams has no byte string"
 
 -- | Each value's output, one after another. Compute sizes without retaining
 -- a serializer for every value; build their writers as the sender advances.
