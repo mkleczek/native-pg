@@ -33,6 +33,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     Stall (..),
     Taken (..),
     borrowInputReady,
+    borrowInputWaiting,
     pollInput,
     retryInput,
     watchInputLoan,
@@ -298,6 +299,36 @@ borrowInputReady receiver readSize count previous = restoreWorkspace previous >>
         -- as 'someInput' takes it: the count, or what the buffer has room for
         size = min count (bufferCapacity buffer - bufferStart buffer)
 
+-- | 'borrowInputReady' that waits in place: when a receive finds nothing, it
+-- calls the wait with what the read is stalled on, and tries again from where
+-- it is, as long as it takes, so it always gives the bytes. The wait must
+-- leave the input as it is.
+--
+-- As 'retryInput' does, it keeps the loan across the waits, and across the
+-- chunks: when nothing is left of the buffer, and the loan is the request's
+-- primary, or there is none, it rewinds the buffer in place, which is the
+-- layout that a new loan has, and does not give the loan back and take it
+-- again. An additional loan goes back.
+borrowInputWaiting :: Receiver -> (Stall -> IO ()) -> Int -> Int -> InputBuffer -> IO (ByteString, InputBuffer)
+borrowInputWaiting receiver wait readSize count previous = restoreWorkspace previous >>= start >>= go
+  where
+    start buffer
+      | bufferStart buffer == bufferEnd buffer =
+          holdable buffer >>= \case
+            True -> pure buffer {bufferStart = 0, bufferEnd = 0}
+            False -> retireConsumed buffer
+      | otherwise = pure buffer
+    go buffer
+      | buffered > 0 && buffered >= size = pure (slice size buffer, consume size buffer)
+      | otherwise =
+          pollRetired receiver readSize buffer >>= \case
+            (Arrived, filled) -> go filled
+            (NotArrived stalled, kept) -> wait stalled *> go kept
+            (NoRoom, _) -> throwIO (InputError "an empty buffer has no room")
+      where
+        buffered = bufferEnd buffer - bufferStart buffer
+        size = min count (bufferCapacity buffer - bufferStart buffer)
+
 -- | Receives once, without waiting, into the free part of the buffer, after
 -- it takes a loan if it has none, and makes room if none is free. The
 -- consumed bytes make way for them, in a reusable buffer by moving the
@@ -308,6 +339,11 @@ borrowInputReady receiver readSize count previous = restoreWorkspace previous >>
 pollInput :: Receiver -> Int -> InputBuffer -> IO (Poll, InputBuffer)
 pollInput receiver readSize previous = do
   retired <- retireConsumed =<< restoreWorkspace previous
+  pollRetired receiver readSize retired
+
+-- | 'pollInput' of a buffer that is retired already, or is to be kept as it is.
+pollRetired :: Receiver -> Int -> InputBuffer -> IO (Poll, InputBuffer)
+pollRetired receiver readSize retired =
   tryAcquireInputBuffer retired >>= \case
     Nothing -> do
       blocked <- receivePush receiver
@@ -371,16 +407,6 @@ retryInput Receiver {receiveNow = receive} reference !count known = readIORef re
               go rewound
             else pure FallBack
       | otherwise = go buffer
-    -- Whether a consumed buffer may be reused where it is: it is not storage
-    -- that allocates, which is never written over, since the values it gave out
-    -- are slices of it, and it holds no loan, or the request's own, which no
-    -- other request waits for. An additional loan goes back, as it does after
-    -- every chunk.
-    holdable buffer
-      | not (bufferReusable buffer) = pure False
-      | otherwise = case bufferRequest buffer of
-          Nothing -> pure True
-          Just (RequestBuffer _ slot _) -> maybe False isPrimaryLoan <$> readIORef slot
     -- What 'retireConsumed' gives the loan back for, and 'makeRoom' makes room
     -- of by moving nothing.
     consumed buffer =
@@ -416,6 +442,18 @@ retryInput Receiver {receiveNow = receive} reference !count known = readIORef re
         buffered = bufferEnd buffer - bufferStart buffer
         -- as 'borrowInputReady' takes it
         size = min count (bufferCapacity buffer - bufferStart buffer)
+
+-- | Whether a consumed buffer may be reused where it is: it is not storage
+-- that allocates, which is never written over, since the values it gave out
+-- are slices of it, and it holds no loan, or the request's own, which no
+-- other request waits for. An additional loan goes back, as it does after
+-- every chunk.
+holdable :: InputBuffer -> IO Bool
+holdable buffer
+  | not (bufferReusable buffer) = pure False
+  | otherwise = case bufferRequest buffer of
+      Nothing -> pure True
+      Just (RequestBuffer _ slot _) -> maybe False isPrimaryLoan <$> readIORef slot
 
 -- | Whether two interests are the same wait. An interest in what a source
 -- offers is never the same as another, as its watch is made anew.

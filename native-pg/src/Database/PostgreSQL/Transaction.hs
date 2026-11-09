@@ -49,7 +49,7 @@ import Network.Streaming.Scope (Ending (..), Scope, acquireIn, owned)
 import Network.Streaming.Watch (Watch)
 import Network.Streaming.Link (Interest (..))
 import qualified Network.Streaming.Link as Link (Blocked (Done))
-import Network.Streaming.Source (Pulled (Ended, Pulled), Source (..))
+import Network.Streaming.Source (Pulled (Ended, Pulled), Source (..), WaitingSource (..))
 import qualified Network.Streaming.Source as Source
 
 -- | Work run synchronously on the thread that entered the transaction scope.
@@ -78,7 +78,7 @@ data Result tx (row :: Type -> Type) = Result Runtime Pending (RowDecoder row)
 data Preparation (tx :: Type) = Preparation Runtime Pending
 -- | A trailing field borrowed from the current row. Advancing its row,
 -- sending another pipeline or finishing the transaction expires the field.
-data Field (tx :: Type) = Field Runtime ByteStream (IO Row.ColumnPull) Retry
+data Field (tx :: Type) = Field Runtime ByteStream (IO Row.ColumnPull) ((IO Watch -> IO ()) -> IO (Maybe ByteString)) Retry
 
 data Cardinality = AnyRows | ExactlyOne | AtMostOne
 
@@ -292,7 +292,7 @@ fieldSource :: Field s -> FieldSource s
 fieldSource = FieldSource
 
 instance Source (FieldSource s) where
-  pullReady (FieldSource (Field runtime _ ready retry)) = do
+  pullReady (FieldSource (Field runtime _ ready _ retry)) = do
     armed <- readIORef (runtimeArmed runtime)
     retried <- case armed of
       Armed token | token == retryToken retry -> retryPull runtime retry
@@ -300,7 +300,15 @@ instance Source (FieldSource s) where
     case retried of
       Just pulled -> pure pulled
       Nothing -> pullThrough runtime ready retry
-  watchSource (FieldSource (Field runtime _ _ _)) = watchStalled runtime
+  watchSource (FieldSource (Field runtime _ _ _ _)) = watchStalled runtime
+
+-- | The pulls of a field that wait in place, with the rules of 'nextChunk':
+-- the wait is the caller's, and a failure of it, like any other failure of
+-- the pull, abandons the transaction. Nothing is armed, as nothing returns to
+-- be retried, and 'runPull' disarms.
+instance WaitingSource (FieldSource s) where
+  pullWaiting (FieldSource (Field runtime _ _ waiting _)) wait =
+    runPull runtime (throwFailure runtime *> waiting wait)
 
 -- | The pull through every layer, which arms the field's retry when what comes
 -- next can be retried at the receive.
@@ -347,11 +355,11 @@ attemptRetry runtime retry = do
   pure pulled
 
 -- | A field with what its pulls use to retry at the receive.
-fieldOf :: Runtime -> Row.Row -> (ByteStream, IO Row.ColumnPull) -> IO (Field tx)
-fieldOf runtime current (stream, ready) = do
+fieldOf :: Runtime -> Row.Row -> (ByteStream, IO Row.ColumnPull, (IO Watch -> IO ()) -> IO (Maybe ByteString)) -> IO (Field tx)
+fieldOf runtime current (stream, ready, waiting) = do
   token <- newIORef ()
   let retry = Retry current token (Armed token) failed (attemptRetry runtime retry)
-  pure (Field runtime stream ready retry)
+  pure (Field runtime stream ready waiting retry)
   where
     -- as a failure of the full pull is handled: the row is invalid, the failure
     -- of the input is a protocol error, and the transaction is abandoned
@@ -977,14 +985,14 @@ unexpectedRows (Result owner pending _) count = operation $ \runtime -> do
 
 -- | The field's declared byte length, independent of how much was consumed.
 fieldLength :: Field tx -> Int
-fieldLength (Field _ stream _ _) = byteStreamLength stream
+fieldLength (Field _ stream _ _ _) = byteStreamLength stream
 
 -- | Pulls one borrowed chunk, or an empty chunk at field EOF. Its bytes are
 -- valid until the next input operation (including nextChunk, nextRow,
 -- pipeline or finishTransaction) or the enclosing scope ends. Copy before
 -- retaining them across such an operation. EOF does not imply success.
 nextChunk :: Field tx -> Transaction tx ByteString
-nextChunk (Field owner stream _ _) = operation $ \runtime -> do
+nextChunk (Field owner stream _ _ _) = operation $ \runtime -> do
   sameScope owner runtime
   throwFailure runtime
   byteStreamNext stream

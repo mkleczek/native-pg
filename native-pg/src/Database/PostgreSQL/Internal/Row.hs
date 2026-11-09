@@ -35,6 +35,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec
   )
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
+import Network.Streaming.Watch (Watch)
 
 data RowsMessage
   = RowStarted Int32 Int
@@ -204,9 +205,10 @@ data ColumnPull
     ColumnStalled !Stall
 
 -- | The current column's value as chunks borrowed until the next pull, with
--- the pull that waits, and the one that doesn't. Both expire when the row or
--- its column advances.
-columnBorrowedStream :: Row -> IO (ByteStream, IO ColumnPull)
+-- the pull that waits, the one that doesn't, and the one that waits in place
+-- with the wait it is given and gives 'Nothing' at the column's end. All
+-- expire when the row or its column advances.
+columnBorrowedStream :: Row -> IO (ByteStream, IO ColumnPull, (IO Watch -> IO ()) -> IO (Maybe ByteString))
 columnBorrowedStream row = do
   cursor <- untakenCursor row
   writeIORef (rowCursor row) cursor {cursorValueTaken = True}
@@ -233,7 +235,15 @@ columnBorrowedStream row = do
               Taken chunk -> do
                 writeIORef (rowCursor row) now {cursorValueLeft = cursorValueLeft now - BS.length chunk}
                 pure (ColumnChunk chunk)
-  pure (ByteStream (cursorValueLeft cursor) next, ready)
+      waiting wait = do
+        now <- current
+        if cursorValueLeft now == 0
+          then pure Nothing
+          else do
+            chunk <- runContextBorrowWaiting (rowContext row) wait (cursorValueLeft now) `onException` invalidateRow row
+            writeIORef (rowCursor row) now {cursorValueLeft = cursorValueLeft now - BS.length chunk}
+            pure (Just chunk)
+  pure (ByteStream (cursorValueLeft cursor) next, ready, waiting)
 
 -- | What the retry of a pull that was stalled on the link found.
 data ColumnRetry

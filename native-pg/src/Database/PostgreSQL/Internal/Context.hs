@@ -9,6 +9,7 @@ module Database.PostgreSQL.Internal.Context
     contextInput,
     runContextInput,
     runContextBorrowReady,
+    runContextBorrowWaiting,
     retryContextBorrow,
     contextBuffered,
     contextReceiveMore,
@@ -53,7 +54,7 @@ import Network.Streaming.Link (Interest (..))
 import qualified Network.Streaming.Link as Link (Blocked (Done))
 import Network.Streaming.Watch (Watch, anyWatch)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
-import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), Poll, Receiver (..), Retry (..), Stall (..), Taken, borrowInputReady, pollInput, retryInput, reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedBytes, unconsumedInput, emptyInputBuffer, runInputUntil, watchInputLoan)
+import Database.PostgreSQL.Internal.Protocol.Codec (Output, Input, InputBuffer, InputError (..), InputSource (..), Poll, Receiver (..), Retry (..), Stall (..), Taken, borrowInputReady, borrowInputWaiting, pollInput, retryInput, reusableInputBuffer, requestInputBuffer, releaseInputBuffer, unconsumedBytes, unconsumedInput, emptyInputBuffer, runInputUntil, watchInputLoan)
 import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
 import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, outputBufferPerOutput, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
 
@@ -164,6 +165,20 @@ runContextBorrowReady context count = do
       `catch` \(InputError reason) -> throwIO (ProtocolError reason)
   writeIORef (contextInput context) input'
   pure taken
+
+-- | 'runContextBorrowReady' that waits in place: when nothing is ready, it
+-- calls the wait with a watch for what the read is stalled on, and tries again,
+-- as long as it takes. The wait is the caller's, and it runs with the read in
+-- the middle of its work, so it must not touch the connection.
+runContextBorrowWaiting :: Context -> (IO Watch -> IO ()) -> Int -> IO ByteString
+runContextBorrowWaiting context wait count = do
+  ensureContextActive context
+  input <- readIORef (contextInput context)
+  (chunk, input') <-
+    borrowInputWaiting (contextReceiver context) (wait . contextWatchStall context) (contextReadSize context) count input
+      `catch` \(InputError reason) -> throwIO (ProtocolError reason)
+  writeIORef (contextInput context) input'
+  pure chunk
 
 -- | Retries what 'runContextBorrowReady' found nothing to take for, or took a
 -- chunk that left bytes of the value, at the receive, as 'retryInput' does. The

@@ -114,7 +114,7 @@ spec = describe "borrowed field streams" $ do
       -- The stream ends inside the field
       _ <- try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
-        (_, pullNow) <- PG.columnBorrowedStream row
+        (_, pullNow, _) <- PG.columnBorrowedStream row
         try @ConnectionError pullNow >>= \case
           Left (ProtocolError _) -> pure ()
           other -> failTest ("the pull gave " <> either show (const "a result") other)
