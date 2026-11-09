@@ -9,25 +9,21 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), IOException, evaluate, throwIO, try)
-import Control.Monad (forM, forM_, replicateM_, void, when)
+import Control.Monad (forM_, void)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Int (Int64)
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust, isNothing)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
-import Database.PostgreSQL.Internal.Channel (Channel (..), newChannel)
 import Database.PostgreSQL.Internal.Context (Connection (..), Context, SessionState (..), contextConnection)
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import FeedSupport
-import Foreign.Marshal.Alloc (allocaBytes)
-import GHC.Conc (getAllocationCounter)
 import Network.Streaming.BufferPool (BufferAccess, borrowBuffer, tryBorrowBuffer, watchBorrow)
 import Network.Streaming.Scope (withScope)
-import Network.Streaming.Source (Pulled (..), Source (..), pull)
+import Network.Streaming.Source (Pulled (..), Source (..), WaitingSource (..))
 import Network.Streaming.Watch (Watch (..), awaitWatch)
 import Skeletest hiding (context)
 import System.Timeout (timeout)
@@ -61,44 +57,61 @@ withField context use =
       Just (Body (Just field)) -> use field <* Tx.finishTransaction
       _ -> liftIO (failTest "the row has no field")
 
--- | Pulls until the source is pending or ended, copying each chunk, and says
--- which.
-pullAvailable :: Source source => source -> IO ([BS.ByteString], Bool)
-pullAvailable source = go []
-  where
-    go chunks =
-      pullReady source >>= \case
-        Pulled chunk -> evaluate (BS.copy chunk) >>= \copied -> go (copied : chunks)
-        Pending -> pure (reverse chunks, False)
-        Ended -> pure (reverse chunks, True)
-
 -- | What a pull found, with the chunk copied.
-data Step = Chunk BS.ByteString | Waits | Over
+data Step = Chunk BS.ByteString | Over
   deriving (Eq)
 
 instance Show Step where
   show (Chunk chunk) = "Chunk of " <> show (BS.length chunk) <> " bytes"
-  show Waits = "Waits"
   show Over = "Over"
 
--- | One pull, which has to return at once, as a pull never waits.
-step :: Source source => source -> IO Step
-step source =
-  timeout 1_000_000 (pullReady source) >>= \case
-    Nothing -> failTest "the pull waited"
-    Just (Pulled chunk) -> Chunk <$> evaluate (BS.copy chunk)
-    Just Pending -> pure Waits
-    Just Ended -> pure Over
+-- | A wait that fails the spec: the pull may not wait.
+noWait :: IO Watch -> IO ()
+noWait _ = failTest "the pull waited"
+
+-- | One pull, with the wait it is given.
+stepWith :: WaitingSource source => (IO Watch -> IO ()) -> source -> IO Step
+stepWith wait source =
+  pullWaiting source wait >>= \case
+    Nothing -> pure Over
+    Just chunk -> Chunk <$> evaluate (BS.copy chunk)
+
+-- | One pull that has to return without a wait, as the input has what it needs.
+step :: WaitingSource source => source -> IO Step
+step = stepWith noWait
+
+-- | One pull that has to give a chunk, without a wait.
+stepChunk :: WaitingSource source => source -> IO BS.ByteString
+stepChunk source =
+  step source >>= \case
+    Chunk chunk -> pure chunk
+    Over -> failTest "the field ended"
+
+-- | The chunks until the end of the field, copied, with the wait that the pulls are given.
+chunksWith :: WaitingSource source => (IO Watch -> IO ()) -> source -> IO [BS.ByteString]
+chunksWith wait source = go []
+  where
+    go chunks =
+      stepWith wait source >>= \case
+        Chunk chunk -> go (chunk : chunks)
+        Over -> pure (reverse chunks)
+
+-- | The chunks until the end of the field, which the pulls have to give without a wait.
+chunks :: WaitingSource source => source -> IO [BS.ByteString]
+chunks = chunksWith noWait
 
 -- | The sizes of the chunks that pulls give, until the end of the field.
-pulledSizes :: Source source => source -> IO [Int]
-pulledSizes source = go []
-  where
-    go sizes =
-      step source >>= \case
-        Chunk chunk -> go (BS.length chunk : sizes)
-        Waits -> failTest "the pull was pending, though the link has the bytes"
-        Over -> pure (reverse sizes)
+pulledSizes :: WaitingSource source => source -> IO [Int]
+pulledSizes source = map BS.length <$> chunks source
+
+-- | The wait of an answer that arrives in pieces: it feeds the next piece to the
+-- link, and waits for the watch of the pull, which has fired by then.
+feeding :: FeedLink -> IORef [BS.ByteString] -> IO Watch -> IO ()
+feeding link pieces register = do
+  readIORef pieces >>= \case
+    [] -> pure ()
+    piece : rest -> writeIORef pieces rest *> feed link piece
+  awaitWatch register
 
 -- | The sizes of the chunks that 'Tx.nextChunk' gives, until the end of the field.
 blockingSizes :: Tx.Field tx -> Tx.Transaction tx [Int]
@@ -109,77 +122,14 @@ blockingSizes field = go []
         if BS.null chunk then pure (reverse sizes) else go (BS.length chunk : sizes)
 
 -- | The sizes of the chunks that pulls give while the answer arrives in pieces
--- of this size, with the pulls of a wake-up after each piece.
+-- of this size.
 piecewiseSizes :: Int -> FeedLink -> Context -> BS.ByteString -> IO [Int]
 piecewiseSizes size link context body = do
   -- the row's header, and some of the field, which the first receive brings together
   let (header, rest) = BS.splitAt (fieldStart body + 500) (answer [body])
   feed link header
-  withField context $ \field -> liftIO $ do
-    let source = Tx.fieldSource field
-    sizes <- newIORef []
-    forM_ (slices size rest) $ \piece -> do
-      feed link piece
-      (chunks, _) <- pullAvailable source
-      modifyIORef' sizes (<> map BS.length chunks)
-    (chunks, ended) <- pullAvailable source
-    ended `shouldBe` True
-    (<> map BS.length chunks) <$> readIORef sizes
-
--- | The bytes that the action allocated on this thread, on average over this
--- many runs.
-allocatedBy :: Int -> IO () -> IO Int64
-allocatedBy runs action = do
-  before <- getAllocationCounter
-  loop runs
-  after <- getAllocationCounter
-  pure ((before - after) `div` fromIntegral runs)
-  where
-    loop :: Int -> IO ()
-    loop 0 = pure ()
-    loop n = action *> loop (n - 1)
-
--- | The bytes that the action allocated on this thread.
-allocatedOnce :: IO a -> IO Int64
-allocatedOnce action = do
-  before <- getAllocationCounter
-  _ <- action
-  after <- getAllocationCounter
-  pure (before - after)
-
--- | What a receive on a link of its own allocates, when the link has nothing.
-rawEmptyReceive :: IO Int64
-rawEmptyReceive = do
-  link <- newFeedLink
-  let channel = newChannel link
-  allocaBytes 128 $ \pointer -> allocatedBy 1000 (void (channelReceiveReady channel pointer 128))
-
--- | What a receive on a link of its own allocates, when it has this many bytes.
-rawWakeup :: Int -> IO Int64
-rawWakeup size = do
-  link <- newFeedLink
-  let channel = newChannel link
-  allocaBytes size $ \pointer -> do
-    costs <- forM [1 .. 20 :: Int] $ \_ -> do
-      feed link (BS.replicate size 65)
-      allocatedOnce (channelReceiveReady channel pointer size)
-    pure (sum costs `div` 20)
-
--- | What a pull may allocate beyond its receives: the closures of the handler
--- it installs, the values that the receive's interface boxes and gives back,
--- and the buffer's new bounds when bytes arrived. Retried at the receive, a
--- pull measures between -40 and 44 bytes more than the bare receive, in the
--- optimised build that the suite gets; through every layer above the receive it
--- is 248 to 1,272 bytes more, and 372 when bytes arrived. The bounds are
--- between the two.
-extraWhenNothing, extraWhenPartial :: Int64
-extraWhenNothing = 128
-extraWhenPartial = 192
-
-checkExtra :: String -> Int64 -> Int64 -> IO ()
-checkExtra label extra bound =
-  when (extra > bound) $
-    failTest (label <> ": a pull allocated " <> show extra <> " bytes more than its receives, which may be " <> show bound)
+  pieces <- newIORef (slices size rest)
+  withField context $ \field -> liftIO $ map BS.length <$> chunksWith (feeding link pieces) (Tx.fieldSource field)
 
 -- | Where a body starts in the answer.
 fieldStart :: BS.ByteString -> Int
@@ -217,51 +167,43 @@ starvedWith queued taker link context body use = do
   readIORef outcome >>= maybe (failTest "the scope ended early") pure
 
 spec :: Spec
-spec = describe "a field as a pull source" $ do
+spec = describe "a field as a source that is waited for in place" $ do
   it "gives the bytes that the input holds without receiving, and ends at the field's end" $
     withFeed 4096 $ \link context -> do
       let body = bodyOf 300
       feed link (answer [body])
       withField context $ \field -> liftIO $ do
         emptyBefore <- emptyReceives link
-        (chunks, ended) <- pullAvailable (Tx.fieldSource field)
-        BS.concat chunks `shouldBe` body
-        ended `shouldBe` True
+        received <- chunks (Tx.fieldSource field)
+        BS.concat received `shouldBe` body
         -- Everything came from the one receive that read the row
         emptyReceives link `shouldReturn` emptyBefore
 
-  it "is pending when it holds less than a blocking read gives and nothing can be received" $
+  it "waits when it holds less than a blocking read gives and nothing can be received" $
     withFeed 64 $ \link context -> do
       let body = bodyOf 300
           response = answer [body]
           (early, late) = BS.splitAt (BS.length response - 100) response
       feed link early
       withField context $ \field -> liftIO $ do
-        let source = Tx.fieldSource field
-        (first, endedEarly) <- pullAvailable source
-        endedEarly `shouldBe` False
-        -- It tried to receive, and found nothing, before it was pending
-        (> 0) <$> emptyReceives link `shouldReturn` True
-        feed link late
-        (rest, ended) <- pullAvailable source
-        ended `shouldBe` True
-        BS.concat (first <> rest) `shouldBe` body
+        waits <- newIORef (0 :: Int)
+        let wait register = do
+              -- It tried to receive, and found nothing, before it waited
+              (> 0) <$> emptyReceives link `shouldReturn` True
+              modifyIORef' waits (+ 1)
+              feed link late
+              awaitWatch register
+        received <- chunksWith wait (Tx.fieldSource field)
+        BS.concat received `shouldBe` body
+        readIORef waits `shouldReturn` 1
 
-  it "is never pending while the link has the bytes, though the buffer is smaller than the field" $
+  it "never waits while the link has the bytes, though the buffer is smaller than the field" $
     withFeed 64 $ \link context -> do
       let body = bodyOf 5000
       feed link (answer [body])
       withField context $ \field -> liftIO $ do
-        pendings <- newIORef (0 :: Int)
-        let go chunks = pullReady (Tx.fieldSource field) >>= \case
-              Pulled chunk -> evaluate (BS.copy chunk) >>= \copied -> go (copied : chunks)
-              Pending -> do
-                modifyIORef' pendings (+ 1)
-                count <- readIORef pendings
-                if count > 100 then failTest "the pull stayed pending" else go chunks
-              Ended -> pure (BS.concat (reverse chunks))
-        go [] `shouldReturn` body
-        readIORef pendings `shouldReturn` 0
+        received <- chunks (Tx.fieldSource field)
+        BS.concat received `shouldBe` body
 
   it "pulls a field larger than the buffer to its end, exactly, as the bytes arrive" $
     withFeed 1024 $ \link context -> do
@@ -269,11 +211,8 @@ spec = describe "a field as a pull source" $ do
           response = answer [body]
       _ <- forkIO $ mapM_ (\piece -> feed link piece *> threadDelay 50) (slices 700 response)
       withField context $ \field -> liftIO $ do
-        let source = Tx.fieldSource field
-            go chunks = pull source >>= \case
-              Just chunk -> evaluate (BS.copy chunk) >>= \copied -> go (copied : chunks)
-              Nothing -> pure (BS.concat (reverse chunks))
-        timeout 5_000_000 (go []) `shouldReturn` Just body
+        received <- timeout 5_000_000 (chunksWith awaitWatch (Tx.fieldSource field))
+        BS.concat <$> received `shouldBe` Just body
 
   it "gives a chunk that lasts until the next pull" $
     withFeed 128 $ \link context -> do
@@ -281,28 +220,29 @@ spec = describe "a field as a pull source" $ do
       feed link (answer [body])
       withField context $ \field -> liftIO $ do
         let source = Tx.fieldSource field
-        pullReady source >>= \case
-          Pulled first -> do
+        pullWaiting source noWait >>= \case
+          Just first -> do
             first `shouldBe` BS.take (BS.length first) body
             let taken = BS.length first
-            pullReady source >>= \case
-              Pulled second -> second `shouldBe` BS.take (BS.length second) (BS.drop taken body)
-              _ -> failTest "the second pull gave no chunk"
-          _ -> failTest "the first pull gave no chunk"
+            pullWaiting source noWait >>= \case
+              Just second -> second `shouldBe` BS.take (BS.length second) (BS.drop taken body)
+              Nothing -> failTest "the second pull gave no chunk"
+          Nothing -> failTest "the first pull gave no chunk"
 
-  it "fires the watch of a pending pull when the server sends, and releases it" $
+  it "gives the watch of what it waits for, which fires when the server sends, and is released" $
     withFeed 64 $ \link context -> do
       let response = answer [bodyOf 300]
           (early, late) = BS.splitAt (BS.length response - 100) response
       feed link early
       withField context $ \field -> liftIO $ do
-        let source = Tx.fieldSource field
-        _ <- pullAvailable source
-        watch <- watchSource source
-        timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-        feed link late
-        timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-        watchCancel watch
+        let wait register = do
+              watch <- register
+              timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
+              feed link late
+              timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
+              watchCancel watch
+        received <- chunksWith wait (Tx.fieldSource field)
+        BS.concat received `shouldBe` bodyOf 300
 
   it "expires when its row advances" $
     withFeed 4096 $ \link context -> do
@@ -312,7 +252,7 @@ spec = describe "a field as a pull source" $ do
         Tx.nextRow cursor >>= \case
           Just (Body (Just field)) -> do
             _ <- Tx.nextRow cursor
-            failure <- liftIO (try @ConnectionError (pullReady (Tx.fieldSource field)))
+            failure <- liftIO (try @ConnectionError (pullWaiting (Tx.fieldSource field) noWait))
             Tx.finishTransaction
             pure failure
           _ -> liftIO (failTest "the row has no field")
@@ -321,21 +261,15 @@ spec = describe "a field as a pull source" $ do
         Left other -> failTest ("unexpected failure: " <> show other)
         Right _ -> failTest "a field of a row that advanced was pulled"
 
-  it "rejects a pull and a watch from another thread" $
+  it "rejects a pull from another thread" $
     withFeed 4096 $ \link context -> do
       feed link (answer [bodyOf 100])
       withField context $ \field -> liftIO $ do
-        let source = Tx.fieldSource field
         pulled <- newEmptyMVar
-        watched <- newEmptyMVar
-        _ <- forkIO (try @ConnectionError (void (pullReady source)) >>= putMVar pulled)
-        _ <- forkIO (try @ConnectionError (void (watchSource source)) >>= putMVar watched)
+        _ <- forkIO (try @ConnectionError (void (pullWaiting (Tx.fieldSource field) noWait)) >>= putMVar pulled)
         takeMVar pulled >>= \case
           Left (SessionUnusable _) -> pure ()
           other -> failTest ("another thread pulled: " <> show (either show (const "ok") other))
-        takeMVar watched >>= \case
-          Left (SessionUnusable _) -> pure ()
-          other -> failTest ("another thread watched: " <> show (either show (const "ok") other))
 
   describe "chunks" $ do
     it "are as large as a blocking read's, though the link delivers 8 KiB with each receive" $ do
@@ -361,12 +295,11 @@ spec = describe "a field as a pull source" $ do
         withField context $ \field -> liftIO $ do
           let source = Tx.fieldSource field
               full = 16384 - fieldStart body
-          -- 8 KiB is all that the link has, and it is only half of a chunk
-          emptyBefore <- emptyReceives link
-          step source `shouldReturn` Waits
-          (> emptyBefore) <$> emptyReceives link `shouldReturn` True
-          feed link (BS.take 8192 late)
-          step source `shouldReturn` Chunk (BS.take full body)
+              wait _ = do
+                -- 8 KiB is all that the link has, and it is only half of a chunk
+                (> 0) <$> emptyReceives link `shouldReturn` True
+                feed link (BS.take 8192 late)
+          stepWith wait source `shouldReturn` Chunk (BS.take full body)
           -- what the transaction's end drains
           feed link (BS.drop 8192 late)
 
@@ -382,46 +315,110 @@ spec = describe "a field as a pull source" $ do
           let source = Tx.fieldSource field
           step source `shouldReturn` Chunk (BS.take full body)
           -- a thousand bytes of the 3,658 that the field has left
-          step source `shouldReturn` Waits
-          feed link late
-          step source `shouldReturn` Chunk (BS.drop full body)
+          stepWith (\_ -> feed link late) source `shouldReturn` Chunk (BS.drop full body)
           step source `shouldReturn` Over
 
   describe "without a buffer to receive into" $ do
-    it "is pending without waiting, and its watch fires when a buffer is returned" $
+    it "waits for a buffer, and its watch fires when one is returned" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
         withRequestFeed reader $ \link context -> do
           let body = bodyOf 10000
+              response = answer [body]
           starved taker link context body $ \source registration -> do
-            step source `shouldReturn` Waits
-            watch <- watchSource source
-            timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-            -- a pull while the registration is pending doesn't try, which would fail
-            step source `shouldReturn` Waits
-            watchCancel registration
-            timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-            watchCancel watch
+            let wait register = do
+                  watch <- register
+                  timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
+                  watchCancel registration
+                  timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
+                  watchCancel watch
+                  feed link (BS.drop scarceSize response)
+            stepWith wait source `shouldReturn` Chunk (BS.take scarceSize (BS.drop (scarceSize - fieldStart body) body))
 
-    it "keeps its place in the queue and its buffer when a wait releases the watch after it fired" $
+    it "keeps its place in the queue and its buffer when its wait releases the watch after it fired" $
       withScarceRequests $ \reader taker rival -> do
         _ <- borrowBuffer reader
         withRequestFeed reader $ \link context -> do
           let body = bodyOf 10000
               response = answer [body]
           starved taker link context body $ \source registration -> do
-            step source `shouldReturn` Waits
-            feed link (BS.drop scarceSize response)
-            -- the wait registers the watch, and releases it once it has fired
-            watch <- watchSource source
-            rivalRegistration <- queueFor rival
-            watchCancel registration
-            awaitWatch (pure watch)
-            -- a release that returned the buffer would have given it to the rival
-            timeout 50_000 (atomically (watchReady rivalRegistration)) `shouldReturn` Nothing
-            step source `shouldReturn` Chunk (BS.take scarceSize (BS.drop (scarceSize - fieldStart body) body))
+            let wait register = do
+                  feed link (BS.drop scarceSize response)
+                  -- the wait registers the watch, and releases it once it has fired
+                  watch <- register
+                  rivalRegistration <- queueFor rival
+                  watchCancel registration
+                  awaitWatch (pure watch)
+                  -- a release that returned the buffer would have given it to the rival
+                  timeout 50_000 (atomically (watchReady rivalRegistration)) `shouldReturn` Nothing
+            stepWith wait source `shouldReturn` Chunk (BS.take scarceSize (BS.drop (scarceSize - fieldStart body) body))
 
-    it "gives an additional loan back at the pull after each consumed buffer, though the field is armed, and a queued request gets it" $
+    it "withdraws its registration for a buffer when its scope ends" $
+      withScarceRequests $ \reader taker _ -> do
+        _ <- borrowBuffer reader
+        registration <- withRequestFeed reader $ \link context ->
+          starved taker link context (bodyOf 10000) $ \source registration -> do
+            -- the wait registers for a buffer, and the pull is interrupted
+            _ <- try @AsyncException (stepWith (\register -> void register *> throwIO ThreadKilled) source)
+            pure registration
+        -- a registration that was left would be a second loan, and fail this try
+        isNothing <$> tryBorrowBuffer reader `shouldReturn` True
+        watchCancel registration
+        isJust <$> tryBorrowBuffer reader `shouldReturn` True
+
+    it "gives back the buffer that was granted to its registration, when its scope ends without a pull taking it" $
+      withScarceRequests $ \reader taker rival -> do
+        _ <- borrowBuffer reader
+        rivalRegistration <- withRequestFeed reader $ \link context ->
+          starved taker link context (bodyOf 10000) $ \source registration -> do
+            rivalRegistrations <- newIORef Nothing
+            let wait register = do
+                  watch <- register
+                  rivalRegistration <- queueFor rival
+                  writeIORef rivalRegistrations (Just rivalRegistration)
+                  watchCancel registration
+                  timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
+                  throwIO ThreadKilled
+            _ <- try @AsyncException (stepWith wait source)
+            readIORef rivalRegistrations >>= maybe (failTest "the pull did not wait") pure
+        timeout 2_000_000 (atomically (watchReady rivalRegistration)) `shouldReturn` Just ()
+
+    it "holds the request's primary loan across its waits, and the chunks" $
+      withScarceRequests $ \reader taker _ -> do
+        -- the pool's spare is taken, so that only the primary can serve another use of the request's buffers
+        _ <- borrowBuffer taker
+        _ <- borrowBuffer taker
+        withRequestFeed reader $ \link context -> do
+          let body = bodyOf 10000
+              response = answer [body]
+          feed link (BS.take scarceSize response)
+          ended <- try @AsyncException $ withScope $ \scope -> do
+            tx <- Tx.transactionIn scope Tx.ReadCommitted Tx.Read (Exchange.Session context)
+            field <- Tx.runIn tx $ do
+              cursor <- Tx.pipeline (Tx.statement () bodyStatement)
+              Tx.nextRow cursor >>= \case
+                Just (Body (Just found)) -> pure found
+                _ -> liftIO (failTest "the row has no field")
+            let source = Tx.fieldSource field
+                first = scarceSize - fieldStart body
+            -- the first pull takes the whole block, and leaves bytes of the field
+            step source `shouldReturn` Chunk (BS.take first body)
+            borrowed <- newEmptyMVar
+            _ <- forkIO (try @IOError (borrowBuffer reader) >>= putMVar borrowed)
+            threadDelay 20_000
+            -- the consumed buffer is not given back, and the pull waits with it
+            let wait register = do
+                  isNothing <$> timeout 50_000 (readMVar borrowed) `shouldReturn` True
+                  feed link (BS.take scarceSize (BS.drop scarceSize response))
+                  awaitWatch register
+            pullWaiting source wait >>= \case
+              Just chunk -> chunk `shouldBe` BS.take (BS.length chunk) (BS.drop first body)
+              Nothing -> failTest "the field ended"
+            isNothing <$> timeout 50_000 (readMVar borrowed) `shouldReturn` True
+            throwIO ThreadKilled :: IO ()
+          ended `shouldBe` Left ThreadKilled
+
+    it "gives an additional loan back before it waits, and a queued request gets it" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
         withRequestFeed reader $ \link context -> do
@@ -436,82 +433,24 @@ spec = describe "a field as a pull source" $ do
                 Just (Body (Just found)) -> pure found
                 _ -> liftIO (failTest "the row has no field")
             let source = Tx.fieldSource field
+                first = scarceSize - fieldStart body
             -- the first pull takes the whole block, and leaves bytes of the field
-            step source `shouldReturn` Chunk (BS.take (scarceSize - fieldStart body) body)
-            first <- queueFor taker
-            -- the buffer is consumed: the pull gives the loan back, and the request that waits for it gets it
-            step source `shouldReturn` Waits
-            timeout 2_000_000 (atomically (watchReady first)) `shouldReturn` Just ()
-            watchCancel first
-            -- and the same at the next consumed buffer
-            feed link (BS.take scarceSize (BS.drop scarceSize response))
-            step source `shouldReturn` Chunk (BS.take scarceSize (BS.drop (scarceSize - fieldStart body) body))
-            second <- watchBorrow taker
-            step source `shouldReturn` Waits
-            timeout 2_000_000 (atomically (watchReady second)) `shouldReturn` Just ()
-            watchCancel second
+            step source `shouldReturn` Chunk (BS.take first body)
+            queued <- queueFor taker
+            -- the loan goes back, the request that waits for it gets it, and the pull waits for a buffer until it is given back
+            let wait register = do
+                  timeout 2_000_000 (atomically (watchReady queued)) `shouldReturn` Just ()
+                  watchCancel queued
+                  feed link (BS.take scarceSize (BS.drop scarceSize response))
+                  awaitWatch register
+            pullWaiting source wait >>= \case
+              Just chunk -> chunk `shouldBe` BS.take (BS.length chunk) (BS.drop first body)
+              Nothing -> failTest "the field ended"
             throwIO ThreadKilled :: IO ()
           ended `shouldBe` Left ThreadKilled
-
-    it "holds the request's primary loan across chunks while the field is armed, and gives it back at the first pull after another operation" $
-      withScarceRequests $ \reader taker _ -> do
-        -- the pool's spare is taken, so that only the primary can serve another use of the request's buffers
-        _ <- borrowBuffer taker
-        _ <- borrowBuffer taker
-        withRequestFeed reader $ \link context -> do
-          let body = bodyOf 10000
-          feed link (BS.take scarceSize (answer [body]))
-          ended <- try @AsyncException $ withScope $ \scope -> do
-            tx <- Tx.transactionIn scope Tx.ReadCommitted Tx.Read (Exchange.Session context)
-            field <- Tx.runIn tx $ do
-              cursor <- Tx.pipeline (Tx.statement () bodyStatement)
-              Tx.nextRow cursor >>= \case
-                Just (Body (Just found)) -> pure found
-                _ -> liftIO (failTest "the row has no field")
-            let source = Tx.fieldSource field
-            -- the first pull takes the whole block, and leaves bytes of the field
-            step source `shouldReturn` Chunk (BS.take (scarceSize - fieldStart body) body)
-            waiting <- newEmptyMVar
-            _ <- forkIO (try @IOError (borrowBuffer reader) >>= putMVar waiting)
-            threadDelay 20_000
-            -- the pull that follows retries at the receive, and keeps the primary
-            step source `shouldReturn` Waits
-            isNothing <$> timeout 50_000 (readMVar waiting) `shouldReturn` True
-            -- after another operation the buffer is consumed for the pull that gives the primary back
-            Tx.runIn tx Tx.condemn
-            step source `shouldReturn` Waits
-            isJust <$> timeout 2_000_000 (readMVar waiting) `shouldReturn` True
-            throwIO ThreadKilled :: IO ()
-          ended `shouldBe` Left ThreadKilled
-
-    it "withdraws its registration for a buffer when its scope ends" $
-      withScarceRequests $ \reader taker _ -> do
-        _ <- borrowBuffer reader
-        registration <- withRequestFeed reader $ \link context ->
-          starved taker link context (bodyOf 10000) $ \source registration -> do
-            step source `shouldReturn` Waits
-            _ <- watchSource source
-            pure registration
-        -- a registration that was left would be a second loan, and fail this try
-        isNothing <$> tryBorrowBuffer reader `shouldReturn` True
-        watchCancel registration
-        isJust <$> tryBorrowBuffer reader `shouldReturn` True
-
-    it "gives back the buffer that was granted to its registration, when its scope ends without a pull taking it" $
-      withScarceRequests $ \reader taker rival -> do
-        _ <- borrowBuffer reader
-        rivalRegistration <- withRequestFeed reader $ \link context ->
-          starved taker link context (bodyOf 10000) $ \source registration -> do
-            step source `shouldReturn` Waits
-            watch <- watchSource source
-            rivalRegistration <- queueFor rival
-            watchCancel registration
-            timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-            pure rivalRegistration
-        timeout 2_000_000 (atomically (watchReady rivalRegistration)) `shouldReturn` Just ()
 
   describe "with output that is unsent" $ do
-    it "watches what the output waits for as well while no buffer is free, so that it keeps moving" $ do
+    it "waits for what the output waits for as well while no buffer is free, so that it keeps moving" $ do
       flag <- newTVarIO False
       let uploading =
             Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just (ParameterBorrowedStream 4 (UploadSource flag)))]) Tx.noResult
@@ -521,18 +460,20 @@ spec = describe "a field as a pull source" $ do
         -- the upload is never finished, so the request ends with output unsent
         outcome <- try @ConnectionError $ withRequestFeed reader $ \link context ->
           starvedWith queued taker link context (bodyOf 10000) $ \source _ -> do
-            step source `shouldReturn` Waits
-            watch <- watchSource source
-            -- no buffer is free, and the upload has nothing ready
-            timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-            atomically (writeTVar flag True)
-            timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-            watchCancel watch
+            let wait register = do
+                  watch <- register
+                  -- no buffer is free, and the upload has nothing ready
+                  timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
+                  atomically (writeTVar flag True)
+                  timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
+                  watchCancel watch
+                  throwIO ThreadKilled
+            void (try @AsyncException (stepWith wait source))
         case outcome of
           Left (SessionUnusable _) -> pure ()
           other -> failTest ("the request ended differently: " <> either show (const "no failure") other)
 
-    it "watches the upload's source as well, so that its readiness is noticed" $ do
+    it "waits for the upload's source as well, so that its readiness is noticed" $ do
       ready' <- newTVarIO False
       let upload = UploadSource ready'
           uploading =
@@ -545,20 +486,21 @@ spec = describe "a field as a pull source" $ do
           (cursor, _) <- Tx.pipeline ((,) <$> Tx.statement () bodyStatement <*> Tx.statement () uploading)
           Tx.nextRow cursor >>= \case
             Just (Body (Just field)) -> liftIO $ do
-              let source = Tx.fieldSource field
-              _ <- pullAvailable source
-              watch <- watchSource source
-              -- PostgreSQL has nothing, and the link takes what it is offered,
-              -- so it is the upload that the pull waits for
-              timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-              atomically (writeTVar ready' True)
-              timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-              watchCancel watch
+              let wait register = do
+                    watch <- register
+                    -- PostgreSQL has nothing, and the link takes what it is offered,
+                    -- so it is the upload that the pull waits for
+                    timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
+                    atomically (writeTVar ready' True)
+                    timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
+                    watchCancel watch
+                    ioError (userError "done")
+              void (chunksWith wait (Tx.fieldSource field))
             _ -> liftIO (failTest "the row has no field")
           liftIO (ioError (userError "done"))
       isLeft' result `shouldBe` True
 
-    it "watches for the link to be writable while it takes nothing" $ do
+    it "waits for the link to be writable while it takes nothing" $ do
       flag <- newTVarIO False
       let uploading =
             Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just (ParameterBorrowedStream 4 (UploadSource flag)))]) Tx.noResult
@@ -570,72 +512,99 @@ spec = describe "a field as a pull source" $ do
           (cursor, _) <- Tx.pipeline ((,) <$> Tx.statement () bodyStatement <*> Tx.statement () uploading)
           Tx.nextRow cursor >>= \case
             Just (Body (Just field)) -> liftIO $ do
-              let source = Tx.fieldSource field
-              _ <- pullAvailable source
-              watch <- watchSource source
-              timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-              setWritable link True
-              timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-              watchCancel watch
+              let wait register = do
+                    watch <- register
+                    timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
+                    setWritable link True
+                    timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
+                    watchCancel watch
+                    ioError (userError "done")
+              void (chunksWith wait (Tx.fieldSource field))
             _ -> liftIO (failTest "the row has no field")
           liftIO (ioError (userError "done"))
       isLeft' result `shouldBe` True
-  describe "after a pull that was pending" $ do
-    it "keeps the bytes in order when a blocking read of the field comes between pulls" $
+
+    it "keeps sending unsent output while it waits, and pulls the field to its end" $ do
+      flag <- newTVarIO False
+      let uploading =
+            Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just (ParameterBorrowedStream 4 (UploadSource flag)))]) Tx.noResult
+          body = bodyOf 300
+          response = answer [body]
+          (early, late) = BS.splitAt (BS.length response - 100) response
+      -- The reply to the upload is never fed, so the scope can only end by a failure
+      result <- try @IOException $ withFeed 64 $ \link context -> do
+        feed link early
+        setWritable link False
+        Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
+          (cursor, _) <- Tx.pipeline ((,) <$> Tx.statement () bodyStatement <*> Tx.statement () uploading)
+          Tx.nextRow cursor >>= \case
+            Just (Body (Just field)) -> liftIO $ do
+              waits <- newIORef (0 :: Int)
+              sentBefore <- newIORef 0
+              let wait register = do
+                    n <- readIORef waits
+                    writeIORef waits (n + 1)
+                    case n of
+                      0 -> do
+                        writeIORef sentBefore . BS.length =<< sentBytes link
+                        setWritable link True
+                      1 -> do
+                        -- the pull sent what the link takes now, up to the upload
+                        before <- readIORef sentBefore
+                        after <- BS.length <$> sentBytes link
+                        (after > before) `shouldBe` True
+                        feed link late
+                      _ -> failTest "the pull waited too often"
+                    awaitWatch register
+              received <- chunksWith wait (Tx.fieldSource field)
+              BS.concat received `shouldBe` body
+            _ -> liftIO (failTest "the row has no field")
+          liftIO (ioError (userError "done"))
+      isLeft' result `shouldBe` True
+
+  describe "with blocking reads of the field between its pulls" $ do
+    it "keeps the bytes in order" $
       withFeed 1024 $ \link context -> do
         let body = bodyOf 5000
-            (early, late) = BS.splitAt (fieldStart body + 2500) (answer [body])
-        feed link early
+        feed link (answer [body])
         withField context $ \field -> do
           let source = Tx.fieldSource field
-          (first, endedEarly) <- liftIO (pullAvailable source)
-          liftIO (endedEarly `shouldBe` False)
-          liftIO (feed link late)
+          first <- liftIO (stepChunk source)
           chunk <- Tx.nextChunk field
           owned <- liftIO (evaluate (BS.copy chunk))
-          (rest, ended) <- liftIO (pullAvailable source)
-          liftIO $ do
-            ended `shouldBe` True
-            BS.concat (first <> [owned] <> rest) `shouldBe` body
+          rest <- liftIO (chunks source)
+          liftIO (BS.concat (first : owned : rest) `shouldBe` body)
 
     it "ends at the field's end when a blocking read took the rest of the field" $
       withFeed 1024 $ \link context -> do
         let body = bodyOf 5000
-            (early, late) = BS.splitAt (fieldStart body + 2500) (answer [body])
-        feed link early
+        feed link (answer [body])
         withField context $ \field -> do
           let source = Tx.fieldSource field
-              drainField chunks =
+              drainField chunks' =
                 Tx.nextChunk field >>= \chunk ->
-                  if BS.null chunk then pure (reverse chunks) else liftIO (evaluate (BS.copy chunk)) >>= \owned -> drainField (owned : chunks)
-          (first, _) <- liftIO (pullAvailable source)
-          liftIO (feed link late)
+                  if BS.null chunk then pure (reverse chunks') else liftIO (evaluate (BS.copy chunk)) >>= \owned -> drainField (owned : chunks')
+          first <- liftIO (stepChunk source)
           rest <- drainField []
           liftIO $ do
             step source `shouldReturn` Over
-            BS.concat (first <> rest) `shouldBe` body
+            BS.concat (first : rest) `shouldBe` body
 
-    it "rejects a pull of a field whose row advanced, though the field of a later row is pending" $
+  describe "after its row advanced, or its scope ended" $ do
+    it "rejects a pull of a field whose row advanced, though the field of a later row has chunks" $
       withFeed 1024 $ \link context -> do
         let rowOne = bodyOf 3000
             rowTwo = "second:" <> bodyOf 2900
-            response = answer [rowOne, rowTwo]
-            inOne = fieldStart rowOne + 1500
-            inTwo = BS.length (fst (BS.breakSubstring rowTwo response)) + 1500
-            (start, afterStart) = BS.splitAt inOne response
-            (middle, end) = BS.splitAt (inTwo - inOne) afterStart
-        feed link start
+        feed link (answer [rowOne, rowTwo])
         outcome <- Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
           cursor <- Tx.pipeline (Tx.statement () bodyStatement)
           Tx.nextRow cursor >>= \case
             Just (Body (Just earlier)) -> do
-              liftIO (pullAvailable (Tx.fieldSource earlier) >>= \(_, ended) -> ended `shouldBe` False)
-              liftIO (feed link middle)
+              liftIO (step (Tx.fieldSource earlier) >>= \pulled -> (pulled /= Over) `shouldBe` True)
               Tx.nextRow cursor >>= \case
                 Just (Body (Just later)) -> do
-                  liftIO (pullAvailable (Tx.fieldSource later) >>= \(_, ended) -> ended `shouldBe` False)
-                  stale <- liftIO (try @ConnectionError (pullReady (Tx.fieldSource earlier)))
-                  liftIO (feed link end)
+                  liftIO (step (Tx.fieldSource later) >>= \pulled -> (pulled /= Over) `shouldBe` True)
+                  stale <- liftIO (try @ConnectionError (pullWaiting (Tx.fieldSource earlier) noWait))
                   Tx.finishTransaction
                   pure stale
                 _ -> liftIO (failTest "the second row has no field")
@@ -648,32 +617,27 @@ spec = describe "a field as a pull source" $ do
     it "rejects a pull from another thread, and the owner pulls on" $
       withFeed 64 $ \link context -> do
         let body = bodyOf 300
-            (early, late) = BS.splitAt (BS.length (answer [body]) - 100) (answer [body])
-        feed link early
+        feed link (answer [body])
         withField context $ \field -> liftIO $ do
           let source = Tx.fieldSource field
-          (first, _) <- pullAvailable source
+          first <- stepChunk source
           pulled <- newEmptyMVar
-          _ <- forkIO (try @ConnectionError (void (pullReady source)) >>= putMVar pulled)
+          _ <- forkIO (try @ConnectionError (void (pullWaiting source noWait)) >>= putMVar pulled)
           takeMVar pulled >>= \case
             Left (SessionUnusable _) -> pure ()
             other -> failTest ("another thread pulled: " <> either show (const "a result") other)
-          feed link late
-          (rest, ended) <- pullAvailable source
-          ended `shouldBe` True
-          BS.concat (first <> rest) `shouldBe` body
+          rest <- chunks source
+          BS.concat (first : rest) `shouldBe` body
 
     it "rejects a pull after the scope ended" $
       withFeed 64 $ \link context -> do
         let response = answer [bodyOf 300]
-            (early, late) = BS.splitAt (BS.length response - 100) response
-        feed link early
-        kept <- newIORef (pure Ended)
+        feed link response
+        kept <- newIORef (pure Nothing)
         withField context $ \field -> liftIO $ do
           let source = Tx.fieldSource field
-          _ <- pullAvailable source
-          writeIORef kept (pullReady source)
-          feed link late
+          _ <- step source
+          writeIORef kept (pullWaiting source noWait)
         late' <- readIORef kept
         try @ConnectionError late' >>= \case
           Left (SessionUnusable _) -> pure ()
@@ -682,9 +646,8 @@ spec = describe "a field as a pull source" $ do
     it "rejects a pull after the scope of its transaction ended" $
       withFeed 64 $ \link context -> do
         let response = answer [bodyOf 300]
-            (early, late) = BS.splitAt (BS.length response - 100) response
-        feed link early
-        kept <- newIORef (pure Ended)
+        feed link response
+        kept <- newIORef (pure Nothing)
         withScope $ \scope -> do
           tx <- Tx.transactionIn scope Tx.ReadCommitted Tx.Read (Exchange.Session context)
           field <- Tx.runIn tx $ do
@@ -693,10 +656,9 @@ spec = describe "a field as a pull source" $ do
               Just (Body (Just found)) -> pure found
               _ -> liftIO (failTest "the row has no field")
           let source = Tx.fieldSource field
-          _ <- pullAvailable source
-          writeIORef kept (pullReady source)
+          _ <- step source
+          writeIORef kept (pullWaiting source noWait)
           -- the scope completes, which drains the field and commits
-          feed link late
         readIORef kept >>= try @ConnectionError >>= \case
           Left (SessionUnusable _) -> pure ()
           other -> failTest ("a pull after the scope ended: " <> either show (const "gave a result") other)
@@ -705,18 +667,14 @@ spec = describe "a field as a pull source" $ do
       withFeed 1024 $ \link context -> do
         let rowOne = bodyOf 3000
             rowTwo = "second:" <> bodyOf 2900
-            response = answer [rowOne, rowTwo]
-            inOne = fieldStart rowOne + 1500
-            (start, end) = BS.splitAt inOne response
-        feed link start
+        feed link (answer [rowOne, rowTwo])
         outcome <- Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
           cursor <- Tx.pipeline (Tx.statement () bodyStatement)
           Tx.nextRow cursor >>= \case
             Just (Body (Just earlier)) -> do
-              liftIO (pullAvailable (Tx.fieldSource earlier) >>= \(_, ended) -> ended `shouldBe` False)
-              liftIO (feed link end)
+              liftIO (step (Tx.fieldSource earlier) >>= \pulled -> (pulled /= Over) `shouldBe` True)
               _ <- Tx.nextRow cursor
-              stale <- liftIO (try @ConnectionError (pullReady (Tx.fieldSource earlier)))
+              stale <- liftIO (try @ConnectionError (pullWaiting (Tx.fieldSource earlier) noWait))
               Tx.finishTransaction
               pure stale
             _ -> liftIO (failTest "the first row has no field")
@@ -725,6 +683,7 @@ spec = describe "a field as a pull source" $ do
           Left other -> failTest ("unexpected failure: " <> show other)
           Right _ -> failTest "a field of a row that advanced was pulled"
 
+  describe "when the wait, or the server's connection, fails" $ do
     it "fails, and breaks the connection, when the server's connection is lost" $
       withFeed 64 $ \link context -> do
         let response = answer [bodyOf 300]
@@ -735,10 +694,8 @@ spec = describe "a field as a pull source" $ do
           Tx.nextRow cursor >>= \case
             Just (Body (Just field)) -> liftIO $ do
               let source = Tx.fieldSource field
-              _ <- pullAvailable source
-              endFeed link
-              lost <- try @ConnectionError (pullReady source)
-              again <- try @ConnectionError (pullReady source)
+              lost <- try @ConnectionError (chunksWith (\_ -> endFeed link) source)
+              again <- try @ConnectionError (pullWaiting source noWait)
               pure (lost, again)
             _ -> liftIO (failTest "the row has no field")
         case outcome of
@@ -749,20 +706,27 @@ spec = describe "a field as a pull source" $ do
           Broken -> pure ()
           _ -> failTest "the connection was not broken"
 
-    it "fires the watch when the server sends, however often it was pulled in vain" $
+    it "fails, and breaks the connection, when the wait fails" $
       withFeed 64 $ \link context -> do
         let response = answer [bodyOf 300]
-            (early, late) = BS.splitAt (BS.length response - 100) response
+            early = BS.take (BS.length response - 100) response
         feed link early
-        withField context $ \field -> liftIO $ do
-          let source = Tx.fieldSource field
-          _ <- pullAvailable source
-          replicateM_ 5 (step source `shouldReturn` Waits)
-          watch <- watchSource source
-          timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-          feed link late
-          timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-          watchCancel watch
+        outcome <- Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
+          cursor <- Tx.pipeline (Tx.statement () bodyStatement)
+          Tx.nextRow cursor >>= \case
+            Just (Body (Just field)) -> liftIO $ do
+              let source = Tx.fieldSource field
+              gone <- try @IOException (chunksWith (\_ -> throwIO (userError "the client went away")) source)
+              again <- try @ConnectionError (pullWaiting source noWait)
+              pure (gone, again)
+            _ -> liftIO (failTest "the row has no field")
+        case outcome of
+          (Left _, Left (SessionUnusable _)) -> pure ()
+          (gone, again) -> failTest ("the pulls gave " <> either show (const "a result") gone <> " and " <> either show (const "a result") again)
+        state <- readIORef (connectionState (contextConnection context))
+        case state of
+          Broken -> pure ()
+          _ -> failTest "the connection was not broken"
 
   describe "storage that allocates" $ do
     it "keeps the owned columns of its row, though the field is pulled on in storage that is replaced as it grows" $
@@ -774,14 +738,13 @@ spec = describe "a field as a pull source" $ do
           Tx.nextRow cursor >>= \case
             Just (Tagged tag (Just field)) -> do
               liftIO $ do
-                (chunks, ended) <- pullAvailable (Tx.fieldSource field)
-                ended `shouldBe` True
-                BS.concat chunks `shouldBe` body
+                received <- chunks (Tx.fieldSource field)
+                BS.concat received `shouldBe` body
                 tag `shouldBe` "tag-one"
               Tx.finishTransaction
             _ -> liftIO (failTest "the row has no field")
 
-  describe "chunks that arrive in pieces, with a pull after each" $ do
+  describe "chunks that arrive in pieces" $ do
     it "are as large as a blocking read's" $ do
       let body = bodyOf 60000
       pulled <- withFeed 16384 $ \link context -> do
@@ -804,40 +767,7 @@ spec = describe "a field as a pull source" $ do
         withField context blockingSizes
       pulled `shouldBe` blocking
 
-  describe "a retry after a wait" $ do
-    it "keeps sending unsent output while pulls are pending, and pulls the field to its end" $ do
-      flag <- newTVarIO False
-      let uploading =
-            Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just (ParameterBorrowedStream 4 (UploadSource flag)))]) Tx.noResult
-          body = bodyOf 300
-          response = answer [body]
-          (early, late) = BS.splitAt (BS.length response - 100) response
-      -- The reply to the upload is never fed, so the scope can only end by a failure
-      result <- try @IOException $ withFeed 64 $ \link context -> do
-        feed link early
-        setWritable link False
-        Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ do
-          (cursor, _) <- Tx.pipeline ((,) <$> Tx.statement () bodyStatement <*> Tx.statement () uploading)
-          Tx.nextRow cursor >>= \case
-            Just (Body (Just field)) -> liftIO $ do
-              let source = Tx.fieldSource field
-              (first, _) <- pullAvailable source
-              step source `shouldReturn` Waits
-              sentBefore <- BS.length <$> sentBytes link
-              setWritable link True
-              -- the pull sends what the link takes now, up to the upload
-              step source `shouldReturn` Waits
-              sentAfter <- BS.length <$> sentBytes link
-              (sentAfter > sentBefore) `shouldBe` True
-              feed link late
-              (rest, ended) <- pullAvailable source
-              ended `shouldBe` True
-              BS.concat (first <> rest) `shouldBe` body
-            _ -> liftIO (failTest "the row has no field")
-          liftIO (ioError (userError "done"))
-      isLeft' result `shouldBe` True
-
-    it "pulls on to the field's end exactly once a buffer was granted, as the bytes arrive in pieces" $
+    it "pull on to the field's end exactly once a buffer was granted, as the bytes arrive" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
         withRequestFeed reader $ \link context -> do
@@ -845,57 +775,16 @@ spec = describe "a field as a pull source" $ do
               response = answer [body]
               taken = BS.take (scarceSize - fieldStart body) body
           starved taker link context body $ \source registration -> do
-            step source `shouldReturn` Waits
-            -- the spare buffer goes back to the pool, and the next pull takes it
-            watchCancel registration
-            collected <- newIORef []
-            forM_ (slices 1000 (BS.drop scarceSize response)) $ \piece -> do
-              feed link piece
-              (chunks, _) <- pullAvailable source
-              modifyIORef' collected (<> chunks)
-            (chunks, ended) <- pullAvailable source
-            ended `shouldBe` True
-            rest <- readIORef collected
-            BS.concat (taken : rest <> chunks) `shouldBe` body
-
-  describe "a pull after a wake-up" $ do
-    -- A pull has to receive, and a receive has its own cost, which is the link's:
-    -- what these specs bound is what a pull adds to it. Pulls that are pending
-    -- are repeated at every wake-up of a response, so what they add is paid
-    -- many times for a large body.
-    it "that received nothing allocates little more than the receive does" $ do
-      raw <- rawEmptyReceive
-      forM_ [("an empty buffer", 0), ("the start of a chunk in the buffer", 2000)] $ \(label, inBuffer) ->
-        withScarceRequests $ \_ taker _ -> withRequestFeed taker $ \link context -> do
-          let body = bodyOf 20000
-              (early, late) = BS.splitAt (fieldStart body + inBuffer) (answer [body])
-          feed link early
-          withField context $ \field -> liftIO $ do
-            let source = Tx.fieldSource field
-            (_, ended) <- pullAvailable source
-            ended `shouldBe` False
-            pulled <- allocatedBy 1000 (void (pullReady source))
-            checkExtra label (pulled - raw) extraWhenNothing
-            feed link late
-
-    it "that received bytes, but not a whole chunk, allocates little more than its receives do" $ do
-      rawEmpty <- rawEmptyReceive
-      rawBytes <- rawWakeup 64
-      withScarceRequests $ \_ taker _ -> withRequestFeed taker $ \link context -> do
-        let body = bodyOf 20000
-            (early, late) = BS.splitAt (fieldStart body + 2000) (answer [body])
-            pieces = take 20 (slices 64 late)
-        feed link early
-        withField context $ \field -> liftIO $ do
-          let source = Tx.fieldSource field
-          (_, ended) <- pullAvailable source
-          ended `shouldBe` False
-          pulled <- forM pieces $ \piece -> do
-            feed link piece
-            allocatedOnce (pullReady source)
-          -- the receive of the bytes, and the one after it, that finds nothing
-          checkExtra "bytes that make no chunk" (sum pulled `div` fromIntegral (length pulled) - rawBytes - rawEmpty) extraWhenPartial
-          feed link (BS.drop (sum (map BS.length pieces)) late)
+            -- the spare buffer goes back to the pool, and the pull takes it
+            pieces <- newIORef (slices 1000 (BS.drop scarceSize response))
+            released <- newIORef False
+            let wait register = do
+                  readIORef released >>= \case
+                    False -> watchCancel registration *> writeIORef released True
+                    True -> pure ()
+                  feeding link pieces register
+            rest <- chunksWith wait source
+            BS.concat (taken : rest) `shouldBe` body
   where
     isLeft' = either (const True) (const False)
 

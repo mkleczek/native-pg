@@ -35,7 +35,7 @@ import Network.Socket (PortNumber)
 import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.PositiveInt (positiveInt)
-import Network.Streaming.Source (Source, pull)
+import Network.Streaming.Source (WaitingSource (..))
 import Network.Streaming.Watch (awaitWatch)
 import Network.Streaming.Scope (withScope)
 import Skeletest hiding (context)
@@ -223,7 +223,7 @@ spec port = describe "operations and transactions in a scope" $ do
     it "gives up the connection of a request that stopped pulling in the middle" $ withEnv port 1 $ \env -> do
       result <- try @ErrorCall $ inRequest env Tx.Read $ \_ tx -> do
         field <- Tx.runIn tx (firstField =<< Tx.pipeline (Tx.statement () (numbersOf 20000)))
-        _ <- pull (Tx.fieldSource field)
+        _ <- pullWaiting (Tx.fieldSource field) awaitWatch
         throwIO (ErrorCall "the client went away") :: IO ()
       result `shouldBe` Left (ErrorCall "the client went away")
       brokenAfter env
@@ -331,10 +331,10 @@ inRequest env mode body =
     body checkout tx
 
 -- | Pulls the source to its end, with the blocking pull, copying each chunk.
-pullAll :: Source source => source -> IO BS.ByteString
+pullAll :: WaitingSource source => source -> IO BS.ByteString
 pullAll source = go []
   where
-    go chunks = pull source >>= \case
+    go chunks = pullWaiting source awaitWatch >>= \case
       Nothing -> pure (BS.concat (reverse chunks))
       Just chunk -> evaluate (BS.copy chunk) >>= \copied -> go (copied : chunks)
 
