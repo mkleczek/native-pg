@@ -34,7 +34,7 @@ import Network.Streaming.BufferPool
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Scope (withScope)
-import Network.Streaming.Source (pull)
+import Network.Streaming.Source (WaitingSource (..))
 import Network.Streaming.Watch (watchCancel)
 
 prepareNamed :: ByteString -> params -> Transaction.Statement params row -> Transaction.Pipeline tx (Transaction.Preparation tx)
@@ -148,8 +148,7 @@ inScope access pool = withScope $ \scope -> do
         Transaction.nextRow cursor
       case current of
         Just (MaybeField (Just field)) -> do
-          chunk <- pull (Transaction.fieldSource field)
-          _ <- Transaction.endingReady tx
-          Transaction.endingWatch tx >>= watchCancel
+          chunk <- pullWaiting (Transaction.fieldSource field) (>>= watchCancel)
+          _ <- Transaction.endingWaiting tx (>>= watchCancel)
           pure (Right chunk)
         _ -> Right Nothing <$ markBroken checkout Nothing

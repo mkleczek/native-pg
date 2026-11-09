@@ -344,9 +344,7 @@ pullAll source = go []
 awaitEnding :: Tx.Tx s -> IO (Either Tx.QueryError ())
 awaitEnding tx = timeout 5_000_000 loop >>= maybe (failTest "the ending's reply was not given in time") pure
   where
-    loop = Tx.endingReady tx >>= \case
-      Just outcome -> pure outcome
-      Nothing -> awaitWatch (Tx.endingWatch tx) *> loop
+    loop = Tx.endingWaiting tx awaitWatch
 
 -- | The numbers from 1 to this one, separated by commas: a field of that size.
 numbers :: Int -> BS.ByteString

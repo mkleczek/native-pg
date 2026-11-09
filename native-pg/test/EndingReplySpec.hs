@@ -2,15 +2,15 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The ending's reply without waiting, over a link that the spec feeds.
+-- | The ending's reply, waited for in place, over a link that the spec feeds.
 module EndingReplySpec (spec) where
 
 import Control.Concurrent.STM (atomically)
 import Control.Monad.IO.Class (liftIO)
-import Control.Exception (AsyncException (ThreadKilled), throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), IOException, throwIO, try)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust, isNothing)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
 import qualified Database.PostgreSQL.Diagnostics as PG
@@ -20,8 +20,8 @@ import qualified Database.PostgreSQL.Transaction as Tx
 import FeedSupport
 import Network.Streaming.BufferPool (BufferAccess, borrowBuffer, tryBorrowBuffer)
 import Network.Streaming.Scope (withScope)
-import Network.Streaming.Source (Pulled (..), Source (..))
-import Network.Streaming.Watch (Watch (..))
+import Network.Streaming.Source (WaitingSource (..))
+import Network.Streaming.Watch (Watch (..), awaitWatch)
 import Skeletest hiding (context)
 import System.Timeout (timeout)
 
@@ -46,11 +46,15 @@ afterBody final context action = withScope $ \scope -> do
   action tx
 
 -- | Pulls until the end, whatever the chunks, which are not waited for.
-pullToEnd :: Source source => source -> IO ()
-pullToEnd source = pullReady source >>= \case
-  Pulled _ -> pullToEnd source
-  Pending -> failTest "the pull was pending"
-  Ended -> pure ()
+pullToEnd :: WaitingSource source => source -> IO ()
+pullToEnd source =
+  pullWaiting source noWait >>= \case
+    Just _ -> pullToEnd source
+    Nothing -> pure ()
+
+-- | A wait that fails the spec: the call may not wait.
+noWait :: IO Watch -> IO ()
+noWait _ = failTest "the call waited"
 
 -- | What the server sends for a final pipeline that commits.
 committed :: BS.ByteString
@@ -91,13 +95,12 @@ spec = describe "the reply to the transaction's ending" $ do
     withFeed 4096 $ \link context -> do
       feed link committed
       afterBody True context $ \tx -> do
-        Tx.endingReady tx >>= \case
-          Just (Right ()) -> pure ()
-          Just (Left failure) -> failTest ("the ending failed: " <> show failure)
-          Nothing -> failTest "the reply had arrived"
-        Tx.endingReady tx >>= \case
-          Just (Right ()) -> pure ()
-          _ -> failTest "the answer changed when it was asked again"
+        Tx.endingWaiting tx noWait >>= \case
+          Right () -> pure ()
+          Left failure -> failTest ("the ending failed: " <> show failure)
+        Tx.endingWaiting tx noWait >>= \case
+          Right () -> pure ()
+          Left _ -> failTest "the answer changed when it was asked again"
       sent <- sentBytes link
       occurrences "COMMIT" sent `shouldBe` 1
 
@@ -105,59 +108,58 @@ spec = describe "the reply to the transaction's ending" $ do
     withFeed 4096 $ \link context -> do
       feed link (command "BEGIN" <> rows [[Just body]] <> message 49 "" <> message 50 "" <> errorMessage "23503" <> ready)
       afterBody True context $ \tx ->
-        Tx.endingReady tx >>= \case
-          Just (Left (Tx.QueryError "COMMIT" (Tx.ServerFailed (PG.ServerError diagnostics)))) ->
+        Tx.endingWaiting tx noWait >>= \case
+          Left (Tx.QueryError "COMMIT" (Tx.ServerFailed (PG.ServerError diagnostics))) ->
             PG.diagnosticCode diagnostics `shouldBe` "23503"
-          Just (Left other) -> failTest ("an unexpected failure: " <> show other)
-          Just (Right ()) -> failTest "COMMIT's failure was lost"
-          Nothing -> failTest "the reply had arrived"
+          Left other -> failTest ("an unexpected failure: " <> show other)
+          Right () -> failTest "COMMIT's failure was lost"
 
-  it "gives nothing while the reply hasn't arrived, and doesn't wait" $
+  it "waits while the reply hasn't arrived, and takes it once the wait has fed it" $
     withFeed 4096 $ \link context -> do
       let (early, late) = BS.splitAt (BS.length committed - 3) committed
       feed link early
       afterBody True context $ \tx -> do
+        waits <- newIORef (0 :: Int)
         -- Part of a message is not the reply
-        timeout 1_000_000 (Tx.endingReady tx) >>= \case
-          Just Nothing -> pure ()
-          _ -> failTest "a reply that is cut was taken, or the call waited"
-        feed link late
-        Tx.endingReady tx >>= \case
+        let wait register = modifyIORef' waits (+ 1) *> feed link late *> awaitWatch register
+        timeout 5_000_000 (Tx.endingWaiting tx wait) >>= \case
           Just (Right ()) -> pure ()
           _ -> failTest "the reply that arrived was not taken"
+        readIORef waits `shouldReturn` 1
 
-  it "fires its watch when the server sends the rest" $
+  it "gives the watch of what it waits for, which fires when the server sends the rest" $
     withFeed 4096 $ \link context -> do
       let (early, late) = BS.splitAt (BS.length committed - 20) committed
       feed link early
       afterBody True context $ \tx -> do
-        notYet tx
-        watch <- Tx.endingWatch tx
-        timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-        feed link late
-        timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-        watchCancel watch
-        Tx.endingReady tx >>= \case
-          Just (Right ()) -> pure ()
+        let wait register = do
+              watch <- register
+              timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
+              feed link late
+              timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
+              watchCancel watch
+        Tx.endingWaiting tx wait >>= \case
+          Right () -> pure ()
           _ -> failTest "the reply that arrived was not taken"
 
   it "receives the reply in receives that don't wait, when the input is smaller than the rest" $
     withFeed 64 $ \link context -> do
       feed link committed
       afterBody True context $ \tx ->
-        Tx.endingReady tx >>= \case
-          Just (Right ()) -> pure ()
+        Tx.endingWaiting tx noWait >>= \case
+          Right () -> pure ()
           _ -> failTest "the reply was not taken"
 
-  it "queues an ending that wasn't queued, and gives nothing until its reply arrives" $
+  it "queues an ending that wasn't queued, and waits until its reply arrives" $
     withFeed 4096 $ \link context -> do
       feed link (command "BEGIN" <> rows [[Just body]] <> readyTx)
       afterBody False context $ \tx -> do
-        notYet tx
-        sent <- sentBytes link
-        occurrences "COMMIT" sent `shouldBe` 1
-        feed link (command "COMMIT" <> ready)
-        Tx.endingReady tx >>= \case
+        let wait register = do
+              sent <- sentBytes link
+              occurrences "COMMIT" sent `shouldBe` 1
+              feed link (command "COMMIT" <> ready)
+              awaitWatch register
+        timeout 5_000_000 (Tx.endingWaiting tx wait) >>= \case
           Just (Right ()) -> pure ()
           _ -> failTest "the reply that arrived was not taken"
 
@@ -170,27 +172,40 @@ spec = describe "the reply to the transaction's ending" $ do
           cursor <- Tx.finalPipeline (Tx.statement () bodyStatement)
           _ <- Tx.nextRow cursor
           pure ()
-        outcome <- try @ConnectionError (Tx.endingReady tx)
+        outcome <- try @ConnectionError (Tx.endingWaiting tx noWait)
         case outcome of
           Left (RowMisuse _) -> pure ()
           other -> failTest ("unread bytes that don't fit were accepted: " <> either show (const "no failure") other)
+
+  it "fails, and abandons the transaction, when the wait fails" $
+    withFeed 4096 $ \link context -> do
+      let (early, _) = BS.splitAt (BS.length committed - 3) committed
+      feed link early
+      outcome <- newIORef Nothing
+      -- the scope that ends after the abandoned transaction fails too
+      _ <- try @ConnectionError $ afterBody True context $ \tx -> do
+        gone <- try @IOException (Tx.endingWaiting tx (\_ -> throwIO (userError "the client went away")))
+        again <- try @ConnectionError (Tx.endingWaiting tx noWait)
+        writeIORef outcome (Just (gone, again))
+      readIORef outcome >>= \case
+        Just (Left _, Left (SessionUnusable _)) -> pure ()
+        _ -> failTest "the wait's failure was not the call's, or the transaction was not abandoned"
+
   describe "without a buffer to receive into" $ do
-    it "gives nothing without waiting, and its watch fires when a buffer is returned" $
+    it "waits for a buffer, and its watch fires when one is returned" $
       withScarceRequests $ \reader taker _ -> do
         _ <- borrowBuffer reader
         withRequestFeed reader $ \link context ->
           starved taker link context $ \tx registration -> do
-            nothingWithoutWaiting tx
-            watch <- Tx.endingWatch tx
-            timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-            -- a call while the registration is pending doesn't try, which would fail
-            nothingWithoutWaiting tx
-            watchCancel registration
-            timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
-            watchCancel watch
-            feed link afterBodyBytes
-            Tx.endingReady tx >>= \case
-              Just (Right ()) -> pure ()
+            let wait register = do
+                  watch <- register
+                  timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
+                  watchCancel registration
+                  timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
+                  watchCancel watch
+                  feed link afterBodyBytes
+            Tx.endingWaiting tx wait >>= \case
+              Right () -> pure ()
               _ -> failTest "the reply that arrived was not taken"
 
     it "withdraws its registration for a buffer when its scope ends" $
@@ -198,24 +213,17 @@ spec = describe "the reply to the transaction's ending" $ do
         _ <- borrowBuffer reader
         registration <- withRequestFeed reader $ \link context ->
           starved taker link context $ \tx registration -> do
-            nothingWithoutWaiting tx
-            watch <- Tx.endingWatch tx
-            timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
-            watchCancel watch
+            let wait register = do
+                  watch <- register
+                  timeout 50_000 (atomically (watchReady watch)) `shouldReturn` Nothing
+                  watchCancel watch
+                  throwIO ThreadKilled
+            _ <- try @AsyncException (Tx.endingWaiting tx wait)
             pure registration
         -- a registration that was left would be a second loan, and fail this try
         isNothing <$> tryBorrowBuffer reader `shouldReturn` True
         watchCancel registration
         isJust <$> tryBorrowBuffer reader `shouldReturn` True
-  where
-    notYet tx =
-      Tx.endingReady tx >>= \case
-        Nothing -> pure ()
-        Just _ -> failTest "the reply had not arrived"
-    nothingWithoutWaiting tx =
-      timeout 1_000_000 (Tx.endingReady tx) >>= \case
-        Just Nothing -> pure ()
-        _ -> failTest "a reply that can't be received was taken, or the call waited"
 
 -- | How many times the needle occurs in the bytes.
 occurrences :: BS.ByteString -> BS.ByteString -> Int
