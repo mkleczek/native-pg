@@ -9,7 +9,6 @@ module Network.Streaming.Link
     Interest (..),
     Blocked (..),
     StreamLengthError (..),
-    watchInterest,
   )
 where
 
@@ -18,7 +17,7 @@ import Data.ByteString (ByteString)
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr)
 import Network.Socket (Socket, close)
-import Network.Streaming.Watch (Watch (..), anyWatch, awaitFirst, awaitWatch, fdReadable, fdWritable, readyNow)
+import Network.Streaming.Watch (Watch (..), awaitFirst, awaitWatch, fdReadable, fdWritable)
 import System.Posix.Types (Fd (..))
 #if defined(mingw32_HOST_OS)
 import qualified Data.ByteString as BS
@@ -26,7 +25,7 @@ import Network.Socket (recvBuf)
 import Network.Socket.ByteString (sendMany)
 #else
 import Control.Concurrent (threadWaitRead, threadWaitWrite)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import qualified Data.ByteString.Unsafe as BS
 import qualified Foreign.C.Error as Errno
 import Foreign.C.Types (CChar, CInt (..), CSize (..))
@@ -69,6 +68,11 @@ class Link link where
   awaitAny :: link -> Interest -> IO ()
   awaitAny link = awaitWatches (watchReadable link) (watchWritable link)
 
+  -- | 'awaitAny' for input and for being writable, which says whether input
+  -- may be retried, also when both may.
+  awaitReadOrWrite :: link -> IO Bool
+  awaitReadOrWrite link = awaitFirst [(watchReadable link, True), (watchWritable link, False)]
+
   -- | Reads what's ready into the buffer, up to its size, without waiting:
   -- 'Nothing' if nothing is, and 0 at the end of the stream.
   receiveReady :: link -> Ptr Word8 -> Int -> IO (Maybe Int)
@@ -101,10 +105,6 @@ data Blocked
   | -- | The link took only part of what it was offered, or nothing: wait for
     -- it to be writable.
     OnWritable
-  | -- | The link took everything it was offered, and the next source has
-    -- nothing ready. The action registers a watch on the source, for the
-    -- caller to wait on and release.
-    OnSource (IO Watch)
 
 -- | Waits on the watches of what the interest includes, which the actions
 -- register.
@@ -116,40 +116,7 @@ awaitWatches readable writable (Interest input output) = case output of
   OnWritable
     | input -> awaitFirst [(readable, ()), (writable, ())]
     | otherwise -> awaitWatch writable
-  OnSource watch
-    | input -> awaitFirst [(readable, ()), (watch, ())]
-    | otherwise -> awaitWatch watch
 {-# NOINLINE awaitWatches #-}
-
--- | One watch for what the interest includes, which fires once any of it may
--- be retried: 'awaitAny' without the wait, for a caller that waits as it likes,
--- e.g. with other events. The caller releases the watch, which releases the
--- ones it registered. It fires at once for an interest in nothing. It goes
--- through the link's watches, also where 'awaitAny' waits more directly.
-watchInterest :: Link link => link -> Interest -> IO Watch
-watchInterest link = watchInterestOf (watchReadable link) (watchWritable link)
--- Inlined, so that the link's own watches are called, and no 'Link' dictionary
--- is passed or searched at run time. The code that registers them is one
--- function for all links: a specialization of it for each link type would be
--- a copy in each package that compiles a channel, since a function that
--- returns 'IO' is called through a cast alias that callers inline, and a rule
--- for the alias never fires.
-{-# INLINE watchInterest #-}
-
--- | 'watchInterest' of the actions that register the watches for input and
--- for output.
-watchInterestOf :: IO Watch -> IO Watch -> Interest -> IO Watch
-watchInterestOf readable writable (Interest input output) = case output of
-  Done
-    | input -> readable
-    | otherwise -> pure readyNow
-  OnWritable
-    | input -> anyWatch [readable, writable]
-    | otherwise -> writable
-  OnSource watch
-    | input -> anyWatch [readable, watch]
-    | otherwise -> watch
-{-# NOINLINE watchInterestOf #-}
 
 -- | A parameter stream gave a different number of bytes than it declared.
 -- The message it belongs to is incomplete, so the connection is unusable.
@@ -170,10 +137,12 @@ instance Link Socket where
   {-# NOINLINE watchReadable #-}
   watchWritable = socketWatch fdWritable
   {-# NOINLINE watchWritable #-}
-  -- The wait for a source needs watches. Waiting for one event or for both
-  -- needs no watch, and it is the same call every time, so it isn't inlined.
+  -- Waiting for one event or for both needs no watch, and it is the same
+  -- call every time, so it isn't inlined.
   awaitAny = socketAwait
   {-# NOINLINE awaitAny #-}
+  awaitReadOrWrite = socketReadOrWrite
+  {-# NOINLINE awaitReadOrWrite #-}
   receiveReady = tryReceive
   {-# INLINE receiveReady #-}
   sendReady = trySend
@@ -186,24 +155,26 @@ instance Link Socket where
 socketAwait :: Socket -> Interest -> IO ()
 #if defined(mingw32_HOST_OS)
 socketAwait sock = awaitWatches (watchReadable sock) (watchWritable sock)
+
+socketReadOrWrite :: Socket -> IO Bool
+socketReadOrWrite sock = awaitFirst [(watchReadable sock, True), (watchWritable sock, False)]
 #else
-socketAwait sock interest@(Interest input output) = case output of
+socketAwait sock (Interest input output) = case output of
   Done
     | input -> withFdSocket sock (threadWaitRead . Fd)
     | otherwise -> pure ()
   OnWritable
-    | input -> threadWaitReadWrite sock
+    | input -> void (socketReadOrWrite sock)
     | otherwise -> withFdSocket sock (threadWaitWrite . Fd)
-  OnSource _ -> awaitWatches (watchReadable sock) (watchWritable sock) interest
 
 -- | Waits until the socket is readable or writable, as 'threadWaitRead' and
 -- 'threadWaitWrite' wait for one of them, with one registration for both
--- events in the IO manager. Without one, as in the non-threaded runtime, it
--- waits on both watches.
-threadWaitReadWrite :: Socket -> IO ()
-threadWaitReadWrite sock =
+-- events in the IO manager, and says whether it is readable. Without one, as
+-- in the non-threaded runtime, it waits on both watches.
+socketReadOrWrite :: Socket -> IO Bool
+socketReadOrWrite sock =
   getSystemEventManager >>= \case
-    Nothing -> awaitWatches (watchReadable sock) (watchWritable sock) (Interest True OnWritable)
+    Nothing -> awaitFirst [(watchReadable sock, True), (watchWritable sock, False)]
     Just manager -> do
       event <- withFdSocket sock $ \fd ->
         awaitCallback (registerBoth (registerFd manager) (Fd fd)) (unregisterFd manager)
@@ -211,7 +182,8 @@ threadWaitReadWrite sock =
       -- event, since 'GHC.Event' doesn't export the event for it.
       when (event <> bothEvents /= bothEvents) $
         ioError (Errno.errnoToIOError "threadWait" Errno.eBADF Nothing Nothing)
-{-# NOINLINE threadWaitReadWrite #-}
+      pure (event <> evtWrite == bothEvents)
+{-# NOINLINE socketReadOrWrite #-}
 
 -- | Registers the callback for both events, with a function that registers a
 -- callback. 'registerFd' is passed as a function and not applied, because it
@@ -228,7 +200,7 @@ socketWatch :: (Fd -> IO Watch) -> Socket -> IO Watch
 #if defined(mingw32_HOST_OS)
 -- Sockets block on Windows, so receiving and sending never stall and nothing
 -- needs a watch. A retry that is asked for anyway is allowed at once.
-socketWatch _ _ = pure readyNow
+socketWatch _ _ = pure (Watch (pure ()) (pure ()))
 #else
 -- The watch keeps the socket open until it's released, as a wait that held
 -- the descriptor would.

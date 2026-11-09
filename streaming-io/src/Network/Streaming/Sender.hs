@@ -18,16 +18,18 @@ module Network.Streaming.Sender
     outputBufferFrom,
     outputBufferPerOutput,
     unsent,
-    sendSome,
-    pushOutput,
-    Waits (..),
-    pushAnswer,
-    Blocked (..),
+    noUnsent,
+    Resume (..),
+    Stalls (..),
+    Pushed (..),
+    stopping,
+    waitingStalls,
+    pushWith,
   )
 where
 
 import Control.Exception (throwIO)
-import Control.Monad (unless, void)
+import Control.Monad (unless, (>=>))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
@@ -38,7 +40,7 @@ import GHC.Base (IO (..), RealWorld, State#, unIO)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import Network.Socket (Socket)
 import qualified Network.Streaming.Buffer as Buffer
-import Network.Streaming.Link (Blocked (..), Link (..), StreamLengthError (..))
+import Network.Streaming.Link (Blocked (..), Interest (..), Link (..), StreamLengthError (..))
 import Network.Streaming.Output
   ( ByteStream (..),
     Output,
@@ -51,7 +53,7 @@ import Network.Streaming.Output
     writeOutput,
   )
 import Network.Streaming.Source (AnySource (..), AnyWaitingSource (..), Pulled (..), Source (..), WaitingSource (..))
-import Network.Streaming.Watch (Watch)
+import Network.Streaming.Watch (Watch, awaitWatch)
 
 -- | What's left of an output to send. The server may answer the first
 -- messages of an output before it has read the rest, and stop reading until
@@ -62,7 +64,7 @@ unsentEmpty :: Unsent -> Bool
 unsentEmpty (Unsent parts) = null parts
 
 -- | Gives up what's left. Nothing runs on its behalf, so this drops it and
--- stops nothing: sources are only pulled by 'sendSome', and the caller's scope
+-- stops nothing: sources are only pulled by 'pushWith', and the caller's scope
 -- ends them.
 discardUnsent :: Unsent -> IO ()
 discardUnsent _ = pure ()
@@ -156,47 +158,70 @@ gatherSize, gatherPieces :: Int
 gatherSize = 262144
 gatherPieces = 16
 
--- | What the gather does when it can't go on without the link, or a source.
-data Mode
-  = -- | It gives up, and says what to wait for.
-    GiveUp
-  | -- | It waits where it is, and goes on: for the link with the first action,
-    -- and for a source with the second, which first sends the pieces that are
-    -- gathered before the source, which are kept in the reference for it.
-    WaitInPlace !(IORef [ByteString]) !(IO ()) !(IO Watch -> IO ())
+-- | What a push does where it can't go on: its stalls wait, and say whether to
+-- try again or to stop.
+data Resume = Again | Stop
 
--- | Sends what the link takes without waiting for room in the socket,
--- pulling sources as it goes, and gives what's left and what to wait for.
--- Each send gathers the parts up front, up to 'gatherSize' bytes or
--- 'gatherPieces' pieces. A source's chunk is gathered behind the bytes
--- before it, so that framing and the first chunk go in one send; and the
--- gather ends after the chunk, which stays valid only until the source is
--- pulled again, so the source isn't pulled again until the link has taken all
--- of it. A source that has nothing ready cuts the gather, since waiting for
--- it must not hold the bytes before it back: they are sent, the server
--- starts on its statement, and its statement_timeout, as it would without
--- the source. A source that is waited for in place can't be sent, as there is
--- nothing to wait with: 'pushAnswer' sends it.
-sendSome :: Link link => link -> Unsent -> IO (Unsent, Blocked)
-sendSome link left = IO (sendSomeIO link left)
-{-# INLINE sendSome #-}
+data Stalls = Stalls
+  { -- | The link took only part of what it was offered, or hasn't written what
+    -- it took.
+    stallWritable :: IO Resume,
+    -- | A source has nothing ready, and what is before it is sent: waits with
+    -- the registration of its watch, which it releases.
+    stallSource :: IO Watch -> IO Resume
+  }
 
--- | 'sendSome' as a function of the state token. A function that returns
+-- | What a push did. Stopped gives what is left, and the registration of the
+-- watch that it stopped on.
+data Pushed = Pushed | Stopped !Unsent (IO Watch)
+
+noUnsent :: Unsent
+noUnsent = Unsent []
+
+-- | The stalls of a push that never waits.
+stopping :: Stalls
+stopping = Stalls (pure Stop) (\_ -> pure Stop)
+
+-- | The stalls of a push that waits for the link and for sources as long as it
+-- takes, and reads nothing meanwhile.
+waitingStalls :: Link link => link -> Stalls
+waitingStalls link =
+  Stalls
+    { stallWritable = Again <$ awaitAny link (Interest False OnWritable),
+      stallSource = \watching -> Again <$ awaitWatch watching
+    }
+{-# NOINLINE waitingStalls #-}
+
+data Pull = Got !Pulled | Halted (IO Watch)
+
+-- | Sends what the link takes, pulling sources as it goes, and flushes. Where
+-- it can't go on it calls a stall. Each send gathers the parts up front, up to
+-- 'gatherSize' bytes or 'gatherPieces' pieces. A source's chunk is gathered
+-- behind the bytes before it, so that framing and the first chunk go in one
+-- send, and the gather ends after it: the source isn't pulled again until the
+-- link has taken the chunk. A source with nothing ready has what is gathered
+-- before it sent and flushed first, so that the server starts on its statement
+-- as it would without the source. A source that is waited for in place can't
+-- be stopped: a stall that stops it is an error.
+pushWith :: Link link => link -> Stalls -> Unsent -> IO Pushed
+pushWith link stalls left = IO (pushWithIO link stalls left)
+{-# INLINE pushWith #-}
+
+-- | 'pushWith' as a function of the state token. A function that returns
 -- 'IO' is compiled as a function of the token and a cast alias that every
 -- caller inlines, so a specialization rule for the alias never fires and each
 -- package that sends over a 'Socket' compiles a copy of its own. This
 -- function has no alias, so the specialization below is the one copy that
 -- they all call.
-sendSomeIO :: Link link => link -> Unsent -> State# RealWorld -> (# State# RealWorld, (Unsent, Blocked) #)
-sendSomeIO link left = unIO (sendWith GiveUp link left)
-{-# INLINABLE sendSomeIO #-}
-{-# SPECIALIZE sendSomeIO :: Socket -> Unsent -> State# RealWorld -> (# State# RealWorld, (Unsent, Blocked) #) #-}
+pushWithIO :: Link link => link -> Stalls -> Unsent -> State# RealWorld -> (# State# RealWorld, Pushed #)
+pushWithIO link stalls (Unsent parts)
+  | null parts = unIO (flushAll link stalls [])
+  | otherwise = unIO (gatherFrom link stalls parts)
+{-# INLINABLE pushWithIO #-}
+{-# SPECIALIZE pushWithIO :: Socket -> Stalls -> Unsent -> State# RealWorld -> (# State# RealWorld, Pushed #) #-}
 
--- | The gather, for 'sendSome', which gives up, and for 'pushAnswer', which waits
--- where it is. It is inlined into each, so that the mode is known where it
--- is used, and a send that gives up has nothing of the other.
-sendWith :: Link link => Mode -> link -> Unsent -> IO (Unsent, Blocked)
-sendWith mode link (Unsent parts) = go parts
+gatherFrom :: Link link => link -> Stalls -> [Part] -> IO Pushed
+gatherFrom link stalls = go
   where
     go = gather 0 0 []
     -- Count pieces as they are gathered instead of traversing them each time.
@@ -205,7 +230,7 @@ sendWith mode link (Unsent parts) = go parts
       | otherwise = case remaining of
           [] ->
             offer pieces >>= \case
-              [] -> pure (Unsent [], Done)
+              [] -> flushAll link stalls []
               left -> stalled (map PartBytes left)
           -- Rendering in an empty buffer would overwrite gathered bytes that
           -- a partial send still owns.
@@ -219,41 +244,33 @@ sendWith mode link (Unsent parts) = go parts
           PartOutput memory capacity offset steps : others -> do
             rendered <- renderOutput memory capacity (if null pieces then 0 else offset) steps
             gather size pieceCount pieces (rendered <> others)
-          PartSource count anySource@(AnySource source) given : others ->
-            pullReady source >>= \case
-              -- Waiting for the source must not hold back what's gathered.
-              Pending -> case mode of
-                GiveUp ->
-                  offer pieces >>= \case
-                    [] -> pure (Unsent remaining, OnSource (watchSource source))
-                    left -> pure (Unsent (map PartBytes left <> remaining), OnWritable)
-                WaitInPlace gathered _ settle -> do
-                  writeIORef gathered pieces
-                  settle (watchSource source)
-                  regather size pieceCount gathered remaining
-              Ended -> do
+          PartSource count anySource@(AnySource source) given : others -> do
+            gathered <- newIORef pieces
+            pullWith source (pure . Got) (\watching again -> settleBefore link stalls gathered watching >>= maybe again (pure . Halted)) >>= \case
+              Halted watch ->
+                readIORef gathered >>= \left ->
+                  pure (Stopped (Unsent (map PartBytes (reverse left) <> remaining)) watch)
+              Got Ended -> do
                 unless (given == count) (throwIO (StreamLengthError count given))
-                gather size pieceCount pieces others
-              Pulled chunk
+                regather size pieceCount gathered others
+              Got (Pulled chunk)
                 | delivered > count -> throwIO (StreamLengthError count delivered)
-                | BS.null chunk -> gather size pieceCount pieces remaining
-                | otherwise -> gather size pieceCount pieces (PartSourceHeld chunk (PartSource count anySource delivered) : others)
+                | BS.null chunk -> regather size pieceCount gathered remaining
+                | otherwise -> regather size pieceCount gathered (PartSourceHeld chunk (PartSource count anySource delivered) : others)
                 where
                   delivered = given + BS.length chunk
-          PartWaiting count anyWaiting@(AnyWaitingSource source) given : others -> case mode of
-            GiveUp -> throwIO (userError "a source that is waited for in place can't be sent by a send that gives up")
-            WaitInPlace gathered _ settle -> do
-              writeIORef gathered pieces
-              pullWaiting source settle >>= \case
-                Nothing -> do
-                  unless (given == count) (throwIO (StreamLengthError count given))
-                  regather size pieceCount gathered others
-                Just chunk
-                  | delivered > count -> throwIO (StreamLengthError count delivered)
-                  | BS.null chunk -> regather size pieceCount gathered remaining
-                  | otherwise -> regather size pieceCount gathered (PartSourceHeld chunk (PartWaiting count anyWaiting delivered) : others)
-                  where
-                    delivered = given + BS.length chunk
+          PartWaiting count anyWaiting@(AnyWaitingSource source) given : others -> do
+            gathered <- newIORef pieces
+            pullWaiting source (settleBefore link stalls gathered >=> maybe (pure ()) (const (ioError stopped))) >>= \case
+              Nothing -> do
+                unless (given == count) (throwIO (StreamLengthError count given))
+                regather size pieceCount gathered others
+              Just chunk
+                | delivered > count -> throwIO (StreamLengthError count delivered)
+                | BS.null chunk -> regather size pieceCount gathered remaining
+                | otherwise -> regather size pieceCount gathered (PartSourceHeld chunk (PartWaiting count anyWaiting delivered) : others)
+                where
+                  delivered = given + BS.length chunk
           PartSourceHeld chunk resume : others ->
             let (prefix, suffix) = BS.splitAt (gatherSize - size) chunk
              in if BS.null suffix
@@ -281,25 +298,23 @@ sendWith mode link (Unsent parts) = go parts
               | delivered > byteStreamLength source ->
                   throwIO (StreamLengthError (byteStreamLength source) delivered)
               | otherwise -> gather size pieceCount pieces (PartBytes chunk : PartStream source delivered : others)
-    -- Goes on after a wait for a source with what is still gathered before it:
-    -- nothing, if the wait sent it, and then the counts start again.
+    -- What is gathered after a pull: nothing, if its stall sent it.
     regather size pieceCount gathered rest =
       readIORef gathered >>= \case
         [] -> gather 0 0 [] rest
         pieces -> gather size pieceCount pieces rest
-    -- What is left when the link took only part of what it was offered: it is
-    -- given back, or waited for.
-    stalled left = case mode of
-      GiveUp -> pure (Unsent left, OnWritable)
-      WaitInPlace _ writable _ -> writable *> go left
+    stalled left =
+      stallWritable stalls >>= \case
+        Again -> go left
+        Stop -> pure (Stopped (Unsent left) (watchWritable link))
     -- Sends the gathered pieces, which are in reverse, with something to
     -- gather after them, and gives what the link didn't take.
     offer pieces = case pieces of
       [] -> pure []
       _ -> do
-        let gathered = reverse pieces
-        sent <- sendReady link gathered
-        pure (dropSent sent gathered)
+        let forward = reverse pieces
+        sent <- sendReady link forward
+        pure (dropSent sent forward)
     -- Sends what's gathered, and gathers on if the link took it all.
     cut pieces rest =
       offer pieces >>= \case
@@ -310,7 +325,50 @@ sendWith mode link (Unsent parts) = go parts
       [] -> others
       [chunk] -> PartSourceHeld chunk resume : others
       piece : pieces -> PartBytes piece : heldTail pieces resume others
-{-# INLINE sendWith #-}
+{-# INLINE gatherFrom #-}
+
+flushAll :: Link link => link -> Stalls -> [Part] -> IO Pushed
+flushAll link stalls left =
+  flushReady link >>= \case
+    True -> pure Pushed
+    False ->
+      stallWritable stalls >>= \case
+        Again -> flushAll link stalls left
+        Stop -> pure (Stopped (Unsent left) (watchWritable link))
+{-# INLINABLE flushAll #-}
+
+-- | The stall of a pull of a source: sends the pieces gathered before it, which
+-- are in the reference, in reverse, and flushes, and then calls the stall for
+-- the source. Gives the watch that a stop was on. A stop leaves in the
+-- reference what the link didn't take.
+settleBefore :: Link link => link -> Stalls -> IORef [ByteString] -> IO Watch -> IO (Maybe (IO Watch))
+settleBefore link stalls gathered watching = sendGathered
+  where
+    sendGathered =
+      readIORef gathered >>= \case
+        [] -> flushed
+        reversed -> do
+          let pieces = reverse reversed
+          sent <- sendReady link pieces
+          case dropSent sent pieces of
+            [] -> writeIORef gathered [] *> flushed
+            left -> writeIORef gathered (reverse left) *> onWritable sendGathered
+    flushed =
+      flushReady link >>= \case
+        True ->
+          stallSource stalls watching >>= \case
+            Again -> pure Nothing
+            Stop -> pure (Just watching)
+        False -> onWritable flushed
+    onWritable continue =
+      stallWritable stalls >>= \case
+        Again -> continue
+        Stop -> pure (Just (watchWritable link))
+{-# INLINABLE settleBefore #-}
+
+-- | What a stop of a source that is waited for in place is.
+stopped :: IOError
+stopped = userError "a source that is waited for in place can't be stopped"
 
 -- | What a send of the pieces left, as the pieces that remain.
 dropSent :: Int -> [ByteString] -> [ByteString]
@@ -319,84 +377,3 @@ dropSent sent = \case
     | sent >= BS.length chunk -> dropSent (sent - BS.length chunk) others
     | otherwise -> BS.drop sent chunk : others
   [] -> []
-
--- | 'sendSome', and then flushes what the link took but hasn't written, so
--- that waiting on what it gives is enough. Records that aren't flushed would
--- stay behind a wait for a source, so they are reported as a wait for the link
--- to be writable instead. It reports 'Done' only when nothing is left to send
--- and all is flushed. With nothing to send, it only flushes.
-pushOutput :: Link link => link -> Unsent -> IO (Unsent, Blocked)
-pushOutput link left = IO (pushOutputIO link left)
-{-# INLINE pushOutput #-}
-
--- | 'pushOutput' as a function of the state token, for the reason that
--- 'sendSomeIO' is.
-pushOutputIO :: Link link => link -> Unsent -> State# RealWorld -> (# State# RealWorld, (Unsent, Blocked) #)
-pushOutputIO link left
-  | unsentEmpty left = unIO (settle left Done)
-  | otherwise = unIO $
-      sendSome link left >>= \case
-        -- Waiting for the link to be writable sees to the flush too.
-        (rest, OnWritable) -> pure (rest, OnWritable)
-        (rest, blocked) -> settle rest blocked
-  where
-    settle rest blocked = do
-      flushed <- flushReady link
-      pure (rest, if flushed then blocked else OnWritable)
-{-# INLINABLE pushOutputIO #-}
-{-# SPECIALIZE pushOutputIO :: Socket -> Unsent -> State# RealWorld -> (# State# RealWorld, (Unsent, Blocked) #) #-}
-
--- | What a push waits with, on the caller's thread: for the link to take more,
--- and for a source that has nothing ready, with the registration of the watch
--- to wait on, which the wait releases. The caller has what it waits for,
--- such as a client's input and a timeout, besides.
-data Waits = Waits
-  { waitWritable :: IO (),
-    waitSource :: IO Watch -> IO ()
-  }
-
--- | Sends the output and flushes what the link took, and gives nothing back
--- until all is sent: when the link takes only part, it waits for it with
--- 'waitWritable', and when a source has nothing ready, it is pulled with
--- 'pullWaiting' and 'waitSource', which are given the pieces gathered before
--- it sent first, as 'sendSome' sends them before it gives up on a source. The
--- source isn't pulled again before the link has taken its chunk, so a wait never
--- overlaps a chunk that is being sent. A source that gives up is waited for too.
-pushAnswer :: Link link => link -> Waits -> Unsent -> IO ()
-pushAnswer link waits left = IO (pushAnswerIO link waits left)
-{-# INLINE pushAnswer #-}
-
--- | 'pushAnswer' as a function of the state token, for the reason that
--- 'sendSomeIO' is.
-pushAnswerIO :: Link link => link -> Waits -> Unsent -> State# RealWorld -> (# State# RealWorld, () #)
-pushAnswerIO link waits left = unIO $ do
-  unless (unsentEmpty left) $ do
-    gathered <- newIORef []
-    void (sendWith (WaitInPlace gathered (waitWritable waits) (settleBefore link waits gathered)) link left)
-  flushAll link waits
-{-# INLINABLE pushAnswerIO #-}
-{-# SPECIALIZE pushAnswerIO :: Socket -> Waits -> Unsent -> State# RealWorld -> (# State# RealWorld, () #) #-}
-
--- | The wait for a source that has nothing ready: sends the pieces that are
--- gathered before it, and flushes what the link took, waiting for it to be
--- writable as long as it takes, and then waits for the source.
-settleBefore :: Link link => link -> Waits -> IORef [ByteString] -> IO Watch -> IO ()
-settleBefore link waits gathered watch = do
-  pieces <- readIORef gathered
-  unless (null pieces) $ do
-    writeIORef gathered []
-    sendAll (reverse pieces)
-  flushAll link waits
-  waitSource waits watch
-  where
-    sendAll pieces = do
-      sent <- sendReady link pieces
-      case dropSent sent pieces of
-        [] -> pure ()
-        left -> waitWritable waits *> sendAll left
-{-# INLINABLE settleBefore #-}
-
--- | Flushes what the link took, waiting for it to be writable until it has.
-flushAll :: Link link => link -> Waits -> IO ()
-flushAll link waits = flushReady link >>= \flushed -> unless flushed (waitWritable waits *> flushAll link waits)
-{-# INLINABLE flushAll #-}
