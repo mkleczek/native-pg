@@ -47,9 +47,9 @@ spec = describe "borrowed parameter streams" $ do
             count <- atomicModifyIORef' pulls (\n -> (n + 1, n))
             -- The chunk before this one ends with the pull: its memory is cleared.
             withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer 0 32
-            if count >= 3 then pure Ended else do
+            if count >= 3 then pure (Just Ended) else do
               withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer (fromIntegral count + 65) 32
-              pure (Pulled (BSI.BS (bufferMemory buffer) 32))
+              pure (Just (Pulled (BSI.BS (bufferMemory buffer) 32)))
           source = PullSource next noWatch
           output = serializeField @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterBorrowedStream 96 source))
           sender = Sender $ \pieces -> do
@@ -70,9 +70,9 @@ spec = describe "borrowed parameter streams" $ do
       ended <- newIORef False
       let -- Nothing is ready until the earlier results have been read.
           pulling = readTVarIO earlier >>= \left ->
-            if left > 0 then pure Pending else do
+            if left > 0 then pure Nothing else do
               done <- atomicModifyIORef' pulled (True,)
-              if done then writeIORef ended True $> Ended else pure (Pulled (BS.replicate uploadSize 65))
+              if done then writeIORef ended True $> Just Ended else pure (Just (Pulled (BS.replicate uploadSize 65)))
           source = PullSource pulling (pure (Watch (readTVar earlier >>= check . (== 0)) (pure ())))
           receive pointer size = do
             left <- readTVarIO earlier
@@ -129,7 +129,7 @@ spec = describe "borrowed parameter streams" $ do
       watches <- newIORef (0 :: Int)
       cancels <- newIORef (0 :: Int)
       let source = PullSource
-            (readTVarIO open >>= \ready -> pure (if ready then Ended else Pending))
+            (readTVarIO open >>= \ready -> pure (if ready then Just Ended else Nothing))
             (putMVar sourceWatched () $> Watch (readTVar open >>= check) (pure ()))
           -- Input never arrives, so only the source's watch ends a wait.
           watchInput = do
@@ -168,7 +168,7 @@ spec = describe "borrowed parameter streams" $ do
       takes <- newIORef [3 :: Int]
       let source = PullSource
             (atomicModifyIORef' pulls (\n -> (n + 1, n)) >>= \count ->
-              pure (if count == 0 then Pulled "0123456789" else Ended))
+              pure (Just (if count == 0 then Pulled "0123456789" else Ended)))
             noWatch
           -- The link takes 3 bytes, and then none.
           send pieces = atomicModifyIORef' takes (\case [] -> ([], 0); count : rest -> (rest, count))
@@ -215,7 +215,7 @@ spec = describe "borrowed parameter streams" $ do
       finished <- newEmptyMVar
       let source = PullSource
             (readTVarIO open >>= \ready ->
-              if ready then atomicModifyIORef' script (\case [] -> ([], Ended); step : rest -> (rest, step)) else pure Pending)
+              if ready then atomicModifyIORef' script (\case [] -> ([], Just Ended); step : rest -> (rest, Just step)) else pure Nothing)
             (putMVar watching () $> Watch (readTVar open >>= check) (pure ()))
           (framing, _) = BS.breakSubstring "hello" wire
       _ <- forkIO (channelSend (newChannel (recording sends)) (uploadStatement source) `finally` putMVar finished ())
@@ -231,14 +231,14 @@ spec = describe "borrowed parameter streams" $ do
       let channel = newChannel (Sender (pure . sum . map BS.length))
       channelSend channel (borrowedStream 1 (PullSource (ioError (userError "source failed")) noWatch))
         `shouldSatisfy` P.throws @IOException P.anything
-      channelSend channel (borrowedStream 1 (PullSource (pure Pending) (ioError (userError "watch failed"))))
+      channelSend channel (borrowedStream 1 (PullSource (pure Nothing) (ioError (userError "watch failed"))))
         `shouldSatisfy` P.throws @IOException P.anything
 
   it "releases the watch of a cancelled wait for its source before the owner unwinds" $ do
       registered <- newEmptyMVar
       stopped <- newEmptyMVar
       cancels <- newIORef (0 :: Int)
-      let source = PullSource (pure Pending) $ do
+      let source = PullSource (pure Nothing) $ do
             putMVar registered ()
             pure (Watch retry (modifyIORef' cancels (+ 1)))
           sender = Sender (\_ -> pure 0)
@@ -253,7 +253,7 @@ spec = describe "borrowed parameter streams" $ do
       let one chunk = do
             first <- newIORef True
             pure (PullSource (atomicModifyIORef' first (False,) >>= \current ->
-              pure (if current then Pulled chunk else Ended)) noWatch)
+              pure (Just (if current then Pulled chunk else Ended))) noWatch)
       short <- one "a"
       long <- one "abc"
       let channel = newChannel (Sender (pure . sum . map BS.length))
@@ -274,7 +274,7 @@ wire = Output.outputByteString (executionMessages (Execution (Unprepared "SELECT
 chunkSource :: BS.ByteString -> IO PullSource
 chunkSource chunk = do
   script <- newIORef [Pulled chunk, Ended]
-  pure (PullSource (atomicModifyIORef' script (\case [] -> ([], Ended); step : rest -> (rest, step))) noWatch)
+  pure (PullSource (atomicModifyIORef' script (\case [] -> ([], Just Ended); step : rest -> (rest, Just step))) noWatch)
 
 -- | A link that takes everything, and keeps the pieces of each send, the last
 -- first.

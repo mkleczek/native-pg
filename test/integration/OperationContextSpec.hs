@@ -26,7 +26,7 @@ import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Buffer (bufferMemory, bufferCapacity)
-import Network.Streaming.Source (Pulled (..), Source (..))
+import Network.Streaming.Source (Pulled (..), Source (..), retrying)
 import Network.Streaming.Watch (Watch (..))
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Session.Settings as PG
@@ -77,14 +77,14 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
                 traverse_ BufferPool.releaseBuffer =<< readIORef held
                 writeIORef held Nothing
                 left <- readIORef remaining
-                if left == 0 then pure Ended else do
+                if left == 0 then pure (Just Ended) else do
                   loan <- BufferPool.borrowBuffer access
                   writeIORef held (Just loan)
                   let buffer = BufferPool.loanBuffer loan
                       count = min left (bufferCapacity buffer)
                   withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer 120 count
                   writeIORef remaining (left - count)
-                  pure (Pulled (BSI.BS (bufferMemory buffer) count))
+                  pure (Just (Pulled (BSI.BS (bufferMemory buffer) count)))
               statement = Tx.Statement "SELECT $1::bytea"
                 (const [Param (Just 17) BinaryFormat (Just (ParameterBorrowedStream 16385 source))])
                 (Tx.singleRow (Tx.streamingRow @'[] Body))
@@ -125,7 +125,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
                 writeIORef held Nothing
                 left <- readIORef remaining
                 open <- readTVarIO ready
-                if left == 0 then pure Ended else if not open then modifyIORef' waits (+ 1) $> Pending else do
+                if left == 0 then pure (Just Ended) else if not open then modifyIORef' waits (+ 1) $> Nothing else do
                   atomically (writeTVar ready False)
                   loan <- BufferPool.borrowBuffer access
                   writeIORef held (Just loan)
@@ -133,7 +133,7 @@ spec port = describe "explicit contexts over PostgreSQL TLS" $ do
                       count = min left (bufferCapacity buffer)
                   withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer 120 count
                   writeIORef remaining (left - count)
-                  pure (Pulled (BSI.BS (bufferMemory buffer) count))
+                  pure (Just (Pulled (BSI.BS (bufferMemory buffer) count)))
               statement = Tx.Statement "SELECT $1::bytea"
                 (const [Param (Just 17) BinaryFormat (Just (ParameterBorrowedStream 16385 source))])
                 (Tx.singleRow (Tx.streamingRow @'[] Body))
@@ -249,11 +249,10 @@ withTestResources settings action = getAcquisition >>= \waiting ->
   BufferPool.newBufferPool waiting settings >>= action
 
 -- | A source that pulls and watches as its actions say.
-data ChunkSource = ChunkSource (IO Watch) (IO Pulled)
+data ChunkSource = ChunkSource (IO Watch) (IO (Maybe Pulled))
 
 instance Source ChunkSource where
-  pullReady (ChunkSource _ pulling) = pulling
-  watchSource (ChunkSource watching _) = watching
+  pullWith (ChunkSource watching pulling) = retrying pulling watching
 
 newtype Body tx = Body (Maybe (Tx.Field tx))
 data Headers tx = Headers Int64 BS.ByteString (Maybe (Tx.Field tx))

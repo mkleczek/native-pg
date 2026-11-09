@@ -184,7 +184,7 @@ spec = describe "caller-owned output storage" $ do
     received <- newIORef BS.empty
     calls <- newIORef (0 :: Int)
     let next = modifyIORef' ordinaryPulls (+ 1) $> BS.empty
-        source = PullSource (modifyIORef' borrowedPulls (+ 1) $> Ended) noWatch
+        source = PullSource (modifyIORef' borrowedPulls (+ 1) $> Just Ended) noWatch
         output = Output.bytes BS.empty
           <> Output.word32 0x01020304
           <> Output.stream (Output.ByteStream 0 next)
@@ -226,11 +226,11 @@ spec = describe "caller-owned output storage" $ do
               accepted <- readIORef received
               BS.length accepted >= BS.length beforeBorrowed + 4 `shouldBe` True
               withForeignPtr (bufferMemory borrowed) (\pointer -> fillBytes pointer 0 4)
-              pure Ended
+              pure (Just Ended)
             else do
               withForeignPtr (bufferMemory borrowed) $ \pointer ->
                 BS.useAsCString "loan" $ \origin -> copyBytes pointer (castPtr origin) 4
-              pure (Pulled (BSI.BS (bufferMemory borrowed) 4))
+              pure (Just (Pulled (BSI.BS (bufferMemory borrowed) 4)))
         output = Output.word32 0x01020304 <> Output.bytes "xy" <> Output.bytes "spill" <> Output.word16 0x0506
           <> Output.stream (Output.ByteStream 7 next) <> Output.word8 7
           <> Output.borrowedStream 4 source <> Output.word32 0x08090a0b

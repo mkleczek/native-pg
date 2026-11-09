@@ -75,7 +75,7 @@ spec = describe "explicit operation contexts" $ do
 
   it "drops pending sources after a completed owned operation marks itself broken, with no thread to join" $ do
     pulls <- newIORef (0 :: Int)
-    let source = PullSource (modifyIORef' pulls (+ 1) $> Pulled "borrowed") noWatch
+    let source = PullSource (modifyIORef' pulls (+ 1) $> Just (Pulled "borrowed")) noWatch
         channel = newChannel (Scripted (\_ _ -> fail "unexpected receive") (const (pure 0)))
     connection <- newConnection channel 16
     context <- newOwnedContext connection

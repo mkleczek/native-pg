@@ -8,15 +8,15 @@ module PullSourceTestSupport
 where
 
 import GHC.Conc (ThreadStatus (..), listThreads, threadStatus)
-import Network.Streaming.Source (Pulled, Source (..))
+import Network.Streaming.Source (Pulled, Source (..), retrying)
 import Network.Streaming.Watch (Watch)
 
--- | A source that pulls and watches as its actions say.
-data PullSource = PullSource (IO Pulled) (IO Watch)
+-- | A source that pulls and watches as its actions say: the pull gives
+-- 'Nothing' when it has nothing ready.
+data PullSource = PullSource (IO (Maybe Pulled)) (IO Watch)
 
 instance Source PullSource where
-  pullReady (PullSource pulling _) = pulling
-  watchSource (PullSource _ watching) = watching
+  pullWith (PullSource pulling watching) = retrying pulling watching
 
 -- | For a source that never has nothing ready.
 noWatch :: IO Watch

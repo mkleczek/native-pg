@@ -61,14 +61,14 @@ spec = describe "shared operation resources" $ do
             traverse_ releaseBuffer =<< readIORef held
             writeIORef held Nothing
             done <- readIORef returned
-            if done then pure Ended else do
+            if done then pure (Just Ended) else do
               loan <- borrowBuffer access
               writeIORef held (Just loan)
               let buffer = loanBuffer loan
               bufferMemory buffer `shouldBe` memory
               withForeignPtr (bufferMemory buffer) $ \pointer -> fillBytes pointer 65 16
               writeIORef returned True
-              pure (Pulled (BSI.BS (bufferMemory buffer) 16))
+              pure (Just (Pulled (BSI.BS (bufferMemory buffer) 16)))
           source = PullSource pulling noWatch
           link = Transfer (\pointer size -> do
             loan <- borrowBuffer access

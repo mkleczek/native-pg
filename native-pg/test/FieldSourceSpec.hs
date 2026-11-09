@@ -11,6 +11,7 @@ import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, rea
 import Control.Exception (AsyncException (ThreadKilled), IOException, evaluate, throwIO, try)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Unlift (withRunInIO)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -23,7 +24,7 @@ import qualified Database.PostgreSQL.Transaction as Tx
 import FeedSupport
 import Network.Streaming.BufferPool (BufferAccess, borrowBuffer, tryBorrowBuffer)
 import Network.Streaming.Scope (withScope)
-import Network.Streaming.Source (Pulled (..), Source (..), WaitingSource (..))
+import Network.Streaming.Source (Pulled (..), Source (..), WaitingSource (..), retrying)
 import Network.Streaming.Watch (Watch (..), awaitWatch)
 import Skeletest hiding (context)
 import System.Timeout (timeout)
@@ -562,6 +563,25 @@ spec = describe "a field as a source that is waited for in place" $ do
           liftIO (ioError (userError "done"))
       isLeft' result `shouldBe` True
 
+  describe "with an upload that is waited for by a blocking read" $ do
+    it "abandons the transaction when the wait for the upload is interrupted, as the interruption of any other wait does" $ do
+      flag <- newTVarIO False
+      let uploading =
+            Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just (ParameterBorrowedStream 4 (UploadSource flag)))]) Tx.noResult
+      -- Nothing is fed, and the upload has nothing: the read waits for both.
+      -- The upload is never finished, so the scope can only end by a failure.
+      observed <- newIORef Nothing
+      _ <- try @ConnectionError $ withFeed 64 $ \_ context ->
+        Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
+          (cursor, _) <- run (Tx.pipeline ((,) <$> Tx.statement () bodyStatement <*> Tx.statement () uploading))
+          interrupted <- isNothing <$> timeout 50_000 (run (Tx.nextRow cursor))
+          abandoned <-
+            try @ConnectionError (run (Tx.nextRow cursor)) >>= \case
+              Left (SessionUnusable _) -> pure True
+              _ -> pure False
+          writeIORef observed (Just (interrupted, abandoned))
+      readIORef observed `shouldReturn` Just (True, True)
+
   describe "with blocking reads of the field between its pulls" $ do
     it "keeps the bytes in order" $
       withFeed 1024 $ \link context -> do
@@ -792,8 +812,10 @@ spec = describe "a field as a source that is waited for in place" $ do
 newtype UploadSource = UploadSource (TVar Bool)
 
 instance Source UploadSource where
-  pullReady (UploadSource flag) = readTVarIO flag >>= \open -> pure (if open then Pulled "abcd" else Pending)
-  watchSource (UploadSource flag) = pure (Watch (readTVar flag >>= check) (pure ()))
+  pullWith (UploadSource flag) =
+    retrying
+      (readTVarIO flag >>= \open -> pure (if open then Just (Pulled "abcd") else Nothing))
+      (pure (Watch (readTVar flag >>= check) (pure ())))
 
 slices :: Int -> BS.ByteString -> [BS.ByteString]
 slices size bytes
