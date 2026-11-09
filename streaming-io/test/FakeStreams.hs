@@ -10,6 +10,7 @@ module FakeStreams
     linkReceived,
     setFlushed,
     flushCount,
+    writableWatchCount,
     FakeSource,
     newFakeSource,
     newClosedSource,
@@ -18,6 +19,8 @@ module FakeStreams
     watchCounts,
     sourceOutput,
     waitingOutput,
+    Stalled (..),
+    sendSome,
     sendAll,
   )
 where
@@ -28,16 +31,17 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.ByteString (ByteString)
+import Data.Functor (($>))
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, castPtr)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
-import Network.Streaming.Link (Blocked (..), Interest (..), Link (..))
+import Network.Streaming.Link (Link (..))
 import Network.Streaming.Output (Output (..), Uncopied (..), WriteResult (..), Writer (..))
-import Network.Streaming.Sender (Unsent, sendSome)
-import Network.Streaming.Source (AnySource (..), AnyWaitingSource (..), Pulled (..), Source (..), WaitingSource (..))
+import Network.Streaming.Sender (Pushed (..), Resume (..), Stalls (..), Unsent, noUnsent, pushWith, waitingStalls)
+import Network.Streaming.Source (AnySource (..), AnyWaitingSource (..), Pulled (..), Source (..), Waited (..), WaitingSource (..), retrying)
 import Network.Streaming.Watch (Watch (..), readyNow)
 
 -- | A link that takes as many bytes from each send as it's told to, and then
@@ -49,14 +53,15 @@ data FakeLink = FakeLink
     fakeAddresses :: IORef [[(Ptr Word8, Int)]],
     fakeReceived :: IORef ByteString,
     fakeFlushed :: IORef Bool,
-    fakeFlushes :: IORef Int
+    fakeFlushes :: IORef Int,
+    fakeWritableWatches :: IORef Int
   }
 
 -- | The link takes this many bytes from its sends in turn, at most what each
 -- offers. An infinite list makes it take at most that many from every send.
 newFakeLink :: [Int] -> IO FakeLink
 newFakeLink takes =
-  FakeLink <$> newIORef takes <*> newIORef [] <*> newIORef [] <*> newIORef BS.empty <*> newIORef True <*> newIORef 0
+  FakeLink <$> newIORef takes <*> newIORef [] <*> newIORef [] <*> newIORef BS.empty <*> newIORef True <*> newIORef 0 <*> newIORef 0
 
 -- | The pieces of each send as the link was offered them, copied, in order.
 linkOffers :: FakeLink -> IO [[ByteString]]
@@ -73,6 +78,10 @@ linkReceived = readIORef . fakeReceived
 -- | Whether a flush finds nothing left to write.
 setFlushed :: FakeLink -> Bool -> IO ()
 setFlushed = writeIORef . fakeFlushed
+
+-- | How many watches for the link to be writable were registered.
+writableWatchCount :: FakeLink -> IO Int
+writableWatchCount = readIORef . fakeWritableWatches
 
 -- | How many times the link was asked to flush.
 flushCount :: FakeLink -> IO Int
@@ -92,7 +101,7 @@ instance Link FakeLink where
     modifyIORef' (fakeReceived link) (<> taken)
     pure (BS.length taken)
   flushReady link = modifyIORef' (fakeFlushes link) (+ 1) *> readIORef (fakeFlushed link)
-  watchWritable _ = pure readyNow
+  watchWritable link = modifyIORef' (fakeWritableWatches link) (+ 1) $> readyNow
   receiveReady _ _ _ = fail "unexpected receive"
   watchReadable _ = fail "unexpected read wait"
   closeLink _ = pure ()
@@ -100,7 +109,7 @@ instance Link FakeLink where
 -- | A source that gives its script's results in turn, then ends. Every chunk
 -- is written over the memory of the one before, after clearing it, so a chunk
 -- that's used after the next pull shows as wrong bytes. While it's closed it
--- gives 'Pending', and its watch fires once it's opened.
+-- has nothing ready, and its watch fires once it's opened.
 data FakeSource = FakeSource
   { sourceMemory :: ForeignPtr Word8,
     sourceCapacity :: Int,
@@ -142,39 +151,40 @@ pullCount = readIORef . sourcePulls
 watchCounts :: FakeSource -> IO (Int, Int)
 watchCounts source = (,) <$> readIORef (sourceRegistered source) <*> readIORef (sourceReleased source)
 
+-- | A pull that doesn't wait: what the script gives next, or nothing while
+-- the source is closed.
+pullNow :: FakeSource -> IO (Maybe Pulled)
+pullNow source = do
+  modifyIORef' (sourcePulls source) (+ 1)
+  withForeignPtr (sourceMemory source) $ \memory -> fillBytes memory 35 (sourceCapacity source)
+  readTVarIO (sourceIsOpen source) >>= \case
+    False -> pure Nothing
+    True ->
+      atomicModifyIORef' (sourceScript source) (\case [] -> ([], Ended); step : rest -> (rest, step)) >>= \case
+        Pulled chunk -> do
+          withForeignPtr (sourceMemory source) $ \memory ->
+            BSU.unsafeUseAsCStringLen chunk $ \(origin, size) -> copyBytes memory (castPtr origin) size
+          pure (Just (Pulled (BSI.BS (sourceMemory source) (BS.length chunk))))
+        ended -> pure (Just ended)
+
+-- | The registration of a watch for the source to be open.
+watchNow :: FakeSource -> IO Watch
+watchNow source = do
+  modifyIORef' (sourceRegistered source) (+ 1)
+  pure (Watch (readTVar (sourceIsOpen source) >>= check) (modifyIORef' (sourceReleased source) (+ 1)))
+
 instance Source FakeSource where
-  pullReady source = do
-    modifyIORef' (sourcePulls source) (+ 1)
-    withForeignPtr (sourceMemory source) $ \memory -> fillBytes memory 35 (sourceCapacity source)
-    readTVarIO (sourceIsOpen source) >>= \case
-      False -> pure Pending
-      True ->
-        atomicModifyIORef' (sourceScript source) (\case [] -> ([], Ended); step : rest -> (rest, step)) >>= \case
-          Pulled chunk -> do
-            withForeignPtr (sourceMemory source) $ \memory ->
-              BSU.unsafeUseAsCStringLen chunk $ \(origin, size) -> copyBytes memory (castPtr origin) size
-            pure (Pulled (BSI.BS (sourceMemory source) (BS.length chunk)))
-          other -> pure other
-  watchSource source = do
-    modifyIORef' (sourceRegistered source) (+ 1)
-    pure (Watch (readTVar (sourceIsOpen source) >>= check) (modifyIORef' (sourceReleased source) (+ 1)))
+  pullWith source = retrying (pullNow source) (watchNow source)
 
 -- | An output that sends the source, which declares to give this many bytes.
 sourceOutput :: Source source => Int -> source -> Output
 sourceOutput count source = Output count 0 $ \rest ->
   Writer $ \_ _ used -> pure (Yield used (UncopiedSource count (AnySource source)) rest)
 
--- | A source that is waited for in place, which gives up what it is told to
--- wait for: it pulls, and when it finds nothing, it calls the wait with its
--- watch and pulls again.
+-- | A source that is waited for in place, with the wait that it is given, which
+-- always runs again.
 instance WaitingSource FakeSource where
-  pullWaiting source wait = loop
-    where
-      loop =
-        pullReady source >>= \case
-          Pulled chunk -> pure (Just chunk)
-          Ended -> pure Nothing
-          Pending -> wait (watchSource source) *> loop
+  pullWaiting source = pullWaiting (Waited source)
 
 -- | An output that sends the source, which declares to give this many bytes, to
 -- be waited for in place.
@@ -182,10 +192,33 @@ waitingOutput :: Int -> FakeSource -> Output
 waitingOutput count source = Output count 0 $ \rest ->
   Writer $ \_ _ used -> pure (Yield used (UncopiedWaiting count (AnyWaitingSource source)) rest)
 
+-- | What a push that stops at its first stall was stalled on.
+data Stalled
+  = -- | All is sent.
+    AllSent
+  | -- | The link took only part, or has not written what it took.
+    StalledOnLink
+  | -- | A source has nothing ready: the registration of its watch.
+    StalledOnSource (IO Watch)
+
+-- | Pushes until the first stall, where it stops, and gives what is left and
+-- what it was stalled on.
+sendSome :: Link link => link -> Unsent -> IO (Unsent, Stalled)
+sendSome link left = do
+  stalled <- newIORef AllSent
+  let stalls =
+        Stalls
+          { stallWritable = Stop <$ writeIORef stalled StalledOnLink,
+            stallSource = \register -> Stop <$ writeIORef stalled (StalledOnSource register)
+          }
+  pushWith link stalls left >>= \case
+    Pushed -> pure (noUnsent, AllSent)
+    Stopped rest _ -> (,) rest <$> readIORef stalled
+
 -- | Sends everything, waiting on sources as the sender asks. The link is
 -- always writable.
 sendAll :: Link link => link -> Unsent -> IO ()
 sendAll link left =
-  sendSome link left >>= \case
-    (_, Done) -> pure ()
-    (rest, blocked) -> awaitAny link (Interest False blocked) *> sendAll link rest
+  pushWith link (waitingStalls link) left >>= \case
+    Pushed -> pure ()
+    Stopped _ _ -> fail "a push that waits stopped"

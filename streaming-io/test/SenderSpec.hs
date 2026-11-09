@@ -14,12 +14,12 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (plusPtr)
 import GHC.Conc (listThreads)
 import Network.Streaming.Buffer (bufferMemory, newBuffer)
-import Network.Streaming.Link (Interest (..), Link (..), StreamLengthError (..))
+import Network.Streaming.Link (Blocked (..), Interest (..), Link (..), StreamLengthError (..))
 import qualified Network.Streaming.Output as Output
 import Network.Streaming.PositiveInt (PositiveInt, positiveInt)
 import Network.Streaming.Sender
 import Network.Streaming.Source (Pulled (..))
-import Network.Streaming.Watch (Watch, awaitWatch)
+import Network.Streaming.Watch (Watch (..), awaitWatch)
 import Skeletest
 import qualified Skeletest.Predicate as P
 import System.Timeout (timeout)
@@ -268,10 +268,10 @@ spec = describe "the gathering sender" $ do
       streamOf 5 ["abc"] `shouldSatisfy` P.throws (P.con (StreamLengthError (P.eq 5) (P.eq 3)))
       streamOf 5 ["abc", "def"] `shouldSatisfy` P.throws (P.con (StreamLengthError (P.eq 5) (P.eq 6)))
 
-  describe "pushing output" $ do
+  describe "pushing output until a stall" $ do
     it "only flushes when nothing is unsent, and is done once it has" $ do
       link <- newFakeLink []
-      (rest, blocked) <- pushOutput link =<< unsent Nothing mempty
+      (rest, blocked) <- sendSome link =<< unsent Nothing mempty
       name blocked `shouldBe` "done"
       unsentEmpty rest `shouldBe` True
       linkOffers link `shouldReturn` []
@@ -280,26 +280,26 @@ spec = describe "the gathering sender" $ do
     it "waits for the link to be writable when nothing is unsent and records remain" $ do
       link <- newFakeLink []
       setFlushed link False
-      (_, blocked) <- pushOutput link =<< unsent Nothing mempty
+      (_, blocked) <- sendSome link =<< unsent Nothing mempty
       name blocked `shouldBe` "writable"
       linkOffers link `shouldReturn` []
 
     it "is not done while what was sent isn't flushed, and is once it is" $ do
       link <- newFakeLink []
       setFlushed link False
-      (rest, blocked) <- pushOutput link =<< unsent Nothing framing
+      (rest, blocked) <- sendSome link =<< unsent Nothing framing
       name blocked `shouldBe` "writable"
       unsentEmpty rest `shouldBe` True
       linkOffers link `shouldReturn` [[framingBytes]]
       setFlushed link True
-      (_, flushed) <- pushOutput link rest
+      (_, flushed) <- sendSome link rest
       name flushed `shouldBe` "done"
       linkOffers link `shouldReturn` [[framingBytes]]
 
     it "flushes once after sending, and waits for a source if the link is flushed" $ do
       link <- newFakeLink []
       source <- newClosedSource [Pulled "hello", Ended]
-      (_, blocked) <- pushOutput link =<< unsent Nothing (framing <> sourceOutput 5 source)
+      (_, blocked) <- sendSome link =<< unsent Nothing (framing <> sourceOutput 5 source)
       name blocked `shouldBe` "source"
       flushCount link `shouldReturn` 1
 
@@ -307,41 +307,107 @@ spec = describe "the gathering sender" $ do
       link <- newFakeLink []
       setFlushed link False
       source <- newClosedSource [Pulled "hello", Ended]
-      (rest, blocked) <- pushOutput link =<< unsent Nothing (framing <> sourceOutput 5 source)
+      (rest, blocked) <- sendSome link =<< unsent Nothing (framing <> sourceOutput 5 source)
       name blocked `shouldBe` "writable"
       watchCounts source `shouldReturn` (0, 0)
       -- Once flushed, the source is what it waits for.
       setFlushed link True
-      (_, blockedAgain) <- pushOutput link rest
+      (_, blockedAgain) <- sendSome link rest
       name blockedAgain `shouldBe` "source"
 
     it "waits for the link when it took only part of what it was offered" $ do
       link <- newFakeLink [2]
-      (rest, blocked) <- pushOutput link =<< unsent Nothing framing
+      (rest, blocked) <- sendSome link =<< unsent Nothing framing
       name blocked `shouldBe` "writable"
       unsentEmpty rest `shouldBe` False
       flushCount link `shouldReturn` 0
 
-    it "sends everything through the waits it reports" $ do
+    it "sends everything through the stalls it stops at" $ do
       link <- newFakeLink (repeat 3)
       source <- newClosedSource [Pulled "0123456789", Ended]
       let go left =
-            pushOutput link left >>= \case
-              (_, Done) -> pure ()
-              (rest, blocked) -> do
+            sendSome link left >>= \case
+              (_, AllSent) -> pure ()
+              (rest, stalled) -> do
                 -- The link flushes after the first wait that is for it.
                 setFlushed link True
                 openSource source
-                awaitAny link (Interest False blocked) *> go rest
+                case stalled of
+                  StalledOnSource register -> awaitWatch register
+                  _ -> awaitAny link (Interest False OnWritable)
+                go rest
       setFlushed link False
       go =<< unsent Nothing (framing <> sourceOutput 10 source <> trailer)
       linkReceived link `shouldReturn` framingBytes <> "0123456789" <> trailerBytes
 
-  describe "pushing an answer, with the waits in place" $ do
-    let noWaits = Waits (fail "unexpected wait for the link") (\_ -> fail "unexpected wait for the source")
+  describe "pushing with stalls that wait" $ do
+    let noWaits = waits (fail "unexpected wait for the link") (\_ -> fail "unexpected wait for the source")
         -- opens the source when it is waited for, so that the wait ends at once
         opening source register = openSource source *> awaitWatch register
-        recording events source = Waits (modifyIORef' events ("link" :)) (\register -> modifyIORef' events ("source" :) *> opening source register)
+        recording events source = waits (modifyIORef' events ("link" :)) (\register -> modifyIORef' events ("source" :) *> opening source register)
+
+    it "waits for a source in place when the stall runs again, and pulls it again where it stopped" $ do
+      link <- newFakeLink []
+      source <- newClosedSource [Pulled "hello", Ended]
+      events <- newIORef ([] :: [String])
+      let stalls =
+            waits
+              (fail "unexpected wait for the link")
+              ( \register -> do
+                  offered <- linkOffers link
+                  modifyIORef' events (("source after " <> show offered) :)
+                  openSource source *> awaitWatch register
+              )
+      pushAnswer link stalls =<< unsent Nothing (framing <> sourceOutput 5 source <> trailer)
+      readIORef events `shouldReturn` ["source after " <> show [[framingBytes]]]
+      linkOffers link `shouldReturn` [[framingBytes], ["hello"], [trailerBytes]]
+      -- A pull that found nothing, the chunk and the end.
+      pullCount source `shouldReturn` 3
+      watchCounts source `shouldReturn` (1, 1)
+
+    it "gives back the source and what is after it when the stall for the source stops, and goes on from there" $ do
+      link <- newFakeLink []
+      source <- newClosedSource [Pulled "hello", Ended]
+      sources <- newIORef (0 :: Int)
+      let stalls = Stalls (pure Again) (\_ -> Stop <$ modifyIORef' sources (+ 1))
+      Stopped rest _ <- pushWith link stalls =<< unsent Nothing (framing <> sourceOutput 5 source <> trailer)
+      readIORef sources `shouldReturn` 1
+      linkOffers link `shouldReturn` [[framingBytes]]
+      pullCount source `shouldReturn` 1
+      openSource source
+      sendAll link rest
+      linkReceived link `shouldReturn` framingBytes <> "hello" <> trailerBytes
+
+    it "gives back what the link did not take of the pieces before a pending source when the stall for the link stops" $ do
+      link <- newFakeLink [2]
+      source <- newClosedSource [Pulled "hello", Ended]
+      Stopped rest _ <- pushWith link (Stalls (pure Stop) (\_ -> fail "unexpected wait for the source")) =<< unsent Nothing (framing <> sourceOutput 5 source)
+      linkReceived link `shouldReturn` BS.take 2 framingBytes
+      openSource source
+      sendAll link rest
+      linkReceived link `shouldReturn` framingBytes <> "hello"
+
+    it "gives the watch of the source it stopped on, which registers when it is run" $ do
+      link <- newFakeLink []
+      source <- newClosedSource [Pulled "hello", Ended]
+      Stopped _ watch <- pushWith link stopping =<< unsent Nothing (framing <> sourceOutput 5 source)
+      watchCounts source `shouldReturn` (0, 0)
+      watchCancel =<< watch
+      watchCounts source `shouldReturn` (1, 1)
+      writableWatchCount link `shouldReturn` 0
+
+    it "gives the watch for the link to be writable when it stopped on the link, or on its flush" $ do
+      partial <- newFakeLink [2]
+      Stopped _ watch <- pushWith partial stopping =<< unsent Nothing framing
+      writableWatchCount partial `shouldReturn` 0
+      watchCancel =<< watch
+      writableWatchCount partial `shouldReturn` 1
+      unflushed <- newFakeLink []
+      setFlushed unflushed False
+      Stopped rest watchFlush <- pushWith unflushed stopping =<< unsent Nothing framing
+      unsentEmpty rest `shouldBe` True
+      watchCancel =<< watchFlush
+      writableWatchCount unflushed `shouldReturn` 1
 
     it "sends the framing and a ready chunk in one call, and waits for nothing" $ do
       link <- newFakeLink []
@@ -353,15 +419,15 @@ spec = describe "the gathering sender" $ do
       link <- newFakeLink []
       source <- newClosedSource [Pulled "hello", Ended]
       events <- newIORef ([] :: [String])
-      let waits =
-            Waits
-              { waitWritable = fail "unexpected wait for the link",
-                waitSource = \register -> do
+      let stalls =
+            waits
+              (fail "unexpected wait for the link")
+              ( \register -> do
                   offered <- linkOffers link
                   modifyIORef' events (("source after " <> show offered) :)
                   opening source register
-              }
-      pushAnswer link waits =<< unsent Nothing (framing <> waitingOutput 5 source <> trailer)
+              )
+      pushAnswer link stalls =<< unsent Nothing (framing <> waitingOutput 5 source <> trailer)
       readIORef events `shouldReturn` ["source after " <> show [[framingBytes]]]
       linkOffers link `shouldReturn` [[framingBytes], ["hello"], [trailerBytes]]
       -- A pending pull, the chunk and the end.
@@ -381,12 +447,11 @@ spec = describe "the gathering sender" $ do
       setFlushed link False
       source <- newClosedSource [Pulled "hello", Ended]
       events <- newIORef ([] :: [String])
-      let waits =
-            Waits
-              { waitWritable = modifyIORef' events ("link" :) *> setFlushed link True,
-                waitSource = \register -> modifyIORef' events ("source" :) *> opening source register
-              }
-      pushAnswer link waits =<< unsent Nothing (framing <> waitingOutput 5 source)
+      let stalls =
+            waits
+              (modifyIORef' events ("link" :) *> setFlushed link True)
+              (\register -> modifyIORef' events ("source" :) *> opening source register)
+      pushAnswer link stalls =<< unsent Nothing (framing <> waitingOutput 5 source)
       readIORef events `shouldReturn` ["source", "link"]
 
     it "waits for the link when it took only part of a chunk, and sends all of it" $ do
@@ -400,22 +465,22 @@ spec = describe "the gathering sender" $ do
     it "sends everything when the link takes a few bytes at a time and the source waits" $ do
       link <- newFakeLink (repeat 3)
       source <- newClosedSource [Pulled "0123456789", Ended]
-      pushAnswer link (Waits (pure ()) (opening source)) =<< unsent Nothing (framing <> waitingOutput 10 source <> trailer)
+      pushAnswer link (waits (pure ()) (opening source)) =<< unsent Nothing (framing <> waitingOutput 10 source <> trailer)
       linkReceived link `shouldReturn` framingBytes <> "0123456789" <> trailerBytes
 
     it "only flushes when nothing is unsent" $ do
       link <- newFakeLink []
       setFlushed link False
       events <- newIORef ([] :: [String])
-      pushAnswer link (Waits (modifyIORef' events ("link" :) *> setFlushed link True) (\_ -> fail "unexpected wait for the source")) =<< unsent Nothing mempty
+      pushAnswer link (waits (modifyIORef' events ("link" :) *> setFlushed link True) (\_ -> fail "unexpected wait for the source")) =<< unsent Nothing mempty
       readIORef events `shouldReturn` ["link"]
       linkOffers link `shouldReturn` []
 
     it "lets the failure of a wait out, after it has sent the framing" $ do
       link <- newFakeLink []
       source <- newClosedSource [Pulled "hello", Ended]
-      let waits = Waits (pure ()) (\_ -> throwIO (userError "the client went away"))
-      result <- try @IOException (pushAnswer link waits =<< unsent Nothing (framing <> waitingOutput 5 source))
+      let stalls = waits (pure ()) (\_ -> throwIO (userError "the client went away"))
+      result <- try @IOException (pushAnswer link stalls =<< unsent Nothing (framing <> waitingOutput 5 source))
       isLeft result `shouldBe` True
       linkReceived link `shouldReturn` framingBytes
 
@@ -425,10 +490,16 @@ spec = describe "the gathering sender" $ do
       (pushAnswer link noWaits =<< unsent Nothing (waitingOutput 5 source))
         `shouldSatisfy` P.throws (P.con (StreamLengthError (P.eq 5) (P.eq 3)))
 
-    it "is not sent by a send that gives up, which has nothing to wait with" $ do
-      link <- newFakeLink []
+    it "is sent by a push that stops when its source is ready, and fails when it has to wait" $ do
+      ready <- newFakeLink []
       source <- newFakeSource [Pulled "hello", Ended]
-      result <- try @IOException (void (sendSome link =<< unsent Nothing (waitingOutput 5 source)))
+      (rest, stalled) <- sendSome ready =<< unsent Nothing (waitingOutput 5 source)
+      name stalled `shouldBe` "done"
+      unsentEmpty rest `shouldBe` True
+      linkReceived ready `shouldReturn` "hello"
+      link <- newFakeLink []
+      closed <- newClosedSource [Pulled "hello", Ended]
+      result <- try @IOException (void (sendSome link =<< unsent Nothing (waitingOutput 5 closed)))
       isLeft result `shouldBe` True
 
   describe "helper threads" $ do
@@ -479,14 +550,23 @@ unsentIn (Just size) output = do
   buffer <- newBuffer size
   unsent (Just (outputBufferFrom buffer)) output
 
-name :: Blocked -> String
+name :: Stalled -> String
 name = \case
-  Done -> "done"
-  OnWritable -> "writable"
-  OnSource _ -> "source"
+  AllSent -> "done"
+  StalledOnLink -> "writable"
+  StalledOnSource _ -> "source"
 
--- | The watch of a blocked source.
-onSource :: Blocked -> IO Watch
+-- | The registration of the watch of a stalled source.
+onSource :: Stalled -> IO Watch
 onSource = \case
-  OnSource watch -> watch
+  StalledOnSource register -> register
   _ -> error "expected a wait on a source"
+
+-- | Stalls that wait with the actions: for the link, and for a source, with
+-- the registration of its watch.
+waits :: IO () -> (IO Watch -> IO ()) -> Stalls
+waits writable source = Stalls (Again <$ writable) (\register -> Again <$ source register)
+
+-- | Pushes with the stalls until all is sent and flushed.
+pushAnswer :: Link link => link -> Stalls -> Unsent -> IO ()
+pushAnswer link stalls left = void (pushWith link stalls left)

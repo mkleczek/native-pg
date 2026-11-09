@@ -8,7 +8,6 @@ import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, wri
 import Control.Exception (ErrorCall (..), IOException, SomeException, bracket, throwIO, try)
 import Control.Monad (replicateM_, void, when)
 import qualified Data.ByteString as BS
-import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Foreign.Marshal.Alloc (allocaBytes)
 import GHC.Conc (retry)
@@ -166,26 +165,54 @@ spec = do
           try @IOException (timeout 2000000 (awaitAny socket inputAndOutput))
             `shouldSatisfy` P.returns (P.left P.anything)
 
-    describe "for a source" $ do
-      it "waits until the source's watch fires, and releases it" $
-        withSocketPair $ \socket _ -> do
-          counts <- newCounts
-          fired <- newTVarIO False
-          let interest = Interest False (OnSource (fake counts fired))
-          timeout 100000 (awaitAny socket interest) `shouldReturn` Nothing
-          later (atomically (writeTVar fired True))
-          timeout 2000000 (awaitAny socket interest) `shouldReturn` Just ()
-          readCounts counts `shouldReturn` (2, 2)
+  describe "the socket link's wait for input or room, saying which" $ do
+    it "says that sending may be retried when only the socket's room is ready" $
+      withSocketPair $ \socket _ ->
+        timeout 1000000 (awaitReadOrWrite socket) `shouldReturn` Just False
 
-      it "waits for input too" $
-        withSocketPair $ \reader writer -> do
-          counts <- newCounts
-          fired <- newTVarIO False
-          let interest = Interest True (OnSource (fake counts fired))
-          timeout 100000 (awaitAny reader interest) `shouldReturn` Nothing
-          later (sendReady writer ["x"] >>= (`shouldBe` 1))
-          timeout 2000000 (awaitAny reader interest) `shouldReturn` Just ()
-          readCounts counts `shouldReturn` (2, 2)
+    it "says that input is ready, also when the socket has room" $
+      withSocketPair $ \socket peer -> do
+        sendReady peer ["x"] `shouldReturn` 1
+        timeout 1000000 (awaitReadOrWrite socket) `shouldReturn` Just True
+
+    it "waits until the peer sends when the socket has no room, and says input is ready" $
+      withSocketPair $ \socket peer -> do
+        fill socket
+        timeout 100000 (awaitReadOrWrite socket) `shouldReturn` Nothing
+        later (sendReady peer ["x"] >>= (`shouldBe` 1))
+        timeout 2000000 (awaitReadOrWrite socket) `shouldReturn` Just True
+
+    it "waits until the peer reads when nothing can be read, and says that only sending may be retried" $
+      withSocketPair $ \socket peer -> do
+        fill socket
+        timeout 100000 (awaitReadOrWrite socket) `shouldReturn` Nothing
+        later (drain peer)
+        timeout 2000000 (awaitReadOrWrite socket) `shouldReturn` Just False
+
+    it "fails when the socket is closed while it waits" $
+      withSocketPair $ \socket _ -> do
+        fill socket
+        later (Socket.close socket)
+        try @IOException (timeout 2000000 (awaitReadOrWrite socket))
+          `shouldSatisfy` P.returns (P.left P.anything)
+
+  describe "a link's wait for input or room, saying which" $ do
+    it "waits on the watches, and says input is ready when it is, or both are" $ do
+      let saying readableFlag writableFlag = do
+            counts <- newCounts
+            readable <- newTVarIO readableFlag
+            writable <- newTVarIO writableFlag
+            awaitReadOrWrite (SplitLink counts counts readable writable)
+      saying True False `shouldReturn` True
+      saying False True `shouldReturn` False
+      saying True True `shouldReturn` True
+
+    it "registers both watches, and releases them" $ do
+      readable <- newCounts
+      writable <- newCounts
+      fired <- newTVarIO True
+      awaitReadOrWrite (WatchedLink readable writable fired) `shouldReturn` True
+      (,) <$> readCounts readable <*> readCounts writable `shouldReturn` ((1, 1), (1, 1))
 
   describe "a link's wait" $ do
     it "waits on the watches of its interest, unless it waits more directly" $ do
@@ -200,8 +227,6 @@ spec = do
       registered (const (Interest True Done)) `shouldReturn` ((1, 1), (0, 0), (0, 0))
       registered (const (Interest False OnWritable)) `shouldReturn` ((0, 0), (1, 1), (0, 0))
       registered (const (Interest True OnWritable)) `shouldReturn` ((1, 1), (1, 1), (0, 0))
-      registered (Interest False . OnSource) `shouldReturn` ((0, 0), (0, 0), (1, 1))
-      registered (Interest True . OnSource) `shouldReturn` ((1, 1), (0, 0), (1, 1))
 
   describe "one watch for several" $ do
     it "fires once any of the watches has" $ do
@@ -243,53 +268,6 @@ spec = do
       watch <- anyWatch []
       timeout 50000 (atomically (watchReady watch)) `shouldReturn` Nothing
       watchCancel watch
-
-  describe "a watch for an interest" $ do
-    it "registers the watches of what the interest includes, and releases them with its own release" $ do
-      let registered interest = do
-            readable <- newCounts
-            writable <- newCounts
-            source <- newCounts
-            fired <- newTVarIO False
-            watch <- watchInterest (WatchedLink readable writable fired) (interest (fake source fired))
-            during <- (,,) <$> readCounts readable <*> readCounts writable <*> readCounts source
-            watchCancel watch
-            after <- (,,) <$> readCounts readable <*> readCounts writable <*> readCounts source
-            pure (during, after)
-      registered (const (Interest True Done)) `shouldReturn` (((1, 0), (0, 0), (0, 0)), ((1, 1), (0, 0), (0, 0)))
-      registered (const (Interest False OnWritable)) `shouldReturn` (((0, 0), (1, 0), (0, 0)), ((0, 0), (1, 1), (0, 0)))
-      registered (const (Interest True OnWritable)) `shouldReturn` (((1, 0), (1, 0), (0, 0)), ((1, 1), (1, 1), (0, 0)))
-      registered (Interest False . OnSource) `shouldReturn` (((0, 0), (0, 0), (1, 0)), ((0, 0), (0, 0), (1, 1)))
-      registered (Interest True . OnSource) `shouldReturn` (((1, 0), (0, 0), (1, 0)), ((1, 1), (0, 0), (1, 1)))
-
-    it "fires at once for an interest in nothing, and registers nothing" $ do
-      readable <- newCounts
-      writable <- newCounts
-      fired <- newTVarIO False
-      watch <- watchInterest (WatchedLink readable writable fired) (Interest False Done)
-      timeout 2000000 (atomically (watchReady watch)) `shouldReturn` Just ()
-      watchCancel watch
-      (,) <$> readCounts readable <*> readCounts writable `shouldReturn` ((0, 0), (0, 0))
-
-    it "fires when the input is ready, or the output is, or the source is, and not before" $ do
-      let firing :: (IO Watch -> Interest) -> [String] -> IO (Maybe (), Maybe ())
-          firing interest flags = do
-            readable <- newTVarIO False
-            writable <- newTVarIO False
-            source <- newTVarIO False
-            counts <- newCounts
-            watch <- watchInterest (SplitLink counts counts readable writable) (interest (fake counts source))
-            before <- timeout 50000 (atomically (watchReady watch))
-            atomically (traverse_ (\(name, flag) -> when (name `elem` flags) (writeTVar flag True)) [("readable", readable), ("writable", writable), ("source", source)])
-            after <- timeout 50000 (atomically (watchReady watch))
-            watchCancel watch
-            pure (before, after)
-      firing (const (Interest True OnWritable)) ["readable"] `shouldReturn` (Nothing, Just ())
-      firing (const (Interest True OnWritable)) ["writable"] `shouldReturn` (Nothing, Just ())
-      firing (const (Interest False OnWritable)) ["readable"] `shouldReturn` (Nothing, Nothing)
-      firing (Interest True . OnSource) ["source"] `shouldReturn` (Nothing, Just ())
-      firing (Interest False . OnSource) ["readable", "writable"] `shouldReturn` (Nothing, Nothing)
-      firing (const (Interest True Done)) ["writable", "source"] `shouldReturn` (Nothing, Nothing)
 
   describe "awaiting a callback" $ do
     it "gives what the callback is called with, and registers nothing more" $ do

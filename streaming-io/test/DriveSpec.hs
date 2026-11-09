@@ -78,10 +78,10 @@ spec = describe "driving a step" $ do
           1 -> pure (Blocked 2 (Interest True Done))
           2 -> pure (Again 3)
           3 -> pure (Blocked 4 (Interest False OnWritable))
-          4 -> pure (Blocked 5 (Interest False (OnSource (fail "unexpected source watch"))))
+          4 -> pure (Blocked 5 (Interest True OnWritable))
           n -> pure (Ready (n :: Int))
     drive link step 0 `shouldReturn` 5
-    waits link `shouldReturn` [(True, "done"), (False, "writable"), (False, "source")]
+    waits link `shouldReturn` [(True, "done"), (False, "writable"), (True, "writable")]
 
   it "lets the exception of a step propagate, without waiting" $ do
     link <- newWaitLink (pure ())
@@ -103,45 +103,7 @@ spec = describe "driving a step" $ do
     readIORef steps `shouldReturn` 1
     waits link `shouldReturn` [(True, "done")]
 
-  describe "polling a step" $ do
-    it "gives what a ready step gives" $ do
-      poll (\() -> pure (Ready 'x')) () >>= \case
-        Got 'x' -> pure ()
-        _ -> failTest "a ready step gave nothing"
-
-    it "steps again from the state it made progress to" $ do
-      seen <- newIORef []
-      let step n = do
-            modifyIORef' seen (n :)
-            pure (if n < 3 then Again (n + 1) else Ready (n * 10))
-      poll step (0 :: Int) >>= \case
-        Got 30 -> pure ()
-        _ -> failTest "the step did not get to its result"
-      readIORef seen `shouldReturn` [3, 2, 1, 0]
-
-    it "makes progress without growing the stack" $ do
-      let step n = pure (if n == (1000000 :: Int) then Ready n else Again (n + 1))
-      poll step 0 >>= \case
-        Got 1000000 -> pure ()
-        _ -> failTest "the step did not get to its result"
-
-    it "gives up where drive would wait, with what it is blocked on, and doesn't wait" $ do
-      seen <- newIORef []
-      let step n = do
-            modifyIORef' seen (n :)
-            pure (if n == 0 then Again (n + 1) else Blocked (n + 1) (Interest True OnWritable) :: Progress Int ())
-      poll step (0 :: Int) >>= \case
-        Stalled (Interest input output) -> (input, name output) `shouldBe` (True, "writable")
-        Got () -> failTest "a blocked step was ready"
-      -- It gave up at the block, and didn't try again from the state it gave
-      readIORef seen `shouldReturn` [1, 0]
-
-    it "lets the exception of a step propagate" $
-      poll (\() -> throwIO (Boom "step") :: IO (Progress () ())) ()
-        `shouldSatisfy` P.throws (P.con (Boom (P.eq "step")))
-
 name :: Blocked -> String
 name = \case
   Done -> "done"
   OnWritable -> "writable"
-  OnSource _ -> "source"
