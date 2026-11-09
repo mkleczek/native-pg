@@ -8,7 +8,7 @@
 -- | Synchronous cursors that keep a transaction open until explicitly finished.
 module Database.PostgreSQL.Transaction
   ( Transaction, Pipeline, Result, Preparation, Field, Statement (..), RowDecoder,
-    Tx, transactionIn, runIn, FieldSource, fieldSource, endingReady, endingWatch,
+    Tx, transactionIn, runIn, FieldSource, fieldSource, endingReady, endingWatch, endingWaiting,
     runTransaction, statement, prepare, awaitPreparation, executePrepared, pipeline, finalPipeline,
     nextRow, discard, fieldLength, nextChunk, finishTransaction, condemn, sql,
     row, streamingRow, singleRow, rowMaybe, noResult,
@@ -422,6 +422,19 @@ endingReady (Tx runtime) = runPull runtime (settleEnding runtime)
 -- ready. The caller releases it.
 endingWatch :: Tx s -> IO Watch
 endingWatch (Tx runtime) = watchStalled runtime
+
+-- | 'endingReady' that waits for the reply in place: when it has not arrived, or
+-- there is no buffer to receive into, it calls the wait with an action that
+-- registers a watch for what the pull is stalled on, which the wait releases,
+-- and tries again, so it always gives the outcome of the ending. A failure of the
+-- wait, like any other failure of the pull, abandons the transaction.
+endingWaiting :: Tx s -> (IO Watch -> IO ()) -> IO (Either QueryError ())
+endingWaiting (Tx runtime) wait = runPull runtime loop
+  where
+    loop =
+      settleEnding runtime >>= \case
+        Just outcome -> pure outcome
+        Nothing -> wait (watchStalled runtime) *> loop
 
 settleEnding :: Runtime -> IO (Maybe (Either QueryError ()))
 settleEnding runtime = do
