@@ -15,6 +15,7 @@ import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
 import Data.Bifunctor (first)
+import Data.Functor ((<&>))
 import Data.Functor.Const (Const (..))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
@@ -294,7 +295,7 @@ withEnv port size use = do
       setupBufferCount = positiveInt @2
     }
   events <- newIORef []
-  let connect = try @SomeException (fst <$> Streaming.connect resources (settings port)) >>= pure . first show
+  let connect = try @SomeException (fst <$> Streaming.connect resources (settings port)) <&> first show
   pool <- Pool.newPool waiting Config
     { configSize = size,
       configAcquisitionTimeout = 10,
@@ -403,7 +404,7 @@ opened env = length . filter (== "connecting") <$> readIORef (envEvents env)
 
 -- | The last events of the pool, by name.
 lastNames :: Env -> Int -> IO [String]
-lastNames env n = (reverse . take n . reverse) <$> readIORef (envEvents env)
+lastNames env n = reverse . take n . reverse <$> readIORef (envEvents env)
 
 statusName :: ConnectionStatus -> String
 statusName = \case

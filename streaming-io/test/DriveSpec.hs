@@ -3,6 +3,7 @@
 module DriveSpec (spec) where
 
 import Control.Exception (Exception, throwIO)
+import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Network.Streaming.Drive
 import Network.Streaming.Link (Blocked (..), Interest (..), Link (..))
@@ -98,7 +99,7 @@ spec = describe "driving a step" $ do
   it "lets the exception of a wait propagate, and doesn't step again" $ do
     link <- newWaitLink (throwIO (Boom "wait"))
     steps <- newIORef (0 :: Int)
-    let step () = modifyIORef' steps (+ 1) *> pure (Blocked () (Interest True Done) :: Progress () ())
+    let step () = modifyIORef' steps (+ 1) $> (Blocked () (Interest True Done) :: Progress () ())
     drive link step () `shouldSatisfy` P.throws (P.con (Boom (P.eq "wait")))
     readIORef steps `shouldReturn` 1
     waits link `shouldReturn` [(True, "done")]

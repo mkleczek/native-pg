@@ -2,6 +2,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 
+-- Each platform's imports are in its own branch of the conditional, which hlint reads as one.
+{- HLINT ignore "Use fewer imports" -}
+
 -- | The byte-stream interface implemented by transport links, and the raw
 -- socket link.
 module Network.Streaming.Link
@@ -189,7 +192,7 @@ socketReadOrWrite sock =
 -- callback. 'registerFd' is passed as a function and not applied, because it
 -- is inlined where it is applied, which copies its body here.
 registerBoth :: (IOCallback -> Fd -> Event -> Lifetime -> IO FdKey) -> Fd -> (Event -> IO ()) -> IO FdKey
-registerBoth register fd callback = register (\_ -> callback) fd bothEvents OneShot
+registerBoth register fd callback = register (const callback) fd bothEvents OneShot
 {-# NOINLINE registerBoth #-}
 
 bothEvents :: Event

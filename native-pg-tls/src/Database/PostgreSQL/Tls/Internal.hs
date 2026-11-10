@@ -140,13 +140,15 @@ newTlsConfig settings serverName = do
     -- GHC owns this pinned storage; it has no freeing finalizer whose order
     -- would have to be coordinated with the native config and connections.
     name <-
-      ( withCStringLen serverName $ \(bytes, len) -> do
-          owned <- mallocForeignPtrBytes (len + 1)
-          withForeignPtr owned $ \pointer -> do
-            copyBytes pointer bytes len
-            pokeByteOff pointer len (0 :: CChar)
-          pure owned
-      )
+      withCStringLen
+        serverName
+        ( \(bytes, len) -> do
+            owned <- mallocForeignPtrBytes (len + 1)
+            withForeignPtr owned $ \pointer -> do
+              copyBytes pointer bytes len
+              pokeByteOff pointer len (0 :: CChar)
+            pure owned
+        )
         `onException` c_client_config_free config
     owned <- Foreign.newForeignPtr (unConstPtr config) (withForeignPtr name $ \_ -> c_client_config_free config)
     pure (TlsConfig owned name)
