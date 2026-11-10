@@ -9,6 +9,7 @@ import Control.Concurrent.STM (atomically)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Exception (ErrorCall (..), throwIO, toException)
 import Control.Monad (replicateM_, void, when)
+import Data.Bool (bool)
 import Data.Functor (($>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub)
@@ -85,9 +86,7 @@ spec = do
       harness <- newHarness
       failing <- newIORef True
       let connect =
-            readIORef failing >>= \case
-              True -> writeIORef failing False $> Left "the server is down"
-              False -> configConnect (config harness)
+            readIORef failing >>= bool (configConnect (config harness)) (writeIORef failing False $> Left "the server is down")
       pool <- newPool waiting (config harness){configConnect = connect}
       useOnce pool `shouldReturn` Left (ConnectionFailed "the server is down")
       useOnce pool `shouldReturn` Right 1
@@ -128,14 +127,14 @@ spec = do
     it "closes a connection that a use broke" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
-      use pool (\connection -> pure (Broke (Just (pack "lost")), connection)) `shouldReturn` Right 1
+      use pool (pure . (Broke (Just (pack "lost")),)) `shouldReturn` Right 1
       readIORef (harnessClosed harness) `shouldReturn` [1]
       useOnce pool `shouldReturn` Right 2
 
     it "keeps a connection after a use that failed" $ getAcquisition >>= \waiting -> do
       harness <- newHarness
       pool <- newPool waiting (config harness)
-      use pool (\connection -> pure (Failed (toException (ErrorCall "no rows")), connection)) `shouldReturn` Right 1
+      use pool (pure . (Failed (toException (ErrorCall "no rows")),)) `shouldReturn` Right 1
       useOnce pool `shouldReturn` Right 1
       readIORef (harnessClosed harness) `shouldReturn` []
 
@@ -195,9 +194,7 @@ spec = do
       started <- newEmptyMVar
       first <- newIORef True
       let connect =
-            readIORef first >>= \case
-              True -> writeIORef first False *> putMVar started () *> threadDelay 10_000_000 $> Left "never"
-              False -> configConnect (config harness)
+            readIORef first >>= bool (configConnect (config harness)) (writeIORef first False *> putMVar started () *> threadDelay 10_000_000 $> Left "never")
       pool <- newPool waiting (config harness){configConnect = connect}
       user <- forkIO (void (useOnce pool))
       takeMVar started
@@ -269,7 +266,7 @@ statusName = \case
 
 -- | A use that succeeds, giving its connection.
 useOnce :: Pool Int String -> IO (Either (UsageError String) Int)
-useOnce pool = use pool (\connection -> pure (Succeeded, connection))
+useOnce pool = use pool (pure . (Succeeded,))
 
 -- | Starts a use that holds its connection, and waits until it has one. Gives
 -- the connection, and an action that ends the use and waits for it.

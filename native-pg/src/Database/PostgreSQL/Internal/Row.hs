@@ -18,7 +18,7 @@ import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (newMVar, takeMVar, putMVar, readMVar)
 import Control.Exception (SomeException, catch, finally, fromException, mask, onException, throwIO, toException, uninterruptibleMask_)
 import Control.Monad.Except (throwError)
-import Control.Monad (join, unless, when)
+import Control.Monad (join, unless, void, when)
 import Data.Foldable (for_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -114,7 +114,7 @@ startRow context rowLength columnCount = do
 -- | Skips what the step left unread, so the next message can be read.
 finishRow :: Row -> IO ()
 finishRow row = do
-  _ <- activeCursor row
+  void (activeCursor row)
   writeIORef (rowCursor row) (RowCursor False 0 0 True False)
   position <- inputPosition <$> readIORef (contextInput (rowContext row))
   inRow row (skipInput (rowEnd row - position))
@@ -132,7 +132,7 @@ rowUnreadBytes :: Row -> IO Int
 rowUnreadBytes row = do
   cursor <- readIORef (rowCursor row)
   if cursorActive cursor
-    then (\input -> rowEnd row - inputPosition input) <$> readIORef (contextInput (rowContext row))
+    then (rowEnd row -) . inputPosition <$> readIORef (contextInput (rowContext row))
     else pure 0
 
 -- | Pulls the next column, skipping what's left unread of the current one.
@@ -246,15 +246,13 @@ columnChunks row use = do
 borrowColumnChunks :: Row -> RowCursor -> (ByteString -> IO ()) -> IO ()
 borrowColumnChunks row cursor use = do
   writeIORef (rowCursor row) cursor {cursorValueTaken = True, cursorBorrowed = True}
-  let loop remaining
-        | remaining == 0 = pure ()
-        | otherwise = do
-            size <- inRow row $ withInputSome remaining $ \chunk -> do
-              use chunk
-              pure (BS.length chunk)
-            let left = remaining - size
-            writeIORef (rowCursor row) cursor {cursorValueLeft = left, cursorValueTaken = True, cursorBorrowed = True}
-            loop left
+  let loop remaining = unless (remaining == 0) $ do
+        size <- inRow row $ withInputSome remaining $ \chunk -> do
+          use chunk
+          pure (BS.length chunk)
+        let left = remaining - size
+        writeIORef (rowCursor row) cursor {cursorValueLeft = left, cursorValueTaken = True, cursorBorrowed = True}
+        loop left
   loop (cursorValueLeft cursor) `onException`
     writeIORef (rowCursor row) cursor {cursorActive = False, cursorValueTaken = True}
   writeIORef (rowCursor row) cursor {cursorValueLeft = 0, cursorValueTaken = True}

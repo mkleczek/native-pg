@@ -29,7 +29,7 @@ readySpec = describe "ready connection reservations" $ do
     reservation <- ready pool
     isNothing <$> atomically (tryReserveReady pool) `shouldReturn` True
     validateReservation reservation `shouldReturn` True
-    useReservation reservation (\connection -> pure (Succeeded, connection)) `shouldReturn` 1
+    useReservation reservation (pure . (Succeeded,)) `shouldReturn` 1
     finishReservation reservation Succeeded
     validateReservation reservation `shouldReturn` False
     rejected <- try @ReservationError (useReservation reservation (\_ -> pure (Succeeded, ())))
@@ -132,7 +132,7 @@ ready :: Pool Int String -> IO (Reservation Int String)
 ready pool = atomically (tryReserveReady pool) >>= maybe (fail "expected a ready reservation") pure
 
 useOnce :: Pool Int String -> IO (Either (UsageError String) Int)
-useOnce pool = use pool (\connection -> pure (Succeeded, connection))
+useOnce pool = use pool (pure . (Succeeded,))
 
 harness :: Acquire.Context -> (Config Int String -> Config Int String) -> IO (Pool Int String, IORef Int, IORef [Int])
 harness waiting = policyHarness waiting defaultPolicy
@@ -171,7 +171,7 @@ openingSpec = describe "independent connection startup" $ do
     isNothing <$> atomically (tryReserveOpening pool) `shouldReturn` True
     reservation <- ready pool
     validateReservation reservation `shouldReturn` True
-    useReservation reservation (\connection -> pure (Succeeded, connection)) `shouldReturn` 1
+    useReservation reservation (pure . (Succeeded,)) `shouldReturn` 1
     readIORef opened `shouldReturn` 1
     release pool
 
@@ -265,7 +265,7 @@ shutdownSpec = describe "permanent pool shutdown" $ do
       useOnce pool `shouldReturn` Left PoolClosed
       release pool
       useOnce pool `shouldReturn` Left PoolClosed
-      useReservation owned (\n -> pure (Succeeded, n)) `shouldReturn` 1
+      useReservation owned (pure . (Succeeded,)) `shouldReturn` 1
       finishReservation owned Succeeded
       destroy pool
       readIORef closed `shouldReturn` [1]

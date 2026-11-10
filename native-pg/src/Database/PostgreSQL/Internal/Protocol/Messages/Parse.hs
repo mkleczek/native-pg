@@ -25,13 +25,7 @@ parseMessage :: forall message {payload} {schema}.
   (message ~ Envelope payload schema, Parsable message schema) => ByteString -> Either String message
 parseMessage input = do
   (message, rest) <- runBodyParser input (parser @message)
-  if BS.null rest
-    then pure message
-    else
-      Left $
-        "parser left "
-          <> show (BS.length rest)
-          <> " unconsumed bytes"
+  if BS.null rest then pure message else Left ("parser left " <> show (BS.length rest) <> " unconsumed bytes")
 
 serialize :: forall a s. Serializable (Envelope a s) s => Envelope a s -> Output
 serialize = serializeField @(Envelope a s) @s

@@ -147,9 +147,7 @@ spec = describe "independent request and connection admission" $ do
         mkWeakPtr pool Nothing
       let collect = do
             performGC
-            deRefWeak weak >>= \case
-              Nothing -> pure ()
-              Just _ -> yield >> collect
+            deRefWeak weak >>= maybe (pure ()) (const (yield >> collect))
       timeout 1_000_000 collect `shouldReturn` Just ()
       assertAcquisitionUsable waiting
 
@@ -321,7 +319,7 @@ sharedConfig connect = Pool.Config
     }
 
 useOnce :: Pool.Pool Int String -> IO (Either (Pool.UsageError String) Int)
-useOnce pool = Pool.use pool (\connection -> pure (Pool.Succeeded, connection))
+useOnce pool = Pool.use pool (pure . (Pool.Succeeded,))
 
 -- Only the worker retains the pool while primary admission waits.
 startQueuedRequest :: Acquire.Context -> BufferPool.BufferPool -> IO (ThreadId, MVar (Either SomeException (Either (Pool.UsageError String) Int)))
@@ -356,5 +354,5 @@ withTestResources settings action = getAcquisition >>= \waiting ->
 assertAcquisitionUsable :: Acquire.Context -> IO ()
 assertAcquisitionUsable waiting =
   Acquire.acquire waiting Acquire.NoDeadline retry
-    (\waiter -> void (Acquire.tryGrant waiter (pure ())))
+    (void . (`Acquire.tryGrant` (pure ())))
     (const (pure ())) (const (pure ())) `shouldReturn` Just ()

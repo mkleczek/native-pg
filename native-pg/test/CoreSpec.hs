@@ -23,6 +23,7 @@ import Database.PostgreSQL.Diagnostics
 import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
 import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Internal.Protocol
+import FeedSupport (staticBytes)
 import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
@@ -38,8 +39,8 @@ spec :: Spec
 spec = do
   describe "frontend messages" $ do
     it "infers startup negotiation framing from message constructors" $ do
-      outputByteString (serialize SSLRequest) `shouldBe` (int32 8 <> int32 80877103)
-      outputByteString (serialize GSSENCRequest) `shouldBe` (int32 8 <> int32 80877104)
+      staticBytes (serialize SSLRequest) `shouldBe` (int32 8 <> int32 80877103)
+      staticBytes (serialize GSSENCRequest) `shouldBe` (int32 8 <> int32 80877104)
     it "encodes Sync" $
       encodes @Sync Sync "S\0\0\0\4"
     it "encodes Query" $
@@ -69,7 +70,7 @@ spec = do
     it "encodes a CancelRequest" $
       encodes @(CancelRequest ByteString) cancelRequest cancelRequestBytes
     it "rejects a zero byte inside a C string" $
-      evaluate (outputByteString (serialize (Query "a\0b" :: Query ByteString)))
+      evaluate (staticBytes (serialize (Query "a\0b" :: Query ByteString)))
         `shouldSatisfy` P.throws (P.anything @ErrorCall)
     it "round-trips every frontend message" $ do
       roundTrip @(StartupMessage ByteString) startupMessage
@@ -97,8 +98,8 @@ spec = do
 
   describe "primitive field schemas" $
     it "keeps schema selection explicit for the same byte value" $ do
-      outputByteString (serializeField @ByteString @'CStringAtom "value") `shouldBe` "value\0"
-      outputByteString (serializeField @ByteString @'RemainingBytesAtom "value") `shouldBe` "value"
+      staticBytes (serializeField @ByteString @'CStringAtom "value") `shouldBe` "value\0"
+      staticBytes (serializeField @ByteString @'RemainingBytesAtom "value") `shouldBe` "value"
 
   describe "backend messages" $ do
     it "decodes AuthenticationOk" $
@@ -322,9 +323,9 @@ spec = do
     it "reads sslmode, and requiressl as libpq does" $ do
       let sslMode = fmap connectionSslMode
       mapM_
-        (\string -> sslMode (parse string) `shouldBe` Right SslRequire)
+        ((`shouldBe` Right SslRequire) . sslMode . parse)
         ["sslmode=require", "requiressl=1", "sslmode=disable requiressl=1", "postgresql://h/db?ssl=true"]
-      mapM_ (\string -> sslMode (parse string) `shouldBe` Right SslPrefer) ["", "sslmode=prefer", "requiressl=0"]
+      mapM_ ((`shouldBe` Right SslPrefer) . sslMode . parse) ["", "sslmode=prefer", "requiressl=0"]
       sslMode (parse "sslmode=allow") `shouldBe` Right SslAllow
       sslMode (parse "requiressl=1 sslmode=disable") `shouldBe` Right SslDisable
       sslMode (parseWith [("PGREQUIRESSL", "1")] "") `shouldBe` Right SslRequire
@@ -477,10 +478,10 @@ rfc7677ServerFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22
 conversation :: ByteString
 conversation =
   BS.concat
-    [ outputByteString (serialize ParseComplete),
-      outputByteString (serialize (DataRow [Just "42", Nothing, Just "a longer value"] :: DataRow ByteString)),
-      outputByteString (serialize (CommandComplete "SELECT 1" :: CommandComplete ByteString)),
-      outputByteString (serialize (ReadyForQuery TxIdle))
+    [ staticBytes (serialize ParseComplete),
+      staticBytes (serialize (DataRow [Just "42", Nothing, Just "a longer value"] :: DataRow ByteString)),
+      staticBytes (serialize (CommandComplete "SELECT 1" :: CommandComplete ByteString)),
+      staticBytes (serialize (ReadyForQuery TxIdle))
     ]
 
 type QueryReplies =
@@ -549,13 +550,13 @@ dispatch input = do
         :|: NoAlternatives
 
 encodes :: forall message a s. (message ~ Envelope a s, Serializable message s) => message -> ByteString -> IO ()
-encodes message expected = outputByteString (serialize message) `shouldBe` expected
+encodes message expected = staticBytes (serialize message) `shouldBe` expected
 
 decodes :: forall message a s. (message ~ Envelope a s, Parsable message s, Eq message, Show message) => ByteString -> message -> IO ()
 decodes input expected = parseMessage @message input `shouldBe` Right expected
 
 roundTrip :: forall message a s. (message ~ Envelope a s, Parsable message s, Serializable message s, Eq message, Show message) => message -> IO ()
-roundTrip message = parseMessage @message (outputByteString (serialize message)) `shouldBe` Right message
+roundTrip message = parseMessage @message (staticBytes (serialize message)) `shouldBe` Right message
 
 startupMessage :: StartupMessage ByteString
 startupMessage =

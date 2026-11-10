@@ -30,6 +30,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Char8 as Char8
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Word (Word8)
 
 -- | The answer to an MD5 password request:
@@ -123,9 +124,10 @@ scramVerifyServerFinal expected serverFinal =
 
 attribute :: Char -> [ByteString] -> Either String ByteString
 attribute name attributes =
-  case [value | pair <- attributes, Just value <- [BS.stripPrefix (Char8.pack [name, '=']) pair]] of
-    value : _ -> Right value
-    [] -> Left ("missing attribute " <> [name])
+  maybe (Left ("missing attribute " <> [name])) Right
+    . listToMaybe
+    . mapMaybe (BS.stripPrefix (Char8.pack [name, '=']))
+    $ attributes
 
 hmacSha256 :: ByteString -> ByteString -> ByteString
 hmacSha256 key message = ByteArray.convert (hmac key message :: HMAC SHA256)

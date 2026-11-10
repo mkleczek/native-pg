@@ -15,6 +15,7 @@ import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
 import Data.Bifunctor (first)
+import Data.Either (isLeft, isRight)
 import Data.Functor ((<&>))
 import Data.Functor.Const (Const (..))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -75,7 +76,7 @@ spec port = describe "operations and transactions in a scope" $ do
       inRequest env Tx.Write $ \_ tx -> do
         Tx.runIn tx (Tx.sql "INSERT INTO scope_handled VALUES (1)")
         failure <- try @Tx.QueryError (Tx.runIn tx (Tx.pipeline (Tx.statement () divisionByZero) >>= Tx.singleRowValue))
-        isLeft' failure `shouldBe` True
+        isLeft failure `shouldBe` True
       lastNames env 1 `shouldReturn` ["ready: succeeded"]
       opened env `shouldReturn` 1
       count env "scope_handled" `shouldReturn` 0
@@ -153,7 +154,7 @@ spec port = describe "operations and transactions in a scope" $ do
       result <- try @Tx.QueryError $ inRequest env Tx.Write $ \_ tx -> do
         Tx.runIn tx (Tx.sql "INSERT INTO scope_error VALUES (1)")
         Tx.runIn tx (Tx.pipeline (Tx.statement () divisionByZero) >>= Tx.singleRowValue)
-      isLeft' result `shouldBe` True
+      isLeft result `shouldBe` True
       lastNames env 1 `shouldReturn` ["ready: failed"]
       opened env `shouldReturn` 1
       count env "scope_error" `shouldReturn` 0
@@ -237,7 +238,7 @@ spec port = describe "operations and transactions in a scope" $ do
         field <- Tx.runIn tx (firstField =<< Tx.finalPipeline (Tx.statement () (numbersOf 3000)))
         _ <- pullAll (Tx.fieldSource field)
         awaitEnding tx
-      isRight' outcome `shouldBe` True
+      isRight outcome `shouldBe` True
       lastNames env 1 `shouldReturn` ["ready: succeeded"]
       count env "reply_commit" `shouldReturn` 1
 
@@ -396,7 +397,7 @@ brokenAfter env = do
   count env "pg_class" `shouldSatisfyValue` (> 0)
   opened env `shouldReturn` 2
   where
-    shouldSatisfyValue action predicate = action >>= \value -> predicate value `shouldBe` True
+    shouldSatisfyValue action predicate = action >>= (`shouldBe` True) . predicate
 
 -- | How many connections the pool opened.
 opened :: Env -> IO Int
@@ -446,12 +447,6 @@ sleepingAtTheEnd =
 
 sleeping :: Tx.Statement () (Const Int64)
 sleeping = Tx.Statement "SELECT 1 FROM pg_sleep(30)" (const []) (Tx.singleRow (Tx.row @'[Int64] Const))
-
-isRight' :: Either a b -> Bool
-isRight' = either (const False) (const True)
-
-isLeft' :: Either a b -> Bool
-isLeft' = either (const True) (const False)
 
 drain :: Tx.Transaction tx BS.ByteString -> (BS.ByteString -> Tx.Transaction tx ()) -> Tx.Transaction tx ()
 drain source use = do

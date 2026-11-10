@@ -89,6 +89,7 @@ import Database.PostgreSQL.Internal.Protocol.Messages.Types
     Envelope (Envelope),
     ErrorNoticeField,
     ErrorNoticeFieldType (ErrorNoticeFieldType),
+    FramedMessage,
     Notification,
     NotificationType (NotificationType),
     Oid,
@@ -103,11 +104,7 @@ import Database.PostgreSQL.Internal.Protocol.Messages.Types
     TransactionStatusType (TransactionStatusType),
   )
 
-type BackendSessionMessage tag payload =
-  'PayloadStruct
-    '[ 'PayloadConst 1 tag,
-       'PayloadBounded payload
-     ]
+type BackendSessionMessage tag payload = FramedMessage tag payload
 
 data BackendKeyDataType (payload :: Payload) where
   BackendKeyDataType ::

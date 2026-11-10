@@ -74,8 +74,8 @@ spec = do
           >>= putMVar finished
       takeMVar registered
       throwTo waiter (ErrorCall "interrupted")
-      timeout 2000000 (takeMVar finished) >>= \outcome ->
-        fmap (either show (const "returned")) outcome `shouldBe` Just "interrupted"
+      timeout 2000000 (takeMVar finished)
+        >>= (`shouldBe` Just "interrupted") . fmap (either show (const "returned"))
       readCounts counts `shouldReturn` (3, 3)
 
     it "releases the registered watches when registering another fails" $ do

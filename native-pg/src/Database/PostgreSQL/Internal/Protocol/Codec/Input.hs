@@ -41,6 +41,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Exception (Exception, evaluate, throwIO, try, mask_, onException)
 import Control.Monad (ap, liftM, when)
 import Control.Monad.Except (MonadError (..))
@@ -707,17 +708,13 @@ fill metadata source count buffer
 {-# NOINLINE fill #-}
 
 suppliedCapacity :: InputBuffer -> Int
-suppliedCapacity buffer = case bufferHome buffer of
-  Nothing -> bufferCapacity buffer
-  Just (HomeBuffer _ capacity) -> capacity
+suppliedCapacity buffer = maybe (bufferCapacity buffer) (\(HomeBuffer _ capacity) -> capacity) (bufferHome buffer)
 
 expandMetadata :: Int -> InputBuffer -> IO InputBuffer
 expandMetadata capacity buffer = do
   storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
   let count = bufferEnd buffer - bufferStart buffer
-      home = case bufferHome buffer of
-        Nothing -> Just (HomeBuffer (bufferMemory buffer) (bufferCapacity buffer))
-        previous -> previous
+      home = bufferHome buffer <|> Just (HomeBuffer (bufferMemory buffer) (bufferCapacity buffer))
   withForeignPtr (Buffer.bufferMemory storage) $ \target ->
     withForeignPtr (bufferMemory buffer) $ \origin ->
       copyBytes target (origin `plusPtr` bufferStart buffer) count

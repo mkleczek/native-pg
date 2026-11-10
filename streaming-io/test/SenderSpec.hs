@@ -11,6 +11,7 @@ import Data.Either (isLeft)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import FakeStreams
 import Foreign.ForeignPtr (withForeignPtr)
+import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import Foreign.Ptr (plusPtr)
 import GHC.Conc (listThreads)
 import Network.Streaming.Buffer (bufferMemory, newBuffer)
@@ -19,6 +20,7 @@ import qualified Network.Streaming.Output as Output
 import Network.Streaming.PositiveInt (PositiveInt, positiveInt)
 import Network.Streaming.Sender
 import Network.Streaming.Source (Pulled (..))
+import System.IO.Unsafe (unsafeDupablePerformIO)
 import Network.Streaming.Watch (Watch (..), awaitWatch)
 import Skeletest
 import qualified Skeletest.Predicate as P
@@ -242,7 +244,7 @@ spec = describe "the gathering sender" $ do
           buffer <- newBuffer (positiveInt @64)
           link <- newFakeLink (repeat accepts)
           sendAll link =<< unsent (Just (outputBufferFrom buffer)) output
-          linkReceived link `shouldReturn` Output.outputByteString output
+          linkReceived link `shouldReturn` staticBytes output
 
   describe "owned streams" $ do
     it "limits gathered chunks and preserves their order across partial writes" $ do
@@ -545,10 +547,7 @@ directValue =
 
 -- | The output's parts, in a supplied buffer of this size or none.
 unsentIn :: Maybe PositiveInt -> Output.Output -> IO Unsent
-unsentIn Nothing output = unsent Nothing output
-unsentIn (Just size) output = do
-  buffer <- newBuffer size
-  unsent (Just (outputBufferFrom buffer)) output
+unsentIn size output = do buffer <- traverse newBuffer size; unsent (fmap outputBufferFrom buffer) output
 
 name :: Stalled -> String
 name = \case
@@ -570,3 +569,12 @@ waits writable source = Stalls (Again <$ writable) (\register -> Again <$ source
 -- | Pushes with the stalls until all is sent and flushed.
 pushAnswer :: Link link => link -> Stalls -> Unsent -> IO ()
 pushAnswer link stalls left = void (pushWith link stalls left)
+
+-- | The bytes of an output that has no streams, for fixtures.
+staticBytes :: Output.Output -> BS.ByteString
+staticBytes output = unsafeDupablePerformIO $ do
+  parts <- (`Output.writeOutput` output) =<< mallocPlainForeignPtrBytes (Output.outputCopied output)
+  pure . BS.concat $ map (either id uncopied) parts
+  where
+    uncopied (Output.UncopiedBytes value) = value
+    uncopied _ = error "an output with streams has no byte string"

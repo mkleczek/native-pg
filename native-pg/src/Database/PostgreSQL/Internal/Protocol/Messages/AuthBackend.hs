@@ -47,15 +47,12 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   )
 import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( Envelope (..),
+    FramedMessage,
   )
 
 type AuthenticationSubcode code = 'PayloadConst 4 code
 
-type AuthenticationMessage payload =
-  'PayloadStruct
-    '[ 'PayloadConst 1 'R',
-       'PayloadBounded payload
-     ]
+type AuthenticationMessage payload = FramedMessage 'R' payload
 
 data AuthenticationOkType (payload :: Payload) where
   AuthenticationOkType ::

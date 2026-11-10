@@ -44,7 +44,7 @@ connectFirstUsing open dispose value adjust string =
         Left failure -> attempt target others ((host, failure) : failures)
     tryHost target host =
       fromMaybe (Left TimedOut) <$> withTimeout (establish target host `catches` handlers)
-    withTimeout = maybe (fmap Just) (\seconds -> timeout (seconds * 1000000)) (connectionTimeout string)
+    withTimeout = maybe (fmap Just) (timeout . (* 1000000)) (connectionTimeout string)
     handlers =
       [ Handler (pure . Left . NotConnected),
         Handler (pure . Left . NotStarted),

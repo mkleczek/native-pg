@@ -170,7 +170,7 @@ spec = describe "borrowed field streams" $ do
     let observe offset = when (offset >= 32) $ do
           first <- atomicModifyIORef' entered (\previous -> (True, not previous))
           when first (putMVar blocked () *> threadDelay 10000000)
-        cleanup = readIORef child >>= maybe (pure ()) killThread
+        cleanup = readIORef child >>= mapM_ killThread
     (do
       result <- withFieldsObserved observe [Just payload] ready $ \context _ ->
         try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
@@ -257,7 +257,7 @@ drain source sink = do
   unless (BS.null chunk) (sink chunk *> drain source sink)
 
 payload :: BS.ByteString
-payload = BS.concat (map (BS.replicate 31) [65..72])
+payload = foldMap (BS.replicate 31) [65 .. 72]
 
 execution :: PG.Execution
 execution = PG.Execution (PG.Prepared "") [] [] []

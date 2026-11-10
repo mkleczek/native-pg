@@ -12,10 +12,11 @@ module Database.PostgreSQL.Internal.Execution
   ) where
 
 import Control.Exception (throwIO)
-import Data.Bifunctor (first)
+import Data.Bifunctor (first, second)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef')
 import Data.Int (Int32)
+import Data.List (unsnoc)
 import Data.Word (Word32)
 import Database.PostgreSQL.Diagnostics (ServerError)
 import Database.PostgreSQL.Internal.Context
@@ -25,6 +26,10 @@ import Database.PostgreSQL.Session (closeStatement)
 import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), Output)
 import Database.PostgreSQL.Internal.Protocol.Messages hiding (notificationProcessId)
 import qualified Database.PostgreSQL.Internal.Protocol.Messages.Types as Protocol
+
+-- | The parameter types of an unprepared statement, as protocol OIDs.
+scalarize :: [Maybe Word32] -> [Maybe Oid]
+scalarize = map (fmap Scalar)
 
 -- | A statement to run.
 data Statement
@@ -51,7 +56,7 @@ data Execution = Execution
 -- lets the server infer a type.
 prepare :: Session 'Ready -> ByteString -> ByteString -> [Maybe Word32] -> IO (Either ServerError (), TransactionStatus)
 prepare session name query parameterTypes = operation session $ do
-  sendOutputs session (serialize (Parse name query (map (fmap Scalar) parameterTypes)) <> sync)
+  sendOutputs session (serialize (Parse name query (scalarize parameterTypes)) <> sync)
   parsed <- pullEither (continueIn session :: Session 'ParseResult) ((\ParseComplete -> Reply ()) :|: sessionTail)
   awaitReady session id parsed
 
@@ -118,11 +123,7 @@ startExecution session execution = do
   case parsed of
     Left failure -> pure (Left failure)
     Right () | parsesOnly execution -> pure (Right ())
-    Right () -> do
-      bound <- pullEither (continueIn session :: Session 'BindResult) ((\BindComplete -> Reply ()) :|: sessionTail)
-      case bound of
-        Left failure -> pure (Left failure)
-        Right () -> pure (Right ())
+    Right () -> pullEither (continueIn session :: Session 'BindResult) ((\BindComplete -> Reply ()) :|: sessionTail)
   where
     parseComplete = pullEither (continueIn session :: Session 'ParseResult) ((\ParseComplete -> Reply ()) :|: sessionTail)
     described = do
@@ -142,8 +143,7 @@ awaitNotification session = operation session $ do
   kept <- atomicModifyIORef' (connectionNotifications connection) takeOldest
   maybe waitForOne pure kept
   where
-    takeOldest [] = ([], Nothing)
-    takeOldest kept = (init kept, Just (last kept))
+    takeOldest = maybe ([], Nothing) (second Just) . unsnoc
     waitForOne = do
       reply <-
         pullEither session $
@@ -152,7 +152,7 @@ awaitNotification session = operation session $ do
             :|: onParameterStatus
             :|: (\(NotificationResponse notification) -> Reply (copyNotification notification))
             :|: NoAlternatives
-      either (\failure -> throwIO (ProtocolError ("an error while idle: " <> show failure))) pure reply
+      either (throwIO . ProtocolError . ("an error while idle: " <>) . show) pure reply
 
 -- | Parse (unless the statement is prepared already), Bind and Execute; only
 -- the Parse of a statement that is 'parsesOnly'. A prepared statement is
@@ -178,11 +178,11 @@ executionMessages execution =
           <> serialize (Execute "" 0 :: Execute ByteString)
   where
     (preamble, statementName) = case executionStatement execution of
-      Unprepared query parameterTypes -> (serialize (Parse "" query (map (fmap Scalar) parameterTypes)), "")
+      Unprepared query parameterTypes -> (serialize (Parse "" query (scalarize parameterTypes)), "")
       Prepared name
         | streamsParameter execution -> (serialize (Describe PreparedStatement name), name)
         | otherwise -> (mempty, name)
-      Parsing name query parameterTypes -> (serialize (Parse name query (map (fmap Scalar) parameterTypes)), name)
+      Parsing name query parameterTypes -> (serialize (Parse name query (scalarize parameterTypes)), name)
 
 -- | Whether the execution only parses its statement: it sends no Bind or
 -- Execute, and has no rows.

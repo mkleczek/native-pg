@@ -149,8 +149,4 @@ data StatementError
 
 -- | Whether the server ends the session after this error.
 isConnectionFatal :: ServerError -> Bool
-isConnectionFatal (ServerError fields) =
-  case diagnosticSeverity fields of
-    SeverityFatal -> True
-    SeverityPanic -> True
-    _ -> False
+isConnectionFatal (ServerError fields) = diagnosticSeverity fields `elem` [SeverityFatal, SeverityPanic]

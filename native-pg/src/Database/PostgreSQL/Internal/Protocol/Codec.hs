@@ -41,7 +41,6 @@ module Database.PostgreSQL.Internal.Protocol.Codec
     unconsumedBytes,
     withInputSome,
     inputPosition,
-    outputByteString,
     outputCopied,
     outputLength,
     parseChoice,
@@ -106,7 +105,6 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Output
     cstring,
     int16,
     int32,
-    outputByteString,
     outputCopied,
     outputLength,
     outputs,
@@ -446,7 +444,7 @@ instance forall a (payload :: Payload). Serializable a payload => Serializable [
   {-# INLINE serializeField #-}
 
 instance forall a (payload :: Payload). Serializable a payload => Serializable [a] ('PayloadCounted32 payload) where
-  serializeField values = int32 (lengthAsInt32 (length values)) <> outputs (serializeField @a @payload) values
+  serializeField values = int32 (countAsInt32 values) <> outputs (serializeField @a @payload) values
   {-# INLINE serializeField #-}
 
 instance {-# OVERLAPPABLE #-}
@@ -664,6 +662,14 @@ countAsInt16 values
   where
     count = length values
 {-# INLINE countAsInt16 #-}
+
+countAsInt32 :: [a] -> Int32
+countAsInt32 values
+  | count <= fromIntegral (maxBound @Int32) = fromIntegral count
+  | otherwise = error ("element count " <> show count <> " does not fit in an Int32")
+  where
+    count = length values
+{-# INLINE countAsInt32 #-}
 
 natAsInt :: forall n. KnownNat n => Int
 natAsInt = fromInteger (natVal (Proxy @n))

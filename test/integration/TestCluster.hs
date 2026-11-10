@@ -1,6 +1,7 @@
 module TestCluster (withCluster, certificate) where
 
 import Control.Exception (bracket, bracket_)
+import Control.Monad (unless)
 import Data.Foldable (for_)
 import qualified Network.Socket as Socket
 import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive)
@@ -60,9 +61,8 @@ withCluster action = do
         ]
     -- A port nothing listens on now, at least.
     freePort =
-      bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
-        Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
-        Socket.socketPort sock
+      bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock ->
+        Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1))) *> Socket.socketPort sock
     rolesSql =
       unlines
         [ "SET password_encryption = 'scram-sha-256';",
@@ -76,6 +76,4 @@ withCluster action = do
         ]
     run command arguments = do
       (exitCode, out, err) <- readProcessWithExitCode command arguments ""
-      case exitCode of
-        ExitSuccess -> pure ()
-        ExitFailure _ -> fail (unwords (command : arguments) <> " failed:\n" <> out <> err)
+      unless (exitCode == ExitSuccess) (fail (unwords (command : arguments) <> " failed:\n" <> out <> err))

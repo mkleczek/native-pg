@@ -15,7 +15,8 @@ module Control.Concurrent.Resource.Acquisition
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad (void)
-import Data.Time.Clock (DiffTime)
+import Data.Bool (bool)
+import Data.Time.Clock (DiffTime, diffTimeToPicoseconds)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -41,7 +42,7 @@ newContext = Context
 deadlineAfter :: DiffTime -> IO Deadline
 deadlineAfter duration = do
   now <- getMonotonicTimeNSec
-  let delta = max 0 (floor (toRational duration * 1000000000) :: Integer)
+  let delta = max 0 (diffTimeToPicoseconds duration `div` 1000)
   pure (At (fromInteger (min (toInteger (maxBound :: Word64)) (toInteger now + delta))))
 
 deadlineExpired :: Deadline -> IO Bool
@@ -97,8 +98,7 @@ acquire (Context manager) deadline reserveNow enqueue remove cleanup = mask $ \r
       -- A reservation or timer cancellation may cross the deadline after the
       -- initial clock read. Ownership still belongs to cleanup until this check.
       expiredAtDelivery <- deadlineExpired deadline
-      if expiredAtDelivery then cleanup value >> pure Nothing
-      else pure (Just value)
+      bool (pure (Just value)) (cleanup value >> pure Nothing) expiredAtDelivery
 
 -- | The first half of 'acquire' without the wait, for callers that cannot
 -- block: reserve now, or register in the same transaction, so a release
@@ -119,11 +119,11 @@ enroll reserveNow enqueue remove = (reserveNow >>= offered) `orElse` registerReq
 -- exception that the reservation raised in 'tryGrant'. Nothing while the
 -- request is pending, and after 'withdraw'.
 delivered :: Request a -> STM (Maybe (Either SomeException a))
-delivered waiter = do
-  state <- readTVar (deliveryState waiter)
-  pure $ case state of
-    Offered result -> Just result
-    _ -> Nothing
+delivered waiter = offeredResult <$> readTVar (deliveryState waiter)
+
+offeredResult :: Delivery a -> Maybe (Either SomeException a)
+offeredResult (Offered result) = Just result
+offeredResult _ = Nothing
 
 -- | Gives up the request. A pending one is detached and can no longer be
 -- granted; a delivered one returns its value, which the caller must now
@@ -172,13 +172,10 @@ tryGrant waiter reserve = do
       else do
         value <- ((Just . Right <$> reserve) `orElse` pure Nothing)
           `catchSTM` (pure . Just . Left @SomeException)
-        case value of
-          Nothing -> pure False
-          Just result -> do
-            writeTVar (deliveryState waiter) (Offered result)
-            detach waiter
-            pure True
+        maybe (pure False) grant value
     _ -> pure False
+  where
+    grant result = writeTVar (deliveryState waiter) (Offered result) >> detach waiter >> pure True
 
 -- Only the deadline signal may complete a request without a reservation.
 timeoutRequest :: Request a -> STM Bool
@@ -196,9 +193,7 @@ data TimerRegistration = TimerRegistration Timer.TimerManager Timer.TimeoutKey (
 armTimer :: Timer.TimerManager -> Deadline -> Request a -> IO (Maybe TimerRegistration)
 armTimer _ NoDeadline _ = pure Nothing
 armTimer manager (At at) waiter = do
-  pending <- atomically $ do
-    delivery <- readTVar (deliveryState waiter)
-    pure (case delivery of Pending -> True; _ -> False)
+  pending <- atomically (isPending <$> readTVar (deliveryState waiter))
   if not pending then pure Nothing else do
     now <- getMonotonicTimeNSec
     let remaining = (max 0 (toInteger at - toInteger now) + 999) `div` 1000
@@ -211,6 +206,10 @@ armTimer manager (At at) waiter = do
         !signal = fromMaybe (expiration waiter) rearm
     key <- Timer.registerTimeout manager (fromInteger micros) (expireSignal signal)
     pure (Just (TimerRegistration manager key rearm))
+
+isPending :: Delivery a -> Bool
+isPending Pending = True
+isPending _ = False
 
 cancelTimer :: Maybe TimerRegistration -> IO ()
 cancelTimer Nothing = pure ()

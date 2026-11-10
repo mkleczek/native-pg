@@ -20,6 +20,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import qualified Database.PostgreSQL.Internal.Row as PG
 import qualified Database.PostgreSQL.Session as PG
 import Database.PostgreSQL.Transport (Link (..))
+import FeedSupport (message, number)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
@@ -351,9 +352,3 @@ commandComplete tag = message 67 (tag <> "\0")
 -- | A notification on channel @ch@ from process 9.
 notification :: ByteString -> ByteString
 notification payload = message 65 (number 9 <> "ch\0" <> payload <> "\0")
-
-message :: Word8 -> ByteString -> ByteString
-message tag body = BS.singleton tag <> number (4 + BS.length body) <> body
-
-number :: Int -> ByteString
-number n = BS.pack [fromIntegral (n `div` 16777216), fromIntegral (n `div` 65536), fromIntegral (n `div` 256), fromIntegral n]

@@ -5,6 +5,7 @@ import Control.Concurrent.STM
 import Control.Concurrent.Resource.Acquisition
 import Control.Exception
 import Control.Monad (forM, forM_, replicateM, replicateM_, void, when, unless)
+import Data.Bool (bool)
 import Data.Either (isLeft)
 import Data.List (sort)
 import Data.Maybe (isNothing)
@@ -89,7 +90,7 @@ spec = describe "private acquisition" $ do
       (\() -> putMVar entered () >> takeMVar hold)
     await entered
     killThread tid
-    await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+    await result >>= (`shouldBe` True) . isLeft
     readTVarIO cleaned >>= (`shouldBe` 1)
   it "transfers an immediate grant without running cleanup" $ usingSystemTimer $ \context -> do
     cleaned <- newTVarIO (0 :: Int)
@@ -162,7 +163,7 @@ spec = describe "private acquisition" $ do
       request <- within (atomically (takeTMVar registered))
       atomically (tryGrant request (if offer then pure () else throwSTM OwnerClosed)) >>= (`shouldBe` True)
       atomically (tryGrant request (writeTVar reserved True)) >>= (`shouldBe` False)
-      if offer then await result >>= expectWaitResult (Just ()) else await result >>= expectOwnerClosed
+      await result >>= bool expectOwnerClosed (expectWaitResult (Just ())) offer
       readTVarIO reentered >>= (`shouldBe` [False, False])
       readTVarIO reserved >>= (`shouldBe` False)
       readTVarIO removed >>= (`shouldBe` 1)
@@ -195,7 +196,7 @@ spec = describe "private acquisition" $ do
       (const (fail "unassigned cleanup"))
     request <- within (atomically (takeTMVar registered))
     killThread tid
-    await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+    await result >>= (`shouldBe` True) . isLeft
     atomically (tryGrant request (pure ())) >>= (`shouldBe` False)
     readTVarIO detached >>= (`shouldBe` 1)
   it "settles cancel and grant races with exactly one cleanup owner" $ usingSystemTimer $ \context ->
@@ -234,7 +235,7 @@ spec = describe "private acquisition" $ do
     atomically (tryGrant request (pure ())) >>= (`shouldBe` True)
     await entered
     killThread tid
-    await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+    await result >>= (`shouldBe` True) . isLeft
     readTVarIO cleaned >>= (`shouldBe` 1)
   it "rolls back a retrying compound reservation" $ usingSystemTimer $ \context -> do
     registered <- newEmptyTMVarIO
@@ -360,8 +361,8 @@ spec = describe "private acquisition" $ do
       [(first, firstResult), (second, secondResult), (_, survivor)] -> do
         killThread first
         killThread second
-        await firstResult >>= (\outcome -> isLeft outcome `shouldBe` True)
-        await secondResult >>= (\outcome -> isLeft outcome `shouldBe` True)
+        await firstResult >>= (`shouldBe` True) . isLeft
+        await secondResult >>= (`shouldBe` True) . isLeft
         await survivor >>= expectWaitResult Nothing
       _ -> fail "expected three registered waiters"
     readTVarIO detached >>= (`shouldBe` 3)
@@ -385,14 +386,14 @@ spec = describe "private acquisition" $ do
     atomically (delivered request) >>= expectDelivered 7
     atomically (delivered request) >>= expectDelivered 7
     atomically (withdraw request) >>= (`shouldBe` Just 7)
-    atomically (delivered request) >>= (\outcome -> isNothing outcome `shouldBe` True)
+    atomically (delivered request) >>= (`shouldBe` True) . isNothing
     atomically (withdraw request) >>= (`shouldBe` Nothing)
     atomically (tryGrant request (pure 9)) >>= (`shouldBe` False)
     readTVarIO touched >>= (`shouldBe` [])
   it "delivers a later grant to an enrolled request and keeps it until withdrawn" $ do
     removed <- newTVarIO (0 :: Int)
     request <- atomically $ enroll retry (\_ -> pure ()) (const (modifyTVar' removed (+ 1)))
-    atomically (delivered request) >>= (\outcome -> isNothing outcome `shouldBe` True)
+    atomically (delivered request) >>= (`shouldBe` True) . isNothing
     atomically (tryGrant request (pure 7)) >>= (`shouldBe` True)
     readTVarIO removed >>= (`shouldBe` 1)
     atomically (delivered request) >>= expectDelivered 7
@@ -403,11 +404,11 @@ spec = describe "private acquisition" $ do
   it "withdraws a pending enrolled request by detaching it exactly once" $ do
     removed <- newTVarIO (0 :: Int)
     request <- atomically $ enroll retry (\_ -> pure ()) (const (modifyTVar' removed (+ 1)))
-    atomically (withdraw request) >>= (\value -> value `shouldBe` (Nothing :: Maybe Int))
-    atomically (withdraw request) >>= (\value -> value `shouldBe` (Nothing :: Maybe Int))
+    atomically (withdraw request) >>= (`shouldBe` (Nothing :: Maybe Int))
+    atomically (withdraw request) >>= (`shouldBe` (Nothing :: Maybe Int))
     readTVarIO removed >>= (`shouldBe` 1)
     atomically (tryGrant request (pure 9)) >>= (`shouldBe` False)
-    atomically (delivered request) >>= (\outcome -> isNothing outcome `shouldBe` True)
+    atomically (delivered request) >>= (`shouldBe` True) . isNothing
   it "delivers a reservation exception to an enrolled request" $ do
     request <- atomically $ enroll retry (\_ -> pure ()) (const (pure ()))
     atomically (tryGrant request (throwSTM OwnerClosed :: STM Int)) >>= (`shouldBe` True)
@@ -422,7 +423,7 @@ spec = describe "private acquisition" $ do
       (\_ -> writeTVar registered True) (const (pure ()))
     readTVarIO touched >>= (`shouldBe` False)
     readTVarIO registered >>= (`shouldBe` True)
-    atomically (delivered request) >>= (\outcome -> isNothing outcome `shouldBe` True)
+    atomically (delivered request) >>= (`shouldBe` True) . isNothing
   it "rolls back an enroll whose immediate reservation throws without registering" $ do
     reserved <- newTVarIO False
     registered <- newTVarIO False

@@ -9,6 +9,7 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM (atomically, check, newEmptyTMVarIO, newTVarIO, putTMVar, readTMVar, readTVar, readTVarIO, writeTVar)
 import Control.Exception (IOException, SomeException, bracket, evaluate, finally, try)
 import Control.Monad (void, when)
+import Data.Bool (bool)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Functor (($>))
@@ -18,10 +19,10 @@ import Database.PostgreSQL.Internal.Channel
 import Database.PostgreSQL.Internal.Execution (Execution (..), Statement (..), executionMessages)
 import Database.PostgreSQL.Internal.Protocol (Parameter (..))
 import Database.PostgreSQL.Internal.Protocol.Codec
-import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (borrowedStream)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (MaybeBytes32Atom))
 import Database.PostgreSQL.Transport hiding (newChannel)
+import FeedSupport (staticBytes)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
@@ -129,7 +130,7 @@ spec = describe "borrowed parameter streams" $ do
       watches <- newIORef (0 :: Int)
       cancels <- newIORef (0 :: Int)
       let source = PullSource
-            (readTVarIO open >>= \ready -> pure (if ready then Just Ended else Nothing))
+            (bool Nothing (Just Ended) <$> readTVarIO open)
             (putMVar sourceWatched () $> Watch (readTVar open >>= check) (pure ()))
           -- Input never arrives, so only the source's watch ends a wait.
           watchInput = do
@@ -167,12 +168,11 @@ spec = describe "borrowed parameter streams" $ do
       pulls <- newIORef (0 :: Int)
       takes <- newIORef [3 :: Int]
       let source = PullSource
-            (atomicModifyIORef' pulls (\n -> (n + 1, n)) >>= \count ->
-              pure (Just (if count == 0 then Pulled "0123456789" else Ended)))
+            (Just . bool Ended (Pulled "0123456789") . (== 0) <$> atomicModifyIORef' pulls (\n -> (n + 1, n)))
             noWatch
           -- The link takes 3 bytes, and then none.
           send pieces = atomicModifyIORef' takes (\case [] -> ([], 0); count : rest -> (rest, count))
-            >>= \count -> pure (min count (sum (map BS.length pieces)))
+            >>= pure . (`min` (sum (map BS.length pieces)))
           link = Duplex (\_ _ -> pure Nothing) send
             (pure (Watch retry (pure ())))
             (putMVar registered () $> Watch retry (pure ()))
@@ -252,8 +252,7 @@ spec = describe "borrowed parameter streams" $ do
   it "rejects a short and an overlong stream" $ do
       let one chunk = do
             first <- newIORef True
-            pure (PullSource (atomicModifyIORef' first (False,) >>= \current ->
-              pure (Just (if current then Pulled chunk else Ended))) noWatch)
+            pure (PullSource (Just . bool Ended (Pulled chunk) <$> atomicModifyIORef' first (False,)) noWatch)
       short <- one "a"
       long <- one "abc"
       let channel = newChannel (Sender (pure . sum . map BS.length))
@@ -268,7 +267,7 @@ uploadStatement source = executionMessages (Execution (Unprepared "SELECT $1" []
 
 -- | The same statement with its five bytes at hand: what the server gets.
 wire :: BS.ByteString
-wire = Output.outputByteString (executionMessages (Execution (Unprepared "SELECT $1" []) [] [Just (ParameterBytes "hello")] []))
+wire = staticBytes (executionMessages (Execution (Unprepared "SELECT $1" []) [] [Just (ParameterBytes "hello")] []))
 
 -- | A source of one chunk.
 chunkSource :: BS.ByteString -> IO PullSource

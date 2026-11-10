@@ -11,7 +11,6 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Output
     outputCopied,
     Uncopied (..),
     writeOutput,
-    outputByteString,
     outputs,
     word8,
     word16,

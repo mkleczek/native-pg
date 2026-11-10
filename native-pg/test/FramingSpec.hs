@@ -14,6 +14,7 @@ import Data.Int (Int16, Int32)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
+import FeedSupport (staticBytes)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Database.PostgreSQL.Internal.Protocol.Codec
 import Foreign.Marshal.Utils (copyBytes)
@@ -36,7 +37,7 @@ spec = describe "protocol framing" $ do
   it "parses consecutive complete messages across tiny caller-owned storage refills" $ do
     let ready = ReadyForQuery TxIdle
         command = CommandComplete "SELECT 1" :: CommandComplete ByteString
-    source <- bytesSource (outputByteString (serialize ready <> serialize command))
+    source <- bytesSource (staticBytes (serialize ready <> serialize command))
     storage <- newBuffer (positiveInt @4)
     (messages, _) <- runInputUntil source maxBound (reusableInputBuffer storage) $
       (,) <$> parser @ReadyForQuery <*> parser @(CommandComplete ByteString)
@@ -44,7 +45,7 @@ spec = describe "protocol framing" $ do
 
   it "permits a streamed row body across source chunks" $ do
     let column = BS.replicate 1024 120
-        body = outputByteString (serializeField @Int16 @('FixedBytesAtom 2) 1 <> serializeField @Int32 @('FixedBytesAtom 4) 1024) <> column
+        body = staticBytes (serializeField @Int16 @('FixedBytesAtom 2) 1 <> serializeField @Int32 @('FixedBytesAtom 4) 1024) <> column
     source <- bytesSource (frameHeader 68 body <> body)
     inputResult (runInputUntil source maxBound emptyInputBuffer $ do
       _ <- fieldParser @DataRowHeader @('PayloadField 'DataRowHeaderType)
@@ -53,8 +54,8 @@ spec = describe "protocol framing" $ do
       pure "streamed") `shouldReturn` Right "streamed"
 
   it "batches primitive reads inside a frame, reading ahead only into free storage" $ do
-    let body = outputByteString (mconcat (replicate 100 (serializeField @Int32 @('FixedBytesAtom 4) 7)))
-        envelope = outputByteString (serializeField @Int32 @('FixedBytesAtom 4) 400) <> body
+    let body = staticBytes (mconcat (replicate 100 (serializeField @Int32 @('FixedBytesAtom 4) 7)))
+        envelope = staticBytes (serializeField @Int32 @('FixedBytesAtom 4) 400) <> body
         bytes = envelope <> "next"
     offset <- newIORef 0
     requests <- newIORef []
@@ -92,7 +93,7 @@ spec = describe "protocol framing" $ do
     readIORef inside `shouldReturn` True
 
 frameHeader :: Word8 -> ByteString -> ByteString
-frameHeader tag body = BS.singleton tag <> outputByteString (serializeField @Int32 @('FixedBytesAtom 4) (fromIntegral (BS.length body + 4)))
+frameHeader tag body = BS.singleton tag <> staticBytes (serializeField @Int32 @('FixedBytesAtom 4) (fromIntegral (BS.length body + 4)))
 
 inputResult :: IO (ByteString, InputBuffer) -> IO (Either String ByteString)
 inputResult action = either (\(InputError reason) -> Left reason) (Right . fst) <$> try action

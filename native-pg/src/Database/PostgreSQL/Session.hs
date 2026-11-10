@@ -12,6 +12,7 @@ module Database.PostgreSQL.Session
 
 import Control.Exception (IOException, SomeAsyncException, SomeException, catch, displayException, finally, fromException, mask, mask_, throwIO, try)
 import Control.Monad (unless)
+import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Functor (($>))
@@ -62,11 +63,7 @@ close opened = mask $ \restore -> do
 -- is running, and none broke it. An operation that an exception interrupts
 -- leaves the session broken, e.g. when its thread is killed.
 isUsable :: Connection -> IO Bool
-isUsable opened = do
-  state <- readIORef (connectionState opened)
-  pure $ case state of
-    Idle -> True
-    _ -> False
+isUsable opened = (Idle ==) <$> readIORef (connectionState opened)
 
 -- | Checks, without waiting, that the server hasn't ended an idle
 -- connection. The server sends an idle session nothing, except
@@ -98,7 +95,7 @@ checkIdle opened = mask_ $ do
     -- What a scope read past its last reply has arrived as much as what the
     -- link holds.
     arrived = readIORef (connectionCarryOver opened) >>= \carried ->
-      if BS.null carried then readReady else pure (Right (Just (BS.length carried)))
+      bool (pure (Right (Just (BS.length carried)))) readReady (BS.null carried)
 #if defined(mingw32_HOST_OS)
     -- Sockets block on Windows, so reading would wait: only the state is
     -- checked.
@@ -122,9 +119,8 @@ closeStatement session name = operation session $ do
 -- comes too late does nothing.
 cancel :: ConnectSettings -> BackendKey ByteString -> IO ()
 cancel settings key =
-  withChannel settings $ \opened _ -> do
+  withChannel settings $ \channel _ -> do
     pending <- newIORef =<< unsent Nothing mempty
-    let channel = opened
     ( do
         channelSend channel (serialize (CancelRequest key))
         -- The server closes the connection once it has handled the request.

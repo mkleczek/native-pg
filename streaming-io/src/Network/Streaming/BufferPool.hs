@@ -15,10 +15,11 @@ import Control.Exception (bracket, mask, onException)
 import Control.Concurrent.Resource.Queue qualified as Queue
 import Control.Concurrent.Resource.Acquisition (Deadline (NoDeadline), Context, tryGrant)
 import Control.Concurrent.Resource.Acquisition qualified as Acquire
-import Control.Monad (when, unless, void, foldM)
+import Control.Monad (foldM, forM_, unless, void, when)
+import Data.Foldable (traverse_)
 import Data.IntSet qualified as IntSet
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Tuple (Solo (MkSolo))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
 import Network.Streaming.Buffer (Buffer, newBuffers)
@@ -242,7 +243,7 @@ expireAccess (BufferAccess _ primary state) = do
   current <- readTVar state
   when (accessActive current) $ do
     writeTVar state current {accessActive = False}
-    mapM_ (\waiter -> void (tryGrant waiter (throwSTM (userError "request buffer access is closed")))) (extraWaiter current)
+    forM_ (extraWaiter current) (void . (`tryGrant` (throwSTM (userError "request buffer access is closed"))))
     mapM_ releaseLoan (primaryLoan current)
     mapM_ releaseLoan (extraLoan current)
     release primary
@@ -261,9 +262,7 @@ borrowBuffer access@(BufferAccess pool _ state) = mask $ \_ -> do
     Nothing -> do
       let failed = atomically $ do
             current <- readTVar state
-            case extraLoan current of
-              Nothing -> writeTVar state current {extraBusy = False}
-              Just _ -> pure ()
+            when (isNothing (extraLoan current)) $ writeTVar state current {extraBusy = False}
       admit pool 1 (grantExtra access) (registerExtra access) (unregisterExtra access)
         (atomically . releaseLoan) `onException` failed
 
@@ -337,10 +336,8 @@ watchBorrow access@(BufferAccess pool _ state) = do
 enterSlot :: BufferAccess -> AccessState -> STM Bool
 enterSlot (BufferAccess _ _ state) current = case primaryLoan current of
   Nothing -> do
-    case extraLoan current of
-      Nothing -> when (extraBusy current) $
-        throwSTM (userError "request already has a pending buffer loan")
-      Just _ -> pure ()
+    when (isNothing (extraLoan current) && extraBusy current) $
+      throwSTM (userError "request already has a pending buffer loan")
     pure True
   Just _ -> do
     when (extraBusy current) $ throwSTM (userError "request already has two buffer loans")
@@ -367,9 +364,7 @@ registerExtra access@(BufferAccess _ _ state) waiter = do
   writeTVar state current {extraWaiter = Just waiter}
   -- A local return may have happened between deciding to queue and
   -- registration. Resolve that race without waiting for global supply.
-  case primaryLoan current of
-    Nothing -> void (tryGrant waiter (grantExtra access))
-    Just _ -> pure ()
+  when (isNothing (primaryLoan current)) $ void (tryGrant waiter (grantExtra access))
 
 unregisterExtra :: BufferAccess -> STM ()
 unregisterExtra (BufferAccess _ _ state) = do
@@ -399,7 +394,7 @@ cancelWatch state (Registration request settled) = do
   done <- readTVar settled
   unless done $ do
     writeTVar settled True
-    Acquire.withdraw request >>= mapM_ releaseLoan
+    Acquire.withdraw request >>= traverse_ releaseLoan
     current <- readTVar state
     writeTVar state current {extraWatch = Nothing, extraBusy = isJust (extraLoan current)}
 

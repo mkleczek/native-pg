@@ -102,8 +102,8 @@ spec = do
     (count, buffers) <- newBuffers (positiveInt @21) (positiveInt @7)
     count `shouldBe` 3
     map bufferCapacity buffers `shouldBe` [7, 7, 7]
-    forM_ buffers $ \buffer -> withForeignPtr (bufferMemory buffer) $ \pointer ->
-      peekArray 7 pointer `shouldReturn` replicate 7 0
+    forM_ buffers $ (`withForeignPtr` (\pointer ->
+      peekArray 7 pointer `shouldReturn` replicate 7 0)) . bufferMemory
     case buffers of
       first : _ -> withForeignPtr (bufferMemory first) $ \start ->
         forM_ (zip [0 ..] buffers) $ \(index, buffer) ->
@@ -263,5 +263,5 @@ assertAcquisitionUsable :: Acquire.Context -> IO ()
 assertAcquisitionUsable waiting =
   Acquire.acquire waiting Acquire.NoDeadline
     retry
-    (\waiter -> void (Acquire.tryGrant waiter (pure ())))
+    (void . (`Acquire.tryGrant` (pure ())))
     (const (pure ())) (const (pure ())) `shouldReturn` Just ()

@@ -58,7 +58,7 @@ spec = describe "checking out in a scope" $ do
         takeMVar closing
       takeMVar holding
       later <- newEmptyMVar
-      _ <- forkIO (use pool (\connection -> pure (Succeeded, connection)) >>= putMVar later)
+      _ <- forkIO (use pool (pure . (Succeeded,)) >>= putMVar later)
       threadDelay 100_000
       tryReadMVar later `shouldReturn` Nothing
       putMVar closing ()
@@ -105,8 +105,7 @@ spec = describe "checking out in a scope" $ do
           >>= putMVar finished
       takeMVar holding
       throwTo worker (ErrorCall "interrupted")
-      timeout 2_000_000 (takeMVar finished) >>= \outcome ->
-        fmap (either show (const "returned")) outcome `shouldBe` Just "interrupted"
+      timeout 2_000_000 (takeMVar finished) >>= ((`shouldBe` Just "interrupted") . fmap (either show (const "returned")))
       lastName harness `shouldReturn` Just "ready: failed"
       stats pool `shouldReturn` Stats {statsIdle = 1, statsInUse = 0, statsOpening = 0}
 

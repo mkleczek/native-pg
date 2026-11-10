@@ -83,7 +83,7 @@ withScope body = mask $ \restore -> do
   releases <- newIORef (Open [])
   result <- try (restore (body (Scope releases)))
   closeScope releases (either Aborted (const Completed) result) >>= \case
-    Completed -> either (\failure -> throwIO (failure :: SomeException)) pure result
+    Completed -> either throwIO pure result
     Aborted failure -> throwIO failure
 {-# INLINE withScope #-}
 
@@ -91,9 +91,9 @@ withScope body = mask $ \restore -> do
 -- releases, which is the last failure of one, if there was one.
 closeScope :: IORef Releases -> Ending -> IO Ending
 closeScope releases ending = do
-  pending <- readIORef releases
-  writeIORef releases Closed
-  runReleases ending (case pending of Open registered -> registered; Closed -> [])
+  readIORef releases >>= \case
+    Closed -> pure ending
+    Open registered -> writeIORef releases Closed *> runReleases ending registered
 {-# NOINLINE closeScope #-}
 
 runReleases :: Ending -> [Ending -> IO ()] -> IO Ending

@@ -340,15 +340,7 @@ sync = serialize Sync
 awaitReady :: Session phase -> (ServerError -> e) -> Either e a -> IO (Either e a, TransactionStatus)
 awaitReady session failed result = do
   let syncing = continueIn session :: Session 'SyncResult
-  reply <-
-    receive syncing $
-      (\(ReadyForQuery status) -> Reply status) :|: sessionTail
+  reply <- pullReply syncing ((\(ReadyForQuery status) -> Reply status) :|: sessionTail)
   case reply of
-    Reply status -> pure (result, status)
-    Skip -> awaitReady session failed result
-    Notified notification -> do
-      keepNotification session notification
-      awaitReady session failed result
-    Rejected fields -> do
-      failure <- sessionError fields
-      awaitReady session failed (result >>= const (Left (failed failure)))
+    Right status -> pure (result, status)
+    Left fields -> sessionError fields >>= \failure -> awaitReady session failed (result >>= const (Left (failed failure)))

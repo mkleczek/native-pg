@@ -12,8 +12,10 @@ import Control.Exception (AsyncException (ThreadKilled), IOException, evaluate, 
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.IO.Unlift (withRunInIO)
+import Data.Bool (bool)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
+import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust, isNothing)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
@@ -499,7 +501,7 @@ spec = describe "a field as a source that is waited for in place" $ do
               void (chunksWith wait (Tx.fieldSource field))
             _ -> liftIO (failTest "the row has no field")
           liftIO (ioError (userError "done"))
-      isLeft' result `shouldBe` True
+      isLeft result `shouldBe` True
 
     it "waits for the link to be writable while it takes nothing" $ do
       flag <- newTVarIO False
@@ -523,7 +525,7 @@ spec = describe "a field as a source that is waited for in place" $ do
               void (chunksWith wait (Tx.fieldSource field))
             _ -> liftIO (failTest "the row has no field")
           liftIO (ioError (userError "done"))
-      isLeft' result `shouldBe` True
+      isLeft result `shouldBe` True
 
     it "keeps sending unsent output while it waits, and pulls the field to its end" $ do
       flag <- newTVarIO False
@@ -561,7 +563,7 @@ spec = describe "a field as a source that is waited for in place" $ do
               BS.concat received `shouldBe` body
             _ -> liftIO (failTest "the row has no field")
           liftIO (ioError (userError "done"))
-      isLeft' result `shouldBe` True
+      isLeft result `shouldBe` True
 
   describe "with an upload that is waited for by a blocking read" $ do
     it "abandons the transaction when the wait for the upload is interrupted, as the interruption of any other wait does" $ do
@@ -805,8 +807,6 @@ spec = describe "a field as a source that is waited for in place" $ do
                   feeding link pieces register
             rest <- chunksWith wait source
             BS.concat (taken : rest) `shouldBe` body
-  where
-    isLeft' = either (const True) (const False)
 
 -- | A source that has nothing ready until its flag is set, and then four bytes.
 newtype UploadSource = UploadSource (TVar Bool)
@@ -814,10 +814,8 @@ newtype UploadSource = UploadSource (TVar Bool)
 instance Source UploadSource where
   pullWith (UploadSource flag) =
     retrying
-      (readTVarIO flag >>= \open -> pure (if open then Just (Pulled "abcd") else Nothing))
+      (bool Nothing (Just (Pulled "abcd")) <$> readTVarIO flag)
       (pure (Watch (readTVar flag >>= check) (pure ())))
 
 slices :: Int -> BS.ByteString -> [BS.ByteString]
-slices size bytes
-  | BS.null bytes = []
-  | otherwise = let (piece, rest) = BS.splitAt size bytes in piece : slices size rest
+slices size = takeWhile (not . BS.null) . map (BS.take size) . iterate (BS.drop size)

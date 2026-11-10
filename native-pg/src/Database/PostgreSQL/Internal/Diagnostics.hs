@@ -40,7 +40,8 @@ diagnostics fields = do
         diagnosticSourceFunction = field 'R'
       }
   where
-    field name = BS.copy <$> lookup (byte name) [(code, value) | Scalar (code, value) <- fields]
+    listed = [(code, value) | Scalar (code, value) <- fields]
+    field name = BS.copy <$> lookup (byte name) listed
     required name = maybe (Left ("an error or notice without its " <> name)) Right
     number value = case Char8.readInt value of
       Just (parsed, rest) | BS.null rest -> Just parsed

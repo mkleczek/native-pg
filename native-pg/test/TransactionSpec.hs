@@ -933,7 +933,7 @@ drain source sink = do
   unless (BS.null chunk) (sink chunk *> drain source sink)
 
 payload :: BS.ByteString
-payload = BS.concat (map (BS.replicate 31) [65..72])
+payload = foldMap (BS.replicate 31) [65 .. 72]
 
 withResponse :: BS.ByteString -> (Context -> Buffer -> IO a) -> IO a
 withResponse = withResponseObserved (const (pure ()))

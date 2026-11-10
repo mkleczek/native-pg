@@ -40,6 +40,7 @@ import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
+import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Network.Streaming.BufferPool (BufferAccess)
@@ -76,6 +77,7 @@ data SessionState
     -- unknown.
     Broken
   | Closed
+  deriving (Eq)
 
 -- | Builds protocol/link state for a connected, initialized transport.
 newConnection :: Channel -> Int -> IO Connection
@@ -202,18 +204,25 @@ contextWatchStall context = \case
   where
     loan = readIORef (contextInput context) >>= watchInputLoan
 
--- | Takes the connection's carried-over bytes before the link's, as
--- 'carriedInput' does.
-carriedPoll :: IORef ByteString -> (Ptr Word8 -> Int -> IO (Either (IO Watch) Int)) -> Ptr Word8 -> Int -> IO (Either (IO Watch) Int)
-carriedPoll carry poll pointer size = do
+-- | Takes the connection's carried-over bytes into the buffer, if any: how
+-- many were taken, or Nothing when the carry-over is empty.
+takeCarried :: IORef ByteString -> Ptr Word8 -> Int -> IO (Maybe Int)
+takeCarried carry pointer size = do
   carried <- readIORef carry
   if BS.null carried
-    then poll pointer size
+    then pure Nothing
     else do
       let (taken, left) = BS.splitAt size carried
       BSU.unsafeUseAsCStringLen taken $ \(origin, count) -> copyBytes pointer (castPtr origin) count
       writeIORef carry left
-      pure (Right (BS.length taken))
+      pure (Just (BS.length taken))
+
+-- | Takes the connection's carried-over bytes before the link's, as
+-- 'carriedInput' does.
+carriedPoll :: IORef ByteString -> (Ptr Word8 -> Int -> IO (Either (IO Watch) Int)) -> Ptr Word8 -> Int -> IO (Either (IO Watch) Int)
+carriedPoll carry poll pointer size = do
+  taken <- takeCarried carry pointer size
+  maybe (poll pointer size) (pure . Right) taken
 
 -- | Reads the connection's carried-over bytes before the link's. A read takes
 -- no more than it asks for, and leaves the rest for the next one.
@@ -221,14 +230,8 @@ carriedInput :: IORef ByteString -> InputSource -> InputSource
 carriedInput carry source =
   source
     { readInputInto = \pointer size -> do
-        carried <- readIORef carry
-        if BS.null carried
-          then readInputInto source pointer size
-          else do
-            let (taken, left) = BS.splitAt size carried
-            BSU.unsafeUseAsCStringLen taken $ \(origin, count) -> copyBytes pointer (castPtr origin) count
-            writeIORef carry left
-            pure (BS.length taken)
+        taken <- takeCarried carry pointer size
+        maybe (readInputInto source pointer size) pure taken
     }
 
 -- | Binds supplied initialized buffers for the callback. Acquires the
@@ -297,7 +300,7 @@ closeScopedContext context failed = do
       unless (unsentEmpty pending) $ do
         breakConnection connection
         throwIO (SessionUnusable "operation scope ended with unsent output")
-      atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
+      markIdle connection
   where
     connection = contextConnection context
 
@@ -311,9 +314,13 @@ closeAbortedContext context = do
     expireContext context `finally` cleanupContext context
     pending <- readIORef (contextPending context)
     unless (unsentEmpty pending) (breakConnection connection)
-    atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
+    markIdle connection
   where
     connection = contextConnection context
+
+-- | Releases the connection as idle if an operation had claimed it.
+markIdle :: Connection -> IO ()
+markIdle connection = atomicModifyIORef' (connectionState connection) (\state -> (case state of Busy -> Idle; other -> other, ()))
 
 cleanupContext :: Context -> IO ()
 cleanupContext context = do
@@ -338,15 +345,13 @@ expireContext context = do
   owner <- atomicModifyIORef' (contextUse context) $ \case
     Using thread -> (Expired, Just thread)
     _ -> (Expired, Nothing)
-  case owner of
-    Nothing -> pure ()
-    Just thread -> do
-      breakConnection (contextConnection context)
-      -- A second cancellation must not return the loan while the first
-      -- cancellation is still unwinding a child that can touch its buffers.
-      uninterruptibleMask_ $ do
-        killThread thread
-        readMVar (contextFinished context)
+  for_ owner $ \thread -> do
+    breakConnection (contextConnection context)
+    -- A second cancellation must not return the loan while the first
+    -- cancellation is still unwinding a child that can touch its buffers.
+    uninterruptibleMask_ $ do
+      killThread thread
+      readMVar (contextFinished context)
 
 ensureContextActive :: Context -> IO ()
 ensureContextActive context = readIORef (contextUse context) >>= \case

@@ -64,6 +64,16 @@ version = \case
   Tls12 -> 0x0303
   Tls13 -> 0x0304
 
+-- | The bytes that a pointer and a length locate, used for ALPN and the
+-- server certificate's DER.
+peekCStringAt :: Ptr (Ptr Word8) -> Ptr CSize -> IO ByteString
+peekCStringAt bytes len =
+  BS.packCStringLen =<< ((,) . castPtr <$> peek bytes <*> (fromIntegral <$> peek len))
+
+-- | Flushes an alert, ignoring I/O errors: the connection is ending anyway.
+flushAlert :: TlsConnection -> IO ()
+flushAlert tls = void (flushTls tls) `catch` \(_ :: IOException) -> pure ()
+
 -- | Starts TLS for native-pg's connections, with a new configuration each
 -- time, so that changed certificate files count, as with libpq.
 tlsClient :: TlsClient
@@ -74,7 +84,7 @@ tlsClient = TlsClient $ \settings serverName sock -> do
     protocol <- withConnection tls $ \connection ->
       alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
         c_connection_get_alpn_protocol connection (castPtr bytes) len
-        BS.packCStringLen =<< ((,) . castPtr <$> peek bytes <*> (fromIntegral <$> peek len))
+        peekCStringAt bytes len
     unless (protocol == "postgresql") $ do
       closeTls tls
       throwIO (TlsError "direct SSL connection was established without ALPN protocol negotiation extension")
@@ -91,7 +101,7 @@ channelBinding tls = withConnection tls $ \rustls -> do
     then pure Nothing
     else alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
       check "could not read the server's certificate" =<< c_certificate_get_der peer (castPtr bytes) len
-      certificate <- BS.packCStringLen =<< ((,) . castPtr <$> peek bytes <*> (fromIntegral <$> peek len))
+      certificate <- peekCStringAt bytes len
       pure (Just (serverEndPoint certificate))
 
 -- | A configuration for connections to one server. rustls-ffi 0.15 borrows
@@ -156,7 +166,7 @@ newTlsConfig settings serverName = do
     withVerifier roots useVerifier =
       bracket c_root_cert_store_builder_new c_root_cert_store_builder_free $ \storeBuilder -> do
         check ("could not read root certificate file " <> show roots)
-          =<< withCString roots (\path -> c_root_cert_store_builder_load_roots_from_file storeBuilder path (CBool 1))
+          =<< withCString roots (flip (c_root_cert_store_builder_load_roots_from_file storeBuilder) (CBool 1))
         bracket (built "could not create the root certificate store" (c_root_cert_store_builder_build storeBuilder)) c_root_cert_store_free $ \store ->
           bracket (c_web_pki_server_cert_verifier_builder_new store) c_web_pki_server_cert_verifier_builder_free $ \verifierBuilder -> do
             for_ (tlsRevocationLists settings) $ \file -> do
@@ -173,11 +183,9 @@ newTlsConfig settings serverName = do
 -- | The verifier against the system's root certificates, the same each time,
 -- since it loads all of them, and never freed.
 systemVerifier :: IO (Ptr ServerCertVerifier)
-systemVerifier = modifyMVar systemVerifierMade $ \made -> case made of
-  Just verifier -> pure (made, verifier)
-  Nothing -> do
-    verifier <- built "could not load the system's root certificates" c_platform_server_cert_verifier
-    pure (Just verifier, verifier)
+systemVerifier = modifyMVar systemVerifierMade $ \made -> do
+  verifier <- maybe (built "could not load the system's root certificates" c_platform_server_cert_verifier) pure made
+  pure (Just verifier, verifier)
 
 systemVerifierMade :: MVar (Maybe (Ptr ServerCertVerifier))
 systemVerifierMade = unsafePerformIO (newMVar Nothing)
@@ -274,7 +282,7 @@ receiveFailed tls pointer size status = case negate status `shiftR` 32 of
   0 -> receiveTls tls pointer size
   1 -> throwIO . TlsError =<< describe value
   2 -> do
-    void (flushTls tls) `catch` \(_ :: IOException) -> pure ()
+    flushAlert tls
     throwIO . TlsError =<< describe value
   _ -> throwIO (errnoToIOError "recv" (Errno (fromIntegral value)) Nothing Nothing)
   where
@@ -349,7 +357,7 @@ readRecords tls = do
     | errno == 0 -> do
         result <- withConnection tls c_connection_process_new_packets
         unless (result == resultOk) $ do
-          void (flushTls tls) `catch` \(_ :: IOException) -> pure ()
+          flushAlert tls
           throwIO . TlsError =<< describe result
         pure Read
     | Errno errno == eINTR -> readRecords tls

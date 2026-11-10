@@ -23,13 +23,9 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Empty,
     Payload (..),
   )
-import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope (..))
+import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope (..), FramedMessage)
 
-type CopyMessage tag payload =
-  'PayloadStruct
-    '[ 'PayloadConst 1 tag,
-       'PayloadBounded payload
-     ]
+type CopyMessage tag payload = FramedMessage tag payload
 
 data CopyDataType (payload :: Payload) where
   CopyDataType ::

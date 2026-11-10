@@ -25,15 +25,9 @@ import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
-import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope (..))
+import Database.PostgreSQL.Internal.Protocol.Messages.Types (Envelope (..), FramedMessage)
 
-type AuthFrontendTag = 'PayloadConst 1 'p'
-
-type AuthFrontendMessage payload =
-  'PayloadStruct
-    '[ AuthFrontendTag,
-       'PayloadBounded payload
-     ]
+type AuthFrontendMessage payload = FramedMessage 'p' payload
 
 data PasswordMessageType (payload :: Payload) where
   PasswordMessageType ::

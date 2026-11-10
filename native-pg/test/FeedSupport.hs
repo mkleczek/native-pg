@@ -26,11 +26,12 @@ module FeedSupport
     readyTx,
     ready,
     errorMessage,
+    staticBytes,
   )
 where
 
 import AcquisitionTestSupport (getAcquisition)
-import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
@@ -38,6 +39,9 @@ import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Channel (newChannel)
 import Database.PostgreSQL.Internal.Context (Context, newConnection, newOwnedContext, withContext, withRequestContext)
 import Foreign.Marshal.Utils (copyBytes)
+import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
+import Network.Streaming.Output (Output, Uncopied (..), outputCopied, writeOutput)
+import System.IO.Unsafe (unsafeDupablePerformIO)
 import Foreign.Ptr (castPtr)
 import Network.Streaming.Buffer (newBuffer)
 import Network.Streaming.BufferPool (BufferAccess, PoolSettings (..), borrowBuffer, newBufferPool, watchBorrow, withRequestBuffers)
@@ -67,7 +71,7 @@ setReceiveLimit = writeIORef . feedLimit
 
 -- | What the server sends next.
 feed :: FeedLink -> BS.ByteString -> IO ()
-feed link bytes = atomically $ readTVar (feedInput link) >>= writeTVar (feedInput link) . (<> bytes)
+feed link bytes = atomically (modifyTVar' (feedInput link) (<> bytes))
 
 setWritable :: FeedLink -> Bool -> IO ()
 setWritable link = atomically . writeTVar (feedWritable link)
@@ -96,11 +100,7 @@ instance Link FeedLink where
         if ended then pure (Just 0) else Nothing <$ modifyIORef' (feedEmpty link) (+ 1)
       else do
         limit <- readIORef (feedLimit link)
-        taken <- atomically $ do
-          bytes <- readTVar (feedInput link)
-          let (now, later) = BS.splitAt (min size limit) bytes
-          writeTVar (feedInput link) later
-          pure now
+        taken <- atomically (stateTVar (feedInput link) (BS.splitAt (min size limit)))
         BSU.unsafeUseAsCStringLen taken $ \(origin, count) -> copyBytes pointer (castPtr origin) count
         pure (Just (BS.length taken))
   sendReady link pieces = do
@@ -208,3 +208,12 @@ ready = message 90 "I"
 -- | An error of the server, with its SQLSTATE.
 errorMessage :: BS.ByteString -> BS.ByteString
 errorMessage code = message 69 ("SERROR\0C" <> code <> "\0Mthe server refused\0\0")
+
+-- | The bytes of an output that has no streams, for serializer fixtures.
+staticBytes :: Output -> BS.ByteString
+staticBytes output = unsafeDupablePerformIO $ do
+  parts <- (`writeOutput` output) =<< mallocPlainForeignPtrBytes (outputCopied output)
+  pure . BS.concat $ map (either id uncopied) parts
+  where
+    uncopied (UncopiedBytes value) = value
+    uncopied _ = error "an output with streams has no byte string"

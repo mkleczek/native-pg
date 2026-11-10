@@ -42,9 +42,7 @@ collected finalized = within loop
     loop = do
       performGC
       done <- tryReadMVar finalized
-      case done of
-        Just () -> pure ()
-        Nothing -> threadDelay 1000 >> loop
+      maybe (threadDelay 1000 >> loop) pure done
 
 usingSystemTimer :: (Context -> IO a) -> IO a
 usingSystemTimer action = Timer.getSystemTimerManager >>= action . newContext

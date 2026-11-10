@@ -25,6 +25,7 @@ import Control.Monad.IO.Unlift (MonadUnliftIO (..))
 import Control.Monad.Reader (ReaderT (..), ask)
 import Control.Monad.State.Strict (StateT, modify', runStateT)
 import qualified Data.Bifunctor as Bifunctor
+import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Foldable (traverse_)
@@ -217,9 +218,7 @@ settleTransaction runtime = \case
     if failed then cleanupRuntime runtime else finish
   Aborted failure
     | isInterrupted failure -> abandon runtime
-    | otherwise -> do
-        unread <- fieldUnread runtime
-        if unread then abandon runtime else cleanupRuntime runtime
+    | otherwise -> bool (cleanupRuntime runtime) (abandon runtime) =<< fieldUnread runtime
   where
     -- The first drain of the ending throws a failure that nothing has read
     -- before it reads the ReadyForQuery that follows, so, as when the scope
@@ -229,7 +228,7 @@ settleTransaction runtime = \case
       ended <- try @SomeException (runOperation runtime (finishRuntime runtime))
       case ended of
         Left failure -> do
-          if isInterrupted failure then abandon runtime else cleanupRuntime runtime
+          bool (cleanupRuntime runtime) (abandon runtime) (isInterrupted failure)
           throwIO failure
         Right () -> pure ()
 
@@ -597,10 +596,14 @@ submit final plan = operation $ \runtime -> submitOn runtime final plan
 runPipeline :: Runtime -> Pipeline tx a -> IO (a, [Pending])
 runPipeline runtime (Pipeline plan) = Bifunctor.second reverse <$> runReaderT (runStateT plan []) runtime
 
+-- | Whether the transaction's ending has been queued, or the transaction has ended.
+finalQueued :: Runtime -> IO Bool
+finalQueued runtime = (||) <$> readIORef (runtimeFinal runtime) <*> readIORef (runtimeEnded runtime)
+
 submitOn :: Runtime -> Bool -> Pipeline tx a -> IO a
 submitOn runtime final plan = do
   throwFailure runtime
-  ended <- (||) <$> readIORef (runtimeFinal runtime) <*> readIORef (runtimeEnded runtime)
+  ended <- finalQueued runtime
   when ended (throwIO (SessionUnusable "a statement followed the final pipeline"))
   drain runtime True
   (value, pending) <- runPipeline runtime plan
@@ -625,12 +628,12 @@ sql query = void (pipeline (statement () (Statement query (const []) noResult)))
 -- | Chooses rollback for an ending that has not yet been queued.
 condemn :: Transaction tx ()
 condemn = operation $ \runtime -> do
-  final <- (||) <$> readIORef (runtimeFinal runtime) <*> readIORef (runtimeEnded runtime)
+  final <- finalQueued runtime
   when final (throwIO (SessionUnusable "the transaction ending is already queued"))
   writeIORef (runtimeCommits runtime) False
 
 ending :: Runtime -> IO ByteString
-ending runtime = (\commits -> if commits then "COMMIT" else "ROLLBACK") <$> readIORef (runtimeCommits runtime)
+ending runtime = bool "ROLLBACK" "COMMIT" <$> readIORef (runtimeCommits runtime)
 
 -- | Drains unread results, including their fields and rows, checks cardinality
 -- and server errors, then sends and observes COMMIT or ROLLBACK. A final
@@ -783,13 +786,11 @@ pullRow runtime pending = do
           pure (Just value)
 
 skipResult :: Runtime -> Pending -> Bool -> IO ()
-skipResult runtime pending validating = do
-  result <- try @QueryError (pullRow runtime pending)
-  case result of
-    Left failure | validating -> throwIO failure
-    Left _ -> pure ()
-    Right Nothing -> pure ()
-    Right (Just _) -> skipResult runtime pending validating
+skipResult runtime pending validating =
+  if validating then go
+  else void $ try @QueryError go
+  where
+    go = pullRow runtime pending >>= maybe (pure ()) (const go)
 
 drain :: Runtime -> Bool -> IO ()
 drain runtime validating = do
@@ -811,7 +812,7 @@ drain runtime validating = do
 serverFailure :: Runtime -> Pending -> ServerError -> IO a
 serverFailure runtime pending failure = do
   waiting <- atomicModifyIORef' (runtimePending runtime) ([],)
-  traverse_ (\cursor -> writeIORef (pendingState cursor) Failed) waiting
+  traverse_ ((`writeIORef` Failed) . pendingState) waiting
   failQuery runtime pending (ServerFailed failure)
 
 failQuery :: Runtime -> Pending -> StatementError -> IO a

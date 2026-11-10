@@ -10,7 +10,6 @@ module Network.Streaming.Output
     outputWriter,
     Uncopied (..),
     writeOutput,
-    outputByteString,
     outputs,
     word8,
     word16,
@@ -33,9 +32,7 @@ import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Foreign.Storable (pokeByteOff)
-import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import Network.Streaming.Source (AnySource, AnyWaitingSource)
-import System.IO.Unsafe (unsafeDupablePerformIO)
 
 -- | Bytes that arrive in chunks, with their total length known up front.
 data ByteStream = ByteStream
@@ -105,16 +102,6 @@ writeOutput memory output =
             Yield end part rest -> go end end rest (Right part : copied start end parts)
      in go 0 0 (outputWriter output) []
 
--- | The bytes of an output that has no streams.
-outputByteString :: Output -> ByteString
-outputByteString output = unsafeDupablePerformIO $ do
-  parts <- (`writeOutput` output) =<< mallocPlainForeignPtrBytes (outputCopied output)
-  pure . BS.concat $ map (either id uncopiedBytes) parts
-  where
-    uncopiedBytes (UncopiedBytes value) = value
-    uncopiedBytes (UncopiedStream _) = error "an output with streams has no byte string"
-    uncopiedBytes (UncopiedSource _ _) = error "an output with streams has no byte string"
-    uncopiedBytes (UncopiedWaiting _ _) = error "an output with streams has no byte string"
 
 -- | Each value's output, one after another. Compute sizes without retaining
 -- a serializer for every value; build their writers as the sender advances.

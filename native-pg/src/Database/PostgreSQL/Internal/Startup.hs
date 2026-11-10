@@ -16,7 +16,7 @@ import Data.Char (isDigit)
 import Data.Foldable (toList)
 import Data.IORef (newIORef)
 import Data.List (sort)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, maybeToList)
 #if defined(mingw32_HOST_OS)
 import System.Directory (doesDirectoryExist, doesFileExist, getPermissions, listDirectory)
 #else
@@ -55,8 +55,7 @@ connectOwned settings = withChannel settings start
     -- output.
     start channel binding = do
       connection <- newConnection channel (connectReadSize settings)
-      context <- newOwnedContext connection
-      startSession settings binding context
+      startSession settings binding =<< newOwnedContext connection
 
 -- | Startup/authentication using caller-supplied initialized workspace.
 -- Integration-only callers reserve separate setup capacity for this scope.
@@ -223,7 +222,7 @@ startupMessage settings =
   StartupMessage (connectProtocolVersion settings) $
     map Scalar $
       ("user", connectUser settings)
-        : maybe [] (\database -> [("database", database)]) (connectDatabase settings)
+        : maybeToList (("database",) <$> connectDatabase settings)
         <> connectParameters settings
 
 data AuthenticationRequest

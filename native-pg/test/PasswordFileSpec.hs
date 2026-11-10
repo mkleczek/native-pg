@@ -150,5 +150,4 @@ isolated action = do
   environment <- getEnvironment
   clear [name | (name, _) <- environment, "PG" `isPrefixOf` name]
   where
-    clear [] = action
-    clear (name : rest) = withVariable name Nothing (clear rest)
+    clear names = foldr (flip withVariable Nothing) action names

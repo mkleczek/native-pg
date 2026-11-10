@@ -34,13 +34,14 @@ import Control.Exception (IOException, try)
 #else
 import Control.Exception (IOException, bracket, try)
 #endif
-import Control.Monad (join, unless, when)
+import Control.Monad (guard, join, mfilter, unless, when)
+import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_, toList)
 import Data.Functor ((<&>))
-import Data.List.NonEmpty (NonEmpty (..))
+import Data.List.NonEmpty (nonEmpty)
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
@@ -86,8 +87,7 @@ readConnectionString defaults string = do
         parsedWithPasswords
           | connectionSslMode parsedWithPasswords == SslRequire,
             Just roots <- rootCertificateIn <$> defaultCertificateDirectory defaults ->
-              doesFileExist roots <&> \verifying ->
-                if verifying then Left (requireWithRoots roots) else Right parsedWithPasswords
+              doesFileExist roots <&> bool (Right parsedWithPasswords) (Left (requireWithRoots roots))
           | otherwise -> pure (Right parsedWithPasswords)
 
 -- | Like 'readConnectionString', with the environment variables and the local
@@ -182,9 +182,7 @@ passwordFor entries host port database user = listToMaybe (mapMaybe match entrie
           (portField, rest2) <- field rest1
           (databaseField, rest3) <- field rest2
           (userField, password) <- field rest3
-          if and (zipWith matches [hostField, portField, databaseField, userField] [host, port, database, user])
-            then Just (unescape password)
-            else Nothing
+          unescape password <$ guard (and (zipWith matches [hostField, portField, databaseField, userField] [host, port, database, user]))
     matches rawField value = rawField == "*" || unescape rawField == value
     field = go [] . BS.unpack
       where
@@ -509,7 +507,7 @@ resolve option defaults localUser = do
   when (minVersion > maxVersion) $
     Left "min_protocol_version is greater than max_protocol_version"
   -- rustls has no version below 1.2, so a lower minimum is 1.2's.
-  minTls <- maybe (Right Tls12) (fmap (max Tls12 . fromMaybe Tls12) . tlsVersion "ssl_min_protocol_version") (given "ssl_min_protocol_version")
+  minTls <- maybe (Right Tls12) (fmap (maybe Tls12 (max Tls12)) . tlsVersion "ssl_min_protocol_version") (given "ssl_min_protocol_version")
   maxTls <- maybe (Right (Just maxBound)) (tlsVersion "ssl_max_protocol_version") (given "ssl_max_protocol_version")
   sslVersions <- case maxTls of
     Nothing -> Left "ssl_max_protocol_version is lower than TLSv1.2, the lowest version supported"
@@ -536,7 +534,7 @@ resolve option defaults localUser = do
             <> [("client_encoding", value) | Just value <- [given "client_encoding"]],
         -- libpq waits at least two seconds, so that rounding doesn't make a
         -- connection fail almost at once.
-        connectionTimeout = (\seconds -> if seconds <= 0 then Nothing else Just (max 2 seconds)) =<< connectTimeout,
+        connectionTimeout = max 2 <$> mfilter (> 0) connectTimeout,
         connectionTargetSessionAttrs = target,
         connectionProtocolVersion = maxVersion,
         connectionMinProtocolVersion = minVersion,
@@ -573,7 +571,7 @@ resolve option defaults localUser = do
     -- Zero or less keeps the system's default.
     positive keyword = do
       parsed <- traverse (integer keyword) (given keyword)
-      Right (parsed >>= \value -> if value <= 0 then Nothing else Just value)
+      Right (mfilter (> 0) parsed)
     sslModeRequired = \case
       SslRequire -> True
       SslVerifyFull _ -> True
@@ -609,9 +607,7 @@ resolve option defaults localUser = do
       unless (length ports <= 1 || length ports == count) $
         Left ("could not match " <> show (length ports) <> " port numbers to " <> show count <> " hosts")
       parsed <- traverse (host names addresses ports) [0 .. count - 1]
-      case parsed of
-        first : others -> Right (first :| others)
-        [] -> Left "no host"
+      maybe (Left "no host") Right (nonEmpty parsed)
     host names addresses ports index = do
       let name = at index names
           address = at index addresses

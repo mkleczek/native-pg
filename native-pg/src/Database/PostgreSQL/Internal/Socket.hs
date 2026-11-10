@@ -43,7 +43,7 @@ connectSocket _ (UnixAddress path) =
 connectSocket options (TcpAddress host port) = do
   addresses <-
     getAddrInfo (Just defaultHints {addrSocketType = Stream}) (Just host) (Just (show port))
-      `catch` \failure -> throwIO (UnresolvedHost host (ioe_description failure))
+      `catch` (throwIO . UnresolvedHost host . ioe_description)
   connectFirst [] addresses
   where
     connectFirst [] [] = throwIO (UnresolvedHost host "no address found")

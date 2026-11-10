@@ -125,10 +125,7 @@ unsent reused output = do
     Just (OutputBuffer memory size _) | outputCopied output <= size -> pure memory
     _ -> mallocPlainForeignPtrBytes (outputCopied output)
   parts <- writeOutput memory output
-  pure (Unsent (map part parts))
-  where
-    part (Left copied) = PartBytes copied
-    part (Right uncopied) = uncopiedPart uncopied
+  pure (Unsent (map (either PartBytes uncopiedPart) parts))
 
 -- | The part that sends bytes that weren't copied.
 uncopiedPart :: Uncopied -> Part
@@ -285,7 +282,7 @@ gatherFrom link stalls = go
             | BS.null chunk -> gather size pieceCount pieces others
             | otherwise ->
                 let (prefix, suffix) = BS.splitAt (gatherSize - size) chunk
-                    rest = [PartBytes suffix | not (BS.null suffix)] <> others
+                    rest = if BS.null suffix then others else PartBytes suffix : others
                  in gather (size + BS.length prefix) (pieceCount + 1) (prefix : pieces) rest
           PartStream _ 0 : _ | not (null pieces) -> cut pieces remaining
           PartStream source given : others -> do

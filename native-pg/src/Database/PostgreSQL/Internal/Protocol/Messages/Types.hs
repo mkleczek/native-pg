@@ -5,6 +5,7 @@
 
 module Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( Envelope (..),
+    FramedMessage,
     SomeEnvelope,
     Scalar (..),
     OidType (OidType),
@@ -87,6 +88,13 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   )
 import GHC.Exts (Any)
 import Unsafe.Coerce (unsafeCoerce)
+
+-- | A message's frame: its tag byte and the length-prefixed body.
+type FramedMessage tag payload =
+  'PayloadStruct
+    '[ 'PayloadConst 1 tag,
+       'PayloadBounded payload
+     ]
 
 -- Framing is part of message identity, not a coercible tag.
 type role Envelope representational nominal

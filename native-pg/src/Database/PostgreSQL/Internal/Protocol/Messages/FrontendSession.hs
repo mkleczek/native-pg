@@ -49,6 +49,7 @@ import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( BindBody,
     BindBodyType (BindBodyType),
     Envelope (..),
+    FramedMessage,
     FormatCode,
     FormatCodeType (FormatCodeType),
     NamedObject,
@@ -59,11 +60,7 @@ import Database.PostgreSQL.Internal.Protocol.Messages.Types
     OptionalOidType (OptionalOidType),
   )
 
-type FrontendSessionMessage tag payload =
-  'PayloadStruct
-    '[ 'PayloadConst 1 tag,
-       'PayloadBounded payload
-     ]
+type FrontendSessionMessage tag payload = FramedMessage tag payload
 
 data BindType (payload :: Payload) where
   BindType ::

@@ -20,6 +20,7 @@ import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Database.PostgreSQL.Internal.Context
 import Network.Streaming.PositiveInt (PositiveInt, positiveInt)
 import Network.Streaming.Buffer (bufferMemory, bufferCapacity, newBuffer)
+import FeedSupport (staticBytes)
 import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Database.PostgreSQL.Internal.Protocol (pattern Sync, pattern Parse, pattern Execute, pattern Query, serialize)
@@ -101,7 +102,7 @@ spec = describe "caller-owned output storage" $ do
           <> serialize (Query (BS.replicate 9000 65))
           <> serialize (Execute ("" :: BS.ByteString) 17)
           <> serialize Sync
-        expected = Output.outputByteString output
+        expected = staticBytes output
     forM_ [positiveInt @4, positiveInt @7, positiveInt @256] $ \capacity -> do
       buffer <- newBuffer capacity
       received <- newIORef BS.empty
@@ -259,7 +260,7 @@ spec = describe "caller-owned output storage" $ do
           connection <- newConnection (newChannel link) 16
           withRequestContext connection access $ \context ->
             runContextOperation context (send context pipeline)
-          reverse <$> readIORef sends `shouldReturn` [Output.outputByteString pipeline]
+          reverse <$> readIORef sends `shouldReturn` [staticBytes pipeline]
 
     it "arrives intact through a link that takes a few bytes at a time" $
       forM_ [1, 7, 4096] $ \accepts -> forM_ [pipeline, bigPipeline] $ \output ->
@@ -268,7 +269,7 @@ spec = describe "caller-owned output storage" $ do
           connection <- newConnection (newChannel (takingUpTo accepts received)) 16
           withRequestContext connection access $ \context ->
             runContextOperation context (sendContextOutput context output)
-          readIORef received `shouldReturn` Output.outputByteString output
+          readIORef received `shouldReturn` staticBytes output
 
   describe "output continued after a direct value" $ do
     it "goes to the link in one send, from the supplied buffer after what came before" $ do
@@ -291,7 +292,7 @@ spec = describe "caller-owned output storage" $ do
           buffer <- newBuffer (positiveInt @64)
           received <- newIORef BS.empty
           channelSendBuffered (newChannel (takingUpTo accepts received)) (outputBufferFrom buffer) output
-          readIORef received `shouldReturn` Output.outputByteString output
+          readIORef received `shouldReturn` staticBytes output
   where
     batch = mconcat (replicate 40 (serialize Sync))
     wire = BS.concat (replicate 40 "S\0\0\0\4")

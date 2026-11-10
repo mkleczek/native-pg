@@ -60,6 +60,7 @@ import Control.Concurrent.Resource.Acquisition qualified as Acquire
 import Control.Concurrent.Resource.Queue qualified as Queue
 import Control.Exception (Exception, SomeException, bracket, catch, displayException, finally, mask, mask_, onException, throwIO, try)
 import Control.Monad (forever, unless, void, when)
+import Data.Bool (bool)
 import Data.Either (fromRight)
 import Data.Foldable (for_, traverse_)
 import Data.Functor (($>))
@@ -152,12 +153,14 @@ overflowPolicy size delay isRefused = do
   refusals <- newTVarIO 0
   lastBackoff <- newTVarIO =<< getMonotonicTimeNSec
   gate <- newTVarIO =<< newTVarIO True
-  let micros = fromInteger $ min (toInteger (maxBound :: Int)) (max 0 (diffTimeToPicoseconds delay `div` 1_000_000))
+  let clamped :: Integer -> Int
+      clamped = fromInteger . min (toInteger (maxBound :: Int))
+      micros = clamped (max 0 (diffTimeToPicoseconds delay `div` 1_000_000))
       admit opened waited = do
         available <- readTVar gate >>= readTVar
         limit <- readTVar soft
         pure $ if not available then Wait else if opened < limit || waited then Admit
-          else AdmitAfter (fromInteger $ min (toInteger (maxBound :: Int)) (toInteger micros * toInteger (opened - limit + 1)))
+          else AdmitAfter (clamped (toInteger micros * toInteger (opened - limit + 1)))
       failed err | not (isRefused err) = pure False
                  | otherwise = do
           paused <- registerDelay micros
@@ -371,12 +374,18 @@ tryReserveOpening pool@Pool{..} = do
 ensureOpen :: TVar Bool -> STM ()
 ensureOpen closed = readTVar closed >>= (\stopped -> when stopped (throwSTM PoolClosedError))
 
+-- | Whether the pool's admission delay for this many open connections has elapsed.
+delayedFor :: Int -> Maybe (Int, Int, Bool) -> Bool
+delayedFor opened = \case
+  Just (count, _, True) -> count == opened
+  _ -> False
+
 openingAdmission :: Pool connection failure -> STM Admission
 openingAdmission Pool{..} = do
   free <- readTVar poolCapacity
   delayed <- readTVar poolDelay
   let opened = configSize poolConfig - free
-      waited = case delayed of Just (count, _, True) -> count == opened; _ -> False
+      waited = delayedFor opened delayed
   policyAdmit poolPolicy opened waited `orElse` pure Wait
 
 -- Kept outside tryGrant's retried reservation, so requesting a delay commits
@@ -508,7 +517,7 @@ watchPolicy policy config capacity delayed closed pending = do
         free <- readTVar capacity
         delay <- readTVar delayed
         let opened = configSize config - free
-            waited = case delay of Just (count, _, True) -> count == opened; _ -> False
+            waited = delayedFor opened delay
         admission <- policyAdmit policy opened waited `orElse` pure Wait
         pure (free, delay, admission)
       loop = do
@@ -668,8 +677,7 @@ claimChecked pool@Pool{..} preflight restore handOver = do
         Right opening -> do
           prepared <- prepareReservation opening
           case prepared of
-            Left (ConnectionFailed failure) -> policyFailed poolPolicy failure >>= \waitInstead ->
-              pure $ if waitInstead then Nothing else Just (Left (ConnectionFailed failure))
+            Left (ConnectionFailed failure) -> bool (Just (Left (ConnectionFailed failure))) Nothing <$> policyFailed poolPolicy failure
             Left failure -> pure (Just $ Left failure)
             Right reservation -> checked reservation
       checked reservation@Reservation{reservationEntry} = do

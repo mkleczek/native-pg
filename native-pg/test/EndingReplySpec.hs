@@ -98,9 +98,7 @@ spec = describe "the reply to the transaction's ending" $ do
         Tx.endingWaiting tx noWait >>= \case
           Right () -> pure ()
           Left failure -> failTest ("the ending failed: " <> show failure)
-        Tx.endingWaiting tx noWait >>= \case
-          Right () -> pure ()
-          Left _ -> failTest "the answer changed when it was asked again"
+        replied "the answer changed when it was asked again" (Tx.endingWaiting tx noWait)
       sent <- sentBytes link
       occurrences "COMMIT" sent `shouldBe` 1
 
@@ -138,17 +136,13 @@ spec = describe "the reply to the transaction's ending" $ do
               feed link late
               timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
               watchCancel watch
-        Tx.endingWaiting tx wait >>= \case
-          Right () -> pure ()
-          _ -> failTest "the reply that arrived was not taken"
+        replied "the reply that arrived was not taken" (Tx.endingWaiting tx wait)
 
   it "receives the reply in receives that don't wait, when the input is smaller than the rest" $
     withFeed 64 $ \link context -> do
       feed link committed
       afterBody True context $ \tx ->
-        Tx.endingWaiting tx noWait >>= \case
-          Right () -> pure ()
-          _ -> failTest "the reply was not taken"
+        replied "the reply was not taken" (Tx.endingWaiting tx noWait)
 
   it "queues an ending that wasn't queued, and waits until its reply arrives" $
     withFeed 4096 $ \link context -> do
@@ -204,9 +198,7 @@ spec = describe "the reply to the transaction's ending" $ do
                   timeout 2_000_000 (atomically (watchReady watch)) `shouldReturn` Just ()
                   watchCancel watch
                   feed link afterBodyBytes
-            Tx.endingWaiting tx wait >>= \case
-              Right () -> pure ()
-              _ -> failTest "the reply that arrived was not taken"
+            replied "the reply that arrived was not taken" (Tx.endingWaiting tx wait)
 
     it "withdraws its registration for a buffer when its scope ends" $
       withScarceRequests $ \reader taker _ -> do
@@ -224,6 +216,12 @@ spec = describe "the reply to the transaction's ending" $ do
         isNothing <$> tryBorrowBuffer reader `shouldReturn` True
         watchCancel registration
         isJust <$> tryBorrowBuffer reader `shouldReturn` True
+  where
+    replied :: String -> IO (Either Tx.QueryError ()) -> IO ()
+    replied msg outcome =
+      outcome >>= \case
+        Right () -> pure ()
+        _ -> failTest msg
 
 -- | How many times the needle occurs in the bytes.
 occurrences :: BS.ByteString -> BS.ByteString -> Int

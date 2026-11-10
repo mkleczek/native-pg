@@ -26,7 +26,7 @@ spec = describe "timer key ownership races" $ do
         (\() -> throwSTM (userError "immediate reservation was removed"))
         (const (fail "claimed value reached cleanup"))
       result `shouldBe` Just 7
-      Timer.tryRegistration manager >>= (\pending -> isNothing pending `shouldBe` True)
+      Timer.tryRegistration manager >>= (`shouldBe` True) . isNothing
 
   it "preserves caller ownership when cancellation waits for an immediate reservation" $
     Timer.withTimerControl $ \manager -> do
@@ -50,7 +50,7 @@ spec = describe "timer key ownership races" $ do
         (\exception -> fromException exception `shouldBe` Just ThreadKilled)
         (const (fail "cancelled reservation returned to caller"))
       readTVarIO cleaned >>= (`shouldBe` 1)
-      Timer.tryRegistration manager >>= (\pending -> isNothing pending `shouldBe` True)
+      Timer.tryRegistration manager >>= (`shouldBe` True) . isNothing
 
   it "registers and cancels through the supplied manager instead of the default manager" $
     Timer.withTimerControl $ \systemManager -> Timer.withIndependentTimerControl $ \manager -> do
@@ -65,13 +65,13 @@ spec = describe "timer key ownership races" $ do
       await result >>= expectResult (Just 7)
       usedSupplied `shouldBe` True
       Timer.unregisterCount key >>= (`shouldBe` 1)
-      Timer.tryRegistration systemManager >>= (\pending -> isNothing pending `shouldBe` True)
+      Timer.tryRegistration systemManager >>= (`shouldBe` True) . isNothing
       counts detached cleaned 1 1
 
   it "keeps another context sharing the manager usable after application cancellation" $
     sharedContexts $ \requester _ result -> do
       killThread requester
-      await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+      await result >>= (`shouldBe` True) . isLeft
 
   it "keeps another context sharing the manager usable after an owner exception" $
     sharedContexts $ \_ request result -> do
@@ -103,7 +103,7 @@ spec = describe "timer key ownership races" $ do
       within (awaitThrowTo canceller)
       Timer.completeRegistration manager
       await cancelled >>= either throwIO pure
-      await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+      await result >>= (`shouldBe` True) . isLeft
       Timer.unregisterCount key >>= (`shouldBe` 1)
       atomically (tryGrant waiter (pure 7)) >>= (`shouldBe` False)
       counts detached cleaned 1 0
@@ -119,7 +119,7 @@ spec = describe "timer key ownership races" $ do
       atomically (tryGrant waiter (pure 7)) >>= (`shouldBe` True)
       Timer.completeRegistration manager
       await cancelled >>= either throwIO pure
-      await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+      await result >>= (`shouldBe` True) . isLeft
       Timer.unregisterCount key >>= (`shouldBe` 1)
       counts detached cleaned 1 1
 
@@ -189,7 +189,7 @@ spec = describe "timer key ownership races" $ do
       waiter <- awaitTicket ticket
       key <- within (Timer.registration manager)
       Timer.failRegistration manager
-      await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+      await result >>= (`shouldBe` True) . isLeft
       atomically (tryGrant waiter (pure 7)) >>= (`shouldBe` False)
       Timer.unregisterCount key >>= (`shouldBe` 0)
       counts detached cleaned 1 0
@@ -201,7 +201,7 @@ spec = describe "timer key ownership races" $ do
       key <- within (Timer.registration manager)
       atomically (tryGrant waiter (pure 7)) >>= (`shouldBe` True)
       Timer.failRegistration manager
-      await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+      await result >>= (`shouldBe` True) . isLeft
       Timer.unregisterCount key >>= (`shouldBe` 0)
       counts detached cleaned 1 1
 
@@ -226,7 +226,7 @@ spec = describe "timer key ownership races" $ do
       Timer.completeRegistration manager
       within (Timer.awaitUnregistered key)
       killThread requester
-      await result >>= (\outcome -> isLeft outcome `shouldBe` True)
+      await result >>= (`shouldBe` True) . isLeft
       counts detached cleaned 1 1
       Timer.unregisterCount key >>= (`shouldBe` 1)
       Timer.completeUnregistration key

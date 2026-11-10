@@ -104,8 +104,8 @@ spec = describe "a scope" $ do
           >>= putMVar finished
       takeMVar inside
       throwTo worker (ErrorCall "interrupted")
-      timeout 2000000 (takeMVar finished) >>= \outcome ->
-        fmap (either show (const "returned")) outcome `shouldBe` Just "interrupted"
+      timeout 2000000 (takeMVar finished)
+        >>= (`shouldBe` Just "interrupted") . fmap (either show (const "returned"))
       entries logRef `shouldReturn` ["acquire a", "release a aborted interrupted"]
 
     it "run masked" $ do
@@ -161,8 +161,8 @@ spec = describe "a scope" $ do
           >>= putMVar finished
       takeMVar releasing
       throwTo worker (ErrorCall "during release")
-      timeout 2000000 (takeMVar finished) >>= \outcome ->
-        fmap (either show (const "returned")) outcome `shouldBe` Just "during release"
+      timeout 2000000 (takeMVar finished)
+        >>= (`shouldBe` Just "during release") . fmap (either show (const "returned"))
       entries logRef `shouldReturn` ["acquire a", "release a aborted during release"]
 
   describe "acquisitions" $ do
@@ -194,8 +194,8 @@ spec = describe "a scope" $ do
           >>= putMVar finished
       takeMVar blocked
       throwTo worker (ErrorCall "during acquisition")
-      timeout 2000000 (takeMVar finished) >>= \outcome ->
-        fmap (either show (const "returned")) outcome `shouldBe` Just "during acquisition"
+      timeout 2000000 (takeMVar finished)
+        >>= (`shouldBe` Just "during acquisition") . fmap (either show (const "returned"))
       entries logRef `shouldReturn` ["acquire a", "release a aborted during acquisition"]
 
     it "fail in a scope that has closed, without acquiring" $ do

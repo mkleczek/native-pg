@@ -35,7 +35,7 @@ spec = describe "opaque FIFO" $ do
     case workers of
       [((_, firstResult), firstRequest), ((middle, middleResult), middleRequest), ((_, lastResult), lastRequest)] -> do
         killThread middle
-        await middleResult >>= (\outcome -> isLeft outcome `shouldBe` True)
+        await middleResult >>= (`shouldBe` True) . isLeft
         assertTerminal middleRequest
         readTVarIO removed >>= (`shouldBe` 1)
         atomically (fmap fst <$> firstValue queue) >>= (`shouldBe` Just 1)
