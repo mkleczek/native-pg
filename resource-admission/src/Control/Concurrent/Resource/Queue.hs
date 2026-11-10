@@ -9,7 +9,7 @@ import Control.Concurrent.STM
 import Data.Maybe (isNothing)
 
 data Queue a = Queue !(TVar (Maybe (Entry a))) !(TVar (Maybe (Entry a)))
-data Entry a = Entry !(Queue a) a !(TVar (Maybe (Entry a))) !(TVar (Maybe (Entry a)))
+data Entry a = Entry !(Queue a) !a !(TVar (Maybe (Entry a))) !(TVar (Maybe (Entry a)))
 
 newQueue :: STM (Queue a)
 newQueue = Queue <$> newTVar Nothing <*> newTVar Nothing
