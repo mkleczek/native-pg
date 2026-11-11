@@ -6,7 +6,6 @@
 module Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( Envelope (..),
     FramedMessage,
-    SomeEnvelope,
     Scalar (..),
     OidType (OidType),
     OptionalOidType (OptionalOidType),
@@ -66,15 +65,12 @@ module Database.PostgreSQL.Internal.Protocol.Messages.Types
     protocolVersion3_2,
     protocolVersionCode,
     sslRequestCode,
-    toSomeEnvelope,
-    withSomeEnvelope,
   )
 where
 
 import Data.Bits ((.|.), shiftL, shiftR)
 import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32)
-import Data.Kind (Type)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Types
@@ -86,8 +82,6 @@ import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
   )
-import GHC.Exts (Any)
-import Unsafe.Coerce (unsafeCoerce)
 
 -- | A message's frame: its tag byte and the length-prefixed body.
 type FramedMessage tag payload =
@@ -103,14 +97,6 @@ newtype Envelope a (s :: k) = Envelope {unEnvelope :: a}
 deriving instance Eq a => Eq (Envelope a s)
 deriving instance Ord a => Ord (Envelope a s)
 deriving instance Show a => Show (Envelope a s)
-
-newtype SomeEnvelope k = SomeEnvelope Any
-
-toSomeEnvelope :: Envelope a s -> SomeEnvelope k
-toSomeEnvelope = SomeEnvelope . unsafeCoerce
-
-withSomeEnvelope :: SomeEnvelope f -> (forall k (a :: Type) (s :: k). Envelope a s -> r) -> r
-withSomeEnvelope (SomeEnvelope x) k = k (unsafeCoerce x)
 
 newtype Scalar a = Scalar {unScalar :: a}
 

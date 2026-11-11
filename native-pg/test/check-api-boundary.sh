@@ -56,7 +56,7 @@ reject_module Network.Streaming.Internal.ListPrefix
 
 for private_module in \
   Authentication Buffer Internal.Context Internal.Session Internal.Transport \
-  Internal.ConnectionString Internal.Statement Internal.Diagnostics Internal.Some \
+  Internal.ConnectionString Internal.Statement Internal.Diagnostics \
   Internal.Channel Internal.Exchange Internal.HostSelection Internal.Result \
   Internal.Execution Internal.Row \
   Internal.Socket Internal.Startup \

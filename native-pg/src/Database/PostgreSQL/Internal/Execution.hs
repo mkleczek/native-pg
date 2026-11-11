@@ -4,9 +4,8 @@
 -- | Private raw statement execution, batching and asynchronous notifications.
 module Database.PostgreSQL.Internal.Execution
   ( Statement (..), Execution (..), Batch,
-    prepare, execute, batched, runBatch, readExecution, startExecution, executionMessages, parsesOnly, awaitNotification,
-    prepareWithContext, closeStatementWithContext, executeWithContext,
-    runBatchWithContext, awaitNotificationWithContext,
+    prepare, execute, batched, runBatch, startExecution, executionMessages, parsesOnly, awaitNotification,
+    executeWithContext, awaitNotificationWithContext,
     backendProcessId, notificationProcessId, notificationChannel,
     notificationPayload,
   ) where
@@ -22,7 +21,6 @@ import Database.PostgreSQL.Diagnostics (ServerError)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange
 import Database.PostgreSQL.Internal.Row (Row, readRows)
-import Database.PostgreSQL.Session (closeStatement)
 import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), Output)
 import Database.PostgreSQL.Internal.Protocol.Messages hiding (notificationProcessId)
 import qualified Database.PostgreSQL.Internal.Protocol.Messages.Types as Protocol
@@ -200,17 +198,8 @@ streamsParameter = any streamed . executionParameters
     streamed _ = False
 
 -- | Explicit-context variants for bounded integrations.
-prepareWithContext :: Context -> ByteString -> ByteString -> [Maybe Word32] -> IO (Either ServerError (), TransactionStatus)
-prepareWithContext = prepare . Session
-
-closeStatementWithContext :: Context -> ByteString -> IO (Either ServerError (), TransactionStatus)
-closeStatementWithContext = closeStatement . Session
-
 executeWithContext :: Context -> Execution -> (acc -> Row -> IO acc) -> acc -> IO (Either ServerError (acc, ByteString), TransactionStatus)
 executeWithContext = execute . Session
-
-runBatchWithContext :: Context -> (ServerError -> e) -> Batch e a -> IO (Either e a, TransactionStatus)
-runBatchWithContext = runBatch . Session
 
 awaitNotificationWithContext :: Context -> IO (Notification ByteString)
 awaitNotificationWithContext = awaitNotification . Session

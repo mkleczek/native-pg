@@ -7,7 +7,7 @@
 -- threads. Requesting threads never retry on resource inventory.
 module Control.Concurrent.Resource.Acquisition
   ( Context, Request, Deadline(..)
-  , newContext, deadlineAfter, deadlineExpired
+  , newContext, deadlineAfter
   , acquire, tryGrant
   , enroll, delivered, withdraw
   ) where

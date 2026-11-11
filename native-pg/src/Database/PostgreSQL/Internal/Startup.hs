@@ -5,7 +5,7 @@
 
 -- | Private socket negotiation, authentication and startup exchange.
 module Database.PostgreSQL.Internal.Startup
-  ( withChannel, startSession, connectOwned, connectWithBuffers,
+  ( withChannel, connectOwned, connectWithBuffers,
   ) where
 
 import Control.Exception (Exception (..), IOException, bracketOnError, catch, throwIO, try)

@@ -456,8 +456,6 @@ The original code is a guideline, not a literal requirement.
    prefix and discards whatever it leaves.
 6. **Messages are grouped by protocol phase**: `Startup`, `AuthBackend`,
    `AuthFrontend`, `FrontendSession`, `BackendSession`, `Copy`.
-7. **Existentials are zero-cost** (`Some`, `SomeEnvelope`) and eliminated in
-   continuation-passing style.
 
 ## Gaps in the current code
 
