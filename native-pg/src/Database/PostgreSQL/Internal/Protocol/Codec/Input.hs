@@ -53,10 +53,9 @@ import Data.Word (Word8, Word16, Word32)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Network.Streaming.BufferPool (BufferAccess, BufferLoan, borrowBuffer, isPrimaryLoan, loanBuffer, releaseBuffer, tryBorrowBuffer, watchBorrow)
 import Network.Streaming.PositiveInt (mkPositiveInt)
-import Network.Streaming.Buffer (Buffer (Buffer), newBuffer)
+import Network.Streaming.Buffer (Buffer (..), newBuffer)
 import Network.Streaming.Watch (Watch (..), readyNow)
-import qualified Network.Streaming.Buffer as Buffer
-import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
+import Foreign.ForeignPtr (plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, moveBytes)
 import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peekByteOff)
@@ -90,8 +89,7 @@ data InputSource = InputSource
 -- Allocating input preserves slices; reusable input compacts in place and
 -- copies owned results before exposing them.
 data InputBuffer = InputBuffer
-  { bufferMemory :: {-# UNPACK #-} !(ForeignPtr Word8),
-    bufferCapacity :: {-# UNPACK #-} !Int,
+  { bufferStorage :: {-# UNPACK #-} !Buffer,
     bufferStart :: {-# UNPACK #-} !Int,
     bufferEnd :: {-# UNPACK #-} !Int,
     -- | How many bytes were consumed before 'bufferStart'.
@@ -169,7 +167,7 @@ retireConsumed buffer
 -- since a wait can't overlap it.
 acquireInputBuffer :: InputBuffer -> IO InputBuffer
 acquireInputBuffer buffer = case bufferRequest buffer of
-  Just (RequestBuffer access slot waiting) | bufferCapacity buffer == 0 -> mask_ $ do
+  Just (RequestBuffer access slot waiting) | bufferCapacity (bufferStorage buffer) == 0 -> mask_ $ do
     withdrawRegistration waiting
     loan <- borrowBuffer access
     writeIORef slot (Just loan) `onException` releaseBuffer loan
@@ -182,7 +180,7 @@ acquireInputBuffer buffer = case bufferRequest buffer of
 -- made, since the registration holds the place of the second loan.
 tryAcquireInputBuffer :: InputBuffer -> IO (Maybe InputBuffer)
 tryAcquireInputBuffer buffer = case bufferRequest buffer of
-  Just (RequestBuffer access slot waiting) | bufferCapacity buffer == 0 -> mask_ $ do
+  Just (RequestBuffer access slot waiting) | bufferCapacity (bufferStorage buffer) == 0 -> mask_ $ do
     state <- readIORef waiting
     granted <- case state of
       Registered registered -> atomically ((True <$ watchReady registered) `orElse` pure False)
@@ -223,11 +221,11 @@ watchInputLoan buffer = case bufferRequest buffer of
 
 emptyInputBuffer :: InputBuffer
 emptyInputBuffer = case BS.empty of
-  BSI.BS memory _ -> InputBuffer memory 0 0 0 0 False Nothing Nothing
+  BSI.BS memory _ -> InputBuffer (Buffer memory 0) 0 0 0 False Nothing Nothing
 
 -- | Empty input backed by storage lent by the caller.
 reusableInputBuffer :: Buffer -> InputBuffer
-reusableInputBuffer storage = InputBuffer (Buffer.bufferMemory storage) (Buffer.bufferCapacity storage) 0 0 0 True Nothing Nothing
+reusableInputBuffer storage = InputBuffer storage 0 0 0 True Nothing Nothing
 
 -- | The bytes that were read from the source and aren't consumed yet, without
 -- copying them. They are valid until the next read.
@@ -297,7 +295,7 @@ borrowInputWaiting receiver wait readSize count previous = restoreWorkspace prev
             (NoRoom, _) -> throwIO (InputError "an empty buffer has no room")
       where
         buffered = bufferEnd buffer - bufferStart buffer
-        size = min count (bufferCapacity buffer - bufferStart buffer)
+        size = min count (bufferCapacity (bufferStorage buffer) - bufferStart buffer)
 
 -- | Receives once, without waiting, into the free part of the buffer, after
 -- it takes a loan if it has none, and makes room if none is free. The
@@ -323,8 +321,8 @@ pollRetired receiver readSize retired =
         Nothing -> pure (NoRoom, buffer)
         Just roomy -> do
           polled <-
-            withForeignPtr (bufferMemory roomy) $ \pointer ->
-              receiveNow receiver (pointer `plusPtr` bufferEnd roomy) (bufferCapacity roomy - bufferEnd roomy)
+            withForeignPtr (bufferMemory (bufferStorage roomy)) $ \pointer ->
+              receiveNow receiver (pointer `plusPtr` bufferEnd roomy) (bufferCapacity (bufferStorage roomy) - bufferEnd roomy)
           case polled of
             Left watch -> pure (NotArrived (StallOnLink watch), roomy)
             Right received
@@ -345,22 +343,22 @@ holdable buffer
 
 makeRoom :: Int -> InputBuffer -> IO (Maybe InputBuffer)
 makeRoom readSize buffer
-  | bufferEnd buffer < bufferCapacity buffer = pure (Just buffer)
+  | bufferEnd buffer < bufferCapacity (bufferStorage buffer) = pure (Just buffer)
   | bufferReusable buffer =
       if bufferStart buffer == 0
         then pure Nothing
         else do
-          withForeignPtr (bufferMemory buffer) $ \pointer ->
+          withForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
             moveBytes pointer (pointer `plusPtr` bufferStart buffer) unconsumed
           pure (Just buffer {bufferStart = 0, bufferEnd = unconsumed})
   | otherwise = do
-      let capacity = max readSize (2 * bufferCapacity buffer)
+      let capacity = max readSize (2 * bufferCapacity (bufferStorage buffer))
       storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
-      let memory = Buffer.bufferMemory storage
+      let memory = bufferMemory storage
       unsafeWithForeignPtr memory $ \target ->
-        unsafeWithForeignPtr (bufferMemory buffer) $ \origin ->
+        unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \origin ->
           copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
-      pure (Just (InputBuffer memory capacity 0 unconsumed (bufferPosition buffer) False Nothing Nothing))
+      pure (Just (InputBuffer storage 0 unconsumed (bufferPosition buffer) False Nothing Nothing))
   where
     unconsumed = bufferEnd buffer - bufferStart buffer
 
@@ -433,7 +431,7 @@ instance MonadInput Input where
   peekInputByteAt offset = do
     buffer <- ensureAvailable (offset + 1)
     inputIO $
-      unsafeWithForeignPtr (bufferMemory buffer) $ \pointer ->
+      unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
         peekByteOff pointer (bufferStart buffer + offset)
   {-# INLINE peekInputByteAt #-}
 
@@ -552,7 +550,7 @@ readScalar :: Int -> (Ptr Word8 -> IO a) -> Input a
 readScalar count decode = do
   buffer <- ensureAvailable count
   -- Force the result before consuming the bytes can release their loan.
-  value <- inputIO $ unsafeWithForeignPtr (bufferMemory buffer) $ \pointer ->
+  value <- inputIO $ unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
     decode (pointer `plusPtr` bufferStart buffer) >>= evaluate
   putBuffer (consume count buffer)
   pure value
@@ -563,7 +561,7 @@ readScalar count decode = do
 peekInputMetadataByteAt :: Int -> Input Word8
 peekInputMetadataByteAt offset = do
   buffer <- ensureAvailableWith True (offset + 1)
-  inputIO $ unsafeWithForeignPtr (bufferMemory buffer) $ \pointer ->
+  inputIO $ unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
     peekByteOff pointer (bufferStart buffer + offset)
 {-# INLINE peekInputMetadataByteAt #-}
 
@@ -583,7 +581,7 @@ someInput count
   | otherwise = do
       buffer <- ensureAvailable 1
       limit <- getLimit
-      let size = minimum [count, bufferCapacity buffer - bufferStart buffer, limit - bufferPosition buffer]
+      let size = minimum [count, bufferCapacity (bufferStorage buffer) - bufferStart buffer, limit - bufferPosition buffer]
       filled <- ensureAvailable size
       pure (size, filled)
 
@@ -601,7 +599,7 @@ skipInput count
 runBodyParser :: ByteString -> Input a -> Either String (a, ByteString)
 runBodyParser (BSI.BS memory size) parser =
   unsafeDupablePerformIO $ do
-    result <- try (runInput endOfInput (InputBuffer memory size 0 size 0 False Nothing Nothing) parser)
+    result <- try (runInput endOfInput (InputBuffer (Buffer memory size) 0 size 0 False Nothing Nothing) parser)
     pure $ case result of
       Left (InputError message) -> Left message
       Right (a, buffer) -> Right (a, slice (bufferEnd buffer - bufferStart buffer) buffer)
@@ -671,63 +669,63 @@ ensureActiveAvailable metadata count = Input $ \env buffer s ->
 -- after the ones needed.
 fill :: Bool -> InputSource -> Int -> InputBuffer -> IO InputBuffer
 fill metadata source count buffer
-  | bufferReusable buffer && count > bufferCapacity buffer =
+  | bufferReusable buffer && count > bufferCapacity (bufferStorage buffer) =
       if metadata
         then readUntilAvailable =<< expandMetadata count buffer
         else throwIO (InputError ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (suppliedCapacity buffer)))
   | Just (Buffer _ capacity) <- bufferHome buffer,
     count <= capacity = fill metadata source count =<< restoreHome buffer
-  | bufferStart buffer + count <= bufferCapacity buffer = readUntilAvailable buffer
+  | bufferStart buffer + count <= bufferCapacity (bufferStorage buffer) = readUntilAvailable buffer
   | bufferReusable buffer = readUntilAvailable =<< compact
   | otherwise = readUntilAvailable =<< reallocate
   where
     compact = do
       let unconsumed = bufferEnd buffer - bufferStart buffer
-      withForeignPtr (bufferMemory buffer) $ \pointer ->
+      withForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
         moveBytes pointer (pointer `plusPtr` bufferStart buffer) unconsumed
       pure buffer {bufferStart = 0, bufferEnd = unconsumed}
     reallocate = do
       let unconsumed = bufferEnd buffer - bufferStart buffer
           capacity = max (inputReadSize source) count
       storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
-      let memory = Buffer.bufferMemory storage
+      let memory = bufferMemory storage
       unsafeWithForeignPtr memory $ \target ->
-        unsafeWithForeignPtr (bufferMemory buffer) $ \origin ->
+        unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \origin ->
           copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
-      pure (InputBuffer memory capacity 0 unconsumed (bufferPosition buffer) False Nothing Nothing)
+      pure (InputBuffer storage 0 unconsumed (bufferPosition buffer) False Nothing Nothing)
     readUntilAvailable current
       | bufferEnd current - bufferStart current >= count = pure current
       | otherwise = do
           received <-
-            withForeignPtr (bufferMemory current) $ \pointer ->
-              readInputInto source (pointer `plusPtr` bufferEnd current) (bufferCapacity current - bufferEnd current)
+            withForeignPtr (bufferMemory (bufferStorage current)) $ \pointer ->
+              readInputInto source (pointer `plusPtr` bufferEnd current) (bufferCapacity (bufferStorage current) - bufferEnd current)
           when (received <= 0) (throwIO (InputError "unexpected end of input"))
           readUntilAvailable current {bufferEnd = bufferEnd current + received}
 {-# NOINLINE fill #-}
 
 suppliedCapacity :: InputBuffer -> Int
-suppliedCapacity buffer = maybe (bufferCapacity buffer) (\(Buffer _ capacity) -> capacity) (bufferHome buffer)
+suppliedCapacity buffer = maybe (bufferCapacity (bufferStorage buffer)) (\(Buffer _ capacity) -> capacity) (bufferHome buffer)
 
 expandMetadata :: Int -> InputBuffer -> IO InputBuffer
 expandMetadata capacity buffer = do
   storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
   let count = bufferEnd buffer - bufferStart buffer
-      home = bufferHome buffer <|> Just (Buffer (bufferMemory buffer) (bufferCapacity buffer))
-  withForeignPtr (Buffer.bufferMemory storage) $ \target ->
-    withForeignPtr (bufferMemory buffer) $ \origin ->
+      home = bufferHome buffer <|> Just (bufferStorage buffer)
+  withForeignPtr (bufferMemory storage) $ \target ->
+    withForeignPtr (bufferMemory (bufferStorage buffer)) $ \origin ->
       copyBytes target (origin `plusPtr` bufferStart buffer) count
-  pure buffer {bufferMemory = Buffer.bufferMemory storage, bufferCapacity = capacity, bufferStart = 0, bufferEnd = count, bufferHome = home}
+  pure buffer {bufferStorage = storage, bufferStart = 0, bufferEnd = count, bufferHome = home}
 
 restoreHome :: InputBuffer -> IO InputBuffer
 restoreHome buffer = case bufferHome buffer of
   Nothing -> pure buffer
-  Just (Buffer memory capacity) -> do
+  Just home@(Buffer memory capacity) -> do
     let count = bufferEnd buffer - bufferStart buffer
     when (count > capacity) (throwIO (InputError "protocol lookahead exceeds its supplied workspace"))
     withForeignPtr memory $ \target ->
-      withForeignPtr (bufferMemory buffer) $ \origin ->
+      withForeignPtr (bufferMemory (bufferStorage buffer)) $ \origin ->
         copyBytes target (origin `plusPtr` bufferStart buffer) count
-    pure buffer {bufferMemory = memory, bufferCapacity = capacity, bufferStart = 0, bufferEnd = count, bufferHome = Nothing}
+    pure buffer {bufferStorage = home, bufferStart = 0, bufferEnd = count, bufferHome = Nothing}
 
 -- Metadata is owned independently from the operation arena. Unlike a field's
 -- contiguous materialization, it may span any number of bounded refills.
@@ -786,7 +784,7 @@ consume count buffer =
 
 -- | The given number of unconsumed bytes, without copying.
 slice :: Int -> InputBuffer -> ByteString
-slice count buffer = BSI.BS (bufferMemory buffer `plusForeignPtr` bufferStart buffer) count
+slice count buffer = BSI.BS (bufferMemory (bufferStorage buffer) `plusForeignPtr` bufferStart buffer) count
 {-# INLINE slice #-}
 
 -- Force the copy while this arena generation is still valid. A delayed pure

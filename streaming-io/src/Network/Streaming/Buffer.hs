@@ -1,6 +1,7 @@
--- | Initialized, fixed-capacity storage lent exclusively to one operation.
--- A borrowed alias expires with its loan. Owned buffers and their slices keep
--- the backing allocation alive through their ForeignPtr.
+-- | Memory and its capacity in bytes. 'newBuffer' and 'newBuffers' make them
+-- initialized and of fixed capacity, and a pool lends each exclusively to one
+-- operation. A borrowed alias expires with its loan. Owned buffers and their
+-- slices keep the backing allocation alive through their ForeignPtr.
 module Network.Streaming.Buffer
   ( Buffer (..), newBuffer, newBuffers ) where
 
