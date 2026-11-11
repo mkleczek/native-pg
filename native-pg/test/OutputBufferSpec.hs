@@ -48,7 +48,7 @@ spec = describe "caller-owned output storage" $ do
             accepted <- evaluate (BS.copy (BS.concat chunks))
             modifyIORef' sent (<> accepted)
             pure (sum (map BS.length chunks))
-      channelSendBuffered (newChannel link) (outputBufferFrom buffer) batch
+      channelSend (newChannel link) (Just (outputBufferFrom buffer)) batch
       readIORef sent `shouldReturn` wire
       readIORef addresses `shouldReturn` True
 
@@ -82,7 +82,7 @@ spec = describe "caller-owned output storage" $ do
           prefix <- evaluate (BS.copy (BS.take 5 (BS.concat chunks)))
           modifyIORef' received (<> prefix)
           pure (BS.length prefix)
-    channelSend (newChannel sender) (Output.stream (Output.ByteStream 40 next))
+    channelSend (newChannel sender) Nothing (Output.stream (Output.ByteStream 40 next))
     readIORef received `shouldReturn` BS.pack [1 .. 40]
     offered <- reverse <$> readIORef offers
     take 1 offered `shouldBe` [16]
@@ -95,7 +95,7 @@ spec = describe "caller-owned output storage" $ do
           prefix <- evaluate (BS.copy (BS.take 3 (BS.concat chunks)))
           modifyIORef' sent (<> prefix)
           pure (BS.length prefix)
-    channelSendBuffered (newChannel link) (outputBufferFrom buffer) batch
+    channelSend (newChannel link) (Just (outputBufferFrom buffer)) batch
     readIORef sent `shouldReturn` wire
 
   it "matches contiguous serialization for complete messages at small capacities" $ do
@@ -111,7 +111,7 @@ spec = describe "caller-owned output storage" $ do
             prefix <- evaluate (BS.copy (BS.take 3 (BS.concat chunks)))
             modifyIORef' received (<> prefix)
             pure (BS.length prefix)
-      channelSendBuffered (newChannel sender) (outputBufferFrom buffer) output
+      channelSend (newChannel sender) (Just (outputBufferFrom buffer)) output
       readIORef received `shouldReturn` expected
 
   it "sizes and sends a list containing empty, copied and direct byte strings" $ do
@@ -125,7 +125,7 @@ spec = describe "caller-owned output storage" $ do
           pure (BS.length prefix)
     Output.outputLength output `shouldBe` 8198
     Output.outputCopied output `shouldBe` 6
-    channelSendBuffered (newChannel sender) (outputBufferFrom buffer) output
+    channelSend (newChannel sender) (Just (outputBufferFrom buffer)) output
     readIORef received `shouldReturn` (BS.concat values <> "\1\2")
 
   it "resumes suspended fields in a different output buffer" $ do
@@ -200,11 +200,11 @@ spec = describe "caller-owned output storage" $ do
           let prefix = if even call then BS.empty else BS.take 1 offered
           modifyIORef' received (<> prefix)
           pure (BS.length prefix)
-    channelSendBuffered (newChannel sender) (outputBufferFrom buffer) output
+    channelSend (newChannel sender) (Just (outputBufferFrom buffer)) output
     readIORef received `shouldReturn` "\1\2\3\4\5\6\7\8"
     readIORef ordinaryPulls `shouldReturn` 1
     readIORef borrowedPulls `shouldReturn` 1
-    channelSendBuffered (newChannel sender) (outputBufferFrom buffer) mempty
+    channelSend (newChannel sender) (Just (outputBufferFrom buffer)) mempty
     readIORef calls `shouldReturn` 16
 
   it "resumes mixed fields and scoped streams in four bytes across blocked sends" $ do
@@ -245,7 +245,7 @@ spec = describe "caller-owned output storage" $ do
           prefix <- evaluate (BS.copy (BS.take count offered))
           modifyIORef' received (<> prefix)
           pure (BS.length prefix)
-    channelSendBuffered (newChannel sender) (outputBufferFrom buffer) output
+    channelSend (newChannel sender) (Just (outputBufferFrom buffer)) output
     readIORef received `shouldReturn` expected
     readIORef pulls `shouldReturn` 2
 
@@ -280,7 +280,7 @@ spec = describe "caller-owned output storage" $ do
             pieces <- mapM (\chunk -> BSU.unsafeUseAsCStringLen chunk (\(pointer, size) -> pure (castPtr pointer, size))) chunks
             modifyIORef' sends (pieces :)
             pure (sum (map BS.length chunks))
-      channelSendBuffered (newChannel link) (outputBufferFrom buffer) directValue
+      channelSend (newChannel link) (Just (outputBufferFrom buffer)) directValue
       calls <- readIORef sends
       map (map snd) calls `shouldBe` [[10, 9000, 6]]
       withForeignPtr (bufferMemory buffer) $ \start -> case calls of
@@ -292,7 +292,7 @@ spec = describe "caller-owned output storage" $ do
         forM_ [directValue, directValue <> mconcat (replicate 40 (serialize Sync))] $ \output -> do
           buffer <- newBuffer (positiveInt @64)
           received <- newIORef BS.empty
-          channelSendBuffered (newChannel (takingUpTo accepts received)) (outputBufferFrom buffer) output
+          channelSend (newChannel (takingUpTo accepts received)) (Just (outputBufferFrom buffer)) output
           readIORef received `shouldReturn` staticBytes output
   where
     batch = mconcat (replicate 40 (serialize Sync))

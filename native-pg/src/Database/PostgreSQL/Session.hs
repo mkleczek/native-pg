@@ -56,7 +56,7 @@ close opened = mask $ \restore -> do
       -- the server may not be reading, so it isn't told to terminate.
       restore
         ( case state of
-            Idle -> channelSend (connectionChannel opened) (serialize Terminate) `catch` \(_ :: IOException) -> pure ()
+            Idle -> channelSend (connectionChannel opened) Nothing (serialize Terminate) `catch` \(_ :: IOException) -> pure ()
             _ -> pure ()
         )
         `finally` channelClose (connectionChannel opened)
@@ -124,7 +124,7 @@ cancel settings key =
   withChannel settings $ \channel _ -> do
     pending <- newIORef =<< unsent Nothing mempty
     ( do
-        channelSend channel (serialize (CancelRequest key))
+        channelSend channel Nothing (serialize (CancelRequest key))
         -- The server closes the connection once it has handled the request.
         let waitForClose = do
               received <- allocaBytes 64 $ \buffer -> readInputInto (channelInput channel pending 64) buffer 64

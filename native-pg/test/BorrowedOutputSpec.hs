@@ -59,7 +59,7 @@ spec = describe "borrowed parameter streams" $ do
             prefix <- evaluate (BS.copy (BS.take 7 (BS.concat pieces)))
             modifyIORef' received (<> prefix)
             pure (BS.length prefix)
-      channelSend (newChannel sender) output
+      channelSend (newChannel sender) Nothing output
       readIORef received `shouldReturn` ("\0\0\0`" <> BS.replicate 32 65 <> BS.replicate 32 66 <> BS.replicate 32 67)
       readIORef pulls `shouldReturn` 4
 
@@ -111,11 +111,11 @@ spec = describe "borrowed parameter streams" $ do
             count <- readInputInto (channelInput channel pending 4096) pointer 4
             BS.packCStringLen (castPtr pointer, count)
       outcome <- timeout 2000000 $ bracket (unsent Nothing (borrowedStream uploadSize source)) discardUnsent $ \initial -> do
-        pending <- newIORef =<< channelSendSome channel initial
+        pending <- newIORef initial
+        void (channelPush channel pending)
         value <- drain pending
         -- The output cursor still needs the source's end.
-        left <- readIORef pending
-        channelSendSome channel left >>= writeIORef pending
+        void (channelPush channel pending)
         pure value
       outcome `shouldBe` Just "done"
       readIORef sent `shouldReturn` uploadSize
@@ -145,7 +145,8 @@ spec = describe "borrowed parameter streams" $ do
           upload = do
             liveThreads >>= putMVar baseline
             bracket (unsent Nothing (borrowedStream 0 source)) discardUnsent $ \initial -> do
-              pending <- newIORef =<< channelSendSome channel initial
+              pending <- newIORef initial
+              void (channelPush channel pending)
               allocaBytes 16 $ \pointer -> readInputInto (channelInput channel pending 16) pointer 16
       outcome <- timeout 5000000 $ do
         reader <- forkIO (void (try @SomeException upload) `finally` putMVar stopped ())
@@ -182,7 +183,8 @@ spec = describe "borrowed parameter streams" $ do
           upload = do
             liveThreads >>= putMVar baseline
             bracket (unsent Nothing (borrowedStream 10 source)) discardUnsent $ \initial -> do
-              pending <- newIORef =<< channelSendSome channel initial
+              pending <- newIORef initial
+              void (channelPush channel pending)
               allocaBytes 16 $ \pointer -> readInputInto (channelInput channel pending 16) pointer 16
       outcome <- timeout 5000000 $ do
         reader <- forkIO (void (try @SomeException upload) `finally` putMVar stopped ())
@@ -201,7 +203,7 @@ spec = describe "borrowed parameter streams" $ do
     it "goes to the link in one send with a ready first chunk" $ do
       sends <- newIORef []
       source <- chunkSource "hello"
-      channelSend (newChannel (recording sends)) (uploadStatement source)
+      channelSend (newChannel (recording sends)) Nothing (uploadStatement source)
       offers <- reverse <$> readIORef sends
       let (framing, _) = BS.breakSubstring "hello" wire
       map BS.concat offers `shouldBe` [framing <> "hello", BS.drop (BS.length framing + 5) wire]
@@ -220,7 +222,7 @@ spec = describe "borrowed parameter streams" $ do
               if ready then atomicModifyIORef' script (\case [] -> ([], Just Ended); step : rest -> (rest, Just step)) else pure Nothing)
             (putMVar watching () $> Watch (readTVar open >>= check) (pure ()))
           (framing, _) = BS.breakSubstring "hello" wire
-      _ <- forkIO (channelSend (newChannel (recording sends)) (uploadStatement source) `finally` putMVar finished ())
+      _ <- forkIO (channelSend (newChannel (recording sends)) Nothing (uploadStatement source) `finally` putMVar finished ())
       timeout 2000000 (takeMVar watching) `shouldReturn` Just ()
       -- The statement is on its way while the upload has nothing.
       (map BS.concat . reverse <$> readIORef sends) `shouldReturn` [framing]
@@ -231,9 +233,9 @@ spec = describe "borrowed parameter streams" $ do
 
   it "propagates a source error and a failing watch" $ do
       let channel = newChannel (Sender (pure . sum . map BS.length))
-      channelSend channel (borrowedStream 1 (PullSource (ioError (userError "source failed")) noWatch))
+      channelSend channel Nothing (borrowedStream 1 (PullSource (ioError (userError "source failed")) noWatch))
         `shouldSatisfy` P.throws @IOException P.anything
-      channelSend channel (borrowedStream 1 (PullSource (pure Nothing) (ioError (userError "watch failed"))))
+      channelSend channel Nothing (borrowedStream 1 (PullSource (pure Nothing) (ioError (userError "watch failed"))))
         `shouldSatisfy` P.throws @IOException P.anything
 
   it "releases the watch of a cancelled wait for its source before the owner unwinds" $ do
@@ -244,7 +246,7 @@ spec = describe "borrowed parameter streams" $ do
             putMVar registered ()
             pure (Watch retry (modifyIORef' cancels (+ 1)))
           sender = Sender (\_ -> pure 0)
-      owner <- forkIO $ void (try @SomeException (channelSend (newChannel sender) (borrowedStream 8 source)))
+      owner <- forkIO $ void (try @SomeException (channelSend (newChannel sender) Nothing (borrowedStream 8 source)))
         `finally` putMVar stopped ()
       takeMVar registered
       killThread owner
@@ -258,9 +260,9 @@ spec = describe "borrowed parameter streams" $ do
       short <- one "a"
       long <- one "abc"
       let channel = newChannel (Sender (pure . sum . map BS.length))
-      channelSend channel (borrowedStream 2 short)
+      channelSend channel Nothing (borrowedStream 2 short)
         `shouldSatisfy` P.throws (P.con (StreamLengthError (P.eq 2) (P.eq 1)))
-      channelSend channel (borrowedStream 2 long)
+      channelSend channel Nothing (borrowedStream 2 long)
         `shouldSatisfy` P.throws (P.con (StreamLengthError (P.eq 2) (P.eq 3)))
 
 -- | A statement whose only parameter is five bytes from the source.

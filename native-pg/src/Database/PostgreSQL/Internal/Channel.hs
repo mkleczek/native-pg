@@ -12,7 +12,7 @@ module Database.PostgreSQL.Internal.Channel
 where
 
 import Control.Exception (bracket)
-import Control.Monad (void, (>=>))
+import Control.Monad (void)
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol.Codec (Output)
@@ -48,11 +48,9 @@ data Channel = Channel
   { -- | Reads input. While output is unsent, waiting for input also sends it
     -- as the link takes it.
     channelInput :: IORef Unsent -> Int -> InputSource,
-    -- | Sends what the link takes without waiting, and gives what's left.
-    channelSendSome :: Unsent -> IO Unsent,
-    -- | Sends the output, waiting for room as needed.
-    channelSend :: Output -> IO (),
-    channelSendBuffered :: OutputBuffer -> Output -> IO (),
+    -- | Sends the output, waiting for room as needed, writing it to the buffer
+    -- if there is one.
+    channelSend :: Maybe OutputBuffer -> Output -> IO (),
     -- | Reads what's ready into the buffer, up to its size, without waiting:
     -- 'Nothing' if nothing is, and 0 at the end of the stream.
     channelReceiveReady :: Ptr Word8 -> Int -> IO (Maybe Int),
@@ -61,8 +59,8 @@ data Channel = Channel
     -- unsent, as far as the link takes it, before it gives up.
     channelPoll :: IORef Unsent -> Ptr Word8 -> Int -> IO (Either (IO Watch) Int),
     -- | Sends output that is unsent, as far as the link takes it, without
-    -- reading, for a read that has nowhere to read to. It gives a watch for
-    -- what the output waits for, if it does.
+    -- reading, to start sending it or for a read that has nowhere to read to.
+    -- It gives a watch for what the output waits for, if it does.
     channelPush :: IORef Unsent -> IO (Maybe (IO Watch)),
     channelClose :: IO ()
   }
@@ -74,12 +72,7 @@ newChannel :: Link link => link -> Channel
 newChannel link =
   Channel
     { channelInput = linkInputSource link reading,
-      channelSendSome =
-        pushWith link stopping >=> \case
-          Pushed -> pure noUnsent
-          Stopped rest _ -> pure rest,
       channelSend = sendOutput link sending,
-      channelSendBuffered = sendOutputWith link sending . Just,
       channelReceiveReady = receiveReady link,
       channelPoll = pollStep link,
       channelPush = \pending -> readIORef pending >>= pushPending link pending,
@@ -155,11 +148,11 @@ pushPending link pending left =
     Stopped rest watch -> Just watch <$ writeIORef pending rest
 {-# INLINABLE pushPending #-}
 
--- | Sends the output, waiting for the link to become writable as needed.
-sendOutput :: Link link => link -> Stalls -> Output -> IO ()
-sendOutput link stalls = sendOutputWith link stalls Nothing
-{-# INLINABLE sendOutput #-}
-
-sendOutputWith :: Link link => link -> Stalls -> Maybe OutputBuffer -> Output -> IO ()
-sendOutputWith link stalls buffer output = bracket (unsent buffer output) discardUnsent (void . pushWith link stalls)
-{-# INLINABLE sendOutputWith #-}
+-- | Sends the output, waiting for the link to become writable as needed. It is
+-- inlined with only the link and stalls, so that all sends of a channel share
+-- the closure that pushes.
+sendOutput :: Link link => link -> Stalls -> Maybe OutputBuffer -> Output -> IO ()
+sendOutput link stalls = send
+  where
+    send buffer output = bracket (unsent buffer output) discardUnsent (void . pushWith link stalls)
+{-# INLINE sendOutput #-}

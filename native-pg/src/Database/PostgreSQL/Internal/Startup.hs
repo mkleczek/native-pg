@@ -207,7 +207,7 @@ requestTls :: Socket -> IO Bool
 requestTls sock = do
   pending <- newIORef =<< unsent Nothing mempty
   let channel = newChannel sock
-  channelSend channel (serialize SSLRequest)
+  channelSend channel Nothing (serialize SSLRequest)
   answer <- allocaBytes 1 $ \byte -> do
     received <- readInputInto (channelInput channel pending 1) byte 1
     if received == 0 then pure Nothing else Just <$> peek byte

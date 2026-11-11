@@ -56,7 +56,7 @@ spec = describe "channels over a link without a socket" $ do
             testWritable = writeIORef ready True $> readyNow
           }
     (channel, _) <- channelWith link mempty
-    timeout 1000000 (channelSend channel sync) `shouldReturn` Just ()
+    timeout 1000000 (channelSend channel Nothing sync) `shouldReturn` Just ()
     readIORef sent `shouldReturn` syncBytes
 
   it "waits until buffered output can be flushed" $ do
@@ -68,7 +68,7 @@ spec = describe "channels over a link without a socket" $ do
             testWritable = writeIORef flushed True $> readyNow
           }
     (channel, _) <- channelWith link mempty
-    timeout 1000000 (channelSend channel sync) `shouldReturn` Just ()
+    timeout 1000000 (channelSend channel Nothing sync) `shouldReturn` Just ()
     readIORef sent `shouldReturn` syncBytes
     readIORef flushed `shouldReturn` True
 
@@ -174,7 +174,7 @@ checkGather output expected = do
           testWritable = pure readyNow
         }
   (channel, _) <- channelWith link mempty
-  channelSend channel output
+  channelSend channel Nothing output
   readIORef sent `shouldReturn` expected
   (all (<= 262144) <$> readIORef calls) `shouldReturn` True
 

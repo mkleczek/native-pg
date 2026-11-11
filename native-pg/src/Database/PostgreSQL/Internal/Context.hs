@@ -36,7 +36,7 @@ module Database.PostgreSQL.Internal.Context
 import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (MVar, newMVar, takeMVar, putMVar, readMVar)
 import Control.Exception (catch, finally, mask, onException, throwIO, uninterruptibleMask_)
-import Control.Monad (unless, when)
+import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
@@ -121,7 +121,7 @@ newOwnedContext connection = do
 sendContextOutput :: Context -> Output -> IO ()
 sendContextOutput context output = do
   ensureContextActive context
-  channelSendBuffered (connectionChannel (contextConnection context)) (contextOutput context) output
+  channelSend (connectionChannel (contextConnection context)) (Just (contextOutput context)) output
 
 -- | Starts a batch without waiting for the peer to consume all of it.
 -- Reads subsequently advance this context's pending writes.
@@ -132,8 +132,7 @@ queueContextOutput context output = do
   unless (unsentEmpty previous) (throwIO (SessionUnusable "the operation still has pending output"))
   pending <- unsent (Just (contextOutput context)) output
   writeIORef (contextPending context) pending
-  remaining <- channelSendSome (connectionChannel (contextConnection context)) pending
-  writeIORef (contextPending context) remaining
+  void (channelPush (connectionChannel (contextConnection context)) (contextPending context))
 
 -- | Runs a concrete parser against this operation's cursor and pending
 -- output. The parser consumes no further than the limit, but a read fills
