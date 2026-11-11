@@ -6,7 +6,7 @@
 
 -- | Connection input and output, specialized to its transport link.
 module Database.PostgreSQL.Internal.Channel
-  ( Channel (..),
+  ( Channel (channelInput, channelSend, channelReceiveReady, channelPoll, channelPush, channelClose),
     newChannel,
   )
 where
