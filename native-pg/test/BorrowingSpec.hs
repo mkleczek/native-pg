@@ -8,7 +8,6 @@ import AcquisitionTestSupport (getAcquisition)
 import qualified Network.Streaming.BufferPool as BufferPool
 import Control.Exception (evaluate, try)
 import Control.Monad (forM_, replicateM)
-import Control.Monad.Except (catchError)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
@@ -161,24 +160,6 @@ spec = describe "caller-owned input" $ do
           modifyIORef' chunks (<> [(offset, copied)])
     _ <- runInput source (reusableInputBuffer storage) (withInputSome 8 consume *> withInputSome 8 consume)
     readIORef chunks `shouldReturn` [(0, "abcd"), (0, "efgh")]
-
-  it "does not enter rollback handlers after reusable storage was refilled" $ do
-    storage <- newBuffer (positiveInt @4)
-    calls <- newIORef (0 :: Int)
-    source <- bytesSource 4 "abcdefgh" (\_ -> modifyIORef' calls (+ 1))
-    let parser = catchError
-          (readInputExactly 4 *> readInputExactly 4 *> readInputExactly 5)
-          (const (pure "rollback handler entered"))
-    inputResult (runInput source (reusableInputBuffer storage) parser)
-      `shouldReturn` Left "contiguous input of 5 bytes exceeds buffer capacity 4"
-    readIORef calls `shouldReturn` 2
-
-  it "preserves rollback handlers for allocating input" $ do
-    source <- bytesSource 4 "abcdefgh" (const (pure ()))
-    let parser = catchError
-          (readInputExactly 4 *> readInputExactly 4 *> readInputExactly 5)
-          (const (pure "recovered"))
-    inputResult (runInput source emptyInputBuffer parser) `shouldReturn` Right "recovered"
 
   it "assembles long C-string metadata into owned storage" $ do
     storage <- newBuffer (positiveInt @4)

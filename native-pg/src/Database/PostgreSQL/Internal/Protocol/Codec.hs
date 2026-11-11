@@ -24,6 +24,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec
     readInputRemaining,
     readInputCStringBytes,
     withInputLimit,
+    failInput,
     Output,
     Parsable (..),
     ParseConstructor (..),
@@ -59,7 +60,6 @@ module Database.PostgreSQL.Internal.Protocol.Codec
 where
 
 import Control.Monad (replicateM, unless)
-import Control.Monad.Except (MonadError (..))
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
@@ -80,6 +80,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Input
     readInputRemaining,
     readInputCStringBytes,
     withInputLimit,
+    failInput,
     emptyInputBuffer,
     reusableInputBuffer,
     requestInputBuffer,
@@ -237,7 +238,7 @@ instance Parsable (Maybe ByteString) 'MaybeBytes32Atom where
     case compare lengthOrMissing (-1) of
       EQ -> pure Nothing
       GT -> Just <$> readInputExactly (fromIntegral lengthOrMissing)
-      LT -> throwError ("negative length " <> show lengthOrMissing <> " is invalid for MaybeBytes32Atom")
+      LT -> failInput ("negative length " <> show lengthOrMissing <> " is invalid for MaybeBytes32Atom")
   {-# INLINE fieldParser #-}
 
 instance KnownChar value => Parsable () ('PayloadConst 1 (value :: Char)) where
@@ -279,7 +280,7 @@ instance forall a (payload :: Payload). Parsable a payload => Parsable [a] ('Pay
     count <- fieldParser @Int16 @('FixedBytesAtom 2)
     unless
       (count >= 0)
-      (throwError ("negative element count " <> show count <> " is invalid for PayloadCounted16"))
+      (failInput ("negative element count " <> show count <> " is invalid for PayloadCounted16"))
     replicateM (fromIntegral count) (fieldParser @a @payload)
   {-# INLINE fieldParser #-}
 
@@ -288,7 +289,7 @@ instance forall a (payload :: Payload). Parsable a payload => Parsable [a] ('Pay
     count <- fieldParser @Int32 @('FixedBytesAtom 4)
     unless
       (count >= 0)
-      (throwError ("negative element count " <> show count <> " is invalid for PayloadCounted32"))
+      (failInput ("negative element count " <> show count <> " is invalid for PayloadCounted32"))
     replicateM (fromIntegral count) (fieldParser @a @payload)
   {-# INLINE fieldParser #-}
 
@@ -359,7 +360,7 @@ instance
 instance ParseConstructor ('PayloadChoice '[]) (Alternatives '[] r) r where
   parseWithConstructor NoAlternatives = do
     first <- peekInputByteAt 0
-    throwError ("no alternative matches input starting with byte " <> show first)
+    failInput ("no alternative matches input starting with byte " <> show first)
   {-# INLINE parseWithConstructor #-}
 
 instance
@@ -618,7 +619,7 @@ withBoundedInput inner = do
   totalLength <- fieldParser @Int32 @('FixedBytesAtom 4)
   unless
     (totalLength >= 4)
-    (throwError ("length " <> show totalLength <> " is invalid for PayloadBounded"))
+    (failInput ("length " <> show totalLength <> " is invalid for PayloadBounded"))
   let bodyLength = fromIntegral totalLength - 4
   withInputLimit bodyLength inner
 {-# INLINE withBoundedInput #-}
@@ -627,11 +628,11 @@ withLengthPrefix :: Output -> Output
 withLengthPrefix inner = int32 (lengthAsInt32 (outputLength inner + 4)) <> inner
 {-# INLINE withLengthPrefix #-}
 
-expectConstant :: (MonadError String m, Eq a, Show a) => a -> a -> m ()
+expectConstant :: (Eq a, Show a) => a -> a -> Input ()
 expectConstant expected actual =
   unless
     (actual == expected)
-    (throwError ("unexpected constant " <> show actual <> ", expected " <> show expected))
+    (failInput ("unexpected constant " <> show actual <> ", expected " <> show expected))
 {-# INLINE expectConstant #-}
 
 -- Narrow once after combining bytes, as in the consuming scalar readers.

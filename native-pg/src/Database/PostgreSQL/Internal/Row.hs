@@ -17,7 +17,6 @@ module Database.PostgreSQL.Internal.Row
 import Control.Concurrent (ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar (newMVar, takeMVar, putMVar, readMVar)
 import Control.Exception (SomeException, catch, finally, fromException, mask, onException, throwIO, toException, uninterruptibleMask_)
-import Control.Monad.Except (throwError)
 import Control.Monad (join, unless, void, when)
 import Data.Foldable (for_)
 import Data.ByteString (ByteString)
@@ -31,7 +30,7 @@ import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange
 import Database.PostgreSQL.Internal.Protocol.Codec
   ( Alternatives (..), ByteStream (..), Input, InputError (..), Parsable (..),
-    inputPosition, readInputSome, readInputBorrowedSome, withInputSome, skipInput,
+    failInput, inputPosition, readInputSome, readInputBorrowedSome, withInputSome, skipInput,
   )
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
@@ -323,7 +322,7 @@ readOwnedNullable = do
   case compare size (-1) of
     EQ -> pure Nothing
     GT -> Just <$> readOwnedBytes (fromIntegral size)
-    LT -> throwError ("negative length " <> show size <> " is invalid for MaybeBytes32Atom")
+    LT -> failInput ("negative length " <> show size <> " is invalid for MaybeBytes32Atom")
 
 -- | A row's columns, described by the Haskell types they decode to.
 class DecodeRow (columns :: [Type]) where

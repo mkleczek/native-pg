@@ -18,6 +18,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     readInputRemaining,
     readInputCStringBytes,
     withInputLimit,
+    failInput,
     emptyInputBuffer,
     reusableInputBuffer,
     requestInputBuffer,
@@ -48,7 +49,6 @@ where
 import Control.Applicative ((<|>))
 import Control.Exception (Exception, evaluate, throwIO, try, mask_, onException)
 import Control.Monad (ap, liftM, when)
-import Control.Monad.Except (MonadError (..))
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -409,18 +409,11 @@ instance Monad Input where
       (# s', buffer', a #) -> unInput (k a) env buffer' s'
   {-# INLINE (>>=) #-}
 
--- | Allocating parsers recover from errors using their previous buffer
--- snapshot. Reusable parsers cannot recover: compaction may have overwritten
--- that snapshot, so errors remain terminal even under 'catchError'.
-instance MonadError String Input where
-  throwError message = inputIO (throwIO (InputError message))
-  {-# INLINE throwError #-}
-  catchError (Input m) handler = Input $ \env buffer s ->
-    if bufferReusable buffer
-      then m env buffer s
-      else case unIO (try (IO (\s1 -> case m env buffer s1 of (# s2, buffer', a #) -> (# s2, (buffer', a) #)))) s of
-        (# s', Right (buffer', a) #) -> (# s', buffer', a #)
-        (# s', Left (InputError message) #) -> unInput (handler message) env buffer s'
+-- | Fails the parser with an 'InputError'. Errors are terminal: a parser has
+-- no way to recover from one and go on reading.
+failInput :: String -> Input a
+failInput message = inputIO (throwIO (InputError message))
+{-# INLINE failInput #-}
 
 -- | The byte at the given offset from the current position, without
 -- consuming anything. Blocks until that many bytes are available.
@@ -434,7 +427,7 @@ peekInputByteAt offset = do
 
 readInputExactly :: Int -> Input ByteString
 readInputExactly count
-  | count < 0 = throwError ("negative byte count " <> show count <> " is invalid")
+  | count < 0 = failInput ("negative byte count " <> show count <> " is invalid")
   | otherwise = do
       buffer <- ensureAvailable count
       value <- ownedSlice count buffer
@@ -447,7 +440,7 @@ readInputRemaining :: Input ByteString
 readInputRemaining = do
   limit <- getLimit
   if limit == unbounded
-    then throwError "RemainingBytesAtom needs an enclosing bounded part"
+    then failInput "RemainingBytesAtom needs an enclosing bounded part"
     else do
       buffer <- getBuffer
       let count = limit - bufferPosition buffer
@@ -465,13 +458,13 @@ withInputLimit :: Int -> Input a -> Input a
 withInputLimit count (Input action) = Input $ \env buffer s ->
   let end = bufferPosition buffer + count
    in if count < 0 || end > envLimit env
-        then unInput (throwError ("a bounded part of " <> show count <> " bytes doesn't fit the enclosing one")) env buffer s
+        then unInput (failInput ("a bounded part of " <> show count <> " bytes doesn't fit the enclosing one")) env buffer s
         else case action env {envLimit = end} buffer s of
           (# s', buffer', a #)
             | bufferPosition buffer' == end -> (# s', buffer', a #)
             | otherwise ->
                 unInput
-                  (throwError ("bounded parser left " <> show (end - bufferPosition buffer') <> " unconsumed bytes"))
+                  (failInput ("bounded parser left " <> show (end - bufferPosition buffer') <> " unconsumed bytes"))
                   env
                   buffer'
                   s'
@@ -573,12 +566,12 @@ restoreBorrowedWorkspace = do
     Nothing -> pure ()
     Just (Buffer _ capacity) -> do
       when (bufferEnd buffer - bufferStart buffer > capacity) $
-        throwError "borrowed input cannot expose unconsumed protocol lookahead"
+        failInput "borrowed input cannot expose unconsumed protocol lookahead"
       putBuffer =<< inputIO (restoreHome buffer)
 
 someInput :: Int -> Input (Int, InputBuffer)
 someInput count
-  | count <= 0 = throwError "a streamed input request must be positive"
+  | count <= 0 = failInput "a streamed input request must be positive"
   | otherwise = do
       buffer <- ensureAvailable 1
       limit <- getLimit
@@ -653,9 +646,9 @@ ensureAvailableWith metadata count = do
 ensureActiveAvailable :: Bool -> Int -> Input InputBuffer
 ensureActiveAvailable metadata count = Input $ \env buffer s ->
   if bufferPosition buffer + count > envLimit env
-    then unInput (throwError ("unexpected end of a bounded part: needed " <> show count <> " bytes")) env buffer s
+    then unInput (failInput ("unexpected end of a bounded part: needed " <> show count <> " bytes")) env buffer s
     else if bufferReusable buffer && not metadata && count > suppliedCapacity buffer
-      then unInput (throwError ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (suppliedCapacity buffer))) env buffer s
+      then unInput (failInput ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (suppliedCapacity buffer))) env buffer s
     else
       if bufferEnd buffer - bufferStart buffer >= count
         then (# s, buffer, buffer #)
@@ -741,7 +734,7 @@ reusableCString :: [ByteString] -> Input ByteString
 reusableCString chunks = do
   before <- getBuffer
   limit <- getLimit
-  when (bufferPosition before >= limit) (throwError "unterminated C-string")
+  when (bufferPosition before >= limit) (failInput "unterminated C-string")
   buffer <- ensureAvailable 1
   let available = min (bufferEnd buffer - bufferStart buffer) (limit - bufferPosition buffer)
   case BS.elemIndex 0 (slice available buffer) of
@@ -772,7 +765,7 @@ cstringFrom scanned = do
       putBuffer (consume (size + 1) buffer)
       pure value
     Nothing
-      | bufferPosition buffer + available >= limit -> throwError "unterminated C-string"
+      | bufferPosition buffer + available >= limit -> failInput "unterminated C-string"
       | otherwise -> ensureAvailable (available + 1) *> cstringFrom available
 
 consume :: Int -> InputBuffer -> InputBuffer
