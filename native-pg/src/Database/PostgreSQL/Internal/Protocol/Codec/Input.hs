@@ -53,7 +53,7 @@ import Data.Word (Word8, Word16, Word32)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Network.Streaming.BufferPool (BufferAccess, BufferLoan, borrowBuffer, isPrimaryLoan, loanBuffer, releaseBuffer, tryBorrowBuffer, watchBorrow)
 import Network.Streaming.PositiveInt (mkPositiveInt)
-import Network.Streaming.Buffer (Buffer, newBuffer)
+import Network.Streaming.Buffer (Buffer (Buffer), newBuffer)
 import Network.Streaming.Watch (Watch (..), readyNow)
 import qualified Network.Streaming.Buffer as Buffer
 import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
@@ -98,11 +98,9 @@ data InputBuffer = InputBuffer
     bufferPosition :: {-# UNPACK #-} !Int,
     bufferReusable :: !Bool,
     -- | The supplied workspace while a protocol discriminator uses owned lookahead.
-    bufferHome :: !(Maybe HomeBuffer),
+    bufferHome :: !(Maybe Buffer),
     bufferRequest :: !(Maybe RequestBuffer)
   }
-
-data HomeBuffer = HomeBuffer !(ForeignPtr Word8) !Int
 
 -- The mutable loan slot also lets exception cleanup find a loan acquired by
 -- a parser that did not return its cursor. The input's wait for a loan is
@@ -369,7 +367,7 @@ makeRoom readSize buffer
 restoreWorkspace :: InputBuffer -> IO InputBuffer
 restoreWorkspace buffer = case bufferHome buffer of
   Nothing -> pure buffer
-  Just (HomeBuffer _ capacity) -> do
+  Just (Buffer _ capacity) -> do
     when (bufferEnd buffer - bufferStart buffer > capacity) $
       throwIO (InputError "borrowed input cannot expose unconsumed protocol lookahead")
     restoreHome buffer
@@ -574,7 +572,7 @@ restoreBorrowedWorkspace = do
   buffer <- getBuffer
   case bufferHome buffer of
     Nothing -> pure ()
-    Just (HomeBuffer _ capacity) -> do
+    Just (Buffer _ capacity) -> do
       when (bufferEnd buffer - bufferStart buffer > capacity) $
         throwError "borrowed input cannot expose unconsumed protocol lookahead"
       putBuffer =<< inputIO (restoreHome buffer)
@@ -677,7 +675,7 @@ fill metadata source count buffer
       if metadata
         then readUntilAvailable =<< expandMetadata count buffer
         else throwIO (InputError ("contiguous input of " <> show count <> " bytes exceeds buffer capacity " <> show (suppliedCapacity buffer)))
-  | Just (HomeBuffer _ capacity) <- bufferHome buffer,
+  | Just (Buffer _ capacity) <- bufferHome buffer,
     count <= capacity = fill metadata source count =<< restoreHome buffer
   | bufferStart buffer + count <= bufferCapacity buffer = readUntilAvailable buffer
   | bufferReusable buffer = readUntilAvailable =<< compact
@@ -708,13 +706,13 @@ fill metadata source count buffer
 {-# NOINLINE fill #-}
 
 suppliedCapacity :: InputBuffer -> Int
-suppliedCapacity buffer = maybe (bufferCapacity buffer) (\(HomeBuffer _ capacity) -> capacity) (bufferHome buffer)
+suppliedCapacity buffer = maybe (bufferCapacity buffer) (\(Buffer _ capacity) -> capacity) (bufferHome buffer)
 
 expandMetadata :: Int -> InputBuffer -> IO InputBuffer
 expandMetadata capacity buffer = do
   storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
   let count = bufferEnd buffer - bufferStart buffer
-      home = bufferHome buffer <|> Just (HomeBuffer (bufferMemory buffer) (bufferCapacity buffer))
+      home = bufferHome buffer <|> Just (Buffer (bufferMemory buffer) (bufferCapacity buffer))
   withForeignPtr (Buffer.bufferMemory storage) $ \target ->
     withForeignPtr (bufferMemory buffer) $ \origin ->
       copyBytes target (origin `plusPtr` bufferStart buffer) count
@@ -723,7 +721,7 @@ expandMetadata capacity buffer = do
 restoreHome :: InputBuffer -> IO InputBuffer
 restoreHome buffer = case bufferHome buffer of
   Nothing -> pure buffer
-  Just (HomeBuffer memory capacity) -> do
+  Just (Buffer memory capacity) -> do
     let count = bufferEnd buffer - bufferStart buffer
     when (count > capacity) (throwIO (InputError "protocol lookahead exceeds its supplied workspace"))
     withForeignPtr memory $ \target ->
