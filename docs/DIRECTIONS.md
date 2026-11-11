@@ -2,16 +2,18 @@
 
 Draft for review. It proposes replacing the hand-written wait loops of
 native-pg, streaming-io and the Warp fork with code written once per data
-direction, in direct style. `Link` is parametrized by the monad that runs the
-directions, and blocks in that monad's way. Each link's instance states what it
-needs of the monad through small capability classes, and each monad provides
-them: IO with a thread per direction, `Loop`, which runs both directions on one
-thread and suspends with GHC's delimited continuations, and a deterministic
-simulator for tests. It adds no dependency. It builds on `STREAMING-IO.md`: it
-keeps the layers below the waits (output, gathering, loans, scopes) and replaces
-the drivers.
+direction, as arrows, against a few classes: a link whose calls block in the
+arrow that runs them, and what an arrow can do for it (run an action that never
+waits, block until an event fires, run two arrows at once). Two arrows implement
+them: `Threads`, a function to IO with a thread for each concurrent part, and
+`Loop`, a program as data that one thread runs, or a simulation runs in an order
+a seed chooses. It adds no dependency. It builds on `STREAMING-IO.md`: it keeps
+the layers below the waits (output, gathering, loans, scopes) and replaces the
+drivers.
 
-References are to native-pg d9d4ed6c11b3 and the Warp fork b89c12ac0037.
+The prototype is the package `directions/`, apart from the code that would use
+it. References are to native-pg d9d4ed6c11b3 and the Warp fork b89c12ac0037,
+and to postgrestream af328fe1386c for PostgREST.
 
 ## Why
 
@@ -64,33 +66,33 @@ neither.
 ## A proxy first
 
 A proxy copies a client's bytes to a server and the server's back, streaming,
-with bounded memory. With a thread per direction:
+with bounded memory. Written against the classes (`directions/src/Network/Directions/Proxy.hs`):
 
 ```haskell
-proxy :: (Link a, Link b) => a -> b -> Int -> IO ()
-proxy client server size =
-  withAsync (pump server client) (\answers -> pump client server *> wait answers)
-    `finally` (closeLink client *> closeLink server)
+-- | One direction: what the source sends goes to the sink through the buffer,
+-- until the source ends; then the sink's output ends.
+pump :: (ArrowChoice arr, Link arr source, Link arr sink) => Buffer -> source -> sink -> arr () ()
+pump buffer source sink = loop
   where
-    pump source sink = do
-      memory <- mallocPlainForeignPtrBytes size
-      let loop =
-            receive source (Room memory size) >>= \case
-              0 -> shutdownSend sink
-              n -> sendAll sink [BS memory n] *> loop
-      loop
+    loop =
+      const (roomOf buffer)
+        ^>> receive source
+        >>> (\count -> if count == 0 then Left () else Right [view buffer count])
+        ^>> (shutdownSend sink ||| (sendAll sink >>> loop))
+
+-- | A direction each way.
+proxy :: (ArrowChoice arr, Concurrent arr, Link arr client, Link arr server) => Buffer -> Buffer -> client -> server -> arr () ()
+proxy requests answers client server = together [pump requests client server, pump answers server client]
 ```
 
 - **The buffer is the bound, and waiting is the backpressure.** A direction
   whose sink is full stops reading its source, and TCP passes that on.
 - **The directions never wait for each other.** A full sink stops only its own
   direction.
-- **One coordination point:** both pumps end, and a failure of either cancels
-  the other.
-- **The state is each thread's stack.** The same proxy on one thread needs a
-  record per direction, a pass that moves what it can without waiting, and a
-  loop that waits on the union of what the passes found blocked: the event loop
-  this code base lacks, written out.
+- **One coordination point:** both pumps end, and a failure of either stops the
+  other.
+- **Nothing in it says how it runs.** The same `proxy` runs with a thread for
+  each direction, or with both on one thread, or in a simulation.
 
 PostgREST is the same proxy with a transform in each direction, coupled by
 control: the answer depends on the plan, and the request depends on answers (a
@@ -178,227 +180,145 @@ their own.
   data of every stream crosses into it. The rule becomes one owner per half per
   stream, and one writer per socket.
 
-## Links and capabilities
+## Why arrows
 
-### Link, blocking in the monad
+Direction code needs to wait, and the two ways to run it disagree on what a
+wait leaves behind:
+
+- **On a thread of its own,** a wait blocks the thread, and the rest of the
+  direction is the thread's stack.
+- **On one thread with other directions,** a wait has to hand the thread back,
+  so the rest of the direction must be a value the scheduler keeps.
+
+A monad's bind takes the rest as a function, `m a -> (a -> m b) -> m b`, which is
+opaque: the one-thread runner can only keep it as a closure, built at every
+bind, or capture the stack (`control0#`). Arrows were made for this (Hughes,
+2000): composition takes the rest as an arrow, `arr a b -> arr b c -> arr a c`,
+which a runner can keep as data.
+
+- **What is lost:** a later step can't be chosen from a result at run time.
+  `ArrowChoice` chooses between branches that are written down; `ArrowApply`,
+  which runs an arrow computed from a result, is as opaque as a monad.
+- **It isn't needed.** A direction's choices are fixed branches: end or go on,
+  commit or roll back. PostgREST's are too (see "PostgREST as arrows").
+- **Nothing else is lost:** `Kleisli IO` is an arrow, so monadic code still
+  runs where it has to, as `Threads` does.
+
+## The classes
+
+`directions/src/Network/Directions/Classes.hs`. None has a superclass:
+instances and users add the constraints they need.
 
 ```haskell
--- | A byte stream, in the monad that runs its directions. Calls block in the
--- monad's way: a thread waits, and a direction of a scheduler suspends.
-class Monad m => Link m link where
-  -- | Reads into the room: how many bytes, 0 at the end of the stream.
-  receive :: link -> Room -> m Int
-  -- | Sends all of the pieces, and writes them.
-  sendAll :: link -> [ByteString] -> m ()
-  -- | Ends this direction of the stream, once what was sent is written.
-  shutdownSend :: link -> m ()
-  close :: link -> m ()
+-- | A byte stream whose calls block in the arrow that runs them.
+class Link arr link where
+  receive :: link -> arr Room Int              -- 0 at the end of the stream
+  sendAll :: link -> arr [ByteString] ()       -- all of them, written
+  shutdownSend :: link -> arr () ()
+  close :: link -> arr () ()
 
--- | Memory to receive into: its start and size. Made only where the size is
--- known, from a buffer's free part or by 'withRoom'.
-data Room = Room {-# UNPACK #-} !(Ptr Word8) {-# UNPACK #-} !Int
+-- | An action that never waits.
+class Effect arr where
+  now :: (a -> IO b) -> arr a b
 
--- | The halves of a link. A direction is given one of each, of different
--- links, so that each half has one owner; direction code receives and sends
--- through them only.
-newtype Reader link = Reader link
-newtype Writer link = Writer link
+-- | Waiting until an event fires, given the registration of its watch.
+class Block arr where
+  block :: arr (IO Watch) ()
+
+-- | Two arrows at once on the same input, as '&&&' runs them one after the
+-- other: both outputs, once both have ended.
+class Concurrent arr where
+  concurrently :: arr a b -> arr a c -> arr a (b, c)
 ```
 
-### Capabilities
+- **A link's instance is written once, for any arrow** that can run its tries
+  and block. The socket's tries are streaming-io's, as they are; `HalfClose`
+  adds what they lack:
 
-```haskell
--- | Waiting, and running what never waits.
-class Monad m => MonadWait m where
-  -- | Runs an action that never waits: a try of a link, decoding,
-  -- rendering, fulfilling a ticket.
-  now :: IO a -> m a
-  -- | Waits until the descriptor may be tried again for the interest.
-  waitFd :: Fd -> Interest -> m ()
-  -- | Waits until the watch fires, and releases it: loans, tickets, timers.
-  waitWatch :: IO Watch -> m ()
+  ```haskell
+  instance (ArrowChoice arr, Effect arr, Block arr) => Link arr Socket where
+    receive = receiveTrying
+    ...
 
--- | Exclusion between the directions of one connection. The section is IO,
--- so nothing can wait while it holds the lock.
-class MonadWait m => MonadLock m where
-  type Lock m
-  newLock :: m (Lock m)
-  withLock :: Lock m -> IO a -> m a
-
--- | The other direction, and resources that are released however a
--- direction ends.
-class MonadWait m => MonadSpawn m where
-  -- | Starts the other direction, and gives the wait for its end, which
-  -- rethrows its failure. The other direction ends if this one does first.
-  spawn :: m a -> m (m a)
-  -- | Acquires, uses and releases, also when the direction is cancelled.
-  -- The release learns how the use ended.
-  bracketIn :: m a -> (Ending -> a -> m ()) -> (a -> m b) -> m b
-```
-
-### Instances of links
-
-A link's instance states what it needs, and nothing about threads:
-
-```haskell
--- | What a try that couldn't go on waits for before it is tried again.
-data Interest = Readable | Writable
-
--- | What a try did: something, or nothing until the interest fires.
-data Try a = Done !a | Blocked !Interest
-
-instance MonadWait m => Link m Socket where
-  receive sock room = go
+  receiveTrying :: (S.Link link, ArrowChoice arr, Effect arr, Block arr) => link -> arr Room Int
+  receiveTrying link = loop
     where
-      go = now (tryRecv sock room) >>= \case
-        Done n -> pure n
-        Blocked interest -> waitFd (socketFd sock) interest *> go
-  ...
+      loop = now attempt >>> (((S.watchReadable link,) ^>> first block >>> snd ^>> loop) ||| returnA)
+      attempt room = ... -- Right count, or Left room while nothing is ready
+  ```
 
--- | A TLS connection belongs to the monad it was made for, whose lock guards
--- the session that the connection's two halves share.
-data TlsConnection m = TlsConnection !Socket !Session !(Lock m)
+- **The arrows know nothing of links.** They provide `now`, `block` and
+  `concurrently`, and that is all a link or a direction needs from them.
+- **Programs read as what they do:** `^>>` and `>>^` put a function before or
+  after an arrow, in place of `arr` chains, and there is no arrow notation,
+  whose desugaring would decide what `Loop` builds. All three operators are
+  `infixr 1`, so a function in the middle of a chain goes `^>>` into what
+  follows it.
+- **A memory region is a `Room`** (pointer and size), made only where the size
+  is known; a `Buffer` gives its room and views of what it received.
 
-instance MonadLock m => Link m (TlsConnection m) where
-  receive (TlsConnection sock session lock) room = go
-    where
-      go = withLock lock (tryTlsReceive sock session room) >>= \case
-        Done n -> pure n
-        Blocked interest -> waitFd (socketFd sock) interest *> go
-  ...
-```
+## The two arrows
 
-- **The tries stay non-blocking,** inside each instance: a socket's `recv` and
-  `writev`, a TLS session's calls. A try says what it is blocked on: over TLS a
-  receive may have to write first, and so wait to be writable, which today's
-  `receiveReady` can't say.
-- **One instance per link,** constrained by what it needs, not one per link and
-  monad.
-- **Nothing waits under the lock.** `withLock` takes IO, not `m`, so the types
-  keep the waits out of the section.
-- **`now` is a review rule.** Its action must not wait, which the types can't
-  check, like "valid until the next pull".
-- **A connection belongs to one monad.** `TlsConnection m`, and so a pool of
-  them, is made for the monad that runs its directions: a server runs in one
-  mode, chosen when it is built or started.
+### Threads: a thread for each concurrent part
 
-### Tickets and sources
+`directions/src/Network/Directions/Threads.hs`: a newtype over `Kleisli IO`.
+
+- **`now`** is the action, and **`block`** is `awaitWatch`: the thread waits.
+- **`concurrently`** runs each arrow on a thread of its own and joins them; a
+  failure of either stops both and is rethrown.
+- **The directions may run in parallel,** on different capabilities.
+
+### Loop: every part on one thread
+
+`directions/src/Network/Directions/Loop.hs`: a program as data.
 
 ```haskell
--- | The result of an entry of the queue, which the answer direction fulfils.
-newtype Ticket a = Ticket (TMVar (Either SomeException a))
-
--- | A try, then a wait for the watch of the 'TMVar'.
-await :: MonadWait m => Ticket a -> m a
-
--- | The next chunk of a source, waiting for it.
-pull :: (MonadWait m, Source source) => source -> m Pulled
-pull source = now (pullNow source) >>= either (\watch -> waitWatch watch *> pull source) pure
+data Loop a b where
+  Arr :: (a -> b) -> Loop a b
+  Seq :: Loop a b -> Loop b c -> Loop a c
+  First :: Loop a b -> Loop (a, c) (b, c)
+  Choose :: Loop a b -> Loop (Either a c) (Either b c)
+  Both :: Loop a b -> Loop a c -> Loop a (b, c)
+  Now :: (a -> IO b) -> Loop a b
+  Block :: Loop (IO Watch) ()
 ```
 
-- **One source class.** A source has a pull that doesn't wait and gives a watch
-  when nothing is ready, as `Source` has, without the stall callback; waiting is
-  `pull`. `WaitingSource` exists for consumers that can wait while others have
-  to give up (`STREAMING-IO.md`, "Two classes, not one"). With a direction per
-  consumer, none has to give up.
-- **Gathering keeps its try:** the batch is cut only where a pull would wait.
-  `sendAll` gathers as `pushWith` does today, and waits for room, or for a
-  source that isn't ready once what is gathered before it has gone.
+- **Two primitives:** `Now` and `Block`. The rest is the structure of arrows.
+- **A part is the program left and what follows it, as data:** the rest of a
+  sequence, the other half of a pair, a choice to wrap, or the join of a
+  concurrent pair. A part that blocks keeps those and its watch; nothing is
+  captured, and no `control0#` is needed.
+- **`runLoop`** runs each part that can go on in turn, for up to 64 steps of
+  its primitives, and when none can, waits once on all of their
+  watches.
+- **`runSimulation seed`** runs the same program one step at a time, a part
+  picked at random among those that can go on. It never waits: when no part
+  can go on, it looks at their watches and goes on with those that have
+  fired; if none has, the parts wait for each other, which it reports with
+  their numbers. Over simulated links (`Simulated.hs`, lanes that hold a set
+  number of bytes), a seed always gives the same run.
 
-### Specialization
+## PostgREST as arrows
 
-Code over the classes is `INLINABLE`, with a `SPECIALIZE` for each pair of
-monad and link that a build uses, as code over `Link` is today. Specialized to
-IO, it is today's code with the lock; specialized to `Loop`, the lock is gone.
-Core checks confirm both.
+postgrestream already has the two directions' shapes (`MainTx.hs`):
 
-## Monads
-
-### IO: a thread per direction
-
-```haskell
-instance MonadWait IO where
-  now = id
-  waitFd fd Readable = threadWaitRead fd
-  waitFd fd Writable = threadWaitWrite fd
-  waitWatch = awaitWatch
-
-instance MonadLock IO where
-  type Lock IO = MVar ()
-  newLock = newMVar ()
-  withLock lock = withMVar lock . const
-```
-
-- **Waits:** a socket waits on its descriptor directly, with no watch.
-- **Directions:** `spawn` forks a thread in the caller's scope, and its wait
-  joins it. A failure of either thread cancels the other. A cancelled direction
-  stops by an asynchronous exception, and its `bracketIn` releases run.
-- **Parallelism:** the directions may run on different capabilities.
-
-### Loop: both directions on one thread
-
-```haskell
--- | Directions on one thread. It is IO underneath, so a bind is IO's; only
--- the waits differ.
-newtype Loop a = Loop (IO a) deriving newtype (Functor, Applicative, Monad)
-
-instance MonadWait Loop where
-  now = Loop
-  waitFd fd interest = Loop (suspend (fdWatch fd interest))
-  waitWatch = Loop . suspend
-
-instance MonadLock Loop where
-  type Lock Loop = ()
-  newLock = pure ()
-  withLock () = Loop -- its directions never run at once
-
--- | What the scheduler runs: a direction until it waits, spawns or ends.
-data Step = Wait (IO Watch) (IO Step) | Spawn (IO Step) (IO Step) | Finished
-
--- | Captures the direction up to the scheduler's prompt with control0#, and
--- gives the scheduler what it waits for and how to go on.
-suspend :: IO Watch -> IO ()
-suspend watching = control0 schedulerTag (\resume -> pure (Wait watching (resume (pure ()))))
-```
-
-- **The scheduler** runs on the thread that would otherwise run the request,
-  Warp's connection thread. It runs each step under `prompt schedulerTag`,
-  keeps the suspended directions with their watches, waits with one
-  `awaitFirst` on the union, and resumes what fired. Readiness is a hint, so
-  resuming all is correct; resuming what fired is cheaper.
-- **One prompt tag** serves every scheduler: `control0#` captures up to the
-  nearest prompt with the tag, which is the running step's.
-- **The cost is per suspension, not per bind.** Suspending copies the stack
-  between the prompt and the wait to the heap. A try that finds bytes copies
-  nothing, and a bind is IO's.
-- **Tickets are waited for as sockets are:** a ticket's watch is a `TVar`'s,
-  and a watch was never tied to a descriptor.
-- **Cancellation** drops a direction's continuation and runs its releases,
-  innermost first. The scheduler catches what a step throws, which ends that
-  direction the same way. No asynchronous exceptions pass between directions.
-- **To be verified** before it is relied on (step 1): what `control0#` may
-  capture (it is believed to refuse across an STM transaction or a thunk's
-  evaluation), how masking and exception handlers in the captured stack
-  behave, and what a suspension costs against a thread's wake-up.
-- **This is the explicit state machine** of the proxy, derived from the same
-  code.
-
-### Simulation, for tests
-
-- **What it is:** `Loop`'s scheduler with a seed that chooses which ready
-  direction runs next, simulated links (in memory, with capacities) as an
-  instance of `Link`, and a simulated clock for timers, which advances when
-  every direction waits.
-- **Interleavings are at waits only.** That is enough here: directions interact
-  only where one waits, on a half, a ticket, a loan or a timer; calls into a
-  link never wait, and the lock is a no-op on one thread.
-- **What it tests:** what is timing-dependent and flaky against real sockets:
-  early failures during an upload, a client that goes away, timeouts at every
-  coordination point, pipelining. One suite runs in every monad, which is also
-  what keeps their semantics the same.
-- **No dependency.** `io-sim` would add a systematic search of thread orders,
-  inside STM and `MVar` code too, which direction code doesn't have between
-  waits.
+- **The request side is `Applicative`,** which is less than an arrow needs.
+  `Steps tx` builds a `Tx.Pipeline`: transaction variables, the pre-request
+  function, the EXPLAIN count and the main statement are known, keyed and sent
+  before any result is read.
+- **The only request-side choice is the ending,** made before anything is sent:
+  with no check that can roll back, `finalPipeline` sends COMMIT in the batch;
+  otherwise the ending waits for the checks (point 3).
+- **The answer side reads in order** with fixed branches: the EXPLAIN total if
+  there is one, the first row, `checkCrud`, which condemns on a failure, the
+  pure `actionResponse`, then owned bytes or a streamed field, whose last chunk
+  waits for COMMIT's reply on a write. `ArrowChoice` covers it.
+- **A request's program is built from its plan before it runs,** which is a
+  value, not `ArrowApply`. Server tasks (accepting connections, the schema
+  cache's listener, reloads, the admin server) aren't request programs and
+  stay IO. Running several requests in one program, as multi-request
+  transactions would, needs `ArrowApply`, or a fresh program for each request,
+  which the driver can start.
 
 ## What it replaces
 
@@ -406,14 +326,13 @@ suspend watching = control0 schedulerTag (\resume -> pure (Wait watching (resume
 |---|---|
 | `receiveWaiting`, `readStalls`, the push inside a read | gone: a read only reads |
 | `pollStep`, `channelPoll`, `channelPush`, `Receiver`, `Stall`, `Poll`, `pollInput`, `borrowInputWaiting` | gone: they exist so that a read can give up and be waited for elsewhere |
-| `Stalls`, `Resume`, `waitingStalls`, `stopping`, `Pushed`'s watch | gone: `sendAll` waits in `m` |
-| `WaitingSource`, `Field`'s wait, `endingWaiting`'s wait, `watchStalled` | `pull` and `await` in `m` |
-| `Source`'s stall callback | a pull that doesn't wait and gives a watch |
-| `Link`'s non-waiting calls, `watchReadable`, `watchWritable`, `awaitAny`, `awaitReadOrWrite` | tries inside each instance; the class blocks in `m` |
-| `Interest`'s record and `Blocked` | `Interest`: readable or writable |
+| `Stalls`, `Resume`, `waitingStalls`, `stopping`, `Pushed`'s watch | gone: `sendAll` blocks in its arrow |
+| `WaitingSource`, `Field`'s wait, `endingWaiting`'s wait, `watchStalled` | arrows that block |
+| `Link`'s non-waiting calls | the tries inside each link's instance |
+| `awaitAny`, `awaitReadOrWrite`, `Interest`'s record | `block` on the link's watch |
 | Warp's `answering`, its kept watch, the one-byte probe, `Client` | the answer direction's `sendAll`; the request direction reads the client |
-| Warp's `Waiting` (`OnBytes`, `OnLoan`, `OnRegistration`) | a wait for a loan's registration in `m` |
-| `Channel`'s fields | the connection's `Reader` and `Writer` |
+| Warp's `Waiting` (`OnBytes`, `OnLoan`, `OnRegistration`) | a `block` on a loan's registration |
+| `Channel`'s fields | the connection's two halves, each a link of one direction |
 | `contextPending` and the one batch of `queueContextOutput` | the queue of expected answers |
 | `Watch`, `awaitFirst`, `Buffer`, `BufferPool`, `Scope`, `Output`, the gather | kept |
 
@@ -421,42 +340,66 @@ suspend watching = control0 schedulerTag (\resume -> pure (Wait watching (resume
   header leaving at once when the body isn't ready, bounded memory, zero copy,
   specialized hot paths.
 - **Two of its invariants change:** "One owner per link" becomes one owner per
-  half, and "Teardown releases without joining" holds for `Loop` only: in IO
-  the spawned direction is joined.
+  half, and "Teardown releases without joining" holds for `Loop` only: in
+  `Threads` the concurrent parts are joined.
 - **"Why not conduit or streamly" stands,** except the point that waiting on
   two peers is done with threads: here it may be, by choice.
 
+## The prototype
+
+The client sends a request through the proxy to an echo server, which sends it
+back; the round trip is one program over four ends.
+
+- **Tests** (`directions/test`, all pass): the round trip with `Threads`, with
+  `Loop`, and in simulations with 20 seeds; over socket pairs with `Threads`
+  and `Loop`; a transform on the client's bytes; the same seed giving the same
+  run; a client in one direction (`sendThenReceive`) deadlocking, and the
+  simulation naming the four parts that wait; the same client finishing while
+  its request fits in the buffers on the way; a failing part stopping the
+  others under `Threads`.
+- **Bench** (`directions-bench 64 +RTS -T`, a Mac, 64 MiB each way, not
+  optimized):
+
+  | run | MiB/s | steps/MiB | waits/MiB | allocated/MiB |
+  |---|---|---|---|---|
+  | Threads, socket pairs | 300–400 | – | – | 4.1 MB |
+  | Loop, socket pairs | 140–175 | 2,370 | 256 | 9.8 MB |
+  | Loop, simulated links | 1,500–2,100 | 736 | 32 | 15.4 MB |
+
+  The wide ranges are runs on a busy machine. Not optimized: every wait
+  registers watches, and `runLoop` registers all of the waiting parts'; `Loop`
+  interprets its program node by node; the simulated lanes copy.
+
 ## Costs and risks
 
-- **A thread per request, in IO.** A fork costs microseconds and a small stack.
-  The answer direction lives for a request, not for a keep-alive connection,
-  whose idle threads would each hold a stack chunk.
-- **A wake-up per request, in IO.** Starting the answer direction wakes a
-  thread. It overlaps the server's work, so it is hidden while a query takes
-  longer than the run queue's delay. At CPU saturation that delay has been
-  measured in milliseconds in PostgREST load tests. A read pays it as much as an
-  upload. `Loop` doesn't pay it, which is what the A/B between them is for.
-- **TLS's lock, in IO.** Both halves share one session, so each try takes the
-  lock. It is never held across a wait, so it is almost never contended, and a
-  free lock costs tens of nanoseconds against microseconds of encryption per
-  record. `Loop` has none. Removing it in IO needs the session split by
-  direction:
-  - **TLS 1.3 keeps keys and sequence numbers per direction.** After the
-    handshake only key updates, alerts and session tickets cross, and they are
-    control: a coordination point from the reader to the writer.
-  - **kTLS on Linux** splits it in the kernel: the socket then reads and writes
-    plaintext, so the TLS link is a socket's, with no lock, no TLS buffers in
-    user space, and decryption in place. It needs the session's secrets, which
-    rustls can export and rustls-ffi 0.15.3 can't, and a recent kernel to rekey
-    on receive. macOS keeps the lock.
-- **`control0#`.** What it may capture, and what a suspension costs, decide
-  whether `Loop` is usable at all: step 1 settles them before anything depends
-  on it.
-- **Specialization is required.** Without a `SPECIALIZE` for a pair, every call
-  goes through dictionaries.
-- **Two meanings of cancellation:** asynchronous exceptions in IO, dropped
-  continuations in `Loop`. Releases go through `bracketIn` only, and the shared
-  suite checks both.
+- **`Loop` interprets.** Each step walks the program's nodes and allocates
+  what follows as data. Whether a static program can be specialized or
+  compiled ahead into a state machine, and what `Loop` costs against
+  `Threads` in PostgREST, are open.
+- **A thread per request, in `Threads`.** A fork costs microseconds and a small
+  stack; starting the answer direction wakes a thread, which a query hides
+  until the run queue's delay is longer than it (milliseconds at CPU
+  saturation in PostgREST load tests). `Loop` doesn't pay it.
+- **Waits that aren't links'.** The pool's checkout, buffer loans, admission
+  and timeouts wait too, so each needs a try, and else a registration whose
+  watch `block` waits for, keeping its place in its queue, as the registering
+  borrow of loans does. The pool's state stays IO and STM.
+- **Releases.** A connection or a loan has to go back however its direction
+  ends, which needs one more capability, a bracket: masking and an exception
+  handler in `Threads`, a frame that runs the release when a part ends or is
+  dropped in `Loop`.
+- **TLS's lock.** Both halves share one session. Under `Threads` each try takes
+  a lock (never held across a wait); under `Loop` none is needed. The arrow
+  picks it when the connection is made, as a type (`Lock Threads = MVar ()`,
+  `Lock Loop = ()`); kTLS on Linux would remove it by splitting the session,
+  which needs rustls-ffi to export the session's secrets (0.15.3 can't).
+- **Read-ahead.** `pump` receives only between sends, so it holds what one
+  receive brought, not a full buffer. A pump that reads ahead while it sends
+  needs a buffer it can receive into meanwhile, which is a design choice per
+  direction.
+- **Specialization.** Code over the classes is polymorphic in the arrow; on hot
+  paths it needs a `SPECIALIZE` for `Threads` and for `Loop`, which Core checks
+  confirm.
 - **Warp's order.** Warp reads the next request only once the response has
   ended, so pipelining needs the fork to let the request direction read ahead.
 
@@ -466,48 +409,31 @@ Each step is its own change, tests first, checked as before: no new warnings or
 hlint hints, the suites, Core of the hot paths, and an allocation A/B within its
 limits.
 
-1. **Prototype.** The proxy, in IO and in `Loop`: what `control0#` may capture,
-   how masking and exceptions behave across it, and what a suspension costs
-   against a thread's wake-up.
-2. **Links and capabilities.** The capability classes with their IO instances,
-   `Link m` with the socket's and TLS's instances, `Room`, the halves, tickets
-   and `shutdownSend`, in streaming-io and native-pg-tls. No users yet.
-3. **Sources.** `Source`'s pull gives a watch instead of calling a stall, and
-   `pull` waits for it. `WaitingSource` stays for the transition.
-4. **The connection's halves.** native-pg's connection gets a `Reader`, a
-   `Writer` and the queue of expected answers, and the current API runs on
-   them: a batch is written by a spawned direction, which the reads join at its
-   ReadyForQuery. `receiveWaiting`, the polls and the stalls go. A request has
-   several batches until step 7, so this first A/B is an upper bound of what the
-   threads cost.
-5. **native-pg over the capabilities.** The API becomes polymorphic in its
-   monad, specialized to IO. The A/B should show no difference.
-6. **Warp.** The answer direction sends the answer with `sendAll`. `answering`,
-   the kept watch, the probe and `WaitingSource` go.
-7. **PostgREST.** The handler becomes two directions over tickets: the request
-   direction sends statements and streams the body, and the answer direction
-   decides the status from the first results and streams the response. The
-   final-chunk rule becomes a wait for the ending's ticket.
-8. **`Loop` in the server.** The A/B against IO is a switch of monad in one
-   build.
-9. **Simulation.** Simulated links and clock, and the interleaving tests.
+1. **Prototype** (done): `directions/`, the classes, `Threads`, `Loop`, the
+   simulation and the proxy.
+2. **The classes in streaming-io,** with `Threads` and `Loop`, the socket's and
+   TLS's `Link` instances, and a bracket.
+3. **The other waits:** loans, admission, the pool's checkout and timers as a
+   try and a registration that `block` waits for.
+4. **native-pg's connection as two directions:** the request side's pipeline
+   and the answer side's reading in order, joined by the queue of expected
+   answers.
+5. **Warp:** the answer direction sends the answer; the request direction reads
+   the body. `answering`, the kept watch, the probe and `WaitingSource` go.
+6. **PostgREST:** a request's program built from its plan, run by `Threads`.
+7. **`Loop` in the server,** an A/B against `Threads` by switching the arrow.
+8. **The simulation's tests** of interleavings: early failures, a client that
+   goes away, timeouts at every coordination point, pipelining.
 
 ## Open questions
 
-- **Which direction runs on Warp's connection thread.**
-  - **The answer direction:** keeps the fork's `Answer` API, where Warp sends
-    the response on its own thread. The request direction is spawned and reads
-    the body.
-  - **The request direction:** makes Warp's thread the client's lasting reader,
-    which pipelining needs, and moves sending to the spawned thread.
-- **The queue as API.** native-pg's public API could be the queue itself (send a
-  statement, get a ticket), with today's transaction API on top of it, or keep
-  the queue internal.
-- **The parser:** polymorphic in the monad, or in IO with its refill given as an
-  IO action. Every monad here is IO underneath, so a direction's `receive`,
-  unwrapped, is an IO action that waits or suspends as its monad does, and the
-  hottest code needn't be polymorphic.
-- **TLS in IO:** the lock, or a split session through kTLS, which needs an
-  addition to rustls-ffi.
+- **Which direction runs on Warp's connection thread:** the answer direction,
+  which keeps the fork's `Answer` API, or the request direction, the client's
+  lasting reader, which pipelining needs.
+- **The queue as API:** native-pg's public API could be the queue itself (send
+  a statement, get a ticket), with today's transaction API on top of it.
+- **`Loop`'s cost:** interpreting against specializing or compiling static
+  programs.
+- **TLS in `Threads`:** the lock, or kTLS.
 - **Pipelining:** how many requests are read ahead, and whether a request's
   statements share the previous request's connection.
