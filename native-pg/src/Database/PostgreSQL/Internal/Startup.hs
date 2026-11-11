@@ -34,7 +34,6 @@ import Database.PostgreSQL.Internal.Authentication
     scramClientFirst, scramMechanism, scramPlusMechanism, scramVerifyServerFinal,
   )
 import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..))
-import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
 import Database.PostgreSQL.Transport
   ( Address (..), newChannel, RootCertificates (..), ServerVerification (..),
@@ -209,7 +208,7 @@ requestTls sock = do
   let channel = newChannel sock
   channelSend channel Nothing (serialize SSLRequest)
   answer <- allocaBytes 1 $ \byte -> do
-    received <- readInputInto (channelInput channel pending 1) byte 1
+    received <- channelReceive channel pending byte 1
     if received == 0 then pure Nothing else Just <$> peek byte
   case answer of
     Just 83 -> pure True

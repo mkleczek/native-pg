@@ -139,8 +139,8 @@ runContextInput context limit parse = do
   ensureContextActive context
   input <- readIORef (contextInput context)
   let connection = contextConnection context
-      source = carriedInput (connectionCarryOver connection)
-        (channelInput (connectionChannel connection) (contextPending context) (contextReadSize context))
+      source = carriedInput (connectionCarryOver connection) (connectionChannel connection)
+        (contextPending context) (contextReadSize context)
   (result, input') <- runInputUntil source limit input parse
     `catch` \(InputError reason) -> throwIO (ProtocolError reason)
   writeIORef (contextInput context) input'
@@ -224,12 +224,13 @@ carriedPoll carry poll pointer size = do
 
 -- | Reads the connection's carried-over bytes before the link's. A read takes
 -- no more than it asks for, and leaves the rest for the next one.
-carriedInput :: IORef ByteString -> InputSource -> InputSource
-carriedInput carry source =
-  source
+carriedInput :: IORef ByteString -> Channel -> IORef Unsent -> Int -> InputSource
+carriedInput carry channel pending readSize =
+  InputSource
     { readInputInto = \pointer size -> do
         taken <- takeCarried carry pointer size
-        maybe (readInputInto source pointer size) pure taken
+        maybe (channelReceive channel pending pointer size) pure taken,
+      inputReadSize = readSize
     }
 
 -- | Binds supplied initialized buffers for the callback. Acquires the

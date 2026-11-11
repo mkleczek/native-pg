@@ -13,7 +13,6 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol (Parameter (..), pattern Sync, serialize)
 import Database.PostgreSQL.Internal.Protocol.Codec (Output, serializeField)
-import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (RemainingBytesAtom, MaybeBytes32Atom))
 import Database.PostgreSQL.Internal.Context (newConnection, newOwnedContext)
 import qualified Database.PostgreSQL.Session as Session
@@ -101,7 +100,7 @@ spec = describe "channels over a link without a socket" $ do
     (channel, _) <- channelWith link mempty
     current <- newIORef =<< unsent Nothing sync
     timeout 1000000 (allocaBytes 16 $ \pointer -> do
-      count <- readInputInto (channelInput channel current 16) pointer 16
+      count <- channelReceive channel current pointer 16
       BS.packCStringLen (castPtr pointer, count)) `shouldReturn` Just "reply"
     readIORef sent `shouldReturn` syncBytes
     (unsentEmpty <$> readIORef current) `shouldReturn` True
@@ -221,7 +220,7 @@ channelWith link output = do
 
 readBytes :: Channel -> IORef Unsent -> IO ByteString
 readBytes channel pending = allocaBytes 16 $ \pointer -> do
-  count <- readInputInto (channelInput channel pending 16) pointer 16
+  count <- channelReceive channel pending pointer 16
   BS.packCStringLen (castPtr pointer, count)
 
 provide :: ByteString -> Ptr Word8 -> Int -> IO (Maybe Int)

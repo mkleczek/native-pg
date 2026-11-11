@@ -6,7 +6,7 @@
 
 -- | Connection input and output, specialized to its transport link.
 module Database.PostgreSQL.Internal.Channel
-  ( Channel (channelInput, channelSend, channelReceiveReady, channelPoll, channelPush, channelClose),
+  ( Channel (channelReceive, channelSend, channelReceiveReady, channelPoll, channelPush, channelClose),
     newChannel,
   )
 where
@@ -16,7 +16,6 @@ import Control.Monad (void)
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol.Codec (Output)
-import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Transport.Link
 import Foreign.Ptr (Ptr)
 import Network.Socket (Socket)
@@ -41,20 +40,21 @@ import Network.Streaming.Watch (Watch, anyWatch, awaitFirst)
 -- dictionary, and the rest of the client doesn't know which link it has.
 --
 -- Callers must ensure exclusive access to the channel and its underlying
--- 'Link', including calls to the 'InputSource' in 'channelInput'. Reading
--- may also send and flush pending output, so reads and writes must not run
--- concurrently. Ownership may pass to another thread between calls.
+-- 'Link', including calls to 'channelReceive'. Reading may also send and flush
+-- pending output, so reads and writes must not run concurrently. Ownership
+-- may pass to another thread between calls.
 data Channel = Channel
-  { -- | Reads input. While output is unsent, waiting for input also sends it
-    -- as the link takes it.
-    channelInput :: IORef Unsent -> Int -> InputSource,
+  { -- | Reads input into the buffer, up to its size, waiting until there is
+    -- some, and gives how much: 0 at the end of the stream. While output is
+    -- unsent, waiting for input also sends it as the link takes it.
+    channelReceive :: IORef Unsent -> Ptr Word8 -> Int -> IO Int,
     -- | Sends the output, waiting for room as needed, writing it to the buffer
     -- if there is one.
     channelSend :: Maybe OutputBuffer -> Output -> IO (),
     -- | Reads what's ready into the buffer, up to its size, without waiting:
     -- 'Nothing' if nothing is, and 0 at the end of the stream.
     channelReceiveReady :: Ptr Word8 -> Int -> IO (Maybe Int),
-    -- | Reads as 'channelInput' does, but where that waits it gives up, and
+    -- | Reads as 'channelReceive' does, but where that waits it gives up, and
     -- gives a watch for what it would have waited for. It sends output that is
     -- unsent, as far as the link takes it, before it gives up.
     channelPoll :: IORef Unsent -> Ptr Word8 -> Int -> IO (Either (IO Watch) Int),
@@ -66,12 +66,12 @@ data Channel = Channel
   }
 
 -- | A channel retains the link; each input operation supplies its own pending
--- output and read size. Callers must ensure exclusive access to the channel
--- and its link, including reads and writes through the channel.
+-- output. Callers must ensure exclusive access to the channel and its link,
+-- including reads and writes through the channel.
 newChannel :: Link link => link -> Channel
 newChannel link =
   Channel
-    { channelInput = linkInputSource link reading,
+    { channelReceive = receiveWaiting link reading,
       channelSend = sendOutput link sending,
       channelReceiveReady = receiveReady link,
       channelPoll = pollStep link,
@@ -93,36 +93,30 @@ readStalls link =
     }
 {-# NOINLINE readStalls #-}
 
--- | Reads from the link into the parser's buffer, which a new allocation
--- makes the given size. While output is unsent, waiting for input also sends
--- it as the link takes it, and waits for the source of an upload on this
--- thread, so that a delayed upload doesn't stop the answers from being read.
-linkInputSource :: Link link => link -> Stalls -> IORef Unsent -> Int -> InputSource
-linkInputSource link stalls pending readSize =
-  InputSource
-    { readInputInto = receive,
-      inputReadSize = readSize
-    }
+-- | Reads from the link into the buffer. While output is unsent, waiting for
+-- input also sends it as the link takes it, and waits for the source of an
+-- upload on this thread, so that a delayed upload doesn't stop the answers
+-- from being read.
+receiveWaiting :: Link link => link -> Stalls -> IORef Unsent -> Ptr Word8 -> Int -> IO Int
+receiveWaiting link stalls pending pointer size = loop
   where
     -- Reads what the link has, or else sends what's left of the output as the
     -- link takes it. With none to send, it waits for input.
-    receive pointer size = loop
-      where
-        loop =
-          receiveReady link pointer size >>= \case
-            Just received -> pure received
-            Nothing -> do
-              left <- readIORef pending
-              pushWith link stalls left >>= \case
-                Pushed
-                  | unsentEmpty left -> awaitAny link (Interest True Done) *> loop
-                  -- The server may have answered while the rest was sent, so input
-                  -- is read before waiting for it.
-                  | otherwise -> writeIORef pending noUnsent *> loop
-                Stopped rest _ -> writeIORef pending rest *> loop
-{-# INLINABLE linkInputSource #-}
+    loop =
+      receiveReady link pointer size >>= \case
+        Just received -> pure received
+        Nothing -> do
+          left <- readIORef pending
+          pushWith link stalls left >>= \case
+            Pushed
+              | unsentEmpty left -> awaitAny link (Interest True Done) *> loop
+              -- The server may have answered while the rest was sent, so input
+              -- is read before waiting for it.
+              | otherwise -> writeIORef pending noUnsent *> loop
+            Stopped rest _ -> writeIORef pending rest *> loop
+{-# INLINABLE receiveWaiting #-}
 
--- | The read of 'linkInputSource' that doesn't wait: it gives the watch for what
+-- | The read of 'receiveWaiting' that doesn't wait: it gives the watch for what
 -- it would have waited for.
 pollStep :: Link link => link -> IORef Unsent -> Ptr Word8 -> Int -> IO (Either (IO Watch) Int)
 pollStep link pending pointer size = loop

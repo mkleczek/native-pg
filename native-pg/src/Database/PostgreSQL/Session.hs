@@ -25,7 +25,6 @@ import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Internal.Startup (withChannel)
 import Database.PostgreSQL.Session.Settings (ConnectSettings)
 import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..))
-import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
 import Database.PostgreSQL.Internal.Channel (Channel (..))
 import Foreign.Marshal.Alloc (allocaBytes)
@@ -127,7 +126,7 @@ cancel settings key =
         channelSend channel Nothing (serialize (CancelRequest key))
         -- The server closes the connection once it has handled the request.
         let waitForClose = do
-              received <- allocaBytes 64 $ \buffer -> readInputInto (channelInput channel pending 64) buffer 64
+              received <- allocaBytes 64 $ \buffer -> channelReceive channel pending buffer 64
               unless (received == 0) waitForClose
         waitForClose `catch` \(_ :: IOException) -> pure ()
       )

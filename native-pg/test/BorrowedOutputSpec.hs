@@ -19,7 +19,6 @@ import Database.PostgreSQL.Internal.Channel
 import Database.PostgreSQL.Internal.Execution (Execution (..), Statement (..), executionMessages)
 import Database.PostgreSQL.Internal.Protocol (Parameter (..))
 import Database.PostgreSQL.Internal.Protocol.Codec
-import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (borrowedStream)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (MaybeBytes32Atom))
 import Database.PostgreSQL.Transport
@@ -105,10 +104,10 @@ spec = describe "borrowed parameter streams" $ do
           drain pending = allocaBytes 4096 $ \pointer -> do
             let go 0 = pure ()
                 go left = do
-                  count <- readInputInto (channelInput channel pending 4096) pointer (min 4096 left)
+                  count <- channelReceive channel pending pointer (min 4096 left)
                   go (left - count)
             go earlierSize
-            count <- readInputInto (channelInput channel pending 4096) pointer 4
+            count <- channelReceive channel pending pointer 4
             BS.packCStringLen (castPtr pointer, count)
       outcome <- timeout 2000000 $ bracket (unsent Nothing (borrowedStream uploadSize source)) discardUnsent $ \initial -> do
         pending <- newIORef initial
@@ -147,7 +146,7 @@ spec = describe "borrowed parameter streams" $ do
             bracket (unsent Nothing (borrowedStream 0 source)) discardUnsent $ \initial -> do
               pending <- newIORef initial
               void (channelPush channel pending)
-              allocaBytes 16 $ \pointer -> readInputInto (channelInput channel pending 16) pointer 16
+              allocaBytes 16 $ \pointer -> channelReceive channel pending pointer 16
       outcome <- timeout 5000000 $ do
         reader <- forkIO (void (try @SomeException upload) `finally` putMVar stopped ())
         before <- takeMVar baseline
@@ -185,7 +184,7 @@ spec = describe "borrowed parameter streams" $ do
             bracket (unsent Nothing (borrowedStream 10 source)) discardUnsent $ \initial -> do
               pending <- newIORef initial
               void (channelPush channel pending)
-              allocaBytes 16 $ \pointer -> readInputInto (channelInput channel pending 16) pointer 16
+              allocaBytes 16 $ \pointer -> channelReceive channel pending pointer 16
       outcome <- timeout 5000000 $ do
         reader <- forkIO (void (try @SomeException upload) `finally` putMVar stopped ())
         before <- takeMVar baseline

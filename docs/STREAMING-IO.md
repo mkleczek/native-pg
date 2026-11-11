@@ -291,7 +291,7 @@ error.
 
 ## Drivers
 
-- **native-pg input** (`linkInputSource`), a loop of its own (`receive`). After
+- **native-pg input** (`receiveWaiting`), a loop of its own. After
   `receiveReady` returns `Nothing`: `pushWith` with the read's stalls, and
   receive again. The stall for the link waits for it to be writable or the server
   to have sent something (`awaitReadOrWrite`), and goes on if only the link is
