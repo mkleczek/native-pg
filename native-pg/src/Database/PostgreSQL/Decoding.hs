@@ -170,7 +170,7 @@ instance DecodeField a => DecodeValue [a] where
   {-# INLINE valueDecoder #-}
 
 instance
-  TypeError ('Text "A ByteStream column isn't decoded: stream the row's last column with decodeRowStreaming") =>
+  TypeError ('Text "A ByteStream column isn't decoded: stream the row's last column with streamingRow") =>
   DecodeValue ByteStream
   where
   valueDecoder = error "unreachable"

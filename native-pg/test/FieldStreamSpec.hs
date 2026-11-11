@@ -4,12 +4,8 @@
 module FieldStreamSpec (spec) where
 
 import Control.Monad.IO.Unlift (withRunInIO)
-import Control.Exception (SomeException, evaluate, finally, throwIO, try)
-import Control.Concurrent (forkFinally, killThread, threadDelay)
-import Control.Concurrent.MVar
-import Data.Maybe (isNothing)
-import System.Timeout (timeout)
-import Control.Monad (unless, when)
+import Control.Exception (evaluate, try)
+import Control.Monad (unless)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
@@ -29,7 +25,7 @@ import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, minusPtr)
 import Data.Word (Word8)
 import Database.PostgreSQL.Transport
-import Network.Streaming.Watch (readyNow)
+import Network.Streaming.Watch (Watch, readyNow)
 import Skeletest hiding (context)
 
 spec :: Spec
@@ -50,55 +46,40 @@ spec = describe "borrowed field streams" $ do
         pure ()) ()
       result `shouldBe` (Right ((), "SELECT 1"), TxIdle)
 
-  it "borrows columnChunks directly from the supplied input" $
+  it "borrows a column's chunks directly from the supplied input, pulled in place" $
     withFields [Just payload] ready $ \context input -> do
       inside <- newIORef True
       received <- newIORef BS.empty
       result <- PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
-        PG.columnChunks row (collect input inside received)) ()
+        (_, pullNow) <- PG.columnBorrowedStream row
+        drainWaiting pullNow (collect input inside received)) ()
       result `shouldBe` (Right ((), "SELECT 1"), TxIdle)
       readIORef inside `shouldReturn` True
       readIORef received `shouldReturn` payload
 
-  it "borrows a Source until its next pull or scope end" $
+  it "borrows a column stream's chunks until its next pull" $
     withFields [Just payload] ready $ \context input -> do
       inside <- newIORef True
       received <- newIORef BS.empty
       result <- PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
-        PG.withColumnStream row $ \stream -> do
-          byteStreamLength stream `shouldBe` BS.length payload
-          drain (byteStreamNext stream) (collect input inside received)) ()
+        (stream, _) <- PG.columnBorrowedStream row
+        byteStreamLength stream `shouldBe` BS.length payload
+        drain (byteStreamNext stream) (collect input inside received)) ()
       result `shouldBe` (Right ((), "SELECT 1"), TxIdle)
       readIORef inside `shouldReturn` True
       readIORef received `shouldReturn` payload
 
-  it "expires an escaped Source even before the row callback returns" $
-    withFields [Just "abc"] ready $ \context _ -> do
+  it "expires a column stream once the next column is pulled" $
+    withFields [Just "abc", Just "def"] ready $ \context _ -> do
       result <- PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
-        next <- PG.withColumnStream row (pure . byteStreamNext)
-        failure <- try @ConnectionError next
-        case failure of Left (RowMisuse _) -> pure (); _ -> failTest "escaped Source remained readable") ()
+        (stream, _) <- PG.columnBorrowedStream row
+        _ <- PG.nextColumn row
+        failure <- try @ConnectionError (byteStreamNext stream)
+        case failure of Left (RowMisuse _) -> pure (); _ -> failTest "a stale column stream remained readable") ()
       result `shouldBe` (Right ((), "SELECT 1"), TxIdle)
-
-  it "rejects row advancement during a borrowed callback" $
-    withFields [Just payload] ready $ \context _ -> do
-      _ <- PG.executeWithContext context execution (\_ row -> do
-        _ <- PG.nextColumn row
-        PG.columnChunks row $ \_ -> do
-          failure <- try @ConnectionError (PG.nextColumn row)
-          case failure of Left (RowMisuse _) -> pure (); _ -> failTest "row advanced during borrowed callback") ()
-      pure ()
-
-  it "keeps a caught borrowed callback failure terminal" $
-    withFields [Just payload] ready $ \context _ -> do
-      result <- try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
-        _ <- PG.nextColumn row
-        _ <- try @SomeException (PG.columnChunks row (\_ -> throwIO (userError "consumer failed")))
-        pure ()) ()
-      case result of Left (RowMisuse _) -> pure (); _ -> failTest "failed callback left a recoverable row"
 
   it "invalidates a row after a caught materialization failure" $
     withResponse (message 50 "" <> BS.singleton 68 <> number 106 <> "\0\1" <> number 100 <> "short") $ \context _ -> do
@@ -127,8 +108,8 @@ spec = describe "borrowed field streams" $ do
       delivered <- newIORef False
       result <- PG.executeWithContext context execution (\_ row -> do
         _ <- PG.nextColumn row
-        PG.withColumnStream row $ \stream ->
-          drain (byteStreamNext stream) (const (pure ()))
+        (stream, _) <- PG.columnBorrowedStream row
+        drain (byteStreamNext stream) (const (pure ()))
         writeIORef delivered True) ()
       readIORef delivered `shouldReturn` True
       case fst result of
@@ -160,27 +141,6 @@ spec = describe "borrowed field streams" $ do
           Just (Streamed Nothing) -> pure ()
           _ -> failTest "expected NULL"
         run Tx.finishTransaction
-
-  it "cancels and joins an unfinished field pull before closing its scope" $ do
-    blocked <- newEmptyMVar
-    stopped <- newEmptyMVar
-    entered <- newIORef False
-    child <- newIORef Nothing
-    let observe offset = when (offset >= 32) $ do
-          first <- atomicModifyIORef' entered (\previous -> (True, not previous))
-          when first (putMVar blocked () *> threadDelay 10000000)
-        cleanup = readIORef child >>= mapM_ killThread
-    (do
-      result <- withFieldsObserved observe [Just payload] ready $ \context _ ->
-        try @ConnectionError $ PG.executeWithContext context execution (\_ row -> do
-          _ <- PG.nextColumn row
-          PG.withColumnStream row $ \source -> do
-            thread <- forkFinally (drain (byteStreamNext source) (const (pure ()))) (putMVar stopped)
-            writeIORef child (Just thread)
-            timeout 1000000 (readMVar blocked) `shouldReturn` Just ()) ()
-      case result of Left (RowMisuse _) -> pure (); _ -> failTest "abandoned pull left a usable row"
-      joined <- timeout 1000000 (readMVar stopped)
-      isNothing joined `shouldBe` False) `finally` cleanup
 
   it "materializes an owned column larger than the supplied block" $
     withFields [Just payload] ready $ \context _ -> do
@@ -254,6 +214,11 @@ drain :: IO BS.ByteString -> (BS.ByteString -> IO ()) -> IO ()
 drain source sink = do
   chunk <- source
   unless (BS.null chunk) (sink chunk *> drain source sink)
+
+-- | Pulls a column with a wait that fails the spec, until the column's end.
+drainWaiting :: ((IO Watch -> IO ()) -> IO (Maybe BS.ByteString)) -> (BS.ByteString -> IO ()) -> IO ()
+drainWaiting pullNow sink =
+  pullNow (\_ -> failTest "the pull waited") >>= mapM_ (\chunk -> sink chunk *> drainWaiting pullNow sink)
 
 payload :: BS.ByteString
 payload = foldMap (BS.replicate 31) [65 .. 72]

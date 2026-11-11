@@ -194,7 +194,7 @@ receiveExactly socket = go []
 
 countField :: Int -> PG.Row -> IO Int
 countField count row = PG.nextColumn row >>= \case
-  Just (PG.Column _) -> PG.columnStream row >>= drain count
+  Just (PG.Column _) -> PG.columnBorrowedStream row >>= drain count . fst
   _ -> failTest "expected one non-null streamed field"
   where
     drain total stream = do

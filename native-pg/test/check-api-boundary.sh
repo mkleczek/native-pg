@@ -108,8 +108,6 @@ for private_symbol in \
   'Session (Column)' \
   'Session (DecodeRow)' \
   'Session (columnBytes)' \
-  'Session (columnChunks)' \
-  'Session (withColumnStream)' \
   'Session (decodeRow)' \
   'Session (nextColumn)' \
   'Session (backendProcessId)' \

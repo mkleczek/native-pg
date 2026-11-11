@@ -5,7 +5,7 @@ module BatchedReadsSpec (spec) where
 
 import AcquisitionTestSupport (getAcquisition)
 import Control.Exception (SomeException, bracket, evaluate, throwIO, try)
-import Control.Monad (forM_, replicateM, when)
+import Control.Monad (forM_, replicateM, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef
@@ -15,7 +15,7 @@ import Database.PostgreSQL.Internal.Channel (newChannel)
 import Database.PostgreSQL.Internal.Context
 import qualified Database.PostgreSQL.Internal.Execution as PG
 import Database.PostgreSQL.Internal.Protocol
-import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), parseChoice)
+import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), ByteStream (..), parseChoice)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import qualified Database.PostgreSQL.Internal.Row as PG
 import qualified Database.PostgreSQL.Session as PG
@@ -62,7 +62,8 @@ spec = describe "batched scoped reads" $ do
       result <- scopeRun scope connection $ \context ->
         PG.executeWithContext context execution (\_ row -> do
           PG.nextColumn row `shouldReturn` Just (PG.Column 1000)
-          PG.columnChunks row (\chunk -> evaluate (BS.copy chunk) >>= \owned -> modifyIORef' chunks (<> [owned]))) ()
+          (stream, _) <- PG.columnBorrowedStream row
+          drain (byteStreamNext stream) (\chunk -> evaluate (BS.copy chunk) >>= \owned -> modifyIORef' chunks (<> [owned]))) ()
       result `shouldBe` (Right ((), "SELECT 1"), TxIdle)
       BS.concat <$> readIORef chunks `shouldReturn` column
       sizes <- readSizes server
@@ -78,7 +79,8 @@ spec = describe "batched scoped reads" $ do
       _ <- scopeRun scope connection $ \context ->
         PG.executeWithContext context execution (\_ row -> do
           _ <- PG.nextColumn row
-          PG.columnChunks row (const (pure ()))) ()
+          (stream, _) <- PG.columnBorrowedStream row
+          drain (byteStreamNext stream) (const (pure ()))) ()
       sizes <- readSizes server
       (maximum sizes <= 64) `shouldBe` True
       readsStayInBlock scope server
@@ -166,7 +168,7 @@ spec = describe "batched scoped reads" $ do
       readSizes server `shouldReturn` [256]
 
   describe "a lent chunk" $
-    it "stays valid while its callback runs and the rest of the reply is already read" $
+    it "stays valid until the next pull, and the rest of the reply is already read" $
       withTestPool (positiveInt @256) $ \access -> do
         let payload = BS.replicate 31 65 <> BS.replicate 31 66
         server <- newServer [parseComplete <> bindComplete <> dataRow [payload] <> dataRow [payload] <> commandComplete "SELECT 2" <> ready]
@@ -175,7 +177,8 @@ spec = describe "batched scoped reads" $ do
         result <- withRequestContext connection access $ \context ->
           PG.executeWithContext context execution (\count row -> do
             _ <- PG.nextColumn row
-            PG.columnChunks row $ \chunk -> do
+            (stream, _) <- PG.columnBorrowedStream row
+            drain (byteStreamNext stream) $ \chunk -> do
               entered <- evaluate (BS.copy chunk)
               readsBefore <- length <$> readSizes server
               -- A producer that borrows while the chunk is lent gets another
@@ -320,6 +323,12 @@ readsStayInBlock scope server = do
 
 execution :: PG.Execution
 execution = PG.Execution (PG.Unprepared "SELECT 1" []) [] [] []
+
+-- | Pulls chunks until the end of the column, and gives each to the consumer.
+drain :: IO ByteString -> (ByteString -> IO ()) -> IO ()
+drain source use = do
+  chunk <- source
+  unless (BS.null chunk) (use chunk *> drain source use)
 
 -- | Runs the statement, collecting its rows' only column.
 run :: Context -> IO (Either ServerError ([ByteString], ByteString), TransactionStatus)

@@ -205,12 +205,10 @@ returns a slice of input storage, valid until the next input operation or scope
 exit. Advancing a row, submitting another pipeline or finishing the transaction
 expires its field. Consumers copy bytes they need to retain.
 
-Private protocol helpers also support synchronous `columnChunks` sinks and a
-length-bearing `withColumnStream` source. In that private source interface,
-pulls are exclusive and row advancement is blocked while the source owns the
-column. Teardown cancels and joins an unfinished pull before returning storage;
-repeated cancellation cannot interrupt the join. Parser or borrowed-callback
-failures invalidate the row because input may already have compacted.
+A private protocol helper, `columnBorrowedStream`, gives a column's chunks
+borrowed until the next pull, with a length and a pull that waits in place.
+The stream expires when the row or its column advances. A failed pull
+invalidates the row because input may already have compacted.
 
 Explicit owned operations (private `columnBytes`, decoded columns, and leading columns
 of a streaming decoder) assemble stable owned chunks across small input blocks.

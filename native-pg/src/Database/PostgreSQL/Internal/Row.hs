@@ -1,6 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -8,17 +7,12 @@
 module Database.PostgreSQL.Internal.Row
   ( Row, Column (..), DecodeRow (..),
     readRows, nextRow, startRow, finishRow, invalidateRow,
-    rowColumnCount, rowValueUnread, rowUnreadBytes, nextColumn, columnBytes, columnStream,
-    columnStreamWithChunks, columnBorrowedStream, columnChunks, withColumnStream,
-    decodeRow, decodeRowStreaming, decodeRowStreamingNullable,
-    decodeRowStreamingUsing,
+    rowColumnCount, rowValueUnread, rowUnreadBytes, nextColumn, columnBytes,
+    columnBorrowedStream, decodeRow, decodeRowStreamingUsing,
   ) where
 
-import Control.Concurrent (ThreadId, myThreadId, killThread)
-import Control.Concurrent.MVar (newMVar, takeMVar, putMVar, readMVar)
-import Control.Exception (SomeException, catch, finally, fromException, mask, onException, throwIO, toException, uninterruptibleMask_)
-import Control.Monad (join, unless, void, when)
-import Data.Foldable (for_)
+import Control.Exception (SomeException, catch, fromException, onException, throwIO, toException)
+import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -30,7 +24,7 @@ import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange
 import Database.PostgreSQL.Internal.Protocol.Codec
   ( Alternatives (..), ByteStream (..), Input, InputError (..), Parsable (..),
-    failInput, inputPosition, readInputSome, readInputBorrowedSome, withInputSome, skipInput,
+    failInput, inputPosition, readInputSome, readInputBorrowedSome, skipInput,
   )
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
@@ -98,7 +92,7 @@ data RowCursor = RowCursor
 data Column
   = NullColumn
   | -- | A value of this many bytes, to take with 'columnBytes' or
-    -- 'columnStream'.
+    -- 'columnBorrowedStream'.
     Column Int
   deriving (Eq, Show)
 
@@ -158,41 +152,13 @@ nextColumn row = do
 
 -- | Materializes the current column into an owned value that remains valid
 -- across later input reads. May allocate memory proportional to the field;
--- use 'columnChunks' or 'withColumnStream' for borrowed body transfer.
+-- use 'columnBorrowedStream' for borrowed body transfer.
 columnBytes :: Row -> IO ByteString
 columnBytes row = do
   cursor <- untakenCursor row
   value <- inRow row (readOwnedBytes (cursorValueLeft cursor))
   writeIORef (rowCursor row) cursor {cursorValueLeft = 0, cursorValueTaken = True}
   pure value
-
--- | The current column's value as owned chunks, each no larger than the
--- available input storage. The stream is valid until the next column is
--- pulled; returned chunks remain valid across reads.
-columnStream :: Row -> IO ByteStream
-columnStream = fmap fst . columnStreamWithChunks
-
--- | Owned pulls and borrowed draining for the same column cursor. Both
--- expire together when the row or column advances; neither may overlap.
-columnStreamWithChunks :: Row -> IO (ByteStream, (ByteString -> IO ()) -> IO ())
-columnStreamWithChunks row = do
-  cursor <- untakenCursor row
-  writeIORef (rowCursor row) cursor {cursorValueTaken = True}
-  let currentCursor = do
-        current <- activeCursor row
-        unless (cursorColumn current == cursorColumn cursor) $
-          throwIO (RowMisuse "a column stream was read after the next column was pulled")
-        pure current
-      next = do
-        current <- currentCursor
-        if cursorValueLeft current == 0
-          then pure BS.empty
-          else do
-            chunk <- inRow row (readInputSome (cursorValueLeft current))
-            writeIORef (rowCursor row) current {cursorValueLeft = cursorValueLeft current - BS.length chunk}
-            pure chunk
-      chunks use = currentCursor >>= \current -> borrowColumnChunks row current use
-  pure (ByteStream (cursorValueLeft cursor) next, chunks)
 
 -- | The current column's value as chunks borrowed until the next pull, with
 -- the pull that waits in place with the wait it is given, and gives 'Nothing'
@@ -232,78 +198,6 @@ failedRead row failure = do
   throwIO $ case fromException failure of
     Just (InputError reason) -> toException (ProtocolError reason)
     Nothing -> failure
-
--- | Calls the consumer with successive borrowed chunks of this column.
--- Chunks are valid only until their callback returns; copy retained bytes.
--- A callback exception invalidates the row even if the step catches it,
--- because input may have been refilled before the callback was invoked.
-columnChunks :: Row -> (ByteString -> IO ()) -> IO ()
-columnChunks row use = do
-  (_, chunks) <- columnStreamWithChunks row
-  chunks use
-
-borrowColumnChunks :: Row -> RowCursor -> (ByteString -> IO ()) -> IO ()
-borrowColumnChunks row cursor use = do
-  writeIORef (rowCursor row) cursor {cursorValueTaken = True, cursorBorrowed = True}
-  let loop remaining = unless (remaining == 0) $ do
-        size <- inRow row $ withInputSome remaining $ \chunk -> do
-          use chunk
-          pure (BS.length chunk)
-        let left = remaining - size
-        writeIORef (rowCursor row) cursor {cursorValueLeft = left, cursorValueTaken = True, cursorBorrowed = True}
-        loop left
-  loop (cursorValueLeft cursor) `onException`
-    writeIORef (rowCursor row) cursor {cursorActive = False, cursorValueTaken = True}
-  writeIORef (rowCursor row) cursor {cursorValueLeft = 0, cursorValueTaken = True}
-
--- | A field-only borrowed Source, with its declared length. Chunks expire
--- on the next pull or callback return. Field EOF does not imply that the
--- statement or transaction succeeded; the enclosing operation still reads
--- trailing completion messages and can report a late server error.
-withColumnStream :: Row -> (ByteStream -> IO a) -> IO a
-withColumnStream row use = mask $ \restore -> do
-  cursor <- untakenCursor row
-  writeIORef (rowCursor row) cursor {cursorValueTaken = True, cursorBorrowed = True}
-  state <- newIORef PullAvailable
-  finished <- newMVar ()
-  let next = mask $ \resume -> do
-        thread <- myThreadId
-        failure <- atomicModifyIORef' state $ \case
-          PullAvailable -> (PullReading thread, Nothing)
-          current@(PullReading _) -> (current, Just "a column Source was pulled concurrently")
-          PullExpired -> (PullExpired, Just "a column Source was used after its scope ended")
-        maybe (pure ()) (throwIO . RowMisuse) failure
-        takeMVar finished
-        let done = do
-              putMVar finished ()
-              atomicModifyIORef' state (\current -> (case current of PullReading _ -> PullAvailable; other -> other, ()))
-            readChunk = do
-              ensureContextActive (rowContext row)
-              current <- readIORef (rowCursor row)
-              unless (cursorActive current && cursorBorrowed current && cursorColumn current == cursorColumn cursor) $
-                throwIO (RowMisuse "a column Source no longer owns its row")
-              if cursorValueLeft current == 0
-                then pure BS.empty
-                else do
-                  chunk <- inRow row (readInputBorrowedSome (cursorValueLeft current))
-                  writeIORef (rowCursor row) current {cursorValueLeft = cursorValueLeft current - BS.length chunk}
-                  pure chunk
-        resume readChunk `onException` invalidateRow row `finally` done
-      closeSource = do
-        owner <- atomicModifyIORef' state $ \case
-          PullReading thread -> (PullExpired, Just thread)
-          _ -> (PullExpired, Nothing)
-        for_ owner $ \thread -> do
-          invalidateRow row
-          -- The callback cannot return storage while a cancelled pull is
-          -- still unwinding inside the transport or parser.
-          uninterruptibleMask_ (killThread thread *> readMVar finished)
-        atomicModifyIORef' (rowCursor row) (\current -> (current {cursorBorrowed = False}, ()))
-  restore (use (ByteStream (cursorValueLeft cursor) next))
-    `onException` invalidateRow row
-    `finally` closeSource
-
-data PullState = PullAvailable | PullReading ThreadId | PullExpired
 
 -- Explicit materializers own their results separately from the reusable
 -- body workspace. Each copied chunk is stable before the next refill.
@@ -379,22 +273,6 @@ decodeRow row function = do
       either (pure . Left) (fmap Right) decoded
 -- Inlined so that each call site unrolls the decoding of its own columns.
 {-# INLINE decodeRow #-}
-
--- | Like 'decodeRow', but the row has one more column, which is streamed:
--- the function gets it last, as a 'ByteStream' that is valid during the
--- action.
-decodeRowStreaming :: forall columns r. DecodeRow columns => Row -> RowFunction columns (ByteStream -> IO r) -> IO (Either DecodingError r)
-decodeRowStreaming row function =
-  join <$> decodeRowStreamingNullable @columns row (mapRowFunction @columns @(ByteStream -> IO r) @(Maybe ByteStream -> IO (Either DecodingError r)) streamOrFail function)
-  where
-    streamOrFail continue = maybe (pure (Left (ColumnDecodingFailed (rowArity @columns + 1) "unexpected NULL in a streamed column"))) (fmap Right . continue)
-{-# INLINE decodeRowStreaming #-}
-
--- | Like 'decodeRowStreaming', but the streamed column may be NULL, which the
--- function gets as 'Nothing'.
-decodeRowStreamingNullable :: forall columns r. DecodeRow columns => Row -> RowFunction columns (Maybe ByteStream -> IO r) -> IO (Either DecodingError r)
-decodeRowStreamingNullable = decodeRowStreamingUsing @columns columnStream
-{-# INLINE decodeRowStreamingNullable #-}
 
 -- | Chooses how the final column is consumed while its cursor is unclaimed.
 decodeRowStreamingUsing :: forall columns stream r. DecodeRow columns => (Row -> IO stream) -> Row -> RowFunction columns (Maybe stream -> IO r) -> IO (Either DecodingError r)

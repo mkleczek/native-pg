@@ -497,8 +497,8 @@ spec socketPath port = do
         `shouldReturn` Left (ColumnDecodingFailed 1 "int8 needs 8 bytes, got 4")
       query session "SELECT 1" [] `shouldReturn` (Right ([[Just "1"]], "SELECT 1"), TxIdle)
     it "streams a last column after decoding the others" $ withSession $ \session ->
-      decodeSingleStreaming @'[Int32] session "SELECT 200::int4, repeat('x', 1000000)" (\status body -> (status,) <$> streamedLength body)
-        `shouldReturn` Right (200, 1000000)
+      decodeSingleStreaming @'[Int32] session "SELECT 200::int4, repeat('x', 1000000)" (\status body -> (status,) <$> traverse streamedLength body)
+        `shouldReturn` Right (200, Just 1000000)
 
   describe "errors" $ do
     it "reports a missing relation with its position in the query" $ withSession $ \session -> do
@@ -837,9 +837,6 @@ spec socketPath port = do
       committed Tx.ReadCommitted Tx.Read
         ((,) <$> streamedLengths "SELECT 7::int4, repeat('x', 1000000)" <*> streamedLengths "SELECT 8::int4, NULL::text") session
         `shouldReturn` Right ((7, Just (1000000, 1000000)), (8, Nothing))
-    it "rejects NULL in a column streamed as one that can't be NULL" $ withSession $ \session ->
-      decodeSingleStreaming @'[Int32] session "SELECT 7::int4, NULL::text" (\_ _ -> pure ())
-        `shouldReturn` Left (ColumnDecodingFailed 2 "unexpected NULL in a streamed column")
     it "aborts when the transaction throws between statements, and leaves the session usable" $ withSession $ \session -> do
       createItems session
       Tx.runTransaction Tx.ReadCommitted Tx.Write session (insert "1" *> liftIO (throwIO (ErrorCall "boom")))
@@ -886,7 +883,7 @@ spec socketPath port = do
     -- accumulators are strict, so they don't keep the chunks alive.
     consumeSlowly row = do
       Just (Column size) <- nextColumn row
-      source <- columnStream row
+      (source, _) <- columnBorrowedStream row
       let loop !count !received !small !valid !peak = do
             chunk <- byteStreamNext source
             if BS.null chunk
@@ -960,8 +957,8 @@ instance DecodeValue Pair where
 decodeSingle :: forall columns r. DecodeRow columns => Session -> Text -> RowFunction columns (IO r) -> IO (Either DecodingError r)
 decodeSingle session sql function = single session sql (\row -> decodeRow @columns row function)
 
-decodeSingleStreaming :: forall columns r. DecodeRow columns => Session -> Text -> RowFunction columns (ByteStream -> IO r) -> IO (Either DecodingError r)
-decodeSingleStreaming session sql function = single session sql (\row -> decodeRowStreaming @columns row function)
+decodeSingleStreaming :: forall columns r. DecodeRow columns => Session -> Text -> RowFunction columns (Maybe ByteStream -> IO r) -> IO (Either DecodingError r)
+decodeSingleStreaming session sql function = single session sql (\row -> decodeRowStreamingUsing @columns (fmap fst . columnBorrowedStream) row function)
 
 single :: Session -> Text -> (Row -> IO (Either DecodingError r)) -> IO (Either DecodingError r)
 single session sql decode = do
