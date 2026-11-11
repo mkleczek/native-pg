@@ -15,7 +15,6 @@ library
   ghc-options: -Wall
   exposed-modules: Network.Streaming
                    Network.Streaming.Link
-                   Network.Streaming.Drive
                    Network.Streaming.Output
                    Network.Streaming.PositiveInt
                    Network.Streaming.BufferPool
@@ -35,12 +34,10 @@ test-suite streaming-io-spec
   other-modules: ListPrefixSpec
                       AcquisitionTestSupport
                  AdmissionResourcesSpec
-                 DriveSpec
                  FakeStreams
                  Network.Streaming.Internal.ListPrefix
                  Network.Streaming
                  Network.Streaming.Link
-                 Network.Streaming.Drive
                  Network.Streaming.Output
                  Network.Streaming.PositiveInt
                  Network.Streaming.BufferPool

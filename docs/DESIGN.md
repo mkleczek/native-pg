@@ -711,11 +711,6 @@ any -> Broken | Closed
   back what is left and the watch it stopped on. Records a TLS link took but
   hasn't written are flushed before the wait for a source, so they don't stay
   behind it.
-- Loops that wait are steps run by `drive` (`Network.Streaming.Drive`). A step
-  tries without waiting and gives `Ready` with the result, `Again` when it made
-  progress and should try again before waiting, or `Blocked` with its
-  `Interest`. `drive` is the only recursion and the only `awaitAny` of its
-  users, and it is inlined into them, so no `Progress` is allocated.
 - native-pg-tls supplies a TLS `Link` through rustls-ffi. Its public API is
   just `tlsClient`, which a client gives native-pg as a `TlsClient`.
   TLS configuration construction, connection operations and FFI helpers

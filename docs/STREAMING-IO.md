@@ -290,45 +290,20 @@ error.
   the thread registry in `Unsent` go away; `discardUnsent` only drops
   references.
 
-### Drive: the loop around a step
-
-```haskell
-data Progress s a = Ready a | Again s | Blocked s Interest
-
--- | Runs the step until it is ready, and waits for the link when it is blocked.
-drive :: Link link => link -> (s -> IO (Progress s a)) -> s -> IO a
-```
-
-- **One loop.** `drive` is the only recursion and the only `awaitAny` of its
-  users. A step tries what it can and waits for nothing but what it says it is
-  blocked on: it gives the result, or says whether it made progress, or what it
-  is blocked on. (native-pg's read step waits for an upload in the stalls of its
-  push, which is part of a try, and stops it for the server's input.)
-- **`Again` goes before a wait.** It means "made progress, try again before
-  waiting", for example when the rest of the output was sent and the server
-  may have answered meanwhile. `Blocked` waits once for the interest and
-  steps again from the state it gave. Readiness is a hint, so the step tries
-  every operation it is blocked on again, whichever fired.
-- **No cost.** `drive` is `INLINE`, so a step that is known where it is run
-  becomes part of the loop: `Progress` is matched where it is made and never
-  allocated, and the wait stays the known call it is without `drive`.
-- **Exceptions** from a step or a wait propagate. `drive` holds nothing to
-  release.
-
 ## Drivers
 
-- **native-pg input** (`linkInputSource`), a step run by `drive`. After
+- **native-pg input** (`linkInputSource`), a loop of its own (`receive`). After
   `receiveReady` returns `Nothing`: `pushWith` with the read's stalls, and
   receive again. The stall for the link waits for it to be writable or the server
   to have sent something (`awaitReadOrWrite`), and goes on if only the link is
   writable; the stall for an upload waits for its watch or the server's input,
   and goes on if the upload is ready. When the server has sent something, the
-  push stops and the step receives again: input is tried first, on the request
+  push stops and the loop receives again: input is tried first, on the request
   thread, so an answer is read before more is sent. When the push has sent the
-  rest of the output, the step makes progress instead of blocking, since the
-  server may have answered meanwhile. With nothing unsent the step blocks on the
-  link's input. Sending output without reading is `pushWith` with
-  `waitingStalls`.
+  rest of the output, the loop receives again instead of waiting, since the
+  server may have answered meanwhile. With nothing unsent it waits for the
+  link's input with `awaitAny`, and receives again. Sending output without
+  reading is `pushWith` with `waitingStalls`.
 - **Warp response.** The application returns an `Answer`: a status, headers
   and a body, which is a `WaitingSource`. Warp sends it with `pushWith` on the
   client link, and gives it stalls that wait for the link writable, or for the

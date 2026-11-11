@@ -26,8 +26,6 @@ import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol.Codec (InputSource (..), Output)
 import Database.PostgreSQL.Transport.Link
 import Foreign.Ptr (Ptr)
-import Network.Streaming.Drive (Progress, drive)
-import qualified Network.Streaming.Drive as Drive
 import Network.Streaming.Sender
   ( OutputBuffer,
     Pushed (..),
@@ -116,30 +114,30 @@ readStalls link =
 linkInputSource :: Link link => link -> Stalls -> IORef Unsent -> Int -> InputSource
 linkInputSource link stalls pending readSize =
   InputSource
-    { readInputInto = \pointer size -> drive link (receiveStep link stalls pending pointer size) (),
+    { readInputInto = receive,
       inputReadSize = readSize
     }
+  where
+    -- Reads what the link has, or else sends what's left of the output as the
+    -- link takes it. With none to send, it waits for input.
+    receive pointer size = loop
+      where
+        loop =
+          receiveReady link pointer size >>= \case
+            Just received -> pure received
+            Nothing -> do
+              left <- readIORef pending
+              pushWith link stalls left >>= \case
+                Pushed
+                  | unsentEmpty left -> awaitAny link (Interest True Done) *> loop
+                  -- The server may have answered while the rest was sent, so input
+                  -- is read before waiting for it.
+                  | otherwise -> writeIORef pending noUnsent *> loop
+                Stopped rest _ -> writeIORef pending rest *> loop
 {-# INLINABLE linkInputSource #-}
 
--- | One try to read: what the link has, or else what's left of the output sent
--- as the link takes it.
-receiveStep :: Link link => link -> Stalls -> IORef Unsent -> Ptr Word8 -> Int -> () -> IO (Progress () Int)
-receiveStep link stalls pending pointer size () =
-  receiveReady link pointer size >>= \case
-    Just received -> pure (Drive.Ready received)
-    Nothing -> do
-      left <- readIORef pending
-      pushWith link stalls left >>= \case
-        Pushed
-          | unsentEmpty left -> pure (Drive.Blocked () (Interest True Done))
-          -- The server may have answered while the rest was sent, so input
-          -- is read before waiting for it.
-          | otherwise -> Drive.Again () <$ writeIORef pending noUnsent
-        Stopped rest _ -> Drive.Again () <$ writeIORef pending rest
-{-# INLINE receiveStep #-}
-
--- | 'receiveStep' that doesn't wait: it gives the watch for what it would
--- have waited for.
+-- | The read of 'linkInputSource' that doesn't wait: it gives the watch for what
+-- it would have waited for.
 pollStep :: Link link => link -> IORef Unsent -> Ptr Word8 -> Int -> IO (Either (IO Watch) Int)
 pollStep link pending pointer size = loop
   where
