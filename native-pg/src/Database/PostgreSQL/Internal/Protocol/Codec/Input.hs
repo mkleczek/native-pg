@@ -13,7 +13,11 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Input
     InputBuffer,
     InputError (..),
     InputSource (..),
-    MonadInput (..),
+    peekInputByteAt,
+    readInputExactly,
+    readInputRemaining,
+    readInputCStringBytes,
+    withInputLimit,
     emptyInputBuffer,
     reusableInputBuffer,
     requestInputBuffer,
@@ -63,15 +67,6 @@ import GHC.Exts (RealWorld, State#)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import GHC.Conc (atomically, orElse)
 import GHC.IO (IO (..), unIO, unsafeDupablePerformIO)
-
-class MonadError String m => MonadInput m where
-  -- | The byte at the given offset from the current position, without
-  -- consuming anything. Blocks until that many bytes are available.
-  peekInputByteAt :: Int -> m Word8
-  readInputExactly :: Int -> m ByteString
-  readInputRemaining :: m ByteString
-  readInputCStringBytes :: m ByteString
-  withInputLimit :: Int -> m a -> m a
 
 -- | Where input bytes come from.
 data InputSource = InputSource
@@ -427,54 +422,60 @@ instance MonadError String Input where
         (# s', Right (buffer', a) #) -> (# s', buffer', a #)
         (# s', Left (InputError message) #) -> unInput (handler message) env buffer s'
 
-instance MonadInput Input where
-  peekInputByteAt offset = do
-    buffer <- ensureAvailable (offset + 1)
-    inputIO $
-      unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
-        peekByteOff pointer (bufferStart buffer + offset)
-  {-# INLINE peekInputByteAt #-}
+-- | The byte at the given offset from the current position, without
+-- consuming anything. Blocks until that many bytes are available.
+peekInputByteAt :: Int -> Input Word8
+peekInputByteAt offset = do
+  buffer <- ensureAvailable (offset + 1)
+  inputIO $
+    unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
+      peekByteOff pointer (bufferStart buffer + offset)
+{-# INLINE peekInputByteAt #-}
 
-  readInputExactly count
-    | count < 0 = throwError ("negative byte count " <> show count <> " is invalid")
-    | otherwise = do
-        buffer <- ensureAvailable count
-        value <- ownedSlice count buffer
-        putBuffer (consume count buffer)
-        pure value
-  {-# INLINE readInputExactly #-}
+readInputExactly :: Int -> Input ByteString
+readInputExactly count
+  | count < 0 = throwError ("negative byte count " <> show count <> " is invalid")
+  | otherwise = do
+      buffer <- ensureAvailable count
+      value <- ownedSlice count buffer
+      putBuffer (consume count buffer)
+      pure value
+{-# INLINE readInputExactly #-}
 
-  readInputRemaining = do
-    limit <- getLimit
-    if limit == unbounded
-      then throwError "RemainingBytesAtom needs an enclosing bounded part"
-      else do
-        buffer <- getBuffer
-        let count = limit - bufferPosition buffer
-        if bufferReusable buffer
-          then ownedRemaining count []
-          else readInputExactly count
-  {-# INLINE readInputRemaining #-}
+-- Not INLINE: the body is large, and as a method it was never inlined into parsers.
+readInputRemaining :: Input ByteString
+readInputRemaining = do
+  limit <- getLimit
+  if limit == unbounded
+    then throwError "RemainingBytesAtom needs an enclosing bounded part"
+    else do
+      buffer <- getBuffer
+      let count = limit - bufferPosition buffer
+      if bufferReusable buffer
+        then ownedRemaining count []
+        else readInputExactly count
 
-  readInputCStringBytes = do
-    buffer <- getBuffer
-    if bufferReusable buffer then reusableCString [] else cstringFrom 0
-  {-# INLINE readInputCStringBytes #-}
+readInputCStringBytes :: Input ByteString
+readInputCStringBytes = do
+  buffer <- getBuffer
+  if bufferReusable buffer then reusableCString [] else cstringFrom 0
+{-# INLINE readInputCStringBytes #-}
 
-  withInputLimit count (Input action) = Input $ \env buffer s ->
-    let end = bufferPosition buffer + count
-     in if count < 0 || end > envLimit env
-          then unInput (throwError ("a bounded part of " <> show count <> " bytes doesn't fit the enclosing one")) env buffer s
-          else case action env {envLimit = end} buffer s of
-            (# s', buffer', a #)
-              | bufferPosition buffer' == end -> (# s', buffer', a #)
-              | otherwise ->
-                  unInput
-                    (throwError ("bounded parser left " <> show (end - bufferPosition buffer') <> " unconsumed bytes"))
-                    env
-                    buffer'
-                    s'
-  {-# INLINE withInputLimit #-}
+withInputLimit :: Int -> Input a -> Input a
+withInputLimit count (Input action) = Input $ \env buffer s ->
+  let end = bufferPosition buffer + count
+   in if count < 0 || end > envLimit env
+        then unInput (throwError ("a bounded part of " <> show count <> " bytes doesn't fit the enclosing one")) env buffer s
+        else case action env {envLimit = end} buffer s of
+          (# s', buffer', a #)
+            | bufferPosition buffer' == end -> (# s', buffer', a #)
+            | otherwise ->
+                unInput
+                  (throwError ("bounded parser left " <> show (end - bufferPosition buffer') <> " unconsumed bytes"))
+                  env
+                  buffer'
+                  s'
+{-# INLINE withInputLimit #-}
 
 -- | Runs a parser on the given unconsumed bytes, and returns its result with
 -- the bytes it left unconsumed. Malformed input throws 'InputError'.
@@ -557,7 +558,7 @@ readScalar count decode = do
 {-# INLINE readScalar #-}
 
 -- Protocol constants, unlike body fields, can span a small supplied block.
--- This helper is private to the codec implementation, not part of MonadInput.
+-- This helper is private to the codec implementation, unlike 'peekInputByteAt'.
 peekInputMetadataByteAt :: Int -> Input Word8
 peekInputMetadataByteAt offset = do
   buffer <- ensureAvailableWith True (offset + 1)

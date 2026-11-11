@@ -778,8 +778,7 @@ thread, exclusive use and scope lifetime. Synchronous callback nesting between
 operations is allowed; re-entry while an operation is active is rejected.
 Escaped actions cannot access the database after the scope ends. The transaction
 driver starts no result worker. The parser remains the concrete `Input`
-implementation; transaction composition adds no `MonadInput` dictionary to
-parsing.
+implementation; transaction composition adds no class dictionary to parsing.
 
 Results are consumed in wire order, which is the order of their statements: the
 server answers them one after the other on one connection, so reading a later

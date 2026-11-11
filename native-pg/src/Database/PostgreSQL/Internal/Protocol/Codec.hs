@@ -19,7 +19,11 @@ module Database.PostgreSQL.Internal.Protocol.Codec
     InputBuffer,
     InputError (..),
     InputSource (..),
-    MonadInput (..),
+    peekInputByteAt,
+    readInputExactly,
+    readInputRemaining,
+    readInputCStringBytes,
+    withInputLimit,
     Output,
     Parsable (..),
     ParseConstructor (..),
@@ -71,7 +75,11 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Input
     InputBuffer,
     InputError (..),
     InputSource (..),
-    MonadInput (..),
+    peekInputByteAt,
+    readInputExactly,
+    readInputRemaining,
+    readInputCStringBytes,
+    withInputLimit,
     emptyInputBuffer,
     reusableInputBuffer,
     requestInputBuffer,
@@ -145,9 +153,9 @@ data Alternatives (functions :: [Type]) (r :: Type) where
 
 infixr 5 :|:
 
--- Parsers run in 'Input' itself, rather than in any 'MonadInput', so that
--- their binds are inlined instead of called through the class's dictionary,
--- which allocates closures for every message.
+-- Parsers run in 'Input' itself, rather than in a polymorphic monad, so that
+-- their binds are inlined instead of called through a class dictionary, which
+-- allocates closures for every message.
 class Parsable (a :: Type) s where
   fieldParser :: Input a
 
