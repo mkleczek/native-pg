@@ -17,7 +17,6 @@ module Network.Streaming.Output
     word32,
     int32,
     bytes,
-    stream,
   )
 where
 
@@ -47,7 +46,7 @@ data ByteStream = ByteStream
 data Output = Output
   { outputLength :: {-# UNPACK #-} !Int,
     -- | The bytes 'writeOutput' copies to its buffer: all but long byte
-    -- strings and streams.
+    -- strings and sources.
     outputCopied :: {-# UNPACK #-} !Int,
     outputBuild :: Writer -> Writer
   }
@@ -71,7 +70,6 @@ outputWriter Output {outputBuild} = outputBuild (Writer (\_ _ used -> pure (Fini
 -- | A part of an output that's sent from where it is, rather than copied.
 data Uncopied
   = UncopiedBytes ByteString
-  | UncopiedStream ByteStream
   | -- | A pull source, and how many bytes it declares it will give.
     UncopiedSource !Int !AnySource
   | -- | A source that is waited for in place, and how many bytes it declares
@@ -199,9 +197,3 @@ writeBytes value rest = Writer $ \pointer capacity used -> do
     copyBytes (pointer `plusPtr` used) (castPtr source) size
   runWriter rest pointer capacity (used + BS.length value)
 {-# INLINE writeBytes #-}
-
--- | Bytes the client supplies as they're sent.
-stream :: ByteStream -> Output
-stream source = Output (byteStreamLength source) 0 $ \rest ->
-  Writer $ \_ _ used -> pure (Yield used (UncopiedStream source) rest)
-{-# INLINE stream #-}

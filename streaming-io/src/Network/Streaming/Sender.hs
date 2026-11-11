@@ -1,7 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
-{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE UnboxedTuples #-}
 
 -- | Sends outputs to a link as the link takes them, gathering their pieces
@@ -42,8 +41,7 @@ import Network.Socket (Socket)
 import qualified Network.Streaming.Buffer as Buffer
 import Network.Streaming.Link (Blocked (..), Interest (..), Link (..), StreamLengthError (..))
 import Network.Streaming.Output
-  ( ByteStream (..),
-    Output,
+  ( Output,
     Uncopied (..),
     WriteResult (..),
     Writer,
@@ -69,10 +67,9 @@ unsentEmpty (Unsent parts) = null parts
 discardUnsent :: Unsent -> IO ()
 discardUnsent _ = pure ()
 
--- | Bytes, or a stream with how many bytes it has given.
+-- | Bytes, or a source with how many bytes it has given.
 data Part
   = PartBytes ByteString
-  | PartStream ByteStream {-# UNPACK #-} !Int
   | -- | Output rendering on in the memory from an offset, past the bytes
     -- before the part that was sent from where it is.
     PartOutput (ForeignPtr Word8) {-# UNPACK #-} !Int {-# UNPACK #-} !Int Writer
@@ -110,7 +107,7 @@ outputBufferPerOutput = PerOutputBuffer
 -- | All of the output. Caller-supplied buffers are filled incrementally and
 -- reused only after their bytes have been sent. Per-output buffers are filled
 -- in the same way, in memory of their own. Legacy buffers may grow to fit the
--- copied output. Long byte strings and streams retain their own storage until
+-- copied output. Long byte strings and sources retain their own storage until
 -- accepted by the link.
 unsent :: Maybe OutputBuffer -> Output -> IO Unsent
 unsent (Just (OutputBuffer (Buffer.Buffer memory size) True)) output
@@ -131,7 +128,6 @@ unsent reused output = do
 uncopiedPart :: Uncopied -> Part
 uncopiedPart = \case
   UncopiedBytes value -> PartBytes value
-  UncopiedStream source -> PartStream source 0
   UncopiedSource count source -> PartSource count source 0
   UncopiedWaiting count source -> PartWaiting count source 0
 
@@ -284,17 +280,6 @@ gatherFrom link stalls = go
                 let (prefix, suffix) = BS.splitAt (gatherSize - size) chunk
                     rest = if BS.null suffix then others else PartBytes suffix : others
                  in gather (size + BS.length prefix) (pieceCount + 1) (prefix : pieces) rest
-          PartStream _ 0 : _ | not (null pieces) -> cut pieces remaining
-          PartStream source given : others -> do
-            chunk <- byteStreamNext source
-            let delivered = given + BS.length chunk
-            if
-              | BS.null chunk -> do
-                  unless (given == byteStreamLength source) (throwIO (StreamLengthError (byteStreamLength source) given))
-                  gather size pieceCount pieces others
-              | delivered > byteStreamLength source ->
-                  throwIO (StreamLengthError (byteStreamLength source) delivered)
-              | otherwise -> gather size pieceCount pieces (PartBytes chunk : PartStream source delivered : others)
     -- What is gathered after a pull: nothing, if its stall sent it.
     regather size pieceCount gathered rest =
       readIORef gathered >>= \case

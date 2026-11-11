@@ -494,25 +494,25 @@ Output records its length, how many bytes need copying, and a resumable writer.
 Composition joins writers directly, so adjacent fields can be written without
 building intermediate instruction nodes. The bounded sender and the contiguous
 serializer run the same writer. It stops when scratch space fills or a direct
-byte string or stream must be sent. Its continuation retains the remaining
+byte string or source must be sent. Its continuation retains the remaining
 values, not the old scratch pointer, so sending can resume in different storage.
 Inspecting lengths or composing writers never pulls parameter sources. Arrays
 and chunk lists scan their sizes without retaining a serializer for each
 element; their writers are built as sending advances. Client-supplied byte strings of
 8 KiB or more aren't copied: they're sent from where they are, as parts of
 their own. A parameter can also be given in chunks, each
-sent so, without copying them into one first, or be a `ByteStream`. Its
-chunks are pulled from the client's source, after the declared length. A
-stream that gives a different number of bytes leaves the message incomplete,
-so the session breaks.
+sent so, without copying them into one first, or be a
+`ParameterBorrowedStream`. Its chunks are pulled from the client's source,
+after the declared length. A source that gives a different number of bytes
+leaves the message incomplete, so the session breaks.
 
-Each send is one `writev` of the parts up front, with a stream's chunks
+Each send is one `writev` of the parts up front, with a parameter's chunks
 gathered up to 256 KiB or 16 pieces. warp gives a body in chunks of up to
 16 KiB, and sending each on its own woke the server once per chunk: about
 3,300 times for a 50 MB body, against about 200. Pulling a chunk may wait
-for the client, so the bytes before a stream are sent before it's pulled,
+for the client, so the bytes before a source are sent before it's pulled,
 and the server starts on its statement, and its `statement_timeout`, as
-without the stream.
+without the source.
 
 ### Receiving and dispatch
 
@@ -935,7 +935,7 @@ endingWaiting :: Tx s -> (IO Watch -> IO ()) -> IO (Either QueryError ())
   the field must fit the input, or it raises `RowMisuse`. It may move the
   input's bytes, so the field's last chunk must be copied before it.
 
-A streamed input parameter has this shape:
+A streamed field has this shape:
 
 ```haskell
 data ByteStream = ByteStream
@@ -944,7 +944,7 @@ data ByteStream = ByteStream
   }
 ```
 
-Owned input uses strict bytes or `ByteStream`. Borrowed input uses
+Owned input uses strict bytes or chunks. Borrowed input uses
 `ParameterBorrowedStream n source`, whose chunks remain valid during their
 source callback. The PostgreSQL wire length must be known; unknown-length
 uploads remain an explicit materialization case.
@@ -1156,8 +1156,7 @@ partially sent chunk is held and its source isn't pulled again until the
 link has taken the rest. No thread is forked: the request thread drives both
 the link and the source, preserving exclusive TLS access, and teardown only
 releases watches. A source that delivers more or fewer bytes than declared
-fails with `StreamLengthError`. Ordinary `ParameterStream` retains its
-owned-value contract.
+fails with `StreamLengthError`.
 
 ### Values outside transport storage
 

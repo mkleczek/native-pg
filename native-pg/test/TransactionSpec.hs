@@ -23,7 +23,7 @@ import Database.PostgreSQL.Internal.Context
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import qualified Database.PostgreSQL.Diagnostics as PG
 import qualified Database.PostgreSQL.Session as Session
-import Database.PostgreSQL.Streaming.Types (ByteStream (..), Parameter (..))
+import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
@@ -31,7 +31,9 @@ import Foreign.Ptr (Ptr, castPtr, minusPtr)
 import Data.Word (Word8)
 import Database.PostgreSQL.Transport
 import GHC.Conc (retry)
+import Network.Streaming.Source (Pulled (..))
 import Network.Streaming.Watch (Watch (..), readyNow)
+import PullSourceTestSupport (PullSource (..), noWatch)
 import Skeletest hiding (context)
 
 newtype Body tx = Body (Maybe (Tx.Field tx))
@@ -89,10 +91,10 @@ spec = describe "canonical transactions" $ do
               case result of
                 Left (SessionUnusable _) -> modifyIORef' attempted (+ 1)
                 _ -> failTest "parameter callback reentered the protocol"
-            source = ParameterStream (ByteStream 1 $ do
+            source = ParameterBorrowedStream 1 $ pulling $ do
               bytes <- atomicModifyIORef' remaining (BS.empty,)
               unless (BS.null bytes) (rejectReentry *> rejectReentry)
-              pure bytes)
+              pure bytes
             query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
         _ <- run (Tx.pipeline (Tx.statement () query))
         run Tx.finishTransaction
@@ -110,10 +112,10 @@ spec = describe "canonical transactions" $ do
               case result of
                 Left (SessionUnusable _) -> modifyIORef' attempted (+ 1)
                 _ -> failTest "cleanup parameter callback reentered the protocol"
-            source = ParameterStream (ByteStream 1 $ do
+            source = ParameterBorrowedStream 1 $ pulling $ do
               bytes <- atomicModifyIORef' remaining (BS.empty,)
               unless (BS.null bytes) (rejectReentry *> rejectReentry)
-              pure bytes)
+              pure bytes
             query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
         void (run (Tx.pipeline (Tx.statement () query)))
         readIORef attempted `shouldReturn` 0
@@ -127,7 +129,7 @@ spec = describe "canonical transactions" $ do
       writeIORef opened (Just (contextConnection context))
       marker <- newIORef ()
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let source = ParameterStream (ByteStream 1 (throwIO (MarkerFailure marker)))
+        let source = ParameterBorrowedStream 1 (pulling (throwIO (MarkerFailure marker)))
             query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
         result <- try @MarkerFailure (run (Tx.pipeline (Tx.statement () query) *> Tx.finishTransaction))
         case result of
@@ -148,7 +150,7 @@ spec = describe "canonical transactions" $ do
     outcome <- try @ConnectionError $ withDeferredResponse ordinary $ \context _ -> do
       writeIORef opened (Just (contextConnection context))
       Tx.runTransaction Tx.ReadCommitted Tx.Read (Exchange.Session context) $ withRunInIO $ \run -> do
-        let source = ParameterStream (ByteStream 1 (throwIO (SessionUnusable "producer marker")))
+        let source = ParameterBorrowedStream 1 (pulling (throwIO (SessionUnusable "producer marker")))
             query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
         _ <- run (Tx.pipeline (Tx.statement () query))
         failure <- try @ConnectionError (run Tx.finishTransaction)
@@ -775,7 +777,7 @@ spec = describe "canonical transactions" $ do
 
   it "still breaks the session when a parameter source throws an ordinary exception" $ do
     opened <- newIORef Nothing
-    let source = ParameterStream (ByteStream 8 (throwIO (ErrorCall "parameter source failed")))
+    let source = ParameterBorrowedStream 8 (pulling (throwIO (ErrorCall "parameter source failed")))
         query = Tx.Statement "SELECT $1" (const [Tx.Param Nothing Tx.BinaryFormat (Just source)]) Tx.noResult
     result <- try @ErrorCall $ withResponse ordinary $ \context _ -> do
       writeIORef opened (Just (contextConnection context))
@@ -965,6 +967,10 @@ withResponseCallbacksBuffer output defer observe sent response action = do
   blocked <- newIORef (if defer then 2 else 0)
   connection <- newConnection (newChannel (Scripted receive sent blocked)) 16
   withContext connection input output (`action` input)
+
+-- | A source that gives the chunks that the action pulls, and ends at an empty one.
+pulling :: IO BS.ByteString -> PullSource
+pulling next = PullSource (fmap (\chunk -> Just (if BS.null chunk then Ended else Pulled chunk)) next) noWatch
 
 data Scripted = Scripted (Ptr Word8 -> Int -> IO (Maybe Int)) ([BS.ByteString] -> IO ()) (IORef Int)
 instance Link Scripted where

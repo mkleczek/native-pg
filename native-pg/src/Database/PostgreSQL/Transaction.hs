@@ -567,7 +567,6 @@ enqueue query execution cardinality skippable = do
 
 protectParameter :: Runtime -> Parameter -> Parameter
 protectParameter runtime = \case
-  ParameterStream stream -> ParameterStream stream {byteStreamNext = untrusted runtime (byteStreamNext stream)}
   ParameterBorrowedStream size source -> ParameterBorrowedStream size (Untrusted runtime source)
   parameter -> parameter
 

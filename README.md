@@ -187,8 +187,8 @@ reject overlapping access, including re-entry from a parameter producer.
 Synchronous callbacks between operations are allowed. The transaction driver
 and result consumer run on the same calling thread.
 
-For input parameters, `Encoders.Parameter` and `Streaming.ByteStream` provide
-streamed values. `ParameterBorrowedStream` accepts a known length and a pull
+For input parameters, `Encoders.Parameter` provides streamed values.
+`ParameterBorrowedStream` accepts a known length and a pull
 `Source` (`Network.Streaming.Source`); the sender pulls the next chunk only once
 the link has taken the previous one, which stays valid until then. A source
 with nothing ready is waited for on the operation's own thread. Keep its source

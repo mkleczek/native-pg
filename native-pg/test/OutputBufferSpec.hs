@@ -70,20 +70,17 @@ spec = describe "caller-owned output storage" $ do
     readIORef sent `shouldReturn` wire
     readIORef supplied `shouldReturn` True
 
-  it "limits gathered stream chunks and preserves their order across partial writes" $ do
-    remaining <- newIORef (map BS.singleton [1 .. 40])
+  it "limits gathered pieces and preserves their order across partial writes" $ do
     offers <- newIORef []
     received <- newIORef BS.empty
-    let next = atomicModifyIORef' remaining $ \case
-          [] -> ([], BS.empty)
-          chunk : rest -> (rest, chunk)
+    let values = [BS.replicate 9000 byte | byte <- [1 .. 40]]
         sender = Sender $ \chunks -> do
           modifyIORef' offers (length chunks :)
-          prefix <- evaluate (BS.copy (BS.take 5 (BS.concat chunks)))
+          prefix <- evaluate (BS.copy (BS.take 5000 (BS.concat chunks)))
           modifyIORef' received (<> prefix)
           pure (BS.length prefix)
-    channelSend (newChannel sender) Nothing (Output.stream (Output.ByteStream 40 next))
-    readIORef received `shouldReturn` BS.pack [1 .. 40]
+    channelSend (newChannel sender) Nothing (Output.outputs Output.bytes values)
+    readIORef received `shouldReturn` BS.concat values
     offered <- reverse <$> readIORef offers
     take 1 offered `shouldBe` [16]
     all (<= 16) offered `shouldBe` True
@@ -181,15 +178,12 @@ spec = describe "caller-owned output storage" $ do
 
   it "finishes exact-fit scalars across empty and zero-length stream boundaries" $ do
     buffer <- newBuffer (positiveInt @4)
-    ordinaryPulls <- newIORef (0 :: Int)
     borrowedPulls <- newIORef (0 :: Int)
     received <- newIORef BS.empty
     calls <- newIORef (0 :: Int)
-    let next = modifyIORef' ordinaryPulls (+ 1) $> BS.empty
-        source = PullSource (modifyIORef' borrowedPulls (+ 1) $> Just Ended) noWatch
+    let source = PullSource (modifyIORef' borrowedPulls (+ 1) $> Just Ended) noWatch
         output = Output.bytes BS.empty
           <> Output.word32 0x01020304
-          <> Output.stream (Output.ByteStream 0 next)
           <> Output.borrowedStream 0 source
           <> Output.bytes BS.empty
           <> Output.word16 0x0506 <> Output.word16 0x0708
@@ -202,7 +196,6 @@ spec = describe "caller-owned output storage" $ do
           pure (BS.length prefix)
     channelSend (newChannel sender) (Just (outputBufferFrom buffer)) output
     readIORef received `shouldReturn` "\1\2\3\4\5\6\7\8"
-    readIORef ordinaryPulls `shouldReturn` 1
     readIORef borrowedPulls `shouldReturn` 1
     channelSend (newChannel sender) (Just (outputBufferFrom buffer)) mempty
     readIORef calls `shouldReturn` 16
@@ -210,15 +203,11 @@ spec = describe "caller-owned output storage" $ do
   it "resumes mixed fields and scoped streams in four bytes across blocked sends" $ do
     buffer <- newBuffer (positiveInt @4)
     borrowed <- newBuffer (positiveInt @4)
-    ordinary <- newIORef ["stream", "!", ""]
     pulls <- newIORef (0 :: Int)
     received <- newIORef BS.empty
     calls <- newIORef (0 :: Int)
     let beforeBorrowed = "\1\2\3\4xyspill\5\6stream!\7"
         expected = beforeBorrowed <> "loan" <> "\8\9\10\11"
-        next = atomicModifyIORef' ordinary $ \case
-          [] -> ([], BS.empty)
-          chunk : rest -> (rest, chunk)
         -- The chunk ends with the next pull, by when the link has taken it.
         source = PullSource pullChunk noWatch
         pullChunk = do
@@ -234,7 +223,7 @@ spec = describe "caller-owned output storage" $ do
                 BS.useAsCString "loan" $ \origin -> copyBytes pointer (castPtr origin) 4
               pure (Just (Pulled (BSI.BS (bufferMemory borrowed) 4)))
         output = Output.word32 0x01020304 <> Output.bytes "xy" <> Output.bytes "spill" <> Output.word16 0x0506
-          <> Output.stream (Output.ByteStream 7 next) <> Output.word8 7
+          <> Output.bytes "stream!" <> Output.word8 7
           <> Output.borrowedStream 4 source <> Output.word32 0x08090a0b
         sender = Sender $ \chunks -> do
           offered <- evaluate (BS.copy (BS.concat chunks))

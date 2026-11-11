@@ -80,7 +80,6 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Output
     outputCopied,
     outputLength,
     outputs,
-    stream,
     borrowedStream,
     word16,
     word32,
@@ -667,7 +666,6 @@ instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
   serializeField Nothing = int32 (-1)
   serializeField (Just (ParameterBytes value)) = int32 (parameterLengthAsInt32 (BS.length value)) <> bytes value
   serializeField (Just (ParameterChunks chunks)) = int32 (parameterLengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
-  serializeField (Just (ParameterStream source)) = int32 (parameterLengthAsInt32 (byteStreamLength source)) <> stream source
   serializeField (Just (ParameterBorrowedStream count source)) = int32 (parameterLengthAsInt32 count) <> borrowedStream count source
   {-# INLINE serializeField #-}
 

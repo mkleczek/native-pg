@@ -8,7 +8,7 @@ import Control.Exception (IOException, throwIO, try)
 import Control.Monad (forM_, void)
 import qualified Data.ByteString as BS
 import Data.Either (isLeft)
-import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import FakeStreams
 import Foreign.ForeignPtr (withForeignPtr)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
@@ -197,6 +197,15 @@ spec = describe "the gathering sender" $ do
       map length <$> linkOffers link `shouldReturn` [16, 16, 8]
       linkReceived link `shouldReturn` BS.concat values
 
+    it "offers at most 16 pieces across partial writes, and keeps their order" $ do
+      link <- newFakeLink (repeat 5000)
+      let values = [BS.replicate 9000 byte | byte <- [1 .. 40]]
+      sendAll link =<< unsent Nothing (Output.outputs Output.bytes values)
+      linkReceived link `shouldReturn` BS.concat values
+      offered <- map length <$> linkOffers link
+      take 1 offered `shouldBe` [16]
+      all (<= 16) offered `shouldBe` True
+
     it "gathers a chunk as the sixteenth piece" $ do
       link <- newFakeLink []
       source <- newFakeSource [Pulled "hello", Ended]
@@ -245,30 +254,6 @@ spec = describe "the gathering sender" $ do
           link <- newFakeLink (repeat accepts)
           sendAll link =<< unsent (Just (outputBufferFrom buffer)) output
           linkReceived link `shouldReturn` staticBytes output
-
-  describe "owned streams" $ do
-    it "limits gathered chunks and preserves their order across partial writes" $ do
-      remaining <- newIORef (map BS.singleton [1 .. 40])
-      let next = atomicModifyIORef' remaining $ \case
-            [] -> ([], BS.empty)
-            chunk : rest -> (rest, chunk)
-      link <- newFakeLink (repeat 5)
-      sendAll link =<< unsent Nothing (Output.stream (Output.ByteStream 40 next))
-      linkReceived link `shouldReturn` BS.pack [1 .. 40]
-      offered <- map length <$> linkOffers link
-      take 1 offered `shouldBe` [16]
-      all (<= 16) offered `shouldBe` True
-
-    it "rejects a stream that gives a different length than it declared" $ do
-      let streamOf declared chunks = do
-            remaining <- newIORef chunks
-            link <- newFakeLink []
-            let next = atomicModifyIORef' remaining $ \case
-                  [] -> ([], BS.empty)
-                  chunk : rest -> (rest, chunk)
-            void (sendSome link =<< unsent Nothing (Output.stream (Output.ByteStream declared next)))
-      streamOf 5 ["abc"] `shouldSatisfy` P.throws (P.con (StreamLengthError (P.eq 5) (P.eq 3)))
-      streamOf 5 ["abc", "def"] `shouldSatisfy` P.throws (P.con (StreamLengthError (P.eq 5) (P.eq 6)))
 
   describe "pushing output until a stall" $ do
     it "only flushes when nothing is unsent, and is done once it has" $ do

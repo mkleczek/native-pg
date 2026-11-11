@@ -24,6 +24,7 @@ import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
 import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Internal.Protocol
 import FeedSupport (staticBytes)
+import PullSourceTestSupport (PullSource (..), noWatch)
 import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputBuffer, InputSource (..), emptyInputBuffer, runInput)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
@@ -33,6 +34,7 @@ import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions, serverEndPoint)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
+import Network.Streaming.Source (Pulled (..))
 import Skeletest
 import qualified Skeletest.Predicate as P
 
@@ -456,8 +458,8 @@ spec = do
       paramView (Encoders.rawParam Encoders.rawJsonb (Just (ParameterBytes "{}"))) `shouldBe` (Just 3802, TextFormat, Just "{}")
       paramView (Encoders.rawParam Encoders.rawBytea (Just (ParameterBytes "\0"))) `shouldBe` (Just 17, BinaryFormat, Just "\0")
       paramView (Encoders.rawParam Encoders.rawUnknown Nothing) `shouldBe` (Just 705, TextFormat, Nothing)
-      case Encoders.rawParam Encoders.rawJsonb (Just (ParameterStream (ByteStream 2 (pure "{}")))) of
-        Tx.Param oid format (Just (ParameterStream stream)) -> (oid, format, byteStreamLength stream) `shouldBe` (Just 3802, TextFormat, 2)
+      case Encoders.rawParam Encoders.rawJsonb (Just (ParameterBorrowedStream 2 (PullSource (pure (Just Ended)) noWatch))) of
+        Tx.Param oid format (Just (ParameterBorrowedStream size _)) -> (oid, format, size) `shouldBe` (Just 3802, TextFormat, 2)
         _ -> failTest "the parameter isn't streamed"
     it "sends a one-dimensional array of the elements' type" $
       paramView (Encoders.param (Encoders.nonNullable (Encoders.foldableArray (Encoders.nonNullable Encoders.text))) ["a", "bc"])
@@ -632,7 +634,6 @@ paramView :: Tx.Param -> (Maybe Word32, FormatCode, Maybe ByteString)
 paramView (Tx.Param oid format value) = (oid, format, bytes <$> value)
   where
     bytes (ParameterBytes strict) = strict
-    bytes (ParameterStream _) = error "a streamed parameter"
     bytes (ParameterBorrowedStream _ _) = error "a borrowed streamed parameter"
     bytes (ParameterChunks chunks) = BS.concat chunks
 

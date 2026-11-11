@@ -120,9 +120,8 @@ copied length, writer), `Writer`, `WriteResult` (`Finished`, `NeedSpace`,
 `Yield`), scalar writers in network byte order, `bytes` with its copy
 threshold, `outputs`. The resume rules stay as in "Bounded serialization".
 
-- **Uncopied parts:** `UncopiedBytes ByteString`, `UncopiedOwned` (today's
-  `ByteStream`, owned chunks) and `UncopiedSource` (a declared length and a
-  borrowed source, below).
+- **Uncopied parts:** `UncopiedBytes ByteString` and `UncopiedSource` (a declared
+  length and a borrowed source, below).
 - **Stays in native-pg:** `cstring`, length prefixes, `Parameter` and the
   message codecs, all built on the moved core.
 - **New in Warp:** the status line, headers, and chunked framing (size line

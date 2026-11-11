@@ -19,7 +19,6 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Output
     int32,
     bytes,
     cstring,
-    stream,
     borrowedStream,
   )
 where

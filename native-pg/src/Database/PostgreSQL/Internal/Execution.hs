@@ -193,7 +193,6 @@ parsesOnly execution = case executionStatement execution of
 streamsParameter :: Execution -> Bool
 streamsParameter = any streamed . executionParameters
   where
-    streamed (Just (ParameterStream _)) = True
     streamed (Just (ParameterBorrowedStream _ _)) = True
     streamed _ = False
 

@@ -12,7 +12,7 @@ import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol (Parameter (..), pattern Sync, serialize)
-import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), Output, serializeField)
+import Database.PostgreSQL.Internal.Protocol.Codec (Output, serializeField)
 import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (RemainingBytesAtom, MaybeBytes32Atom))
 import Database.PostgreSQL.Internal.Context (newConnection, newOwnedContext)
@@ -27,7 +27,9 @@ import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr)
 import GHC.Conc (retry)
 import Network.Streaming.Sender (Unsent, unsent, unsentEmpty)
+import Network.Streaming.Source (Pulled (..))
 import Network.Streaming.Watch (Watch (..), readyNow)
+import PullSourceTestSupport (PullSource (..), noWatch)
 import System.Timeout (timeout)
 import Skeletest
 import qualified Skeletest.Predicate as P
@@ -122,11 +124,11 @@ spec = describe "channels over a link without a socket" $ do
       let payload = BS.replicate 600000 42
       checkGather (serializeField @ByteString @'RemainingBytesAtom payload) payload
 
-  it "splits a large stream chunk without losing its partial-write suffix" $ do
+  it "splits a large borrowed chunk without losing its partial-write suffix" $ do
       let payload = BS.replicate 600000 61
-      next <- newIORef payload
-      let source = ByteStream (BS.length payload) (readIORef next <* writeIORef next BS.empty)
-          output = serializeField @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterStream source))
+      next <- newIORef (Pulled payload)
+      let source = PullSource (Just <$> (readIORef next <* writeIORef next Ended)) noWatch
+          output = serializeField @(Maybe Parameter) @'MaybeBytes32Atom (Just (ParameterBorrowedStream (BS.length payload) source))
       checkGather output ("\0\9'\192" <> payload)
 
   it "closes the channel once when sending Terminate throws" $

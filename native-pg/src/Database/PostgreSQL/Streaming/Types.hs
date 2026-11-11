@@ -12,7 +12,6 @@ data Parameter
   | -- | Sent one after another, each from where it is, as the serializer sends a
     -- long one, so that they aren't copied into one first.
     ParameterChunks [ByteString]
-  | ParameterStream ByteStream
   | -- | Declared length and a source, pulled as the chunks are sent. A chunk
     -- remains valid until the source is pulled again, which happens once the
     -- link has taken it.

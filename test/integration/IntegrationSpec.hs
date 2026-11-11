@@ -52,6 +52,7 @@ import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
+import Network.Streaming.Source (Pulled (..), Source (..))
 import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive)
 import System.FilePath (takeDirectory, (</>))
 import System.Mem (performMajorGC)
@@ -400,7 +401,7 @@ spec socketPath port = do
       (result, _) <-
         execute
           session
-          (Execution (Unprepared "SELECT $1::text = repeat('0123456789abcdef', 524288)" []) [] [Just (ParameterStream (ByteStream (chunks * BS.length payloadPattern) source))] [])
+          (Execution (Unprepared "SELECT $1::text = repeat('0123456789abcdef', 524288)" []) [] [Just (ParameterBorrowedStream (chunks * BS.length payloadPattern) source)] [])
           (\rows row -> (: rows) <$> columns row)
           []
       result `shouldBe` Right ([[Just "t"]], "SELECT 1")
@@ -420,16 +421,16 @@ spec socketPath port = do
       prepare session "length_of" "SELECT length($1::text)" [] `shouldReturn` (Right (), TxIdle)
       let streamed name = do
             source <- chunkSource ["abc", "def"]
-            collectRows session (Execution (Prepared name) [] [Just (ParameterStream (ByteStream 6 source))] [])
+            collectRows session (Execution (Prepared name) [] [Just (ParameterBorrowedStream 6 source)] [])
       streamed "insert_streamed" `shouldReturn` (Right ([], "INSERT 0 1"), TxIdle)
       streamed "length_of" `shouldReturn` (Right ([[Just "6"]], "SELECT 1"), TxIdle)
     it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $ withSession $ \session -> do
       _ <- query session "SET statement_timeout = '200ms'" []
       prepare session "slow_length" "SELECT length($1::text)" [] `shouldReturn` (Right (), TxIdle)
       let slowly target = do
-            source <- chunkSource (replicate 4 (Char8.replicate 1000 'y'))
-            let delayed = threadDelay 150000 *> source
-            (result, _) <- execute session (Execution target [] [Just (ParameterStream (ByteStream 4000 delayed))] []) (\() _ -> pure ()) ()
+            ChunkSource pulling <- chunkSource (replicate 4 (Char8.replicate 1000 'y'))
+            let delayed = ChunkSource (threadDelay 150000 *> pulling)
+            (result, _) <- execute session (Execution target [] [Just (ParameterBorrowedStream 4000 delayed)] []) (\() _ -> pure ()) ()
             pure (either errorCode (const Nothing) result)
       slowly (Unprepared "SELECT length($1::text)" []) `shouldReturn` Just "57014"
       slowly (Prepared "slow_length") `shouldReturn` Just "57014"
@@ -864,15 +865,15 @@ spec socketPath port = do
   describe "execute (failures)" $ do
     it "breaks the session when a parameter stream is shorter than declared" $ withSession $ \session -> do
       source <- chunkSource ["short"]
-      let short = Execution (Unprepared "SELECT $1::text" []) [] [Just (ParameterStream (ByteStream 10 source))] []
+      let short = Execution (Unprepared "SELECT $1::text" []) [] [Just (ParameterBorrowedStream 10 source)] []
       try (execute session short (\() _ -> pure ()) ()) >>= \case
         Left (_ :: StreamLengthError) -> pure ()
         Right _ -> failTest "expected a StreamLengthError"
       query session "SELECT 1" [] `shouldSatisfy` P.throws sessionUnusable
     it "throws a parameter stream's failure, and breaks the session" $ withSession $ \session -> do
       sent <- newIORef False
-      let source = readIORef sent >>= \done -> if done then throwIO (userError "the client went away") else writeIORef sent True $> Char8.replicate 1000000 'y'
-          failing = Execution (Unprepared "SELECT length($1::text)" []) [] [Just (ParameterStream (ByteStream 2000000 source))] []
+      let source = ChunkSource (readIORef sent >>= \done -> if done then throwIO (userError "the client went away") else writeIORef sent True $> Pulled (Char8.replicate 1000000 'y'))
+          failing = Execution (Unprepared "SELECT length($1::text)" []) [] [Just (ParameterBorrowedStream 2000000 source)] []
       try (execute session failing (\() _ -> pure ()) ()) >>= \case
         Left (_ :: IOException) -> pure ()
         Right _ -> failTest "expected the stream's failure"
@@ -1017,14 +1018,20 @@ columns row = do
       (Just value :) <$> columns row
 
 -- | A source that gives the chunks, then the end.
-chunkSource :: [ByteString] -> IO (IO ByteString)
+-- | A source that pulls as its action says, and never has to wait.
+newtype ChunkSource = ChunkSource (IO Pulled)
+
+instance Source ChunkSource where
+  pullWith (ChunkSource pulling) ready _ = pulling >>= ready
+
+chunkSource :: [ByteString] -> IO ChunkSource
 chunkSource chunks = do
   remaining <- newIORef chunks
-  pure $ do
+  pure . ChunkSource $ do
     queued <- readIORef remaining
     case queued of
-      [] -> pure BS.empty
-      chunk : others -> chunk <$ writeIORef remaining others
+      [] -> pure Ended
+      chunk : others -> Pulled chunk <$ writeIORef remaining others
 
 -- | Live heap bytes after a major collection.
 liveBytes :: IO Int
