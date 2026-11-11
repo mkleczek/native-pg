@@ -1,27 +1,31 @@
 # directions: a prototype of I/O by data direction
 
-A fresh package that shows the design of `docs/DIRECTIONS.md` with commands
-instead of a monad, apart from the code that would use it. Nothing in
-native-pg, streaming-io or Warp depends on it.
+A fresh package that shows the arrow design, apart from the code that would use
+it. Nothing in native-pg, streaming-io or Warp depends on it.
 
-- **Stages** (`Network.Directions.Stage`): a stage's state is data and its step
-  a function fixed when it is made. A step never waits: it moves what it can
-  and returns one of three commands, `Again`, `Await` with what it waits for
-  (its input, room in its output, or an event outside the direction), or
-  `Done`. Stages compose with `~>` through a bounded gap.
-- **Directions** are stages whose first stage reads nothing and whose last
-  writes nothing, such as `receiving link ~> sending other`.
-- **Drivers** (`Network.Directions.Drive`) are the only code that waits, and
-  they differ only in how: `runThreads` gives each direction a thread,
-  `runLoop` runs all of them on one thread, and `runSimulation` runs them on
-  one thread in an order a seed chooses, never waits, and reports directions
-  that wait for each other.
-- **Ends** (`Network.Directions.Ends`): stages over streaming-io's `Link`, as
-  it is, plus `HalfClose`, which it lacks. `Network.Directions.Simulated` is an
-  in-memory link whose lanes hold a set number of bytes.
-- **The proxy** (`Network.Directions.Proxy`): a direction each way, an echo
-  server, a client in two directions, and the same client as one stage, which
-  deadlocks once its request outgrows the buffers on the way.
+- **The classes** (`Network.Directions.Classes`): `Link arr link`, whose calls
+  block in the arrow that runs them (`receive`, `sendAll`, `shutdownSend`,
+  `close`); and what an arrow can do: `Effect` (`now`, an action that never
+  waits), `Block` (wait until a watch fires) and `Concurrent` (two arrows at
+  once). None has a superclass: instances and users add what they need.
+- **A link's instance is written once, for any arrow:** the socket's and the
+  simulated end's are `(ArrowChoice arr, Effect arr, Block arr) => Link arr _`,
+  a try with `now`, and a `block` on the link's watch while nothing is ready.
+  The tries are streaming-io's, as they are, plus `HalfClose`, which they lack.
+  `Network.Directions.Simulated` is an in-memory link whose lanes hold a set
+  number of bytes.
+- **Two arrows provide the capabilities:**
+  - `Threads` (`Network.Directions.Threads`), a function to IO: `block` blocks
+    the thread, and each half of a concurrent pair has a thread of its own.
+  - `Loop` (`Network.Directions.Loop`), a program as data, whose only
+    primitives are `now` and `block`. `runLoop` runs all of its concurrent
+    parts on one thread; a part that blocks is the rest of its program, as
+    data. `runSimulation` runs the same program in an order a seed chooses,
+    never waits, and reports parts that wait for each other.
+- **The proxy** (`Network.Directions.Proxy`): `pump`, written once with
+  `ArrowChoice` and `Link`; the proxy, a pump each way; an echo server; a
+  client in two directions, and the same client in one, which deadlocks once
+  its request outgrows the buffers on the way.
 
 Run from the repository's root, in its `nix-shell`:
 

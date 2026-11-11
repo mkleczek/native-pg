@@ -8,13 +8,14 @@ module Network.Directions.Simulated
   )
 where
 
+import Control.Arrow (ArrowChoice)
 import Control.Concurrent.STM (STM, TVar, atomically, check, newTVarIO, readTVar, writeTVar)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
-import Network.Directions.Ends (HalfClose (..))
-import Network.Streaming.Link (Link (..))
+import Network.Directions.Classes
+import qualified Network.Streaming.Link as S
 import Network.Streaming.Watch (Watch (..))
 
 -- | One way of a connection: the bytes sent and not yet received, whether the
@@ -37,7 +38,7 @@ connect capacity = do
   where
     newLane = Lane <$> newTVarIO BS.empty <*> newTVarIO False <*> pure capacity
 
-instance Link SimEnd where
+instance S.Link SimEnd where
   watchReadable end = pure (Watch (readable (endIn end)) (pure ()))
   watchWritable end = pure (Watch (writable (endOut end)) (pure ()))
   receiveReady end pointer size = do
@@ -46,8 +47,8 @@ instance Link SimEnd where
       if BS.null bytes
         then (\ended -> if ended then Just BS.empty else Nothing) <$> readTVar (laneEnded lane)
         else do
-          let (now, rest) = BS.splitAt size bytes
-          Just now <$ writeTVar (laneBytes lane) rest
+          let (part, rest) = BS.splitAt size bytes
+          Just part <$ writeTVar (laneBytes lane) rest
     case taken of
       Nothing -> pure Nothing
       Just chunk -> Just (BS.length chunk) <$ BSU.unsafeUseAsCStringLen chunk (\(from, count) -> copyBytes pointer (castPtr from) count)
@@ -55,17 +56,24 @@ instance Link SimEnd where
       lane = endIn end
   sendReady end pieces = atomically $ do
     bytes <- readTVar (laneBytes lane)
-    -- The pieces may be views of a stage's buffer, so the lane keeps a copy,
+    -- The pieces may be views of a direction's buffer, so the lane keeps a copy,
     -- made now.
     let !chunk = BS.copy (BS.take (laneCapacity lane - BS.length bytes) (BS.concat pieces))
     BS.length chunk <$ (writeTVar (laneBytes lane) $! bytes <> chunk)
     where
       lane = endOut end
   flushReady _ = pure True
-  closeLink = shutdownSend
+  closeLink = halfClose
 
 instance HalfClose SimEnd where
-  shutdownSend end = atomically (writeTVar (laneEnded (endOut end)) True)
+  halfClose end = atomically (writeTVar (laneEnded (endOut end)) True)
+
+-- | A simulated end, in any arrow that can run its tries and block.
+instance (ArrowChoice arr, Effect arr, Block arr) => Link arr SimEnd where
+  receive = receiveTrying
+  sendAll = sendAllTrying
+  shutdownSend end = now (\() -> halfClose end)
+  close end = now (\() -> S.closeLink end)
 
 readable :: Lane -> STM ()
 readable lane = do

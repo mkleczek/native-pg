@@ -11,9 +11,9 @@ library
   default-language: GHC2021
   hs-source-dirs: src
   ghc-options: -Wall
-  exposed-modules: Network.Directions.Stage
-                   Network.Directions.Drive
-                   Network.Directions.Ends
+  exposed-modules: Network.Directions.Classes
+                   Network.Directions.Threads
+                   Network.Directions.Loop
                    Network.Directions.Simulated
                    Network.Directions.Proxy
   build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, network >=3.1 && <3.3, stm >=2.5 && <2.6, streaming-io
@@ -33,4 +33,4 @@ executable directions-bench
   hs-source-dirs: bench
   main-is: Main.hs
   ghc-options: -Wall -threaded -rtsopts
-  build-depends: base, bytestring, network, directions, streaming-io
+  build-depends: base, network, directions

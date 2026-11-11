@@ -1,0 +1,246 @@
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE LambdaCase #-}
+
+-- | Every concurrent part on one thread: an arrow is a program as data, which
+-- a scheduler runs. A part that waits is the rest of its program and the value
+-- going into it, so nothing is captured when it waits. The simulation runs the
+-- same programs in an order a seed chooses.
+module Network.Directions.Loop
+  ( Loop,
+    Report (..),
+    runLoop,
+    Outcome (..),
+    Simulated (..),
+    runSimulation,
+  )
+where
+
+import Control.Arrow (Arrow (..), ArrowChoice (..))
+import Control.Category (Category (..))
+import Control.Concurrent.STM (atomically, orElse, retry)
+import Control.Exception (bracket, mask, onException, uninterruptibleMask_)
+import Control.Monad (filterM)
+import Data.Bits (shiftR, xor)
+import qualified Data.Function as Function
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (partition, sort)
+import Data.Word (Word64)
+import Network.Directions.Classes
+import Network.Streaming.Watch (Watch (..))
+import Prelude hiding (id, (.))
+
+-- | A program as data: functions, sequences, choices and concurrent pairs, and
+-- its two primitives, an action that never waits and a block until an event
+-- fires.
+data Loop a b where
+  Arr :: (a -> b) -> Loop a b
+  Seq :: Loop a b -> Loop b c -> Loop a c
+  First :: Loop a b -> Loop (a, c) (b, c)
+  Choose :: Loop a b -> Loop (Either a c) (Either b c)
+  Both :: Loop a b -> Loop a c -> Loop a (b, c)
+  Now :: (a -> IO b) -> Loop a b
+  Block :: Loop (IO Watch) ()
+
+instance Category Loop where
+  id = Arr Function.id
+  (.) = flip Seq
+
+instance Arrow Loop where
+  arr = Arr
+  first = First
+
+instance ArrowChoice Loop where
+  left = Choose
+
+instance Concurrent Loop where
+  concurrently = Both
+
+instance Effect Loop where
+  now = Now
+
+-- | Suspends the part: the scheduler goes on with it once the watch fires.
+instance Block Loop where
+  block = Block
+
+-- | A part of a running program: a program with its input, or a value for
+-- what follows, and what follows.
+data Process r where
+  Run :: Loop a b -> a -> Frames b r -> Process r
+  Give :: b -> Frames b r -> Process r
+
+-- | What follows a program, as data: the rest of a sequence, the other half of
+-- a pair, a choice to wrap, or the join of a concurrent pair.
+data Frames b r where
+  Return :: Frames r r
+  Then :: Loop b c -> Frames c r -> Frames b r
+  Beside :: c -> Frames (b, c) r -> Frames b r
+  OnLeft :: Frames (Either b c) r -> Frames b r
+  JoinFirst :: IORef (Half b d) -> Frames (b, d) r -> Frames b r
+  JoinSecond :: IORef (Half b d) -> Frames (b, d) r -> Frames d r
+
+-- | What a concurrent pair has of its halves' results.
+data Half b d = Neither | FirstDone b | SecondDone d
+
+-- | What a part came to.
+data Advanced r
+  = Finished r
+  | -- | It ended at a join, which the other half goes on from.
+    Ended
+  | -- | It used its steps, and can go on.
+    Yielded (Process r)
+  | Forked (Process r) (Process r)
+  | Waits (IO Watch) (Process r)
+
+-- | Runs a part until it waits, forks, ends, or has taken this many steps of
+-- its primitives: what it came to, and how many steps it took.
+advance :: forall r. Int -> Process r -> IO (Int, Advanced r)
+advance fuel = go 0
+  where
+    go :: Int -> Process r -> IO (Int, Advanced r)
+    go steps process
+      | steps >= fuel = pure (steps, Yielded process)
+      | otherwise = case process of
+          Run program input frames -> case program of
+            Arr function -> go steps (Give (function input) frames)
+            Seq before after -> go steps (Run before input (Then after frames))
+            First inner -> case input of
+              (a, c) -> go steps (Run inner a (Beside c frames))
+            Choose inner -> case input of
+              Left a -> go steps (Run inner a (OnLeft frames))
+              Right c -> go steps (Give (Right c) frames)
+            Both one two -> do
+              joined <- newIORef Neither
+              pure (steps, Forked (Run one input (JoinFirst joined frames)) (Run two input (JoinSecond joined frames)))
+            Now action -> action input >>= \output -> go (steps + 1) (Give output frames)
+            Block -> pure (steps + 1, Waits input (Give () frames))
+          Give value frames -> case frames of
+            Return -> pure (steps, Finished value)
+            Then next rest -> go steps (Run next value rest)
+            Beside c rest -> go steps (Give (value, c) rest)
+            OnLeft rest -> go steps (Give (Left value) rest)
+            JoinFirst joined rest ->
+              readIORef joined >>= \case
+                SecondDone d -> go steps (Give (value, d) rest)
+                _ -> (steps, Ended) <$ writeIORef joined (FirstDone value)
+            JoinSecond joined rest ->
+              readIORef joined >>= \case
+                FirstDone b -> go steps (Give (b, value) rest)
+                _ -> (steps, Ended) <$ writeIORef joined (SecondDone value)
+
+-- | What a run did: how many steps of primitives, and how many waits.
+data Report = Report {reportSteps :: !Int, reportWaits :: !Int}
+  deriving (Eq, Show)
+
+-- | Runs the program and all of its concurrent parts on this thread. It runs
+-- each part that can go on in turn, for up to 64 steps, and when none can,
+-- waits once for all of their watches.
+runLoop :: Loop a b -> a -> IO (b, Report)
+runLoop program input = go (Report 0 0) [Run program input Return] []
+  where
+    go report ready waiting = case ready of
+      process : others -> do
+        (steps, advanced) <- advance 64 process
+        let report' = report {reportSteps = reportSteps report + steps}
+        case advanced of
+          Finished value -> pure (value, report')
+          Ended -> go report' others waiting
+          Yielded process' -> go report' (others <> [process']) waiting
+          Forked one two -> go report' (others <> [one, two]) waiting
+          Waits watch process' -> go report' others ((watch, process') : waiting)
+      []
+        | null waiting -> ioError (userError "runLoop: the program ended without a result")
+        | otherwise -> do
+            fired <- awaitFired (zip (map fst waiting) [0 :: Int ..])
+            let (wake, still) = partition ((`elem` fired) . fst) (zip [0 ..] waiting)
+            go report {reportWaits = reportWaits report + 1} (map (snd . snd) wake) (map snd still)
+
+-- | How a simulation ended.
+data Outcome b
+  = Completed b
+  | -- | These parts wait for each other: none of their watches can fire.
+    Deadlocked [Int]
+  | -- | It took the most steps it was allowed.
+    GaveUp
+  deriving (Eq, Show)
+
+data Simulated b = Simulated
+  { simulatedOutcome :: Outcome b,
+    simulatedReport :: Report,
+    -- | The parts, by number, in the order they stepped.
+    simulatedTrace :: [Int]
+  }
+
+-- | Runs the program on this thread in an order the seed chooses: one step of
+-- a primitive at a time, of a part picked at random among those that can go
+-- on, up to the given number of steps. It never waits: when no part can go
+-- on, it looks at their watches and goes on with those that have fired; if
+-- none has, the parts wait for each other, which it reports. Its links must
+-- be simulated ones, whose watches depend only on what the parts did, so
+-- that a seed always gives the same run.
+runSimulation :: Word64 -> Int -> Loop a b -> a -> IO (Simulated b)
+runSimulation seed limit program input = go seed 1 (Report 0 0) [] [(0, Run program input Return)] []
+  where
+    go random next report trace ready waiting
+      | reportSteps report >= limit = finish GaveUp
+      | null ready && null waiting = ioError (userError "runSimulation: the program ended without a result")
+      | null ready = do
+          checked <- traverse (\entry@(_, (watch, _)) -> (,) entry <$> anyFired watch) waiting
+          let (wake, still) = partition snd checked
+          if null wake
+            then finish (Deadlocked (sort (map (fst . fst) still)))
+            else go random next report {reportWaits = reportWaits report + length wake} trace [(ident, process) | ((ident, (_, process)), _) <- wake] (map fst still)
+      | otherwise = do
+          let (random', pick) = splitMix random
+              ((ident, process), others) = takeAt (fromIntegral (pick `mod` fromIntegral (length ready))) ready
+              trace' = ident : trace
+          (steps, advanced) <- advance 1 process
+          let report' = report {reportSteps = reportSteps report + steps}
+          case advanced of
+            Finished value -> pure (Simulated (Completed value) report' (reverse trace'))
+            Ended -> go random' next report' trace' others waiting
+            Yielded process' -> go random' next report' trace' ((ident, process') : others) waiting
+            Forked one two -> go random' (next + 2) report' trace' ((next, one) : (next + 1, two) : others) waiting
+            Waits watch process' -> go random' next report' trace' others ((ident, (watch, process')) : waiting)
+      where
+        finish outcome = pure (Simulated outcome report (reverse trace))
+
+-- | Registers the watches, waits until one has fired, and gives the values of
+-- all that have fired by then. It releases them all, also if it is
+-- interrupted.
+awaitFired :: [(IO Watch, a)] -> IO [a]
+awaitFired entries = mask $ \restore -> do
+  registered <- newIORef []
+  let register (make, value) = do
+        watch <- make
+        modifyIORef' registered (watch :)
+        pure (watch, value)
+      release = uninterruptibleMask_ (readIORef registered >>= mapM_ watchCancel)
+  fired <-
+    ( do
+        watches <- traverse register entries
+        restore (atomically (foldr (orElse . watchReady . fst) retry watches))
+        filterM (hasFired . fst) watches
+    )
+      `onException` release
+  map snd fired <$ release
+
+-- | Whether the event has fired, without waiting.
+anyFired :: IO Watch -> IO Bool
+anyFired make = bracket make watchCancel hasFired
+
+hasFired :: Watch -> IO Bool
+hasFired watch = atomically ((True <$ watchReady watch) `orElse` pure False)
+
+-- | The element at the index, and the others in their order.
+takeAt :: Int -> [a] -> (a, [a])
+takeAt index list = case splitAt index list of
+  (before, chosen : after) -> (chosen, before <> after)
+  (_, []) -> error "takeAt: the index is past the end"
+
+-- | SplitMix64: the next state, and a random number.
+splitMix :: Word64 -> (Word64, Word64)
+splitMix state = (state', mixed `xor` (mixed `shiftR` 31))
+  where
+    state' = state + 0x9e3779b97f4a7c15
+    z = (state' `xor` (state' `shiftR` 30)) * 0xbf58476d1ce4e5b9
+    mixed = (z `xor` (z `shiftR` 27)) * 0x94d049bb133111eb
