@@ -27,7 +27,7 @@ import Database.PostgreSQL.Session.Settings (ConnectSettings)
 import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
 import Database.PostgreSQL.Internal.Channel (Channel (..))
-import Foreign.Marshal.Alloc (allocaBytes)
+import qualified Database.PostgreSQL.Internal.Channel as Channel
 import Network.Streaming.Sender (unsent)
 
 -- | A session ready for application operations; protocol phases stay private.
@@ -86,8 +86,9 @@ checkIdle opened = mask_ $ do
     Nothing ->
       arrived >>= \case
         Right Nothing -> atomicModifyIORef' (connectionState opened) (\state -> (case state of Busy -> Idle; other -> other, Right ()))
-        Right (Just 0) -> broken "the server closed the connection"
-        Right (Just _) -> broken "the server sent a message to the idle session, as it does before ending it"
+        Right (Just received)
+          | BS.null received -> broken "the server closed the connection"
+          | otherwise -> broken "the server sent a message to the idle session, as it does before ending it"
         Left failure
           | isJust (fromException @SomeAsyncException failure) -> breakConnection opened *> throwIO failure
           | otherwise -> broken (displayException failure)
@@ -96,13 +97,13 @@ checkIdle opened = mask_ $ do
     -- What a scope read past its last reply has arrived as much as what the
     -- link holds.
     arrived = readIORef (connectionCarryOver opened) >>= \carried ->
-      bool (pure (Right (Just (BS.length carried)))) readReady (BS.null carried)
+      bool (pure (Right (Just carried))) readReady (BS.null carried)
 #if defined(mingw32_HOST_OS)
     -- Sockets block on Windows, so reading would wait: only the state is
     -- checked.
     readReady = pure (Right Nothing)
 #else
-    readReady = try @SomeException (allocaBytes 1 $ \buffer -> channelReceiveReady (connectionChannel opened) buffer 1)
+    readReady = try @SomeException (Channel.receiveReadySome (connectionChannel opened) 1)
 #endif
 
 -- | Closes a named statement. Closing one that doesn't exist isn't an
@@ -126,8 +127,8 @@ cancel settings key =
         channelSend channel Nothing (serialize (CancelRequest key))
         -- The server closes the connection once it has handled the request.
         let waitForClose = do
-              received <- allocaBytes 64 $ \buffer -> channelReceive channel pending buffer 64
-              unless (received == 0) waitForClose
+              received <- Channel.receiveSome channel pending 64
+              unless (BS.null received) waitForClose
         waitForClose `catch` \(_ :: IOException) -> pure ()
       )
       `finally` channelClose channel

@@ -21,7 +21,6 @@ import qualified Database.PostgreSQL.Internal.Execution as Session
 import qualified Database.PostgreSQL.Diagnostics as Session
 import Database.PostgreSQL.Transport
 import Database.PostgreSQL.Internal.Channel
-import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr)
 import GHC.Conc (retry)
@@ -99,9 +98,7 @@ spec = describe "channels over a link without a socket" $ do
           }
     (channel, _) <- channelWith link mempty
     current <- newIORef =<< unsent Nothing sync
-    timeout 1000000 (allocaBytes 16 $ \pointer -> do
-      count <- channelReceive channel current pointer 16
-      BS.packCStringLen (castPtr pointer, count)) `shouldReturn` Just "reply"
+    timeout 1000000 (receiveSome channel current 16) `shouldReturn` Just "reply"
     readIORef sent `shouldReturn` syncBytes
     (unsentEmpty <$> readIORef current) `shouldReturn` True
 
@@ -219,9 +216,7 @@ channelWith link output = do
   pure (newChannel link, pendingOutput)
 
 readBytes :: Channel -> IORef Unsent -> IO ByteString
-readBytes channel pending = allocaBytes 16 $ \pointer -> do
-  count <- channelReceive channel pending pointer 16
-  BS.packCStringLen (castPtr pointer, count)
+readBytes channel pending = receiveSome channel pending 16
 
 provide :: ByteString -> Ptr Word8 -> Int -> IO (Maybe Int)
 provide bytes pointer size =

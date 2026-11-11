@@ -8,16 +8,21 @@
 module Database.PostgreSQL.Internal.Channel
   ( Channel (channelReceive, channelSend, channelReceiveReady, channelPoll, channelPush, channelClose),
     newChannel,
+    receiveSome,
+    receiveReadySome,
   )
 where
 
 import Control.Exception (bracket)
 import Control.Monad (void)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Internal as BSI
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Database.PostgreSQL.Internal.Protocol.Codec (Output)
 import Database.PostgreSQL.Transport.Link
 import Foreign.Ptr (Ptr)
+import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Socket (Socket)
 import Network.Streaming.Sender
   ( OutputBuffer,
@@ -83,6 +88,20 @@ newChannel link =
     !sending = waitingStalls link
 {-# INLINABLE newChannel #-}
 {-# SPECIALIZE newChannel :: Socket -> Channel #-}
+
+-- | Reads what arrives, up to this many bytes, waiting until there is some, as
+-- 'channelReceive' does. It is empty at the end of the stream.
+receiveSome :: Channel -> IORef Unsent -> Int -> IO ByteString
+receiveSome channel pending size = BSI.createUptoN size (\buffer -> channelReceive channel pending buffer size)
+
+-- | Reads what is ready, up to this many bytes, without waiting, as
+-- 'channelReceiveReady' does: 'Nothing' if nothing is, and empty at the end of
+-- the stream.
+receiveReadySome :: Channel -> Int -> IO (Maybe ByteString)
+receiveReadySome channel size = do
+  memory <- BSI.mallocByteString size
+  received <- unsafeWithForeignPtr memory (\buffer -> channelReceiveReady channel buffer size)
+  pure $! BSI.BS memory <$> received
 
 -- | The stalls of a read: they stop for the server's input.
 readStalls :: Link link => link -> Stalls

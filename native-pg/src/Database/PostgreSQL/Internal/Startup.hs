@@ -39,10 +39,8 @@ import Database.PostgreSQL.Transport
   ( Address (..), newChannel, RootCertificates (..), ServerVerification (..),
     TlsChannel (..), TlsClient (..), TlsError, TlsSettings (..),
   )
-import Database.PostgreSQL.Internal.Channel (Channel (..))
+import Database.PostgreSQL.Internal.Channel (Channel (..), receiveSome)
 import Database.PostgreSQL.Internal.Socket (connectSocket)
-import Foreign.Marshal.Alloc (allocaBytes)
-import Foreign.Storable (peek)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 
@@ -207,9 +205,7 @@ requestTls sock = do
   pending <- newIORef =<< unsent Nothing mempty
   let channel = newChannel sock
   channelSend channel Nothing (serialize SSLRequest)
-  answer <- allocaBytes 1 $ \byte -> do
-    received <- channelReceive channel pending byte 1
-    if received == 0 then pure Nothing else Just <$> peek byte
+  answer <- fmap fst . BS.uncons <$> receiveSome channel pending 1
   case answer of
     Just 83 -> pure True
     Just 78 -> pure False

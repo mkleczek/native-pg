@@ -146,7 +146,7 @@ spec = describe "borrowed parameter streams" $ do
             bracket (unsent Nothing (borrowedStream 0 source)) discardUnsent $ \initial -> do
               pending <- newIORef initial
               void (channelPush channel pending)
-              allocaBytes 16 $ \pointer -> channelReceive channel pending pointer 16
+              receiveSome channel pending 16
       outcome <- timeout 5000000 $ do
         reader <- forkIO (void (try @SomeException upload) `finally` putMVar stopped ())
         before <- takeMVar baseline
@@ -184,7 +184,7 @@ spec = describe "borrowed parameter streams" $ do
             bracket (unsent Nothing (borrowedStream 10 source)) discardUnsent $ \initial -> do
               pending <- newIORef initial
               void (channelPush channel pending)
-              allocaBytes 16 $ \pointer -> channelReceive channel pending pointer 16
+              receiveSome channel pending 16
       outcome <- timeout 5000000 $ do
         reader <- forkIO (void (try @SomeException upload) `finally` putMVar stopped ())
         before <- takeMVar baseline
