@@ -84,9 +84,7 @@ data RowCursor = RowCursor
     -- | Unread bytes of the current column's value.
     cursorValueLeft :: !Int,
     -- | Whether the current column's value is being read already.
-    cursorValueTaken :: !Bool,
-    -- | A synchronous borrowed consumer owns the column.
-    cursorBorrowed :: !Bool
+    cursorValueTaken :: !Bool
   }
 
 data Column
@@ -101,14 +99,14 @@ startRow context rowLength columnCount = do
   unless (rowLength >= 6 && columnCount >= 0) $
     throwIO (ProtocolError ("invalid DataRow length " <> show rowLength <> " or column count " <> show columnCount))
   position <- inputPosition <$> readIORef (contextInput context)
-  cursor <- newIORef (RowCursor True 0 0 False False)
+  cursor <- newIORef (RowCursor True 0 0 False)
   pure (Row context columnCount (position + fromIntegral rowLength - 6) cursor)
 
 -- | Skips what the step left unread, so the next message can be read.
 finishRow :: Row -> IO ()
 finishRow row = do
   void (activeCursor row)
-  writeIORef (rowCursor row) (RowCursor False 0 0 True False)
+  writeIORef (rowCursor row) (RowCursor False 0 0 True)
   position <- inputPosition <$> readIORef (contextInput (rowContext row))
   inRow row (skipInput (rowEnd row - position))
 
@@ -143,10 +141,10 @@ nextColumn row = do
       let column = cursorColumn cursor + 1
       case compare size (-1) of
         EQ -> do
-          writeIORef (rowCursor row) (RowCursor True column 0 True False)
+          writeIORef (rowCursor row) (RowCursor True column 0 True)
           pure (Just NullColumn)
         GT -> do
-          writeIORef (rowCursor row) (RowCursor True column (fromIntegral size) False False)
+          writeIORef (rowCursor row) (RowCursor True column (fromIntegral size) False)
           pure (Just (Column (fromIntegral size)))
         LT -> throwIO (ProtocolError ("invalid column length " <> show size))
 
@@ -269,7 +267,7 @@ decodeRow row function = do
     Left failure -> pure (Left failure)
     Right () -> do
       decoded <- inRow row (applyColumns @columns 1 function)
-      writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True False)
+      writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True)
       either (pure . Left) (fmap Right) decoded
 -- Inlined so that each call site unrolls the decoding of its own columns.
 {-# INLINE decodeRow #-}
@@ -291,14 +289,14 @@ decodeRowStreamingUsing makeStream row function = do
             pure (Right (fromIntegral size, continue))
       case decoded of
         Left failure -> do
-          writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True False)
+          writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True)
           pure (Left failure)
         Right (size, continue)
           | size < 0 -> do
-              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True False)
+              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) 0 True)
               Right <$> continue Nothing
           | otherwise -> do
-              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) size False False)
+              writeIORef (rowCursor row) (RowCursor True (rowColumnCount row) size False)
               stream <- makeStream row
               Right <$> continue (Just stream)
 {-# INLINE decodeRowStreamingUsing #-}
@@ -320,7 +318,6 @@ activeCursor row = do
   ensureContextActive (rowContext row)
   cursor <- readIORef (rowCursor row)
   unless (cursorActive cursor) $ throwIO (RowMisuse "a row was used after its step returned or a read failed")
-  when (cursorBorrowed cursor) $ throwIO (RowMisuse "a row was used during its column callback")
   pure cursor
 
 untakenCursor :: Row -> IO RowCursor
