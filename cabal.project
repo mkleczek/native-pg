@@ -3,4 +3,5 @@ packages: .
           streaming-io
           native-pg
           native-pg-tls
+          directions
 tests: true

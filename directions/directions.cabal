@@ -1,0 +1,36 @@
+cabal-version: 3.0
+name: directions
+version: 0.1.0.0
+synopsis: Prototype: I/O by data direction, as stages that never wait and drivers that do
+license: AGPL-3.0-or-later
+license-file: LICENSE
+build-type: Simple
+extra-doc-files: README.md
+
+library
+  default-language: GHC2021
+  hs-source-dirs: src
+  ghc-options: -Wall
+  exposed-modules: Network.Directions.Stage
+                   Network.Directions.Drive
+                   Network.Directions.Ends
+                   Network.Directions.Simulated
+                   Network.Directions.Proxy
+  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, network >=3.1 && <3.3, stm >=2.5 && <2.6, streaming-io
+
+test-suite directions-spec
+  type: exitcode-stdio-1.0
+  default-language: GHC2021
+  hs-source-dirs: test
+  main-is: Main.hs
+  other-modules: DirectionsSpec
+  ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
+  build-depends: base, bytestring, network, directions, skeletest >=0.4.2 && <0.5
+
+executable directions-bench
+  default-language: GHC2021
+  hs-source-dirs: bench
+  main-is: Main.hs
+  ghc-options: -Wall -threaded -rtsopts
+  build-depends: base, bytestring, network, directions, streaming-io
