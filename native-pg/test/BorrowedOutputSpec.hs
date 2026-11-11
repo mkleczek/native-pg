@@ -32,6 +32,7 @@ import qualified Foreign.Ptr
 import GHC.Conc (retry)
 import Network.Streaming.Buffer (bufferMemory, newBuffer)
 import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Sender (discardUnsent, unsent)
 import Network.Streaming.Source (Pulled (..), Source)
 import Network.Streaming.Watch (Watch (..), readyNow)
 import PullSourceTestSupport

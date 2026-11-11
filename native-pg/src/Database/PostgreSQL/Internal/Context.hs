@@ -48,12 +48,13 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
+import Network.Streaming.Sender (OutputBuffer, Unsent, discardUnsent, newOutputBuffer, outputBufferFrom, outputBufferPerOutput, unsent, unsentEmpty)
 import Network.Streaming.Watch (Watch, anyWatch)
 import Database.PostgreSQL.Diagnostics (ConnectionError (..))
 import Database.PostgreSQL.Internal.Protocol.Codec (Input, InputError (..), Output)
 import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputBuffer, InputSource (..), Poll, Receiver (..), Stall (..), borrowInputWaiting, emptyInputBuffer, pollInput, releaseInputBuffer, requestInputBuffer, reusableInputBuffer, runInputUntil, unconsumedBytes, unconsumedInput, watchInputLoan)
 import Database.PostgreSQL.Internal.Protocol.Messages (Notification)
-import Database.PostgreSQL.Internal.Channel (Channel (..), OutputBuffer, Unsent, outputBufferFrom, outputBufferPerOutput, unsent, unsentEmpty, newOutputBuffer, discardUnsent)
+import Database.PostgreSQL.Internal.Channel (Channel (..))
 
 data Connection = Connection
   { -- | Input and output over the socket, or TLS over it.

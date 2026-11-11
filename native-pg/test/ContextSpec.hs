@@ -26,6 +26,7 @@ import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Data.Word (Word8)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Buffer (Buffer (..), newBuffer)
+import Network.Streaming.Sender (discardUnsent)
 import Network.Streaming.Source (Pulled (..))
 import Network.Streaming.Watch (readyNow)
 import PullSourceTestSupport

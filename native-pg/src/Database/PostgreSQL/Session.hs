@@ -27,8 +27,9 @@ import Database.PostgreSQL.Session.Settings (ConnectSettings)
 import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
-import Database.PostgreSQL.Internal.Channel (Channel (..), unsent)
+import Database.PostgreSQL.Internal.Channel (Channel (..))
 import Foreign.Marshal.Alloc (allocaBytes)
+import Network.Streaming.Sender (unsent)
 
 -- | A session ready for application operations; protocol phases stay private.
 -- A borrowed session expires when its buffer callback returns.

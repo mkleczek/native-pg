@@ -8,14 +8,6 @@
 module Database.PostgreSQL.Internal.Channel
   ( Channel (..),
     newChannel,
-    Unsent,
-    OutputBuffer,
-    newOutputBuffer,
-    outputBufferFrom,
-    outputBufferPerOutput,
-    unsent,
-    unsentEmpty,
-    discardUnsent,
   )
 where
 
@@ -34,10 +26,7 @@ import Network.Streaming.Sender
     Stalls (..),
     Unsent,
     discardUnsent,
-    newOutputBuffer,
     noUnsent,
-    outputBufferFrom,
-    outputBufferPerOutput,
     pushWith,
     stopping,
     unsent,

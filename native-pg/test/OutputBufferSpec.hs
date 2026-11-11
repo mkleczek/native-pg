@@ -29,6 +29,7 @@ import Database.PostgreSQL.Internal.Channel
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
+import Network.Streaming.Sender (outputBufferFrom)
 import Network.Streaming.Source (Pulled (..))
 import Network.Streaming.Watch (readyNow)
 import PullSourceTestSupport (PullSource (..), noWatch)

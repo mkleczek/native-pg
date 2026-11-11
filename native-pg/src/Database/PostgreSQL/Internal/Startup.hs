@@ -26,6 +26,7 @@ import qualified System.Posix.User as Posix
 #endif
 import Database.PostgreSQL.Session.Settings
 import Network.Streaming.Buffer (Buffer)
+import Network.Streaming.Sender (unsent)
 import Database.PostgreSQL.Internal.Context
 import Database.PostgreSQL.Internal.Exchange
 import Database.PostgreSQL.Internal.Authentication
@@ -39,7 +40,7 @@ import Database.PostgreSQL.Transport
   ( Address (..), newChannel, RootCertificates (..), ServerVerification (..),
     TlsChannel (..), TlsClient (..), TlsError, TlsSettings (..),
   )
-import Database.PostgreSQL.Internal.Channel (Channel (..), unsent)
+import Database.PostgreSQL.Internal.Channel (Channel (..))
 import Database.PostgreSQL.Internal.Socket (connectSocket)
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Storable (peek)
