@@ -19,6 +19,7 @@ import Database.PostgreSQL.Internal.Channel
 import Database.PostgreSQL.Internal.Execution (Execution (..), Statement (..), executionMessages)
 import Database.PostgreSQL.Internal.Protocol (Parameter (..))
 import Database.PostgreSQL.Internal.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (borrowedStream)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (MaybeBytes32Atom))
 import Database.PostgreSQL.Transport hiding (newChannel)

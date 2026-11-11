@@ -23,7 +23,8 @@ import Control.Exception (bracket)
 import Control.Monad (void, (>=>))
 import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Word (Word8)
-import Database.PostgreSQL.Internal.Protocol.Codec (InputSource (..), Output)
+import Database.PostgreSQL.Internal.Protocol.Codec (Output)
+import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Transport.Link
 import Foreign.Ptr (Ptr)
 import Network.Streaming.Sender

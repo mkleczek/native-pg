@@ -25,6 +25,7 @@ import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Internal.Protocol
 import FeedSupport (staticBytes)
 import Database.PostgreSQL.Internal.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputBuffer, InputSource (..), emptyInputBuffer, runInput)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet

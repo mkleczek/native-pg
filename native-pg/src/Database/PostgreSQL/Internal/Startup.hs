@@ -32,7 +32,8 @@ import Database.PostgreSQL.Internal.Authentication
   ( ChannelBinding (..), md5Password, newScramNonce, scramClientFinal,
     scramClientFirst, scramMechanism, scramPlusMechanism, scramVerifyServerFinal,
   )
-import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), InputSource (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..))
+import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
 import Database.PostgreSQL.Transport
   ( Address (..), newChannel, RootCertificates (..), ServerVerification (..),

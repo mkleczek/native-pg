@@ -24,7 +24,8 @@ import Database.PostgreSQL.Internal.Exchange hiding (Session)
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Internal.Startup (withChannel)
 import Database.PostgreSQL.Session.Settings (ConnectSettings)
-import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..), InputSource (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (Alternatives (..))
+import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Messages
 import Database.PostgreSQL.Internal.Channel (Channel (..), unsent)
 import Foreign.Marshal.Alloc (allocaBytes)

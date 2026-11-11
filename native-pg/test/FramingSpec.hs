@@ -17,6 +17,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import FeedSupport (staticBytes)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Database.PostgreSQL.Internal.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputBuffer, InputSource (..), emptyInputBuffer, readInputExactly, reusableInputBuffer, runInput, runInputUntil, withInputLimit)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr, minusPtr)
 import Foreign.ForeignPtr (withForeignPtr)

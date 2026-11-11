@@ -18,6 +18,7 @@ import Data.IORef (modifyIORef', newIORef, readIORef)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Buffer (bufferMemory, newBuffer)
 import Database.PostgreSQL.Internal.Protocol.Codec
+import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputBuffer, InputSource (..), peekInputByteAt, readInputCStringBytes, readInputExactly, readInputRemaining, releaseInputBuffer, requestInputBuffer, reusableInputBuffer, runInput, runInputUntil, withInputLimit)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, castPtr, minusPtr)

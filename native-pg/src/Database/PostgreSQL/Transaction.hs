@@ -40,7 +40,8 @@ import Database.PostgreSQL.Internal.Context
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import Database.PostgreSQL.Internal.Execution (Execution (..))
 import qualified Database.PostgreSQL.Internal.Execution as Execution
-import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..), Poll (..), Stall (..))
+import Database.PostgreSQL.Internal.Protocol.Codec (ByteStream (..))
+import Database.PostgreSQL.Internal.Protocol.Codec.Input (Poll (..), Stall (..))
 import Database.PostgreSQL.Internal.Row (DecodeRow (..))
 import qualified Database.PostgreSQL.Internal.Row as Row
 import Database.PostgreSQL.Session (Session)
