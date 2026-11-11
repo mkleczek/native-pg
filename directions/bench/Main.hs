@@ -15,6 +15,7 @@ import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.Classes
 import Network.Directions.Compiled
+import Network.Directions.Delimited
 import Network.Directions.Loop
 import Network.Directions.Proxy
 import Network.Directions.Simulated
@@ -35,8 +36,10 @@ main = do
   measure "threads, sockets" mib (overSockets (\program -> Nothing <$ runThreads program ()))
   measure "loop, sockets" mib (overSockets (\program -> Just . snd <$> runLoop program ()))
   measure "compiled, sockets" mib (overSockets (\program -> Just . snd <$> runCompiled program ()))
+  measure "delimited, sockets" mib (overSockets (\program -> Just . snd <$> runDelimited program ()))
   measure "loop, simulated" mib (overSimulated (\program -> Just . snd <$> runLoop program ()))
   measure "compiled, simulated" mib (overSimulated (\program -> Just . snd <$> runCompiled program ()))
+  measure "delimited, simulated" mib (overSimulated (\program -> Just . snd <$> runDelimited program ()))
   measure "simulation" (min mib 8) (overSimulated (\program -> Just . simulatedReport <$> runSimulation 1 maxBound program ()))
 
 -- | Runs the round trip of this many MiB, and prints what it did per MiB.

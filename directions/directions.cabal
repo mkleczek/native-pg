@@ -17,6 +17,7 @@ library
                    Network.Directions.Loop
                    Network.Directions.Scheduler
                    Network.Directions.Compiled
+                   Network.Directions.Delimited
                    Network.Directions.Simulated
                    Network.Directions.Proxy
   c-sources: cbits/poller.c

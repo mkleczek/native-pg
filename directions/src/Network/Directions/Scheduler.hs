@@ -13,6 +13,7 @@ module Network.Directions.Scheduler
   ( Step (..),
     Run,
     newRun,
+    spent,
     stepped,
     counted,
     wakeTicket,
@@ -92,13 +93,19 @@ setCounter :: Run -> Int -> Int -> IO ()
 setCounter run index value = unsafeWithForeignPtr (runCounters run) (\pointer -> pokeElemOff pointer index value)
 {-# INLINE setCounter #-}
 
+-- | Counts a step of a primitive, and says whether the part has used its steps
+-- and yields.
+spent :: Run -> IO Bool
+spent run = do
+  counter run 1 >>= setCounter run 1 . (+ 1)
+  remaining <- counter run 0
+  if remaining <= 1 then pure True else False <$ setCounter run 0 (remaining - 1)
+{-# INLINE spent #-}
+
 -- | Counts a step of a primitive, and goes on, or yields once the part has
 -- used its steps.
 stepped :: Run -> IO Step -> IO Step
-stepped run continue = do
-  counter run 1 >>= setCounter run 1 . (+ 1)
-  remaining <- counter run 0
-  if remaining <= 1 then pure (Yielded continue) else setCounter run 0 (remaining - 1) *> continue
+stepped run continue = spent run >>= \yields -> if yields then pure (Yielded continue) else continue
 {-# INLINE stepped #-}
 
 -- | Counts a step of a primitive that suspends its part.
