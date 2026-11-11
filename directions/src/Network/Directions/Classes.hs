@@ -101,6 +101,7 @@ receiveTrying link = loop
     loop = now attempt >>> (((S.watchReadable link,) ^>> first block >>> snd ^>> loop) ||| returnA)
     attempt room@(Room memory size) =
       withForeignPtr memory (\pointer -> S.receiveReady link pointer size) <&> maybe (Left room) Right
+{-# INLINABLE receiveTrying #-}
 
 -- | A send to streaming-io's link: it sends what the link takes and writes it,
 -- and while some is left, blocks until the link is writable, and goes on.
@@ -115,6 +116,7 @@ sendAllTrying link = loop
         case dropSent sent pieces of
           [] -> attempt []
           rest -> pure (Left rest)
+{-# INLINABLE sendAllTrying #-}
 
 -- | Memory to receive into, from its start: where it is and its size.
 data Room = Room !(ForeignPtr Word8) !Int

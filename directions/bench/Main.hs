@@ -13,6 +13,7 @@ import Data.Maybe (listToMaybe)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.Classes
+import Network.Directions.Compiled
 import Network.Directions.Loop
 import Network.Directions.Proxy
 import Network.Directions.Simulated
@@ -27,8 +28,10 @@ main = do
   mib <- maybe 64 read . listToMaybe <$> getArgs
   printf "%-24s %6s %9s %10s %10s %12s\n" "run" "MiB" "MiB/s" "steps/MiB" "waits/MiB" "alloc/MiB"
   measure "threads, sockets" mib (overSockets (\program -> Nothing <$ runThreads program ()))
-  measure "one thread, sockets" mib (overSockets (\program -> Just . snd <$> runLoop program ()))
-  measure "one thread, simulated" mib (overSimulated (\program -> Just . snd <$> runLoop program ()))
+  measure "loop, sockets" mib (overSockets (\program -> Just . snd <$> runLoop program ()))
+  measure "compiled, sockets" mib (overSockets (\program -> Just . snd <$> runCompiled program ()))
+  measure "loop, simulated" mib (overSimulated (\program -> Just . snd <$> runLoop program ()))
+  measure "compiled, simulated" mib (overSimulated (\program -> Just . snd <$> runCompiled program ()))
   measure "simulation" (min mib 8) (overSimulated (\program -> Just . simulatedReport <$> runSimulation 1 maxBound program ()))
 
 -- | Runs the round trip of this many MiB, and prints what it did per MiB.

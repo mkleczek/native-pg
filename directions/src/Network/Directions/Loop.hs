@@ -13,6 +13,7 @@ module Network.Directions.Loop
     Outcome (..),
     Simulated (..),
     runSimulation,
+    awaitFired,
   )
 where
 

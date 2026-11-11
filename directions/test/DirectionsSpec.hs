@@ -9,6 +9,7 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Word (Word64)
 import Network.Directions.Classes
+import Network.Directions.Compiled
 import Network.Directions.Loop
 import Network.Directions.Proxy
 import Network.Directions.Simulated
@@ -27,6 +28,9 @@ spec = describe "directions" $ do
     it "brings the request back, with every part on one thread" $
       within (snd <$> roundTrip plain request looped) `shouldReturn` Just request
 
+    it "brings the request back, compiled, with every part on one thread" $
+      within (snd <$> roundTrip plain request compiled) `shouldReturn` Just request
+
     it "brings the request back in a simulation, whatever order the seed gives" $
       forM_ [1 .. 20] $ \seed ->
         roundTrip plain request (simulate seed) `shouldReturn` (Completed (), request)
@@ -34,6 +38,7 @@ spec = describe "directions" $ do
     it "brings the request back over sockets, with threads and on one thread" $ do
       within (overSockets threaded) `shouldReturn` Just request
       within (overSockets looped) `shouldReturn` Just request
+      within (overSockets compiled) `shouldReturn` Just request
 
     it "changes the client's bytes on their way" $ do
       let through = Setup exchange (proxyThrough (BS.map toUpper))
@@ -66,6 +71,8 @@ spec = describe "directions" $ do
       within (transact (const False) threaded) `shouldReturn` Just ((), BS8.pack "ROLLBACK\n")
       within (transact (== batch) looped) `shouldReturn` Just ((), BS8.pack "COMMIT\n")
       within (transact (const False) looped) `shouldReturn` Just ((), BS8.pack "ROLLBACK\n")
+      within (transact (== batch) compiled) `shouldReturn` Just ((), BS8.pack "COMMIT\n")
+      within (transact (const False) compiled) `shouldReturn` Just ((), BS8.pack "ROLLBACK\n")
       forM_ [1 .. 20] $ \seed ->
         transact (== batch) (simulate seed) `shouldReturn` (Completed (), BS8.pack "COMMIT\n")
 
@@ -153,6 +160,9 @@ threaded program = runThreads program ()
 
 looped :: Loop () () -> IO ()
 looped program = fst <$> runLoop program ()
+
+compiled :: Compiled () () -> IO ()
+compiled program = fst <$> runCompiled program ()
 
 simulate :: Word64 -> Loop () () -> IO (Outcome ())
 simulate seed program = simulatedOutcome <$> runSimulation seed limit program ()
