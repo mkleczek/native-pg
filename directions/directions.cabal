@@ -6,6 +6,7 @@ license: AGPL-3.0-or-later
 license-file: LICENSE
 build-type: Simple
 extra-doc-files: README.md
+extra-source-files: cbits/poller.c
 
 library
   default-language: GHC2021
@@ -14,10 +15,12 @@ library
   exposed-modules: Network.Directions.Classes
                    Network.Directions.Threads
                    Network.Directions.Loop
+                   Network.Directions.Scheduler
                    Network.Directions.Compiled
                    Network.Directions.Simulated
                    Network.Directions.Proxy
-  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, network >=3.1 && <3.3, stm >=2.5 && <2.6, streaming-io
+  c-sources: cbits/poller.c
+  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, containers >=0.6 && <0.8, network >=3.1 && <3.3, stm >=2.5 && <2.6, streaming-io
 
 test-suite directions-spec
   type: exitcode-stdio-1.0

@@ -12,7 +12,7 @@ where
 
 import Control.Arrow (Arrow, ArrowChoice, Kleisli (..))
 import Control.Category (Category)
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (forkIO, killThread, threadWaitRead, threadWaitWrite)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Control.Concurrent.STM (TMVar, atomically, newEmptyTMVarIO, readTMVar, tryPutTMVar)
 import Control.Exception (SomeException, finally, throwIO, try)
@@ -52,9 +52,13 @@ instance Concurrent Threads where
             Right (Right d') -> collect b (Just d')
     collect Nothing Nothing `finally` mapM_ killThread started
 
--- | Blocks the thread.
+-- | Blocks the thread: on a descriptor directly, as 'threadWaitRead' does, and
+-- on any other event by its watch.
 instance Block Threads where
-  block = threads awaitWatch
+  block = threads $ \case
+    Readable fd -> threadWaitRead fd
+    Writable fd -> threadWaitWrite fd
+    Watched register -> awaitWatch register
 
 -- | A ticket is a 'TMVar', which blocks the thread that waits for it.
 instance Exchange Threads where

@@ -14,32 +14,15 @@ where
 
 import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (partition)
+import qualified Data.Function as Function
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Network.Directions.Classes
-import Network.Directions.Loop (Report (..), awaitFired)
-import Network.Streaming.Watch (Watch)
+import Network.Directions.Loop (Report)
+import Network.Directions.Scheduler
 import Prelude hiding (id, (.))
 
 -- | An arrow as a function of its input and of what follows it.
 newtype Compiled a b = Compiled (Run -> a -> (b -> IO Step) -> IO Step)
-
--- | What a part comes to, for the scheduler.
-data Step
-  = -- | It ended, at a join or with the program's result.
-    Ended
-  | -- | It waits for the watch, and goes on with the action once it fires.
-    Suspended (IO Watch) (IO Step)
-  | -- | Two parts that go on at once.
-    Forked (IO Step) (IO Step)
-  | -- | It waits for a ticket, whose slot holds it.
-    Parked
-  | -- | It used its steps, and can go on.
-    Yielded (IO Step)
-
--- | What the parts of a run share: the steps a part has left before it
--- yields, the parts that tickets woke, and the steps taken.
-data Run = Run {runFuel :: IORef Int, runWoken :: IORef [IO Step], runSteps :: IORef Int}
 
 instance Category Compiled where
   id = Compiled (\_ value next -> next value)
@@ -53,18 +36,24 @@ instance Arrow Compiled where
   first (Compiled inner) = Compiled (\run (a, c) next -> inner run a (\b -> next (b, c)))
   {-# INLINE first #-}
 
+-- | A choice goes on with the branch's continuation itself, so that it wraps
+-- nothing.
 instance ArrowChoice Compiled where
   left (Compiled inner) = Compiled $ \run choice next -> case choice of
     Left a -> inner run a (next . Left)
     Right c -> next (Right c)
   {-# INLINE left #-}
+  Compiled one ||| Compiled two = Compiled $ \run choice next -> case choice of
+    Left a -> one run a next
+    Right c -> two run c next
+  {-# INLINE (|||) #-}
 
 instance Effect Compiled where
   now action = Compiled (\run value next -> action value >>= \output -> stepped run (next output))
   {-# INLINE now #-}
 
 instance Block Compiled where
-  block = Compiled (\run register next -> counted run (Suspended register (next ())))
+  block = Compiled (\run event next -> counted run (Suspended event (next ())))
   {-# INLINE block #-}
 
 instance Concurrent Compiled where
@@ -89,7 +78,7 @@ instance Exchange Compiled where
       Empty -> writeIORef slot (Given value) *> stepped run (next ())
       Waiter resume -> do
         writeIORef slot (Given value)
-        modifyIORef' (runWoken run) (resume value :)
+        wakeTicket run (resume value)
         stepped run (next ())
       Given _ -> ioError (userError "a ticket was given a value twice")
   await (CompiledTicket slot) = Compiled $ \run () next ->
@@ -98,53 +87,11 @@ instance Exchange Compiled where
       Empty -> Parked <$ writeIORef slot (Waiter next)
       Waiter _ -> ioError (userError "two parts wait for one ticket")
 
-data Slot a = Empty | Given a | Waiter (a -> IO Step)
-
--- | Counts a step of a primitive, and goes on, or yields once the part has
--- used its steps.
-stepped :: Run -> IO Step -> IO Step
-stepped run continue = do
-  modifyIORef' (runSteps run) (+ 1)
-  remaining <- readIORef (runFuel run)
-  if remaining <= 1 then pure (Yielded continue) else writeIORef (runFuel run) (remaining - 1) *> continue
-
--- | Counts a step of a primitive that suspends.
-counted :: Run -> Step -> IO Step
-counted run step = step <$ modifyIORef' (runSteps run) (+ 1)
-
--- | Runs the program and all of its concurrent parts on this thread, as
--- 'Network.Directions.Loop.runLoop' does: each part that can go on in turn,
--- for up to 64 steps, and when none can, one wait for all of their watches.
+-- | Runs the program and all of its concurrent parts on this thread: each part
+-- that can go on in turn, for up to 64 steps, and when none can, a wait until
+-- a descriptor wakes one, or a watch fires.
 runCompiled :: Compiled a b -> a -> IO (b, Report)
 runCompiled (Compiled program) input = do
-  run <- Run <$> newIORef 64 <*> newIORef [] <*> newIORef 0
+  run <- newRun
   result <- newIORef Nothing
-  let finished =
-        readIORef result >>= \case
-          Just value -> (\steps -> Just (value, steps)) <$> readIORef (runSteps run)
-          Nothing -> pure Nothing
-      -- The parts that tickets woke join those that can go on.
-      go waits parked ready waiting = do
-        risen <- reverse <$> readIORef (runWoken run)
-        writeIORef (runWoken run) []
-        next waits (parked - length risen) (ready <> risen) waiting
-      next waits parked ready waiting = case ready of
-        part : others -> do
-          writeIORef (runFuel run) 64
-          step <- part
-          finished >>= \case
-            Just (value, steps) -> pure (value, Report steps waits)
-            Nothing -> case step of
-              Ended -> go waits parked others waiting
-              Parked -> go waits (parked + 1) others waiting
-              Yielded part' -> go waits parked (others <> [part']) waiting
-              Forked one two -> go waits parked (others <> [one, two]) waiting
-              Suspended watch part' -> go waits parked others ((watch, part') : waiting)
-        []
-          | null waiting && parked > (0 :: Int) -> ioError (userError "runCompiled: parts wait for tickets that nothing will give a value")
-          | null waiting -> ioError (userError "runCompiled: the program ended without a result")
-          | otherwise -> do
-              fired <- awaitFired (zip (map fst waiting) [0 :: Int ..])
-              let (wake, still) = partition ((`elem` fired) . fst) (zip [0 ..] waiting)
-              go (waits + 1) parked (map (snd . snd) wake) (map snd still)
-  go 0 0 [program run input (\value -> Ended <$ writeIORef result (Just value))] []
+  schedule run Function.id result (program run input (\value -> Ended <$ writeIORef result (Just value)))

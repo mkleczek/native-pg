@@ -1,14 +1,15 @@
 -- | Moves bytes from a client through the proxy to an echo server and back,
 -- with each way to run the program, and says what each did per MiB that went
 -- each way: how fast, how many steps and waits (one thread only), and how much
--- it allocated (with @+RTS -T@). Usage: @directions-bench [MiB]@, 64 by
--- default.
+-- it allocated (with @+RTS -T@). Usage: @directions-bench [MiB [run]]@: 64 MiB
+-- by default, and every run unless one is named.
 module Main (main) where
 
 import Control.Arrow (ArrowChoice, first, returnA, (>>>), (^>>), (|||))
 import Control.Exception (bracket)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.List (isPrefixOf)
 import Data.Maybe (listToMaybe)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
@@ -25,7 +26,11 @@ import Text.Printf (printf)
 
 main :: IO ()
 main = do
-  mib <- maybe 64 read . listToMaybe <$> getArgs
+  arguments <- getArgs
+  let mib = maybe 64 read (listToMaybe arguments)
+      -- A second argument picks the runs whose names start with it.
+      picked name = all (`isPrefixOf` name) (take 1 (drop 1 arguments))
+      measure name size run = when (picked name) (measureRun name size run)
   printf "%-24s %6s %9s %10s %10s %12s\n" "run" "MiB" "MiB/s" "steps/MiB" "waits/MiB" "alloc/MiB"
   measure "threads, sockets" mib (overSockets (\program -> Nothing <$ runThreads program ()))
   measure "loop, sockets" mib (overSockets (\program -> Just . snd <$> runLoop program ()))
@@ -35,8 +40,8 @@ main = do
   measure "simulation" (min mib 8) (overSimulated (\program -> Just . simulatedReport <$> runSimulation 1 maxBound program ()))
 
 -- | Runs the round trip of this many MiB, and prints what it did per MiB.
-measure :: String -> Int -> (Int -> IO (Maybe Report, Int)) -> IO ()
-measure name mib run = do
+measureRun :: String -> Int -> (Int -> IO (Maybe Report, Int)) -> IO ()
+measureRun name mib run = do
   stats <- getRTSStatsEnabled
   before <- if stats then allocated_bytes <$> getRTSStats else pure 0
   started <- getMonotonicTime

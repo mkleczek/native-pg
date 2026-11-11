@@ -28,7 +28,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (partition, sort)
 import Data.Word (Word64)
 import Network.Directions.Classes
-import Network.Streaming.Watch (Watch (..))
+import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
 -- | A program as data: functions, sequences, choices and concurrent pairs, and
@@ -41,7 +41,7 @@ data Loop a b where
   Choose :: Loop a b -> Loop (Either a c) (Either b c)
   Both :: Loop a b -> Loop a c -> Loop a (b, c)
   Now :: (a -> IO b) -> Loop a b
-  Block :: Loop (IO Watch) ()
+  Block :: Loop Event ()
   Fulfil :: IORef (Slot a) -> Loop a ()
   Await :: IORef (Slot a) -> Loop () a
 
@@ -132,7 +132,7 @@ advance fuel wake = go 0
               joined <- newIORef Neither
               pure (steps, Forked (Run one input (JoinFirst joined frames)) (Run two input (JoinSecond joined frames)))
             Now action -> action input >>= \output -> go (steps + 1) (Give output frames)
-            Block -> pure (steps + 1, Waits input (Give () frames))
+            Block -> pure (steps + 1, Waits (watchOf input) (Give () frames))
             Fulfil slot ->
               readIORef slot >>= \case
                 Empty -> writeIORef slot (Given input) *> go (steps + 1) (Give () frames)
@@ -156,6 +156,13 @@ advance fuel wake = go 0
               readIORef joined >>= \case
                 FirstDone b -> go steps (Give (b, value) rest)
                 _ -> (steps, Ended) <$ writeIORef joined (SecondDone value)
+
+-- | An event's watch: the scheduler waits on all of its parts' at once.
+watchOf :: Event -> IO Watch
+watchOf = \case
+  Readable fd -> fdReadable fd
+  Writable fd -> fdWritable fd
+  Watched register -> register
 
 -- | What a run did: how many steps of primitives, and how many waits.
 data Report = Report {reportSteps :: !Int, reportWaits :: !Int}

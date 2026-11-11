@@ -39,8 +39,8 @@ connect capacity = do
     newLane = Lane <$> newTVarIO BS.empty <*> newTVarIO False <*> pure capacity
 
 instance S.Link SimEnd where
-  watchReadable end = pure (Watch (readable (endIn end)) (pure ()))
-  watchWritable end = pure (Watch (writable (endOut end)) (pure ()))
+  watchReadable end = pure (Watch (laneReadable (endIn end)) (pure ()))
+  watchWritable end = pure (Watch (laneWritable (endOut end)) (pure ()))
   receiveReady end pointer size = do
     taken <- atomically $ do
       bytes <- readTVar (laneBytes lane)
@@ -68,6 +68,11 @@ instance S.Link SimEnd where
 instance HalfClose SimEnd where
   halfClose end = atomically (writeTVar (laneEnded (endOut end)) True)
 
+-- | A simulated end's events are its lanes' watches.
+instance Events SimEnd where
+  readable end = pure (Watched (S.watchReadable end))
+  writable end = pure (Watched (S.watchWritable end))
+
 -- | A simulated end, in any arrow that can run its tries and block.
 instance (ArrowChoice arr, Effect arr, Block arr) => Link arr SimEnd where
   receive = receiveTrying
@@ -75,11 +80,11 @@ instance (ArrowChoice arr, Effect arr, Block arr) => Link arr SimEnd where
   shutdownSend end = now (\() -> halfClose end)
   close end = now (\() -> S.closeLink end)
 
-readable :: Lane -> STM ()
-readable lane = do
+laneReadable :: Lane -> STM ()
+laneReadable lane = do
   bytes <- readTVar (laneBytes lane)
   ended <- readTVar (laneEnded lane)
   check (not (BS.null bytes) || ended)
 
-writable :: Lane -> STM ()
-writable lane = readTVar (laneBytes lane) >>= check . (< laneCapacity lane) . BS.length
+laneWritable :: Lane -> STM ()
+laneWritable lane = readTVar (laneBytes lane) >>= check . (< laneCapacity lane) . BS.length

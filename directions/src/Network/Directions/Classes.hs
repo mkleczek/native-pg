@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -- | The classes of the design: a link whose calls block in the arrow that runs
@@ -11,6 +12,8 @@ module Network.Directions.Classes
     Concurrent (..),
     Effect (..),
     Block (..),
+    Event (..),
+    Events (..),
     Exchange (..),
     HalfClose (..),
     receiveTrying,
@@ -28,7 +31,6 @@ import Control.Arrow (ArrowChoice, first, returnA, (>>>), (^>>), (|||))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
-import Data.Functor ((<&>))
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
@@ -36,6 +38,7 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Streaming.Link as S
 import Network.Streaming.Watch (Watch)
+import System.Posix.Types (Fd (..))
 
 -- | A byte stream whose calls block in the arrow that runs them. How they
 -- block is the arrow's.
@@ -74,10 +77,23 @@ class Concurrent arr where
 class Effect arr where
   now :: (a -> IO b) -> arr a b
 
--- | Waiting until an event fires: given the registration of its watch, which
--- it releases.
+-- | Waiting until an event fires.
 class Block arr where
-  block :: arr (IO Watch) ()
+  block :: arr Event ()
+
+-- | What a part can wait for: a descriptor that becomes readable or writable,
+-- which an arrow can wait for directly, or any other event, by the
+-- registration of its watch, which the wait releases.
+data Event = Readable !Fd | Writable !Fd | Watched (IO Watch)
+
+-- | The events that a link's two halves wait for.
+class Events link where
+  readable :: link -> IO Event
+  writable :: link -> IO Event
+
+instance Events Socket where
+  readable sock = Readable . Fd <$> Socket.unsafeFdSocket sock
+  writable sock = Writable . Fd <$> Socket.unsafeFdSocket sock
 
 -- | Ends a link's output, which streaming-io's link can't do yet.
 class HalfClose link where
@@ -95,27 +111,30 @@ instance (ArrowChoice arr, Effect arr, Block arr) => Link arr Socket where
 
 -- | A receive from streaming-io's link: a try, and while nothing is ready, a
 -- block until the link is readable, and the try again.
-receiveTrying :: (S.Link link, ArrowChoice arr, Effect arr, Block arr) => link -> arr Room Int
+receiveTrying :: (S.Link link, Events link, ArrowChoice arr, Effect arr, Block arr) => link -> arr Room Int
 receiveTrying link = loop
   where
-    loop = now attempt >>> (((S.watchReadable link,) ^>> first block >>> snd ^>> loop) ||| returnA)
+    loop = now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
     attempt room@(Room memory size) =
-      withForeignPtr memory (\pointer -> S.receiveReady link pointer size) <&> maybe (Left room) Right
+      withForeignPtr memory (\pointer -> S.receiveReady link pointer size) >>= \case
+        Just count -> pure (Right count)
+        Nothing -> (\event -> Left (event, room)) <$> readable link
 {-# INLINABLE receiveTrying #-}
 
 -- | A send to streaming-io's link: it sends what the link takes and writes it,
 -- and while some is left, blocks until the link is writable, and goes on.
-sendAllTrying :: (S.Link link, ArrowChoice arr, Effect arr, Block arr) => link -> arr [ByteString] ()
+sendAllTrying :: (S.Link link, Events link, ArrowChoice arr, Effect arr, Block arr) => link -> arr [ByteString] ()
 sendAllTrying link = loop
   where
-    loop = filter (not . BS.null) ^>> now attempt >>> (((S.watchWritable link,) ^>> first block >>> snd ^>> loop) ||| returnA)
+    loop = filter (not . BS.null) ^>> now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
     attempt pieces = case pieces of
-      [] -> S.flushReady link <&> \flushed -> if flushed then Right () else Left []
+      [] -> S.flushReady link >>= \flushed -> if flushed then pure (Right ()) else blocked []
       _ -> do
         sent <- S.sendReady link (take 16 pieces)
         case dropSent sent pieces of
           [] -> attempt []
-          rest -> pure (Left rest)
+          rest -> blocked rest
+    blocked rest = (\event -> Left (event, rest)) <$> writable link
 {-# INLINABLE sendAllTrying #-}
 
 -- | Memory to receive into, from its start: where it is and its size.
