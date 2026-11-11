@@ -1,14 +1,17 @@
+{-# LANGUAGE TypeFamilies #-}
+
 -- | The classes of the design: a link whose calls block in the arrow that runs
--- them, and what an arrow can do for a link: run an action that never waits,
--- and block until an event fires. Two arrows provide them,
--- "Network.Directions.Threads", a thread for each concurrent part, and
--- "Network.Directions.Loop", every part on one thread; a link's instance is
--- written once for any arrow that does.
+-- them, what an arrow can do for a link (run an action that never waits, and
+-- block until an event fires), and how directions exchange values. Two arrows
+-- provide them, "Network.Directions.Threads", a thread for each concurrent
+-- part, and "Network.Directions.Loop", every part on one thread; a link's
+-- instance is written once for any arrow that does.
 module Network.Directions.Classes
   ( Link (..),
     Concurrent (..),
     Effect (..),
     Block (..),
+    Exchange (..),
     HalfClose (..),
     receiveTrying,
     sendAllTrying,
@@ -47,6 +50,20 @@ class Link arr link where
   shutdownSend :: link -> arr () ()
 
   close :: link -> arr () ()
+
+-- | Values that one direction gives another, once each: the way directions
+-- exchange what they know. How a ticket is kept and waited for is the arrow's.
+class Exchange arr where
+  data Ticket arr a
+
+  -- | A ticket, made while the program is built.
+  newTicket :: IO (Ticket arr a)
+
+  -- | Gives the ticket its value. A ticket is given one once.
+  fulfil :: Ticket arr a -> arr a ()
+
+  -- | Waits until the ticket has its value, and gives it.
+  await :: Ticket arr a -> arr () a
 
 -- | Two arrows that run at once on the same input, as '&&&' runs them one
 -- after the other: the result is both outputs, once both have ended.

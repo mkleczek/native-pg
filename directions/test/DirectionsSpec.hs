@@ -5,6 +5,7 @@ import Control.Exception (ErrorCall (..), bracket, throwIO, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Word (Word64)
 import Network.Directions.Classes
@@ -59,6 +60,19 @@ spec = describe "directions" $ do
     it "lets the same client finish while its request fits in the buffers on the way" $
       roundTrip oneDirection (BS.take 5000 request) (simulate 1) `shouldReturn` (Completed (), BS.take 5000 request)
 
+  describe "tickets" $ do
+    it "let one direction go on with what the other decided" $ do
+      within (transact (== batch) threaded) `shouldReturn` Just ((), BS8.pack "COMMIT\n")
+      within (transact (const False) threaded) `shouldReturn` Just ((), BS8.pack "ROLLBACK\n")
+      within (transact (== batch) looped) `shouldReturn` Just ((), BS8.pack "COMMIT\n")
+      within (transact (const False) looped) `shouldReturn` Just ((), BS8.pack "ROLLBACK\n")
+      forM_ [1 .. 20] $ \seed ->
+        transact (== batch) (simulate seed) `shouldReturn` (Completed (), BS8.pack "COMMIT\n")
+
+    it "show, in a simulation, a part that waits for a ticket nothing gives a value" $ do
+      ticket <- newTicket :: IO (Ticket Loop ())
+      (simulatedOutcome <$> runSimulation 1 limit (await ticket) ()) `shouldReturn` Deadlocked [0]
+
   describe "threads" $
     it "stop every part when one fails, and rethrow its failure" $ do
       (_, end) <- connect 1000
@@ -66,6 +80,22 @@ spec = describe "directions" $ do
       kept <- newIORef []
       let failing = now (\() -> throwIO (ErrorCall "the part failed"))
       within (try (runThreads (together [receiveAll buffer end kept, failing]) ())) `shouldReturn` Just (Left (ErrorCall "the part failed"))
+
+batch :: ByteString
+batch = BS8.pack "BATCH\n"
+
+-- | A transaction against an echo server over simulated links, deciding to
+-- commit by the batch's answer: what the run gave, and what came back after
+-- the batch.
+transact :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, Block arr) => (ByteString -> Bool) -> (arr () () -> IO a) -> IO (a, ByteString)
+transact commits run = do
+  (client, server) <- connect 1000
+  decision <- newTicket
+  forClient <- newBuffer 4096
+  forServer <- newBuffer 4096
+  kept <- newIORef []
+  result <- run (together [transaction decision forClient client batch commits kept, echo forServer server])
+  (,) result . BS.concat . reverse <$> readIORef kept
 
 -- | How the client and the proxy are made.
 data Setup = Setup

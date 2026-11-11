@@ -1,8 +1,8 @@
 {-# LANGUAGE LambdaCase #-}
 
 -- | The proxy of the design notes, written once over the classes, and what it
--- is tried with: an echo server, a client in two directions, and the same
--- client in one.
+-- is tried with: an echo server, a client in two directions, the same client
+-- in one, and a transaction whose two directions exchange a decision.
 module Network.Directions.Proxy
   ( pump,
     pumpWith,
@@ -13,12 +13,15 @@ module Network.Directions.Proxy
     receiveAll,
     exchange,
     sendThenReceive,
+    receiveBytes,
+    transaction,
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, first, returnA, (>>>), (>>^), (^>>), (|||))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import Data.IORef (IORef, modifyIORef')
 import Network.Directions.Classes
 
@@ -84,3 +87,33 @@ exchange buffer end request kept = together [const [request] ^>> sendAll end >>>
 sendThenReceive :: (ArrowChoice arr, Effect arr, Link arr end) => Buffer -> end -> ByteString -> IORef [ByteString] -> arr () ()
 sendThenReceive buffer end request kept =
   const [request] ^>> sendAll end >>> shutdownSend end >>> receiveAll buffer end kept
+
+-- | Receives this many bytes, or what comes before the end of the stream, and
+-- gives them.
+receiveBytes :: (ArrowChoice arr, Link arr end) => Buffer -> end -> Int -> arr () ByteString
+receiveBytes buffer end total = const BS.empty ^>> loop
+  where
+    loop = (roomOf buffer,) ^>> first (receive end) >>> collect ^>> (returnA ||| loop)
+    collect (count, got)
+      | count == 0 || BS.length next >= total = Left next
+      | otherwise = Right next
+      where
+        -- The view is of the buffer, which the next receive reuses, so it's
+        -- copied now.
+        !next = got <> BS.copy (view buffer count)
+
+-- | A transaction's two directions, as a client of a server that answers each
+-- line: the request side sends the batch, waits for the decision that the
+-- answer side gives it, and sends the ending that was decided; the answer side
+-- reads the batch's answer, decides from it, and keeps what follows.
+transaction :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, Link arr end) => Ticket arr Bool -> Buffer -> end -> ByteString -> (ByteString -> Bool) -> IORef [ByteString] -> arr () ()
+transaction decision buffer end batch commits kept = together [requests, answers]
+  where
+    requests =
+      const [batch]
+        ^>> sendAll end
+        >>> await decision
+        >>> (\commit -> [BS8.pack (if commit then "COMMIT\n" else "ROLLBACK\n")])
+        ^>> sendAll end
+        >>> shutdownSend end
+    answers = receiveBytes buffer end (BS.length batch) >>> commits ^>> fulfil decision >>> receiveAll buffer end kept

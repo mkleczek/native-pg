@@ -1,5 +1,6 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -- | A thread for each concurrent part: an arrow is a function to IO, and a
 -- link blocks its thread.
@@ -13,7 +14,9 @@ import Control.Arrow (Arrow, ArrowChoice, Kleisli (..))
 import Control.Category (Category)
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
+import Control.Concurrent.STM (TMVar, atomically, newEmptyTMVarIO, readTMVar, tryPutTMVar)
 import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Monad (unless)
 import Network.Directions.Classes
 import Network.Streaming.Watch (awaitWatch)
 
@@ -52,3 +55,12 @@ instance Concurrent Threads where
 -- | Blocks the thread.
 instance Block Threads where
   block = threads awaitWatch
+
+-- | A ticket is a 'TMVar', which blocks the thread that waits for it.
+instance Exchange Threads where
+  newtype Ticket Threads a = ThreadTicket (TMVar a)
+  newTicket = ThreadTicket <$> newEmptyTMVarIO
+  fulfil (ThreadTicket var) = threads $ \value -> do
+    given <- atomically (tryPutTMVar var value)
+    unless given $ ioError (userError "a ticket was given a value twice")
+  await (ThreadTicket var) = threads (\() -> atomically (readTMVar var))

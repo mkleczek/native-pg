@@ -1,5 +1,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -- | Every concurrent part on one thread: an arrow is a program as data, which
 -- a scheduler runs. A part that waits is the rest of its program and the value
@@ -30,8 +31,8 @@ import Network.Streaming.Watch (Watch (..))
 import Prelude hiding (id, (.))
 
 -- | A program as data: functions, sequences, choices and concurrent pairs, and
--- its two primitives, an action that never waits and a block until an event
--- fires.
+-- its primitives: an action that never waits, a block until an event fires,
+-- and giving and waiting for a ticket.
 data Loop a b where
   Arr :: (a -> b) -> Loop a b
   Seq :: Loop a b -> Loop b c -> Loop a c
@@ -40,6 +41,8 @@ data Loop a b where
   Both :: Loop a b -> Loop a c -> Loop a (b, c)
   Now :: (a -> IO b) -> Loop a b
   Block :: Loop (IO Watch) ()
+  Fulfil :: IORef (Slot a) -> Loop a ()
+  Await :: IORef (Slot a) -> Loop () a
 
 instance Category Loop where
   id = Arr Function.id
@@ -61,6 +64,19 @@ instance Effect Loop where
 -- | Suspends the part: the scheduler goes on with it once the watch fires.
 instance Block Loop where
   block = Block
+
+-- | A ticket is a slot on this thread. A part that waits for it is parked in
+-- it, with no watch, and goes back among those that can go on when the ticket
+-- is given its value.
+instance Exchange Loop where
+  newtype Ticket Loop a = LoopTicket (IORef (Slot a))
+  newTicket = LoopTicket <$> newIORef Empty
+  fulfil (LoopTicket slot) = Fulfil slot
+  await (LoopTicket slot) = Await slot
+
+-- | A ticket's slot: empty, given its value, or holding the part that waits for
+-- it, as what puts the part back among those that can go on.
+data Slot a = Empty | Given a | Waiter (a -> IO ())
 
 -- | A part of a running program: a program with its input, or a value for
 -- what follows, and what follows.
@@ -86,15 +102,18 @@ data Advanced r
   = Finished r
   | -- | It ended at a join, which the other half goes on from.
     Ended
+  | -- | It waits for a ticket, whose slot holds it.
+    Parked
   | -- | It used its steps, and can go on.
     Yielded (Process r)
   | Forked (Process r) (Process r)
   | Waits (IO Watch) (Process r)
 
 -- | Runs a part until it waits, forks, ends, or has taken this many steps of
--- its primitives: what it came to, and how many steps it took.
-advance :: forall r. Int -> Process r -> IO (Int, Advanced r)
-advance fuel = go 0
+-- its primitives: what it came to, and how many steps it took. A part it parks
+-- on a ticket goes back with the given action when the ticket has its value.
+advance :: forall r. Int -> (Process r -> IO ()) -> Process r -> IO (Int, Advanced r)
+advance fuel wake = go 0
   where
     go :: Int -> Process r -> IO (Int, Advanced r)
     go steps process
@@ -113,6 +132,16 @@ advance fuel = go 0
               pure (steps, Forked (Run one input (JoinFirst joined frames)) (Run two input (JoinSecond joined frames)))
             Now action -> action input >>= \output -> go (steps + 1) (Give output frames)
             Block -> pure (steps + 1, Waits input (Give () frames))
+            Fulfil slot ->
+              readIORef slot >>= \case
+                Empty -> writeIORef slot (Given input) *> go (steps + 1) (Give () frames)
+                Waiter resume -> writeIORef slot (Given input) *> resume input *> go (steps + 1) (Give () frames)
+                Given _ -> ioError (userError "a ticket was given a value twice")
+            Await slot ->
+              readIORef slot >>= \case
+                Given value -> go (steps + 1) (Give value frames)
+                Empty -> (steps + 1, Parked) <$ writeIORef slot (Waiter (\value -> wake (Give value frames)))
+                Waiter _ -> ioError (userError "two parts wait for one ticket")
           Give value frames -> case frames of
             Return -> pure (steps, Finished value)
             Then next rest -> go steps (Run next value rest)
@@ -133,31 +162,41 @@ data Report = Report {reportSteps :: !Int, reportWaits :: !Int}
 
 -- | Runs the program and all of its concurrent parts on this thread. It runs
 -- each part that can go on in turn, for up to 64 steps, and when none can,
--- waits once for all of their watches.
+-- waits once for all of their watches. Parts parked on tickets go on once the
+-- tickets have their values.
 runLoop :: Loop a b -> a -> IO (b, Report)
-runLoop program input = go (Report 0 0) [Run program input Return] []
-  where
-    go report ready waiting = case ready of
-      process : others -> do
-        (steps, advanced) <- advance 64 process
-        let report' = report {reportSteps = reportSteps report + steps}
-        case advanced of
-          Finished value -> pure (value, report')
-          Ended -> go report' others waiting
-          Yielded process' -> go report' (others <> [process']) waiting
-          Forked one two -> go report' (others <> [one, two]) waiting
-          Waits watch process' -> go report' others ((watch, process') : waiting)
-      []
-        | null waiting -> ioError (userError "runLoop: the program ended without a result")
-        | otherwise -> do
-            fired <- awaitFired (zip (map fst waiting) [0 :: Int ..])
-            let (wake, still) = partition ((`elem` fired) . fst) (zip [0 ..] waiting)
-            go report {reportWaits = reportWaits report + 1} (map (snd . snd) wake) (map snd still)
+runLoop program input = do
+  woken <- newIORef []
+  let -- The parts that tickets woke join those that can go on.
+      go report parked ready waiting = do
+        risen <- reverse <$> readIORef woken
+        writeIORef woken []
+        step report (parked - length risen) (ready <> risen) waiting
+      step report parked ready waiting = case ready of
+        process : others -> do
+          (steps, advanced) <- advance 64 (\woke -> modifyIORef' woken (woke :)) process
+          let report' = report {reportSteps = reportSteps report + steps}
+          case advanced of
+            Finished value -> pure (value, report')
+            Ended -> go report' parked others waiting
+            Parked -> go report' (parked + 1) others waiting
+            Yielded process' -> go report' parked (others <> [process']) waiting
+            Forked one two -> go report' parked (others <> [one, two]) waiting
+            Waits watch process' -> go report' parked others ((watch, process') : waiting)
+        []
+          | null waiting && parked > (0 :: Int) -> ioError (userError "runLoop: parts wait for tickets that nothing will give a value")
+          | null waiting -> ioError (userError "runLoop: the program ended without a result")
+          | otherwise -> do
+              fired <- awaitFired (zip (map fst waiting) [0 :: Int ..])
+              let (wake, still) = partition ((`elem` fired) . fst) (zip [0 ..] waiting)
+              go report {reportWaits = reportWaits report + 1} parked (map (snd . snd) wake) (map snd still)
+  go (Report 0 0) 0 [Run program input Return] []
 
 -- | How a simulation ended.
 data Outcome b
   = Completed b
-  | -- | These parts wait for each other: none of their watches can fire.
+  | -- | These parts wait for each other: none of their watches can fire, and
+    -- no ticket they wait for will be given a value.
     Deadlocked [Int]
   | -- | It took the most steps it was allowed.
     GaveUp
@@ -174,35 +213,43 @@ data Simulated b = Simulated
 -- a primitive at a time, of a part picked at random among those that can go
 -- on, up to the given number of steps. It never waits: when no part can go
 -- on, it looks at their watches and goes on with those that have fired; if
--- none has, the parts wait for each other, which it reports. Its links must
--- be simulated ones, whose watches depend only on what the parts did, so
--- that a seed always gives the same run.
+-- none has, the parts wait for each other, or for tickets that nothing will
+-- give a value, which it reports. Its links must be simulated ones, whose
+-- watches depend only on what the parts did, so that a seed always gives the
+-- same run.
 runSimulation :: Word64 -> Int -> Loop a b -> a -> IO (Simulated b)
-runSimulation seed limit program input = go seed 1 (Report 0 0) [] [(0, Run program input Return)] []
-  where
-    go random next report trace ready waiting
-      | reportSteps report >= limit = finish GaveUp
-      | null ready && null waiting = ioError (userError "runSimulation: the program ended without a result")
-      | null ready = do
-          checked <- traverse (\entry@(_, (watch, _)) -> (,) entry <$> anyFired watch) waiting
-          let (wake, still) = partition snd checked
-          if null wake
-            then finish (Deadlocked (sort (map (fst . fst) still)))
-            else go random next report {reportWaits = reportWaits report + length wake} trace [(ident, process) | ((ident, (_, process)), _) <- wake] (map fst still)
-      | otherwise = do
-          let (random', pick) = splitMix random
-              ((ident, process), others) = takeAt (fromIntegral (pick `mod` fromIntegral (length ready))) ready
-              trace' = ident : trace
-          (steps, advanced) <- advance 1 process
-          let report' = report {reportSteps = reportSteps report + steps}
-          case advanced of
-            Finished value -> pure (Simulated (Completed value) report' (reverse trace'))
-            Ended -> go random' next report' trace' others waiting
-            Yielded process' -> go random' next report' trace' ((ident, process') : others) waiting
-            Forked one two -> go random' (next + 2) report' trace' ((next, one) : (next + 1, two) : others) waiting
-            Waits watch process' -> go random' next report' trace' others ((ident, (watch, process')) : waiting)
-      where
-        finish outcome = pure (Simulated outcome report (reverse trace))
+runSimulation seed limit program input = do
+  woken <- newIORef []
+  let -- The parts that tickets woke join those that can go on.
+      go random next report trace parked ready waiting = do
+        risen <- reverse <$> readIORef woken
+        writeIORef woken []
+        step random next report trace (filter (`notElem` map fst risen) parked) (ready <> risen) waiting
+      step random next report trace parked ready waiting
+        | reportSteps report >= limit = finish GaveUp
+        | null ready && null waiting && null parked = ioError (userError "runSimulation: the program ended without a result")
+        | null ready = do
+            checked <- traverse (\entry@(_, (watch, _)) -> (,) entry <$> anyFired watch) waiting
+            let (wake, still) = partition snd checked
+            if null wake
+              then finish (Deadlocked (sort (map (fst . fst) still <> parked)))
+              else go random next report {reportWaits = reportWaits report + length wake} trace parked [(ident, process) | ((ident, (_, process)), _) <- wake] (map fst still)
+        | otherwise = do
+            let (random', pick) = splitMix random
+                ((ident, process), others) = takeAt (fromIntegral (pick `mod` fromIntegral (length ready))) ready
+                trace' = ident : trace
+            (steps, advanced) <- advance 1 (\woke -> modifyIORef' woken ((ident, woke) :)) process
+            let report' = report {reportSteps = reportSteps report + steps}
+            case advanced of
+              Finished value -> pure (Simulated (Completed value) report' (reverse trace'))
+              Ended -> go random' next report' trace' parked others waiting
+              Parked -> go random' next report' trace' (ident : parked) others waiting
+              Yielded process' -> go random' next report' trace' parked ((ident, process') : others) waiting
+              Forked one two -> go random' (next + 2) report' trace' parked ((next, one) : (next + 1, two) : others) waiting
+              Waits watch process' -> go random' next report' trace' parked others ((ident, (watch, process')) : waiting)
+        where
+          finish outcome = pure (Simulated outcome report (reverse trace))
+  go seed 1 (Report 0 0) [] [] [(0, Run program input Return)] []
 
 -- | Registers the watches, waits until one has fired, and gives the values of
 -- all that have fired by then. It releases them all, also if it is
