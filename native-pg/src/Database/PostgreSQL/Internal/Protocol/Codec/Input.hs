@@ -342,20 +342,36 @@ makeRoom readSize buffer
   | bufferReusable buffer =
       if bufferStart buffer == 0
         then pure Nothing
-        else do
-          withForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
-            moveBytes pointer (pointer `plusPtr` bufferStart buffer) unconsumed
-          pure (Just buffer {bufferStart = 0, bufferEnd = unconsumed})
-  | otherwise = do
-      let capacity = max readSize (2 * bufferCapacity (bufferStorage buffer))
-      storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
-      let memory = bufferMemory storage
-      unsafeWithForeignPtr memory $ \target ->
-        unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \origin ->
-          copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
-      pure (Just (InputBuffer storage 0 unconsumed (bufferPosition buffer) False Nothing Nothing))
-  where
-    unconsumed = bufferEnd buffer - bufferStart buffer
+        else Just <$> compactInput buffer
+  | otherwise = Just <$> reallocateInput (max readSize (2 * bufferCapacity (bufferStorage buffer))) buffer
+
+-- | Moves the unconsumed bytes to the start of the buffer's storage.
+compactInput :: InputBuffer -> IO InputBuffer
+compactInput buffer = do
+  let unconsumed = bufferEnd buffer - bufferStart buffer
+  withForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
+    moveBytes pointer (pointer `plusPtr` bufferStart buffer) unconsumed
+  pure buffer {bufferStart = 0, bufferEnd = unconsumed}
+{-# NOINLINE compactInput #-}
+
+-- | New storage of the given capacity, with the unconsumed bytes copied to
+-- its start.
+copiedStorage :: Int -> InputBuffer -> IO Buffer
+copiedStorage capacity buffer = do
+  storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
+  unsafeWithForeignPtr (bufferMemory storage) $ \target ->
+    unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \origin ->
+      copyBytes target (origin `plusPtr` bufferStart buffer) (bufferEnd buffer - bufferStart buffer)
+  pure storage
+{-# NOINLINE copiedStorage #-}
+
+-- | The unconsumed bytes in new storage of the given capacity, for input that
+-- allocates.
+reallocateInput :: Int -> InputBuffer -> IO InputBuffer
+reallocateInput capacity buffer = do
+  storage <- copiedStorage capacity buffer
+  pure $! InputBuffer storage 0 (bufferEnd buffer - bufferStart buffer) (bufferPosition buffer) False Nothing Nothing
+{-# NOINLINE reallocateInput #-}
 
 restoreWorkspace :: InputBuffer -> IO InputBuffer
 restoreWorkspace buffer = case bufferHome buffer of
@@ -564,10 +580,7 @@ restoreBorrowedWorkspace = do
   buffer <- getBuffer
   case bufferHome buffer of
     Nothing -> pure ()
-    Just (Buffer _ capacity) -> do
-      when (bufferEnd buffer - bufferStart buffer > capacity) $
-        failInput "borrowed input cannot expose unconsumed protocol lookahead"
-      putBuffer =<< inputIO (restoreHome buffer)
+    Just _ -> putBuffer =<< inputIO (restoreWorkspace buffer)
 
 someInput :: Int -> Input (Int, InputBuffer)
 someInput count
@@ -670,23 +683,9 @@ fill metadata source count buffer
   | Just (Buffer _ capacity) <- bufferHome buffer,
     count <= capacity = fill metadata source count =<< restoreHome buffer
   | bufferStart buffer + count <= bufferCapacity (bufferStorage buffer) = readUntilAvailable buffer
-  | bufferReusable buffer = readUntilAvailable =<< compact
-  | otherwise = readUntilAvailable =<< reallocate
+  | bufferReusable buffer = readUntilAvailable =<< compactInput buffer
+  | otherwise = readUntilAvailable =<< reallocateInput (max (inputReadSize source) count) buffer
   where
-    compact = do
-      let unconsumed = bufferEnd buffer - bufferStart buffer
-      withForeignPtr (bufferMemory (bufferStorage buffer)) $ \pointer ->
-        moveBytes pointer (pointer `plusPtr` bufferStart buffer) unconsumed
-      pure buffer {bufferStart = 0, bufferEnd = unconsumed}
-    reallocate = do
-      let unconsumed = bufferEnd buffer - bufferStart buffer
-          capacity = max (inputReadSize source) count
-      storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
-      let memory = bufferMemory storage
-      unsafeWithForeignPtr memory $ \target ->
-        unsafeWithForeignPtr (bufferMemory (bufferStorage buffer)) $ \origin ->
-          copyBytes target (origin `plusPtr` bufferStart buffer) unconsumed
-      pure (InputBuffer storage 0 unconsumed (bufferPosition buffer) False Nothing Nothing)
     readUntilAvailable current
       | bufferEnd current - bufferStart current >= count = pure current
       | otherwise = do
@@ -702,12 +701,9 @@ suppliedCapacity buffer = maybe (bufferCapacity (bufferStorage buffer)) (\(Buffe
 
 expandMetadata :: Int -> InputBuffer -> IO InputBuffer
 expandMetadata capacity buffer = do
-  storage <- maybe (ioError (userError "buffer capacity must be positive")) newBuffer (mkPositiveInt (toInteger capacity))
+  storage <- copiedStorage capacity buffer
   let count = bufferEnd buffer - bufferStart buffer
       home = bufferHome buffer <|> Just (bufferStorage buffer)
-  withForeignPtr (bufferMemory storage) $ \target ->
-    withForeignPtr (bufferMemory (bufferStorage buffer)) $ \origin ->
-      copyBytes target (origin `plusPtr` bufferStart buffer) count
   pure buffer {bufferStorage = storage, bufferStart = 0, bufferEnd = count, bufferHome = home}
 
 restoreHome :: InputBuffer -> IO InputBuffer
