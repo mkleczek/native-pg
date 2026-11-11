@@ -348,8 +348,8 @@ awaitSuccessful done = timeout 200_000 (takeMVar done) >>= \case
   _ -> failTest "FIFO successor did not receive its connection"
 
 withTestResources :: BufferPool.PoolSettings -> (Acquire.Context -> BufferPool.BufferPool -> IO a) -> IO a
-withTestResources settings action = getAcquisition >>= \waiting ->
-  BufferPool.newBufferPool waiting settings >>= action waiting
+withTestResources poolSettings action = getAcquisition >>= \waiting ->
+  BufferPool.newBufferPool waiting poolSettings >>= action waiting
 
 assertAcquisitionUsable :: Acquire.Context -> IO ()
 assertAcquisitionUsable waiting =

@@ -193,7 +193,7 @@ spec port = describe "operations and transactions in a scope" $ do
       takeMVar started
       threadDelay 100_000
       killThread worker
-      timeout 5_000_000 (takeMVar finished) >>= \outcome -> fmap (either (const "interrupted") (const "returned")) outcome `shouldBe` Just "interrupted"
+      timeout 5_000_000 (takeMVar finished) >>= \outcome -> fmap (either (const "interrupted") (const "returned")) outcome `shouldBe` (Just "interrupted" :: Maybe String)
       brokenAfter env
 
     it "breaks the connection when the thread is interrupted between operations, and doesn't wait for the answer" $ withEnv port 1 $ \env -> do
@@ -210,7 +210,7 @@ spec port = describe "operations and transactions in a scope" $ do
           >>= putMVar finished
       takeMVar started
       killThread worker
-      timeout 5_000_000 (takeMVar finished) >>= \outcome -> fmap (either (const "interrupted") (const "returned")) outcome `shouldBe` Just "interrupted"
+      timeout 5_000_000 (takeMVar finished) >>= \outcome -> fmap (either (const "interrupted") (const "returned")) outcome `shouldBe` (Just "interrupted" :: Maybe String)
       brokenAfter env
 
   describe "a field as a pull source" $ do

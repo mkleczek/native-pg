@@ -94,10 +94,10 @@ stepChunk source =
 chunksWith :: WaitingSource source => (IO Watch -> IO ()) -> source -> IO [BS.ByteString]
 chunksWith wait source = go []
   where
-    go chunks =
+    go acc =
       stepWith wait source >>= \case
-        Chunk chunk -> go (chunk : chunks)
-        Over -> pure (reverse chunks)
+        Chunk chunk -> go (chunk : acc)
+        Over -> pure (reverse acc)
 
 -- | The chunks until the end of the field, which the pulls have to give without a wait.
 chunks :: WaitingSource source => source -> IO [BS.ByteString]

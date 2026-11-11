@@ -130,7 +130,7 @@ withFeed :: Int -> (FeedLink -> Context -> IO a) -> IO a
 withFeed size action = do
   link <- newFeedLink
   input <- buffer size
-  output <- buffer 64
+  output <- buffer (64 :: Int)
   connection <- newConnection (newChannel link) size
   withContext connection input output (action link)
   where

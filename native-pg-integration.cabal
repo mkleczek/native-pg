@@ -31,6 +31,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Internal.Exchange
                       Database.PostgreSQL.Internal.Execution
                       Database.PostgreSQL.Internal.HostSelection
+                      Database.PostgreSQL.Internal.PoolLifetime
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
                       Database.PostgreSQL.Internal.Protocol.Codec.Input
@@ -50,6 +51,8 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Internal.Socket
                       Database.PostgreSQL.Internal.Some
                       Database.PostgreSQL.Internal.Startup
+                      Database.PostgreSQL.Pool
+                      Database.PostgreSQL.Pool.Observation
                       Database.PostgreSQL.Session
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet

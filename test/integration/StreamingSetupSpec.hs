@@ -204,8 +204,8 @@ countField count row = PG.nextColumn row >>= \case
         drain (total + BS.length chunk) stream
 
 withTestResources :: PoolSettings -> (BufferPool.BufferPool -> IO a) -> IO a
-withTestResources settings action = getAcquisition >>= \waiting ->
-  BufferPool.newBufferPool waiting settings >>= action
+withTestResources poolSettings action = getAcquisition >>= \waiting ->
+  BufferPool.newBufferPool waiting poolSettings >>= action
 
 -- Keep both body buffers occupied while connection setup uses its own pair.
 withRequestPair :: BufferPool.BufferPool -> ((Buffer, Buffer) -> IO a) -> IO a

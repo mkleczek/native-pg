@@ -277,7 +277,7 @@ tryReserveReady pool@Pool{..} = do
   ensureOpen poolClosed
   entry <- tryReadTQueue poolIdle
   for_ entry (const $ modifyTVar' poolIdleCount (subtract 1))
-  traverse (\owned -> Reservation pool <$> readTVar poolReuse <*> pure owned <*> newTVar Tentative) entry
+  traverse (\connection -> Reservation pool <$> readTVar poolReuse <*> pure connection <*> newTVar Tentative) entry
 
 -- | Checks expiration against a fresh monotonic time, closing an invalid
 -- tentative claim. A validated claim remains valid until finished. Returns
@@ -316,10 +316,10 @@ finishReservation Reservation{..} outcome = withPoolLifetime reservationPool $ m
         Validated taken -> reservationEntry{entryTaken = taken}
         InUse taken -> reservationEntry{entryTaken = taken}
         _ -> reservationEntry
-  for_ entry $ \owned -> case outcome of
-    Succeeded -> returnPoolEntry reservationPool reservationReuse owned SessionSucceededConnectionReadyForUseReason
-    Failed failure -> returnPoolEntry reservationPool reservationReuse owned (SessionFailedConnectionReadyForUseReason failure)
-    Broke details -> closePoolEntry reservationPool owned (NetworkErrorConnectionTerminationReason details)
+  for_ entry $ \connection -> case outcome of
+    Succeeded -> returnPoolEntry reservationPool reservationReuse connection SessionSucceededConnectionReadyForUseReason
+    Failed failure -> returnPoolEntry reservationPool reservationReuse connection (SessionFailedConnectionReadyForUseReason failure)
+    Broke details -> closePoolEntry reservationPool connection (NetworkErrorConnectionTerminationReason details)
 
 -- | Runs an already validated reservation, with 'use'-style exception cleanup.
 -- A tentative or finished claim throws 'ReservationError' before the action.

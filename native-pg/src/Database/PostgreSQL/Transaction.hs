@@ -191,8 +191,8 @@ transactionIn scope isolation mode session@(Exchange.Session context) =
     begin = do
       beginContextOperation context
       newRuntime isolation mode session `onException` endContextOperation context True
-    release ending runtime = do
-      outcome <- try @SomeException (settleTransaction runtime ending)
+    release end runtime = do
+      outcome <- try @SomeException (settleTransaction runtime end)
       endLife runtime
       -- A failure of the server doesn't break the connection, and one of the
       -- rest does, as an operation that fails decides.
