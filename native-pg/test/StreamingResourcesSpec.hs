@@ -25,8 +25,7 @@ import qualified Database.PostgreSQL.Diagnostics as PG
 import qualified Skeletest.Predicate as P
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Streaming as PG
-import Database.PostgreSQL.Transport hiding (newChannel)
-import Database.PostgreSQL.Internal.Channel
+import Database.PostgreSQL.Transport
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.BufferPool
 import qualified Network.Streaming.BufferPool as BufferPool

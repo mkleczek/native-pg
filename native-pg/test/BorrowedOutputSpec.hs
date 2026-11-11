@@ -22,7 +22,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (borrowedStream)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (MaybeBytes32Atom))
-import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Transport
 import FeedSupport (staticBytes)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Alloc (allocaBytes)

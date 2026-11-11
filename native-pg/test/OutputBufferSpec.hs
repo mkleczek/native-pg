@@ -24,7 +24,7 @@ import FeedSupport (staticBytes)
 import Network.Streaming.BufferPool (PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Database.PostgreSQL.Internal.Protocol (pattern Sync, pattern Parse, pattern Execute, pattern Query, serialize)
-import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Transport
 import Database.PostgreSQL.Internal.Channel
 import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Foreign.ForeignPtr (withForeignPtr)

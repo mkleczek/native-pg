@@ -18,8 +18,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Output (borrowedStream)
 import qualified Database.PostgreSQL.Session as PG
 import qualified Database.PostgreSQL.Internal.Execution as PG
 import qualified Database.PostgreSQL.Internal.Row as PG
-import Database.PostgreSQL.Transport hiding (newChannel)
-import Database.PostgreSQL.Internal.Channel
+import Database.PostgreSQL.Transport
 import Foreign.ForeignPtr (withForeignPtr, plusForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)

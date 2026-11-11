@@ -34,8 +34,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.List (intercalate)
 import Data.Word (Word8)
-import Database.PostgreSQL.Internal.Channel (Channel)
-import qualified Database.PostgreSQL.Internal.Channel as Channel
+import Database.PostgreSQL.Internal.Channel (Channel, newChannel)
 import Database.PostgreSQL.Transport.Link
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
 import GHC.IO.Exception (IOException (..))
@@ -176,14 +175,6 @@ newtype TlsError = TlsError String
 
 instance Exception TlsError where
   displayException (TlsError reason) = "SSL error: " <> reason
-
--- | A channel retains the link; each input operation supplies its own pending
--- output and read size. Callers must ensure exclusive access to the channel
--- and its link, including reads and writes through the channel.
-newChannel :: Link link => link -> Channel
-newChannel = Channel.newChannel
-{-# INLINABLE newChannel #-}
-{-# SPECIALIZE newChannel :: Socket -> Channel #-}
 
 -- | Channel binding's data for tls-server-end-point (RFC 5929): the hash of
 -- the server's certificate, given in DER, with the hash its signature

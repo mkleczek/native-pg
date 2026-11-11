@@ -19,6 +19,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec (Output)
 import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputSource (..))
 import Database.PostgreSQL.Transport.Link
 import Foreign.Ptr (Ptr)
+import Network.Socket (Socket)
 import Network.Streaming.Sender
   ( OutputBuffer,
     Pushed (..),
@@ -67,7 +68,8 @@ data Channel = Channel
   }
 
 -- | A channel retains the link; each input operation supplies its own pending
--- output and read size.
+-- output and read size. Callers must ensure exclusive access to the channel
+-- and its link, including reads and writes through the channel.
 newChannel :: Link link => link -> Channel
 newChannel link =
   Channel
@@ -87,6 +89,7 @@ newChannel link =
     !reading = readStalls link
     !sending = waitingStalls link
 {-# INLINABLE newChannel #-}
+{-# SPECIALIZE newChannel :: Socket -> Channel #-}
 
 -- | The stalls of a read: they stop for the server's input.
 readStalls :: Link link => link -> Stalls

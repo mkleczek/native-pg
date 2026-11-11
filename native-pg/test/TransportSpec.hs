@@ -20,7 +20,7 @@ import qualified Database.PostgreSQL.Session as Session
 import qualified Database.PostgreSQL.Internal.Exchange as Exchange
 import qualified Database.PostgreSQL.Internal.Execution as Session
 import qualified Database.PostgreSQL.Diagnostics as Session
-import Database.PostgreSQL.Transport hiding (newChannel)
+import Database.PostgreSQL.Transport
 import Database.PostgreSQL.Internal.Channel
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes)

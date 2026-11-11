@@ -28,8 +28,7 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, minusPtr)
 import Data.Word (Word8)
-import Database.PostgreSQL.Transport hiding (newChannel)
-import Database.PostgreSQL.Internal.Channel
+import Database.PostgreSQL.Transport
 import Network.Streaming.Watch (readyNow)
 import Skeletest hiding (context)
 
