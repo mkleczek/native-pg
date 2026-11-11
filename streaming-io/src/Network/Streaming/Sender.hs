@@ -13,7 +13,7 @@ module Network.Streaming.Sender
     Unsent,
     unsentEmpty,
     discardUnsent,
-    OutputBuffer (..),
+    OutputBuffer,
     newOutputBuffer,
     outputBufferFrom,
     outputBufferPerOutput,
@@ -92,15 +92,15 @@ data Part
 -- | Memory that outputs are written to, reused once what was written to it
 -- is sent; or new memory for each output.
 data OutputBuffer
-  = OutputBuffer (ForeignPtr Word8) Int Bool
+  = OutputBuffer !Buffer.Buffer !Bool
   | PerOutputBuffer Int
 
 newOutputBuffer :: Int -> IO OutputBuffer
-newOutputBuffer size = (\memory -> OutputBuffer memory size False) <$> mallocPlainForeignPtrBytes size
+newOutputBuffer size = (\memory -> OutputBuffer (Buffer.Buffer memory size) False) <$> mallocPlainForeignPtrBytes size
 
 -- | The caller must keep the loan exclusive until all output has been sent.
 outputBufferFrom :: Buffer.Buffer -> OutputBuffer
-outputBufferFrom buffer = OutputBuffer (Buffer.bufferMemory buffer) (Buffer.bufferCapacity buffer) True
+outputBufferFrom buffer = OutputBuffer buffer True
 
 -- | New memory for each output, as large as its copied bytes, or the limit
 -- if less, so that an output goes in one send unless it is longer than that.
@@ -113,7 +113,7 @@ outputBufferPerOutput = PerOutputBuffer
 -- copied output. Long byte strings and streams retain their own storage until
 -- accepted by the link.
 unsent :: Maybe OutputBuffer -> Output -> IO Unsent
-unsent (Just (OutputBuffer memory size True)) output
+unsent (Just (OutputBuffer (Buffer.Buffer memory size) True)) output
   | size < 4 = ioError (userError "output buffer capacity must be at least four bytes")
   | otherwise = pure (Unsent [PartOutput memory size 0 (outputWriter output)])
 unsent (Just (PerOutputBuffer limit)) output = do
@@ -122,7 +122,7 @@ unsent (Just (PerOutputBuffer limit)) output = do
   pure (Unsent [PartOutput memory size 0 (outputWriter output)])
 unsent reused output = do
   memory <- case reused of
-    Just (OutputBuffer memory size _) | outputCopied output <= size -> pure memory
+    Just (OutputBuffer (Buffer.Buffer memory size) _) | outputCopied output <= size -> pure memory
     _ -> mallocPlainForeignPtrBytes (outputCopied output)
   parts <- writeOutput memory output
   pure (Unsent (map (either PartBytes uncopiedPart) parts))
