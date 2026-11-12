@@ -1,0 +1,89 @@
+cabal-version: 3.0
+name: native-pg-integration
+version: 0.1.0.0
+synopsis: Whitebox PostgreSQL and TLS integration tests for native-pg
+license: AGPL-3.0-or-later
+license-file: LICENSE
+build-type: Simple
+extra-source-files: native-pg-tls/src/cbits/native-pg-tls.h
+                    native-pg-tls/test/certificates/*.crt
+                    native-pg-tls/test/certificates/*.key
+                    native-pg-tls/test/certificates/*.crl
+                    native-pg-tls/test/certificates/*.sh
+
+-- The integration tests of the v2 API. Every group of them is marked as an expected
+-- failure until the v2 code is there.
+test-suite native-pg-integration
+  default-language: GHC2021
+  default-extensions: QuasiQuotes
+  type: exitcode-stdio-1.0
+  -- Compile both implementations together: tests can reach private operations
+  -- without exposing them to applications or creating duplicate type identities.
+  hs-source-dirs: test/integration native-pg/src native-pg-tls/src
+  other-modules:      Database.PostgreSQL.Connection
+                      Database.PostgreSQL.Connection.Internal
+                      Database.PostgreSQL.ConnectionString
+                      Database.PostgreSQL.ConnectionString.Types
+                      Database.PostgreSQL.Decoding
+                      Database.PostgreSQL.Diagnostics
+                      Database.PostgreSQL.Encoders
+                      Database.PostgreSQL.Errors
+                      Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Diagnostics
+                      Database.PostgreSQL.Internal.Protocol
+                      Database.PostgreSQL.Internal.Protocol.Codec
+                      Database.PostgreSQL.Internal.Protocol.Codec.Output
+                      Database.PostgreSQL.Internal.Protocol.Codec.Payload
+                      Database.PostgreSQL.Internal.Protocol.Messages
+                      Database.PostgreSQL.Internal.Protocol.Messages.AuthBackend
+                      Database.PostgreSQL.Internal.Protocol.Messages.AuthFrontend
+                      Database.PostgreSQL.Internal.Protocol.Messages.BackendSession
+                      Database.PostgreSQL.Internal.Protocol.Messages.Copy
+                      Database.PostgreSQL.Internal.Protocol.Messages.FrontendSession
+                      Database.PostgreSQL.Internal.Protocol.Messages.MessageType
+                      Database.PostgreSQL.Internal.Protocol.Messages.Parse
+                      Database.PostgreSQL.Internal.Protocol.Messages.Startup
+                      Database.PostgreSQL.Internal.Protocol.Messages.Types
+                      Database.PostgreSQL.Notifications
+                      Database.PostgreSQL.Pool
+                      Database.PostgreSQL.Pool.Observation
+                      Database.PostgreSQL.Session.Settings
+                      Database.PostgreSQL.Snippet
+                      Database.PostgreSQL.Tls
+                      Database.PostgreSQL.Tls.Internal
+                      Database.PostgreSQL.Transaction
+                      Database.PostgreSQL.Transport
+                      Database.PostgreSQL.Types
+                      AcquisitionTestSupport
+                      BufferSpec
+                      IntegrationSpec
+                      ScopeTransactionSpec
+                      TestCluster
+                      TestPrograms
+                      TransactionSpec
+  main-is: Main.hs
+  ghc-options: -Wall -threaded "-with-rtsopts=-T"
+  build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
+  c-sources: native-pg-tls/src/cbits/native-pg-tls.c
+  include-dirs: native-pg-tls/src/cbits
+  pkgconfig-depends: rustls >= 0.15 && < 0.16
+  build-depends:      base              >= 4.9 && < 4.22
+                    , base64-bytestring >= 1 && < 1.3
+                    , bytestring        >= 0.10.8 && < 0.13
+                    , crypton           >= 1.0 && < 1.1
+                    , directory         >= 1.2.6 && < 1.4
+                    , filepath          >= 1.4 && < 1.6
+                    , memory            >= 0.18 && < 0.19
+                    , network           >= 3.1 && < 3.3
+                    , postgresql-binary >= 0.14.2 && < 0.15
+                    , process           >= 1.4.2 && < 1.7
+                    , resource-admission
+                    , scientific        >= 0.3 && < 0.4
+                    , skeletest         >= 0.4.2 && < 0.5
+                    , streaming-io
+                    , text              >= 1.2.2 && < 2.2
+                    , time              >= 1.9 && < 2
+                    , unix              >= 2.7 && < 2.9
+                    , uuid              >= 1.3 && < 2
+  if os(windows)
+    buildable: False
