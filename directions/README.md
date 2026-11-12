@@ -1,11 +1,18 @@
 # directions: a prototype of I/O by data direction
 
-A fresh package that shows the arrow design, apart from the code that would use
-it. Nothing in native-pg, streaming-io or Warp depends on it.
+A prototype that shows the arrow design, apart from the code that would use it.
+The runtime it began with, the classes, the arrows, the scheduler, tickets,
+scopes, the pool and the reader, is now in `streaming-io`, under
+`Network.Streaming`, and is described below with the modules' new names. What
+stays here is what only the prototype uses: the proxy and what it is tried
+with (`Network.Directions.Proxy`), the ping-pong programs, the link over bytes in
+memory, the row parsers (`Rows`, `Resumable`) and the benchmarks. Nothing in
+native-pg, streaming-io or Warp depends on this package, but native-pg's cursor
+tests and benchmark use its parsers.
 
-- **The classes** (`Network.Directions.Classes`): `Link arr link`, whose calls
-  block in the arrow that runs them (`receive`, `sendAll`, `shutdownSend`,
-  `close`); and what an arrow can do: `Effect` (`now`, an action that never
+- **The classes** (`Network.Streaming.Classes`): `Link arr link`, whose calls
+  block in the arrow that runs them (`receive`, `sendAll`, `awaitInput`,
+  `shutdownSend`, `close`); and what an arrow can do: `Effect` (`now`, an action that never
   waits), `Block` (wait until a watch fires), `Concurrent` (two arrows at
   once) and `Exchange arr r` (a ticket that one direction gives a value and
   another waits for; made as the program runs, `ticket :: arr () (Waiting arr r a, Giver r a)`,
@@ -14,15 +21,17 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   need.
 - **A link's instance is written once, for any arrow:** the socket's and the
   simulated end's are `(ArrowChoice arr, Effect arr, Block arr) => Link arr _`,
-  a try with `now`, and a `block` on the link's watch while nothing is ready.
-  The tries are streaming-io's, as they are, plus `HalfClose`, which they lack.
-  `Network.Directions.Simulated` is an in-memory link whose lanes hold a set
+  a try with `now`, and a `block` on the link's event while nothing is ready.
+  The tries are the link's own calls that never wait (`receiveWith` and
+  `sendAllWith` of `Classes` build the calls of the class from them), and
+  `awaitInput` blocks on the event of its input without taking any.
+  `Network.Streaming.Simulated` is an in-memory link whose lanes hold a set
   number of bytes.
 - **Two arrows provide the capabilities:**
-  - `Threads` (`Network.Directions.Threads`), a function to IO: `block` blocks
+  - `Threads` (`Network.Streaming.Threads`), a function to IO: `block` blocks
     the thread, each half of a concurrent pair has a thread of its own, and a
     ticket is a `TMVar` that blocks the thread waiting for it.
-  - `Loop` (`Network.Directions.Loop`), a program as data, whose only
+  - `Loop` (`Network.Streaming.Loop`), a program as data, whose only
     primitives are `now` and `block`. `runLoop` runs all of its concurrent
     parts on one thread; a part that blocks is the rest of its program, as
     data. A ticket is a slot on that thread: a part that waits for it is
@@ -37,7 +46,7 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   request side waits for the decision of its answer side to send COMMIT or
   ROLLBACK.
 
-- **Cores** (`Network.Directions.Delimited`, `Pool`, `PingPong`): thread per
+- **Cores** (`Network.Streaming.Delimited`, `Pool`, `PingPong`): thread per
   core is one `Delimited` scheduler for each core, with its own poller and
   mailbox. The core is in the arrow's type, as `ST`'s state thread is:
   `Delimited s a b`, run by `runDelimited :: (forall s. Delimited s a b) -> ...`
@@ -57,14 +66,14 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   one reference to the free connections and the givers of the waiters.
   `Threads` has the one reach, `'Anywhere`, and `Compiled` and `Loop` only
   `Local`'s.
-- **Helpers** (`Network.Directions.Combinators`): what programs need so that a
+- **Helpers** (`Network.Streaming.Combinators`): what programs need so that a
   value is made where it is used and not carried through the arrows between:
   `timesWith` (a step this many times, on a state), `untilJust` (a retry that
   gives way), `keeping` (an arrow's result next to the input), and `expect` and
   `call` for a request that carries the giver its answer is given at, for a
   ticket of any reach.
 
-- **Scopes and cancellation** (`Scope`, `Race`; `Network.Directions.Cancel`):
+- **Scopes and cancellation** (`Scope`, `Race`; `Network.Streaming.Internal.Cancel`):
   `scope acquire release body` releases on every exit, behind a shield, and
   the release may wait; `tryA` gives a failure as a value and lets a
   cancellation pass; `shield` keeps the cancellations of scopes outside it
@@ -77,7 +86,7 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   `Loop` unwinds frames. A shutdown of a `Delimited` or `Compiled` run
   cancels every part that holds something, and runs its release. The pool's
   `checkout` gives up its place when cancelled.
-- **Time** (`Time`, `Within`; `Network.Directions.Timers`): `clock`, `block
+- **Time** (`Time`, `Within`; `Network.Streaming.Internal.Timers`): `clock`, `block
   (Until instant)`, `sleep`, and `within d body`, a deadline that is a scope
   inherited by everything inside it. `Delimited` and `Compiled` keep a timer
   wheel for each core, read the clock once a round, and wait in the poller
@@ -89,6 +98,7 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
 Run from the repository's root, in its `nix-shell`:
 
 ```sh
+cabal test streaming-io --test-options='+RTS -N4'
 cabal test directions --test-options='+RTS -N4'
 cabal run directions-bench -- 64 +RTS -T
 cabal run directions-cores-bench -- pool delimited 4 16 8 2 +RTS -T -N4

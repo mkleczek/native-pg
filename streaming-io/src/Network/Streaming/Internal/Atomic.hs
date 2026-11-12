@@ -6,7 +6,7 @@
 -- the new value before it installs it by compare-and-swap, and a core that loses the race computes it again from
 -- the value that won. The reference must always hold an evaluated value, which its first one is if it is a
 -- constructor, and everything 'update' installs is.
-module Network.Directions.Atomic
+module Network.Streaming.Internal.Atomic
   ( update,
   )
 where

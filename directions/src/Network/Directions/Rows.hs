@@ -3,7 +3,7 @@
 -- | PostgreSQL-shaped messages, and parsers for them written as arrows over a
 -- 'Reader': a stream of DataRow messages ended by a CommandComplete, and one
 -- DataRow whose only field is as large as a whole response body. They are what
--- "Network.Directions.Reader" is measured with.
+-- "Network.Streaming.Reader" is measured with.
 module Network.Directions.Rows
   ( -- * The wire
     rowsWire,
@@ -45,9 +45,9 @@ import Data.Int (Int64)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray)
 import Foreign.Storable (peek, poke)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
-import Network.Directions.Classes
-import Network.Directions.Reader
 import Network.Directions.Resumable
+import Network.Streaming.Classes
+import Network.Streaming.Reader
 
 -- | A stream of this many DataRow messages, each of five fields, then a
 -- CommandComplete. Row i has an int4 (i), an int8, a text of 16 bytes, a text

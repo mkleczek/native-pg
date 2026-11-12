@@ -15,9 +15,9 @@ import Control.Exception (TypeError (..), evaluate, try)
 import Control.Monad (void, when)
 import Data.Coerce (coerce)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Network.Directions.Classes
-import Network.Directions.Combinators (keeping)
-import Network.Directions.Delimited
+import Network.Streaming.Classes
+import Network.Streaming.Combinators (keeping)
+import Network.Streaming.Delimited
 import Skeletest
 
 spec :: Spec

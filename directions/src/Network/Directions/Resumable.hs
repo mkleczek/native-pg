@@ -24,11 +24,11 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
-import Foreign.ForeignPtr (plusForeignPtr)
 import Foreign.Marshal.Utils (moveBytes)
 import Foreign.Ptr (castPtr)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
-import Network.Directions.Classes hiding (Exit (..))
+import Network.Streaming.Buffer (Buffer (..))
+import Network.Streaming.Classes hiding (Exit (..))
 
 -- | Where a parser is: done, with the bytes it left in hand, or in need of
 -- bytes, or with a piece of a field to give away.
@@ -107,7 +107,7 @@ parse link buffer consumer (Parser parser) = (`parser` Done) ^>> loop
 fill :: (ArrowChoice arr, Effect arr, Link arr link) => link -> Buffer -> arr (Int, ByteString) ByteString
 fill link buffer = now compact >>> loop
   where
-    Room memory size = roomOf buffer
+    Buffer memory size = buffer
     compact (count, held)
       | count > size = ioError (userError "an atom larger than the buffer")
       | otherwise = do
@@ -116,7 +116,7 @@ fill link buffer = now compact >>> loop
     loop = enough ^>> ((first (receive link) >>> added ^>> loop) ||| returnA)
     enough (count, filled)
       | filled >= count = Right (BSI.BS memory filled)
-      | otherwise = Left (Room (memory `plusForeignPtr` filled) (size - filled), (count, filled))
+      | otherwise = Left (Room buffer filled (size - filled), (count, filled))
     added (received, (count, filled))
       | received <= 0 = error "the stream ended inside a value"
       | otherwise = (count, filled + received)

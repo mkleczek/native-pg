@@ -3,7 +3,7 @@
 
 -- | Two parts that send each other a value and wait for the answer, over
 -- tickets that are made as they go, written once for any arrow that has them
--- and for any reach: the program that the tickets of "Network.Directions.Classes" are measured
+-- and for any reach: the program that the tickets of "Network.Streaming.Classes" are measured
 -- with, on one core, across two, and in two threads.
 module Network.Directions.PingPong
   ( Ping,
@@ -28,8 +28,8 @@ import Control.Arrow (Arrow, ArrowChoice, arr, (>>>), (>>^), (^>>))
 import Control.Concurrent (threadDelay)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.Word (Word64)
-import Network.Directions.Classes
-import Network.Directions.Combinators
+import Network.Streaming.Classes
+import Network.Streaming.Combinators
 
 -- | A request: the giver of the answer.
 newtype Ping r = Ping (Giver r (Pong r))

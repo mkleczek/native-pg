@@ -21,9 +21,9 @@ import Data.ByteString (ByteString)
 import Data.Int (Int32, Int64)
 import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
-import Network.Directions.Classes
-import Network.Directions.Reader (Reader)
 import Network.Directions.Rows (Counter, adding)
+import Network.Streaming.Classes
+import Network.Streaming.Reader (Reader)
 
 -- | What the result of a query is: rows, ended by a command's completion.
 type ResultStream =

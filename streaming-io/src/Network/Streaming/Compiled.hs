@@ -2,19 +2,19 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- | Every concurrent part on one thread, as 'Network.Directions.Loop' runs
+-- | Every concurrent part on one thread, as 'Network.Streaming.Loop' runs
 -- them, but compiled: an arrow is a function that takes what follows it as a
 -- continuation, so a program's composition is function composition, which GHC
 -- inlines. A part that waits is a closure, which can't be looked into, and is
 -- built only where the part waits.
 --
 -- A part's handlers are not on a stack that a wait captures, as they are in
--- "Network.Directions.Delimited": each scope gives what runs inside it its own
+-- "Network.Streaming.Delimited": each scope gives what runs inside it its own
 -- failure continuation, and the part says which is the one it runs in when it
 -- goes on. A failure that leaves the code the scheduler runs is handed, by the
 -- scheduler's catch, to the one the part set last, which runs the scope's
 -- release as an arrow, and then goes on to the scope outside.
-module Network.Directions.Compiled
+module Network.Streaming.Compiled
   ( Compiled,
     runCompiled,
     runCompiledTurn,
@@ -26,12 +26,12 @@ import Control.Category (Category (..))
 import Control.Exception (SomeException, mask_, throwIO, toException)
 import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Network.Directions.Cancel
-import Network.Directions.Classes
-import Network.Directions.Loop (Report)
-import Network.Directions.Scheduler
-import Network.Directions.Tickets
-import Network.Directions.Timers (addTimer, cancelTimer)
+import Network.Streaming.Classes
+import Network.Streaming.Internal.Cancel
+import Network.Streaming.Internal.Scheduler
+import Network.Streaming.Internal.Tickets
+import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
+import Network.Streaming.Loop (Report)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 

@@ -15,7 +15,7 @@
 -- cancellation throws once, and only to a part that waits and whose scope lies
 -- above its innermost shield; a part that doesn't wait looks at the scopes'
 -- flags when it does, so that a cancellation is neither lost nor early.
-module Network.Directions.Threads
+module Network.Streaming.Threads
   ( Threads,
     runThreads,
   )
@@ -38,10 +38,10 @@ import GHC.Exts (casMutVar#)
 import GHC.IO (IO (..))
 import GHC.IORef (IORef (..), atomicSwapIORef)
 import GHC.STRef (STRef (..))
-import Network.Directions.Atomic (update)
-import Network.Directions.Cancel (CancelScope (..), Frame (..), cancelledIn, deliverable, newCancelScope)
-import Network.Directions.Classes
-import Network.Directions.Tickets
+import Network.Streaming.Classes
+import Network.Streaming.Internal.Atomic (update)
+import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledIn, deliverable, newCancelScope)
+import Network.Streaming.Internal.Tickets
 import Network.Streaming.Watch (awaitWatch)
 import System.IO.Unsafe (unsafePerformIO)
 import Prelude hiding (id, (.))

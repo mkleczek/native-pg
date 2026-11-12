@@ -164,4 +164,4 @@ test-suite cursors-spec
                       Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ghc-options:        -Wall -threaded -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
-  build-depends:      base, bytestring, directions, skeletest >= 0.4.2 && < 0.5
+  build-depends:      base, bytestring, directions, streaming-io, skeletest >= 0.4.2 && < 0.5

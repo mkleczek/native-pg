@@ -5,12 +5,12 @@
 -- tells the parts inside it; each arrow tells them in its own way. A part looks at the flags of its scopes at its
 -- waits, and a cancellation is for it only if its scope lies above the innermost shield.
 --
--- What a scope keeps of the parts inside it is the arrow's, and its type. "Network.Directions.Threads", whose parts
+-- What a scope keeps of the parts inside it is the arrow's, and its type. "Network.Streaming.Threads", whose parts
 -- run on several threads, keeps them in a map that every thread that enters or leaves the scope changes atomically.
--- The arrows that run every part of a core on one thread ("Network.Directions.Scheduler") keep nothing of them
+-- The arrows that run every part of a core on one thread ("Network.Streaming.Internal.Scheduler") keep nothing of them
 -- when a part enters or leaves a scope: a scope begins with the parts that made it, and the rest are found
 -- through those when it is cancelled.
-module Network.Directions.Cancel
+module Network.Streaming.Internal.Cancel
   ( CancelScope (..),
     Frame (..),
     newCancelScope,
@@ -20,7 +20,7 @@ module Network.Directions.Cancel
 where
 
 import Data.IORef (IORef, newIORef, readIORef)
-import Network.Directions.Classes (ScopeId (..))
+import Network.Streaming.Classes (ScopeId (..))
 
 -- | A scope: which it is, whether it was cancelled, and what the arrow keeps of the parts inside it, in a reference.
 data CancelScope m = CancelScope

@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuantifiedConstraints #-}
 
 -- | Moves bytes from a client through the proxy to an echo server and back,
@@ -16,15 +17,18 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (isPrefixOf)
 import Data.Maybe (listToMaybe)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
-import Network.Directions.Classes
-import Network.Directions.Compiled
-import Network.Directions.Delimited
-import Network.Directions.Loop
 import Network.Directions.Proxy
-import Network.Directions.Simulated
-import Network.Directions.Threads
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
+import Network.Streaming.Buffer (Buffer, bufferCapacity, newBuffer)
+import Network.Streaming.Classes
+import Network.Streaming.Combinators (together)
+import Network.Streaming.Compiled
+import Network.Streaming.Delimited
+import Network.Streaming.Loop
+import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Simulated
+import Network.Streaming.Threads
 import System.Environment (getArgs)
 import Text.Printf (printf)
 
@@ -83,11 +87,11 @@ roundTrip run size (client, front, back, server) = do
   received <- newIORef 0
   report <-
     run $ do
-      forSending <- newBuffer 16384
-      forCounting <- newBuffer 16384
-      requests <- newBuffer 16384
-      answers <- newBuffer 16384
-      forServer <- newBuffer 16384
+      forSending <- newBuffer (positiveInt @16384)
+      forCounting <- newBuffer (positiveInt @16384)
+      requests <- newBuffer (positiveInt @16384)
+      answers <- newBuffer (positiveInt @16384)
+      forServer <- newBuffer (positiveInt @16384)
       pure $
         together
           [ sending forSending size client,
@@ -108,7 +112,7 @@ sending buffer total end = const total ^>> loop
     loop =
       (\left -> if left == 0 then Left () else Right left)
         ^>> (shutdownSend end ||| (chunk ^>> first (sendAll end) >>> snd ^>> loop))
-    chunk left = let count = min left (bufferSize buffer) in ([view buffer count], left - count)
+    chunk left = let count = min left (bufferCapacity buffer) in ([view buffer count], left - count)
 
 -- | Counts what arrives, until the end of the stream.
 counting :: (ArrowChoice arr, Effect arr, Link arr end) => Buffer -> end -> IORef Int -> arr () ()

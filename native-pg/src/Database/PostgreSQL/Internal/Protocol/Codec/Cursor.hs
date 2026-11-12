@@ -89,8 +89,8 @@ import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peekByteOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import GHC.TypeLits (KnownChar, KnownNat, Nat, charVal, natVal)
-import Network.Directions.Classes
-import Network.Directions.Reader
+import Network.Streaming.Classes
+import Network.Streaming.Reader
 
 -- | A message's frame: its tag byte and the length-prefixed body, as
 -- native-pg's own.

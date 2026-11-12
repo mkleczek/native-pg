@@ -21,13 +21,15 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
 import Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Empty, Payload (..))
 import Foreign.Storable (peekByteOff)
-import Network.Directions.Classes
-import Network.Directions.Compiled
-import Network.Directions.Delimited
 import Network.Directions.Memory
-import Network.Directions.Reader
 import Network.Directions.Rows (Counter, adding, counted, newCounter, rowsChecksum, rowsWire, streamWire)
-import Network.Directions.Threads
+import Network.Streaming.Buffer (Buffer, newBuffer)
+import Network.Streaming.Classes
+import Network.Streaming.Compiled
+import Network.Streaming.Delimited
+import Network.Streaming.PositiveInt (mkPositiveInt)
+import Network.Streaming.Reader
+import Network.Streaming.Threads
 import Skeletest
 
 -- | The messages that some of the tests read: a ParseComplete, rows, and a
@@ -183,7 +185,7 @@ runAll' program input wire limit capacity =
         <$> try
           ( do
               memory <- newMemory wire limit
-              reader <- newReader memory capacity
+              reader <- bufferOf capacity >>= newReader memory
               run (program reader) >>= evaluate
           )
 
@@ -210,10 +212,14 @@ outcome = either (Left . told) Right
       Just (CursorError what) -> "cursor error: " <> what
       Nothing -> "other: " <> show failure
 
+-- | A buffer of the capacity, which the runs choose.
+bufferOf :: Int -> IO Buffer
+bufferOf = maybe (ioError (userError "the capacity is not positive")) newBuffer . mkPositiveInt . toInteger
+
 withReader :: ByteString -> Int -> Int -> (Reader Memory -> IO a) -> IO a
 withReader wire limit capacity use = do
   memory <- newMemory wire limit
-  reader <- newReader memory capacity
+  reader <- bufferOf capacity >>= newReader memory
   use reader
 
 -- | A program that sets itself up in IO.

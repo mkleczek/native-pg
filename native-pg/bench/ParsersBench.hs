@@ -26,16 +26,15 @@ import Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
 import Database.PostgreSQL.Internal.Protocol.Codec.Input
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
-import qualified Network.Directions.Classes as Directions
-import Network.Directions.Compiled
-import Network.Directions.Delimited
 import Network.Directions.Memory
-import Network.Directions.Reader
 import Network.Directions.Resumable
 import Network.Directions.Rows
-import Network.Directions.Threads
-import Network.Streaming.Buffer (newBuffer)
+import Network.Streaming.Buffer (Buffer, newBuffer)
+import Network.Streaming.Compiled
+import Network.Streaming.Delimited
 import Network.Streaming.PositiveInt (mkPositiveInt)
+import Network.Streaming.Reader
+import Network.Streaming.Threads
 import System.Environment (getArgs)
 import System.Exit (die)
 import System.Mem (performMajorGC)
@@ -92,8 +91,12 @@ variants =
       (streamed (\counter reader -> fst <$> runDelimited (streamCursors reader (counting counter)) ()))
   ]
 
+-- | A buffer of the capacity.
+bufferOf :: Int -> IO Buffer
+bufferOf = maybe (ioError (userError "the capacity is not positive")) newBuffer . mkPositiveInt . toInteger
+
 withReader :: Memory -> (Reader Memory -> IO a) -> IO a
-withReader memory use = newReader memory capacity >>= use
+withReader memory use = bufferOf capacity >>= newReader memory >>= use
 
 -- | Runs the program that streams the field to a counter, and gives the count.
 streamed :: (Counter -> Reader Memory -> IO ()) -> Memory -> IO Int
@@ -103,11 +106,11 @@ streamed run memory = do
   counted counter
 
 -- | Runs the program of a resumable parser, which is given a buffer.
-resumable :: (Directions.Buffer -> IO a) -> IO a
-resumable run = Directions.newBuffer capacity >>= run
+resumable :: (Buffer -> IO a) -> IO a
+resumable run = bufferOf capacity >>= run
 
 -- | The same for the program that streams the field to a counter.
-streamedResumable :: (Memory -> Directions.Buffer -> Counter -> IO ()) -> Memory -> IO Int
+streamedResumable :: (Memory -> Buffer -> Counter -> IO ()) -> Memory -> IO Int
 streamedResumable run memory = do
   counter <- newCounter
   resumable (\buffer -> run memory buffer counter)
@@ -120,7 +123,7 @@ ignored = returnA >>^ const ()
 -- | Runs the parser of today's input over the link, in a buffer of the size.
 inputRun :: Memory -> Input a -> IO a
 inputRun memory parser = do
-  storage <- maybe (ioError (userError "the capacity is not positive")) newBuffer (mkPositiveInt (toInteger capacity))
+  storage <- bufferOf capacity
   fst <$> runInput (InputSource (memoryReceive memory) capacity) (reusableInputBuffer storage) parser
 
 -- | The rows' checksum, as the arrows' 'foldRows' gives it.

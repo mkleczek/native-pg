@@ -3,7 +3,7 @@
 {-# LANGUAGE LambdaCase #-}
 
 -- | The scheduler of the arrows that run every part of a program on one thread
--- as code: "Network.Directions.Compiled" and "Network.Directions.Delimited". A
+-- as code: "Network.Streaming.Compiled" and "Network.Streaming.Delimited". A
 -- part is an action that runs until it ends, waits, forks or yields, and says
 -- which. The scheduler owns a poller (kqueue, or epoll on Linux): a descriptor
 -- is registered with it once, for edges of both readability and writability,
@@ -30,7 +30,7 @@
 -- asynchronous exception reaches it where it waits for a descriptor, and once
 -- in a while otherwise: it cancels every part that is in a scope, waits until
 -- they have ended, and then fails the run with the exception.
-module Network.Directions.Scheduler
+module Network.Streaming.Internal.Scheduler
   ( Step (..),
     Turn (..),
     microseconds,
@@ -89,12 +89,12 @@ import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
-import Network.Directions.Atomic (update)
-import Network.Directions.Cancel
-import Network.Directions.Classes (Cancelled (..), Event (..), Instant (..), cancelledBy, monotonicNanoseconds)
-import Network.Directions.Loop (Report (..))
-import Network.Directions.Tickets (Slot (..))
-import Network.Directions.Timers
+import Network.Streaming.Classes (Cancelled (..), Event (..), Instant (..), cancelledBy, monotonicNanoseconds)
+import Network.Streaming.Internal.Atomic (update)
+import Network.Streaming.Internal.Cancel
+import Network.Streaming.Internal.Tickets (Slot (..))
+import Network.Streaming.Internal.Timers
+import Network.Streaming.Loop (Report (..))
 import Network.Streaming.Watch (Watch (..))
 import System.Posix.Types (Fd (..))
 
@@ -192,7 +192,7 @@ data Run = Run
     runRoot :: !PartScope,
     -- | The asynchronous exception that the run is shutting down for.
     runShutdown :: !(IORef (Maybe SomeException)),
-    -- | What goes on with a failure of the part that runs, in a run of "Network.Directions.Compiled", whose
+    -- | What goes on with a failure of the part that runs, in a run of "Network.Streaming.Compiled", whose
     -- parts have no handlers of their own on a stack that can be captured: the part sets it when it goes on.
     runFailure :: !(IORef (SomeException -> IO Step)),
     -- | The timers of the parts: deadlines, and those that sleep.
@@ -229,7 +229,7 @@ newRun :: Turn -> IO Run
 newRun (Turn turn) = do
   counters <- mallocForeignPtrArray 10
   unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 9]
-  poller <- throwErrnoIfNull "directions_poller_new" c_pollerNew
+  poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
   Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel)
 
@@ -472,7 +472,7 @@ newtype Escaped = Escaped SomeException
 
 instance Exception Escaped
 
--- | Runs a part of "Network.Directions.Compiled": a failure that leaves it goes to the handler that the part
+-- | Runs a part of "Network.Streaming.Compiled": a failure that leaves it goes to the handler that the part
 -- last set, which goes on with the part. A failure of that handler goes to the handler it set.
 guardedBy :: Run -> IO Step -> IO Step
 guardedBy run = (`catch` unwind)
@@ -671,7 +671,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
       waiters <- readIORef (runWaiters run)
       let key = fromIntegral fd
           Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
-      if IntMap.member key waiters then pure () else throwErrnoIfMinus1_ "directions_poller_add" (c_pollerAdd (runPoller run) fd)
+      if IntMap.member key waiters then pure () else throwErrnoIfMinus1_ "streaming_io_poller_add" (c_pollerAdd (runPoller run) fd)
       writeIORef (runWaiters run) $
         IntMap.insert key (if reading then Waiters (entry : readers) writers else Waiters readers (entry : writers)) waiters
     -- Asks the poller what became ready, without waiting.
@@ -689,7 +689,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
           call (runPoller run) fds kinds (fromIntegral batch) timeout
     -- The parts that wait on what became ready.
     afterPoll count
-      | count < 0 = getErrno >>= \errno -> if errno == eINTR then pure [] else throwErrno "directions_poller_wait"
+      | count < 0 = getErrno >>= \errno -> if errno == eINTR then pure [] else throwErrno "streaming_io_poller_wait"
       | otherwise = do
           readied <-
             unsafeWithForeignPtr (runReady run) $ \fds ->
@@ -711,24 +711,24 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
 hasFired :: Watch -> IO Bool
 hasFired watch = atomically ((True <$ watchReady watch) `orElse` pure False)
 
-foreign import ccall unsafe "directions_poller_new"
+foreign import ccall unsafe "streaming_io_poller_new"
   c_pollerNew :: IO (Ptr Poller)
 
-foreign import ccall unsafe "directions_poller_free"
+foreign import ccall unsafe "streaming_io_poller_free"
   c_pollerFree :: Ptr Poller -> IO ()
 
-foreign import ccall unsafe "directions_poller_add"
+foreign import ccall unsafe "streaming_io_poller_add"
   c_pollerAdd :: Ptr Poller -> CInt -> IO CInt
 
 -- | Ends the poller's wait, or its next one, from any thread.
-foreign import ccall unsafe "directions_poller_wake"
+foreign import ccall unsafe "streaming_io_poller_wake"
   c_pollerWake :: Ptr Poller -> IO CInt
 
 -- | Asks without waiting.
-foreign import ccall unsafe "directions_poller_wait"
+foreign import ccall unsafe "streaming_io_poller_wait"
   c_pollerPoll :: Ptr Poller -> Ptr CInt -> Ptr CInt -> CInt -> CInt -> IO CInt
 
 -- | Waits, and can be interrupted, so that an asynchronous exception reaches
 -- the scheduler.
-foreign import ccall interruptible "directions_poller_wait"
+foreign import ccall interruptible "streaming_io_poller_wait"
   c_pollerWait :: Ptr Poller -> Ptr CInt -> Ptr CInt -> CInt -> CInt -> IO CInt

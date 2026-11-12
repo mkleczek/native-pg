@@ -5,9 +5,9 @@
 -- and the 'Giver's of those that wait for one, and an arrow's tickets of reach
 -- 'Anywhere for the waiting: the pool is shared by the parts of every core, so
 -- the givers it keeps can't belong to one. It is written once, for any arrow that
--- has them: parts on the cores of "Network.Directions.Delimited" share it, and so
--- do the threads of "Network.Directions.Threads".
-module Network.Directions.Pool
+-- has them: parts on the cores of "Network.Streaming.Delimited" share it, and so
+-- do the threads of "Network.Streaming.Threads".
+module Network.Streaming.Pool
   ( Pool,
     newPool,
     checkout,
@@ -22,8 +22,8 @@ import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (^>>), (|||))
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Sequence (Seq, ViewL (..), viewl, (|>))
 import qualified Data.Sequence as Seq
-import Network.Directions.Atomic (update)
-import Network.Directions.Classes
+import Network.Streaming.Classes
+import Network.Streaming.Internal.Atomic (update)
 
 -- | The connections that are free, and the givers of those that wait for one,
 -- in the order they came. While there are waiters, none is free.

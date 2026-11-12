@@ -2,9 +2,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- | What the giving end of a ticket is made of, for the instances of 'Network.Directions.Classes.Exchange'. The
+-- | What the giving end of a ticket is made of, for the instances of 'Network.Streaming.Classes.Exchange'. The
 -- package doesn't expose this module: a program that could make a 'Giver' of its own would choose its reach.
-module Network.Directions.Tickets
+module Network.Streaming.Internal.Tickets
   ( Reach (..),
     Giver (..),
     Slot (..),

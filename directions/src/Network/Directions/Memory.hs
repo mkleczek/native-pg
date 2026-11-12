@@ -18,7 +18,8 @@ import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peek, poke)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
-import Network.Directions.Classes
+import Network.Streaming.Buffer (Buffer (..))
+import Network.Streaming.Classes
 
 -- | The bytes, where the next receive starts (unboxed), and the most that one
 -- receive gives.
@@ -41,9 +42,11 @@ memoryReceive (Memory (BSI.BS wire total) position limit) target room = unsafeWi
   pure count
 
 -- | The link is for reading only. A receive never waits, but is a point to give
--- way at, as the receive of a link that does wait is.
+-- way at, as the receive of a link that does wait is, and the link always has
+-- input.
 instance (Arrow arr, Effect arr, GiveWay arr) => Link arr Memory where
-  receive memory = giveWay >>> now (\(Room target size) -> unsafeWithForeignPtr target (\pointer -> memoryReceive memory pointer size))
+  receive memory = giveWay >>> now (\(Room (Buffer target _) offset size) -> unsafeWithForeignPtr target (\pointer -> memoryReceive memory (pointer `plusPtr` offset) size))
   sendAll _ = now (\_ -> throwIO (userError "a memory link is for reading only"))
+  awaitInput _ = now (\() -> pure ())
   shutdownSend _ = now (\() -> pure ())
   close _ = now (\() -> pure ())

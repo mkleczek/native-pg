@@ -1,5 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-
 -- | The proxy of the design notes, written once over the classes, and what it
 -- is tried with: an echo server, a client in two directions, the same client
 -- in one, and a transaction whose two directions exchange a decision.
@@ -9,8 +7,6 @@ module Network.Directions.Proxy
     proxy,
     proxyThrough,
     echo,
-    together,
-    times,
     receiveAll,
     exchange,
     sendThenReceive,
@@ -19,13 +15,14 @@ module Network.Directions.Proxy
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (^>>), (|||))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import Data.IORef (IORef, modifyIORef')
-import Network.Directions.Classes
-import Network.Directions.Combinators
+import Network.Streaming.Buffer (Buffer)
+import Network.Streaming.Classes
+import Network.Streaming.Combinators
 
 -- | One direction: what the source sends goes to the sink through the buffer,
 -- until the source ends; then the sink's output ends.
@@ -59,19 +56,6 @@ proxyThrough change requests answers client server = together [pumpWith change r
 echo :: (ArrowChoice arr, Link arr end) => Buffer -> end -> arr () ()
 echo buffer end = pump buffer end end
 {-# INLINABLE echo #-}
-
--- | Runs the arrows at once on the same input, until all have ended.
-together :: (Arrow arr, Concurrent arr) => [arr a ()] -> arr a ()
-together = \case
-  [] -> arr (const ())
-  [one] -> one
-  one : others -> concurrently one (together others) >>^ const ()
-{-# INLINABLE together #-}
-
--- | Runs the arrow this many times.
-times :: (ArrowChoice arr) => Int -> arr () () -> arr () ()
-times = timesWith
-{-# INLINE times #-}
 
 -- | Keeps a copy of what arrives, the latest first, until the end of the
 -- stream.

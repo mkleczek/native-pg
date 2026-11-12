@@ -40,15 +40,14 @@ import Data.Maybe (isJust)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtr, withForeignPtr)
 import Foreign.Storable (peek, poke)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
-import Network.Directions.Classes
-import Network.Directions.Combinators (keeping, timesWith, untilJust)
-import Network.Directions.Compiled
-import Network.Directions.Delimited
-import Network.Directions.Loop (Report (..))
 import Network.Directions.PingPong
-import Network.Directions.Pool
-import Network.Directions.Proxy (together)
-import Network.Directions.Threads
+import Network.Streaming.Classes
+import Network.Streaming.Combinators (keeping, timesWith, together, untilJust)
+import Network.Streaming.Compiled
+import Network.Streaming.Delimited
+import Network.Streaming.Loop (Report (..))
+import Network.Streaming.Pool
+import Network.Streaming.Threads
 import System.Environment (getArgs, lookupEnv)
 import System.IO (hPrint, stderr)
 import System.Mem (performMajorGC)

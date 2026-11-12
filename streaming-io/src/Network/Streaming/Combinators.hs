@@ -1,10 +1,14 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | Helpers for writing programs over the classes, so that a value is made where it is used and not carried
 -- through the arrows in between: loops with a state, a retry, and a request that carries the end its answer is
 -- waited at. Each is written once for any arrow that has what it needs. All are INLINE, not INLINABLE: in an
--- arrow of continuations, such as "Network.Directions.Compiled", one that isn't inlined is passed its step and
+-- arrow of continuations, such as "Network.Streaming.Compiled", one that isn't inlined is passed its step and
 -- continuation as unknown functions, and allocates for them on every turn.
-module Network.Directions.Combinators
+module Network.Streaming.Combinators
   ( timesWith,
+    times,
+    together,
     untilJust,
     keeping,
     expect,
@@ -14,8 +18,8 @@ module Network.Directions.Combinators
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, first, returnA, (>>>), (>>^), (^>>), (|||))
-import Network.Directions.Classes
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Network.Streaming.Classes
 
 -- | The step this many times, each on what the one before gave.
 timesWith :: (ArrowChoice arr) => Int -> arr s s -> arr s s
@@ -23,6 +27,19 @@ timesWith count step = (,count) ^>> loop
   where
     loop = (\(s, n) -> if n <= 0 then Left s else Right (s, n - 1)) ^>> (returnA ||| (first step >>> loop))
 {-# INLINE timesWith #-}
+
+-- | Runs the arrow this many times.
+times :: (ArrowChoice arr) => Int -> arr () () -> arr () ()
+times = timesWith
+{-# INLINE times #-}
+
+-- | Runs the arrows at once on the same input, until all have ended.
+together :: (Arrow arr, Concurrent arr) => [arr a ()] -> arr a ()
+together = \case
+  [] -> arr (const ())
+  [one] -> one
+  one : others -> concurrently one (together others) >>^ const ()
+{-# INLINABLE together #-}
 
 -- | The action until it gives something, giving way between tries.
 untilJust :: (ArrowChoice arr, Effect arr, GiveWay arr) => IO (Maybe a) -> arr () a

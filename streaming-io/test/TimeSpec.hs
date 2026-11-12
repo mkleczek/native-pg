@@ -11,16 +11,15 @@ import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (>>>))
 import Control.Monad (forM, forM_, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Word (Word64)
-import Network.Directions.Classes
-import Network.Directions.Combinators (releaseWithin, sleep)
-import Network.Directions.Compiled
-import Network.Directions.Delimited
-import Network.Directions.Loop
-import Network.Directions.Pool
-import Network.Directions.Proxy (times, together)
-import Network.Directions.Threads
-import Network.Directions.Timers
 import qualified Network.Socket as Socket
+import Network.Streaming.Classes
+import Network.Streaming.Combinators (releaseWithin, sleep, times, together)
+import Network.Streaming.Compiled
+import Network.Streaming.Delimited
+import Network.Streaming.Internal.Timers
+import Network.Streaming.Loop
+import Network.Streaming.Pool
+import Network.Streaming.Threads
 import Skeletest
 import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Types (Fd (..))

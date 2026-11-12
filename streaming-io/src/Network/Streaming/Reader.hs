@@ -1,16 +1,18 @@
 {-# LANGUAGE BangPatterns #-}
 
 -- | The reader of one direction: the link it receives from, a buffer of fixed
--- size, and the bytes in hand, which are the part of the buffer that was
--- received and not taken yet. Parsers are arrows over it: each atom is one
+-- size that its caller gives it, and the bytes in hand, which are the part of
+-- the buffer that was received and not taken yet. Parsers are arrows over it: each atom is one
 -- 'now' that takes what is in hand, and only an atom that finds too little
 -- receives, through the link, with the wait that the arrow gives it.
 --
 -- A reader belongs to one direction: its parts run one after the other, and
 -- none but the part that streams a field takes bytes while it does.
-module Network.Directions.Reader
+module Network.Streaming.Reader
   ( Reader (..),
     newReader,
+    readerMemory,
+    readerCapacity,
     bytes,
     word8,
     word16,
@@ -42,14 +44,14 @@ import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray, plusForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, moveBytes)
 import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peekByteOff, peekElemOff, pokeElemOff)
-import GHC.ForeignPtr (mallocPlainForeignPtrBytes, unsafeWithForeignPtr)
-import Network.Directions.Classes
+import GHC.ForeignPtr (unsafeWithForeignPtr)
+import Network.Streaming.Buffer (Buffer (..))
+import Network.Streaming.Classes
 
 -- | One direction's reader.
 data Reader link = Reader
   { readerLink :: !link,
-    readerMemory :: !(ForeignPtr Word8),
-    readerCapacity :: !Int,
+    readerBuffer :: !Buffer,
     -- | Where the bytes in hand start and end, how many bytes the atom that
     -- receives, or the stream, still wants, where the body that cursors stand
     -- in ends, and what each level of a cursor has left: unboxed, so that
@@ -57,15 +59,22 @@ data Reader link = Reader
     readerMarks :: !(ForeignPtr Int)
   }
 
--- | A reader of the link, with a buffer of this many bytes.
-newReader :: link -> Int -> IO (Reader link)
-newReader link capacity
-  | capacity <= 0 = ioError (userError "a reader's buffer needs a positive capacity")
-  | otherwise = do
-      memory <- mallocPlainForeignPtrBytes capacity
-      marks <- mallocForeignPtrArray markCount
-      unsafeWithForeignPtr marks (\pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. markCount - 1])
-      pure (Reader link memory capacity marks)
+-- | The memory of the reader's buffer, and its size.
+readerMemory :: Reader link -> ForeignPtr Word8
+readerMemory = bufferMemory . readerBuffer
+{-# INLINE readerMemory #-}
+
+readerCapacity :: Reader link -> Int
+readerCapacity = bufferCapacity . readerBuffer
+{-# INLINE readerCapacity #-}
+
+-- | A reader of the link, in the buffer, which no other reader or direction
+-- uses meanwhile.
+newReader :: link -> Buffer -> IO (Reader link)
+newReader link buffer = do
+  marks <- mallocForeignPtrArray markCount
+  unsafeWithForeignPtr marks (\pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. markCount - 1])
+  pure (Reader link buffer marks)
 
 -- | Where the bytes in hand start, where they end, how many are wanted, and
 -- where the body ends that cursors read in. The last is a place in the buffer
@@ -180,7 +189,7 @@ refill reader = now prepare >>> loop
 
 -- | The buffer after the bytes in it, to receive into.
 roomAfter :: Reader link -> Int -> Room
-roomAfter reader held = Room (readerMemory reader `plusForeignPtr` held) (readerCapacity reader - held)
+roomAfter reader held = Room (readerBuffer reader) held (readerCapacity reader - held)
 {-# INLINE roomAfter #-}
 
 -- | The next n bytes, as the pieces that arrive: each is a view of the buffer,

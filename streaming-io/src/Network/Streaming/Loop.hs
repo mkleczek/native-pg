@@ -16,7 +16,7 @@
 -- that waits includes, so that cancelling a scope wakes the parts inside it
 -- with the cancellation to raise, in the same way as an event. A part that
 -- waits for a ticket is held by the ticket, and is not cancelled there.
-module Network.Directions.Loop
+module Network.Streaming.Loop
   ( Loop,
     Report (..),
     runLoop,
@@ -39,8 +39,8 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (partition, sort)
 import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
-import Network.Directions.Classes
-import Network.Directions.Tickets
+import Network.Streaming.Classes
+import Network.Streaming.Internal.Tickets
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
@@ -353,7 +353,7 @@ watchOf = \case
 
 -- | What a run did: how many steps, and how many waits. In a run of 'Loop' or
 -- a simulation a step is any primitive that a part ran. In a run of
--- "Network.Directions.Compiled" or "Network.Directions.Delimited" it is only
+-- "Network.Streaming.Compiled" or "Network.Streaming.Delimited" it is only
 -- a point to give way at, which is a link's receive or send, a wait, or a
 -- ticket given or waited for.
 data Report = Report {reportSteps :: !Int, reportWaits :: !Int}

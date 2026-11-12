@@ -7,14 +7,16 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
-import Network.Directions.Classes
-import Network.Directions.Compiled
-import Network.Directions.Delimited
 import Network.Directions.Memory
-import Network.Directions.Reader
 import Network.Directions.Resumable
 import Network.Directions.Rows
-import Network.Directions.Threads
+import Network.Streaming.Buffer (Buffer, newBuffer)
+import Network.Streaming.Classes
+import Network.Streaming.Compiled
+import Network.Streaming.Delimited
+import Network.Streaming.PositiveInt (mkPositiveInt)
+import Network.Streaming.Reader
+import Network.Streaming.Threads
 import Skeletest
 
 spec :: Spec
@@ -84,7 +86,7 @@ runAll program input wire limit capacity =
     over :: (Made a b -> IO b) -> IO (Either IOException b)
     over run = try $ do
       memory <- newMemory wire limit
-      reader <- newReader memory capacity
+      reader <- bufferOf capacity >>= newReader memory
       run (program reader)
 
 -- | The pieces of the stream's fields, copied, in order.
@@ -114,7 +116,7 @@ resumed program wire limit capacity =
     over :: (MadeFrom a -> IO a) -> IO a
     over run = do
       memory <- newMemory wire limit
-      buffer <- newBuffer capacity
+      buffer <- bufferOf capacity
       run (program memory buffer)
 
 -- | The pieces that the resumable parser of the stream yields, copied.
@@ -128,3 +130,7 @@ rowsOf1000 = rowsWire 1000
 
 field :: ByteString
 field = BS.pack (take 100000 (cycle [97 .. 122]))
+
+-- | A buffer of the capacity, which the runs choose.
+bufferOf :: Int -> IO Buffer
+bufferOf = maybe (ioError (userError "the capacity is not positive")) newBuffer . mkPositiveInt . toInteger

@@ -6,7 +6,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UnboxedTuples #-}
 
--- | Every concurrent part on one thread, as 'Network.Directions.Compiled' runs
+-- | Every concurrent part on one thread, as 'Network.Streaming.Compiled' runs
 -- them, but as plain IO: an arrow is a function to IO, so a program is the
 -- code GHC compiles it to, and a part that has to wait captures what follows
 -- it, up to the scheduler's prompt, with GHC's delimited continuations
@@ -25,7 +25,7 @@
 -- cancellation to raise there. The scheduler runs and resumes every part
 -- masked, so that the part sees one masking state everywhere, as if it never
 -- suspended.
-module Network.Directions.Delimited
+module Network.Streaming.Delimited
   ( Delimited,
     runDelimited,
     runDelimitedTurn,
@@ -49,13 +49,13 @@ import Data.Kind (Type)
 import Data.List (sortOn)
 import GHC.Exts (PromptTag#, control0#, newPromptTag#, prompt#)
 import GHC.IO (IO (..))
-import Network.Directions.Atomic (update)
-import Network.Directions.Cancel
-import Network.Directions.Classes
-import Network.Directions.Loop (Report)
-import Network.Directions.Scheduler
-import Network.Directions.Tickets
-import Network.Directions.Timers (addTimer, cancelTimer)
+import Network.Streaming.Classes
+import Network.Streaming.Internal.Atomic (update)
+import Network.Streaming.Internal.Cancel
+import Network.Streaming.Internal.Scheduler
+import Network.Streaming.Internal.Tickets
+import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
+import Network.Streaming.Loop (Report)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 

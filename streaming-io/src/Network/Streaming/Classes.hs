@@ -5,10 +5,11 @@
 -- | The classes of the design: a link whose calls block in the arrow that runs
 -- them, what an arrow can do for a link (run an action that never waits, give
 -- way to the other parts, and block until an event fires), and how directions
--- exchange values. Two arrows provide them, "Network.Directions.Threads", a
--- thread for each concurrent part, and "Network.Directions.Loop", every part on
--- one thread; a link's instance is written once for any arrow that does.
-module Network.Directions.Classes
+-- exchange values. Two arrows provide them, "Network.Streaming.Threads", a
+-- thread for each concurrent part, and "Network.Streaming.Loop", every part on
+-- one thread; a link's instance is written once for any arrow that does, over
+-- the link's own calls that never wait.
+module Network.Streaming.Classes
   ( Link (..),
     Concurrent (..),
     Exit (..),
@@ -33,18 +34,13 @@ module Network.Directions.Classes
     GiveWay (..),
     Block (..),
     Event (..),
-    Events (..),
     Reach (..),
     Giver,
     Exchange (..),
     Local,
-    HalfClose (..),
-    receiveTrying,
-    sendAllTrying,
+    receiveWith,
+    sendAllWith,
     Room (..),
-    Buffer,
-    newBuffer,
-    bufferSize,
     roomOf,
     view,
   )
@@ -57,12 +53,13 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Kind (Type)
 import Data.Word (Word64, Word8)
-import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
-import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
-import Network.Directions.Tickets (Giver, Reach (..))
+import Foreign.ForeignPtr (withForeignPtr)
+import Foreign.Ptr (Ptr, plusPtr)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
-import qualified Network.Streaming.Link as S
+import Network.Streaming.Buffer (Buffer (..))
+import Network.Streaming.Internal.Socket (tryReceive, trySend)
+import Network.Streaming.Internal.Tickets (Giver, Reach (..))
 import Network.Streaming.Watch (Watch)
 import System.Posix.Types (Fd (..))
 
@@ -74,6 +71,11 @@ class Link arr link where
 
   -- | Sends all of the pieces, and writes them.
   sendAll :: link -> arr [ByteString] ()
+
+  -- | Waits until the link has input, and takes none of it: a part that
+  -- waits with it holds no buffer to receive into while it does. The input
+  -- may be the end of the stream.
+  awaitInput :: link -> arr () ()
 
   -- | Ends the stream's output, once what was sent is written.
   shutdownSend :: link -> arr () ()
@@ -188,7 +190,7 @@ newtype Instant = Instant Word64
 
 -- | The time on that clock, which every instant and every turn of a scheduler is read from, so that they agree:
 -- GHC's own is another clock on macOS, with another base, and ticks in microseconds.
-foreign import ccall unsafe "directions_clock_ns"
+foreign import ccall unsafe "streaming_io_clock_ns"
   monotonicNanoseconds :: IO Word64
 
 -- | A length of time, in nanoseconds.
@@ -245,75 +247,66 @@ class Block arr where
 -- @Until@, and not @At@, which the cursors of native-pg have.
 data Event = Readable !Fd | Writable !Fd | Watched (IO Watch) | Until !Instant
 
--- | The events that a link's two halves wait for.
-class Events link where
-  readable :: link -> IO Event
-  writable :: link -> IO Event
-
-instance Events Socket where
-  readable sock = Readable . Fd <$> Socket.unsafeFdSocket sock
-  writable sock = Writable . Fd <$> Socket.unsafeFdSocket sock
-
--- | Ends a link's output, which streaming-io's link can't do yet.
-class HalfClose link where
-  halfClose :: link -> IO ()
-
-instance HalfClose Socket where
-  halfClose sock = Socket.shutdown sock Socket.ShutdownSend
-
--- | A socket, in any arrow that can run its tries, block, and give way.
+-- | A socket, in any arrow that can run its tries, block, and give way: the
+-- tries are the socket's own calls that never wait, and while one finds
+-- nothing ready, the part blocks until the descriptor is readable or writable.
 instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Link arr Socket where
-  receive = receiveTrying
-  sendAll = sendAllTrying
-  shutdownSend sock = now (\() -> halfClose sock)
+  receive sock = receiveWith (tryReceive sock) (readable sock)
+  {-# INLINE receive #-}
+  sendAll sock = sendAllWith (trySend sock) (pure True) (writable sock)
+  {-# INLINE sendAll #-}
+  awaitInput sock = now (\() -> readable sock) >>> block
+  shutdownSend sock = now (\() -> Socket.shutdown sock Socket.ShutdownSend)
   close sock = now (\() -> Socket.close sock)
 
--- | A receive from streaming-io's link: a point to give way at, a try, and
--- while nothing is ready, a block until the link is readable, and the try
--- again. The part gives way before it tries, so that one whose link always has
--- bytes ready still does, once for each receive.
-receiveTrying :: (S.Link link, Events link, ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => link -> arr Room Int
-receiveTrying link = giveWay >>> loop
+-- | The event of a socket's input being ready, and of its output being.
+readable, writable :: Socket -> IO Event
+readable sock = Readable . Fd <$> Socket.unsafeFdSocket sock
+writable sock = Writable . Fd <$> Socket.unsafeFdSocket sock
+
+-- | A receive over a link's try, which an instance supplies: a point to give
+-- way at, the try, and while it finds nothing ready, a block until the event
+-- fires, and the try again. The try receives into the memory at the address,
+-- up to the size, and gives how many bytes, or 'Nothing' if none are ready.
+-- The part gives way before it tries, so that one whose link always has bytes
+-- ready still does, once for each receive.
+receiveWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => (Ptr Word8 -> Int -> IO (Maybe Int)) -> IO Event -> arr Room Int
+receiveWith try readyToReceive = giveWay >>> loop
   where
     loop = now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
-    attempt room@(Room memory size) =
-      withForeignPtr memory (\pointer -> S.receiveReady link pointer size) >>= \case
+    attempt room@(Room (Buffer memory _) offset size) =
+      withForeignPtr memory (\pointer -> try (pointer `plusPtr` offset) size) >>= \case
         Just count -> pure (Right count)
-        Nothing -> (\event -> Left (event, room)) <$> readable link
-{-# INLINABLE receiveTrying #-}
+        Nothing -> (\event -> Left (event, room)) <$> readyToReceive
+{-# INLINE receiveWith #-}
 
--- | A send to streaming-io's link: a point to give way at, then it sends what
--- the link takes and writes it, and while some is left, blocks until the link
--- is writable, and goes on.
-sendAllTrying :: (S.Link link, Events link, ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => link -> arr [ByteString] ()
-sendAllTrying link = giveWay >>> loop
+-- | A send over a link's tries, which an instance supplies: a point to give
+-- way at, then it sends what the link takes of the pieces, at most 16 at a
+-- time, and writes it, and while some is left, blocks until the event fires,
+-- and goes on. The send gives how many bytes the link took, without waiting;
+-- the flush writes what it took and hasn't written yet, without waiting, and
+-- says whether nothing is left.
+sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => ([ByteString] -> IO Int) -> IO Bool -> IO Event -> arr [ByteString] ()
+sendAllWith send flush readyToSend = giveWay >>> loop
   where
     loop = filter (not . BS.null) ^>> now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
     attempt pieces = case pieces of
-      [] -> S.flushReady link >>= \flushed -> if flushed then pure (Right ()) else blocked []
+      [] -> flush >>= \flushed -> if flushed then pure (Right ()) else blocked []
       _ -> do
-        sent <- S.sendReady link (take 16 pieces)
+        sent <- send (take 16 pieces)
         case dropSent sent pieces of
           [] -> attempt []
           rest -> blocked rest
-    blocked rest = (\event -> Left (event, rest)) <$> writable link
-{-# INLINABLE sendAllTrying #-}
+    blocked rest = (\event -> Left (event, rest)) <$> readyToSend
+{-# INLINE sendAllWith #-}
 
--- | Memory to receive into, from its start: where it is and its size.
-data Room = Room !(ForeignPtr Word8) !Int
-
--- | Memory that a direction receives into and sends from.
-data Buffer = Buffer !(ForeignPtr Word8) !Int
-
-newBuffer :: Int -> IO Buffer
-newBuffer size = (`Buffer` size) <$> mallocPlainForeignPtrBytes size
-
-bufferSize :: Buffer -> Int
-bufferSize (Buffer _ size) = size
+-- | Memory to receive into: a view of a buffer, from an offset and up to a
+-- length. The room owns nothing: the buffer is the memory.
+data Room = Room !Buffer !Int !Int
 
 -- | All of the buffer, to receive into.
 roomOf :: Buffer -> Room
-roomOf (Buffer memory size) = Room memory size
+roomOf buffer = Room buffer 0 (bufferCapacity buffer)
 
 -- | The buffer's first bytes, without a copy: valid until it receives again.
 view :: Buffer -> Int -> ByteString

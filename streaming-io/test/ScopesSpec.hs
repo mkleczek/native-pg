@@ -16,16 +16,15 @@ import Data.Functor (($>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Word (Word64)
-import Network.Directions.Classes hiding (within)
-import Network.Directions.Combinators (untilJust)
-import Network.Directions.Compiled
-import Network.Directions.Delimited
-import Network.Directions.Loop (runLoop)
-import Network.Directions.Pool
-import Network.Directions.Proxy (times, together)
-import Network.Directions.Threads
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as Socket
+import Network.Streaming.Classes hiding (within)
+import Network.Streaming.Combinators (times, together, untilJust)
+import Network.Streaming.Compiled
+import Network.Streaming.Delimited
+import Network.Streaming.Loop (runLoop)
+import Network.Streaming.Pool
+import Network.Streaming.Threads
 import Skeletest
 import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Types (Fd (..))

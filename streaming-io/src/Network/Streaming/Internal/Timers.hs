@@ -13,7 +13,7 @@
 --
 -- A timer never fires before its time, and fires at the first 'expire' that is at or past it: the millisecond is
 -- where a timer is kept, not how exactly it is timed.
-module Network.Directions.Timers
+module Network.Streaming.Internal.Timers
   ( Wheel,
     Timer,
     newWheel,

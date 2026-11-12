@@ -7,7 +7,9 @@ parameter streams through caller-owned workspace, and sends statements in pipeli
 - **`native-pg`:** connections (libpq's connection strings, SCRAM), statements,
   pipelines and transactions, with streamed results and parameters, connection
   pooling.
-- **`streaming-io`:** borrowed streams, shared request buffer capabilities and bounded body/setup pools.
+- **`streaming-io`:** borrowed streams, shared request buffer capabilities and bounded body/setup pools,
+  and the arrow runtime (`Network.Streaming.Classes`, with the arrows `Threads`, `Loop`,
+  `Compiled` and `Delimited`), with one `Buffer` type for all memory.
 - **`resource-admission`:** private waiter delivery, shared deadlines and opaque FIFO
   queues for independent resource pools.
 - **`native-pg-tls`:** TLS through [rustls-ffi](https://github.com/rustls/rustls-ffi)

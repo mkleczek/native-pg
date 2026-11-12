@@ -11,8 +11,11 @@ a seed chooses. It adds no dependency. It builds on `STREAMING-IO.md`: it keeps
 the layers below the waits (output, gathering, loans, scopes) and replaces the
 drivers.
 
-The prototype is the package `directions/`, apart from the code that would use
-it. References are to native-pg d9d4ed6c11b3 and the Warp fork b89c12ac0037,
+The prototype began as the package `directions/`, apart from the code that would
+use it. Its runtime (the classes, the arrows, the scheduler, tickets, scopes,
+the pool and the reader) now lives in `streaming-io`, under `Network.Streaming`;
+`directions/` keeps what only the prototype uses: the proxy, the link over
+bytes in memory, the row parsers and the benchmarks. References are to native-pg d9d4ed6c11b3 and the Warp fork b89c12ac0037,
 and to postgrestream af328fe1386c for PostgREST.
 
 ## Why
@@ -206,7 +209,7 @@ which a runner can keep as data.
 
 ## The classes
 
-`directions/src/Network/Directions/Classes.hs`. None has a superclass:
+`streaming-io/src/Network/Streaming/Classes.hs`. None has a superclass:
 instances and users add the constraints they need.
 
 ```haskell
@@ -214,6 +217,7 @@ instances and users add the constraints they need.
 class Link arr link where
   receive :: link -> arr Room Int              -- 0 at the end of the stream
   sendAll :: link -> arr [ByteString] ()       -- all of them, written
+  awaitInput :: link -> arr () ()              -- until there is input, taking none
   shutdownSend :: link -> arr () ()
   close :: link -> arr () ()
 
@@ -232,19 +236,16 @@ class Concurrent arr where
 ```
 
 - **A link's instance is written once, for any arrow** that can run its tries
-  and block. The socket's tries are streaming-io's, as they are; `HalfClose`
-  adds what they lack:
+  and block. The tries are the link's own calls that never wait (the socket's
+  are `recv` and `writev`), and two helpers of `Classes`, `receiveWith` and
+  `sendAllWith`, make "try, and while nothing is ready, block on the event"
+  of them:
 
   ```haskell
-  instance (ArrowChoice arr, Effect arr, Block arr) => Link arr Socket where
-    receive = receiveTrying
+  instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Link arr Socket where
+    receive sock = receiveWith (tryReceive sock) (readable sock)
+    awaitInput sock = now (\() -> readable sock) >>> block
     ...
-
-  receiveTrying :: (S.Link link, ArrowChoice arr, Effect arr, Block arr) => link -> arr Room Int
-  receiveTrying link = loop
-    where
-      loop = now attempt >>> (((S.watchReadable link,) ^>> first block >>> snd ^>> loop) ||| returnA)
-      attempt room = ... -- Right count, or Left room while nothing is ready
   ```
 
 - **The arrows know nothing of links.** They provide `now`, `block` and
@@ -254,14 +255,15 @@ class Concurrent arr where
   whose desugaring would decide what `Loop` builds. All three operators are
   `infixr 1`, so a function in the middle of a chain goes `^>>` into what
   follows it.
-- **A memory region is a `Room`** (pointer and size), made only where the size
-  is known; a `Buffer` gives its room and views of what it received.
+- **A memory region is a `Room`**: a view of a `Buffer`, made of the buffer, an
+  offset and a length. A `Buffer` is streaming-io's, the one type that owns
+  memory; it gives its room and views of what it received.
 
 ## The two arrows
 
 ### Threads: a thread for each concurrent part
 
-`directions/src/Network/Directions/Threads.hs`: a newtype over `Kleisli IO`.
+`streaming-io/src/Network/Streaming/Threads.hs`: a newtype over `Kleisli IO`.
 
 - **`now`** is the action, and **`block`** is `awaitWatch`: the thread waits.
 - **`concurrently`** runs each arrow on a thread of its own and joins them; a
@@ -270,7 +272,7 @@ class Concurrent arr where
 
 ### Loop: every part on one thread
 
-`directions/src/Network/Directions/Loop.hs`: a program as data.
+`streaming-io/src/Network/Streaming/Loop.hs`: a program as data.
 
 ```haskell
 data Loop a b where
@@ -350,7 +352,7 @@ postgrestream already has the two directions' shapes (`MainTx.hs`):
 The client sends a request through the proxy to an echo server, which sends it
 back; the round trip is one program over four ends.
 
-- **Tests** (`directions/test`, all pass): the round trip with `Threads`, with
+- **Tests** (`directions/test` and `streaming-io/test`, all pass): the round trip with `Threads`, with
   `Loop`, and in simulations with 20 seeds; over socket pairs with `Threads`
   and `Loop`; a transform on the client's bytes; the same seed giving the same
   run; a client in one direction (`sendThenReceive`) deadlocking, and the
