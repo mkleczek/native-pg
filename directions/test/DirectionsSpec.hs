@@ -27,6 +27,7 @@ import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Reader (replicateA)
 import Network.Streaming.Simulated
 import Network.Streaming.Threads
+import Network.Streaming.With (With (..), withOnly)
 import Skeletest
 import System.Timeout (timeout)
 
@@ -121,22 +122,22 @@ spec = describe "directions" $ do
         (length turns >= 5) `shouldBe` True
         (length turns <= 40) `shouldBe` True
 
--- | A part that notes which part it was, after each of its 1000 steps.
-type Part = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IORef [Int] -> Int -> Memory -> Buffer -> arr () ()
+-- | A part that notes which part it was, after each of its 1000 steps, and is given its link.
+type Part = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IORef [Int] -> Int -> Buffer -> arr Memory ()
 
 -- | Each step is a receive from a link that never waits.
 receiving :: Part
-receiving order ident link buffer =
-  const 1000 ^>> replicateA (const (roomOf buffer) ^>> receive link >>> now (\_ -> modifyIORef' order (ident :))) >>^ const ()
+receiving order ident buffer =
+  withOnly (const 1000 ^>> replicateA (const (roomOf buffer) ^>> With receive >>> now (\_ -> modifyIORef' order (ident :))) >>^ const ())
 
 -- | Each step is an action that never waits.
 effects :: Part
-effects order ident _ _ = const 1000 ^>> replicateA (now (\() -> modifyIORef' order (ident :))) >>^ const ()
+effects order ident _ = const 1000 ^>> replicateA (now (\() -> modifyIORef' order (ident :))) >>^ const ()
 
 -- | Each step is a point to give way at, and then work for a millisecond that
 -- doesn't give way.
 computing :: Part
-computing order ident _ _ = const 40 ^>> replicateA (giveWay >>> now (\() -> spin 1000000 *> modifyIORef' order (ident :))) >>^ const ()
+computing order ident _ = const 40 ^>> replicateA (giveWay >>> now (\() -> spin 1000000 *> modifyIORef' order (ident :))) >>^ const ()
   where
     spin nanoseconds = monotonicNanoseconds >>= \started -> let wait = monotonicNanoseconds >>= \at -> when (at - started < nanoseconds) wait in wait
 
@@ -154,7 +155,7 @@ twoParts turn part = sequence [measured (compiledFor turn), measured (delimitedF
           one <- newMemory (BS.replicate 1000 0) 1
           two <- newMemory (BS.replicate 1000 0) 1
           buffer <- newBuffer (positiveInt @16)
-          pure (together [part order 1 one buffer, part order 2 two buffer])
+          pure (together [const one ^>> part order 1 buffer, const two ^>> part order 2 buffer])
       (\notes -> (map length (group (reverse notes)), report)) <$> readIORef order
 
 -- | Compiled and on delimited continuations, with turns of that length.
@@ -174,13 +175,13 @@ transact commits run = do
   forClient <- newBuffer (positiveInt @4096)
   forServer <- newBuffer (positiveInt @4096)
   kept <- newIORef []
-  result <- run (pure (together [transaction forClient client batch commits kept, echo forServer server]))
+  result <- run (pure (together [const client ^>> transaction forClient batch commits kept, const server ^>> echo forServer]))
   (,) result . BS.concat . reverse <$> readIORef kept
 
 -- | How the client and the proxy are made.
 data Setup = Setup
-  { setupClient :: forall arr end. (ArrowChoice arr, Concurrent arr, Effect arr, Link arr end) => Buffer -> end -> ByteString -> IORef [ByteString] -> arr () (),
-    setupProxy :: forall arr end. (ArrowChoice arr, Concurrent arr, Link arr end) => Buffer -> Buffer -> end -> end -> arr () ()
+  { setupClient :: forall arr end. (ArrowChoice arr, Concurrent arr, Effect arr, Link arr end) => Buffer -> ByteString -> IORef [ByteString] -> arr end (),
+    setupProxy :: forall arr end. (ArrowChoice arr, Concurrent arr, Link arr end) => Buffer -> Buffer -> arr (end, end) ()
   }
 
 plain, oneDirection :: Setup
@@ -200,9 +201,9 @@ world setup bytes kept (client, front, back, server) = do
   forServer <- newBuffer (positiveInt @16384)
   pure $
     together
-      [ setupClient setup forClient client bytes kept,
-        setupProxy setup requests answers front back,
-        echo forServer server
+      [ const client ^>> setupClient setup forClient bytes kept,
+        const (front, back) ^>> setupProxy setup requests answers,
+        const server ^>> echo forServer
       ]
 
 -- | A program made in IO, which each arrow runs: what the tests run.

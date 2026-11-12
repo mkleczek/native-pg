@@ -12,7 +12,9 @@ tests and benchmark use its parsers.
 
 - **The classes** (`Network.Streaming.Classes`): `Link arr link`, whose calls
   block in the arrow that runs them (`receive`, `sendAll`, `awaitInput`,
-  `shutdownSend`, `close`); and what an arrow can do: `Effect` (`now`, an action that never
+  `shutdownSend`, `close`), and take the link as an input, like the other
+  values that are known only when the program runs: a reader, a cursor, a
+  ticket; and what an arrow can do: `Effect` (`now`, an action that never
   waits), `Block` (wait until a watch fires), `Concurrent` (two arrows at
   once) and `Exchange arr r` (a ticket that one direction gives a value and
   another waits for; made as the program runs, `ticket :: arr () (Waiting arr r a, Giver r a)`,
@@ -72,6 +74,15 @@ tests and benchmark use its parsers.
   gives way), `keeping` (an arrow's result next to the input), and `expect` and
   `call` for a request that carries the giver its answer is given at, for a
   ticket of any reach.
+- **An environment** (`Network.Streaming.With`): `With r arr a b` is an arrow of
+  `arr` that is given an `r` besides its input, which `ask` gives back, so that
+  a program that reads a link or a cursor in many steps doesn't thread it
+  through them. It has the capabilities of the arrow it lifts, `lift` and `with`
+  go between the two, and every method is INLINE, so that the environment is a
+  part of the input for an arrow that is known where the program is built. A
+  step on a hot path tells what comes next with a sum that has nothing in it,
+  and keeps what the next step needs in the environment: a sum that carries a
+  cursor is built, and allocates, each time it is chosen.
 
 - **Scopes and cancellation** (`Scope`, `Race`; `Network.Streaming.Internal.Cancel`):
   `scope acquire release body` releases on every exit, behind a shield, and

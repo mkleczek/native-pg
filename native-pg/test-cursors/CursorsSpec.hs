@@ -3,7 +3,7 @@
 
 module CursorsSpec (spec) where
 
-import Control.Arrow (ArrowChoice, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (ArrowChoice, arr, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (SomeException, evaluate, fromException, try)
 import Control.Monad (forM_, zipWithM)
 import Data.ByteString (ByteString)
@@ -30,6 +30,7 @@ import Network.Streaming.Delimited
 import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Reader
 import Network.Streaming.Threads
+import Network.Streaming.With (With (..), asks, withOnly)
 import Skeletest
 
 -- | The messages that some of the tests read: a ParseComplete, rows, and a
@@ -162,35 +163,32 @@ spec = describe "cursors derived from the schema" $ do
 -- | A message whose body counts elements of four bytes.
 type Fixeds = 'PayloadChoice '[FramedMessage 'k' ('PayloadCounted16 ('FixedBytesAtom 4))]
 
--- | A program over a reader of a memory link, for every arrow.
-type Program a b = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> IO (arr a b)
-
--- | A program that is made in IO, once the reader is there, for every arrow.
-type Made a b = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr a b)
+-- | A program that is made in IO, for every arrow: its input is the reader of a memory link.
+type Program b = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory) b)
 
 -- | Runs the program on the wire with each arrow, a reader of the capacity,
 -- and a link that gives at most the limit at once: what each gave, or how it
 -- failed.
-runAll' :: forall a b. Program a b -> a -> ByteString -> Int -> Int -> IO [Either String b]
-runAll' program input wire limit capacity =
+runIO :: forall b. Program b -> ByteString -> Int -> Int -> IO [Either String b]
+runIO program wire limit capacity =
   sequence
-    [ over (\made -> made >>= (`runThreads` input)),
-      over (\made -> made >>= \arrow -> fst <$> runCompiled arrow input),
-      over (\made -> fst <$> runDelimitedWith made input)
+    [ over (\made reader -> made >>= (`runThreads` reader)),
+      over (\made reader -> made >>= \arrow -> fst <$> runCompiled arrow reader),
+      over (\made reader -> fst <$> runDelimitedWith made reader)
     ]
   where
-    over :: (Made a b -> IO b) -> IO (Either String b)
+    over :: (Program b -> Reader Memory -> IO b) -> IO (Either String b)
     over run =
       outcome
         <$> try
           ( do
               memory <- newMemory wire limit
               reader <- bufferOf capacity >>= newReader memory
-              run (program reader) >>= evaluate
+              run program reader >>= evaluate
           )
 
 -- | Runs a program that adds up into a counter, with each arrow.
-runAll :: (forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> Counter -> arr () ()) -> ByteString -> Int -> Int -> IO [Either String Int]
+runAll :: (forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Counter -> arr (Reader Memory) ()) -> ByteString -> Int -> Int -> IO [Either String Int]
 runAll program wire limit capacity = do
   one <- newCounter
   two <- newCounter
@@ -198,9 +196,9 @@ runAll program wire limit capacity = do
   let counters = [one, two, three]
   results <-
     sequence
-      [ outcome <$> try (withReader wire limit capacity (\reader -> runThreads (program reader one) ())),
-        outcome <$> try (withReader wire limit capacity (\reader -> fst <$> runCompiled (program reader two) ())),
-        outcome <$> try (withReader wire limit capacity (\reader -> fst <$> runDelimited (program reader three) ()))
+      [ outcome <$> try (withReader wire limit capacity (runThreads (program one))),
+        outcome <$> try (withReader wire limit capacity (fmap fst . runCompiled (program two))),
+        outcome <$> try (withReader wire limit capacity (fmap fst . runDelimited (program three)))
       ]
   zipWithM (\counter result -> either (pure . Left) (\() -> Right <$> counted counter) result) counters results
 
@@ -222,13 +220,9 @@ withReader wire limit capacity use = do
   reader <- bufferOf capacity >>= newReader memory
   use reader
 
--- | A program that sets itself up in IO.
-runIO :: forall b. Program () b -> ByteString -> Int -> Int -> IO [Either String b]
-runIO program = runAll' program ()
-
--- | A program that needs no input.
-runWith :: forall b. (forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> arr () b) -> ByteString -> Int -> Int -> IO [Either String b]
-runWith program = runAll' (pure . program) ()
+-- | A program that needs no setup in IO.
+runWith :: forall b. (forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => arr (Reader Memory) b) -> ByteString -> Int -> Int -> IO [Either String b]
+runWith program = runIO (pure program)
 
 isCursorError :: Either String b -> Bool
 isCursorError = either (isPrefixOf "cursor error: ") (const False)
@@ -236,13 +230,13 @@ isCursorError = either (isPrefixOf "cursor error: ") (const False)
 -- | The pieces of the stream's values, copied, with each arrow.
 runPieces :: ByteString -> Int -> Int -> IO [[ByteString]]
 runPieces wire limit capacity = do
-  results <- runAll' collected () wire limit capacity
+  results <- runIO collected wire limit capacity
   either (failTest . show) pure (sequence results)
 
-collected :: Program () [ByteString]
-collected reader = do
+collected :: Program [ByteString]
+collected = do
   kept <- newIORef []
-  pure (streamCursors reader (keeping kept) >>> now (\() -> reverse <$> readIORef kept))
+  pure (streamCursors (keeping kept) >>> now (\() -> reverse <$> readIORef kept))
 
 keeping :: (Effect arr) => IORef [ByteString] -> arr ByteString ()
 keeping kept = now (\piece' -> evaluate (BS.copy piece') >>= \owned -> modifyIORef' kept (owned :))
@@ -287,132 +281,128 @@ dataRowTwoValuesOneInside = frameOf 'D' (be16 2 <> be32 4 <> BS.pack [0, 0, 0, 1
 
 -- | Of three elements of four bytes, skips the first, reads the second as a
 -- number, skips the third, and finds that there is no fourth.
-fixedElements :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> IO (arr () [Int])
-fixedElements reader = do
+fixedElements :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory) [Int])
+fixedElements = do
   seen <- newIORef []
-  let fixeds = messages reader :: At Fixeds Memory
-      row body =
-        count body
-          >>> const ()
-          ^>> element body
-          >>> const ()
-          ^>> element body
-          >>> const ()
-          ^>> fixed (child body)
+  let row :: With (At ('PayloadCounted16 ('FixedBytesAtom 4)) Memory) arr () [Int]
+      row =
+        asks count
+          >>> asks element
+          >>> asks element
+          >>> asks (child ^>> fixed)
           >>> now (\value -> modifyIORef' seen (value :))
-          >>> const ()
-          ^>> element body
-          >>> const ()
-          ^>> element body
+          >>> asks element
+          >>> asks element
           >>> now (\found -> modifyIORef' seen (maybe (-1) (const (-2)) found :))
           >>> now (\() -> reverse <$> readIORef seen)
-  pure (message fixeds >>> (,()) ^>> cases fixeds (row :> NoCases))
+  pure ((messages :: Reader Memory -> At Fixeds Memory) ^>> withOnly (asks message >>> With (cases (withOnly row :> NoCases))))
 
 -- | Reads this many messages, each as a description of what it was, and
 -- reads nothing of the rows.
-messagesRead :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Int -> Reader Memory -> IO (arr () [String])
-messagesRead total reader = do
+messagesRead :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Int -> IO (arr (Reader Memory) [String])
+messagesRead total = do
   seen <- newIORef []
-  let result = messages reader :: At Mixed Memory
-      noting :: String -> IO ()
+  let noting :: String -> IO ()
       noting description = modifyIORef' seen (description :)
-      parsed _ = now (\() -> noting "parse complete")
-      row _ = now (\() -> noting "data row")
+      parsed = now (\_ -> noting "parse complete")
+      row = now (\_ -> noting "data row")
       -- The tag is a view of the buffer, which is valid until the next pull.
-      complete body = cstring body >>> now (\tag -> evaluate (BS.copy tag) >>= \owned -> noting ("command complete " <> BS8.unpack owned))
-      step = message result >>> (,()) ^>> cases result (parsed :> row :> complete :> NoCases)
-      go :: Int -> arr () [String]
+      complete = cstring >>> now (\tag -> evaluate (BS.copy tag) >>= \owned -> noting ("command complete " <> BS8.unpack owned))
+      step :: With (At Mixed Memory) arr () ()
+      step = asks message >>> With (cases (parsed :> row :> complete :> NoCases))
+      go :: Int -> With (At Mixed Memory) arr () [String]
       go 0 = now (\() -> reverse <$> readIORef seen)
       go left = step >>> go (left - 1)
-  pure (go total)
+  pure ((messages :: Reader Memory -> At Mixed Memory) ^>> withOnly (go total))
 
 -- | Skips whatever the stream has, until the CommandComplete, whose tag it
 -- reads.
-tagAfterSkipping :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr () String
-tagAfterSkipping reader = loop
+tagAfterSkipping :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) String
+tagAfterSkipping = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
-    result = messages reader :: At ResultStream link
-    loop = message result >>> (,()) ^>> cases result (row :> complete :> NoCases) >>> (loop ||| returnA)
-    row _ = returnA >>^ const (Left ())
-    complete body = cstring body >>> now (evaluate . BS.copy) >>^ Right . BS8.unpack
+    loop :: With (At ResultStream link) arr () String
+    loop = asks message >>> With (cases (row :> complete :> NoCases)) >>> (loop ||| returnA)
+    row = arr (const (Left ()))
+    complete = cstring >>> now (evaluate . BS.copy) >>^ Right . BS8.unpack
 {-# INLINABLE tagAfterSkipping #-}
 
 -- | The first value of the stream's first row, decoded in place.
-firstValue :: forall a arr link. (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr () a
-firstValue reader = message result >>> (,()) ^>> cases result (row :> unexpected :> NoCases)
+firstValue :: forall a arr link. (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) a
+firstValue = (messages :: Reader link -> At ResultStream link) ^>> withOnly (asks message >>> With (cases (row :> unexpected :> NoCases)))
   where
-    result = messages reader :: At ResultStream link
-    row body = count body >>> const () ^>> column body
-    unexpected _ = now (\() -> ioError (userError "the stream ended before a row"))
+    row = withOnly (asks count >>> asks column)
+    unexpected = now (\_ -> ioError (userError "the stream ended before a row"))
 {-# INLINABLE firstValue #-}
 
 -- | The values of the stream's first row: the int4, the int8, the lengths of
 -- the two texts, and the bool.
-firstRow :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr () (Int32, (Int64, (Int, (Int, Bool))))
-firstRow reader = message result >>> (,()) ^>> cases result (row :> unexpected :> NoCases)
+firstRow :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) (Int32, (Int64, (Int, (Int, Bool))))
+firstRow = (messages :: Reader link -> At ResultStream link) ^>> withOnly (asks message >>> With (cases (row :> unexpected :> NoCases)))
   where
-    result = messages reader :: At ResultStream link
-    unexpected _ = now (\() -> ioError (userError "the stream ended before a row"))
-    row body =
-      count body
-        >>> const ()
-        ^>> ( column body
-                &&& ( column body
-                        &&& ( (column body >>^ \(Length size) -> size)
-                                &&& ((column body >>^ \(Length size) -> size) &&& column body)
-                            )
-                    )
-            )
+    unexpected = now (\_ -> ioError (userError "the stream ended before a row"))
+    row =
+      withOnly
+        ( asks count
+            >>> ( asks column
+                    &&& ( asks column
+                            &&& ( (asks column >>^ \(Length size) -> size)
+                                    &&& ((asks column >>^ \(Length size) -> size) &&& asks column)
+                                )
+                        )
+                )
+        )
 {-# INLINABLE firstRow #-}
 
 -- | The sizes of all of the values of the stream's first row, with 'Nothing'
 -- for a NULL, each value skipped after its size is read.
-allValues :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> IO (arr () [Maybe Int])
-allValues reader = do
+allValues :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory) [Maybe Int])
+allValues = do
   seen <- newIORef []
-  let result = messages reader :: At ResultStream Memory
-      unexpected _ = now (\() -> ioError (userError "the stream ended before a row"))
-      row body = count body >>> const () ^>> elements body
-      elements body = element body >>> (absent ^>> ((value (child body) >>> elements body) ||| now (\() -> reverse <$> readIORef seen)))
-      value cursor =
-        valueLength cursor
-          >>> now (\size -> modifyIORef' seen ((if size < 0 then Nothing else Just size) :))
-          >>> const ()
-          ^>> skipValue cursor
-  pure (message result >>> (,()) ^>> cases result (row :> unexpected :> NoCases))
+  let unexpected = now (\_ -> ioError (userError "the stream ended before a row"))
+      row = withOnly (asks (count >>^ const ()) >>> elements)
+      elements :: With (At ('PayloadCounted16 'MaybeBytes32Atom) Memory) arr () [Maybe Int]
+      elements = asks advance >>> absent ^>> ((asks (child ^>> value) >>> elements) ||| now (\() -> reverse <$> readIORef seen))
+      value :: arr (At 'MaybeBytes32Atom Memory) ()
+      value =
+        withOnly
+          ( asks valueLength
+              >>> now (\size -> modifyIORef' seen ((if size < 0 then Nothing else Just size) :))
+              >>> asks skipValue
+          )
+  pure ((messages :: Reader Memory -> At ResultStream Memory) ^>> withOnly (asks message >>> With (cases (row :> unexpected :> NoCases))))
 
 -- | The first value of each row is added up; nothing else of the row is pulled.
-firstColumns :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> Counter -> arr () ()
-firstColumns reader total = loop
+firstColumns :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Counter -> arr (Reader link) ()
+firstColumns total = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
-    result = messages reader :: At ResultStream link
-    loop = message result >>> (,()) ^>> cases result (row :> complete :> NoCases) >>> (loop ||| returnA)
-    row body = count body >>> const () ^>> column body >>> (\value -> fromIntegral (value :: Int32)) ^>> adding total >>^ Left
-    complete body = cstring body >>^ Right . const ()
+    loop :: With (At ResultStream link) arr () ()
+    loop = asks message >>> With (cases (row :> complete :> NoCases)) >>> (loop ||| returnA)
+    row = withOnly (asks count >>> asks column >>> (\value -> fromIntegral (value :: Int32)) ^>> adding total) >>^ const (Left ())
+    complete = cstring >>^ const (Right ())
 {-# INLINABLE firstColumns #-}
 
 -- | The first value, and the last value, are added up. The second value is not
 -- pulled, the third is pulled by its length, and the fourth is read in a piece.
-mixedColumns :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> Counter -> arr () ()
-mixedColumns reader total = loop
+mixedColumns :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Counter -> arr (Reader link) ()
+mixedColumns total = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
-    result = messages reader :: At ResultStream link
-    loop = message result >>> (,()) ^>> cases result (row :> complete :> NoCases) >>> (loop ||| returnA)
-    row body =
-      count body
-        >>> const ()
-        ^>> column body
-        >>> (\value -> fromIntegral (value :: Int32))
-        ^>> adding total
-        >>> skipped body
-        >>> lengthOnly body
-        >>> firstPiece body
-        >>> column body
-        >>> (\value -> fromEnum (value :: Bool))
-        ^>> adding total
-        >>^ Left
-    complete body = cstring body >>^ Right . const ()
-    skipped body = element body >>^ const ()
-    lengthOnly body = element body >>> const () ^>> (valueLength (child body) >>^ const ())
-    firstPiece body = element body >>> const () ^>> valueLength (child body) >>> const () ^>> (piece (child body) >>^ const ())
+    loop :: With (At ResultStream link) arr () ()
+    loop = asks message >>> With (cases (row :> complete :> NoCases)) >>> (loop ||| returnA)
+    row = columns >>^ const (Left ())
+    complete = cstring >>^ const (Right ())
+    columns =
+      withOnly $
+        asks count
+          >>> asks column
+          >>> (\value -> fromIntegral (value :: Int32))
+          ^>> adding total
+          >>> skipped
+          >>> lengthOnly
+          >>> firstPiece
+          >>> asks column
+          >>> (\value -> fromEnum (value :: Bool))
+          ^>> adding total
+    skipped = asks element >>^ const ()
+    lengthOnly = asks advance >>> asks (child ^>> valueLength) >>^ const ()
+    firstPiece = asks advance >>> asks (child ^>> valueLength) >>> asks (child ^>> piece) >>^ const ()
 {-# INLINABLE mixedColumns #-}

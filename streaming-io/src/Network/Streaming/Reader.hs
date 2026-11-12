@@ -30,11 +30,12 @@ module Network.Streaming.Reader
     markFrame,
     scalar,
     refill,
+    receiveInto,
     roomAfter,
   )
 where
 
-import Control.Arrow (ArrowChoice, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, first, returnA, (>>>), (>>^), (^>>), (|||))
 import Control.Monad (when)
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
@@ -47,6 +48,7 @@ import Foreign.Storable (peekByteOff, peekElemOff, pokeElemOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes
+import Network.Streaming.With (With (..), asks, lift, with)
 
 -- | One direction's reader.
 data Reader link = Reader
@@ -108,23 +110,23 @@ setMark reader index value = unsafeWithForeignPtr (readerMarks reader) (\pointer
 -- | The next n bytes, copied: they stay valid when the buffer is refilled. It
 -- receives only when fewer than n are in hand. An n larger than the buffer
 -- fails.
-bytes :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr Int ByteString
-bytes reader = atom reader (\from size -> unsafeWithForeignPtr (readerMemory reader) (\memory -> BSI.create size (\target -> copyBytes target (memory `plusPtr` from) size)))
+bytes :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link, Int) ByteString
+bytes = atom (\reader from size -> unsafeWithForeignPtr (readerMemory reader) (\memory -> BSI.create size (\target -> copyBytes target (memory `plusPtr` from) size)))
 {-# INLINABLE bytes #-}
 
 -- | The next byte, as a number.
-word8 :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr () Int
-word8 reader = const 1 ^>> atom reader (\from _ -> scalar reader from 1)
+word8 :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) Int
+word8 = (,1) ^>> atom (\reader from _ -> scalar reader from 1)
 {-# INLINABLE word8 #-}
 
 -- | The next two bytes, as a big-endian number.
-word16 :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr () Int
-word16 reader = const 2 ^>> atom reader (\from _ -> scalar reader from 2)
+word16 :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) Int
+word16 = (,2) ^>> atom (\reader from _ -> scalar reader from 2)
 {-# INLINABLE word16 #-}
 
 -- | The next four bytes, as a big-endian number.
-word32 :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr () Int
-word32 reader = const 4 ^>> atom reader (\from _ -> scalar reader from 4)
+word32 :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) Int
+word32 = (,4) ^>> atom (\reader from _ -> scalar reader from 4)
 {-# INLINABLE word32 #-}
 
 -- | The big-endian number of the bytes from the offset in the buffer.
@@ -141,31 +143,34 @@ scalar reader from size = unsafeWithForeignPtr (readerMemory reader) (\memory ->
 
 -- | An atom of the size it is given: it takes the bytes in hand, which is one
 -- 'now', and only if there are too few, it receives the rest, and takes them
--- then. The taking is given where the bytes start, and its result is
--- evaluated before the bytes are given up.
-atom :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> (Int -> Int -> IO a) -> arr Int a
-atom reader take' = now attempt >>> (retry ||| returnA)
+-- then. The taking is given the reader and where the bytes start, and its
+-- result is evaluated before the bytes are given up. The steps take the reader
+-- from the environment, and the sum between them has nothing in it, so that
+-- nothing is built for the choice: the size is kept where the receive keeps it.
+atom :: (ArrowChoice arr, Effect arr, Link arr link) => (Reader link -> Int -> Int -> IO a) -> arr (Reader link, Int) a
+atom take' = with (With (now ready) >>> (With refill ||| returnA) >>> asks (now taken))
   where
-    attempt size = do
+    ready (reader, size) = do
       from <- mark reader markStart
       end <- mark reader markEnd
       if size >= 0 && end - from >= size
-        then Right <$> taken size from
+        then Right () <$ setMark reader markWanted size
         else pure (Left size)
-    taken size from = do
-      value <- take' from size
+    -- The bytes are in hand, either way: the size is what the atom wanted.
+    taken reader = do
+      from <- mark reader markStart
+      size <- mark reader markWanted
+      value <- take' reader from size
       value `seq` setMark reader markStart (from + size)
       pure value
-    -- The receive made room and wanted the size, so the bytes are in hand.
-    retry = refill reader >>> now (\() -> mark reader markStart >>= \from -> mark reader markWanted >>= \size -> taken size from)
 {-# INLINE atom #-}
 
 -- | Moves the bytes in hand to the buffer's start, and receives after them
 -- until as many bytes as the input says are there.
-refill :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr Int ()
-refill reader = now prepare >>> loop
+refill :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link, Int) ()
+refill = with (With (now prepare) >>> loop)
   where
-    prepare size = do
+    prepare (reader, size) = do
       when (size < 0 || size > readerCapacity reader) $
         ioError (userError ("a read of " <> show size <> " bytes doesn't fit a buffer of " <> show (readerCapacity reader)))
       from <- mark reader markStart
@@ -178,14 +183,19 @@ refill reader = now prepare >>> loop
       setMark reader markEnd held
       setMark reader markWanted size
       pure (roomAfter reader held)
-    loop = receive (readerLink reader) >>> now arrived >>> (loop ||| returnA)
-    arrived count = do
+    loop = With receiveInto >>> With (now arrived) >>> (loop ||| returnA)
+    arrived (reader, count) = do
       when (count <= 0) $ ioError (userError "the stream ended inside a value")
       end <- (+ count) <$> mark reader markEnd
       setMark reader markEnd end
       wanted <- mark reader markWanted
       pure (if end >= wanted then Right () else Left (roomAfter reader end))
 {-# INLINABLE refill #-}
+
+-- | Receives from the reader's link into the room.
+receiveInto :: (Arrow arr, Link arr link) => arr (Reader link, Room) Int
+receiveInto = first readerLink ^>> receive
+{-# INLINE receiveInto #-}
 
 -- | The buffer after the bytes in it, to receive into.
 roomAfter :: Reader link -> Int -> Room
@@ -196,14 +206,14 @@ roomAfter reader held = Room (readerBuffer reader) held (readerCapacity reader -
 -- not a copy, valid until the consumer ends, and no larger than the buffer.
 -- The consumer must not read from the reader. The bytes in hand go first, and
 -- a receive is made only when none are.
-stream :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr ByteString () -> arr Int ()
-stream reader consumer = now begin >>> loop
+stream :: (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (Reader link, Int) ()
+stream consumer = with (With (now begin) >>> loop)
   where
-    begin size = do
+    begin (reader, size) = do
       when (size < 0) $ ioError (userError ("a stream of " <> show size <> " bytes"))
       setMark reader markWanted size
-    loop = now next >>> (returnA ||| (more ||| (consumer >>> loop)))
-    next () = do
+    loop = asks (now next) >>> (returnA ||| (more ||| (lift consumer >>> loop)))
+    next reader = do
       left <- mark reader markWanted
       if left == 0
         then pure (Left ())
@@ -219,20 +229,24 @@ stream reader consumer = now begin >>> loop
               pure (Right (Right (BSI.BS (readerMemory reader `plusForeignPtr` from) size)))
     -- Nothing is in hand, so the receive has the whole buffer.
     more =
-      now
-        ( \() -> do
-            end <- mark reader markEnd
-            limit <- mark reader markLimit
-            setMark reader markLimit (limit - end)
-            setMark reader markStart 0
-            setMark reader markEnd 0
-            pure (roomAfter reader 0)
+      asks
+        ( now
+            ( \reader -> do
+                end <- mark reader markEnd
+                limit <- mark reader markLimit
+                setMark reader markLimit (limit - end)
+                setMark reader markStart 0
+                setMark reader markEnd 0
+                pure (roomAfter reader 0)
+            )
         )
-        >>> receive (readerLink reader)
-        >>> now
-          ( \count -> do
-              when (count <= 0) $ ioError (userError "the stream ended inside a field")
-              setMark reader markEnd count
+        >>> With receiveInto
+        >>> With
+          ( now
+              ( \(reader, count) -> do
+                  when (count <= 0) $ ioError (userError "the stream ended inside a field")
+                  setMark reader markEnd count
+              )
           )
         >>> loop
 {-# INLINABLE stream #-}

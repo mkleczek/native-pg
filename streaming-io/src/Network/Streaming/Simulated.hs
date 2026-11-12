@@ -79,13 +79,13 @@ writable end = pure (Watched (pure (Watch (laneWritable (endOut end)) (pure ()))
 -- | A simulated end, in any arrow that can run its tries, block, and give way.
 -- It waits for input as its receive does, on its lane's watch.
 instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Link arr SimEnd where
-  receive end = receiveWith (receiveReady end) (readable end)
+  receive = receiveWith receiveReady readable
   {-# INLINE receive #-}
-  sendAll end = sendAllWith (sendReady end) (pure True) (writable end)
+  sendAll = sendAllWith sendReady (\_ -> pure True) writable
   {-# INLINE sendAll #-}
-  awaitInput end = now (\() -> readable end) >>> block
-  shutdownSend end = now (\() -> halfClose end)
-  close end = now (\() -> halfClose end)
+  awaitInput = now readable >>> block
+  shutdownSend = now halfClose
+  close = now halfClose
 
 laneReadable :: Lane -> STM ()
 laneReadable lane = do

@@ -121,10 +121,17 @@ instance Effect Threads where
 -- | A point where the part can be cancelled: a part in a scope raises a cancellation that is there, and lets the
 -- exceptions that wait for it in.
 instance GiveWay Threads where
-  giveWay = Threads $ \(Part _ _ frames _) value ->
-    readIORef frames >>= \case
-      [] -> value <$ allowInterrupt
-      scopes -> cancelledIn scopes >>= maybe (value <$ allowInterrupt) (throwIO . Cancelled)
+  giveWay = Threads (\part value -> value <$ givingWay part)
+  {-# INLINE giveWay #-}
+
+-- | The point itself, which what the part has in hand doesn't go through: the call is not given it, so that a caller
+-- doesn't have to build it, as a link's input is a pair of the link and where it receives, for the call to give it back.
+givingWay :: Part -> IO ()
+givingWay (Part _ _ frames _) =
+  readIORef frames >>= \case
+    [] -> allowInterrupt
+    scopes -> cancelledIn scopes >>= maybe allowInterrupt (throwIO . Cancelled)
+{-# NOINLINE givingWay #-}
 
 -- | A wait of a part that is in scopes: it says it waits, looks for a cancellation that came before, and waits;
 -- a cancellation thrown to it ends the wait. Whatever ended it, the part says it doesn't wait.

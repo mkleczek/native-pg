@@ -32,7 +32,7 @@ module Network.Directions.Rows
   )
 where
 
-import Control.Arrow (ArrowChoice, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (ArrowChoice, returnA, (>>>), (>>^), (^>>), (|||))
 import Control.Monad (replicateM, replicateM_, void)
 import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -47,7 +47,9 @@ import Foreign.Storable (peek, poke)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Directions.Resumable
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (keeping)
 import Network.Streaming.Reader
+import Network.Streaming.With
 
 -- | A stream of this many DataRow messages, each of five fields, then a
 -- CommandComplete. Row i has an int4 (i), an int8, a text of 16 bytes, a text
@@ -110,13 +112,17 @@ strict = BL.toStrict . toLazyByteString
 data Message = DataRow [ByteString] | CommandComplete ByteString
 
 -- | The next message: its tag decides which it is.
-message :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr () Message
-message reader = word8 reader >>> tagged ^>> (row ||| (complete ||| unknown))
-  where
-    row = word32 reader >>> const () ^>> dataRow reader >>^ DataRow
-    complete = word32 reader >>> subtract 4 ^>> bytes reader >>^ CommandComplete
-    unknown = now (\tag -> ioError (userError ("a message with the tag " <> show tag)))
+message :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) Message
+message = withOnly readMessage
 {-# INLINABLE message #-}
+
+readMessage :: (ArrowChoice arr, Effect arr, Link arr link) => With (Reader link) arr () Message
+readMessage = asks word8 >>> tagged ^>> (row ||| (complete ||| unknown))
+  where
+    row = asks word32 >>> const () ^>> dataRow >>^ DataRow
+    complete = asks word32 >>> subtract 4 ^>> With bytes >>^ CommandComplete
+    unknown = now (\tag -> ioError (userError ("a message with the tag " <> show tag)))
+{-# INLINABLE readMessage #-}
 
 tagged :: Int -> Either () (Either () Int)
 tagged 68 = Left ()
@@ -124,29 +130,29 @@ tagged 67 = Right (Left ())
 tagged other = Right (Right other)
 
 -- | A DataRow's body: how many fields, and each one's length and bytes.
-dataRow :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr () [ByteString]
-dataRow reader = word16 reader >>> replicateA field
+dataRow :: (ArrowChoice arr, Effect arr, Link arr link) => With (Reader link) arr () [ByteString]
+dataRow = asks word16 >>> replicateA field
   where
-    field = word32 reader >>> bytes reader
+    field = asks word32 >>> With bytes
 {-# INLINABLE dataRow #-}
 
 -- | Folds the rows of the stream, until its CommandComplete.
-foldRows :: (ArrowChoice arr, Effect arr, Link arr link) => (acc -> [ByteString] -> acc) -> Reader link -> arr acc acc
-foldRows add reader = loop
+foldRows :: (ArrowChoice arr, Effect arr, Link arr link) => (acc -> [ByteString] -> acc) -> arr (Reader link, acc) acc
+foldRows add = with loop
   where
-    loop = ((),) ^>> first (message reader) >>> step ^>> (loop ||| returnA)
+    loop = keeping readMessage >>> step ^>> (loop ||| returnA)
     step (DataRow fields, acc) = Left $! add acc fields
     step (CommandComplete _, acc) = Right acc
 {-# INLINABLE foldRows #-}
 
 -- | The stream's messages, until its CommandComplete, with the bytes of every
 -- field given to the consumer as pieces that arrive.
-streamMessages :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr ByteString () -> arr () ()
-streamMessages reader consumer = loop
+streamMessages :: (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (Reader link) ()
+streamMessages consumer = withOnly loop
   where
-    loop = word8 reader >>> tagged ^>> ((row >>> loop) ||| (complete ||| unknown))
-    row = word32 reader >>> const () ^>> word16 reader >>> replicateA (word32 reader >>> stream reader consumer) >>^ const ()
-    complete = word32 reader >>> subtract 4 ^>> bytes reader >>^ const ()
+    loop = asks word8 >>> tagged ^>> ((row >>> loop) ||| (complete ||| unknown))
+    row = asks word32 >>> asks word16 >>> replicateA (asks word32 >>> With (stream consumer)) >>^ const ()
+    complete = asks word32 >>> subtract 4 ^>> With bytes >>^ const ()
     unknown = now (\tag -> ioError (userError ("a message with the tag " <> show tag)))
 {-# INLINABLE streamMessages #-}
 

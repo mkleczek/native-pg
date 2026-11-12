@@ -46,7 +46,7 @@ module Network.Streaming.Classes
   )
 where
 
-import Control.Arrow (ArrowChoice, first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (ArrowChoice, first, returnA, second, (>>>), (^>>), (|||))
 import Control.Exception (Exception, SomeException, fromException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -64,23 +64,24 @@ import Network.Streaming.Watch (Watch)
 import System.Posix.Types (Fd (..))
 
 -- | A byte stream whose calls block in the arrow that runs them. How they
--- block is the arrow's.
+-- block is the arrow's. The link is a run-time value, so it is an input of each
+-- call, and not an argument.
 class Link arr link where
   -- | Receives into the room: how many bytes, 0 at the end of the stream.
-  receive :: link -> arr Room Int
+  receive :: arr (link, Room) Int
 
   -- | Sends all of the pieces, and writes them.
-  sendAll :: link -> arr [ByteString] ()
+  sendAll :: arr (link, [ByteString]) ()
 
   -- | Waits until the link has input, and takes none of it: a part that
   -- waits with it holds no buffer to receive into while it does. The input
   -- may be the end of the stream.
-  awaitInput :: link -> arr () ()
+  awaitInput :: arr link ()
 
   -- | Ends the stream's output, once what was sent is written.
-  shutdownSend :: link -> arr () ()
+  shutdownSend :: arr link ()
 
-  close :: link -> arr () ()
+  close :: arr link ()
 
 -- | Values that one direction gives another, once each: the way directions
 -- exchange what they know. A ticket has two ends, a 'Waiting' end that the
@@ -251,13 +252,16 @@ data Event = Readable !Fd | Writable !Fd | Watched (IO Watch) | Until !Instant
 -- tries are the socket's own calls that never wait, and while one finds
 -- nothing ready, the part blocks until the descriptor is readable or writable.
 instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Link arr Socket where
-  receive sock = receiveWith (tryReceive sock) (readable sock)
+  receive = receiveWith tryReceive readable
   {-# INLINE receive #-}
-  sendAll sock = sendAllWith (trySend sock) (pure True) (writable sock)
+  sendAll = sendAllWith trySend (\_ -> pure True) writable
   {-# INLINE sendAll #-}
-  awaitInput sock = now (\() -> readable sock) >>> block
-  shutdownSend sock = now (\() -> Socket.shutdown sock Socket.ShutdownSend)
-  close sock = now (\() -> Socket.close sock)
+  awaitInput = now readable >>> block
+  {-# INLINE awaitInput #-}
+  shutdownSend = now (`Socket.shutdown` Socket.ShutdownSend)
+  {-# INLINE shutdownSend #-}
+  close = now Socket.close
+  {-# INLINE close #-}
 
 -- | The event of a socket's input being ready, and of its output being.
 readable, writable :: Socket -> IO Event
@@ -266,18 +270,18 @@ writable sock = Writable . Fd <$> Socket.unsafeFdSocket sock
 
 -- | A receive over a link's try, which an instance supplies: a point to give
 -- way at, the try, and while it finds nothing ready, a block until the event
--- fires, and the try again. The try receives into the memory at the address,
--- up to the size, and gives how many bytes, or 'Nothing' if none are ready.
--- The part gives way before it tries, so that one whose link always has bytes
--- ready still does, once for each receive.
-receiveWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => (Ptr Word8 -> Int -> IO (Maybe Int)) -> IO Event -> arr Room Int
+-- fires, and the try again. The try receives from the link into the memory at
+-- the address, up to the size, and gives how many bytes, or 'Nothing' if none
+-- are ready. The part gives way before it tries, so that one whose link always
+-- has bytes ready still does, once for each receive.
+receiveWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => (link -> Ptr Word8 -> Int -> IO (Maybe Int)) -> (link -> IO Event) -> arr (link, Room) Int
 receiveWith try readyToReceive = giveWay >>> loop
   where
     loop = now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
-    attempt room@(Room (Buffer memory _) offset size) =
-      withForeignPtr memory (\pointer -> try (pointer `plusPtr` offset) size) >>= \case
+    attempt (link, room@(Room (Buffer memory _) offset size)) =
+      withForeignPtr memory (\pointer -> try link (pointer `plusPtr` offset) size) >>= \case
         Just count -> pure (Right count)
-        Nothing -> (\event -> Left (event, room)) <$> readyToReceive
+        Nothing -> (\event -> Left (event, (link, room))) <$> readyToReceive link
 {-# INLINE receiveWith #-}
 
 -- | A send over a link's tries, which an instance supplies: a point to give
@@ -286,18 +290,18 @@ receiveWith try readyToReceive = giveWay >>> loop
 -- and goes on. The send gives how many bytes the link took, without waiting;
 -- the flush writes what it took and hasn't written yet, without waiting, and
 -- says whether nothing is left.
-sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => ([ByteString] -> IO Int) -> IO Bool -> IO Event -> arr [ByteString] ()
+sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => (link -> [ByteString] -> IO Int) -> (link -> IO Bool) -> (link -> IO Event) -> arr (link, [ByteString]) ()
 sendAllWith send flush readyToSend = giveWay >>> loop
   where
-    loop = filter (not . BS.null) ^>> now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
-    attempt pieces = case pieces of
-      [] -> flush >>= \flushed -> if flushed then pure (Right ()) else blocked []
+    loop = second (filter (not . BS.null)) ^>> now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
+    attempt (link, pieces) = case pieces of
+      [] -> flush link >>= \flushed -> if flushed then pure (Right ()) else blocked link []
       _ -> do
-        sent <- send (take 16 pieces)
+        sent <- send link (take 16 pieces)
         case dropSent sent pieces of
-          [] -> attempt []
-          rest -> blocked rest
-    blocked rest = (\event -> Left (event, rest)) <$> readyToSend
+          [] -> attempt (link, [])
+          rest -> blocked link rest
+    blocked link rest = (\event -> Left (event, (link, rest))) <$> readyToSend link
 {-# INLINE sendAllWith #-}
 
 -- | Memory to receive into: a view of a buffer, from an offset and up to a

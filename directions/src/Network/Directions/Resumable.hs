@@ -29,6 +29,7 @@ import Foreign.Ptr (castPtr)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes hiding (Exit (..))
+import Network.Streaming.With
 
 -- | Where a parser is: done, with the bytes it left in hand, or in need of
 -- bytes, or with a piece of a field to give away.
@@ -89,13 +90,14 @@ streamBytes n = Parser (go n)
 
 -- | Runs the parser on the bytes in hand, which are in the buffer, receives
 -- when it needs more, and gives each piece it yields to the consumer. It gives
--- the parser's result and the bytes it left in hand.
-parse :: (ArrowChoice arr, Effect arr, Link arr link) => link -> Buffer -> arr ByteString () -> Parser a -> arr ByteString (a, ByteString)
-parse link buffer consumer (Parser parser) = (`parser` Done) ^>> loop
+-- the parser's result and the bytes it left in hand. Its input is the link it
+-- receives from, and the bytes in hand.
+parse :: (ArrowChoice arr, Effect arr, Link arr link) => Buffer -> arr ByteString () -> Parser a -> arr (link, ByteString) (a, ByteString)
+parse buffer consumer (Parser parser) = with ((`parser` Done) ^>> loop)
   where
     loop = step ^>> ((more ||| chunk) ||| returnA)
-    more = first (fill link buffer) >>> (\(received, go) -> go received) ^>> loop
-    chunk = first consumer >>> snd ^>> loop
+    more = first (With (fill buffer)) >>> (\(received, go) -> go received) ^>> loop
+    chunk = first (lift consumer) >>> snd ^>> loop
     step = \case
       Done value rest -> Right (value, rest)
       More count held go -> Left (Left ((count, held), go))
@@ -104,20 +106,20 @@ parse link buffer consumer (Parser parser) = (`parser` Done) ^>> loop
 
 -- | Moves the bytes in hand to the buffer's start, and receives after them
 -- until there are as many as the parser needs.
-fill :: (ArrowChoice arr, Effect arr, Link arr link) => link -> Buffer -> arr (Int, ByteString) ByteString
-fill link buffer = now compact >>> loop
+fill :: (ArrowChoice arr, Effect arr, Link arr link) => Buffer -> arr (link, (Int, ByteString)) ByteString
+fill buffer = now compact >>> loop
   where
     Buffer memory size = buffer
-    compact (count, held)
+    compact (link, (count, held))
       | count > size = ioError (userError "an atom larger than the buffer")
       | otherwise = do
           unsafeWithForeignPtr memory (\target -> BSU.unsafeUseAsCStringLen held (\(from, n) -> moveBytes target (castPtr from) n))
-          pure (count, BS.length held)
-    loop = enough ^>> ((first (receive link) >>> added ^>> loop) ||| returnA)
-    enough (count, filled)
+          pure (link, (count, BS.length held))
+    loop = enough ^>> ((first receive >>> added ^>> loop) ||| returnA)
+    enough (link, (count, filled))
       | filled >= count = Right (BSI.BS memory filled)
-      | otherwise = Left (Room buffer filled (size - filled), (count, filled))
-    added (received, (count, filled))
+      | otherwise = Left ((link, Room buffer filled (size - filled)), (link, (count, filled)))
+    added (received, (link, (count, filled)))
       | received <= 0 = error "the stream ended inside a value"
-      | otherwise = (count, filled + received)
+      | otherwise = (link, (count, filled + received))
 {-# INLINABLE fill #-}

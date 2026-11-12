@@ -21,13 +21,18 @@
 -- whole: the pieces of a value are views of the buffer, and a value that is
 -- decoded in place is decoded from the buffer.
 --
--- A cursor is not a value that flows through an arrow, because what a step
--- does when it has to wait is an arrow that is built from the reader: it is an
--- index into the reader, which the steps take as an argument. 'cases' and
--- 'child' hand out the cursors of the shapes below the one a cursor stands at.
+-- A cursor is a run-time value, so it is an input of a step, and not an
+-- argument: what a step does when it has to wait is an arrow, which is built
+-- once for any reader, and a cursor is an index into the reader. 'element' gives
+-- the cursor of an element, and 'cases' hands the cursor of the body that
+-- 'message' chose to the arrow for its alternative; 'messages' and 'child' only
+-- compute a cursor from another, and are functions. A step that tells what to do
+-- next does it with a sum that has nothing in it ('advance', 'message'), and the
+-- cursor comes from the environment, because a sum that carries a cursor is
+-- built, and allocates, each time it is chosen.
 --
 -- What the schema derives, by instances, is the shape of the stream: which
--- messages an alternative has ('Framed', 'Messages': the sum of their cursors
+-- messages an alternative has ('Framed', 'Messages': which of them a tag chooses
 -- and the cases that go on from it), how a payload is begun ('Cursor') and left
 -- before its end ('Skippable'), and how a type is decoded ('InPlace'). The
 -- steps of a shape ('count', 'element', 'valueLength', 'piece', 'decode',
@@ -51,6 +56,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Cursor
     -- * Counted payloads
     child,
     count,
+    advance,
     element,
 
     -- * A value that is a length and bytes
@@ -70,7 +76,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Cursor
   )
 where
 
-import Control.Arrow (ArrowChoice, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (Exception, throwIO)
 import Control.Monad (when)
 import Data.Bits (shiftL, (.|.))
@@ -91,6 +97,7 @@ import GHC.ForeignPtr (unsafeWithForeignPtr)
 import GHC.TypeLits (KnownChar, KnownNat, Nat, charVal, natVal)
 import Network.Streaming.Classes
 import Network.Streaming.Reader
+import Network.Streaming.With (With (..), asks, lift, with, withOnly)
 
 -- | A message's frame: its tag byte and the length-prefixed body, as
 -- native-pg's own.
@@ -174,17 +181,17 @@ instance (KnownNat n) => Cursor ('FixedBytesAtom n) where
 class (Cursor p) => Skippable (p :: Payload) where
   -- | Skips what is unread of the payload the cursor stands at, receiving if
   -- the bytes are not in hand.
-  skipRest :: (ArrowChoice arr, Effect arr, Link arr link) => At p link -> arr () ()
+  skipRest :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At p link) ()
 
 -- | A value whose length was not read is read, to skip it.
 instance Skippable 'MaybeBytes32Atom where
-  skipRest cursor@(At reader depth) =
-    now (\() -> (\left -> if left < 0 then Left () else Right ()) <$> mark reader (markFrame depth))
-      >>> (((valueLength cursor >>^ const ()) >>> skipValue cursor) ||| skipValue cursor)
+  skipRest = withOnly (asks (now unread) >>> ((asks valueLength >>> asks skipValue) ||| asks skipValue))
+    where
+      unread (At reader depth) = (\left -> if left < 0 then Left () else Right ()) <$> mark reader (markFrame depth)
   {-# INLINE skipRest #-}
 
 instance (KnownNat n) => Skippable ('FixedBytesAtom n) where
-  skipRest (At reader depth) = skipLeft reader depth >>^ const ()
+  skipRest = skipLeft >>^ const ()
   {-# INLINE skipRest #-}
 
 -- | The messages of a stream, told apart by the tag of their frame.
@@ -205,42 +212,42 @@ instance (KnownNat tag) => Framed (FramedMessage (tag :: Nat) body) where
   {-# INLINE frameTag #-}
 
 -- | One arrow for each alternative of a stream of messages, given the cursor of
--- the alternative's body, and all taking the same input and giving the same
--- result.
-data Cases (alternatives :: [Payload]) link (arr :: Type -> Type -> Type) x r where
-  NoCases :: Cases '[] link arr x r
-  (:>) :: (At (BodyOf alternative) link -> arr x r) -> Cases alternatives link arr x r -> Cases (alternative ': alternatives) link arr x r
+-- the alternative's body, and all giving the same result.
+data Cases (alternatives :: [Payload]) link (arr :: Type -> Type -> Type) r where
+  NoCases :: Cases '[] link arr r
+  (:>) :: arr (At (BodyOf alternative) link) r -> Cases alternatives link arr r -> Cases (alternative ': alternatives) link arr r
 
 infixr 5 :>
 
 -- | The alternatives of a stream of messages: which one the frame of the next
--- message tells, as a sum of the cursors at the alternatives' bodies, and the
--- arrow that goes on from each.
+-- message tells, as a sum that has nothing in it but which, so that no cursor is
+-- built to tell it, and the arrow that goes on from each, which is given the
+-- cursor of the alternative's body.
 class Messages (alternatives :: [Payload]) where
-  type Chosen alternatives link :: Type
+  type Chosen alternatives :: Type
 
   -- | The alternative that has the tag, with its body begun at the depth below.
-  select :: Reader link -> Int -> Int -> IO (Chosen alternatives link)
+  select :: Reader link -> Int -> Int -> IO (Chosen alternatives)
 
-  -- | Goes on from the alternative that was chosen, with the case for it.
-  branches :: (ArrowChoice arr) => At ('PayloadChoice alternatives) link -> Cases alternatives link arr x r -> arr (Chosen alternatives link, x) r
+  -- | Goes on from the alternative that was chosen, with the case for it, in the
+  -- environment of the cursor of the stream.
+  branches :: (ArrowChoice arr) => Cases alternatives link arr r -> With (At p link) arr (Chosen alternatives) r
 
 -- | No alternative has the tag.
 instance Messages '[] where
-  type Chosen '[] _ = Void
+  type Chosen '[] = Void
   select _ _ tag = failing ("a message with the tag " <> show tag)
   {-# INLINE select #-}
-  branches _ NoCases = returnA >>^ (absurd . fst)
+  branches NoCases = arr absurd
   {-# INLINE branches #-}
 
 instance (Framed alternative, Cursor (BodyOf alternative), Messages alternatives) => Messages (alternative ': alternatives) where
-  type Chosen (alternative ': alternatives) link = Either (At (BodyOf alternative) link) (Chosen alternatives link)
+  type Chosen (alternative ': alternatives) = Either () (Chosen alternatives)
   select reader depth tag
-    | tag == frameTag @alternative = Left (At reader (depth + 1)) <$ begin @(BodyOf alternative) reader (depth + 1)
+    | tag == frameTag @alternative = Left () <$ begin @(BodyOf alternative) reader (depth + 1)
     | otherwise = Right <$> select @alternatives reader depth tag
   {-# INLINE select #-}
-  branches (At reader depth) (handler :> others) =
-    (\(chosen, x) -> either (const (Left x)) (Right . (,x)) chosen) ^>> (handler (At reader (depth + 1)) ||| branches (At reader depth) others)
+  branches (handler :> others) = (asks (arr (\(At reader depth) -> At reader (depth + 1))) >>> lift handler) ||| branches others
   {-# INLINE branches #-}
 
 -- | The cursor of a stream of messages that the reader starts: nothing of the
@@ -254,22 +261,22 @@ messages reader = At reader 0
 -- are in hand, and tells which alternative the tag chooses, with its body
 -- begun. It never asks for more than the frame says is there: five bytes, and
 -- then the body's own.
-message :: forall alternatives arr link. (Messages alternatives, ArrowChoice arr, Effect arr, Link arr link) => At ('PayloadChoice alternatives) link -> arr () (Chosen alternatives link)
-message (At reader depth) = now ready >>> (slow ||| returnA) >>> now framed
+message :: forall alternatives arr link. (Messages alternatives, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadChoice alternatives) link) (Chosen alternatives)
+message = withOnly (asks (now ready) >>> (slow ||| returnA) >>> asks (now framed))
   where
     -- The frame starts where the previous body ends, if it is in hand.
-    ready () = do
+    ready (At reader _) = do
       from <- mark reader markStart
       limit <- mark reader markLimit
       end <- mark reader markEnd
       pure (if end - max from limit >= 5 then Right () else Left ())
     -- The unread bytes of the body are skipped, and the frame is received.
     slow =
-      now (\() -> (\from limit -> max 0 (limit - from)) <$> mark reader markStart <*> mark reader markLimit)
-        >>> skipBytes reader
-        >>> now (\() -> (\from end -> if end - from >= 5 then Right () else Left 5) <$> mark reader markStart <*> mark reader markEnd)
-        >>> (refill reader ||| returnA)
-    framed () = do
+      asks (now (\(At reader _) -> (\from limit -> max 0 (limit - from)) <$> mark reader markStart <*> mark reader markLimit))
+        >>> onReader skipBytes
+        >>> asks (now (\(At reader _) -> (\from end -> if end - from >= 5 then Right () else Left 5) <$> mark reader markStart <*> mark reader markEnd))
+        >>> (onReader refill ||| returnA)
+    framed (At reader depth) = do
       from <- mark reader markStart
       limit <- mark reader markLimit
       let !at = max from limit
@@ -281,10 +288,10 @@ message (At reader depth) = now ready >>> (slow ||| returnA) >>> now framed
       select @alternatives reader depth tag
 {-# INLINE message #-}
 
--- | Goes on from the alternative that 'message' chose, with the case for it,
--- and the input that the cases share.
-cases :: (Messages alternatives, ArrowChoice arr) => At ('PayloadChoice alternatives) link -> Cases alternatives link arr x r -> arr (Chosen alternatives link, x) r
-cases = branches
+-- | Goes on from the alternative that 'message' chose, with the case for it: its
+-- inputs are the cursor of the stream and the alternative.
+cases :: (Messages alternatives, ArrowChoice arr) => Cases alternatives link arr r -> arr (At ('PayloadChoice alternatives) link, Chosen alternatives) r
+cases handlers = with (branches handlers)
 {-# INLINE cases #-}
 
 -- | The cursor of the elements of a counted payload.
@@ -293,9 +300,9 @@ child (At reader depth) = At reader (depth + 1)
 {-# INLINE child #-}
 
 -- | The number of elements, which is read before them.
-count :: (ArrowChoice arr, Effect arr, Link arr link) => At ('PayloadCounted16 e) link -> arr () Int
-count (At reader depth) =
-  inBody reader 2 $ \from -> do
+count :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 e) link) Int
+count =
+  inBody 2 $ \(At reader depth) from -> do
     elements <- scalar reader from 2
     when (elements > 0x7fff) $ failing "a negative element count"
     setMark reader (markFrame depth) elements
@@ -303,31 +310,38 @@ count (At reader depth) =
     pure elements
 {-# INLINE count #-}
 
--- | The next element, or 'Nothing' after the last, with what is unread of the
--- one before skipped. The element is a cursor that is begun, standing at it.
-element :: forall e arr link. (Skippable e, ArrowChoice arr, Effect arr, Link arr link) => At ('PayloadCounted16 e) link -> arr () (Maybe (At e link))
-element (At reader depth) = now ready >>> (slow ||| returnA) >>> now next
+-- | Moves on to the next element, with what is unread of the one before
+-- skipped, and says whether there is one. Its cursor is the 'child' of this
+-- one, which is begun. It gives no cursor, so nothing is built for it.
+advance :: forall e arr link. (Skippable e, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 e) link) Bool
+advance = withOnly (asks (now ready) >>> (slow ||| returnA) >>> asks (now next))
   where
     -- Nothing is unread of the one before.
-    ready () = (\before -> if before == 0 then Right () else Left ()) <$> mark reader (markFrame (depth + 1))
-    slow = skipRest (At reader (depth + 1) :: At e link)
-    next () = do
+    ready (At reader depth) = (\before -> if before == 0 then Right () else Left ()) <$> mark reader (markFrame (depth + 1))
+    slow = asks (child ^>> skipRest @e)
+    next (At reader depth) = do
       left <- mark reader (markFrame depth)
       if left == 0
-        then pure Nothing
+        then pure False
         else do
           setMark reader (markFrame depth) (left - 1)
           begin @e reader (depth + 1)
-          pure (Just (At reader (depth + 1)))
+          pure True
+{-# INLINE advance #-}
+
+-- | The next element, or 'Nothing' after the last, with what is unread of the
+-- one before skipped. The element is a cursor that is begun, standing at it.
+element :: forall e arr link. (Skippable e, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 e) link) (Maybe (At e link))
+element = advance &&& returnA >>^ \(found, cursor) -> if found then Just (child cursor) else Nothing
 {-# INLINE element #-}
 
 -- | The length of the value, which is read before its bytes, and -1 for NULL.
 -- A value that reaches past the end of its message is an error. This is the
 -- step that allocates nothing: it gives a number, where 'valueSize' gives a
 -- 'Maybe', which is built for whatever follows it when that is large.
-valueLength :: (ArrowChoice arr, Effect arr, Link arr link) => At 'MaybeBytes32Atom link -> arr () Int
-valueLength (At reader depth) =
-  inBody reader 4 $ \from -> do
+valueLength :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) Int
+valueLength =
+  inBody 4 $ \(At reader depth) from -> do
     raw <- scalar reader from 4
     limit <- mark reader markLimit
     if raw == 0xffffffff
@@ -340,17 +354,17 @@ valueLength (At reader depth) =
 {-# INLINE valueLength #-}
 
 -- | The length of the value, or 'Nothing' for NULL.
-valueSize :: (ArrowChoice arr, Effect arr, Link arr link) => At 'MaybeBytes32Atom link -> arr () (Maybe Int)
-valueSize cursor = valueLength cursor >>^ \size -> if size < 0 then Nothing else Just size
+valueSize :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) (Maybe Int)
+valueSize = valueLength >>^ \size -> if size < 0 then Nothing else Just size
 {-# INLINE valueSize #-}
 
 -- | The next piece of the value, as a view of the buffer that is valid until
 -- the next pull: the bytes in hand go first, and a receive is made only when
 -- none are. 'Nothing' at the end of the value.
-piece :: (ArrowChoice arr, Effect arr, Link arr link) => At 'MaybeBytes32Atom link -> arr () (Maybe ByteString)
-piece (At reader depth) = now attempt >>> (more ||| returnA)
+piece :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) (Maybe ByteString)
+piece = withOnly (asks (now attempt) >>> (more ||| returnA))
   where
-    attempt () = do
+    attempt (At reader depth) = do
       left <- mark reader (markFrame depth)
       if left == 0
         then pure (Right Nothing)
@@ -358,8 +372,8 @@ piece (At reader depth) = now attempt >>> (more ||| returnA)
           when (left < 0) $ failing "the length of a value was not read"
           from <- mark reader markStart
           end <- mark reader markEnd
-          if end == from then pure (Left ()) else Right . Just <$> taking left from (end - from)
-    taking !left !from !held = do
+          if end == from then pure (Left ()) else Right . Just <$> taking reader depth left from (end - from)
+    taking reader depth !left !from !held = do
       let !size = min left held
       setMark reader markStart (from + size)
       setMark reader (markFrame depth) (left - size)
@@ -367,38 +381,42 @@ piece (At reader depth) = now attempt >>> (more ||| returnA)
     {-# INLINE taking #-}
     -- Nothing is in hand, so the receive has the whole buffer.
     more =
-      now
-        ( \() -> do
-            end <- mark reader markEnd
-            limit <- mark reader markLimit
-            setMark reader markLimit (limit - end)
-            setMark reader markStart 0
-            setMark reader markEnd 0
-            pure (roomAfter reader 0)
+      asks
+        ( now
+            ( \(At reader _) -> do
+                end <- mark reader markEnd
+                limit <- mark reader markLimit
+                setMark reader markLimit (limit - end)
+                setMark reader markStart 0
+                setMark reader markEnd 0
+                pure (roomAfter reader 0)
+            )
         )
-        >>> receive (readerLink reader)
-        >>> now
-          ( \received -> do
-              when (received <= 0) $ ioError (userError "the stream ended inside a value")
-              setMark reader markEnd received
-              left <- mark reader (markFrame depth)
-              Just <$> taking left 0 received
+        >>> receiveAt
+        >>> With
+          ( now
+              ( \(At reader depth, received) -> do
+                  when (received <= 0) $ ioError (userError "the stream ended inside a value")
+                  setMark reader markEnd received
+                  left <- mark reader (markFrame depth)
+                  Just <$> taking reader depth left 0 received
+              )
           )
 {-# INLINE piece #-}
 
 -- | The pieces of the value, one after the other, given to the consumer.
-eachPiece :: (ArrowChoice arr, Effect arr, Link arr link) => At 'MaybeBytes32Atom link -> arr ByteString () -> arr () ()
-eachPiece cursor consumer = loop
+eachPiece :: (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (At 'MaybeBytes32Atom link) ()
+eachPiece consumer = withOnly loop
   where
-    loop = piece cursor >>> (maybe (Left ()) Right ^>> (returnA ||| (consumer >>> loop)))
+    loop = asks piece >>> (maybe (Left ()) Right ^>> (returnA ||| (lift consumer >>> loop)))
 {-# INLINE eachPiece #-}
 
 -- | Skips what is unread of the value, whose length was read. The size of what
 -- was skipped.
-skipLeft :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> Int -> arr () Int
-skipLeft reader depth = now starting >>> ((\size -> (size, size)) ^>> first (skipBytes reader) >>^ snd)
+skipLeft :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At p link) Int
+skipLeft = withOnly (asks (now starting) >>> (\size -> (size, size)) ^>> first (onReader skipBytes) >>^ snd)
   where
-    starting () = do
+    starting (At reader depth) = do
       size <- mark reader (markFrame depth)
       when (size < 0) $ failing "the length of a value was not read"
       setMark reader (markFrame depth) 0
@@ -406,8 +424,8 @@ skipLeft reader depth = now starting >>> ((\size -> (size, size)) ^>> first (ski
 {-# INLINE skipLeft #-}
 
 -- | Skips what is unread of the value, whose length was read.
-skipValue :: (ArrowChoice arr, Effect arr, Link arr link) => At 'MaybeBytes32Atom link -> arr () ()
-skipValue (At reader depth) = skipLeft reader depth >>^ const ()
+skipValue :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) ()
+skipValue = skipLeft >>^ const ()
 {-# INLINE skipValue #-}
 
 -- | How a type is decoded from the bytes of a value.
@@ -446,19 +464,19 @@ instance InPlace Length where
 -- | The value, decoded in place: with all of its bytes in hand, which a receive
 -- makes if it has to. Its length must have been read. A value that is larger
 -- than the buffer, or that the type has another size for, is an error.
-decode :: forall a arr link. (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => At 'MaybeBytes32Atom link -> arr () a
-decode (At reader depth) = case decoder @a of
-  Peek wire peek -> inValue reader depth wire (const peek)
-  PeekWhole peek -> inValue reader depth (-1) peek
-  Skip make -> skipLeft reader depth >>^ make
+decode :: forall a arr link. (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) a
+decode = case decoder @a of
+  Peek wire peek -> inValue wire (const peek)
+  PeekWhole peek -> inValue (-1) peek
+  Skip make -> skipLeft >>^ make
 {-# INLINE decode #-}
 
 -- | The value's bytes in hand, and what is made of them: how many bytes the
 -- value must have, unless that is negative.
-inValue :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> Int -> Int -> (Int -> Ptr Word8 -> IO a) -> arr () a
-inValue reader depth wire peek = now ready >>> (refill reader ||| returnA) >>> now taken
+inValue :: (ArrowChoice arr, Effect arr, Link arr link) => Int -> (Int -> Ptr Word8 -> IO a) -> arr (At 'MaybeBytes32Atom link) a
+inValue wire peek = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks (now taken))
   where
-    ready () = do
+    ready (At reader depth) = do
       size <- mark reader (markFrame depth)
       when (size < 0) $ failing "the length of a value was not read"
       when (wire >= 0 && size /= wire) $ wrongSize size wire
@@ -469,7 +487,7 @@ inValue reader depth wire peek = now ready >>> (refill reader ||| returnA) >>> n
         else do
           when (size > readerCapacity reader) $ unfitting "a value" size (readerCapacity reader)
           pure (Left size)
-    taken () = do
+    taken (At reader depth) = do
       size <- mark reader (markFrame depth)
       from <- mark reader markStart
       value <- unsafeWithForeignPtr (readerMemory reader) (\memory -> peek size (memory `plusPtr` from))
@@ -479,9 +497,9 @@ inValue reader depth wire peek = now ready >>> (refill reader ||| returnA) >>> n
 {-# INLINE inValue #-}
 
 -- | A fixed number of bytes, up to eight, as a big-endian number.
-fixed :: forall n arr link. (KnownNat n, ArrowChoice arr, Effect arr, Link arr link) => At ('FixedBytesAtom n) link -> arr () Int
-fixed (At reader depth) =
-  inBody reader (natAsInt @n) $ \from -> do
+fixed :: forall n arr link. (KnownNat n, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('FixedBytesAtom n) link) Int
+fixed =
+  inBody (natAsInt @n) $ \(At reader depth) from -> do
     setMark reader (markFrame depth) 0
     scalar reader from (natAsInt @n)
 {-# INLINE fixed #-}
@@ -489,17 +507,17 @@ fixed (At reader depth) =
 -- | The C string that is the whole body of a control message: a view of the
 -- buffer, without its terminator. A message that doesn't fit the buffer is an
 -- error, since the string is in hand at once.
-cstring :: (ArrowChoice arr, Effect arr, Link arr link) => At 'CStringAtom link -> arr () ByteString
-cstring (At reader _) = now ready >>> (refill reader ||| returnA) >>> now found
+cstring :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'CStringAtom link) ByteString
+cstring = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks (now found))
   where
-    ready () = do
+    ready (At reader _) = do
       from <- mark reader markStart
       limit <- mark reader markLimit
       end <- mark reader markEnd
       let !size = limit - from
       when (size > readerCapacity reader) $ unfitting "a control message" size (readerCapacity reader)
       pure (if end - from >= size then Right () else Left size)
-    found () = do
+    found (At reader _) = do
       from <- mark reader markStart
       limit <- mark reader markLimit
       let body = BSI.BS (readerMemory reader `plusForeignPtr` from) (limit - from)
@@ -515,10 +533,10 @@ cstring (At reader _) = now ready >>> (refill reader ||| returnA) >>> now found
 -- receives the rest; then it takes them, which is the other. It is an error to
 -- reach past the end of the body, which is checked before anything is received,
 -- so that nothing waits for bytes that the message does not have.
-inBody :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> Int -> (Int -> IO a) -> arr () a
-inBody reader size take' = now ready >>> (refill reader ||| returnA) >>> now taken
+inBody :: (ArrowChoice arr, Effect arr, Link arr link) => Int -> (At p link -> Int -> IO a) -> arr (At p link) a
+inBody size take' = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks (now taken))
   where
-    ready () = do
+    ready (At reader _) = do
       from <- mark reader markStart
       limit <- mark reader markLimit
       when (size > limit - from) $ pastBody size
@@ -528,50 +546,64 @@ inBody reader size take' = now ready >>> (refill reader ||| returnA) >>> now tak
         else do
           when (size > readerCapacity reader) $ unfitting "a read" size (readerCapacity reader)
           pure (Left size)
-    taken () = do
+    taken cursor@(At reader _) = do
       from <- mark reader markStart
-      value <- take' from
+      value <- take' cursor from
       value `seq` setMark reader markStart (from + size)
       pure value
 {-# INLINE inBody #-}
 
 -- | Skips this many bytes: the ones in hand, and then the ones that arrive.
-skipBytes :: (ArrowChoice arr, Effect arr, Link arr link) => Reader link -> arr Int ()
-skipBytes reader = now attempt >>> (more ||| returnA)
+skipBytes :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link, Int) ()
+skipBytes = with (With (now attempt) >>> (more ||| returnA))
   where
-    attempt size = do
+    attempt (reader, size) = do
       from <- mark reader markStart
       end <- mark reader markEnd
       if end - from >= size
         then Right () <$ setMark reader markStart (from + size)
         else Left (size - (end - from)) <$ setMark reader markStart end
-    more = now (setMark reader markWanted) >>> loop
+    more = With (now (uncurry (`setMark` markWanted))) >>> loop
     -- Nothing is in hand, so the receive has the whole buffer.
     loop =
-      now
-        ( \() -> do
-            end <- mark reader markEnd
-            limit <- mark reader markLimit
-            setMark reader markLimit (limit - end)
-            setMark reader markStart 0
-            setMark reader markEnd 0
-            pure (roomAfter reader 0)
+      asks
+        ( now
+            ( \reader -> do
+                end <- mark reader markEnd
+                limit <- mark reader markLimit
+                setMark reader markLimit (limit - end)
+                setMark reader markStart 0
+                setMark reader markEnd 0
+                pure (roomAfter reader 0)
+            )
         )
-        >>> receive (readerLink reader)
-        >>> now
-          ( \received -> do
-              when (received <= 0) $ ioError (userError "the stream ended inside a message")
-              wanted <- mark reader markWanted
-              if received >= wanted
-                then Right () <$ (setMark reader markStart wanted *> setMark reader markEnd received)
-                else do
-                  limit <- mark reader markLimit
-                  setMark reader markLimit (limit - received)
-                  setMark reader markWanted (wanted - received)
-                  pure (Left ())
+        >>> With receiveInto
+        >>> With
+          ( now
+              ( \(reader, received) -> do
+                  when (received <= 0) $ ioError (userError "the stream ended inside a message")
+                  wanted <- mark reader markWanted
+                  if received >= wanted
+                    then Right () <$ (setMark reader markStart wanted *> setMark reader markEnd received)
+                    else do
+                      limit <- mark reader markLimit
+                      setMark reader markLimit (limit - received)
+                      setMark reader markWanted (wanted - received)
+                      pure (Left ())
+              )
           )
         >>> (loop ||| returnA)
 {-# INLINE skipBytes #-}
+
+-- | A step of the reader's that takes a size, on the reader of the cursor in the environment.
+onReader :: (Arrow arr) => arr (Reader link, Int) () -> With (At p link) arr Int ()
+onReader step = With ((\(At reader _, size) -> (reader, size)) ^>> step)
+{-# INLINE onReader #-}
+
+-- | Receives from the link of the cursor's reader, into the room.
+receiveAt :: (Arrow arr, Link arr link) => With (At p link) arr Room Int
+receiveAt = With ((\(At reader _, room) -> (reader, room)) ^>> receiveInto)
+{-# INLINE receiveAt #-}
 
 -- | The big-endian number of the bytes at the address.
 bigEndian :: Int -> Ptr Word8 -> IO Word

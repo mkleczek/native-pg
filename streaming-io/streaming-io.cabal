@@ -27,6 +27,7 @@ library
                    Network.Streaming.Loop
                    Network.Streaming.Simulated
                    Network.Streaming.Reader
+                   Network.Streaming.With
                    Network.Streaming.Pool
                    Network.Streaming.Internal.Scheduler
                    Network.Streaming.Internal.Timers
@@ -60,6 +61,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Loop
                  Network.Streaming.Simulated
                  Network.Streaming.Reader
+                 Network.Streaming.With
                  Network.Streaming.Pool
                  Network.Streaming.Internal.Scheduler
                  Network.Streaming.Internal.Timers
@@ -76,6 +78,7 @@ test-suite streaming-io-spec
                  RuntimeSpec
                  ScopesSpec
                  TimeSpec
+                 WithSpec
   ghc-options: -Wall -threaded -rtsopts -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, containers, network, stm, streaming-io, resource-admission, skeletest >=0.4.2 && <0.5

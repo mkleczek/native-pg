@@ -40,14 +40,14 @@ main = do
       picked name = all (`isPrefixOf` name) (take 1 (drop 1 arguments))
       measure name size run = when (picked name) (measureRun name size run)
   printf "%-24s %6s %9s %10s %10s %12s\n" "run" "MiB" "MiB/s" "steps/MiB" "waits/MiB" "alloc/MiB"
-  measure "threads, sockets" mib (overSockets (\built -> built >>= \program -> Nothing <$ runThreads program ()))
-  measure "loop, sockets" mib (overSockets (\built -> built >>= \program -> Just . snd <$> runLoop program ()))
-  measure "compiled, sockets" mib (overSockets (\built -> built >>= \program -> Just . snd <$> runCompiled program ()))
-  measure "delimited, sockets" mib (overSockets (\built -> Just . snd <$> runDelimitedWith built ()))
-  measure "loop, simulated" mib (overSimulated (\built -> built >>= \program -> Just . snd <$> runLoop program ()))
-  measure "compiled, simulated" mib (overSimulated (\built -> built >>= \program -> Just . snd <$> runCompiled program ()))
-  measure "delimited, simulated" mib (overSimulated (\built -> Just . snd <$> runDelimitedWith built ()))
-  measure "simulation" (min mib 8) (overSimulated (\built -> built >>= \program -> Just . simulatedReport <$> runSimulation 1 maxBound program ()))
+  measure "threads, sockets" mib (overSockets (\built ends -> built >>= \program -> Nothing <$ runThreads program ends))
+  measure "loop, sockets" mib (overSockets (\built ends -> built >>= \program -> Just . snd <$> runLoop program ends))
+  measure "compiled, sockets" mib (overSockets (\built ends -> built >>= \program -> Just . snd <$> runCompiled program ends))
+  measure "delimited, sockets" mib (overSockets (\built ends -> Just . snd <$> runDelimitedWith built ends))
+  measure "loop, simulated" mib (overSimulated (\built ends -> built >>= \program -> Just . snd <$> runLoop program ends))
+  measure "compiled, simulated" mib (overSimulated (\built ends -> built >>= \program -> Just . snd <$> runCompiled program ends))
+  measure "delimited, simulated" mib (overSimulated (\built ends -> Just . snd <$> runDelimitedWith built ends))
+  measure "simulation" (min mib 8) (overSimulated (\built ends -> built >>= \program -> Just . simulatedReport <$> runSimulation 1 maxBound program ends))
 
 -- | Runs the round trip of this many MiB, and prints what it did per MiB.
 measureRun :: String -> Int -> (Int -> IO (Maybe Report, Int)) -> IO ()
@@ -67,7 +67,7 @@ measureRun name mib run = do
 
 -- | The round trip over socket pairs: the run's report, and how many bytes the
 -- client got back.
-overSockets :: (Built -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
+overSockets :: (Built Socket -> Ends Socket -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
 overSockets run size = withPair $ \client front -> withPair $ \back server -> roundTrip run size (client, front, back, server)
   where
     withPair :: (Socket -> Socket -> IO a) -> IO a
@@ -76,50 +76,56 @@ overSockets run size = withPair $ \client front -> withPair $ \back server -> ro
         . uncurry
 
 -- | The round trip over simulated links that hold 64 KiB each way.
-overSimulated :: (Built -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
+overSimulated :: (Built SimEnd -> Ends SimEnd -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
 overSimulated run size = do
   (client, front) <- connect 65536
   (back, server) <- connect 65536
   roundTrip run size (client, front, back, server)
 
-roundTrip :: (forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Link arr end) => (Built -> IO (Maybe Report)) -> Int -> (end, end, end, end) -> IO (Maybe Report, Int)
-roundTrip run size (client, front, back, server) = do
+roundTrip :: (forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Link arr end) => (Built end -> Ends end -> IO (Maybe Report)) -> Int -> Ends end -> IO (Maybe Report, Int)
+roundTrip run size ends = do
   received <- newIORef 0
   report <-
-    run $ do
-      forSending <- newBuffer (positiveInt @16384)
-      forCounting <- newBuffer (positiveInt @16384)
-      requests <- newBuffer (positiveInt @16384)
-      answers <- newBuffer (positiveInt @16384)
-      forServer <- newBuffer (positiveInt @16384)
-      pure $
-        together
-          [ sending forSending size client,
-            counting forCounting client received,
-            proxy requests answers front back,
-            echo forServer server
-          ]
+    run
+      ( do
+          forSending <- newBuffer (positiveInt @16384)
+          forCounting <- newBuffer (positiveInt @16384)
+          requests <- newBuffer (positiveInt @16384)
+          answers <- newBuffer (positiveInt @16384)
+          forServer <- newBuffer (positiveInt @16384)
+          pure $
+            together
+              [ (\(client, _, _, _) -> client) ^>> sending forSending size,
+                (\(client, _, _, _) -> client) ^>> counting forCounting received,
+                (\(_, front, back, _) -> (front, back)) ^>> proxy requests answers,
+                (\(_, _, _, server) -> server) ^>> echo forServer
+              ]
+      )
+      ends
   (,) report <$> readIORef received
 
--- | A program made in IO, which each arrow runs.
-type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => IO (arr () ())
+-- | The four ends of the round trip: the client's, the proxy's two, and the server's.
+type Ends end = (end, end, end, end)
+
+-- | A program made in IO, which each arrow runs, and which is given the ends.
+type Built end = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => IO (arr (Ends end) ())
 
 -- | Sends this many bytes from the buffer, whatever is in it, then ends the
 -- output.
-sending :: (ArrowChoice arr, Link arr end) => Buffer -> Int -> end -> arr () ()
-sending buffer total end = const total ^>> loop
+sending :: (ArrowChoice arr, Link arr end) => Buffer -> Int -> arr end ()
+sending buffer total = (,total) ^>> loop
   where
     loop =
-      (\left -> if left == 0 then Left () else Right left)
-        ^>> (shutdownSend end ||| (chunk ^>> first (sendAll end) >>> snd ^>> loop))
-    chunk left = let count = min left (bufferCapacity buffer) in ([view buffer count], left - count)
+      (\(end, left) -> if left == 0 then Left end else Right (end, left))
+        ^>> (shutdownSend ||| (chunk ^>> first sendAll >>> snd ^>> loop))
+    chunk (end, left) = let count = min left (bufferCapacity buffer) in ((end, [view buffer count]), (end, left - count))
 
 -- | Counts what arrives, until the end of the stream.
-counting :: (ArrowChoice arr, Effect arr, Link arr end) => Buffer -> end -> IORef Int -> arr () ()
-counting buffer end total = loop
+counting :: (ArrowChoice arr, Effect arr, Link arr end) => Buffer -> IORef Int -> arr end ()
+counting buffer total = loop
   where
     loop =
-      const (roomOf buffer)
-        ^>> receive end
-        >>> (\count -> if count == 0 then Left () else Right count)
-        ^>> (returnA ||| (now (\count -> modifyIORef' total (+ count)) >>> loop))
+      (\end -> ((end, roomOf buffer), end))
+        ^>> first receive
+        >>> (\(count, end) -> if count == 0 then Left () else Right (count, end))
+        ^>> (returnA ||| (first (now (\count -> modifyIORef' total (+ count))) >>> snd ^>> loop))

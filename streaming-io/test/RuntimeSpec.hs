@@ -80,7 +80,7 @@ spec = describe "the runtime" $ do
       (_, end) <- connect 1000
       buffer <- newBuffer (positiveInt @1024)
       let failing = now (\() -> throwIO (ErrorCall "the part failed"))
-          receiving = const (roomOf buffer) ^>> receive end >>> now (\_ -> pure ())
+          receiving = const (end, roomOf buffer) ^>> receive >>> now (\_ -> pure ())
       within (try (runThreads (together [receiving, failing]) ())) `shouldReturn` Just (Left (ErrorCall "the part failed"))
 
 -- | The programs of the same kind that scope their resources, race, and keep time.
@@ -100,7 +100,7 @@ cancelledFirst run = withPair $ \waiting _ -> do
       ticks name count = const count ^>> replicateA (giveWay >>> now (\() -> note name)) >>^ const ()
   _ <- run $ do
     buffer <- newBuffer (positiveInt @16)
-    let loser = scope (now (\() -> pure ())) (now (\_ -> note "released")) (const (roomOf buffer) ^>> receive waiting >>> now (\_ -> pure ()))
+    let loser = scope (now (\() -> pure ())) (now (\_ -> note "released")) (const (waiting, roomOf buffer) ^>> receive >>> now (\_ -> pure ()))
         winner = ticks "winner" 5 >>> now (\() -> note "won")
     pure $ together [race loser winner >>> now (\_ -> pure ()), ticks "yielder 1" 30, ticks "yielder 2" 30]
   reverse <$> readIORef notes
@@ -116,7 +116,7 @@ timedFirst run = withPair $ \waiting _ -> do
   _ <- run $ do
     buffer <- newBuffer (positiveInt @16)
     let sleeper = ticks "sleeper" 5 >>> now (\() -> note "asleep") >>> sleep (nanos 1) >>> now (\() -> note "woke")
-        expiring = ticks "waiter" 5 >>> now (\() -> note "waiting") >>> Classes.within (nanos 1) (const (roomOf buffer) ^>> receive waiting) >>> now (\_ -> note "expired")
+        expiring = ticks "waiter" 5 >>> now (\() -> note "waiting") >>> Classes.within (nanos 1) (const (waiting, roomOf buffer) ^>> receive) >>> now (\_ -> note "expired")
     pure $ together [sleeper, expiring, ticks "yielder 1" 30, ticks "yielder 2" 30]
   reverse <$> readIORef notes
 
@@ -136,8 +136,8 @@ wokenFirst run = withPair $ \waiting sending -> do
     buffer <- newBuffer (positiveInt @16)
     pure $
       together
-        [ const (roomOf buffer) ^>> receive waiting >>> now (\_ -> note "woke"),
-          ticks "writer" 5 >>> (\() -> [BS.singleton 1]) ^>> sendAll sending >>> now (\() -> note "sent") >>> ticks "writer" 10,
+        [ const (waiting, roomOf buffer) ^>> receive >>> now (\_ -> note "woke"),
+          ticks "writer" 5 >>> (\() -> (sending, [BS.singleton 1])) ^>> sendAll >>> now (\() -> note "sent") >>> ticks "writer" 10,
           ticks "yielder 1" 30,
           ticks "yielder 2" 30
         ]

@@ -45,8 +45,9 @@ memoryReceive (Memory (BSI.BS wire total) position limit) target room = unsafeWi
 -- way at, as the receive of a link that does wait is, and the link always has
 -- input.
 instance (Arrow arr, Effect arr, GiveWay arr) => Link arr Memory where
-  receive memory = giveWay >>> now (\(Room (Buffer target _) offset size) -> unsafeWithForeignPtr target (\pointer -> memoryReceive memory (pointer `plusPtr` offset) size))
-  sendAll _ = now (\_ -> throwIO (userError "a memory link is for reading only"))
-  awaitInput _ = now (\() -> pure ())
-  shutdownSend _ = now (\() -> pure ())
-  close _ = now (\() -> pure ())
+  receive = giveWay >>> now (\(memory, Room (Buffer target _) offset size) -> unsafeWithForeignPtr target (\pointer -> memoryReceive memory (pointer `plusPtr` offset) size))
+  {-# INLINE receive #-}
+  sendAll = now (\_ -> throwIO (userError "a memory link is for reading only"))
+  awaitInput = now (\_ -> pure ())
+  shutdownSend = now (\_ -> pure ())
+  close = now (\_ -> pure ())

@@ -52,36 +52,36 @@ variants :: [Variant]
 variants =
   [ Variant
       "B threads"
-      (\memory -> withReader memory (\reader -> runThreads (foldRows checksum reader) 0))
-      (streamed (\counter reader -> runThreads (streamMessages reader (counting counter)) ())),
+      (\memory -> withReader memory (\reader -> runThreads (foldRows checksum) (reader, 0)))
+      (streamed (runThreads . streamMessages . counting)),
     Variant
       "B compiled"
-      (\memory -> withReader memory (\reader -> fst <$> runCompiled (foldRows checksum reader) 0))
-      (streamed (\counter reader -> fst <$> runCompiled (streamMessages reader (counting counter)) ())),
+      (\memory -> withReader memory (\reader -> fst <$> runCompiled (foldRows checksum) (reader, 0)))
+      (streamed (\counter reader -> fst <$> runCompiled (streamMessages (counting counter)) reader)),
     Variant
       "B delimited"
-      (\memory -> withReader memory (\reader -> fst <$> runDelimited (foldRows checksum reader) 0))
-      (streamed (\counter reader -> fst <$> runDelimited (streamMessages reader (counting counter)) ())),
+      (\memory -> withReader memory (\reader -> fst <$> runDelimited (foldRows checksum) (reader, 0)))
+      (streamed (\counter reader -> fst <$> runDelimited (streamMessages (counting counter)) reader)),
     Variant
       "C compiled"
-      (\memory -> resumable (\buffer -> fst . fst <$> runCompiled (parse memory buffer ignored rowsResumable) BS.empty))
-      (streamedResumable (\memory buffer counter -> void (runCompiled (parse memory buffer (counting counter) streamResumable) BS.empty))),
+      (\memory -> resumable (\buffer -> fst . fst <$> runCompiled (parse buffer ignored rowsResumable) (memory, BS.empty)))
+      (streamedResumable (\memory buffer counter -> void (runCompiled (parse buffer (counting counter) streamResumable) (memory, BS.empty)))),
     Variant
       "C delimited"
-      (\memory -> resumable (\buffer -> fst . fst <$> runDelimited (parse memory buffer ignored rowsResumable) BS.empty))
-      (streamedResumable (\memory buffer counter -> void (runDelimited (parse memory buffer (counting counter) streamResumable) BS.empty))),
+      (\memory -> resumable (\buffer -> fst . fst <$> runDelimited (parse buffer ignored rowsResumable) (memory, BS.empty)))
+      (streamedResumable (\memory buffer counter -> void (runDelimited (parse buffer (counting counter) streamResumable) (memory, BS.empty)))),
     Variant
       "D threads"
-      (streamed (\counter reader -> runThreads (foldRowsCursors reader counter) ()))
-      (streamed (\counter reader -> runThreads (streamCursors reader (counting counter)) ())),
+      (streamed (runThreads . foldRowsCursors))
+      (streamed (runThreads . streamCursors . counting)),
     Variant
       "D compiled"
-      (streamed (\counter reader -> fst <$> runCompiled (foldRowsCursors reader counter) ()))
-      (streamed (\counter reader -> fst <$> runCompiled (streamCursors reader (counting counter)) ())),
+      (streamed (\counter reader -> fst <$> runCompiled (foldRowsCursors counter) reader))
+      (streamed (\counter reader -> fst <$> runCompiled (streamCursors (counting counter)) reader)),
     Variant
       "D delimited"
-      (streamed (\counter reader -> fst <$> runDelimited (foldRowsCursors reader counter) ()))
-      (streamed (\counter reader -> fst <$> runDelimited (streamCursors reader (counting counter)) ()))
+      (streamed (\counter reader -> fst <$> runDelimited (foldRowsCursors counter) reader))
+      (streamed (\counter reader -> fst <$> runDelimited (streamCursors (counting counter)) reader))
   ]
 
 -- | A buffer of the capacity.
