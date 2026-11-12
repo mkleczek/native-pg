@@ -4,4 +4,5 @@ packages: .
           native-pg
           native-pg-tls
           directions
+          fulmen
 tests: true
