@@ -39,7 +39,6 @@ import Data.List (partition, sort)
 import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Network.Directions.Cancel (nextIdent)
 import Network.Directions.Classes
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
@@ -134,25 +133,29 @@ data Process r where
   Check :: Frames () r -> Process r
 
 -- | What the parts of a run share: whether any scope has been cancelled, which is all that most runs ever
--- ask: a part looks at the scopes it is in only once that is so, since the frames it would walk can be long.
-newtype Env = Env (TVar Bool)
+-- ask: a part looks at the scopes it is in only once that is so, since the frames it would walk can be long; and
+-- the number of the next scope.
+data Env = Env !(TVar Bool) !(IORef Int)
 
 newEnv :: IO Env
-newEnv = Env <$> newTVarIO False
+newEnv = Env <$> newTVarIO False <*> newIORef 0
 
 -- | A cancel scope: which it is, whether it was cancelled, which the watches of the parts inside it read, and
 -- the run's flag that some scope was.
 data LoopScope = LoopScope !ScopeId !(TVar Bool) !(TVar Bool)
 
 newLoopScope :: Env -> IO LoopScope
-newLoopScope (Env anyCancelled) = (\ident flag -> LoopScope (ScopeId ident) flag anyCancelled) <$> nextIdent <*> newTVarIO False
+newLoopScope (Env anyCancelled next) = do
+  ident <- readIORef next
+  writeIORef next (ident + 1)
+  (\flag -> LoopScope (ScopeId ident) flag anyCancelled) <$> newTVarIO False
 
 cancelLoopScope :: LoopScope -> IO ()
 cancelLoopScope (LoopScope _ flag anyCancelled) = atomically (writeTVar flag True *> writeTVar anyCancelled True)
 
 -- | The scope whose cancellation reaches a part with these frames, if any scope has been cancelled at all.
 cancelledNow :: Env -> Frames b r -> IO (Maybe ScopeId)
-cancelledNow (Env anyCancelled) frames = readTVarIO anyCancelled >>= \cancelled -> if cancelled then atomically (cancelledSTM frames) else pure Nothing
+cancelledNow (Env anyCancelled _) frames = readTVarIO anyCancelled >>= \cancelled -> if cancelled then atomically (cancelledSTM frames) else pure Nothing
 
 -- | What follows a program, as data: the rest of a sequence, the other half of
 -- a pair, a choice to wrap, or the join of a concurrent pair; and what a scope
@@ -209,7 +212,7 @@ cancelledSTM = go Nothing
 
 -- | The watch of a part that waits for an event: the event, or a cancellation that reaches the part.
 watchFor :: Env -> Event -> Process r -> IO Watch
-watchFor (Env anyCancelled) event process = (\(Watch ready cancel) -> Watch (ready `orElse` cancelled) cancel) <$> watchOf event
+watchFor (Env anyCancelled _) event process = (\(Watch ready cancel) -> Watch (ready `orElse` cancelled) cancel) <$> watchOf event
   where
     cancelled = case process of
       Check frames -> readTVar anyCancelled >>= check >> cancelledSTM frames >>= maybe retry (const (pure ()))

@@ -21,10 +21,13 @@
 -- says where it waits, so that cancelling the scope takes it off what it waits
 -- at and puts it back among those that can go on, with the cancellation to
 -- raise where it waits. A part in no scope says nothing, and waits as it always
--- did. The scheduler runs masked, and an asynchronous exception reaches it where
--- it waits for a descriptor, and once in a while otherwise: it cancels every
--- part that is in a scope, waits until they have ended, and then fails the run
--- with the exception.
+-- did. A scope holds only the parts it began with, and a part that is suspended
+-- at a pair says so: cancelling a scope finds the others through those, so that
+-- a part enters and leaves a scope without anything but its own frames
+-- changing, however many parts there are. The scheduler runs masked, and an
+-- asynchronous exception reaches it where it waits for a descriptor, and once
+-- in a while otherwise: it cancels every part that is in a scope, waits until
+-- they have ended, and then fails the run with the exception.
 module Network.Directions.Scheduler
   ( Step (..),
     Run,
@@ -41,8 +44,10 @@ module Network.Directions.Scheduler
     post,
     schedule,
     Part (..),
+    PartScope,
     Parked (..),
     newPart,
+    newScope,
     childPart,
     endPart,
     pushFrame,
@@ -66,7 +71,7 @@ where
 
 import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDelay, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, try)
-import Control.Monad (forM_, when, (>=>))
+import Control.Monad (when, (>=>))
 import Data.Bits ((.&.))
 import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -119,12 +124,14 @@ data Slot a = Empty | Given a | Waiter (IO a -> IO Step)
 -- none has no frames, and says nothing of where it waits.
 data Part = Part
   { partIdent :: !Int,
-    partFrames :: !(IORef [Frame Part]),
+    partFrames :: !(IORef [Frame [Part]]),
     partWait :: !(IORef Parked)
   }
 
-instance Identified Part where
-  identOf = partIdent
+-- | A scope of a run, with the parts that its body began with: those of the halves of a pair, or the part that
+-- entered a deadline. The others inside it are reached through those: a part that is suspended at a pair says so
+-- (see 'InPair'), and the halves are inside what the part is inside.
+type PartScope = CancelScope [Part]
 
 -- | Where a part waits, as what takes it off that.
 data Parked
@@ -137,6 +144,9 @@ data Parked
   | -- | Anything else: takes the part off, and gives it with the cancellation raised where it waits, if it was
     -- still there.
     Other !(Cancelled -> IO (Maybe (IO Step)))
+  | -- | A pair, whose halves are the parts to look at next: the part is suspended until they have ended, and
+    -- is not taken off anything.
+    InPair !PartScope
 
 -- | What the parts of a run share.
 data Run = Run
@@ -146,7 +156,7 @@ data Run = Run
     -- taken, the waits, the parts that wait for tickets that other cores
     -- give and are not yet back from the mailbox, the parts that wait on
     -- descriptors, those that wait for tickets, the number of the next wait,
-    -- the rounds, and the time that the round began at, or 0 before it is read:
+    -- the rounds, the time that the round began at, or 0 before it is read, and the parts that are in a scope:
     -- unboxed, so that counting allocates nothing. A step is a point
     -- to give way at, which a link's receive or send is, or a wait, or a
     -- ticket given or waited for.
@@ -161,8 +171,8 @@ data Run = Run
     runWaiters :: !(IORef (IntMap.IntMap Waiters)),
     -- | The parts that wait on watches.
     runWatching :: !(IORef [Watching]),
-    -- | The scope that every part in a scope is in, outermost.
-    runRoot :: !(CancelScope Part),
+    -- | The scope that every part in a scope is in, outermost: it begins with the run's first part.
+    runRoot :: !PartScope,
     -- | The asynchronous exception that the run is shutting down for.
     runShutdown :: !(IORef (Maybe SomeException)),
     -- | What goes on with a failure of the part that runs, in a run of "Network.Directions.Compiled", whose
@@ -199,11 +209,11 @@ batch = 64
 -- once nothing that is given parts through its mailbox can run any more.
 newRun :: IO Run
 newRun = do
-  counters <- mallocForeignPtrArray 9
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 8]
+  counters <- mallocForeignPtrArray 10
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 9]
   poller <- throwErrnoIfNull "directions_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
-  Run <$> newIORef [] <*> pure counters <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (getMonotonicTimeNSec >>= newWheel)
+  Run <$> newIORef [] <*> pure counters <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (getMonotonicTimeNSec >>= newWheel)
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
@@ -268,7 +278,7 @@ setCounter run index value = unsafeWithForeignPtr (runCounters run) (\pointer ->
 {-# INLINE setCounter #-}
 
 -- | Adds to a counter: 3 the parts that wait for tickets of other cores, 4 those that wait on descriptors, 5
--- those that wait for tickets.
+-- those that wait for tickets, 9 the parts that are in a scope.
 adjust :: Run -> Int -> Int -> IO ()
 adjust run index delta = counter run index >>= setCounter run index . (+ delta)
 {-# INLINE adjust #-}
@@ -293,7 +303,8 @@ sleepUntil run part (Instant at) resume = do
     _ -> writeIORef (partWait part) (Other (\cancelled -> cancelTimer (runWheel run) timer >>= \wasLive -> pure (if wasLive then Just (resume (throwIO cancelled)) else Nothing)))
   counted run Timed
 
--- | The number of a part or of a wait of a part that is in a scope, which is not 0.
+-- | The number of a part, of a wait of a part that is in a scope, or of a scope: none is 0, and the run's own
+-- counter gives each only once.
 nextWait :: Run -> IO Int
 nextWait run = counter run 6 >>= \n -> n + 1 <$ setCounter run 6 (n + 1)
 {-# INLINE nextWait #-}
@@ -320,48 +331,57 @@ counted run step = step <$ (counter run 1 >>= setCounter run 1 . (+ 1))
 wakeTicket :: Run -> IO Step -> IO ()
 wakeTicket run part = modifyIORef' (runTickets run) (part :) *> adjust run 5 (-1)
 
--- | A part in no scope, to run as the first part of a run, or one that only holds a resource.
+-- | The first part of a run, in no scope: the run's root scope begins with it.
 newPart :: Run -> IO Part
-newPart run = Part <$> nextWait run <*> newIORef [] <*> newIORef NotWaiting
+newPart run = do
+  part <- Part <$> nextWait run <*> newIORef [] <*> newIORef NotWaiting
+  part <$ modifyIORef' (scopeMembers (runRoot run)) (part :)
 
--- | A part for a half of a pair, in the scope of the pair as well as in those of the part that made it.
-childPart :: Run -> Part -> CancelScope Part -> IO Part
+-- | A scope for a pair or a deadline of the run.
+newScope :: Run -> IO PartScope
+newScope run = nextWait run >>= (`newCancelScope` [])
+
+-- | A part for a half of a pair, in the scope of the pair as well as in those of the part that made it. The
+-- parent, which is suspended until the pair has ended, says where its halves are.
+childPart :: Run -> Part -> PartScope -> IO Part
 childPart run parent scope' = do
   outer <- readIORef (partFrames parent)
-  let frames = Inside scope' : if null outer then [Inside (runRoot run)] else outer
-  child <- Part <$> nextWait run <*> newIORef frames <*> newIORef NotWaiting
-  forM_ frames $ \case Inside s -> enter s child; _ -> pure ()
-  pure child
+  child <- Part <$> nextWait run <*> newIORef (Inside scope' : if null outer then [Inside (runRoot run)] else outer) <*> newIORef NotWaiting
+  adjust run 9 1
+  modifyIORef' (scopeMembers scope') (<> [child])
+  child <$ writeIORef (partWait parent) (InPair scope')
 
 -- | A part that has ended is in no scope any more.
-endPart :: Part -> IO ()
-endPart part = do
-  frames <- readIORef (partFrames part)
-  forM_ frames $ \case Inside s -> leave s part; _ -> pure ()
+endPart :: Run -> Part -> IO ()
+endPart run part = do
+  readIORef (partFrames part) >>= \case
+    [] -> pure ()
+    _ -> adjust run 9 (-1)
   writeIORef (partFrames part) []
 
--- | The part goes in a scope, or behind a shield; a part that was in none goes in the run's root scope too.
-pushFrame :: Run -> Part -> Frame Part -> IO ()
+-- | The part goes in a scope, or behind a shield; a part that was in none goes in the run's root scope too. A
+-- scope that a part goes in this way begins with it. Not inlined, so that the frames of a part that was in none
+-- are built only then, and not at every scope.
+pushFrame :: Run -> Part -> Frame [Part] -> IO ()
 pushFrame run part frame = do
   frames <- readIORef (partFrames part)
   case frames of
-    [] -> enter (runRoot run) part *> writeIORef (partFrames part) [frame, Inside (runRoot run)]
+    [] -> adjust run 9 1 *> writeIORef (partFrames part) [frame, Inside (runRoot run)]
     _ -> writeIORef (partFrames part) (frame : frames)
-  case frame of Inside s -> enter s part; _ -> pure ()
+  case frame of Inside s -> writeIORef (scopeMembers s) [part]; _ -> pure ()
+{-# NOINLINE pushFrame #-}
 
--- | The part leaves the innermost scope or shield, which it went in with 'pushFrame'.
+-- | The part leaves the innermost scope or shield, which it went in with 'pushFrame'; the scope holds no part
+-- then, which a timer of a deadline would keep alive.
 popFrame :: Run -> Part -> IO ()
 popFrame run part = do
   frames <- readIORef (partFrames part)
   case frames of
-    [frame, Inside root] | scopeIdent root == scopeIdent (runRoot run) -> do
-      leaveFrame frame
-      leave root part
-      writeIORef (partFrames part) []
-    frame : outer -> leaveFrame frame *> writeIORef (partFrames part) outer
+    [frame, Inside root] | scopeIdent root == scopeIdent (runRoot run) -> adjust run 9 (-1) *> writeIORef (partFrames part) [] *> forget frame
+    frame : outer -> writeIORef (partFrames part) outer *> forget frame
     [] -> pure ()
   where
-    leaveFrame = \case Inside s -> leave s part; _ -> pure ()
+    forget = \case Inside s -> writeIORef (scopeMembers s) []; _ -> pure ()
 
 -- | Raises the cancellation that reaches the part, if there is one.
 checkpoint :: Part -> IO ()
@@ -372,16 +392,25 @@ checkpoint part =
 
 -- | Cancels the scope: its flag is set, and the parts inside it that wait, and whose scope lies above their
 -- innermost shield, are taken off what they wait at, and put back among those that can go on, with the
--- cancellation to raise where they wait. The others see the flag at their next wait.
-cancelScope :: Run -> CancelScope Part -> IO ()
+-- cancellation to raise where they wait. The others see the flag at their next wait. The parts inside it are
+-- those it began with, and the halves of the pairs that those are suspended at, and so on.
+cancelScope :: Run -> PartScope -> IO ()
 cancelScope run scope' = do
-  parts <- markCancelled scope'
-  forM_ parts $ \part -> do
-    frames <- readIORef (partFrames part)
-    when (deliverable (scopeIdent scope') frames) $
-      (readIORef (partWait part) >>= stopWait run (Cancelled (scopeIdent scope'))) >>= \case
-        Nothing -> pure ()
-        Just resume -> modifyIORef' (runTickets run) (resume :)
+  writeIORef (scopeCancelled scope') True
+  readIORef (scopeMembers scope') >>= inside
+  where
+    inside = \case
+      [] -> pure ()
+      part : others -> do
+        frames <- readIORef (partFrames part)
+        waiting <- readIORef (partWait part)
+        when (deliverable (scopeIdent scope') frames) $
+          stopWait run (Cancelled (scopeIdent scope')) waiting >>= \case
+            Nothing -> pure ()
+            Just resume -> modifyIORef' (runTickets run) (resume :)
+        case waiting of
+          InPair halves -> readIORef (scopeMembers halves) >>= \more -> inside (more <> others)
+          _ -> inside others
 
 -- | Takes the part off what it waits at, if it still does: what goes on with the part.
 stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))
@@ -409,6 +438,7 @@ stopWait run cancelled = \case
       ([Watching _ watch resume], rest) -> Just (resume (throwIO cancelled)) <$ (writeIORef (runWatching run) rest *> watchCancel watch)
       _ -> pure Nothing
   Other stop -> stop cancelled
+  InPair _ -> pure Nothing
 
 -- | A failure that nothing in the part handles: it leaves the run.
 newtype Escaped = Escaped SomeException
@@ -441,9 +471,9 @@ data Joined b c = Joined !(Maybe b) !(Maybe c) !(Maybe SomeException) !Int
 -- | What a pair does when one of its halves has ended: it leaves its scopes, and keeps its result, or its failure
 -- if it is the first, which cancels the other half; the half that ends last goes on with the parent: with the
 -- first failure, if there was one.
-pairEnded :: Run -> CancelScope Part -> IORef (Joined b c) -> (SomeException -> IO Step) -> ((b, c) -> IO Step) -> Part -> (x -> Joined b c -> Joined b c) -> Either SomeException x -> IO Step
+pairEnded :: Run -> PartScope -> IORef (Joined b c) -> (SomeException -> IO Step) -> ((b, c) -> IO Step) -> Part -> (x -> Joined b c -> Joined b c) -> Either SomeException x -> IO Step
 pairEnded run scope' joined failure success half record outcome = do
-  endPart half
+  endPart run half
   Joined b c failed count <- readIORef joined
   joined' <- case outcome of
     Left thrown
@@ -452,25 +482,27 @@ pairEnded run scope' joined failure success half record outcome = do
     Right result -> pure (record result (Joined b c failed (count + 1)))
   writeIORef joined joined'
   case joined' of
-    Joined _ _ (Just thrown) 2 -> failure thrown
-    Joined (Just b') (Just c') _ 2 -> success (b', c')
+    Joined _ _ (Just thrown) 2 -> writeIORef (scopeMembers scope') [] *> failure thrown
+    Joined (Just b') (Just c') _ 2 -> writeIORef (scopeMembers scope') [] *> success (b', c')
     Joined{} -> pure Ended
 
 -- | What a race does when one of its halves has ended: the first to end is the winner, which cancels the other;
 -- the loser, once it has ended, lets the race go on with the parent, with the winner's failure, or the loser's
 -- if it isn't its cancellation, or else the winner's result.
-raceEnded :: Run -> CancelScope Part -> IORef (Maybe (Either SomeException (Either b c))) -> (SomeException -> IO Step) -> (Either b c -> IO Step) -> Part -> Either SomeException (Either b c) -> IO Step
+raceEnded :: Run -> PartScope -> IORef (Maybe (Either SomeException (Either b c))) -> (SomeException -> IO Step) -> (Either b c -> IO Step) -> Part -> Either SomeException (Either b c) -> IO Step
 raceEnded run scope' winner failure success half outcome = do
-  endPart half
+  endPart run half
   readIORef winner >>= \case
     Nothing -> do
       writeIORef winner (Just outcome)
       cancelScope run scope'
       pure Ended
-    Just won -> case (won, outcome) of
-      (Left thrown, _) -> failure thrown
-      (Right _, Left thrown) | isNothing (cancelledBy thrown) -> failure thrown
-      (Right result, _) -> success result
+    Just won -> do
+      writeIORef (scopeMembers scope') []
+      case (won, outcome) of
+        (Left thrown, _) -> failure thrown
+        (Right _, Left thrown) | isNothing (cancelledBy thrown) -> failure thrown
+        (Right result, _) -> success result
 
 -- | What goes on with a part that waits, from its step.
 resumeOf :: Step -> IO () -> IO Step
@@ -548,11 +580,11 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
       parked <- counter run 5
       watching <- readIORef (runWatching run)
       shutdown <- readIORef (runShutdown run)
-      members <- readIORef (scopeMembers (runRoot run))
+      inScopes <- counter run 9
       timers <- pending (runWheel run)
       case () of
         _
-          | Just failure <- shutdown, null members -> throwIO failure
+          | Just failure <- shutdown, inScopes == 0 -> throwIO failure
           | null watching && descriptors == 0 && remote == 0 && timers == 0 ->
               ioError . userError $
                 if parked > (0 :: Int)

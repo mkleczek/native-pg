@@ -146,7 +146,7 @@ instance Time (Delimited s) where
 -- recognised by it, and another passes through.
 instance Within (Delimited s) where
   within (Duration limit) (Delimited body) = Delimited $ \context@(Context run _ part) value -> do
-    scope' <- newCancelScope
+    scope' <- newScope run
     started <- roundNow run
     timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
     pushFrame run part (Inside scope')
@@ -198,7 +198,7 @@ instance Scope (Delimited s) where
 instance Concurrent (Delimited s) where
   concurrently (Delimited one) (Delimited two) = Delimited $ \(Context run tag part) value ->
     control0 tag $ \resume -> do
-      scope' <- newCancelScope
+      scope' <- newScope run
       first' <- childPart run part scope'
       second' <- childPart run part scope'
       joined <- newIORef (Joined Nothing Nothing Nothing 0)
@@ -213,7 +213,7 @@ instance Concurrent (Delimited s) where
 instance Race (Delimited s) where
   race (Delimited one) (Delimited two) = Delimited $ \(Context run tag part) value ->
     control0 tag $ \resume -> do
-      scope' <- newCancelScope
+      scope' <- newScope run
       first' <- childPart run part scope'
       second' <- childPart run part scope'
       winner <- newIORef Nothing

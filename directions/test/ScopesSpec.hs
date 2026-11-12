@@ -16,6 +16,7 @@ import Data.List (sort)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Network.Directions.Classes hiding (within)
+import Network.Directions.Combinators (untilJust)
 import Network.Directions.Compiled
 import Network.Directions.Delimited
 import Network.Directions.Loop (runLoop)
@@ -202,9 +203,55 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
     entries <- readLog noted
     sort entries `shouldBe` ["acquire a", "acquire b", "release a: cancelled", "release b: cancelled"]
 
+  it "cancel every one of a thousand parts that wait in a scope, and run their releases" $ do
+    forever <- readableAfter (-1)
+    waiting <- newCounter
+    cancelled <- newCounter
+    let count = 1000
+        -- The part that ends the race waits until every other has begun to wait.
+        everyoneWaits :: Program ()
+        everyoneWaits = untilJust ((\n -> if n == count then Just () else Nothing) <$> readCounter waiting)
+        waiter :: Program ()
+        waiter = counting waiting >>> arr (const forever) >>> block
+    result <- within (run (race (balanced (replicate count (holding cancelled waiter))) everyoneWaits))
+    (winner <$> result) `shouldBe` Just "second"
+    readCounter cancelled `shouldReturn` count
+
+  when (name /= "loop") $ it "runs the release of every one of a thousand parts that hold one when the run is stopped from outside" $ do
+    forever <- readableAfter (-1)
+    released <- newCounter
+    let count = 1000
+    result <- timeout 500000 (run (balanced (replicate count (holding released (arr (const forever) >>> block)))))
+    result `shouldBe` Nothing
+    readCounter released `shouldReturn` count
+
 -- | A failure, as the text of what it was, or of the result.
 describeFailure :: (Show a) => Either SomeException a -> String
 describeFailure = either (\failure -> "Left " <> show failure) (\result -> "Right " <> show result)
+
+-- | A count that parts on several cores add to.
+type Counter = IORef Int
+
+newCounter :: IO Counter
+newCounter = newIORef 0
+
+readCounter :: Counter -> IO Int
+readCounter = readIORef
+
+-- | A part adds one to the count and goes on with what it was given.
+counting :: (Effect arr) => Counter -> arr a a
+counting counter = now (\value -> atomicModifyIORef' counter (\n -> (n + 1, ())) $> value)
+
+-- | A part that holds a resource while its body runs, and counts the releases that follow a cancellation.
+holding :: (Rich arr) => Counter -> arr () () -> arr () ()
+holding counter body =
+  scope returnA (now (\(_, exit) -> case exit of Cancelled' -> atomicModifyIORef' counter (\n -> (n + 1, ())); _ -> pure ())) (arr snd >>> body)
+
+-- | The arrows at once, as a tree of pairs, so that the parts are not nested as deep as there are of them.
+balanced :: (Rich arr) => [arr () ()] -> arr () ()
+balanced [] = returnA
+balanced [one] = one
+balanced parts' = let (front, back) = splitAt (length parts' `div` 2) parts' in concurrently (balanced front) (balanced back) >>> arr (const ())
 
 type Log = IORef [String]
 

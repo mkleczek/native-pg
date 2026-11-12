@@ -122,7 +122,7 @@ instance Time Compiled where
 -- passes through.
 instance Within Compiled where
   within (Duration limit) (Compiled body) = Compiled $ \(Context run part outer) value next -> do
-    scope' <- newCancelScope
+    scope' <- newScope run
     started <- roundNow run
     timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
     pushFrame run part (Inside scope')
@@ -177,7 +177,7 @@ instance Scope Compiled where
 -- failure. A failure of the second half is dropped.
 instance Concurrent Compiled where
   concurrently (Compiled one) (Compiled two) = Compiled $ \(Context run part outer) value next -> do
-    scope' <- newCancelScope
+    scope' <- newScope run
     first' <- childPart run part scope'
     second' <- childPart run part scope'
     joined <- newIORef (Joined Nothing Nothing Nothing 0)
@@ -197,7 +197,7 @@ instance Concurrent Compiled where
 -- isn't its cancellation is too.
 instance Race Compiled where
   race (Compiled one) (Compiled two) = Compiled $ \(Context run part outer) value next -> do
-    scope' <- newCancelScope
+    scope' <- newScope run
     first' <- childPart run part scope'
     second' <- childPart run part scope'
     winner <- newIORef Nothing
