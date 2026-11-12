@@ -18,6 +18,15 @@ module Network.Directions.Classes
     exitOf,
     Scope (..),
     Race (..),
+    Instant (..),
+    Duration (..),
+    nanos,
+    micros,
+    millis,
+    secs,
+    plus,
+    Time (..),
+    Within (..),
     Effect (..),
     GiveWay (..),
     Block (..),
@@ -43,7 +52,7 @@ import Control.Exception (Exception, SomeException, fromException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import Network.Socket (Socket)
@@ -136,8 +145,8 @@ newtype Cancelled = Cancelled ScopeId
 
 instance Exception Cancelled
 
--- | A release failed. It carries how the scope's body had ended, and the release's failure, which replaces the
--- body's exit: the resource is not released, and the failure is the part's.
+-- | A release failed. It carries how the scope's body had ended, and the release's failure: the part fails with
+-- it, in place of the body's own exit, and the part that acquired the resource should discard it.
 data ReleaseFailed = ReleaseFailed Exit SomeException
   deriving (Show)
 
@@ -176,6 +185,40 @@ class Race arr where
   -- scopes are released. If the first to end failed, its failure is rethrown then.
   race :: arr a b -> arr a c -> arr a (Either b c)
 
+-- | A point on the monotonic clock, in nanoseconds.
+newtype Instant = Instant Word64
+  deriving (Eq, Ord, Show)
+
+-- | A length of time, in nanoseconds.
+newtype Duration = Duration Word64
+  deriving (Eq, Ord, Show)
+
+-- | A duration of this many nanoseconds, microseconds, milliseconds or seconds.
+nanos, micros, millis, secs :: Word64 -> Duration
+nanos = Duration
+micros = Duration . (* 1000)
+millis = Duration . (* 1000000)
+secs = Duration . (* 1000000000)
+
+-- | The instant that is the duration after the instant.
+plus :: Instant -> Duration -> Instant
+plus (Instant instant) (Duration duration) = Instant (instant + duration)
+
+-- | Time, only through the arrow: a program never reads the clock in an action that never waits, which would
+-- make a simulation of it differ from the run.
+class Time arr where
+  -- | The time now, which the arrows that run every part on one thread read once for each round of their
+  -- scheduler: reading it costs next to nothing.
+  clock :: arr () Instant
+
+-- | A deadline for what runs inside it: a scope, inherited by every part inside, and nested deadlines take the
+-- nearest. When it passes, the parts inside are cancelled at their next wait, or at once if they wait: it is
+-- soft, and no action that never waits is interrupted. It is observed at a wait or a 'giveWay'.
+class Within arr where
+  -- | The body with a deadline: 'Nothing' when the deadline passed first, and the body was cancelled and its
+  -- scopes released. A cancellation from outside passes through.
+  within :: Duration -> arr a b -> arr a (Maybe b)
+
 -- | An action that never waits, as an arrow.
 class Effect arr where
   now :: (a -> IO b) -> arr a b
@@ -196,8 +239,9 @@ class Block arr where
 
 -- | What a part can wait for: a descriptor that becomes readable or writable,
 -- which an arrow can wait for directly, or any other event, by the
--- registration of its watch, which the wait releases.
-data Event = Readable !Fd | Writable !Fd | Watched (IO Watch)
+-- registration of its watch, which the wait releases, or an instant that the monotonic clock reaches. It is
+-- @Until@, and not @At@, which the cursors of native-pg have.
+data Event = Readable !Fd | Writable !Fd | Watched (IO Watch) | Until !Instant
 
 -- | The events that a link's two halves wait for.
 class Events link where

@@ -1,11 +1,20 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -- | Every concurrent part on one thread: an arrow is a program as data, which
 -- a scheduler runs. A part that waits is the rest of its program and the value
 -- going into it, so nothing is captured when it waits. The simulation runs the
--- same programs in an order a seed chooses.
+-- same programs in an order a seed chooses, with a virtual clock that jumps to
+-- the earliest deadline when no part can go on.
+--
+-- What follows a program is data too, so a scope is a frame in it: a failure
+-- unwinds the frames, and runs the release of each resource it finds, behind a
+-- shield. A cancel scope's flag is an STM variable, which the watch of a part
+-- that waits includes, so that cancelling a scope wakes the parts inside it
+-- with the cancellation to raise, in the same way as an event. A part that
+-- waits for a ticket is held by the ticket, and is not cancelled there.
 module Network.Directions.Loop
   ( Loop,
     Report (..),
@@ -19,14 +28,18 @@ where
 
 import Control.Arrow (Arrow (..), ArrowChoice (..), returnA)
 import Control.Category (Category (..))
-import Control.Concurrent.STM (atomically, orElse, retry)
-import Control.Exception (bracket, mask, onException, uninterruptibleMask_)
+import Control.Concurrent.STM (STM, TVar, atomically, check, newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Exception (SomeException, bracket, mask, onException, throwIO, toException, try, uninterruptibleMask_)
 import Control.Monad (filterM)
 import Data.Bits (shiftR, xor)
 import qualified Data.Function as Function
+import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (partition, sort)
+import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
+import GHC.Clock (getMonotonicTimeNSec)
+import Network.Directions.Cancel (nextIdent)
 import Network.Directions.Classes
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
@@ -41,9 +54,14 @@ data Loop a b where
   Choose :: Loop a b -> Loop (Either a c) (Either b c)
   Both :: Loop a b -> Loop a c -> Loop a (b, c)
   Now :: (a -> IO b) -> Loop a b
+  Clock :: Loop () Instant
   Block :: Loop Event ()
   Fulfil :: Loop (IORef (Slot a), a) ()
   Await :: Loop (IORef (Slot a)) a
+  Scope' :: Loop a r -> Loop (r, Exit) () -> Loop (r, a) b -> Loop a b
+  Try :: Loop a b -> Loop a (Either SomeException b)
+  Shield' :: Loop a b -> Loop a b
+  Race' :: Loop a b -> Loop a c -> Loop a (Either b c)
 
 instance Category Loop where
   id = Arr Function.id
@@ -61,6 +79,27 @@ instance Concurrent Loop where
 
 instance Effect Loop where
   now = Now
+
+-- | The time of the run: the clock of the monotonic time, or in a simulation, the virtual clock.
+instance Time Loop where
+  clock = Clock
+
+instance Scope Loop where
+  scope = Scope'
+  tryA = Try
+  shield = Shield'
+
+instance Race Loop where
+  race = Race'
+
+-- | A deadline is a race of the body and a wait until the instant, so the part that waits is cancelled when it
+-- passes.
+instance Within Loop where
+  within (Duration limit) body =
+    Arr ((),)
+      `Seq` First Clock
+      `Seq` Race' (Arr snd `Seq` body) (Arr (\(Instant at, _) -> Until (Instant (at + limit))) `Seq` Block)
+      `Seq` Arr (either Just (const Nothing))
 
 -- | Nothing: the interpreter counts a step for every action that a part runs,
 -- not only at a link, and gives way after 64 of them (a simulation, after each,
@@ -86,23 +125,95 @@ instance Exchange Loop where
 data Slot a = Empty | Given a | Waiter (a -> IO ())
 
 -- | A part of a running program: a program with its input, or a value for
--- what follows, and what follows.
+-- what follows, and what follows; or a failure, which unwinds what follows,
+-- or the end of a wait, where a cancellation that came is raised.
 data Process r where
   Run :: Loop a b -> a -> Frames b r -> Process r
   Give :: b -> Frames b r -> Process r
+  Fail :: SomeException -> Frames b r -> Process r
+  Check :: Frames () r -> Process r
+
+-- | What the parts of a run share: whether any scope has been cancelled, which is all that most runs ever
+-- ask: a part looks at the scopes it is in only once that is so, since the frames it would walk can be long.
+newtype Env = Env (TVar Bool)
+
+newEnv :: IO Env
+newEnv = Env <$> newTVarIO False
+
+-- | A cancel scope: which it is, whether it was cancelled, which the watches of the parts inside it read, and
+-- the run's flag that some scope was.
+data LoopScope = LoopScope !ScopeId !(TVar Bool) !(TVar Bool)
+
+newLoopScope :: Env -> IO LoopScope
+newLoopScope (Env anyCancelled) = (\ident flag -> LoopScope (ScopeId ident) flag anyCancelled) <$> nextIdent <*> newTVarIO False
+
+cancelLoopScope :: LoopScope -> IO ()
+cancelLoopScope (LoopScope _ flag anyCancelled) = atomically (writeTVar flag True *> writeTVar anyCancelled True)
+
+-- | The scope whose cancellation reaches a part with these frames, if any scope has been cancelled at all.
+cancelledNow :: Env -> Frames b r -> IO (Maybe ScopeId)
+cancelledNow (Env anyCancelled) frames = readTVarIO anyCancelled >>= \cancelled -> if cancelled then atomically (cancelledSTM frames) else pure Nothing
 
 -- | What follows a program, as data: the rest of a sequence, the other half of
--- a pair, a choice to wrap, or the join of a concurrent pair.
+-- a pair, a choice to wrap, or the join of a concurrent pair; and what a scope
+-- needs when the program ends or fails: the release of what it acquired, which
+-- runs behind a shield, a failure to catch, a shield.
 data Frames b r where
   Return :: Frames r r
   Then :: Loop b c -> Frames c r -> Frames b r
   Beside :: c -> Frames (b, c) r -> Frames b r
   OnLeft :: Frames (Either b c) r -> Frames b r
-  JoinFirst :: IORef (Half b d) -> Frames (b, d) r -> Frames b r
-  JoinSecond :: IORef (Half b d) -> Frames (b, d) r -> Frames d r
+  JoinFirst :: Pair b d -> Frames (b, d) r -> Frames b r
+  JoinSecond :: Pair b d -> Frames (b, d) r -> Frames d r
+  RaceFirst :: Contest b d -> Frames (Either b d) r -> Frames b r
+  RaceSecond :: Contest b d -> Frames (Either b d) r -> Frames d r
+  -- | What was acquired is there: the body goes on with it.
+  Acquired :: Loop (x, Exit) () -> Loop (x, a) b -> a -> Frames b r -> Frames x r
+  -- | The body of a scope, with what it holds.
+  Guarded :: x -> Loop (x, Exit) () -> Frames b r -> Frames b r
+  -- | The release of a scope runs: how the body ended, and the result or failure that goes on once it has.
+  Releasing :: Exit -> Either SomeException b -> Frames b r -> Frames () r
+  Trying :: Frames (Either SomeException b) r -> Frames b r
+  Shielding :: Frames b r -> Frames b r
 
--- | What a concurrent pair has of its halves' results.
-data Half b d = Neither | FirstDone b | SecondDone d
+-- | A concurrent pair: the cancel scope of its halves, and what it has of their results.
+data Pair b d = Pair !LoopScope !(IORef (Joined b d))
+
+-- | What a pair has of its halves' results, and its first failure, and how many have ended.
+data Joined b d = Joined !(Maybe b) !(Maybe d) !(Maybe SomeException) !Int
+
+-- | A race: the cancel scope of its halves, and its winner, once there is one.
+data Contest b d = Contest !LoopScope !(IORef (Maybe (Either SomeException (Either b d))))
+
+-- | The scope whose cancellation reaches a part with these frames: the outermost cancelled scope above the
+-- innermost shield.
+cancelledSTM :: Frames b r -> STM (Maybe ScopeId)
+cancelledSTM = go Nothing
+  where
+    go :: Maybe ScopeId -> Frames x y -> STM (Maybe ScopeId)
+    go found = \case
+      Return -> pure found
+      Then _ rest -> go found rest
+      Beside _ rest -> go found rest
+      OnLeft rest -> go found rest
+      JoinFirst (Pair scope' _) rest -> inside scope' found rest
+      JoinSecond (Pair scope' _) rest -> inside scope' found rest
+      RaceFirst (Contest scope' _) rest -> inside scope' found rest
+      RaceSecond (Contest scope' _) rest -> inside scope' found rest
+      Acquired _ _ _ rest -> go found rest
+      Guarded _ _ rest -> go found rest
+      Releasing{} -> pure found
+      Trying rest -> go found rest
+      Shielding _ -> pure found
+    inside (LoopScope ident flag _) found rest = readTVar flag >>= \cancelled -> go (if cancelled then Just ident else found) rest
+
+-- | The watch of a part that waits for an event: the event, or a cancellation that reaches the part.
+watchFor :: Env -> Event -> Process r -> IO Watch
+watchFor (Env anyCancelled) event process = (\(Watch ready cancel) -> Watch (ready `orElse` cancelled) cancel) <$> watchOf event
+  where
+    cancelled = case process of
+      Check frames -> readTVar anyCancelled >>= check >> cancelledSTM frames >>= maybe retry (const (pure ()))
+      _ -> retry
 
 -- | What a part came to.
 data Advanced r
@@ -114,13 +225,41 @@ data Advanced r
   | -- | It used its steps, and can go on.
     Yielded (Process r)
   | Forked (Process r) (Process r)
-  | Waits (IO Watch) (Process r)
+  | Waits Event (Process r)
+
+-- | A half of a pair has ended with a result, or with a failure: the first failure cancels the other half, and the
+-- half that ends last goes on with the parent, with the failure if there was one.
+joinHalf :: Pair b d -> Frames (b, d) r -> (Joined b d -> Joined b d) -> Maybe SomeException -> IO (Maybe (Process r))
+joinHalf (Pair scope' ref) rest record failure = do
+  Joined b d failed count <- readIORef ref
+  failed' <- case failure of
+    Just thrown | isNothing failed -> cancelLoopScope scope' $> Just thrown
+    _ -> pure failed
+  let joined' = case failure of
+        Nothing -> record (Joined b d failed' (count + 1))
+        Just _ -> Joined b d failed' (count + 1)
+  writeIORef ref joined'
+  pure $ case joined' of
+    Joined _ _ (Just thrown) 2 -> Just (Fail thrown rest)
+    Joined (Just b') (Just d') _ 2 -> Just (Give (b', d') rest)
+    _ -> Nothing
+
+-- | A half of a race has ended: the first is the winner, which cancels the other; the loser lets the race go on
+-- with the winner's failure, or its own if it isn't its cancellation, or the winner's result.
+raceHalf :: Contest b d -> Frames (Either b d) r -> Either SomeException (Either b d) -> IO (Maybe (Process r))
+raceHalf (Contest scope' ref) rest outcome =
+  readIORef ref >>= \case
+    Nothing -> Nothing <$ (writeIORef ref (Just outcome) *> cancelLoopScope scope')
+    Just won -> pure $ case (won, outcome) of
+      (Left thrown, _) -> Just (Fail thrown rest)
+      (Right _, Left thrown) | isNothing (cancelledBy thrown) -> Just (Fail thrown rest)
+      (Right result, _) -> Just (Give result rest)
 
 -- | Runs a part until it waits, forks, ends, or has taken this many steps of
 -- its primitives: what it came to, and how many steps it took. A part it parks
 -- on a ticket goes back with the given action when the ticket has its value.
-advance :: forall r. Int -> (Process r -> IO ()) -> Process r -> IO (Int, Advanced r)
-advance fuel wake = go 0
+advance :: forall r. Env -> IO Instant -> Int -> (Process r -> IO ()) -> Process r -> IO (Int, Advanced r)
+advance env time fuel wake = go 0
   where
     go :: Int -> Process r -> IO (Int, Advanced r)
     go steps process
@@ -135,10 +274,19 @@ advance fuel wake = go 0
               Left a -> go steps (Run inner a (OnLeft frames))
               Right c -> go steps (Give (Right c) frames)
             Both one two -> do
-              joined <- newIORef Neither
-              pure (steps, Forked (Run one input (JoinFirst joined frames)) (Run two input (JoinSecond joined frames)))
-            Now action -> action input >>= \output -> go (steps + 1) (Give output frames)
-            Block -> pure (steps + 1, Waits (watchOf input) (Give () frames))
+              scope' <- newLoopScope env
+              pair <- Pair scope' <$> newIORef (Joined Nothing Nothing Nothing 0)
+              pure (steps, Forked (Run one input (JoinFirst pair frames)) (Run two input (JoinSecond pair frames)))
+            Race' one two -> do
+              scope' <- newLoopScope env
+              contest <- Contest scope' <$> newIORef Nothing
+              pure (steps, Forked (Run one input (RaceFirst contest frames)) (Run two input (RaceSecond contest frames)))
+            Now action -> try (action input) >>= either (\failure -> go steps (Fail failure frames)) (\output -> go (steps + 1) (Give output frames))
+            Clock -> time >>= \instant -> go (steps + 1) (Give instant frames)
+            Block ->
+              cancelledNow env frames >>= \case
+                Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
+                Nothing -> pure (steps + 1, Waits input (Check frames))
             Fulfil -> case input of
               (slot, value) ->
                 readIORef slot >>= \case
@@ -150,19 +298,46 @@ advance fuel wake = go 0
                 Given value -> go (steps + 1) (Give value frames)
                 Empty -> (steps + 1, Parked) <$ writeIORef input (Waiter (\value -> wake (Give value frames)))
                 Waiter _ -> ioError (userError "two parts wait for one ticket")
+            Scope' acquire release body -> go steps (Run acquire input (Acquired release body input frames))
+            Try inner -> go steps (Run inner input (Trying frames))
+            Shield' inner -> go steps (Run inner input (Shielding frames))
           Give value frames -> case frames of
             Return -> pure (steps, Finished value)
             Then next rest -> go steps (Run next value rest)
             Beside c rest -> go steps (Give (value, c) rest)
             OnLeft rest -> go steps (Give (Left value) rest)
-            JoinFirst joined rest ->
-              readIORef joined >>= \case
-                SecondDone d -> go steps (Give (value, d) rest)
-                _ -> (steps, Ended) <$ writeIORef joined (FirstDone value)
-            JoinSecond joined rest ->
-              readIORef joined >>= \case
-                FirstDone b -> go steps (Give (b, value) rest)
-                _ -> (steps, Ended) <$ writeIORef joined (SecondDone value)
+            JoinFirst pair rest -> joinHalf pair rest (\(Joined _ d failed count) -> Joined (Just value) d failed count) Nothing >>= endHalf steps
+            JoinSecond pair rest -> joinHalf pair rest (\(Joined b _ failed count) -> Joined b (Just value) failed count) Nothing >>= endHalf steps
+            RaceFirst contest rest -> raceHalf contest rest (Right (Left value)) >>= endHalf steps
+            RaceSecond contest rest -> raceHalf contest rest (Right (Right value)) >>= endHalf steps
+            Acquired release body input rest -> go steps (Run body (value, input) (Guarded value release rest))
+            Guarded held release rest -> go steps (Run release (held, Done) (Releasing Done (Right value) rest))
+            Releasing _ outcome rest -> go steps (either (`Fail` rest) (`Give` rest) outcome)
+            Trying rest -> go steps (Give (Right value) rest)
+            Shielding rest -> go steps (Give value rest)
+          Fail failure frames -> case frames of
+            Return -> throwIO failure
+            Then _ rest -> go steps (Fail failure rest)
+            Beside _ rest -> go steps (Fail failure rest)
+            OnLeft rest -> go steps (Fail failure rest)
+            JoinFirst pair rest -> joinHalf pair rest id (Just failure) >>= endHalf steps
+            JoinSecond pair rest -> joinHalf pair rest id (Just failure) >>= endHalf steps
+            RaceFirst contest rest -> raceHalf contest rest (Left failure) >>= endHalf steps
+            RaceSecond contest rest -> raceHalf contest rest (Left failure) >>= endHalf steps
+            Acquired _ _ _ rest -> go steps (Fail failure rest)
+            Guarded held release rest ->
+              let exit = exitOf (Left failure)
+               in go steps (Run release (held, exit) (Releasing exit (Left failure) rest))
+            Releasing exit _ rest -> go steps (Fail (toException (ReleaseFailed exit failure)) rest)
+            Trying rest -> go steps (if isJust (cancelledBy failure) then Fail failure rest else Give (Left failure) rest)
+            Shielding rest -> go steps (Fail failure rest)
+          Check frames ->
+            cancelledNow env frames >>= \case
+              Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
+              Nothing -> go steps (Give () frames)
+    -- A half has ended: the pair goes on if it was the last, and the half ends if not.
+    endHalf :: Int -> Maybe (Process r) -> IO (Int, Advanced r)
+    endHalf steps = maybe (pure (steps, Ended)) (go steps)
 
 -- | An event's watch: the scheduler waits on all of its parts' at once.
 watchOf :: Event -> IO Watch
@@ -170,6 +345,10 @@ watchOf = \case
   Readable fd -> fdReadable fd
   Writable fd -> fdWritable fd
   Watched register -> register
+  Until (Instant at) -> do
+    current <- getMonotonicTimeNSec
+    elapsed <- registerDelay (fromIntegral (if at > current then (at - current) `div` 1000 else 0))
+    pure (Watch (readTVar elapsed >>= check) (pure ()))
 
 -- | What a run did: how many steps, and how many waits. In a run of 'Loop' or
 -- a simulation a step is any primitive that a part ran. In a run of
@@ -186,29 +365,31 @@ data Report = Report {reportSteps :: !Int, reportWaits :: !Int}
 runLoop :: Loop a b -> a -> IO (b, Report)
 runLoop program input = do
   woken <- newIORef []
-  let -- The parts that tickets woke join those that can go on.
-      go report parked ready waiting = do
-        risen <- reverse <$> readIORef woken
-        writeIORef woken []
-        step report (parked - length risen) (ready <> risen) waiting
-      step report parked ready waiting = case ready of
-        process : others -> do
-          (steps, advanced) <- advance 64 (\woke -> modifyIORef' woken (woke :)) process
-          let report' = report {reportSteps = reportSteps report + steps}
-          case advanced of
-            Finished value -> pure (value, report')
-            Ended -> go report' parked others waiting
-            Parked -> go report' (parked + 1) others waiting
-            Yielded process' -> go report' parked (others <> [process']) waiting
-            Forked one two -> go report' parked (others <> [one, two]) waiting
-            Waits watch process' -> go report' parked others ((watch, process') : waiting)
-        []
-          | null waiting && parked > (0 :: Int) -> ioError (userError "runLoop: parts wait for tickets that nothing will give a value")
-          | null waiting -> ioError (userError "runLoop: the program ended without a result")
-          | otherwise -> do
-              fired <- awaitFired (zip (map fst waiting) [0 :: Int ..])
-              let (wake, still) = partition ((`elem` fired) . fst) (zip [0 ..] waiting)
-              go report {reportWaits = reportWaits report + 1} parked (map (snd . snd) wake) (map snd still)
+  env <- newEnv
+  let
+    -- The parts that tickets woke join those that can go on.
+    go report parked ready waiting = do
+      risen <- reverse <$> readIORef woken
+      writeIORef woken []
+      step report (parked - length risen) (ready <> risen) waiting
+    step report parked ready waiting = case ready of
+      process : others -> do
+        (steps, advanced) <- advance env (Instant <$> getMonotonicTimeNSec) 64 (\woke -> modifyIORef' woken (woke :)) process
+        let report' = report{reportSteps = reportSteps report + steps}
+        case advanced of
+          Finished value -> pure (value, report')
+          Ended -> go report' parked others waiting
+          Parked -> go report' (parked + 1) others waiting
+          Yielded process' -> go report' parked (others <> [process']) waiting
+          Forked one two -> go report' parked (others <> [one, two]) waiting
+          Waits event process' -> go report' parked others ((watchFor env event process', process') : waiting)
+      []
+        | null waiting && parked > (0 :: Int) -> ioError (userError "runLoop: parts wait for tickets that nothing will give a value")
+        | null waiting -> ioError (userError "runLoop: the program ended without a result")
+        | otherwise -> do
+            fired <- awaitFired (zip (map fst waiting) [0 :: Int ..])
+            let (wake, still) = partition ((`elem` fired) . fst) (zip [0 ..] waiting)
+            go report{reportWaits = reportWaits report + 1} parked (map (snd . snd) wake) (map snd still)
   go (Report 0 0) 0 [Run program input Return] []
 
 -- | How a simulation ended.
@@ -232,42 +413,51 @@ data Simulated b = Simulated
 -- a primitive at a time, of a part picked at random among those that can go
 -- on, up to the given number of steps. It never waits: when no part can go
 -- on, it looks at their watches and goes on with those that have fired; if
--- none has, the parts wait for each other, or for tickets that nothing will
--- give a value, which it reports. Its links must be simulated ones, whose
--- watches depend only on what the parts did, so that a seed always gives the
--- same run.
+-- none has, but a part waits for an instant, the virtual clock jumps to the
+-- earliest, so that time costs nothing and a run is the same every time; if
+-- none does, the parts wait for each other, or for tickets that nothing will
+-- give a value, which it reports. The clock starts at 0. Its links must be
+-- simulated ones, whose watches depend only on what the parts did, so that a
+-- seed always gives the same run.
 runSimulation :: Word64 -> Int -> Loop a b -> a -> IO (Simulated b)
 runSimulation seed limit program input = do
   woken <- newIORef []
-  let -- The parts that tickets woke join those that can go on.
-      go random next report trace parked ready waiting = do
-        risen <- reverse <$> readIORef woken
-        writeIORef woken []
-        step random next report trace (filter (`notElem` map fst risen) parked) (ready <> risen) waiting
-      step random next report trace parked ready waiting
-        | reportSteps report >= limit = finish GaveUp
-        | null ready && null waiting && null parked = ioError (userError "runSimulation: the program ended without a result")
-        | null ready = do
-            checked <- traverse (\entry@(_, (watch, _)) -> (,) entry <$> anyFired watch) waiting
-            let (wake, still) = partition snd checked
-            if null wake
-              then finish (Deadlocked (sort (map (fst . fst) still <> parked)))
-              else go random next report {reportWaits = reportWaits report + length wake} trace parked [(ident, process) | ((ident, (_, process)), _) <- wake] (map fst still)
-        | otherwise = do
-            let (random', pick) = splitMix random
-                ((ident, process), others) = takeAt (fromIntegral (pick `mod` fromIntegral (length ready))) ready
-                trace' = ident : trace
-            (steps, advanced) <- advance 1 (\woke -> modifyIORef' woken ((ident, woke) :)) process
-            let report' = report {reportSteps = reportSteps report + steps}
-            case advanced of
-              Finished value -> pure (Simulated (Completed value) report' (reverse trace'))
-              Ended -> go random' next report' trace' parked others waiting
-              Parked -> go random' next report' trace' (ident : parked) others waiting
-              Yielded process' -> go random' next report' trace' parked ((ident, process') : others) waiting
-              Forked one two -> go random' (next + 2) report' trace' parked ((next, one) : (next + 1, two) : others) waiting
-              Waits watch process' -> go random' next report' trace' parked others ((ident, (watch, process')) : waiting)
-        where
-          finish outcome = pure (Simulated outcome report (reverse trace))
+  env <- newEnv
+  virtual <- newIORef 0
+  let
+    -- The parts that tickets woke join those that can go on.
+    go random next report trace parked ready waiting = do
+      risen <- reverse <$> readIORef woken
+      writeIORef woken []
+      step random next report trace (filter (`notElem` map fst risen) parked) (ready <> risen) waiting
+    step random next report trace parked ready waiting
+      | reportSteps report >= limit = finish GaveUp
+      | null ready && null waiting && null parked = ioError (userError "runSimulation: the program ended without a result")
+      | null ready = do
+          checked <- traverse (\entry@(_, (event, process')) -> (,) entry <$> fires env virtual event process') waiting
+          let (wake, still) = partition snd checked
+              deadlines = [at | ((_, (Until (Instant at), _)), _) <- still]
+          case () of
+            _
+              | not (null wake) -> go random next report{reportWaits = reportWaits report + length wake} trace parked [(ident, process) | ((ident, (_, process)), _) <- wake] (map fst still)
+              -- Nothing can go on before the first deadline: the clock goes there.
+              | not (null deadlines) -> modifyIORef' virtual (max (minimum deadlines)) *> step random next report trace parked ready waiting
+              | otherwise -> finish (Deadlocked (sort (map (fst . fst) still <> parked)))
+      | otherwise = do
+          let (random', pick) = splitMix random
+              ((ident, process), others) = takeAt (fromIntegral (pick `mod` fromIntegral (length ready))) ready
+              trace' = ident : trace
+          (steps, advanced) <- advance env (Instant <$> readIORef virtual) 1 (\woke -> modifyIORef' woken ((ident, woke) :)) process
+          let report' = report{reportSteps = reportSteps report + steps}
+          case advanced of
+            Finished value -> pure (Simulated (Completed value) report' (reverse trace'))
+            Ended -> go random' next report' trace' parked others waiting
+            Parked -> go random' next report' trace' (ident : parked) others waiting
+            Yielded process' -> go random' next report' trace' parked ((ident, process') : others) waiting
+            Forked one two -> go random' (next + 2) report' trace' parked ((next, one) : (next + 1, two) : others) waiting
+            Waits event process' -> go random' next report' trace' parked others ((ident, (event, process')) : waiting)
+      where
+        finish outcome = pure (Simulated outcome report (reverse trace))
   go seed 1 (Report 0 0) [] [] [(0, Run program input Return)] []
 
 -- | Registers the watches, waits until one has fired, and gives the values of
@@ -289,6 +479,16 @@ awaitFired entries = mask $ \restore -> do
     )
       `onException` release
   map snd fired <$ release
+
+-- | Whether the event has fired, without waiting: an instant has, if the virtual clock is at or past it.
+fires :: Env -> IORef Word64 -> Event -> Process r -> IO Bool
+fires env virtual event process = case event of
+  Until (Instant at) -> (||) . (>= at) <$> readIORef virtual <*> cancelled
+  _ -> anyFired (watchFor env event process)
+  where
+    cancelled = case process of
+      Check frames -> isJust <$> cancelledNow env frames
+      _ -> pure False
 
 -- | Whether the event has fired, without waiting.
 anyFired :: IO Watch -> IO Bool

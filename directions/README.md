@@ -58,6 +58,26 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   `call` for a request that carries the end its answer is waited at, with
   `expectLocal` and `callLocal` for tickets of a core.
 
+- **Scopes and cancellation** (`Scope`, `Race`; `Network.Directions.Cancel`):
+  `scope acquire release body` releases on every exit, behind a shield, and
+  the release may wait; `tryA` gives a failure as a value and lets a
+  cancellation pass; `shield` keeps the cancellations of scopes outside it
+  until it ends; `concurrently` cancels the other half when one fails, waits
+  for it, and rethrows the first failure; `race` cancels the loser and waits
+  for it. A part is cancelled at its waits only (`block`, `await`,
+  `awaitRemote`, `giveWay`), so no `now` is interrupted. Every arrow has them:
+  `Threads` throws once to a part that waits, `Delimited` resumes the part
+  with the exception, `Compiled` unwinds explicit failure continuations, and
+  `Loop` unwinds frames. A shutdown of a `Delimited` or `Compiled` run
+  cancels every part that holds something, and runs its release. The pool's
+  `checkout` gives up its place when cancelled.
+- **Time** (`Time`, `Within`; `Network.Directions.Timers`): `clock`, `block
+  (Until instant)`, `sleep`, and `within d body`, a deadline that is a scope
+  inherited by everything inside it. `Delimited` and `Compiled` keep a timer
+  wheel for each core, read the clock once a round, and wait in the poller
+  until the next timer; `Threads` uses GHC's timer manager; a `runSimulation`
+  has a virtual clock that jumps to the earliest deadline.
+
 Run from the repository's root, in its `nix-shell`:
 
 ```sh

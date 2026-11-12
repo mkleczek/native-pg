@@ -58,6 +58,9 @@ module Network.Directions.Scheduler
     Escaped (..),
     guardedBy,
     runFailure,
+    runWheel,
+    roundNow,
+    sleepUntil,
   )
 where
 
@@ -70,16 +73,19 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.List (partition)
 import Data.Maybe (fromMaybe, isNothing)
+import Data.Word (Word64)
 import Foreign.C.Error (eINTR, getErrno, throwErrno, throwErrnoIfMinus1_, throwErrnoIfNull)
 import Foreign.C.Types (CInt (..))
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
+import GHC.Clock (getMonotonicTimeNSec)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Directions.Atomic (update)
 import Network.Directions.Cancel
-import Network.Directions.Classes (Cancelled (..), Event (..), cancelledBy)
+import Network.Directions.Classes (Cancelled (..), Event (..), Instant (..), cancelledBy)
 import Network.Directions.Loop (Report (..))
+import Network.Directions.Timers
 import Network.Streaming.Watch (Watch (..))
 import System.Posix.Types (Fd (..))
 
@@ -100,6 +106,8 @@ data Step
     ParkedRemote
   | -- | It used its steps, and can go on.
     Yielded (IO Step)
+  | -- | It waits until an instant, and a timer holds it.
+    Timed
 
 -- | A ticket's slot: empty, given its value, or holding the part that waits
 -- for it, as what puts the part back with the action that runs where it waits:
@@ -138,7 +146,8 @@ data Run = Run
     -- taken, the waits, the parts that wait for tickets that other cores
     -- give and are not yet back from the mailbox, the parts that wait on
     -- descriptors, those that wait for tickets, the number of the next wait,
-    -- and the rounds: unboxed, so that counting allocates nothing. A step is a point
+    -- the rounds, and the time that the round began at, or 0 before it is read:
+    -- unboxed, so that counting allocates nothing. A step is a point
     -- to give way at, which a link's receive or send is, or a wait, or a
     -- ticket given or waited for.
     runCounters :: !(ForeignPtr Int),
@@ -158,7 +167,9 @@ data Run = Run
     runShutdown :: !(IORef (Maybe SomeException)),
     -- | What goes on with a failure of the part that runs, in a run of "Network.Directions.Compiled", whose
     -- parts have no handlers of their own on a stack that can be captured: the part sets it when it goes on.
-    runFailure :: !(IORef (SomeException -> IO Step))
+    runFailure :: !(IORef (SomeException -> IO Step)),
+    -- | The timers of the parts: deadlines, and those that sleep.
+    runWheel :: !Wheel
   }
 
 -- | The parts that wait on a descriptor, as the 'Suspended' steps they gave the scheduler.
@@ -188,11 +199,11 @@ batch = 64
 -- once nothing that is given parts through its mailbox can run any more.
 newRun :: IO Run
 newRun = do
-  counters <- mallocForeignPtrArray 8
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 7]
+  counters <- mallocForeignPtrArray 9
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 8]
   poller <- throwErrnoIfNull "directions_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
-  Run <$> newIORef [] <*> pure counters <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope <*> newIORef Nothing <*> newIORef (throwIO . Escaped)
+  Run <$> newIORef [] <*> pure counters <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (getMonotonicTimeNSec >>= newWheel)
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
@@ -261,6 +272,26 @@ setCounter run index value = unsafeWithForeignPtr (runCounters run) (\pointer ->
 adjust :: Run -> Int -> Int -> IO ()
 adjust run index delta = counter run index >>= setCounter run index . (+ delta)
 {-# INLINE adjust #-}
+
+-- | The time of this round of the scheduler, in nanoseconds: it reads the clock the first time it is asked in a
+-- round, and not at all in one where nothing is.
+roundNow :: Run -> IO Word64
+roundNow run =
+  counter run 8 >>= \known ->
+    if known /= 0
+      then pure (fromIntegral known)
+      else getMonotonicTimeNSec >>= \now -> now <$ setCounter run 8 (fromIntegral now)
+{-# INLINE roundNow #-}
+
+-- | The part, which is suspended, waits until the instant: a timer holds it, and puts it back among those that can
+-- go on. A part that is in a scope says how it can be taken off the timer.
+sleepUntil :: Run -> Part -> Instant -> (IO () -> IO Step) -> IO Step
+sleepUntil run part (Instant at) resume = do
+  timer <- addTimer (runWheel run) at (modifyIORef' (runTickets run) (resume (pure ()) :))
+  readIORef (partFrames part) >>= \case
+    [] -> pure ()
+    _ -> writeIORef (partWait part) (Other (\cancelled -> cancelTimer (runWheel run) timer >>= \wasLive -> pure (if wasLive then Just (resume (throwIO cancelled)) else Nothing)))
+  counted run Timed
 
 -- | The number of a part or of a wait of a part that is in a scope, which is not 0.
 nextWait :: Run -> IO Int
@@ -484,19 +515,25 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
           Just value -> (\steps waits -> (value, Report steps waits)) <$> counter run 1 <*> counter run 2
           Nothing -> case step of
             Ended -> go others later
+            Timed -> go others later
             Parked -> adjust run 5 1 *> go others later
             ParkedRemote -> adjust run 3 1 *> go others later
             Yielded part' -> go others (part' : later)
             Forked one two -> go others (two : one : later)
             Suspended (Readable fd) _ _ -> waitOn fd True step *> adjust run 4 1 *> go others later
             Suspended (Writable fd) _ _ -> waitOn fd False step *> adjust run 4 1 *> go others later
+            Suspended (Until (Instant at)) _ resume -> addTimer (runWheel run) at (modifyIORef' (runTickets run) (resume (pure ()) :)) *> go others later
             Suspended (Watched register) ident resume -> register >>= \watch -> modifyIORef' (runWatching run) (Watching ident watch resume :) *> go others later
       [] -> do
         -- Each round, the parts that tickets woke, that other cores gave, and
         -- that descriptors became ready for join.
         rounds <- counter run 7
         setCounter run 7 (rounds + 1)
+        setCounter run 8 0
         when (rounds .&. 63 == 0) (interruptedBy allowInterrupt)
+        -- The timers that are due: deadlines cancel their scopes, and sleepers wake.
+        timers <- pending (runWheel run)
+        when (timers > 0) (roundNow run >>= expire (runWheel run))
         tickets <- readIORef (runTickets run)
         writeIORef (runTickets run) []
         given <- takeInbox run >>= arrivals run
@@ -512,10 +549,11 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
       watching <- readIORef (runWatching run)
       shutdown <- readIORef (runShutdown run)
       members <- readIORef (scopeMembers (runRoot run))
+      timers <- pending (runWheel run)
       case () of
         _
           | Just failure <- shutdown, null members -> throwIO failure
-          | null watching && descriptors == 0 && remote == 0 ->
+          | null watching && descriptors == 0 && remote == 0 && timers == 0 ->
               ioError . userError $
                 if parked > (0 :: Int)
                   then "the parts wait for tickets that nothing will give a value"
@@ -527,7 +565,8 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
               if null early
                 then do
                   countWait
-                  polled <- pollWait
+                  until' <- untilNextTimer
+                  polled <- pollWait (maybe (-1) (fromIntegral . min 2000000000 . (`div` 1000000) . (+ 999999)) until')
                   given <- afterSleep run >>= arrivals run
                   go (given <> polled) []
                 else go early []
@@ -536,7 +575,13 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
               -- Watches, and descriptors too, and the mailbox: the watches for a
               -- millisecond at most, then the descriptors without waiting, and the
               -- parts that other cores gave in the round that follows.
-              delay <- if descriptors > 0 || remote > 0 then Just <$> registerDelay 1000 else pure Nothing
+              until' <- untilNextTimer
+              let micros = case (descriptors > 0 || remote > 0, until') of
+                    (True, Just nanos) -> Just (min 1000 (fromIntegral (nanos `div` 1000)))
+                    (True, Nothing) -> Just 1000
+                    (False, Just nanos) -> Just (fromIntegral (nanos `div` 1000))
+                    (False, Nothing) -> Nothing
+              delay <- maybe (pure Nothing) (fmap Just . registerDelay) micros
               interruptedBy . atomically $ maybe retry (readTVar >=> check) delay `orElse` foldr (orElse . (\(Watching _ watch _) -> watchReady watch)) retry watching
               watched <- readIORef (runWatching run)
               checked <- traverse (\entry@(Watching _ watch _) -> (,) entry <$> hasFired watch) watched
@@ -546,6 +591,11 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
               polled <- if descriptors > 0 then pollNow else pure []
               go (map (\(Watching _ _ resume, _) -> resume (pure ())) fired <> polled) []
     countWait = counter run 2 >>= setCounter run 2 . (+ 1)
+    -- How long until the next timer is due, in nanoseconds.
+    untilNextTimer =
+      nextDeadline (runWheel run) >>= \case
+        Nothing -> pure Nothing
+        Just deadline -> (\now -> Just (if deadline > now then deadline - now else 0)) <$> getMonotonicTimeNSec
     -- An asynchronous exception that arrives at a wait begins a shutdown: every part that is in a scope is
     -- cancelled. One that arrives again is the same.
     shuttingDown failure =
@@ -567,8 +617,8 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
     -- Waits in the poller, which an asynchronous exception can interrupt: it begins a shutdown. No part runs
     -- while the scheduler waits, so it waits unmasked: a masked thread in an interruptible foreign call returns
     -- from it with the exception still to come.
-    pollWait =
-      try (interruptible (rawPoll c_pollerWait (-1))) >>= \case
+    pollWait timeout =
+      try (interruptible (rawPoll c_pollerWait timeout)) >>= \case
         Left failure -> [] <$ shuttingDown failure
         Right count -> afterPoll count
     rawPoll call timeout =

@@ -49,6 +49,7 @@ import Network.Directions.Cancel
 import Network.Directions.Classes
 import Network.Directions.Loop (Report)
 import Network.Directions.Scheduler
+import Network.Directions.Timers (addTimer, cancelTimer)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -115,7 +116,7 @@ instance GiveWay (Delimited s) where
 instance Block (Delimited s) where
   block = Delimited $ \(Context run tag part) event ->
     readIORef (partFrames part) >>= \case
-      [] -> control0 tag (counted run . Suspended event 0)
+      [] -> waitFor run tag part 0 event
       frames ->
         cancelledIn frames >>= \case
           Just ident -> throwIO (Cancelled ident)
@@ -125,8 +126,38 @@ instance Block (Delimited s) where
               Readable (Fd fd) -> OnFd (fromIntegral fd) True ident
               Writable (Fd fd) -> OnFd (fromIntegral fd) False ident
               Watched _ -> OnWatch ident
-            control0 tag (counted run . Suspended event ident)
+              Until _ -> NotWaiting
+            waitFor run tag part ident event
   {-# INLINE block #-}
+
+-- | Suspends the part until the event: a timer holds it if the event is an instant.
+waitFor :: Run -> PromptTag Step -> Part -> Int -> Event -> IO ()
+waitFor run tag part ident event = case event of
+  Until instant -> control0 tag (sleepUntil run part instant)
+  _ -> control0 tag (counted run . Suspended event ident)
+{-# INLINE waitFor #-}
+
+-- | The time of the round of the scheduler.
+instance Time (Delimited s) where
+  clock = Delimited (\(Context run _ _) () -> Instant <$> roundNow run)
+
+-- | The deadline is a timer of the scheduler's wheel, which cancels the scope when it fires, and a cancel scope
+-- that the part is in while the body runs. The scope is the body's own: the cancellation that ends it is
+-- recognised by it, and another passes through.
+instance Within (Delimited s) where
+  within (Duration limit) (Delimited body) = Delimited $ \context@(Context run _ part) value -> do
+    scope' <- newCancelScope
+    started <- roundNow run
+    timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
+    pushFrame run part (Inside scope')
+    outcome <- try (body context value)
+    popFrame run part
+    _ <- cancelTimer (runWheel run) timer
+    case outcome of
+      Right result -> pure (Just result)
+      Left failure
+        | cancelledBy failure == Just (scopeIdent scope') -> pure Nothing
+        | otherwise -> throwIO failure
 
 -- | Runs the action behind a shield.
 shielded :: Context -> IO a -> IO a

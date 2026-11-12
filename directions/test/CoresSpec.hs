@@ -9,7 +9,7 @@ import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', ne
 import Data.List (isInfixOf, sort)
 import Data.Maybe (fromMaybe)
 import GHC.Clock (getMonotonicTimeNSec)
-import Network.Directions.Classes
+import Network.Directions.Classes hiding (within)
 import Network.Directions.Compiled (runCompiled)
 import Network.Directions.Delimited
 import Network.Directions.Loop (Report (..), runLoop)

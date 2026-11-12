@@ -9,7 +9,7 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (group)
 import Data.Word (Word64)
-import Network.Directions.Classes
+import Network.Directions.Classes hiding (within)
 import Network.Directions.Compiled
 import Network.Directions.Delimited
 import Network.Directions.Loop

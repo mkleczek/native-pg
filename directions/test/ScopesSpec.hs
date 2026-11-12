@@ -15,9 +15,10 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
-import Network.Directions.Classes
+import Network.Directions.Classes hiding (within)
 import Network.Directions.Compiled
 import Network.Directions.Delimited
+import Network.Directions.Loop (runLoop)
 import Network.Directions.Pool
 import Network.Directions.Proxy (times, together)
 import Network.Directions.Threads
@@ -39,11 +40,16 @@ type Program a = forall arr. (Rich arr) => arr () a
 -- | A way to run a program: an arrow's.
 data Runner = Runner String (forall a. Program a -> IO a)
 
+-- | Each arrow runs a program for the unit: a function of its own, since a program is for any arrow.
+onThreads :: Program a -> IO a
+onThreads program = runThreads program ()
+
 runners :: [Runner]
 runners =
-  [ Runner "threads" (`runThreads` ()),
+  [ Runner "threads" onThreads,
     Runner "delimited" (\program -> fst <$> runDelimited program ()),
-    Runner "compiled" (\program -> fst <$> runCompiled program ())
+    Runner "compiled" (\program -> fst <$> runCompiled program ()),
+    Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
 spec :: Spec
@@ -180,7 +186,7 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
         fmap (either (\failure -> show (failure :: SomeException)) (const "ended")) result `shouldBe` Just "user error (core 2 failed)"
         sort <$> readLog noted `shouldReturn` ["acquire core 0", "acquire core 1", "release core 0: cancelled", "release core 1: cancelled"]
 
-  it "runs the release of a part that waits when the run is stopped from outside" $ do
+  when (name /= "loop") $ it "runs the release of a part that waits when the run is stopped from outside" $ do
     noted <- newLog
     result <- timeout 300000 (run (bracketed noted "r" returnA waitsForEver :: Program ()))
     result `shouldBe` Nothing
@@ -188,6 +194,13 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
     -- The release ran once, before the stop returned.
     length entries `shouldBe` 2
     take 1 entries `shouldBe` ["acquire r"]
+
+  when (name /= "loop") $ it "runs the release of both halves of a pair when the run is stopped from outside" $ do
+    noted <- newLog
+    result <- timeout 300000 (run (concurrently (bracketed noted "a" slowWait waitsForEver) (bracketed noted "b" slowWait waitsForEver) >>> arr (const ())))
+    result `shouldBe` Nothing
+    entries <- readLog noted
+    sort entries `shouldBe` ["acquire a", "acquire b", "release a: cancelled", "release b: cancelled"]
 
 -- | A failure, as the text of what it was, or of the result.
 describeFailure :: (Show a) => Either SomeException a -> String

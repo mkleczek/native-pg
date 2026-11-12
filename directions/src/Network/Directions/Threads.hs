@@ -23,7 +23,7 @@ where
 import Control.Applicative ((<|>))
 import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
-import Control.Concurrent (ThreadId, forkIO, myThreadId, threadWaitRead, threadWaitWrite, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
@@ -31,6 +31,8 @@ import Control.Monad (forM_, unless, when)
 import Data.Functor (($>))
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
+import GHC.Clock (getMonotonicTimeNSec)
+import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
 import GHC.Exts (casMutVar#)
 import GHC.IO (IO (..))
 import GHC.IORef (IORef (..), atomicSwapIORef)
@@ -264,6 +266,36 @@ instance Block Threads where
     Readable fd -> threadWaitRead fd
     Writable fd -> threadWaitWrite fd
     Watched register -> awaitWatch register
+    Until (Instant at) -> getMonotonicTimeNSec >>= \current -> when (at > current) (threadDelay (fromIntegral ((at - current + 999) `div` 1000)))
+
+instance Time Threads where
+  clock = Threads (\_ () -> Instant <$> getMonotonicTimeNSec)
+
+-- | The deadline is a timeout of GHC's timer manager, which cancels the scope when it fires, and a cancel scope
+-- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another
+-- passes through.
+instance Within Threads where
+  within (Duration limit) (Threads body) = Threads $ \part value -> do
+    scope' <- newCancelScope
+    manager <- getSystemTimerManager
+    key <- registerTimeout manager (fromIntegral (limit `div` 1000)) (cancelScope scope')
+    outcome <- inScope part scope' (body part value)
+    unregisterTimeout manager key
+    case outcome of
+      Right result -> pure (Just result)
+      Left failure
+        | cancelledBy failure == Just (scopeIdent scope') -> pure Nothing
+        | otherwise -> throwIO failure
+
+-- | Runs the action as a part that is in the cancel scope, and how it ended.
+inScope :: Part -> CancelScope Part -> IO a -> IO (Either SomeException a)
+inScope part@(Part _ _ frames _) scope' action = do
+  readIORef frames >>= writeIORef frames . (Inside scope' :)
+  enter scope' part
+  outcome <- try action
+  leave scope' part
+  readIORef frames >>= writeIORef frames . drop 1
+  pure outcome
 
 -- | A ticket is a 'TMVar', which blocks the thread that waits for it.
 instance Exchange Threads where

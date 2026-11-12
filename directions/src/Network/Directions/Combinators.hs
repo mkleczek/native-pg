@@ -11,6 +11,8 @@ module Network.Directions.Combinators
     call,
     expectLocal,
     callLocal,
+    sleep,
+    releaseWithin,
   )
 where
 
@@ -62,6 +64,17 @@ expectLocal message =
     ^>> first fulfil
     >>^ snd
 {-# INLINE expectLocal #-}
+
+-- | Waits for this long. It is a wait, so a cancellation reaches it.
+sleep :: (Arrow arr, Time arr, Block arr) => Duration -> arr () ()
+sleep duration = clock >>> (\now' -> Until (now' `plus` duration)) ^>> block
+{-# INLINE sleep #-}
+
+-- | A release that has a deadline of its own: shielded from the cancellation that makes it run, but not from its
+-- deadline. 'Nothing' if it missed it, and the part that releases what it holds should discard it.
+releaseWithin :: (Scope arr, Within arr) => Duration -> arr a () -> arr a (Maybe ())
+releaseWithin duration release = shield (within duration release)
+{-# INLINE releaseWithin #-}
 
 -- | 'call' for a ticket of this core.
 callLocal :: (Arrow arr, Exchange arr) => (Ticket arr a -> b) -> arr (Ticket arr b) a

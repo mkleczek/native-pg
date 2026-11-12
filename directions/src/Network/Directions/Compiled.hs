@@ -28,6 +28,7 @@ import Network.Directions.Cancel
 import Network.Directions.Classes
 import Network.Directions.Loop (Report)
 import Network.Directions.Scheduler
+import Network.Directions.Timers (addTimer, cancelTimer)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -70,12 +71,17 @@ resumed :: Context -> IO a -> IO a
 resumed (Context run _ failure) action = writeIORef (runFailure run) failure *> action
 {-# INLINE resumed #-}
 
--- | Counts a step, and goes on, or once the part has used its steps lets the others go on before it: it raises
--- the cancellation that came meanwhile, if it is in a scope, when it does.
+-- | Counts a step, and goes on, or once the part has used its steps lets the others go on before it.
 steppedIn :: Context -> IO Step -> IO Step
-steppedIn context@(Context run part _) continue =
-  spent run >>= \yields -> if yields then pure (Yielded (resumed context (checkpoint part *> continue))) else continue
+steppedIn context@(Context run _ _) continue = spent run >>= \yields -> if yields then yielded context continue else continue
 {-# INLINE steppedIn #-}
+
+-- | The part lets the others go on before it, and raises the cancellation that came meanwhile, if it is in a
+-- scope, when it goes on. Not inlined, so that what it builds is built only when the part yields, and not at
+-- every step.
+yielded :: Context -> IO Step -> IO Step
+yielded context@(Context _ part _) continue = pure (Yielded (resumed context (checkpoint part *> continue)))
+{-# NOINLINE yielded #-}
 
 -- | Counts a step, and once the part has used its steps, lets the others go
 -- on before it.
@@ -86,7 +92,7 @@ instance GiveWay Compiled where
 instance Block Compiled where
   block = Compiled $ \context@(Context run part _) event next ->
     readIORef (partFrames part) >>= \case
-      [] -> counted run (Suspended event 0 (\action -> resumed context (action *> next ())))
+      [] -> waitFor context 0 event next
       frames ->
         cancelledIn frames >>= \case
           Just ident -> throwIO (Cancelled ident)
@@ -96,8 +102,36 @@ instance Block Compiled where
               Readable (Fd fd) -> OnFd (fromIntegral fd) True ident
               Writable (Fd fd) -> OnFd (fromIntegral fd) False ident
               Watched _ -> OnWatch ident
-            counted run (Suspended event ident (\action -> resumed context (action *> next ())))
+              Until _ -> NotWaiting
+            waitFor context ident event next
   {-# INLINE block #-}
+
+-- | Suspends the part until the event: a timer holds it if the event is an instant.
+waitFor :: Context -> Int -> Event -> (() -> IO Step) -> IO Step
+waitFor context@(Context run part _) ident event next = case event of
+  Until instant -> sleepUntil run part instant (\action -> resumed context (action *> next ()))
+  _ -> counted run (Suspended event ident (\action -> resumed context (action *> next ())))
+{-# INLINE waitFor #-}
+
+-- | The time of the round of the scheduler.
+instance Time Compiled where
+  clock = Compiled (\(Context run _ _) () next -> roundNow run >>= next . Instant)
+
+-- | The deadline is a timer of the scheduler's wheel, which cancels the scope when it fires, and a cancel scope
+-- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another
+-- passes through.
+instance Within Compiled where
+  within (Duration limit) (Compiled body) = Compiled $ \(Context run part outer) value next -> do
+    scope' <- newCancelScope
+    started <- roundNow run
+    timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
+    pushFrame run part (Inside scope')
+    let leaves = popFrame run part *> cancelTimer (runWheel run) timer *> writeIORef (runFailure run) outer
+        onFailure failure = do
+          leaves
+          if cancelledBy failure == Just (scopeIdent scope') then next Nothing else outer failure
+    writeIORef (runFailure run) onFailure
+    body (Context run part onFailure) value (\result -> leaves *> next (Just result))
 
 instance Scope Compiled where
   scope (Compiled acquire) (Compiled release) (Compiled body) = Compiled $ \context@(Context run part outer) value next ->

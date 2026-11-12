@@ -14,6 +14,7 @@ library
   ghc-options: -Wall
   exposed-modules: Network.Directions.Classes
                    Network.Directions.Cancel
+                   Network.Directions.Timers
                    Network.Directions.Combinators
                    Network.Directions.Threads
                    Network.Directions.Loop
@@ -42,6 +43,7 @@ test-suite directions-spec
                  CoresSpec
                  RegionSpec
                  ScopesSpec
+                 TimeSpec
   ghc-options: -Wall -threaded -rtsopts -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, network, directions, skeletest >=0.4.2 && <0.5

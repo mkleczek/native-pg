@@ -8,6 +8,7 @@ module Network.Directions.Pool
   ( Pool,
     newPool,
     checkout,
+    checkoutWithin,
     reserve,
     release,
     free,
@@ -42,6 +43,11 @@ checkout :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr, Scope arr) =>
 checkout pool = reserve pool >>> (scope returnA giveUp (arr fst >>> awaitRemote) ||| returnA)
   where
     giveUp = (\(awaiting, exit) -> case exit of Done -> Left (); _ -> Right awaiting) ^>> (returnA ||| (abandon >>> (maybe (Left ()) Right ^>> (returnA ||| release pool))))
+
+-- | A connection, if one is free within the time, as 'checkout' waits for it: 'Nothing' if it isn't, once the
+-- place in the queue is given up.
+checkoutWithin :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr, Scope arr, Within arr) => Duration -> Pool conn -> arr () (Maybe conn)
+checkoutWithin limit pool = within limit (checkout pool)
 
 -- | A connection if one is free, or else the end to wait at for the one that
 -- is released to this part: it queues the part's giver. The waiter can

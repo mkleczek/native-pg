@@ -17,9 +17,13 @@
 --   @half@ (in a half of a concurrent pair, which is in one).
 -- * @cancel KIND SAMPLES@: how long a part that waits for a ticket takes to run its release, after the first to end
 --   of a race, which cancels it, has ended. KIND is as above.
+-- * @within KIND VARIANT ROUNDS@: what a deadline costs that doesn't pass, set and cancelled, in ns and bytes, above
+--   the loop it is in; the timer wheel of the scheduler (@delimited@, @compiled@), or GHC's timer manager
+--   (@threads@). KIND and VARIANT are as for @scope@.
+-- * @deadline KIND SAMPLES@: how late a deadline of 5 ms passes, on a scheduler that has nothing else to do.
 module Main (main) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (evaluate)
 import Control.Monad (replicateM, unless, void, when)
@@ -32,7 +36,7 @@ import Foreign.Storable (peek, poke)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.Classes
-import Network.Directions.Combinators (timesWith)
+import Network.Directions.Combinators (keeping, timesWith)
 import Network.Directions.Compiled
 import Network.Directions.Delimited
 import Network.Directions.Loop (Report (..))
@@ -55,7 +59,9 @@ main = do
     ["wake", kind, samples] -> wakeRun kind (read samples)
     ["scope", kind, variant, rounds] -> scopeRun kind variant (read rounds)
     ["cancel", kind, samples] -> cancelRun kind (read samples)
-    _ -> ioError (userError "usage: directions-cores-bench (pingpong KIND ROUNDS | pool KIND CORES PARTS CONNECTIONS SECONDS | wake KIND SAMPLES | scope KIND VARIANT ROUNDS | cancel KIND SAMPLES) +RTS -T -N..")
+    ["within", kind, variant, rounds] -> withinRun kind variant (read rounds)
+    ["deadline", kind, samples] -> deadlineRun kind (read samples)
+    _ -> ioError (userError "usage: directions-cores-bench (pingpong KIND ROUNDS | pool KIND CORES PARTS CONNECTIONS SECONDS | wake KIND SAMPLES | scope KIND VARIANT ROUNDS | cancel KIND SAMPLES | within KIND VARIANT ROUNDS | deadline KIND SAMPLES) +RTS -T -N..")
 
 -- | Bytes allocated by every thread so far, once a major collection has counted them.
 allocated :: IO Integer
@@ -163,8 +169,8 @@ wakeRun kind samples = do
       at fraction = latencies !! min (length latencies - 1) (floor (fraction * fromIntegral (length latencies)))
   printf "wake %s samples=%d blocked=%s median_us=%.1f p90_us=%.1f p99_us=%.1f min_us=%.1f max_us=%.1f\n" kind samples (maybe "-" show waits) (at 0.5 / 1000) (at 0.9 / 1000) (at 0.99 / 1000) (minimum latencies / 1000) (maximum latencies / 1000)
 
--- | A program for every arrow that has scopes.
-type Program a = forall arr. (ArrowChoice arr, Effect arr, Concurrent arr, Exchange arr, Scope arr, Race arr) => arr () a
+-- | A program for every arrow that has scopes and time.
+type Program a = forall arr. (ArrowChoice arr, Effect arr, Concurrent arr, Exchange arr, Scope arr, Race arr, Time arr, Within arr) => arr () a
 
 runProgram :: String -> Program a -> IO a
 runProgram kind program = case kind of
@@ -209,3 +215,39 @@ cancelRun kind samples = do
   let at :: Double -> Double
       at fraction = sorted !! min (length sorted - 1) (floor (fraction * fromIntegral (length sorted)))
   printf "cancel %s samples=%d median_us=%.1f p90_us=%.1f p99_us=%.1f min_us=%.1f max_us=%.1f\n" kind samples (at 0.5 / 1000) (at 0.9 / 1000) (at 0.99 / 1000) (minimum sorted / 1000) (maximum sorted / 1000)
+
+-- | Rounds of a deadline that doesn't pass, and of nothing, in the part or in a half of a pair: the difference, per
+-- round.
+withinRun :: String -> String -> Int -> IO ()
+withinRun kind variant rounds = do
+  let inside :: (Arrow arr, Concurrent arr) => arr () () -> arr () ()
+      inside loop = case variant of
+        "half" -> concurrently loop returnA >>^ const ()
+        _ -> loop
+      bare :: Program ()
+      bare = inside (timesWith rounds returnA)
+      limited :: Program ()
+      limited = inside (timesWith rounds (within (secs 10) returnA >>^ const ()))
+  void (measured (runProgram kind bare))
+  (baseSeconds, baseBytes) <- measured (runProgram kind bare)
+  (limitedSeconds, limitedBytes) <- measured (runProgram kind limited)
+  printf "within %s %s rounds=%d ns_per_within=%.1f bytes_per_within=%.1f\n" kind variant rounds ((limitedSeconds - baseSeconds) * 1e9 / fromIntegral rounds) (fromIntegral (limitedBytes - baseBytes) / fromIntegral rounds :: Double)
+
+-- | How late a deadline passes: the time from setting it to the end of the part that waits under it, less the
+-- deadline's own 5 ms.
+deadlineRun :: String -> Int -> IO ()
+deadlineRun kind samples = do
+  lateness <- newIORef []
+  let waits :: (Arrow arr, Exchange arr) => arr () ()
+      waits = newTicket >>> await
+      program :: Program ()
+      program =
+        timesWith samples $
+          keeping (now (\() -> getMonotonicTimeNSec))
+            >>> second (within (millis 5) waits)
+            >>> now (\(started, _) -> getMonotonicTimeNSec >>= \ended -> modifyIORef' lateness ((ended - started - 5000000) :))
+  runProgram kind program
+  sorted <- sort . map fromIntegral <$> readIORef lateness :: IO [Double]
+  let at :: Double -> Double
+      at fraction = sorted !! min (length sorted - 1) (floor (fraction * fromIntegral (length sorted)))
+  printf "deadline %s samples=%d median_us=%.1f p90_us=%.1f p99_us=%.1f min_us=%.1f max_us=%.1f\n" kind samples (at 0.5 / 1000) (at 0.9 / 1000) (at 0.99 / 1000) (minimum sorted / 1000) (maximum sorted / 1000)
