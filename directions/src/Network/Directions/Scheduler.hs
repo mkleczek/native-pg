@@ -61,8 +61,10 @@ data Slot a = Empty | Given a | Waiter (a -> IO Step)
 data Run = Run
   { -- | Parts that tickets woke.
     runTickets :: !(IORef [IO Step]),
-    -- | The steps the running part has left, the steps taken, and the waits:
-    -- unboxed, so that counting allocates nothing.
+    -- | The steps the running part has left before it gives way, the steps
+    -- taken, and the waits: unboxed, so that counting allocates nothing. A
+    -- step is a point to give way at, which a link's receive or send is, or a
+    -- wait, or a ticket given or waited for.
     runCounters :: !(ForeignPtr Int),
     runPoller :: !CInt,
     -- | Where the poller writes what became ready: descriptors, and kinds.
@@ -93,8 +95,7 @@ setCounter :: Run -> Int -> Int -> IO ()
 setCounter run index value = unsafeWithForeignPtr (runCounters run) (\pointer -> pokeElemOff pointer index value)
 {-# INLINE setCounter #-}
 
--- | Counts a step of a primitive, and says whether the part has used its steps
--- and yields.
+-- | Counts a step, and says whether the part has used its steps and yields.
 spent :: Run -> IO Bool
 spent run = do
   counter run 1 >>= setCounter run 1 . (+ 1)
@@ -102,13 +103,12 @@ spent run = do
   if remaining <= 1 then pure True else False <$ setCounter run 0 (remaining - 1)
 {-# INLINE spent #-}
 
--- | Counts a step of a primitive, and goes on, or yields once the part has
--- used its steps.
+-- | Counts a step, and goes on, or yields once the part has used its steps.
 stepped :: Run -> IO Step -> IO Step
 stepped run continue = spent run >>= \yields -> if yields then pure (Yielded continue) else continue
 {-# INLINE stepped #-}
 
--- | Counts a step of a primitive that suspends its part.
+-- | Counts a step that suspends its part.
 counted :: Run -> Step -> IO Step
 counted run step = step <$ (counter run 1 >>= setCounter run 1 . (+ 1))
 {-# INLINE counted #-}
@@ -119,7 +119,8 @@ wakeTicket run part = modifyIORef' (runTickets run) (part :)
 
 -- | Runs the first part, and the parts it forks, until the result is there:
 -- each part that can go on in turn, entered with the given action, for up to
--- 64 steps. It closes the run's poller at the end.
+-- 64 steps, which are mostly the receives and sends it makes. It closes the
+-- run's poller at the end.
 schedule :: Run -> (IO Step -> IO Step) -> IORef (Maybe b) -> IO Step -> IO (b, Report)
 schedule run enter result start = go [start] [] [] 0 0 `finally` c_close (runPoller run)
   where

@@ -73,8 +73,14 @@ instance ArrowChoice Delimited where
   {-# INLINE (|||) #-}
 
 instance Effect Delimited where
-  now action = Delimited (\context value -> action value >>= \output -> output <$ step context)
+  now action = Delimited (\_ value -> action value)
   {-# INLINE now #-}
+
+-- | Counts a step, and once the part has used its steps, lets the others go
+-- on before it.
+instance GiveWay Delimited where
+  giveWay = Delimited (\context value -> value <$ step context)
+  {-# INLINE giveWay #-}
 
 instance Block Delimited where
   block = Delimited (\(Context run tag) event -> control0 tag (\resume -> counted run (Suspended event (resume (pure ())))))
@@ -97,7 +103,9 @@ data Half b c = Neither | FirstDone b | SecondDone c
 
 -- | A ticket is a slot on this thread: a part that waits for it is parked in
 -- it, as its captured continuation, and goes back among those that can go on
--- when the ticket is given its value.
+-- when the ticket is given its value. Giving and waiting count a step, and can
+-- give way: a ticket is where parts coordinate, and none is on a parser's
+-- path.
 instance Exchange Delimited where
   newtype Ticket Delimited a = DelimitedTicket (IORef (Slot a))
   newTicket = DelimitedTicket <$> newIORef Empty
@@ -119,8 +127,9 @@ step (Context run tag) = spent run >>= \yields -> when yields (control0 tag (\re
 {-# INLINE step #-}
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
--- that can go on in turn, under the prompt, for up to 64 steps, and when none
--- can, a wait until a descriptor wakes one, or a watch fires.
+-- that can go on in turn, under the prompt, until it has passed 64 points to
+-- give way at (a link's receives and sends), and when none can, a wait until a
+-- descriptor wakes one, or a watch fires.
 runDelimited :: Delimited a b -> a -> IO (b, Report)
 runDelimited (Delimited program) input = do
   run <- newRun

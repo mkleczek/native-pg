@@ -10,7 +10,7 @@ module Network.Directions.Threads
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, Kleisli (..))
+import Control.Arrow (Arrow, ArrowChoice, Kleisli (..), returnA)
 import Control.Category (Category)
 import Control.Concurrent (forkIO, killThread, threadWaitRead, threadWaitWrite)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
@@ -32,6 +32,10 @@ threads = Threads . Kleisli
 
 instance Effect Threads where
   now = threads
+
+-- | GHC's scheduler preempts a thread, so a part has no turn to give way at.
+instance GiveWay Threads where
+  giveWay = returnA
 
 -- | Each on a thread of its own. A failure of either stops both, and is
 -- rethrown.

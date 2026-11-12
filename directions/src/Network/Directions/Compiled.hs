@@ -49,8 +49,14 @@ instance ArrowChoice Compiled where
   {-# INLINE (|||) #-}
 
 instance Effect Compiled where
-  now action = Compiled (\run value next -> action value >>= \output -> stepped run (next output))
+  now action = Compiled (\_ value next -> action value >>= next)
   {-# INLINE now #-}
+
+-- | Counts a step, and once the part has used its steps, lets the others go
+-- on before it.
+instance GiveWay Compiled where
+  giveWay = Compiled (\run value next -> stepped run (next value))
+  {-# INLINE giveWay #-}
 
 instance Block Compiled where
   block = Compiled (\run event next -> counted run (Suspended event (next ())))
@@ -69,7 +75,8 @@ data Half b c = Neither | FirstDone b | SecondDone c
 
 -- | A ticket is a slot on this thread: a part that waits for it is parked in
 -- it, as its continuation, and goes back among those that can go on when the
--- ticket is given its value.
+-- ticket is given its value. Giving and waiting count a step, and can give
+-- way: a ticket is where parts coordinate, and none is on a parser's path.
 instance Exchange Compiled where
   newtype Ticket Compiled a = CompiledTicket (IORef (Slot a))
   newTicket = CompiledTicket <$> newIORef Empty
@@ -88,8 +95,9 @@ instance Exchange Compiled where
       Waiter _ -> ioError (userError "two parts wait for one ticket")
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
--- that can go on in turn, for up to 64 steps, and when none can, a wait until
--- a descriptor wakes one, or a watch fires.
+-- that can go on in turn, until it has passed 64 points to give way at (a
+-- link's receives and sends), and when none can, a wait until a descriptor
+-- wakes one, or a watch fires.
 runCompiled :: Compiled a b -> a -> IO (b, Report)
 runCompiled (Compiled program) input = do
   run <- newRun

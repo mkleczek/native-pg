@@ -17,7 +17,7 @@ module Network.Directions.Loop
   )
 where
 
-import Control.Arrow (Arrow (..), ArrowChoice (..))
+import Control.Arrow (Arrow (..), ArrowChoice (..), returnA)
 import Control.Category (Category (..))
 import Control.Concurrent.STM (atomically, orElse, retry)
 import Control.Exception (bracket, mask, onException, uninterruptibleMask_)
@@ -61,6 +61,12 @@ instance Concurrent Loop where
 
 instance Effect Loop where
   now = Now
+
+-- | Nothing: the interpreter counts a step for every action that a part runs,
+-- not only at a link, and gives way after 64 of them (a simulation, after each,
+-- to try the orders of the parts' actions that a seed gives).
+instance GiveWay Loop where
+  giveWay = returnA
 
 -- | Suspends the part: the scheduler goes on with it once the watch fires.
 instance Block Loop where
@@ -164,7 +170,11 @@ watchOf = \case
   Writable fd -> fdWritable fd
   Watched register -> register
 
--- | What a run did: how many steps of primitives, and how many waits.
+-- | What a run did: how many steps, and how many waits. In a run of 'Loop' or
+-- a simulation a step is any primitive that a part ran. In a run of
+-- "Network.Directions.Compiled" or "Network.Directions.Delimited" it is only
+-- a point to give way at, which is a link's receive or send, a wait, or a
+-- ticket given or waited for.
 data Report = Report {reportSteps :: !Int, reportWaits :: !Int}
   deriving (Eq, Show)
 

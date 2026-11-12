@@ -8,6 +8,7 @@ module Network.Directions.Memory
   )
 where
 
+import Control.Arrow (Arrow, (>>>))
 import Control.Exception (throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Internal as BSI
@@ -39,9 +40,10 @@ memoryReceive (Memory (BSI.BS wire total) position limit) target room = unsafeWi
   poke pointer (at + count)
   pure count
 
--- | The link is for reading only.
-instance (Effect arr) => Link arr Memory where
-  receive memory = now (\(Room target size) -> unsafeWithForeignPtr target (\pointer -> memoryReceive memory pointer size))
+-- | The link is for reading only. A receive never waits, but is a point to give
+-- way at, as the receive of a link that does wait is.
+instance (Arrow arr, Effect arr, GiveWay arr) => Link arr Memory where
+  receive memory = giveWay >>> now (\(Room target size) -> unsafeWithForeignPtr target (\pointer -> memoryReceive memory pointer size))
   sendAll _ = now (\_ -> throwIO (userError "a memory link is for reading only"))
   shutdownSend _ = now (\() -> pure ())
   close _ = now (\() -> pure ())

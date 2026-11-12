@@ -161,7 +161,7 @@ spec = describe "cursors derived from the schema" $ do
 type Fixeds = 'PayloadChoice '[FramedMessage 'k' ('PayloadCounted16 ('FixedBytesAtom 4))]
 
 -- | A program over a reader of a memory link, for every arrow.
-type Program a b = forall arr. (ArrowChoice arr, Effect arr) => Reader Memory -> IO (arr a b)
+type Program a b = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> IO (arr a b)
 
 -- | Runs the program on the wire with each arrow, a reader of the capacity,
 -- and a link that gives at most the limit at once: what each gave, or how it
@@ -174,7 +174,7 @@ runAll' program input wire limit capacity =
       over (\arrow -> fst <$> runDelimited arrow input)
     ]
   where
-    over :: (ArrowChoice arr, Effect arr) => (arr a b -> IO b) -> IO (Either String b)
+    over :: (ArrowChoice arr, Effect arr, GiveWay arr) => (arr a b -> IO b) -> IO (Either String b)
     over run =
       outcome
         <$> try
@@ -185,7 +185,7 @@ runAll' program input wire limit capacity =
           )
 
 -- | Runs a program that adds up into a counter, with each arrow.
-runAll :: (forall arr. (ArrowChoice arr, Effect arr) => Reader Memory -> Counter -> arr () ()) -> ByteString -> Int -> Int -> IO [Either String Int]
+runAll :: (forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> Counter -> arr () ()) -> ByteString -> Int -> Int -> IO [Either String Int]
 runAll program wire limit capacity = do
   one <- newCounter
   two <- newCounter
@@ -218,7 +218,7 @@ runIO :: forall b. Program () b -> ByteString -> Int -> Int -> IO [Either String
 runIO program = runAll' program ()
 
 -- | A program that needs no input.
-runWith :: forall b. (forall arr. (ArrowChoice arr, Effect arr) => Reader Memory -> arr () b) -> ByteString -> Int -> Int -> IO [Either String b]
+runWith :: forall b. (forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> arr () b) -> ByteString -> Int -> Int -> IO [Either String b]
 runWith program = runAll' (pure . program) ()
 
 isCursorError :: Either String b -> Bool
@@ -278,7 +278,7 @@ dataRowTwoValuesOneInside = frameOf 'D' (be16 2 <> be32 4 <> BS.pack [0, 0, 0, 1
 
 -- | Of three elements of four bytes, skips the first, reads the second as a
 -- number, skips the third, and finds that there is no fourth.
-fixedElements :: forall arr. (ArrowChoice arr, Effect arr) => Reader Memory -> IO (arr () [Int])
+fixedElements :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> IO (arr () [Int])
 fixedElements reader = do
   seen <- newIORef []
   let fixeds = messages reader :: At Fixeds Memory
@@ -301,7 +301,7 @@ fixedElements reader = do
 
 -- | Reads this many messages, each as a description of what it was, and
 -- reads nothing of the rows.
-messagesRead :: forall arr. (ArrowChoice arr, Effect arr) => Int -> Reader Memory -> IO (arr () [String])
+messagesRead :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Int -> Reader Memory -> IO (arr () [String])
 messagesRead total reader = do
   seen <- newIORef []
   let result = messages reader :: At Mixed Memory
@@ -358,7 +358,7 @@ firstRow reader = message result >>> (,()) ^>> cases result (row :> unexpected :
 
 -- | The sizes of all of the values of the stream's first row, with 'Nothing'
 -- for a NULL, each value skipped after its size is read.
-allValues :: forall arr. (ArrowChoice arr, Effect arr) => Reader Memory -> IO (arr () [Maybe Int])
+allValues :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> IO (arr () [Maybe Int])
 allValues reader = do
   seen <- newIORef []
   let result = messages reader :: At ResultStream Memory

@@ -1,18 +1,21 @@
 module DirectionsSpec (spec) where
 
-import Control.Arrow (ArrowChoice)
+import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>))
 import Control.Exception (ErrorCall (..), bracket, throwIO, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
-import Data.IORef (IORef, newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.List (group)
 import Data.Word (Word64)
 import Network.Directions.Classes
 import Network.Directions.Compiled
 import Network.Directions.Delimited
 import Network.Directions.Loop
+import Network.Directions.Memory
 import Network.Directions.Proxy
+import Network.Directions.Reader (replicateA)
 import Network.Directions.Simulated
 import Network.Directions.Threads
 import Network.Socket (Socket)
@@ -87,6 +90,21 @@ spec = describe "directions" $ do
       ticket <- newTicket :: IO (Ticket Loop ())
       (simulatedOutcome <$> runSimulation 1 limit (await ticket) ()) `shouldReturn` Deadlocked [0]
 
+  describe "giving way, with every part on one thread" $
+    it "happens at a link's receives, after 64 of them, and not at actions that never wait" $ do
+      byReceives <- twoParts receiving
+      forM_ byReceives $ \(turns, report) -> do
+        sum turns `shouldBe` 2000
+        -- Both parts are there for the first turns, and none of them has more
+        -- than 64 receives in a row; the last turns are the part that is left.
+        (length turns >= 20) `shouldBe` True
+        all (<= 64) (take 20 turns) `shouldBe` True
+        reportSteps report `shouldBe` 2000
+      byEffects <- twoParts effects
+      forM_ byEffects $ \(turns, report) -> do
+        turns `shouldBe` [1000, 1000]
+        reportSteps report `shouldBe` 0
+
   describe "threads" $
     it "stop every part when one fails, and rethrow its failure" $ do
       (_, end) <- connect 1000
@@ -95,13 +113,39 @@ spec = describe "directions" $ do
       let failing = now (\() -> throwIO (ErrorCall "the part failed"))
       within (try (runThreads (together [receiveAll buffer end kept, failing]) ())) `shouldReturn` Just (Left (ErrorCall "the part failed"))
 
+-- | A part that notes which part it was, after each of its 1000 steps.
+type Part = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IORef [Int] -> Int -> Memory -> Buffer -> arr () ()
+
+-- | Each step is a receive from a link that never waits.
+receiving :: Part
+receiving order ident link buffer =
+  const 1000 ^>> replicateA (const (roomOf buffer) ^>> receive link >>> now (\_ -> modifyIORef' order (ident :))) >>^ const ()
+
+-- | Each step is an action that never waits.
+effects :: Part
+effects order ident _ _ = const 1000 ^>> replicateA (now (\() -> modifyIORef' order (ident :))) >>^ const ()
+
+-- | Runs two of the parts at once, compiled and on delimited continuations:
+-- how many steps each turn of a part had, in order, and the run's report.
+twoParts :: Part -> IO [([Int], Report)]
+twoParts part = sequence [measured (`runCompiled` ()), measured (`runDelimited` ())]
+  where
+    measured :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr) => (arr () () -> IO ((), Report)) -> IO ([Int], Report)
+    measured run = do
+      order <- newIORef []
+      one <- newMemory (BS.replicate 1000 0) 1
+      two <- newMemory (BS.replicate 1000 0) 1
+      buffer <- newBuffer 16
+      (_, report) <- run (together [part order 1 one buffer, part order 2 two buffer])
+      (\notes -> (map length (group (reverse notes)), report)) <$> readIORef order
+
 batch :: ByteString
 batch = BS8.pack "BATCH\n"
 
 -- | A transaction against an echo server over simulated links, deciding to
 -- commit by the batch's answer: what the run gave, and what came back after
 -- the batch.
-transact :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, Block arr) => (ByteString -> Bool) -> (arr () () -> IO a) -> IO (a, ByteString)
+transact :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, GiveWay arr, Block arr) => (ByteString -> Bool) -> (arr () () -> IO a) -> IO (a, ByteString)
 transact commits run = do
   (client, server) <- connect 1000
   decision <- newTicket
@@ -141,7 +185,7 @@ world setup bytes kept (client, front, back, server) = do
 
 -- | The round trip over simulated links that hold 1000 bytes each way: what
 -- the run gave, and what the client kept.
-roundTrip :: (ArrowChoice arr, Concurrent arr, Effect arr, Block arr) => Setup -> ByteString -> (arr () () -> IO a) -> IO (a, ByteString)
+roundTrip :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Setup -> ByteString -> (arr () () -> IO a) -> IO (a, ByteString)
 roundTrip setup bytes run = do
   (client, front) <- connect 1000
   (back, server) <- connect 1000
@@ -150,7 +194,7 @@ roundTrip setup bytes run = do
   (,) result . BS.concat . reverse <$> readIORef kept
 
 -- | The same over socket pairs: what the client kept.
-overSockets :: (ArrowChoice arr, Concurrent arr, Effect arr, Block arr) => (arr () () -> IO ()) -> IO ByteString
+overSockets :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => (arr () () -> IO ()) -> IO ByteString
 overSockets run =
   withPair $ \client front -> withPair $ \back server -> do
     kept <- newIORef []

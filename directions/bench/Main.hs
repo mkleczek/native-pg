@@ -1,8 +1,10 @@
 -- | Moves bytes from a client through the proxy to an echo server and back,
 -- with each way to run the program, and says what each did per MiB that went
 -- each way: how fast, how many steps and waits (one thread only), and how much
--- it allocated (with @+RTS -T@). Usage: @directions-bench [MiB [run]]@: 64 MiB
--- by default, and every run unless one is named.
+-- it allocated (with @+RTS -T@). A step of 'Loop' is any primitive; one of
+-- 'Compiled' and 'Delimited' is a receive, a send, a wait, or a ticket.
+-- Usage: @directions-bench [MiB [run]]@: 64 MiB by default, and every run
+-- unless one is named.
 module Main (main) where
 
 import Control.Arrow (ArrowChoice, first, returnA, (>>>), (^>>), (|||))
@@ -60,7 +62,7 @@ measureRun name mib run = do
 
 -- | The round trip over socket pairs: the run's report, and how many bytes the
 -- client got back.
-overSockets :: (ArrowChoice arr, Concurrent arr, Effect arr, Block arr) => (arr () () -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
+overSockets :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => (arr () () -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
 overSockets run size = withPair $ \client front -> withPair $ \back server -> roundTrip run size (client, front, back, server)
   where
     withPair :: (Socket -> Socket -> IO a) -> IO a
@@ -69,7 +71,7 @@ overSockets run size = withPair $ \client front -> withPair $ \back server -> ro
         . uncurry
 
 -- | The round trip over simulated links that hold 64 KiB each way.
-overSimulated :: (ArrowChoice arr, Concurrent arr, Effect arr, Block arr) => (arr () () -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
+overSimulated :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => (arr () () -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
 overSimulated run size = do
   (client, front) <- connect 65536
   (back, server) <- connect 65536

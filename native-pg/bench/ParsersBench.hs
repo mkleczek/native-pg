@@ -83,6 +83,10 @@ variants =
       (streamed (\counter reader -> runThreads (foldRowsCursors reader counter) ()))
       (streamed (\counter reader -> runThreads (streamCursors reader (counting counter)) ())),
     Variant
+      "D compiled"
+      (streamed (\counter reader -> fst <$> runCompiled (foldRowsCursors reader counter) ()))
+      (streamed (\counter reader -> fst <$> runCompiled (streamCursors reader (counting counter)) ())),
+    Variant
       "D delimited"
       (streamed (\counter reader -> fst <$> runDelimited (foldRowsCursors reader counter) ()))
       (streamed (\counter reader -> fst <$> runDelimited (streamCursors reader (counting counter)) ()))

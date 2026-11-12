@@ -2,15 +2,16 @@
 {-# LANGUAGE TypeFamilies #-}
 
 -- | The classes of the design: a link whose calls block in the arrow that runs
--- them, what an arrow can do for a link (run an action that never waits, and
--- block until an event fires), and how directions exchange values. Two arrows
--- provide them, "Network.Directions.Threads", a thread for each concurrent
--- part, and "Network.Directions.Loop", every part on one thread; a link's
--- instance is written once for any arrow that does.
+-- them, what an arrow can do for a link (run an action that never waits, give
+-- way to the other parts, and block until an event fires), and how directions
+-- exchange values. Two arrows provide them, "Network.Directions.Threads", a
+-- thread for each concurrent part, and "Network.Directions.Loop", every part on
+-- one thread; a link's instance is written once for any arrow that does.
 module Network.Directions.Classes
   ( Link (..),
     Concurrent (..),
     Effect (..),
+    GiveWay (..),
     Block (..),
     Event (..),
     Events (..),
@@ -77,6 +78,16 @@ class Concurrent arr where
 class Effect arr where
   now :: (a -> IO b) -> arr a b
 
+-- | A point where a part gives way to the others, if it has used its turn:
+-- the arrows that run every part on one thread count the points a part passes,
+-- and once it has passed enough, it lets the others go on before it. Only
+-- where a part does I/O, in a link's receive and send, is there one: an action
+-- that never waits doesn't give way. An arrow that doesn't need it, because
+-- something else preempts its parts, as GHC's scheduler does threads, makes it
+-- the arrow that does nothing.
+class GiveWay arr where
+  giveWay :: arr a a
+
 -- | Waiting until an event fires.
 class Block arr where
   block :: arr Event ()
@@ -102,17 +113,19 @@ class HalfClose link where
 instance HalfClose Socket where
   halfClose sock = Socket.shutdown sock Socket.ShutdownSend
 
--- | A socket, in any arrow that can run its tries and block.
-instance (ArrowChoice arr, Effect arr, Block arr) => Link arr Socket where
+-- | A socket, in any arrow that can run its tries, block, and give way.
+instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Link arr Socket where
   receive = receiveTrying
   sendAll = sendAllTrying
   shutdownSend sock = now (\() -> halfClose sock)
   close sock = now (\() -> Socket.close sock)
 
--- | A receive from streaming-io's link: a try, and while nothing is ready, a
--- block until the link is readable, and the try again.
-receiveTrying :: (S.Link link, Events link, ArrowChoice arr, Effect arr, Block arr) => link -> arr Room Int
-receiveTrying link = loop
+-- | A receive from streaming-io's link: a point to give way at, a try, and
+-- while nothing is ready, a block until the link is readable, and the try
+-- again. The part gives way before it tries, so that one whose link always has
+-- bytes ready still does, once for each receive.
+receiveTrying :: (S.Link link, Events link, ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => link -> arr Room Int
+receiveTrying link = giveWay >>> loop
   where
     loop = now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
     attempt room@(Room memory size) =
@@ -121,10 +134,11 @@ receiveTrying link = loop
         Nothing -> (\event -> Left (event, room)) <$> readable link
 {-# INLINABLE receiveTrying #-}
 
--- | A send to streaming-io's link: it sends what the link takes and writes it,
--- and while some is left, blocks until the link is writable, and goes on.
-sendAllTrying :: (S.Link link, Events link, ArrowChoice arr, Effect arr, Block arr) => link -> arr [ByteString] ()
-sendAllTrying link = loop
+-- | A send to streaming-io's link: a point to give way at, then it sends what
+-- the link takes and writes it, and while some is left, blocks until the link
+-- is writable, and goes on.
+sendAllTrying :: (S.Link link, Events link, ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => link -> arr [ByteString] ()
+sendAllTrying link = giveWay >>> loop
   where
     loop = filter (not . BS.null) ^>> now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
     attempt pieces = case pieces of

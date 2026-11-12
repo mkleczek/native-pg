@@ -73,8 +73,8 @@ instance Events SimEnd where
   readable end = pure (Watched (S.watchReadable end))
   writable end = pure (Watched (S.watchWritable end))
 
--- | A simulated end, in any arrow that can run its tries and block.
-instance (ArrowChoice arr, Effect arr, Block arr) => Link arr SimEnd where
+-- | A simulated end, in any arrow that can run its tries, block, and give way.
+instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Link arr SimEnd where
   receive = receiveTrying
   sendAll = sendAllTrying
   shutdownSend end = now (\() -> halfClose end)
