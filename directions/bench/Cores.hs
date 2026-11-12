@@ -37,7 +37,6 @@ import Data.List (sort)
 import Data.Maybe (isJust)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtr, withForeignPtr)
 import Foreign.Storable (peek, poke)
-import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.Classes
 import Network.Directions.Combinators (keeping, timesWith, untilJust)
@@ -77,9 +76,9 @@ allocated = performMajorGC *> (fromIntegral . allocated_bytes <$> getRTSStats)
 measured :: IO () -> IO (Double, Integer)
 measured action = do
   before <- allocated
-  started <- getMonotonicTimeNSec
+  started <- monotonicNanoseconds
   action
-  ended <- getMonotonicTimeNSec
+  ended <- monotonicNanoseconds
   after <- allocated
   pure (fromIntegral (ended - started) / 1e9, after - before)
 
@@ -223,10 +222,10 @@ cancelRun kind samples = do
   stamp <- newIORef 0
   latencies <- newIORef []
   let released :: (Effect arr) => arr a ()
-      released = now (\_ -> getMonotonicTimeNSec >>= \late -> readIORef stamp >>= \early -> modifyIORef' latencies ((late - early) :))
+      released = now (\_ -> monotonicNanoseconds >>= \late -> readIORef stamp >>= \early -> modifyIORef' latencies ((late - early) :))
       -- The other part waits a little first, so that this one waits when it ends.
       winner :: (Effect arr) => arr () ()
-      winner = now (\() -> threadDelay 200 *> getMonotonicTimeNSec >>= atomicWriteIORef stamp)
+      winner = now (\() -> threadDelay 200 *> monotonicNanoseconds >>= atomicWriteIORef stamp)
       waits :: (Arrow arr, Exchange arr) => arr a ()
       waits = arr (const ()) >>> newTicket >>> await
       program :: Program ()
@@ -257,9 +256,9 @@ deadlineRun kind samples = do
       program :: Program ()
       program =
         timesWith samples $
-          keeping (now (\() -> getMonotonicTimeNSec))
+          keeping (now (\() -> monotonicNanoseconds))
             >>> second (within (millis 5) waits)
-            >>> now (\(started, _) -> getMonotonicTimeNSec >>= \ended -> modifyIORef' lateness ((ended - started - 5000000) :))
+            >>> now (\(started, _) -> monotonicNanoseconds >>= \ended -> modifyIORef' lateness ((ended - started - 5000000) :))
   runProgram kind program
   sorted <- sort . map fromIntegral <$> readIORef lateness :: IO [Double]
   let at :: Double -> Double

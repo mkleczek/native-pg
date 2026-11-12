@@ -8,7 +8,6 @@ import Data.Either (fromLeft)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf, sort)
 import Data.Maybe (fromMaybe)
-import GHC.Clock (getMonotonicTimeNSec)
 import Network.Directions.Classes hiding (within)
 import Network.Directions.Compiled (runCompiled)
 import Network.Directions.Delimited
@@ -126,9 +125,9 @@ spec = describe "cores" $ do
   describe "a run of cores" $
     it "fails when a core fails, instead of waiting for the cores that wait for ever" $ do
       ensureCores
-      started <- getMonotonicTimeNSec
+      started <- monotonicNanoseconds
       outcome <- within (try (runCores 3 (pure ()) (\() core -> if core == 1 then now (\() -> throwIO (ErrorCall "core 1 failed")) >>> arr (const 0) else waitsForEver)))
-      ended <- getMonotonicTimeNSec
+      ended <- monotonicNanoseconds
       outcome `shouldBe` Just (Left (ErrorCall "core 1 failed") :: Either ErrorCall [Int])
       (ended - started < 5000000000) `shouldBe` True
 

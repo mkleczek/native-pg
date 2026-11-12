@@ -10,6 +10,8 @@
 -- and the scheduler asks it what became ready when no part can go on, or once
 -- a round otherwise, so that a wait costs neither a registration nor a thread
 -- of GHC's IO manager. A part that waits for a ticket is held by the ticket.
+-- A part runs for a turn, a length of time: at a point to give way at, once it
+-- has run longer than that, it lets the others go on before it.
 --
 -- Each scheduler also has a mailbox that other threads, the schedulers of other
 -- cores, put parts in: a part that waited for a ticket that another core gives
@@ -30,6 +32,9 @@
 -- they have ended, and then fails the run with the exception.
 module Network.Directions.Scheduler
   ( Step (..),
+    Turn (..),
+    microseconds,
+    defaultTurn,
     Run,
     newRun,
     freeRun,
@@ -84,11 +89,10 @@ import Foreign.C.Types (CInt (..))
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
-import GHC.Clock (getMonotonicTimeNSec)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Directions.Atomic (update)
 import Network.Directions.Cancel
-import Network.Directions.Classes (Cancelled (..), Event (..), Instant (..), cancelledBy)
+import Network.Directions.Classes (Cancelled (..), Event (..), Instant (..), cancelledBy, monotonicNanoseconds)
 import Network.Directions.Loop (Report (..))
 import Network.Directions.Timers
 import Network.Streaming.Watch (Watch (..))
@@ -109,10 +113,26 @@ data Step
   | -- | It waits for a ticket that another core gives, whose slot holds it; the
     -- giver puts it in the mailbox.
     ParkedRemote
-  | -- | It used its steps, and can go on.
+  | -- | It ran for its turn, and can go on.
     Yielded (IO Step)
   | -- | It waits until an instant, and a timer holds it.
     Timed
+
+-- | How long a part runs before it yields at its next point to give way at, in
+-- nanoseconds. Zero makes every point one it yields at. A short turn keeps the
+-- time that parts wait for their turns short; a part that gives way at
+-- cheap points, a link's receives, still passes many of them in one turn.
+newtype Turn = Turn Int
+
+microseconds :: Int -> Turn
+microseconds = Turn . (* 1000)
+
+-- | The turn of the runs that don't say: about as long as the work between two
+-- of a request's points to give way at, so that a part that waits is woken
+-- within a few turns, and long enough for a part that receives cheaply to pass
+-- many points in one.
+defaultTurn :: Turn
+defaultTurn = microseconds 10
 
 -- | A ticket's slot: empty, given its value, or holding the part that waits
 -- for it, as what puts the part back with the action that runs where it waits:
@@ -152,15 +172,17 @@ data Parked
 data Run = Run
   { -- | Parts that tickets woke.
     runTickets :: !(IORef [IO Step]),
-    -- | The steps the running part has left before it gives way, the steps
-    -- taken, the waits, the parts that wait for tickets that other cores
-    -- give and are not yet back from the mailbox, the parts that wait on
-    -- descriptors, those that wait for tickets, the number of the next wait,
-    -- the rounds, the time that the round began at, or 0 before it is read, and the parts that are in a scope:
-    -- unboxed, so that counting allocates nothing. A step is a point
-    -- to give way at, which a link's receive or send is, or a wait, or a
-    -- ticket given or waited for.
+    -- | When the running part's turn began, on the clock, the steps taken, the
+    -- waits, the parts that wait for tickets that other cores give and are not
+    -- yet back from the mailbox, the parts that wait on descriptors, those that
+    -- wait for tickets, the number of the next wait, the rounds, the time that
+    -- the round began at, or 0 before it is read, and the parts that are in a
+    -- scope: unboxed, so that counting allocates nothing. A step is a point to
+    -- give way at, which a link's receive or send is, or a wait, or a ticket
+    -- given or waited for.
     runCounters :: !(ForeignPtr Int),
+    -- | How long a turn is.
+    runTurn :: !Int,
     runPoller :: !(Ptr Poller),
     -- | Where other threads put parts for this scheduler.
     runMailbox :: !Mailbox,
@@ -206,20 +228,21 @@ batch :: Int
 batch = 64
 
 -- | A run with a poller, which 'freeRun' closes: whoever makes it frees it,
--- once nothing that is given parts through its mailbox can run any more.
-newRun :: IO Run
-newRun = do
+-- once nothing that is given parts through its mailbox can run any more. Its
+-- parts run for turns of that length.
+newRun :: Turn -> IO Run
+newRun (Turn turn) = do
   counters <- mallocForeignPtrArray 10
   unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 9]
   poller <- throwErrnoIfNull "directions_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
-  Run <$> newIORef [] <*> pure counters <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (getMonotonicTimeNSec >>= newWheel)
+  Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel)
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
 
-withRun :: (Run -> IO a) -> IO a
-withRun = bracket newRun freeRun
+withRun :: Turn -> (Run -> IO a) -> IO a
+withRun turn = bracket (newRun turn) freeRun
 
 -- | Gives the scheduler a part to go on with, from any thread, and wakes the
 -- scheduler if it sleeps in its poller. It says whether it did: it didn't if
@@ -290,7 +313,7 @@ roundNow run =
   counter run 8 >>= \known ->
     if known /= 0
       then pure (fromIntegral known)
-      else getMonotonicTimeNSec >>= \now -> now <$ setCounter run 8 (fromIntegral now)
+      else monotonicNanoseconds >>= \now -> now <$ setCounter run 8 (fromIntegral now)
 {-# INLINE roundNow #-}
 
 -- | The part, which is suspended, waits until the instant: a timer holds it, and puts it back among those that can
@@ -309,15 +332,21 @@ nextWait :: Run -> IO Int
 nextWait run = counter run 6 >>= \n -> n + 1 <$ setCounter run 6 (n + 1)
 {-# INLINE nextWait #-}
 
--- | Counts a step, and says whether the part has used its steps and yields.
+-- | Counts a step, and says whether the part has run for its turn and yields.
 spent :: Run -> IO Bool
 spent run = do
   counter run 1 >>= setCounter run 1 . (+ 1)
-  remaining <- counter run 0
-  if remaining <= 1 then pure True else False <$ setCounter run 0 (remaining - 1)
+  began <- counter run 0
+  now <- clock
+  pure (now - began >= runTurn run)
 {-# INLINE spent #-}
 
--- | Counts a step, and goes on, or yields once the part has used its steps.
+-- | The time on the monotonic clock, in nanoseconds, as the counters hold it.
+clock :: IO Int
+clock = fromIntegral <$> monotonicNanoseconds
+{-# INLINE clock #-}
+
+-- | Counts a step, and goes on, or yields once the part has run for its turn.
 stepped :: Run -> IO Step -> IO Step
 stepped run continue = spent run >>= \yields -> if yields then pure (Yielded continue) else continue
 {-# INLINE stepped #-}
@@ -521,10 +550,11 @@ takeEntry ident = go []
       entry : after -> go (entry : before) after
 
 -- | Runs the first part, and the parts it forks, until the result is there:
--- each part that can go on in turn, entered with the given action, for up to
--- 64 steps, which are mostly the receives and sends it makes. At the end it
--- closes the run's mailbox, so that those that give parts to it after that are
--- told they didn't; the run's poller stays until 'freeRun'.
+-- each part that can go on in turn, entered with the given action, until it
+-- has run for the run's turn and reaches a point to give way at, which are
+-- mostly the receives and sends it makes. At the end it closes the run's
+-- mailbox, so that those that give parts to it after that are told they
+-- didn't; the run's poller stays until 'freeRun'.
 --
 -- An asynchronous exception reaches the scheduler where it waits for a
 -- descriptor or a watch, and at the start of each round: the parts that are in
@@ -541,7 +571,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
     -- The parts that can go on in this round, and in the next.
     go ready later = case ready of
       part : others -> do
-        setCounter run 0 64
+        clock >>= setCounter run 0
         step <- enterPart part
         readIORef result >>= \case
           Just value -> (\steps waits -> (value, Report steps waits)) <$> counter run 1 <*> counter run 2
@@ -630,7 +660,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
     untilNextTimer =
       nextDeadline (runWheel run) >>= \case
         Nothing -> pure Nothing
-        Just deadline -> (\now -> Just (if deadline > now then deadline - now else 0)) <$> getMonotonicTimeNSec
+        Just deadline -> (\now -> Just (if deadline > now then deadline - now else 0)) <$> monotonicNanoseconds
     -- An asynchronous exception that arrives at a wait begins a shutdown: every part that is in a scope is
     -- cancelled. One that arrives again is the same.
     shuttingDown failure =

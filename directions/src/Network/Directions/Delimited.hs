@@ -27,9 +27,13 @@
 module Network.Directions.Delimited
   ( Delimited,
     runDelimited,
+    runDelimitedTurn,
     runDelimitedWith,
+    runDelimitedWithTurn,
     runCores,
+    runCoresTurn,
     runCoresReport,
+    runCoresReportTurn,
   )
 where
 
@@ -107,7 +111,7 @@ instance Effect (Delimited s) where
   now action = Delimited (\_ value -> action value)
   {-# INLINE now #-}
 
--- | Counts a step, and once the part has used its steps, lets the others go
+-- | Counts a step, and once the part has run for its turn, lets the others go
 -- on before it.
 instance GiveWay (Delimited s) where
   giveWay = Delimited (\context value -> value <$ step context)
@@ -305,7 +309,7 @@ giveRemote mailbox slot value = do
     Gone -> pure False
     Twice -> ioError (userError "a remote ticket was given a value twice")
 
--- | Counts a step, and once the part has used its steps, yields: captures what
+-- | Counts a step, and once the part has run for its turn, yields: captures what
 -- follows and gives it back to the scheduler. When the part goes on, it
 -- raises the cancellation that came meanwhile, if it is in a scope.
 step :: Context -> IO ()
@@ -313,17 +317,26 @@ step (Context run tag part) = spent run >>= \yields -> when yields (control0 tag
 {-# INLINE step #-}
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
--- that can go on in turn, under the prompt, until it has passed 64 points to
--- give way at (a link's receives and sends), and when none can, a wait until a
--- descriptor wakes one, or a watch fires. The program is for any core: the
--- tickets it makes can't be given to the program of another run.
+-- that can go on in turn, under the prompt, until it has run for a turn and
+-- reaches a point to give way at (a link's receives and sends), and when none
+-- can, a wait until a descriptor wakes one, or a watch fires. The program is
+-- for any core: the tickets it makes can't be given to the program of another
+-- run.
 runDelimited :: (forall s. Delimited s a b) -> a -> IO (b, Report)
-runDelimited program input = withRun (\run -> runIn run program input)
+runDelimited = runDelimitedTurn defaultTurn
+
+-- | 'runDelimited' with a turn of the given length.
+runDelimitedTurn :: Turn -> (forall s. Delimited s a b) -> a -> IO (b, Report)
+runDelimitedTurn turn program input = withRun turn (\run -> runIn run program input)
 
 -- | 'runDelimited' for a program that is made in IO, by an action that is run
 -- once, for the core that runs the program.
 runDelimitedWith :: (forall s. IO (Delimited s a b)) -> a -> IO (b, Report)
-runDelimitedWith setup input = setup >>= \program -> withRun (\run -> runIn run program input)
+runDelimitedWith = runDelimitedWithTurn defaultTurn
+
+-- | 'runDelimitedWith' with a turn of the given length.
+runDelimitedWithTurn :: Turn -> (forall s. IO (Delimited s a b)) -> a -> IO (b, Report)
+runDelimitedWithTurn turn setup input = setup >>= \program -> withRun turn (\run -> runIn run program input)
 
 runIn :: Run -> Delimited s a b -> a -> IO (b, Report)
 runIn run (Delimited program) input = do
@@ -343,13 +356,21 @@ runIn run (Delimited program) input = do
 -- the order of the cores, once all have ended. If any core fails, the others
 -- are stopped, even if they wait, and its exception is rethrown.
 runCores :: Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [r]
-runCores cores setup program = map fst <$> runCoresReport cores setup program
+runCores = runCoresTurn defaultTurn
+
+-- | 'runCores' with turns of the given length.
+runCoresTurn :: Turn -> Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [r]
+runCoresTurn turn cores setup program = map fst <$> runCoresReportTurn turn cores setup program
 
 -- | 'runCores', with each core's report.
 runCoresReport :: Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [(r, Report)]
-runCoresReport cores setup program = do
+runCoresReport = runCoresReportTurn defaultTurn
+
+-- | 'runCoresReport' with turns of the given length.
+runCoresReportTurn :: Turn -> Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [(r, Report)]
+runCoresReportTurn turn cores setup program = do
   shared <- setup
-  withRuns cores $ \runs -> do
+  withRuns turn cores $ \runs -> do
     outcomes <- newChan
     pending <- newIORef cores
     mask $ \restore -> do
@@ -374,7 +395,7 @@ runCoresReport cores setup program = do
 
 -- | The runs of that many cores, all freed once the action ends: after the
 -- threads that use them have.
-withRuns :: Int -> ([Run] -> IO a) -> IO a
-withRuns cores continue
+withRuns :: Turn -> Int -> ([Run] -> IO a) -> IO a
+withRuns turn cores continue
   | cores <= 0 = continue []
-  | otherwise = withRun (\run -> withRuns (cores - 1) (continue . (run :)))
+  | otherwise = withRun turn (\run -> withRuns turn (cores - 1) (continue . (run :)))

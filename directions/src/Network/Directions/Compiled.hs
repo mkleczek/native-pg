@@ -16,6 +16,7 @@
 module Network.Directions.Compiled
   ( Compiled,
     runCompiled,
+    runCompiledTurn,
   )
 where
 
@@ -71,7 +72,7 @@ resumed :: Context -> IO a -> IO a
 resumed (Context run _ failure) action = writeIORef (runFailure run) failure *> action
 {-# INLINE resumed #-}
 
--- | Counts a step, and goes on, or once the part has used its steps lets the others go on before it.
+-- | Counts a step, and goes on, or once the part has run for its turn lets the others go on before it.
 steppedIn :: Context -> IO Step -> IO Step
 steppedIn context@(Context run _ _) continue = spent run >>= \yields -> if yields then yielded context continue else continue
 {-# INLINE steppedIn #-}
@@ -83,7 +84,7 @@ yielded :: Context -> IO Step -> IO Step
 yielded context@(Context _ part _) continue = pure (Yielded (resumed context (checkpoint part *> continue)))
 {-# NOINLINE yielded #-}
 
--- | Counts a step, and once the part has used its steps, lets the others go
+-- | Counts a step, and once the part has run for its turn, lets the others go
 -- on before it.
 instance GiveWay Compiled where
   giveWay = Compiled (\context value next -> steppedIn context (next value))
@@ -234,13 +235,17 @@ instance Exchange Compiled where
       Waiter _ -> ioError (userError "two parts wait for one ticket")
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
--- that can go on in turn, until it has passed 64 points to give way at (a
--- link's receives and sends), and when none can, a wait until a descriptor
--- wakes one, or a watch fires.
+-- that can go on in turn, until it has run for a turn and reaches a point to
+-- give way at (a link's receives and sends), and when none can, a wait until a
+-- descriptor wakes one, or a watch fires.
 runCompiled :: Compiled a b -> a -> IO (b, Report)
-runCompiled (Compiled program) input = do
+runCompiled = runCompiledTurn defaultTurn
+
+-- | 'runCompiled' with a turn of the given length.
+runCompiledTurn :: Turn -> Compiled a b -> a -> IO (b, Report)
+runCompiledTurn turn (Compiled program) input = do
   result <- newIORef Nothing
-  withRun $ \run -> do
+  withRun turn $ \run -> do
     root <- newPart run
     let failure = throwIO . Escaped
         context = Context run root failure

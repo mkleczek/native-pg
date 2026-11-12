@@ -14,7 +14,6 @@ import Data.Functor (($>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Word (Word64)
-import GHC.Clock (getMonotonicTimeNSec)
 import Network.Directions.Classes hiding (within)
 import Network.Directions.Combinators (untilJust)
 import Network.Directions.Compiled
@@ -120,9 +119,9 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
 
     it "lets the loser finish a release that waits, which a shield protects" $ do
       loser <- newLog
-      started <- getMonotonicTimeNSec
+      started <- monotonicNanoseconds
       (winner <$> run (race (bracketed loser "loser" slowWait waitsForEver) giveWayAndEnd)) `shouldReturn` "second"
-      ended <- getMonotonicTimeNSec
+      ended <- monotonicNanoseconds
       readLog loser `shouldReturn` ["acquire loser", "release loser: cancelled"]
       -- The release waits 20 ms, and race waited for it.
       (ended - started >= 15000000) `shouldBe` True
@@ -142,9 +141,9 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
       readLog noted `shouldReturn` ["start", "now done", "after"]
 
     it "reaches a part that waits at once" $ do
-      started <- getMonotonicTimeNSec
+      started <- monotonicNanoseconds
       (winner <$> run (race waitsForEver (slowWait :: Program ()))) `shouldReturn` "second"
-      ended <- getMonotonicTimeNSec
+      ended <- monotonicNanoseconds
       (ended - started < 2000000000) `shouldBe` True
 
   describe "shield" $ do
@@ -326,8 +325,8 @@ giveWayAndEnd = giveWay
 -- | Keeps the thread busy for that many nanoseconds, in an action that doesn't wait.
 spinFor :: Word64 -> IO ()
 spinFor nanoseconds = do
-  started <- getMonotonicTimeNSec
-  let go = getMonotonicTimeNSec >>= \now' -> when (now' - started < nanoseconds) go
+  started <- monotonicNanoseconds
+  let go = monotonicNanoseconds >>= \now' -> when (now' - started < nanoseconds) go
   go
 
 ensureCores :: IO ()

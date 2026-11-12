@@ -76,7 +76,9 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   inherited by everything inside it. `Delimited` and `Compiled` keep a timer
   wheel for each core, read the clock once a round, and wait in the poller
   until the next timer; `Threads` uses GHC's timer manager; a `runSimulation`
-  has a virtual clock that jumps to the earliest deadline.
+  has a virtual clock that jumps to the earliest deadline. Every instant, and
+  every turn of a part, is read from one clock, `monotonicNanoseconds`, and not
+  from GHC's, which ticks in microseconds on macOS and has another base there.
 
 Run from the repository's root, in its `nix-shell`:
 

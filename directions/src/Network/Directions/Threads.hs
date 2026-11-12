@@ -32,7 +32,6 @@ import Data.Functor (($>))
 import Data.IORef (atomicWriteIORef, newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe (isNothing)
-import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
 import GHC.Exts (casMutVar#)
 import GHC.IO (IO (..))
@@ -290,10 +289,10 @@ instance Block Threads where
     Readable fd -> threadWaitRead fd
     Writable fd -> threadWaitWrite fd
     Watched register -> awaitWatch register
-    Until (Instant at) -> getMonotonicTimeNSec >>= \current -> when (at > current) (threadDelay (fromIntegral ((at - current + 999) `div` 1000)))
+    Until (Instant at) -> monotonicNanoseconds >>= \current -> when (at > current) (threadDelay (fromIntegral ((at - current + 999) `div` 1000)))
 
 instance Time Threads where
-  clock = Threads (\_ () -> Instant <$> getMonotonicTimeNSec)
+  clock = Threads (\_ () -> Instant <$> monotonicNanoseconds)
 
 -- | The deadline is a timeout of GHC's timer manager, which cancels the scope when it fires, and a cancel scope
 -- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another

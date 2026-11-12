@@ -20,7 +20,6 @@ import Control.Arrow (Arrow, ArrowChoice, (>>>), (>>^), (^>>))
 import Control.Concurrent (threadDelay)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.Word (Word64)
-import GHC.Clock (getMonotonicTimeNSec)
 import Network.Directions.Classes
 import Network.Directions.Combinators
 
@@ -92,11 +91,11 @@ wakeLatencies (Wake _ noted) = readIORef noted
 sleeper :: (ArrowChoice arr, Effect arr, Remote arr) => Wake -> Int -> arr () ()
 sleeper (Wake box noted) count = timesWith count (leave box >>> awaitRemote >>> now note)
   where
-    note given = getMonotonicTimeNSec >>= \arrived -> modifyIORef' noted ((arrived - given) :)
+    note given = monotonicNanoseconds >>= \arrived -> modifyIORef' noted ((arrived - given) :)
 
 -- | Waits for the sleeper's giver, then this many microseconds for its scheduler to wait, and gives the time:
 -- this many times.
 waker :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr) => Wake -> Int -> Int -> arr () ()
 waker (Wake box _) microseconds count = timesWith count (untilJust (atomicModifyIORef' box (Nothing,)) >>> now delayed >>> give >>^ const ())
   where
-    delayed giver = threadDelay microseconds *> getMonotonicTimeNSec >>= \given -> pure (giver, given)
+    delayed giver = threadDelay microseconds *> monotonicNanoseconds >>= \given -> pure (giver, given)

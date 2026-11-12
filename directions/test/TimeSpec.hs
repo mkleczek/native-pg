@@ -10,7 +10,6 @@ import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (>>>))
 import Control.Monad (forM, forM_, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Word (Word64)
-import GHC.Clock (getMonotonicTimeNSec)
 import Network.Directions.Classes
 import Network.Directions.Combinators (releaseWithin, sleep)
 import Network.Directions.Compiled
@@ -66,9 +65,9 @@ spec = describe "time" $ do
   forM_ runners $ \(Runner name run) -> describe name $ do
     it "gives Nothing when the deadline passes first, and releases what the body held" $ do
       noted <- newLog
-      started <- getMonotonicTimeNSec
+      started <- monotonicNanoseconds
       result <- run (within (millis 30) (bracketed noted "r" returnA waitsForEver))
-      ended <- getMonotonicTimeNSec
+      ended <- monotonicNanoseconds
       result `shouldBe` Nothing
       readLog noted `shouldReturn` ["acquire r", "release r: cancelled"]
       (ended - started >= 30000000) `shouldBe` True
@@ -96,13 +95,13 @@ spec = describe "time" $ do
 
     it "fires a deadline that is inside a shield, whatever outside cancels" $ do
       noted <- newLog
-      started <- getMonotonicTimeNSec
+      started <- monotonicNanoseconds
       winner' <-
         run $
           race
             (scope returnA (releaseWithin (millis 30) waitsForEver >>> noting noted "release ended" >>> arr (const ())) (arr snd >>> waitsForEver))
             giveWayAndEnd
-      ended <- getMonotonicTimeNSec
+      ended <- monotonicNanoseconds
       either (const "first") (const "second") winner' `shouldBe` "second"
       readLog noted `shouldReturn` ["release ended"]
       -- The release waited for its own deadline, and not for ever.
@@ -110,13 +109,13 @@ spec = describe "time" $ do
       (ended - started < 2000000000) `shouldBe` True
 
     it "sleeps for the time, which a cancellation ends" $ do
-      started <- getMonotonicTimeNSec
+      started <- monotonicNanoseconds
       run (sleep (millis 20)) `shouldReturn` ()
-      slept <- getMonotonicTimeNSec
+      slept <- monotonicNanoseconds
       (slept - started >= 20000000) `shouldBe` True
       winner' <- run (race (sleep (secs 30)) giveWayAndEnd)
       either (const "first") (const "second") winner' `shouldBe` "second"
-      ended <- getMonotonicTimeNSec
+      ended <- monotonicNanoseconds
       (ended - slept < 5000000000) `shouldBe` True
 
     it "reads a clock that goes forward, and that a sleep moves" $ do
@@ -143,9 +142,9 @@ spec = describe "time" $ do
 
   describe "the virtual clock of a simulation" $ do
     it "runs a wait of an hour at once, and the clock is where it was waiting until" $ do
-      started <- getMonotonicTimeNSec
+      started <- monotonicNanoseconds
       outcome <- runSimulation 1 1000 (sleep (secs 3600) >>> clock) ()
-      ended <- getMonotonicTimeNSec
+      ended <- monotonicNanoseconds
       simulatedOutcome outcome `shouldBe` Completed (Instant (3600 * 1000000000))
       (ended - started < 1000000000) `shouldBe` True
 
@@ -183,9 +182,9 @@ spec = describe "time" $ do
       simulatedOutcome outcome `shouldBe` Deadlocked [0]
 
     it "reads the clock of the run when it is not a simulation" $ do
-      started <- getMonotonicTimeNSec
+      started <- monotonicNanoseconds
       (Instant after', _) <- runLoop (sleep (millis 20) >>> clock) ()
-      ended <- getMonotonicTimeNSec
+      ended <- monotonicNanoseconds
       (after' >= started + 20000000) `shouldBe` True
       (ended - started >= 20000000) `shouldBe` True
 

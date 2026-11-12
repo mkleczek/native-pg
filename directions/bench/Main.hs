@@ -15,7 +15,6 @@ import Control.Monad (unless, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (isPrefixOf)
 import Data.Maybe (listToMaybe)
-import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.Classes
 import Network.Directions.Compiled
@@ -51,16 +50,16 @@ measureRun :: String -> Int -> (Int -> IO (Maybe Report, Int)) -> IO ()
 measureRun name mib run = do
   stats <- getRTSStatsEnabled
   before <- if stats then allocated_bytes <$> getRTSStats else pure 0
-  started <- getMonotonicTime
+  started <- monotonicNanoseconds
   (report, received) <- run (mib * 1048576)
-  ended <- getMonotonicTime
+  ended <- monotonicNanoseconds
   after <- if stats then allocated_bytes <$> getRTSStats else pure 0
   unless (received == mib * 1048576) $ ioError (userError (name <> ": the client got back " <> show received <> " bytes"))
   let per :: (Integral a) => a -> String
       per count = printf "%.1f" (fromIntegral count / fromIntegral mib :: Double)
       counted field = maybe "-" (per . field) report
       allocation = if stats then per (after - before) else "(+RTS -T)"
-  printf "%-24s %6d %9.1f %10s %10s %12s\n" name mib (fromIntegral mib / (ended - started) :: Double) (counted reportSteps) (counted reportWaits) allocation
+  printf "%-24s %6d %9.1f %10s %10s %12s\n" name mib (fromIntegral mib * 1e9 / fromIntegral (ended - started) :: Double) (counted reportSteps) (counted reportWaits) allocation
 
 -- | The round trip over socket pairs: the run's report, and how many bytes the
 -- client got back.

@@ -38,7 +38,6 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (partition, sort)
 import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
-import GHC.Clock (getMonotonicTimeNSec)
 import Network.Directions.Classes
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
@@ -349,7 +348,7 @@ watchOf = \case
   Writable fd -> fdWritable fd
   Watched register -> register
   Until (Instant at) -> do
-    current <- getMonotonicTimeNSec
+    current <- monotonicNanoseconds
     elapsed <- registerDelay (fromIntegral (if at > current then (at - current) `div` 1000 else 0))
     pure (Watch (readTVar elapsed >>= check) (pure ()))
 
@@ -377,7 +376,7 @@ runLoop program input = do
       step report (parked - length risen) (ready <> risen) waiting
     step report parked ready waiting = case ready of
       process : others -> do
-        (steps, advanced) <- advance env (Instant <$> getMonotonicTimeNSec) 64 (\woke -> modifyIORef' woken (woke :)) process
+        (steps, advanced) <- advance env (Instant <$> monotonicNanoseconds) 64 (\woke -> modifyIORef' woken (woke :)) process
         let report' = report{reportSteps = reportSteps report + steps}
         case advanced of
           Finished value -> pure (value, report')

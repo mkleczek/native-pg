@@ -7,8 +7,11 @@
  * which any other thread can trigger to end the scheduler's wait: an
  * EVFILT_USER event on kqueue, an eventfd on epoll. A wake is not a
  * descriptor's readiness: the wait takes it off and reports nothing for it.
+ *
+ * It also has the clock that every instant and every turn is read from.
  */
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
@@ -21,6 +24,18 @@ typedef struct directions_poller {
   int fd;
   int wake; /* the eventfd on Linux, unused on kqueue */
 } directions_poller;
+
+/* A monotonic clock, in nanoseconds. macOS's CLOCK_MONOTONIC ticks in whole
+ * microseconds, so there it is the uptime clock, which doesn't. */
+uint64_t directions_clock_ns(void) {
+#ifdef __APPLE__
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+#endif
+}
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #include <sys/event.h>

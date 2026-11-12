@@ -19,6 +19,7 @@ module Network.Directions.Classes
     Scope (..),
     Race (..),
     Instant (..),
+    monotonicNanoseconds,
     Duration (..),
     nanos,
     micros,
@@ -189,6 +190,11 @@ class Race arr where
 newtype Instant = Instant Word64
   deriving (Eq, Ord, Show)
 
+-- | The time on that clock, which every instant and every turn of a scheduler is read from, so that they agree:
+-- GHC's own is another clock on macOS, with another base, and ticks in microseconds.
+foreign import ccall unsafe "directions_clock_ns"
+  monotonicNanoseconds :: IO Word64
+
 -- | A length of time, in nanoseconds.
 newtype Duration = Duration Word64
   deriving (Eq, Ord, Show)
@@ -224,8 +230,8 @@ class Effect arr where
   now :: (a -> IO b) -> arr a b
 
 -- | A point where a part gives way to the others, if it has used its turn:
--- the arrows that run every part on one thread count the points a part passes,
--- and once it has passed enough, it lets the others go on before it. Only
+-- the arrows that run every part on one thread time a part's turn, and once
+-- it has run for a turn's length, it lets the others go on before it. Only
 -- where a part does I/O, in a link's receive and send, is there one: an action
 -- that never waits doesn't give way. An arrow that doesn't need it, because
 -- something else preempts its parts, as GHC's scheduler does threads, makes it
