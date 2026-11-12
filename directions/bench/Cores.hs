@@ -3,8 +3,9 @@
 -- | Measures what crosses cores. Run with @+RTS -T@ (allocation) and @-N@ for the cores it uses:
 --
 -- * @pingpong KIND ROUNDS@: round trips between two parts over tickets made as they go, in ns and bytes per round
---   trip. KIND is @local@ (two parts on one core, local tickets), @remote@ (two cores, remote tickets),
---   @threads@ (two threads, tickets) or @remote-threads@ (two threads, remote tickets).
+--   trip. KIND is @local@ (two parts on one core, local tickets), @compiled@ (the same, run by 'Compiled'),
+--   @remote@ (two cores, remote tickets), @threads@ (two threads, tickets) or @remote-threads@ (two threads,
+--   remote tickets).
 -- * @pool KIND CORES PARTS CONNECTIONS SECONDS@: parts that check a connection out of one pool, do a little work,
 --   and release it, for the time given: checkouts per second, how evenly the parts and cores got them, and
 --   allocation per checkout. KIND is @delimited@ (CORES cores of PARTS parts each) or @threads@ (the same number of
@@ -26,6 +27,7 @@ import Foreign.Storable (peek, poke)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.Classes
+import Network.Directions.Compiled
 import Network.Directions.Delimited
 import Network.Directions.Loop (Report (..))
 import Network.Directions.PingPong
@@ -66,6 +68,7 @@ pingPongRun kind rounds = do
   handoff <- newHandoff
   (seconds, bytes) <- measured $ case kind of
     "local" -> void (runDelimited (pingPong rounds) ())
+    "compiled" -> void (runCompiled (pingPong rounds) ())
     "remote" -> void (runCores 2 (pure handoff) (\shared core -> if core == 0 then remoteClient shared rounds else remoteServer shared rounds))
     "threads" -> runThreads (pingPong rounds) ()
     "remote-threads" -> runThreads (concurrently (remoteClient handoff rounds) (remoteServer handoff rounds) >>> arr (const ())) ()

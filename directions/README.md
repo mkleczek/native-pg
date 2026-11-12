@@ -51,6 +51,12 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   mailbox each round and before it sleeps. `Pool` is a connection pool written
   once for any arrow with `Remote`, with one reference to the free connections
   and the givers of the waiters.
+- **Helpers** (`Network.Directions.Combinators`): what programs need so that a
+  value is made where it is used and not carried through the arrows between:
+  `timesWith` (a step this many times, on a state), `untilJust` (a retry that
+  gives way), `keeping` (an arrow's result next to the input), and `expect` and
+  `call` for a request that carries the end its answer is waited at, with
+  `expectLocal` and `callLocal` for tickets of a core.
 
 Run from the repository's root, in its `nix-shell`:
 

@@ -25,6 +25,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import Data.IORef (IORef, modifyIORef')
 import Network.Directions.Classes
+import Network.Directions.Combinators
 
 -- | One direction: what the source sends goes to the sink through the buffer,
 -- until the source ends; then the sink's output ends.
@@ -69,10 +70,8 @@ together = \case
 
 -- | Runs the arrow this many times.
 times :: (ArrowChoice arr) => Int -> arr () () -> arr () ()
-times count act = const count ^>> loop
-  where
-    loop = (\k -> if k == 0 then Left () else Right (k - 1)) ^>> (returnA ||| (((),) ^>> first act >>> arr snd >>> loop))
-{-# INLINABLE times #-}
+times = timesWith
+{-# INLINE times #-}
 
 -- | Keeps a copy of what arrives, the latest first, until the end of the
 -- stream.
@@ -130,16 +129,14 @@ transaction :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, Link 
 transaction buffer end batch commits kept = newTicket >>> together [requests, answers]
   where
     requests =
-      ([batch],)
-        ^>> first (sendAll end)
+      keeping (const [batch] ^>> sendAll end)
         >>> snd
         ^>> await
         >>> (\commit -> [BS8.pack (if commit then "COMMIT\n" else "ROLLBACK\n")])
         ^>> sendAll end
         >>> shutdownSend end
     answers =
-      ((),)
-        ^>> first (receiveBytes buffer end (BS.length batch))
+      keeping (receiveBytes buffer end (BS.length batch))
         >>> (\(answer, decision) -> (decision, commits answer))
         ^>> fulfil
         >>> receiveAll buffer end kept
