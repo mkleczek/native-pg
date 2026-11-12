@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE InterruptibleFFI #-}
 {-# LANGUAGE LambdaCase #-}
 
@@ -215,7 +216,9 @@ schedule run enter result start = go [start] [] [] 0 0 `finally` closeInbox run
   where
     -- The parts that can go on in this round, and in the next; the parts that
     -- wait on watches; how many wait on descriptors; and how many tickets hold.
-    go ready later watching descriptors parked = case ready of
+    -- The counts are strict: a count left as a thunk keeps the parts it was
+    -- computed from, and their continuations, alive.
+    go ready later watching !descriptors !parked = case ready of
       part : others -> do
         setCounter run 0 64
         step <- enter part
@@ -240,7 +243,7 @@ schedule run enter result start = go [start] [] [] 0 0 `finally` closeInbox run
         case reverse later <> reverse tickets <> given <> polled of
           [] -> counter run 3 >>= \remote -> idle remote watching descriptors parked
           next -> go next [] watching (descriptors - length polled) (parked - length tickets)
-    idle remote watching descriptors parked
+    idle !remote watching !descriptors !parked
       | null watching && descriptors == 0 && remote == 0 =
           ioError . userError $
             if parked > (0 :: Int)
