@@ -20,6 +20,10 @@ library
                    Network.Directions.Delimited
                    Network.Directions.Simulated
                    Network.Directions.Proxy
+                   Network.Directions.Reader
+                   Network.Directions.Resumable
+                   Network.Directions.Memory
+                   Network.Directions.Rows
   c-sources: cbits/poller.c
   build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, containers >=0.6 && <0.8, network >=3.1 && <3.3, stm >=2.5 && <2.6, streaming-io
 
@@ -29,6 +33,7 @@ test-suite directions-spec
   hs-source-dirs: test
   main-is: Main.hs
   other-modules: DirectionsSpec
+                 ReaderSpec
   ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, network, directions, skeletest >=0.4.2 && <0.5

@@ -135,3 +135,14 @@ test-suite native-pg-spec
   -- to clients without requiring a separate implementation library.
   build-depends:      skeletest >= 0.4.2 && < 0.5
                     , stm
+
+-- Measures parsers over a reader of the directions prototype against the
+-- Input monad. Input is not exported, so the benchmark compiles its source.
+benchmark parsers-bench
+  type:               exitcode-stdio-1.0
+  default-language:   GHC2021
+  hs-source-dirs:     src bench
+  main-is:            ParsersBench.hs
+  other-modules:      Database.PostgreSQL.Internal.Protocol.Codec.Input
+  ghc-options:        -Wall -threaded -rtsopts
+  build-depends:      base, bytestring, directions, streaming-io
