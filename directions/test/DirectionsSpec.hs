@@ -1,8 +1,11 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE DataKinds #-}
+
 module DirectionsSpec (spec) where
 
-import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>))
-import Control.Exception (ErrorCall (..), bracket, throwIO, try)
-import Control.Monad (forM_, when)
+import Control.Arrow (ArrowChoice, arr, (>>>), (>>^), (^>>))
+import Control.Exception (ErrorCall (..), bracket, throw, throwIO, try)
+import Control.Monad (forM_, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
@@ -90,7 +93,15 @@ spec = describe "directions" $ do
         transact (== batch) (simulate seed) `shouldReturn` (Completed (), BS8.pack "COMMIT\n")
 
     it "show, in a simulation, a part that waits for a ticket nothing gives a value" $ do
-      (simulatedOutcome <$> runSimulation 1 limit (newTicket >>> await :: Loop () ()) ()) `shouldReturn` Deadlocked [0]
+      (simulatedOutcome <$> runSimulation 1 limit (ticket @_ @(Local Loop) >>> arr fst >>> await :: Loop () ()) ()) `shouldReturn` Deadlocked [0]
+
+    it "make the giver evaluate the value, so a value that is an error call fails the giver even when no part waits for the ticket yet" $ do
+      failsAtTheGive (runThreads givingErrorLocal ())
+      failsAtTheGive (runLoop givingErrorLocal ())
+      failsAtTheGive (runCompiled givingErrorLocal ())
+      failsAtTheGive (runDelimited givingErrorLocal ())
+      failsAtTheGive (runDelimited (givingError @'Anywhere) ())
+      failsAtTheGive (runSimulation 1 limit givingErrorLocal ())
 
   describe "giving way, with every part on one thread" $ do
     it "happens at a link's receives once the part has run for its turn, and not at actions that never wait" $ do
@@ -274,6 +285,21 @@ transact commits run = do
   result <- run (pure (together [transaction forClient client batch commits kept, echo forServer server]))
   (,) result . BS.concat . reverse <$> readIORef kept
 
+-- | The error call that the value a giver gives is.
+valueError :: ErrorCall
+valueError = ErrorCall "the value given was an error call"
+
+-- | A ticket that no part waits for, whose giver gives a value that is an error call.
+givingError :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
+givingError = ticket @arr @r >>> arr (\(_, giver) -> (giver, throw valueError :: Int)) >>> give
+
+givingErrorLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () Bool
+givingErrorLocal = givingError @(Local arr)
+
+-- | The run fails with the error call, which the giver evaluates when it gives.
+failsAtTheGive :: IO a -> IO ()
+failsAtTheGive run = try (void run) `shouldReturn` (Left valueError :: Either ErrorCall ())
+
 -- | How the client and the proxy are made.
 data Setup = Setup
   { setupClient :: forall arr end. (ArrowChoice arr, Concurrent arr, Effect arr, Link arr end) => Buffer -> end -> ByteString -> IORef [ByteString] -> arr () (),
@@ -303,7 +329,7 @@ world setup bytes kept (client, front, back, server) = do
       ]
 
 -- | A program made in IO, which each arrow runs: what the tests run.
-type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, GiveWay arr, Block arr) => IO (arr () ())
+type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr) => IO (arr () ())
 
 -- | The round trip over simulated links that hold 1000 bytes each way: what
 -- the run gave, and what the client kept.

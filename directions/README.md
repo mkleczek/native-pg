@@ -7,10 +7,11 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   block in the arrow that runs them (`receive`, `sendAll`, `shutdownSend`,
   `close`); and what an arrow can do: `Effect` (`now`, an action that never
   waits), `Block` (wait until a watch fires), `Concurrent` (two arrows at
-  once) and `Exchange` (a ticket that one direction gives a value and another
-  waits for; made as the program runs, `newTicket :: arr () (Ticket arr a)`,
-  and passed through arrows like any value). None has a superclass: instances
-  and users add what they need.
+  once) and `Exchange arr r` (a ticket that one direction gives a value and
+  another waits for; made as the program runs, `ticket :: arr () (Waiting arr r a, Giver r a)`,
+  and its ends passed through arrows like any value; the ticket's reach `r` is
+  in its type, below). None has a superclass: instances and users add what they
+  need.
 - **A link's instance is written once, for any arrow:** the socket's and the
   simulated end's are `(ArrowChoice arr, Effect arr, Block arr) => Link arr _`,
   a try with `now`, and a `block` on the link's watch while nothing is ready.
@@ -40,23 +41,28 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   core is one `Delimited` scheduler for each core, with its own poller and
   mailbox. The core is in the arrow's type, as `ST`'s state thread is:
   `Delimited s a b`, run by `runDelimited :: (forall s. Delimited s a b) -> ...`
-  or by `runCores`, so a `Ticket (Delimited s) a` belongs to the one scheduler
-  and can't be given a value, or waited for, by the program of another core
-  (`RegionSpec` shows the compiler refusing, with `-fdefer-type-errors`). What
-  crosses cores is a `Remote` ticket: an `Awaiting` end, on the core that made
-  it, and a `Giver`, which has no core in its type and can be kept in shared
-  structures. A `give` to a parked waiter puts its continuation in the
-  waiter's core's mailbox and wakes that core's poller (`EVFILT_USER` on
-  kqueue, an eventfd on epoll) if it sleeps in it; the scheduler takes its
-  mailbox each round and before it sleeps. `Pool` is a connection pool written
-  once for any arrow with `Remote`, with one reference to the free connections
-  and the givers of the waiters.
+  or by `runCores`. One ticket API, `Exchange arr r`, with the ticket's reach in
+  its type: `data Reach = Here Type | Anywhere`. A ticket of reach `'Here s`
+  (`Local (Delimited s)`) belongs to the one scheduler: its `Giver ('Here s) a`
+  mentions `s`, so it and its `Waiting` end can't be given a value, or waited
+  for, by the program of another core (`RegionSpec` shows the compiler refusing,
+  with `-fdefer-type-errors`), and the arrow keeps it as a plain slot, with no
+  atomic operation. A ticket of reach `'Anywhere` has a `Giver 'Anywhere a`,
+  which has no core in its type and can be kept in shared structures, and a
+  `Waiting` end on the core that made it. A `give` to a parked waiter puts its
+  continuation in the waiter's core's mailbox and wakes that core's poller
+  (`EVFILT_USER` on kqueue, an eventfd on epoll) if it sleeps in it; the
+  scheduler takes its mailbox each round and before it sleeps. `Pool` is a
+  connection pool written once for any arrow with `Exchange arr 'Anywhere`, with
+  one reference to the free connections and the givers of the waiters.
+  `Threads` has the one reach, `'Anywhere`, and `Compiled` and `Loop` only
+  `Local`'s.
 - **Helpers** (`Network.Directions.Combinators`): what programs need so that a
   value is made where it is used and not carried through the arrows between:
   `timesWith` (a step this many times, on a state), `untilJust` (a retry that
   gives way), `keeping` (an arrow's result next to the input), and `expect` and
-  `call` for a request that carries the end its answer is waited at, with
-  `expectLocal` and `callLocal` for tickets of a core.
+  `call` for a request that carries the giver its answer is given at, for a
+  ticket of any reach.
 
 - **Scopes and cancellation** (`Scope`, `Race`; `Network.Directions.Cancel`):
   `scope acquire release body` releases on every exit, behind a shield, and
@@ -65,7 +71,7 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   until it ends; `concurrently` cancels the other half when one fails, waits
   for it, and rethrows the first failure; `race` cancels the loser and waits
   for it. A part is cancelled at its waits only (`block`, `await`,
-  `awaitRemote`, `giveWay`), so no `now` is interrupted. Every arrow has them:
+  `giveWay`), so no `now` is interrupted. Every arrow has them:
   `Threads` throws once to a part that waits, `Delimited` resumes the part
   with the exception, `Compiled` unwinds explicit failure continuations, and
   `Loop` unwinds frames. A shutdown of a `Delimited` or `Compiled` run

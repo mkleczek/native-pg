@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -29,6 +30,7 @@ import Network.Directions.Cancel
 import Network.Directions.Classes
 import Network.Directions.Loop (Report)
 import Network.Directions.Scheduler
+import Network.Directions.Tickets
 import Network.Directions.Timers (addTimer, cancelTimer)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
@@ -213,26 +215,28 @@ instance Race Compiled where
         (resumed failing1 (one failing1 value (ended1 . Right . Left)))
         (resumed failing2 (two failing2 value (ended2 . Right . Right)))
 
+-- | The region of the tickets of this arrow: there is one core, the thread that runs it.
+data Core
+
 -- | A ticket is a slot on this thread: a part that waits for it is parked in
--- it, as its continuation, and goes back among those that can go on when the
--- ticket is given its value. Giving and waiting count a step, and can give
--- way: a ticket is where parts coordinate, and none is on a parser's path.
-instance Exchange Compiled where
-  newtype Ticket Compiled a = CompiledTicket (IORef (Slot a))
-  newTicket = Compiled (\_ () next -> newIORef Empty >>= next . CompiledTicket)
-  fulfil = Compiled $ \context@(Context run _ _) (CompiledTicket slot, value) next ->
-    readIORef slot >>= \case
-      Empty -> writeIORef slot (Given value) *> steppedIn context (next ())
-      Waiter resume -> do
-        writeIORef slot (Given value)
-        wakeTicket run (resume (pure value))
-        steppedIn context (next ())
-      Given _ -> ioError (userError "a ticket was given a value twice")
-  await = Compiled $ \context@(Context _ part _) (CompiledTicket slot) next ->
+-- it, as a closure that puts its continuation back among those that can go on,
+-- and goes back when the ticket is given its value. Giving and waiting count a
+-- step, and can give way: a ticket is where parts coordinate, and none is on a
+-- parser's path. There is no instance for reach @'Anywhere@: no program of this
+-- arrow has another core to give a ticket's value from.
+type instance Local Compiled = 'Here Core
+
+instance Exchange Compiled ('Here Core) where
+  newtype Waiting Compiled ('Here Core) a = CompiledWaiting (IORef (Slot a))
+  ticket = Compiled (\_ () next -> newIORef Empty >>= \slot -> next (CompiledWaiting slot, HereGiver slot))
+  await = Compiled $ \context@(Context run part _) (CompiledWaiting slot) next ->
     readIORef slot >>= \case
       Given value -> checkpoint part *> steppedIn context (next value)
-      Empty -> registering part (OnTicket slot) *> (Parked <$ writeIORef slot (Waiter (\action -> resumed context (action >>= next))))
+      Empty -> registering part (OnTicket slot) *> (Parked <$ writeIORef slot (Waiter (\action -> wakeTicket run (resumed context (action >>= next)))))
       Waiter _ -> ioError (userError "two parts wait for one ticket")
+      Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
+  give = Compiled (\context (HereGiver slot, value) next -> giveHere slot value >>= \taken -> steppedIn context (next taken))
+  abandon = Compiled (\_ (CompiledWaiting slot) next -> abandonHere slot >>= next)
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
 -- that can go on in turn, until it has run for a turn and reaches a point to

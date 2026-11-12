@@ -9,8 +9,6 @@ module Network.Directions.Combinators
     keeping,
     expect,
     call,
-    expectLocal,
-    callLocal,
     sleep,
     releaseWithin,
   )
@@ -38,32 +36,22 @@ keeping :: (Arrow arr) => arr () b -> arr c (b, c)
 keeping act = ((),) ^>> first act
 {-# INLINE keeping #-}
 
--- | Makes an end to wait at, gives the message that carries its giver, and keeps the end. It doesn't say whether
--- the giver took the message: a caller that needs that gives it itself.
-expect :: (Arrow arr, Remote arr) => (Giver a -> b) -> arr (Giver b) (Awaiting arr a)
+-- | Makes a ticket, gives the message that carries its giver, and keeps the end to wait at. It doesn't say whether
+-- the giver took the message: a caller that needs that gives it itself. For any reach: a ticket of the arrow's own
+-- core, whose message goes to a part of that core, or a ticket of any core, whose message crosses cores.
+expect :: (Arrow arr, Exchange arr r) => (Giver r a -> b) -> arr (Giver r b) (Waiting arr r a)
 expect message =
   ((),)
-    ^>> first newRemote
+    ^>> first ticket
     >>> (\((end, giver), to) -> ((to, message giver), end))
     ^>> first give
     >>^ snd
 {-# INLINE expect #-}
 
 -- | Asks: gives the message that carries the giver of the answer, and waits for the answer.
-call :: (Arrow arr, Remote arr) => (Giver a -> b) -> arr (Giver b) a
-call message = expect message >>> awaitRemote
+call :: (Arrow arr, Exchange arr r) => (Giver r a -> b) -> arr (Giver r b) a
+call message = expect message >>> await
 {-# INLINE call #-}
-
--- | 'expect' for a ticket of this core, which is both ends: makes the ticket, gives the message that carries it to
--- the ticket, and keeps it to wait at.
-expectLocal :: (Arrow arr, Exchange arr) => (Ticket arr a -> b) -> arr (Ticket arr b) (Ticket arr a)
-expectLocal message =
-  ((),)
-    ^>> first newTicket
-    >>> (\(ticket, to) -> ((to, message ticket), ticket))
-    ^>> first fulfil
-    >>^ snd
-{-# INLINE expectLocal #-}
 
 -- | Waits for this long. It is a wait, so a cancellation reaches it.
 sleep :: (Arrow arr, Time arr, Block arr) => Duration -> arr () ()
@@ -75,8 +63,3 @@ sleep duration = clock >>> (\now' -> Until (now' `plus` duration)) ^>> block
 releaseWithin :: (Scope arr, Within arr) => Duration -> arr a () -> arr a (Maybe ())
 releaseWithin duration release = shield (within duration release)
 {-# INLINE releaseWithin #-}
-
--- | 'call' for a ticket of this core.
-callLocal :: (Arrow arr, Exchange arr) => (Ticket arr a -> b) -> arr (Ticket arr b) a
-callLocal message = expectLocal message >>> await
-{-# INLINE callLocal #-}

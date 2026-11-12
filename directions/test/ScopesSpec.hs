@@ -1,11 +1,13 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 
 -- | Scopes, failures and cancellation, for every arrow that has them: the same programs, written once for any
 -- arrow that has what they need, are run by each.
 module ScopesSpec (spec) where
 
-import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (ArrowChoice, arr, first, returnA, second, (>>>), (^>>), (|||))
 import Control.Concurrent (forkIO, getNumCapabilities, setNumCapabilities, threadDelay)
 import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
@@ -30,10 +32,10 @@ import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr, Scope arr, Race arr)
+type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr)
 
 -- | The same, for the pool, which parts of several cores share.
-type Pooled arr = (Rich arr, Remote arr)
+type Pooled arr = (Rich arr, Exchange arr 'Anywhere)
 
 type Program a = forall arr. (Rich arr) => arr () a
 
@@ -162,6 +164,31 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
       (winner <$> run (race (slowWait >>> noting noted "not cancelled" >>> waitsForEver) giveWayAndEnd)) `shouldReturn` "second"
       readLog noted `shouldReturn` []
 
+  -- A part of a Loop that waits for a ticket is held by the ticket and is not cancelled there.
+  when (name /= "loop") $
+    describe "a part that waits for a ticket of the arrow's own core" $ do
+      it "is cancelled where it waits, and a value given to its ticket afterwards is not given to it, but is its waiter's to take back" $ do
+        noted <- newLog
+        run (cancelledWaiterLocal noted False) `shouldReturn` ("second", True, Just 7)
+        readLog noted `shouldReturn` ["acquire", "release: cancelled"]
+
+      it "gives up its ticket when it is cancelled, and a value given to the ticket afterwards is told it isn't taken" $ do
+        noted <- newLog
+        run (cancelledWaiterLocal noted True) `shouldReturn` ("second", False, Nothing)
+        readLog noted `shouldReturn` ["acquire", "release: cancelled"]
+
+  when (name `elem` ["threads", "delimited"]) $
+    describe "a part that waits for a ticket of any core" $ do
+      it "is cancelled where it waits, and a value given to its ticket afterwards is not given to it, but is its waiter's to take back" $ do
+        noted <- newLog
+        runAnywhere name (cancelledWaiter @'Anywhere noted False) `shouldReturn` ("second", True, Just 7)
+        readLog noted `shouldReturn` ["acquire", "release: cancelled"]
+
+      it "gives up its ticket when it is cancelled, and a value given to the ticket afterwards is told it isn't taken" $ do
+        noted <- newLog
+        runAnywhere name (cancelledWaiter @'Anywhere noted True) `shouldReturn` ("second", False, Nothing)
+        readLog noted `shouldReturn` ["acquire", "release: cancelled"]
+
   when (name /= "compiled") $ it "lose and duplicate no connection of a pool, and let no part wait for ever, whatever cancels the parts" $ do
     ensureCores
     forM_ [1, 2] $ \seed -> do
@@ -286,6 +313,39 @@ describeExit = \case
   Failed failure -> "failed " <> show failure
   Cancelled' -> "cancelled"
 
+-- | A program that parts of every core can share tickets in: the arrows of cores and of threads run it.
+runAnywhere :: String -> (forall arr. (Pooled arr) => arr () a) -> IO a
+runAnywhere name program = case name of
+  "threads" -> runThreads program ()
+  _ -> fst <$> runDelimited program ()
+
+-- | The waiting end of a ticket, waited for in a resource whose release notes how the wait ended and, if it is
+-- told to, gives up the ticket.
+waiterIn :: forall r arr. (Rich arr, Exchange arr r) => Log -> Bool -> arr (Waiting arr r Int) Int
+waiterIn noted giveUp =
+  scope
+    (noting noted "acquire")
+    ((if giveUp then first abandon else first (arr (const Nothing))) >>> now (\(_, exit) -> note noted ("release: " <> describeExit exit)))
+    (arr snd >>> await >>> noting noted "resumed")
+
+-- | A part waits for a ticket in a race that the other half ends at once, so that it is cancelled where it waits.
+-- Then the ticket is given a value, and its waiting end abandoned: whether the give was taken, and what the abandon
+-- gave back.
+cancelledWaiter :: forall r arr. (Rich arr, Exchange arr r) => Log -> Bool -> arr () (String, Bool, Maybe Int)
+cancelledWaiter noted giveUp =
+  ticket @arr @r
+    >>> (\ends -> (ends, ends))
+    ^>> first (race (arr fst >>> waiterIn @r noted giveUp) (arr (const ()) >>> giveWayAndEnd))
+    >>> (\(outcome, (waiting, giver)) -> ((giver, 7), (winner outcome, waiting)))
+    ^>> first give
+    >>> (\(taken, (who, waiting)) -> ((who, taken), waiting))
+    ^>> second abandon
+    >>> arr (\((who, taken), returned) -> (who, taken, returned))
+
+-- | The same at the reach of the arrow's own core.
+cancelledWaiterLocal :: forall arr. (Rich arr) => Log -> Bool -> arr () (String, Bool, Maybe Int)
+cancelledWaiterLocal = cancelledWaiter @(Local arr)
+
 -- | A wait of about 20 ms, for a descriptor that another thread makes readable.
 slowWait :: (Rich arr) => arr () ()
 slowWait = now (\() -> readableAfter 20000) >>> block
@@ -312,7 +372,7 @@ kept = unsafePerformIO (newIORef [])
 
 -- | A wait that another thread ends at once: it may or may not find the value there.
 quickWait :: (Pooled arr) => arr () ()
-quickWait = newRemote >>> now (\(awaiting, Giver giving) -> awaiting <$ forkIO (void (giving ()))) >>> awaitRemote
+quickWait = ticket @_ @'Anywhere >>> now (\(awaiting, giver) -> awaiting <$ forkIO (void (runThreads give (giver, ())))) >>> await
 
 -- | Which half of a race was the first to end.
 winner :: Either a b -> String

@@ -1,4 +1,5 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
 
@@ -26,14 +27,14 @@ import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr, Scope arr, Race arr, Time arr, Within arr)
+type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Time arr, Within arr)
 
 type Program a = forall arr. (Rich arr) => arr () a
 
 data Runner = Runner String (forall a. Program a -> IO a)
 
 -- | A program that parts of several cores share a pool in.
-type PoolProgram a = forall arr. (Rich arr, Remote arr) => arr () a
+type PoolProgram a = forall arr. (Rich arr, Exchange arr 'Anywhere) => arr () a
 
 data PoolRunner = PoolRunner String (forall a. PoolProgram a -> IO a)
 
@@ -67,6 +68,17 @@ spec = describe "time" $ do
       noted <- newLog
       started <- monotonicNanoseconds
       result <- run (within (millis 30) (bracketed noted "r" returnA waitsForEver))
+      ended <- monotonicNanoseconds
+      result `shouldBe` Nothing
+      readLog noted `shouldReturn` ["acquire r", "release r: cancelled"]
+      (ended - started >= 30000000) `shouldBe` True
+      (ended - started < 2000000000) `shouldBe` True
+
+    -- A part of a Loop that waits for a ticket is held by the ticket and is not cancelled there.
+    when (name /= "loop") $ it "gives Nothing when the deadline passes while the part waits for a ticket of the arrow's own core, and releases what the body held" $ do
+      noted <- newLog
+      started <- monotonicNanoseconds
+      result <- run (within (millis 30) (bracketed noted "r" returnA waitsForTicket))
       ended <- monotonicNanoseconds
       result `shouldBe` Nothing
       readLog noted `shouldReturn` ["acquire r", "release r: cancelled"]
@@ -131,7 +143,13 @@ spec = describe "time" $ do
       result `shouldBe` Just 'z'
 
   describe "the pool" $
-    forM_ poolRunners $ \(PoolRunner name run) ->
+    forM_ poolRunners $ \(PoolRunner name run) -> do
+      it ("gives Nothing when the deadline passes while the part waits for a ticket of any core, and releases what the body held (" <> name <> ")") $ do
+        noted <- newLog
+        result <- run (within (millis 30) (bracketed noted "r" returnA waitsForAnywhereTicket))
+        result `shouldBe` Nothing
+        readLog noted `shouldReturn` ["acquire r", "release r: cancelled"]
+
       it ("gives a part that waits for a connection too long Nothing, and keeps no place for it (" <> name <> ")") $ do
         pool <- newPool [7 :: Int]
         -- The part holds the only connection, and asks for another with a deadline.
@@ -178,7 +196,7 @@ spec = describe "time" $ do
       first' <- simulatedTrace <$> runSimulation 5 100000 (together [sleep (secs 2), sleep (secs 1)]) ()
       again <- simulatedTrace <$> runSimulation 5 100000 (together [sleep (secs 2), sleep (secs 1)]) ()
       again `shouldBe` first'
-      outcome <- runSimulation 1 1000 (newTicket >>> await :: Loop () ()) ()
+      outcome <- runSimulation 1 1000 (ticket @_ @(Local Loop) >>> arr fst >>> await :: Loop () ()) ()
       simulatedOutcome outcome `shouldBe` Deadlocked [0]
 
     it "reads the clock of the run when it is not a simulation" $ do
@@ -266,6 +284,13 @@ describeExit = \case
   Cancelled' -> "cancelled"
 
 -- | A wait that nothing ends.
+-- | A wait for a ticket of the arrow's own core that nothing gives a value, and for one of any core.
+waitsForTicket :: forall arr a. (Rich arr) => arr a ()
+waitsForTicket = arr (const ()) >>> ticket @arr @(Local arr) >>> arr fst >>> (await :: arr (Waiting arr (Local arr) ()) ())
+
+waitsForAnywhereTicket :: forall arr a. (Rich arr, Exchange arr 'Anywhere) => arr a ()
+waitsForAnywhereTicket = arr (const ()) >>> ticket @arr @'Anywhere >>> arr fst >>> (await :: arr (Waiting arr 'Anywhere ()) ())
+
 waitsForEver :: (Rich arr) => arr a ()
 waitsForEver = now (const readableNever) >>> block
 

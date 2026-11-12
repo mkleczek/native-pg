@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
@@ -39,12 +40,13 @@ import Data.List (partition, sort)
 import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
 import Network.Directions.Classes
+import Network.Directions.Tickets
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
 -- | A program as data: functions, sequences, choices and concurrent pairs, and
 -- its primitives: an action that never waits, a block until an event fires,
--- and giving and waiting for a ticket.
+-- and waiting for a ticket.
 data Loop a b where
   Arr :: (a -> b) -> Loop a b
   Seq :: Loop a b -> Loop b c -> Loop a c
@@ -54,7 +56,6 @@ data Loop a b where
   Now :: (a -> IO b) -> Loop a b
   Clock :: Loop () Instant
   Block :: Loop Event ()
-  Fulfil :: Loop (IORef (Slot a), a) ()
   Await :: Loop (IORef (Slot a)) a
   Scope' :: Loop a r -> Loop (r, Exit) () -> Loop (r, a) b -> Loop a b
   Try :: Loop a b -> Loop a (Either SomeException b)
@@ -109,18 +110,21 @@ instance GiveWay Loop where
 instance Block Loop where
   block = Block
 
+-- | The region of the tickets of this arrow: there is one core, the thread that runs it.
+data Core
+
 -- | A ticket is a slot on this thread. A part that waits for it is parked in
 -- it, with no watch, and goes back among those that can go on when the ticket
--- is given its value.
-instance Exchange Loop where
-  newtype Ticket Loop a = LoopTicket (IORef (Slot a))
-  newTicket = Now (\() -> LoopTicket <$> newIORef Empty)
-  fulfil = Seq (Arr (\(LoopTicket slot, value) -> (slot, value))) Fulfil
-  await = Seq (Arr (\(LoopTicket slot) -> slot)) Await
+-- is given its value. Giving a value and abandoning the ticket never wait, so
+-- they are actions.
+type instance Local Loop = 'Here Core
 
--- | A ticket's slot: empty, given its value, or holding the part that waits for
--- it, as what puts the part back among those that can go on.
-data Slot a = Empty | Given a | Waiter (a -> IO ())
+instance Exchange Loop ('Here Core) where
+  newtype Waiting Loop ('Here Core) a = LoopWaiting (IORef (Slot a))
+  ticket = Now (\() -> newIORef Empty >>= \slot -> pure (LoopWaiting slot, HereGiver slot))
+  await = Seq (Arr (\(LoopWaiting slot) -> slot)) Await
+  give = Now (\(HereGiver slot, value) -> giveHere slot value)
+  abandon = Now (\(LoopWaiting slot) -> abandonHere slot)
 
 -- | A part of a running program: a program with its input, or a value for
 -- what follows, and what follows; or a failure, which unwinds what follows,
@@ -289,17 +293,12 @@ advance env time fuel wake = go 0
               cancelledNow env frames >>= \case
                 Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
                 Nothing -> pure (steps + 1, Waits input (Check frames))
-            Fulfil -> case input of
-              (slot, value) ->
-                readIORef slot >>= \case
-                  Empty -> writeIORef slot (Given value) *> go (steps + 1) (Give () frames)
-                  Waiter resume -> writeIORef slot (Given value) *> resume value *> go (steps + 1) (Give () frames)
-                  Given _ -> ioError (userError "a ticket was given a value twice")
             Await ->
               readIORef input >>= \case
                 Given value -> go (steps + 1) (Give value frames)
-                Empty -> (steps + 1, Parked) <$ writeIORef input (Waiter (\value -> wake (Give value frames)))
+                Empty -> (steps + 1, Parked) <$ writeIORef input (Waiter (\action -> action >>= \value -> wake (Give value frames)))
                 Waiter _ -> ioError (userError "two parts wait for one ticket")
+                Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
             Scope' acquire release body -> go steps (Run acquire input (Acquired release body input frames))
             Try inner -> go steps (Run inner input (Trying frames))
             Shield' inner -> go steps (Run inner input (Shielding frames))

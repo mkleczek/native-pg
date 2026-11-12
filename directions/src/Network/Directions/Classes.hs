@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -33,9 +34,10 @@ module Network.Directions.Classes
     Block (..),
     Event (..),
     Events (..),
+    Reach (..),
+    Giver,
     Exchange (..),
-    Remote (..),
-    Giver (..),
+    Local,
     HalfClose (..),
     receiveTrying,
     sendAllTrying,
@@ -53,9 +55,11 @@ import Control.Exception (Exception, SomeException, fromException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
+import Data.Kind (Type)
 import Data.Word (Word64, Word8)
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
+import Network.Directions.Tickets (Giver, Reach (..))
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Streaming.Link as S
@@ -77,52 +81,44 @@ class Link arr link where
   close :: link -> arr () ()
 
 -- | Values that one direction gives another, once each: the way directions
--- exchange what they know. How a ticket is kept and waited for is the arrow's.
--- A ticket is made when the program runs, and passed through arrows like any
--- value, so a part can make one for each thing it waits for. An arrow whose
--- parts run on one core, as "Network.Directions.Delimited" does, makes a ticket
--- belong to that core in its type: it can be given and waited for by the parts
--- of that core only.
-class Exchange arr where
-  data Ticket arr a
+-- exchange what they know. A ticket has two ends, a 'Waiting' end that the
+-- part which needs the value waits at, on the core that made the ticket, and
+-- a 'Giver' that gives it, which the part that has the value keeps. A ticket
+-- is made when the program runs, and its ends are passed through arrows like
+-- any value, so a part can make one for each thing it waits for.
+--
+-- The ticket's reach @r@ says in its type where the giver can be used. A giver
+-- of reach @'Here s@ belongs to the core of the arrow @s@ that made the ticket,
+-- as the arrow's own region does: only the parts of that core can give it a
+-- value, and the arrow can keep its slot as plain memory, with no atomic
+-- operation, and its parts on its own run list. A giver of reach @'Anywhere@
+-- belongs to no core, so that shared structures can hold it, and the parts of
+-- any core can give it a value: it costs what a value that crosses cores costs.
+-- An arrow has the instances for the reaches it can keep.
+class Exchange arr (r :: Reach) where
+  data Waiting arr r a
 
-  newTicket :: arr () (Ticket arr a)
+  -- | The ends of a new ticket, made on this core.
+  ticket :: arr () (Waiting arr r a, Giver r a)
 
-  -- | Gives the ticket its value. A ticket is given one once.
-  fulfil :: arr (Ticket arr a, a) ()
+  -- | Waits until the ticket is given its value, and gives it. Only on the
+  -- core that made it, which the arrow's type says.
+  await :: arr (Waiting arr r a) a
 
-  -- | Waits until the ticket has its value, and gives it.
-  await :: arr (Ticket arr a) a
-
--- | A ticket that the parts of other cores can give a value, for a part that
--- waits for it on its own core: one end to wait at, which belongs to that core
--- as a 'Ticket' does, and one to give at, which doesn't, so that shared
--- structures can hold it. A pool of connections keeps the givers of those that
--- wait for one.
-class Remote arr where
-  data Awaiting arr a
-
-  -- | A pair of ends of a new ticket, made on this core.
-  newRemote :: arr () (Awaiting arr a, Giver a)
-
-  -- | Waits until the ticket is given its value, and gives it. Only on the core
-  -- that made it, which its type says.
-  awaitRemote :: arr (Awaiting arr a) a
-
-  -- | Gives the value to the part that waits at the other end, from any core,
-  -- and says whether it did: it didn't if the waiter has gone, and the value
-  -- is the giver's again.
-  give :: arr (Giver a, a) Bool
+  -- | Gives the value to the part that waits at the other end, and says whether
+  -- it did: it didn't if the waiter has gone, and the value is the giver's
+  -- again. A ticket is given one value once.
+  give :: arr (Giver r a, a) Bool
 
   -- | The waiter stops wanting the value, before it waits for it: a later
   -- 'give' says it didn't. If the value was given already, it is the waiter's,
   -- and this gives it back.
-  abandon :: arr (Awaiting arr a) (Maybe a)
+  abandon :: arr (Waiting arr r a) (Maybe a)
 
--- | The giving end of a remote ticket: it says whether the value was given.
--- It mentions no core, so it can be sent to others and kept in structures that
--- they share.
-newtype Giver a = Giver (a -> IO Bool)
+-- | The cheapest reach that an arrow has: that of the tickets whose parts all
+-- run on one core, which is @'Here s@ for an arrow with a region @s@, and
+-- @'Anywhere@ for one that has no cores to belong to.
+type family Local (arr :: Type -> Type -> Type) :: Reach
 
 -- | Two arrows that run at once on the same input, as '&&&' runs them one
 -- after the other: the result is both outputs, once both have ended.
@@ -163,7 +159,7 @@ exitOf = either (\failure -> maybe (Failed failure) (const Cancelled') (cancelle
 
 -- | Resources and failures, and what cancellation reaches.
 --
--- A part is cancelled at its waits only ('block', 'await', 'awaitRemote', and 'giveWay'): a part that waits gets it
+-- A part is cancelled at its waits only ('block', 'await', and 'giveWay'): a part that waits gets it
 -- at once, and one that runs, at its next wait, so that no 'now' is ever interrupted. A cancellation is of a
 -- scope, and is delivered to the parts inside it, unless a 'shield' lies between: then it is kept until the part
 -- has left the shield.

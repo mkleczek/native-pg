@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -27,7 +28,7 @@ import Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay, threadWait
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM_, when)
 import Data.Functor (($>))
 import Data.IORef (atomicWriteIORef, newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
@@ -40,6 +41,7 @@ import GHC.STRef (STRef (..))
 import Network.Directions.Atomic (update)
 import Network.Directions.Cancel (CancelScope (..), Frame (..), cancelledIn, deliverable, newCancelScope)
 import Network.Directions.Classes
+import Network.Directions.Tickets
 import Network.Streaming.Watch (awaitWatch)
 import System.IO.Unsafe (unsafePerformIO)
 import Prelude hiding (id, (.))
@@ -320,32 +322,27 @@ inScope part@(Part _ _ frames _) scope' action = do
   readIORef frames >>= writeIORef frames . drop 1
   pure outcome
 
--- | A ticket is a 'TMVar', which blocks the thread that waits for it.
-instance Exchange Threads where
-  newtype Ticket Threads a = ThreadTicket (TMVar a)
-  newTicket = Threads (\_ () -> ThreadTicket <$> newEmptyTMVarIO)
-  fulfil = Threads $ \_ (ThreadTicket var, value) -> do
-    given <- atomically (tryPutTMVar var value)
-    unless given $ ioError (userError "a ticket was given a value twice")
-  await = Threads (\part (ThreadTicket var) -> waiting part (atomically (readTMVar var)))
+-- | The threads have no cores: every ticket can be given by every thread, so there is one reach.
+type instance Local Threads = 'Anywhere
 
--- | The two ends of a remote ticket are the same 'TMVar', and whether the
--- waiter has gone. Every thread can reach both: there is no core to belong to.
-instance Remote Threads where
-  data Awaiting Threads a = ThreadAwaiting (TMVar a) (TVar Bool)
-  newRemote = Threads $ \_ () -> do
+-- | A ticket is a 'TMVar', which blocks the thread that waits for it, and whether the waiter has gone. The two
+-- ends are the same 'TMVar'. Every thread can reach both: there is no core to belong to.
+instance Exchange Threads 'Anywhere where
+  data Waiting Threads 'Anywhere a = ThreadWaiting (TMVar a) (TVar Bool)
+  ticket = Threads $ \_ () -> do
     var <- newEmptyTMVarIO
     abandoned <- newTVarIO False
-    pure (ThreadAwaiting var abandoned, Giver (giveThread var abandoned))
-  awaitRemote = Threads (\part (ThreadAwaiting var _) -> waiting part (atomically (readTMVar var)))
-  give = Threads (\_ (Giver giving, value) -> giving value)
-  abandon = Threads $ \_ (ThreadAwaiting var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
+    pure (ThreadWaiting var abandoned, AnywhereGiver (giveThread var abandoned))
+  await = Threads (\part (ThreadWaiting var _) -> waiting part (atomically (readTMVar var)))
+  give = Threads (\_ (AnywhereGiver giving, value) -> giving value)
+  abandon = Threads $ \_ (ThreadWaiting var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
 
+-- | The giver evaluates the value, before the transaction, as the other arrows' givers do.
 giveThread :: TMVar a -> TVar Bool -> a -> IO Bool
-giveThread var abandoned value = atomically $ do
+giveThread var abandoned !value = atomically $ do
   gone <- readTVar abandoned
   if gone
     then pure False
     else do
       given <- tryPutTMVar var value
-      if given then pure True else throwSTM (userError "a remote ticket was given a value twice")
+      if given then pure True else throwSTM (userError "a ticket was given a value twice")

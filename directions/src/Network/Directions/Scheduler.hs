@@ -43,7 +43,6 @@ module Network.Directions.Scheduler
     stepped,
     counted,
     wakeTicket,
-    Slot (..),
     Mailbox,
     runMailbox,
     post,
@@ -94,6 +93,7 @@ import Network.Directions.Atomic (update)
 import Network.Directions.Cancel
 import Network.Directions.Classes (Cancelled (..), Event (..), Instant (..), cancelledBy, monotonicNanoseconds)
 import Network.Directions.Loop (Report (..))
+import Network.Directions.Tickets (Slot (..))
 import Network.Directions.Timers
 import Network.Streaming.Watch (Watch (..))
 import System.Posix.Types (Fd (..))
@@ -133,11 +133,6 @@ microseconds = Turn . (* 1000)
 -- many points in one.
 defaultTurn :: Turn
 defaultTurn = microseconds 10
-
--- | A ticket's slot: empty, given its value, or holding the part that waits
--- for it, as what puts the part back with the action that runs where it waits:
--- the value, or a cancellation.
-data Slot a = Empty | Given a | Waiter (IO a -> IO Step)
 
 -- | A part: the scopes it is in and the shields between them, innermost first, and where it waits. A part
 -- that is in a scope is in the run's root scope too, outermost, which a shutdown cancels; a part that is in
@@ -445,9 +440,11 @@ cancelScope run scope' = do
 stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))
 stopWait run cancelled = \case
   NotWaiting -> pure Nothing
+  -- The waiter in the slot puts the part back among those that can go on itself, as a give does, with the
+  -- cancellation to raise where it waits.
   OnTicket slot ->
     readIORef slot >>= \case
-      Waiter resume -> Just (resume (throwIO cancelled)) <$ (writeIORef slot Empty *> adjust run 5 (-1))
+      Waiter wake -> Nothing <$ (writeIORef slot Empty *> wake (throwIO cancelled))
       _ -> pure Nothing
   OnFd fd reading ident -> do
     waiters <- readIORef (runWaiters run)

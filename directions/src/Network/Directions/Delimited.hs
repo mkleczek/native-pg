@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE RankNTypes #-}
@@ -14,9 +15,9 @@
 --
 -- The scheduler's core is in the arrow's type, as the state thread is in
 -- @ST@'s: a program is @'Delimited' s a b@ for any @s@ that its run chooses, and
--- what it makes with 'newTicket' or 'newRemote' belongs to that @s@, so that
+-- what it makes with a ticket of reach @'Here s@ belongs to that @s@, so that
 -- it can't leave the run it was made in, or be used by the program of another
--- core. What crosses cores is a 'Giver', which has no @s@.
+-- core. What crosses cores is a 'Giver' of reach @'Anywhere@, which has no @s@.
 --
 -- A scope is plain IO code in the part: the continuation that a wait captures
 -- holds the part's handlers, so a release runs once, after the resume, however
@@ -53,6 +54,7 @@ import Network.Directions.Cancel
 import Network.Directions.Classes
 import Network.Directions.Loop (Report)
 import Network.Directions.Scheduler
+import Network.Directions.Tickets
 import Network.Directions.Timers (addTimer, cancelTimer)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
@@ -226,28 +228,30 @@ instance Race (Delimited s) where
           (try (Left <$> one (Context run tag first') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) first')
           (try (Right <$> two (Context run tag second') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) second')
 
--- | A ticket is a slot on this core: a part that waits for it is parked in it,
--- as its captured continuation, and goes back among those that can go on when
--- the ticket is given its value. Giving and waiting count a step, and can give
--- way: a ticket is where parts coordinate, and none is on a parser's path.
-instance Exchange (Delimited s) where
-  newtype Ticket (Delimited s) a = DelimitedTicket (IORef (Slot a))
-  newTicket = Delimited (\_ () -> DelimitedTicket <$> newIORef Empty)
-  fulfil = Delimited $ \context@(Context run _ _) (DelimitedTicket slot, value) ->
-    readIORef slot >>= \case
-      Empty -> writeIORef slot (Given value) *> step context
-      Waiter resume -> writeIORef slot (Given value) *> wakeTicket run (resume (pure value)) *> step context
-      Given _ -> ioError (userError "a ticket was given a value twice")
-  await = Delimited $ \context@(Context _ tag part) (DelimitedTicket slot) ->
+-- | The tickets that belong to this core: a slot, which the parts of this core read
+-- and write as plain memory. A part that waits for the ticket is parked in the
+-- slot, as a closure that puts its captured continuation back among those that
+-- can go on, and goes back when the ticket is given its value. Giving and
+-- waiting count a step, and can give way: a ticket is where parts coordinate,
+-- and none is on a parser's path.
+type instance Local (Delimited s) = 'Here s
+
+instance Exchange (Delimited s) ('Here s) where
+  newtype Waiting (Delimited s) ('Here s) a = HereWaiting (IORef (Slot a))
+  ticket = Delimited (\_ () -> newIORef Empty >>= \slot -> pure (HereWaiting slot, HereGiver slot))
+  await = Delimited $ \context@(Context run tag part) (HereWaiting slot) ->
     readIORef slot >>= \case
       Given value -> checkpoint part *> (value <$ step context)
-      Empty -> registering part (OnTicket slot) *> control0 tag (\resume -> Parked <$ writeIORef slot (Waiter resume))
+      Empty -> registering part (OnTicket slot) *> control0 tag (\resume -> Parked <$ writeIORef slot (Waiter (wakeTicket run . resume)))
       Waiter _ -> ioError (userError "two parts wait for one ticket")
+      Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
+  give = Delimited (\context (HereGiver slot, value) -> giveHere slot value <* step context)
+  abandon = Delimited (\_ (HereWaiting slot) -> abandonHere slot)
 
--- | What a remote ticket's slot holds, and what a core that gives it a value
+-- | What the slot of a ticket of reach @'Anywhere@ holds, and what a core that gives it a value
 -- finds: nothing yet, the value, the part that waits for it, or that the waiter
--- has gone. Several cores read and change it, atomically.
-data RemoteSlot a = RemoteEmpty | RemoteGiven a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
+-- has gone. Several cores read and change it, atomically. The value is evaluated, as a local slot's is.
+data RemoteSlot a = RemoteEmpty | RemoteGiven !a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
 
 -- | What a give did to the slot.
 data Giving a = Stored | Resume (IO a -> IO Step) | Gone | Twice
@@ -255,16 +259,16 @@ data Giving a = Stored | Resume (IO a -> IO Step) | Gone | Twice
 -- | What a waiter's parking did to the slot.
 data Parking a = Parking | Ready a | Misused
 
--- | A remote ticket's waiter is parked in the slot as a ticket's is, but the
+-- | The waiter of a ticket that any core can give is parked in the slot as a local ticket's is, but the
 -- giver, on another core, doesn't run it: it puts it in the mailbox of the
 -- scheduler of the waiter's core, which goes on with it in its next round, and
 -- wakes that scheduler if it sleeps in its poller.
-instance Remote (Delimited s) where
-  newtype Awaiting (Delimited s) a = DelimitedAwaiting (IORef (RemoteSlot a))
-  newRemote = Delimited $ \(Context run _ _) () -> do
+instance Exchange (Delimited s) 'Anywhere where
+  newtype Waiting (Delimited s) 'Anywhere a = AnywhereWaiting (IORef (RemoteSlot a))
+  ticket = Delimited $ \(Context run _ _) () -> do
     slot <- newIORef RemoteEmpty
-    pure (DelimitedAwaiting slot, Giver (giveRemote (runMailbox run) slot))
-  awaitRemote = Delimited $ \context@(Context run tag part) (DelimitedAwaiting slot) ->
+    pure (AnywhereWaiting slot, AnywhereGiver (giveRemote (runMailbox run) slot))
+  await = Delimited $ \context@(Context run tag part) (AnywhereWaiting slot) ->
     readIORef slot >>= \case
       RemoteGiven value -> checkpoint part *> (value <$ step context)
       RemoteEmpty -> do
@@ -278,10 +282,10 @@ instance Remote (Delimited s) where
             Parking -> pure ParkedRemote
             -- Given since the look: goes on in its turn.
             Ready value -> pure (Yielded (resume (pure value)))
-            Misused -> ioError (userError "a remote ticket was waited for twice, or after it was abandoned")
-      _ -> ioError (userError "a remote ticket was waited for twice, or after it was abandoned")
-  give = Delimited $ \context (Giver giving, value) -> giving value <* step context
-  abandon = Delimited $ \_ (DelimitedAwaiting slot) ->
+            Misused -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
+      _ -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
+  give = Delimited $ \context (AnywhereGiver giving, value) -> giving value <* step context
+  abandon = Delimited $ \_ (AnywhereWaiting slot) ->
     update slot $ \case
       RemoteGiven value -> (RemoteAbandoned, Just value)
       _ -> (RemoteAbandoned, Nothing)
@@ -295,9 +299,10 @@ stopRemote run slot cancelled =
     Just resume -> Just (resume (throwIO cancelled)) <$ adjust run 3 (-1)
 
 -- | Gives the slot its value, and if a part waits for it, puts the part in the
--- mailbox of the scheduler that owns it. It says whether the waiter takes it.
+-- mailbox of the scheduler that owns it. It says whether the waiter takes it. The value is evaluated before
+-- the compare-and-swap, not between its read and its swap.
 giveRemote :: Mailbox -> IORef (RemoteSlot a) -> a -> IO Bool
-giveRemote mailbox slot value = do
+giveRemote mailbox slot !value = do
   giving <- update slot $ \case
     RemoteEmpty -> (RemoteGiven value, Stored)
     RemoteWaiter resume -> (RemoteGiven value, Resume resume)
@@ -307,7 +312,7 @@ giveRemote mailbox slot value = do
     Stored -> pure True
     Resume resume -> post mailbox (resume (pure value))
     Gone -> pure False
-    Twice -> ioError (userError "a remote ticket was given a value twice")
+    Twice -> ioError (userError "a ticket was given a value twice")
 
 -- | Counts a step, and once the part has run for its turn, yields: captures what
 -- follows and gives it back to the scheduler. When the part goes on, it

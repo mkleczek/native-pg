@@ -1,11 +1,13 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 
 -- | Measures what crosses cores. Run with @+RTS -T@ (allocation) and @-N@ for the cores it uses:
 --
 -- * @pingpong KIND ROUNDS@: round trips between two parts over tickets made as they go, in ns and bytes per round
---   trip. KIND is @local@ (two parts on one core, local tickets), @compiled@ (the same, run by 'Compiled'),
---   @remote@ (two cores, remote tickets), @threads@ (two threads, tickets) or @remote-threads@ (two threads,
---   remote tickets).
+--   trip. KIND is @local@ (two parts on one core, tickets of reach @'Here@), @compiled@ (the same, run by
+--   'Compiled'), @anywhere@ (two parts on one core, tickets of reach @'Anywhere@), @remote@ (two cores, tickets of
+--   reach @'Anywhere@), @threads@ (two threads, tickets) or @remote-threads@ (two threads, the tickets left in a
+--   handoff, as @remote@ does).
 -- * @pool KIND CORES PARTS CONNECTIONS SECONDS@: parts that check a connection out of one pool, do a little work,
 --   and release it, for the time given: checkouts per second, how evenly the parts and cores got them, and
 --   allocation per checkout. KIND is @delimited@ (CORES cores of PARTS parts each) or @threads@ (the same number of
@@ -88,9 +90,10 @@ pingPongRun kind rounds = do
   (seconds, bytes) <- measured $ case kind of
     "local" -> void (runDelimited (pingPong rounds) ())
     "compiled" -> void (runCompiled (pingPong rounds) ())
-    "remote" -> void (runCores 2 (pure handoff) (\shared core -> if core == 0 then remoteClient shared rounds else remoteServer shared rounds))
+    "anywhere" -> void (runDelimited (pingPongAt @'Anywhere rounds) ())
+    "remote" -> void (runCores 2 (pure handoff) (\shared core -> if core == 0 then find shared >>> client rounds else leave shared >>> server rounds))
     "threads" -> runThreads (pingPong rounds) ()
-    "remote-threads" -> runThreads (concurrently (remoteClient handoff rounds) (remoteServer handoff rounds) >>> arr (const ())) ()
+    "remote-threads" -> runThreads (concurrently (find handoff >>> client rounds) (leave handoff >>> server rounds) >>> arr (const ())) ()
     _ -> ioError (userError ("pingpong: no kind " <> kind))
   printf "pingpong %s rounds=%d ns_per_rt=%.1f bytes_per_rt=%.1f\n" kind rounds (seconds * 1e9 / fromIntegral rounds) (fromIntegral bytes / fromIntegral rounds :: Double)
 
@@ -110,7 +113,7 @@ count :: Counter -> IO Int
 count (Counter pointer) = withForeignPtr pointer peek
 
 -- | A part that checks a connection out, works a little while it has it, and releases it, until told to stop.
-part :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr, Scope arr) => Pool Int -> IORef Bool -> Counter -> arr () ()
+part :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> IORef Bool -> Counter -> arr () ()
 part pool stop counter = loop
   where
     loop = now (\() -> readIORef stop) >>> (\stopped -> if stopped then Left () else Right ()) ^>> (returnA ||| turn)
@@ -175,7 +178,7 @@ wakeRun kind samples = do
   printf "wake %s samples=%d blocked=%s median_us=%.1f p90_us=%.1f p99_us=%.1f min_us=%.1f max_us=%.1f\n" kind samples (maybe "-" show waits) (at 0.5 / 1000) (at 0.9 / 1000) (at 0.99 / 1000) (minimum latencies / 1000) (maximum latencies / 1000)
 
 -- | A program for every arrow that has scopes and time.
-type Program a = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Concurrent arr, Exchange arr, Scope arr, Race arr, Time arr, Within arr) => arr () a
+type Program a = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Time arr, Within arr) => arr () a
 
 runProgram :: String -> Program a -> IO a
 runProgram kind program = case kind of
@@ -185,13 +188,13 @@ runProgram kind program = case kind of
   _ -> ioError (userError ("no kind " <> kind))
 
 -- | A part that holds nothing, and waits for ever in a scope of its own, once it has counted itself in.
-waiter :: (Arrow arr, Effect arr, Exchange arr, Scope arr) => IORef Int -> arr () ()
-waiter waiting = scope returnA (arr (const ())) (arr snd >>> now (\() -> atomicModifyIORef' waiting (\n -> (n + 1, ()))) >>> newTicket >>> await)
+waiter :: forall arr. (Arrow arr, Effect arr, Exchange arr (Local arr), Scope arr) => IORef Int -> arr () ()
+waiter waiting = scope returnA (arr (const ())) (arr snd >>> now (\() -> atomicModifyIORef' waiting (\n -> (n + 1, ()))) >>> ticket @arr @(Local arr) >>> arr fst >>> await)
 
 -- | The loop in the first part (VARIANT @bare@), in a half of a pair, or, with that many parts that wait beside it,
 -- in a half of a race with them, which begins once they all wait: so that the run of the loop and the run of
 -- nothing both make and end the parts, and what is measured is the loop.
-inside :: (ArrowChoice arr, Effect arr, GiveWay arr, Concurrent arr, Race arr, Exchange arr, Scope arr) => IORef Int -> String -> Int -> arr () () -> arr () ()
+inside :: (ArrowChoice arr, Effect arr, GiveWay arr, Concurrent arr, Race arr, Exchange arr (Local arr), Scope arr) => IORef Int -> String -> Int -> arr () () -> arr () ()
 inside waiting variant parts loop
   | parts > 0 = race (untilJust ((\n -> if n == parts then Just () else Nothing) <$> readIORef waiting) >>> loop) (balanced (replicate parts (waiter waiting))) >>^ const ()
   | variant == "bare" = loop
@@ -226,8 +229,8 @@ cancelRun kind samples = do
       -- The other part waits a little first, so that this one waits when it ends.
       winner :: (Effect arr) => arr () ()
       winner = now (\() -> threadDelay 200 *> monotonicNanoseconds >>= atomicWriteIORef stamp)
-      waits :: (Arrow arr, Exchange arr) => arr a ()
-      waits = arr (const ()) >>> newTicket >>> await
+      waits :: forall arr a. (Arrow arr, Exchange arr (Local arr)) => arr a ()
+      waits = arr (const ()) >>> ticket @arr @(Local arr) >>> arr fst >>> await
       program :: Program ()
       program = timesWith samples (race (scope returnA released (arr snd >>> waits)) winner >>^ const ())
   runProgram kind program
@@ -251,8 +254,8 @@ withinRun kind variant rounds parts = do
 deadlineRun :: String -> Int -> IO ()
 deadlineRun kind samples = do
   lateness <- newIORef []
-  let waits :: (Arrow arr, Exchange arr) => arr () ()
-      waits = newTicket >>> await
+  let waits :: forall arr. (Arrow arr, Exchange arr (Local arr)) => arr () ()
+      waits = ticket @arr @(Local arr) >>> arr fst >>> await
       program :: Program ()
       program =
         timesWith samples $

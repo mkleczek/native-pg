@@ -123,10 +123,11 @@ receiveBytes buffer end total = const BS.empty ^>> loop
 -- line: the request side sends the batch, waits for the decision that the
 -- answer side gives it, and sends the ending that was decided; the answer side
 -- reads the batch's answer, decides from it, and keeps what follows. The
--- decision is a ticket that the transaction makes when it runs, and both
--- sides are given.
-transaction :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, Link arr end) => Buffer -> end -> ByteString -> (ByteString -> Bool) -> IORef [ByteString] -> arr () ()
-transaction buffer end batch commits kept = newTicket >>> together [requests, answers]
+-- decision is a ticket of the arrow's own core that the transaction makes when
+-- it runs, and the request side is given the end to wait at and the answer side
+-- the end to give at.
+transaction :: forall arr end. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), Link arr end) => Buffer -> end -> ByteString -> (ByteString -> Bool) -> IORef [ByteString] -> arr () ()
+transaction buffer end batch commits kept = ticket @arr @(Local arr) >>> together [arr fst >>> requests, arr snd >>> answers]
   where
     requests =
       keeping (const [batch] ^>> sendAll end)
@@ -138,6 +139,7 @@ transaction buffer end batch commits kept = newTicket >>> together [requests, an
     answers =
       keeping (receiveBytes buffer end (BS.length batch))
         >>> (\(answer, decision) -> (decision, commits answer))
-        ^>> fulfil
+        ^>> give
+        >>> arr (const ())
         >>> receiveAll buffer end kept
 {-# INLINABLE transaction #-}
