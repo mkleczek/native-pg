@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE InterruptibleFFI #-}
 {-# LANGUAGE LambdaCase #-}
 
@@ -16,6 +16,15 @@
 -- is put there by the giver, which wakes the poller if the scheduler waits in
 -- it. The scheduler takes the parts from its mailbox every round, and before
 -- it waits.
+--
+-- The scheduler also keeps what cancels a part: a part that is in a cancel scope
+-- says where it waits, so that cancelling the scope takes it off what it waits
+-- at and puts it back among those that can go on, with the cancellation to
+-- raise where it waits. A part in no scope says nothing, and waits as it always
+-- did. The scheduler runs masked, and an asynchronous exception reaches it where
+-- it waits for a descriptor, and once in a while otherwise: it cancels every
+-- part that is in a scope, waits until they have ended, and then fails the run
+-- with the exception.
 module Network.Directions.Scheduler
   ( Step (..),
     Run,
@@ -31,16 +40,36 @@ module Network.Directions.Scheduler
     runMailbox,
     post,
     schedule,
+    Part (..),
+    Parked (..),
+    newPart,
+    childPart,
+    endPart,
+    pushFrame,
+    popFrame,
+    checkpoint,
+    cancelScope,
+    registering,
+    nextWait,
+    adjust,
+    Joined (..),
+    pairEnded,
+    raceEnded,
+    Escaped (..),
+    guardedBy,
+    runFailure,
   )
 where
 
 import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDelay, retry)
-import Control.Exception (bracket, finally)
-import Control.Monad ((>=>))
+import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, try)
+import Control.Monad (forM_, when, (>=>))
 import Data.Bits ((.&.))
+import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.List (partition)
+import Data.Maybe (fromMaybe, isNothing)
 import Foreign.C.Error (eINTR, getErrno, throwErrno, throwErrnoIfMinus1_, throwErrnoIfNull)
 import Foreign.C.Types (CInt (..))
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray)
@@ -48,7 +77,8 @@ import Foreign.Ptr (Ptr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Directions.Atomic (update)
-import Network.Directions.Classes (Event (..))
+import Network.Directions.Cancel
+import Network.Directions.Classes (Cancelled (..), Event (..), cancelledBy)
 import Network.Directions.Loop (Report (..))
 import Network.Streaming.Watch (Watch (..))
 import System.Posix.Types (Fd (..))
@@ -57,8 +87,10 @@ import System.Posix.Types (Fd (..))
 data Step
   = -- | It ended, at a join or with the program's result.
     Ended
-  | -- | It waits for the event, and goes on with the action once it fires.
-    Suspended !Event (IO Step)
+  | -- | It waits for the event, and goes on with the action once it fires; the number is what the part's
+    -- wait is called by when it is in a scope, and 0 otherwise. The action is what runs where the part
+    -- waits: nothing, or the cancellation to raise.
+    Suspended !Event !Int (IO () -> IO Step)
   | -- | Two parts that go on at once.
     Forked (IO Step) (IO Step)
   | -- | It waits for a ticket, whose slot holds it.
@@ -70,18 +102,45 @@ data Step
     Yielded (IO Step)
 
 -- | A ticket's slot: empty, given its value, or holding the part that waits
--- for it, as what goes on with the value.
-data Slot a = Empty | Given a | Waiter (a -> IO Step)
+-- for it, as what puts the part back with the action that runs where it waits:
+-- the value, or a cancellation.
+data Slot a = Empty | Given a | Waiter (IO a -> IO Step)
+
+-- | A part: the scopes it is in and the shields between them, innermost first, and where it waits. A part
+-- that is in a scope is in the run's root scope too, outermost, which a shutdown cancels; a part that is in
+-- none has no frames, and says nothing of where it waits.
+data Part = Part
+  { partIdent :: !Int,
+    partFrames :: !(IORef [Frame Part]),
+    partWait :: !(IORef Parked)
+  }
+
+instance Identified Part where
+  identOf = partIdent
+
+-- | Where a part waits, as what takes it off that.
+data Parked
+  = NotWaiting
+  | forall a. OnTicket !(IORef (Slot a))
+  | -- | A descriptor, the direction and the number of the wait.
+    OnFd !Int !Bool !Int
+  | -- | A watch, by the number of the wait.
+    OnWatch !Int
+  | -- | Anything else: takes the part off, and gives it with the cancellation raised where it waits, if it was
+    -- still there.
+    Other !(Cancelled -> IO (Maybe (IO Step)))
 
 -- | What the parts of a run share.
 data Run = Run
   { -- | Parts that tickets woke.
     runTickets :: !(IORef [IO Step]),
     -- | The steps the running part has left before it gives way, the steps
-    -- taken, the waits, and the parts that wait for tickets that other cores
-    -- give and are not yet back from the mailbox: unboxed, so that counting
-    -- allocates nothing. A step is a point to give way at, which a link's
-    -- receive or send is, or a wait, or a ticket given or waited for.
+    -- taken, the waits, the parts that wait for tickets that other cores
+    -- give and are not yet back from the mailbox, the parts that wait on
+    -- descriptors, those that wait for tickets, the number of the next wait,
+    -- and the rounds: unboxed, so that counting allocates nothing. A step is a point
+    -- to give way at, which a link's receive or send is, or a wait, or a
+    -- ticket given or waited for.
     runCounters :: !(ForeignPtr Int),
     runPoller :: !(Ptr Poller),
     -- | Where other threads put parts for this scheduler.
@@ -90,10 +149,23 @@ data Run = Run
     runReady :: !(ForeignPtr CInt),
     runKinds :: !(ForeignPtr CInt),
     -- | The parts that wait on each registered descriptor: to read, to write.
-    runWaiters :: !(IORef (IntMap.IntMap Waiters))
+    runWaiters :: !(IORef (IntMap.IntMap Waiters)),
+    -- | The parts that wait on watches.
+    runWatching :: !(IORef [Watching]),
+    -- | The scope that every part in a scope is in, outermost.
+    runRoot :: !(CancelScope Part),
+    -- | The asynchronous exception that the run is shutting down for.
+    runShutdown :: !(IORef (Maybe SomeException)),
+    -- | What goes on with a failure of the part that runs, in a run of "Network.Directions.Compiled", whose
+    -- parts have no handlers of their own on a stack that can be captured: the part sets it when it goes on.
+    runFailure :: !(IORef (SomeException -> IO Step))
   }
 
-data Waiters = Waiters [IO Step] [IO Step]
+-- | The parts that wait on a descriptor, as the 'Suspended' steps they gave the scheduler.
+data Waiters = Waiters [Step] [Step]
+
+-- | A part that waits on a watch.
+data Watching = Watching !Int !Watch (IO () -> IO Step)
 
 -- | A poller: the C struct that is the kqueue or epoll and its wake handle.
 data Poller
@@ -116,11 +188,11 @@ batch = 64
 -- once nothing that is given parts through its mailbox can run any more.
 newRun :: IO Run
 newRun = do
-  counters <- mallocForeignPtrArray 4
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0, 1, 2, 3]
+  counters <- mallocForeignPtrArray 8
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 7]
   poller <- throwErrnoIfNull "directions_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
-  Run <$> newIORef [] <*> pure counters <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty
+  Run <$> newIORef [] <*> pure counters <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope <*> newIORef Nothing <*> newIORef (throwIO . Escaped)
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
@@ -169,7 +241,7 @@ afterSleep run = case runMailbox run of
 -- them.
 arrivals :: Run -> [IO Step] -> IO [IO Step]
 arrivals _ [] = pure []
-arrivals run parts = parts <$ (counter run 3 >>= setCounter run 3 . subtract (length parts))
+arrivals run parts = parts <$ adjust run 3 (negate (length parts))
 
 -- | The scheduler takes no more parts.
 closeInbox :: Run -> IO ()
@@ -183,6 +255,17 @@ counter run index = unsafeWithForeignPtr (runCounters run) (`peekElemOff` index)
 setCounter :: Run -> Int -> Int -> IO ()
 setCounter run index value = unsafeWithForeignPtr (runCounters run) (\pointer -> pokeElemOff pointer index value)
 {-# INLINE setCounter #-}
+
+-- | Adds to a counter: 3 the parts that wait for tickets of other cores, 4 those that wait on descriptors, 5
+-- those that wait for tickets.
+adjust :: Run -> Int -> Int -> IO ()
+adjust run index delta = counter run index >>= setCounter run index . (+ delta)
+{-# INLINE adjust #-}
+
+-- | The number of a part or of a wait of a part that is in a scope, which is not 0.
+nextWait :: Run -> IO Int
+nextWait run = counter run 6 >>= \n -> n + 1 <$ setCounter run 6 (n + 1)
+{-# INLINE nextWait #-}
 
 -- | Counts a step, and says whether the part has used its steps and yields.
 spent :: Run -> IO Bool
@@ -204,101 +287,307 @@ counted run step = step <$ (counter run 1 >>= setCounter run 1 . (+ 1))
 
 -- | Puts a part that a ticket woke back among those that can go on.
 wakeTicket :: Run -> IO Step -> IO ()
-wakeTicket run part = modifyIORef' (runTickets run) (part :)
+wakeTicket run part = modifyIORef' (runTickets run) (part :) *> adjust run 5 (-1)
+
+-- | A part in no scope, to run as the first part of a run, or one that only holds a resource.
+newPart :: Run -> IO Part
+newPart run = Part <$> nextWait run <*> newIORef [] <*> newIORef NotWaiting
+
+-- | A part for a half of a pair, in the scope of the pair as well as in those of the part that made it.
+childPart :: Run -> Part -> CancelScope Part -> IO Part
+childPart run parent scope' = do
+  outer <- readIORef (partFrames parent)
+  let frames = Inside scope' : if null outer then [Inside (runRoot run)] else outer
+  child <- Part <$> nextWait run <*> newIORef frames <*> newIORef NotWaiting
+  forM_ frames $ \case Inside s -> enter s child; _ -> pure ()
+  pure child
+
+-- | A part that has ended is in no scope any more.
+endPart :: Part -> IO ()
+endPart part = do
+  frames <- readIORef (partFrames part)
+  forM_ frames $ \case Inside s -> leave s part; _ -> pure ()
+  writeIORef (partFrames part) []
+
+-- | The part goes in a scope, or behind a shield; a part that was in none goes in the run's root scope too.
+pushFrame :: Run -> Part -> Frame Part -> IO ()
+pushFrame run part frame = do
+  frames <- readIORef (partFrames part)
+  case frames of
+    [] -> enter (runRoot run) part *> writeIORef (partFrames part) [frame, Inside (runRoot run)]
+    _ -> writeIORef (partFrames part) (frame : frames)
+  case frame of Inside s -> enter s part; _ -> pure ()
+
+-- | The part leaves the innermost scope or shield, which it went in with 'pushFrame'.
+popFrame :: Run -> Part -> IO ()
+popFrame run part = do
+  frames <- readIORef (partFrames part)
+  case frames of
+    [frame, Inside root] | scopeIdent root == scopeIdent (runRoot run) -> do
+      leaveFrame frame
+      leave root part
+      writeIORef (partFrames part) []
+    frame : outer -> leaveFrame frame *> writeIORef (partFrames part) outer
+    [] -> pure ()
+  where
+    leaveFrame = \case Inside s -> leave s part; _ -> pure ()
+
+-- | Raises the cancellation that reaches the part, if there is one.
+checkpoint :: Part -> IO ()
+checkpoint part =
+  readIORef (partFrames part) >>= \case
+    [] -> pure ()
+    frames -> cancelledIn frames >>= maybe (pure ()) (throwIO . Cancelled)
+
+-- | Cancels the scope: its flag is set, and the parts inside it that wait, and whose scope lies above their
+-- innermost shield, are taken off what they wait at, and put back among those that can go on, with the
+-- cancellation to raise where they wait. The others see the flag at their next wait.
+cancelScope :: Run -> CancelScope Part -> IO ()
+cancelScope run scope' = do
+  parts <- markCancelled scope'
+  forM_ parts $ \part -> do
+    frames <- readIORef (partFrames part)
+    when (deliverable (scopeIdent scope') frames) $
+      (readIORef (partWait part) >>= stopWait run (Cancelled (scopeIdent scope'))) >>= \case
+        Nothing -> pure ()
+        Just resume -> modifyIORef' (runTickets run) (resume :)
+
+-- | Takes the part off what it waits at, if it still does: what goes on with the part.
+stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))
+stopWait run cancelled = \case
+  NotWaiting -> pure Nothing
+  OnTicket slot ->
+    readIORef slot >>= \case
+      Waiter resume -> Just (resume (throwIO cancelled)) <$ (writeIORef slot Empty *> adjust run 5 (-1))
+      _ -> pure Nothing
+  OnFd fd reading ident -> do
+    waiters <- readIORef (runWaiters run)
+    case IntMap.lookup fd waiters of
+      Nothing -> pure Nothing
+      Just (Waiters readers writers) ->
+        let (found, rest) = takeEntry ident (if reading then readers else writers)
+         in case found of
+              Nothing -> pure Nothing
+              Just resume -> do
+                writeIORef (runWaiters run) (IntMap.insert fd (if reading then Waiters rest writers else Waiters readers rest) waiters)
+                adjust run 4 (-1)
+                pure (Just (resume (throwIO cancelled)))
+  OnWatch ident -> do
+    watching <- readIORef (runWatching run)
+    case partition (\(Watching other _ _) -> other == ident) watching of
+      ([Watching _ watch resume], rest) -> Just (resume (throwIO cancelled)) <$ (writeIORef (runWatching run) rest *> watchCancel watch)
+      _ -> pure Nothing
+  Other stop -> stop cancelled
+
+-- | A failure that nothing in the part handles: it leaves the run.
+newtype Escaped = Escaped SomeException
+  deriving (Show)
+
+instance Exception Escaped
+
+-- | Runs a part of "Network.Directions.Compiled": a failure that leaves it goes to the handler that the part
+-- last set, which goes on with the part. A failure of that handler goes to the handler it set.
+guardedBy :: Run -> IO Step -> IO Step
+guardedBy run = (`catch` unwind)
+  where
+    unwind :: SomeException -> IO Step
+    unwind failure = case fromException failure of
+      Just (Escaped _) -> throwIO failure
+      Nothing -> (readIORef (runFailure run) >>= \handler -> handler failure) `catch` unwind
+
+-- | A wait of a part that is in a scope: it raises the cancellation that is there, and says where it waits.
+-- A part that is in none says nothing.
+registering :: Part -> Parked -> IO ()
+registering part parked =
+  readIORef (partFrames part) >>= \case
+    [] -> pure ()
+    frames -> cancelledIn frames >>= maybe (writeIORef (partWait part) parked) (throwIO . Cancelled)
+{-# INLINE registering #-}
+
+-- | What a pair of halves has of its halves' results, and its first failure, and how many have ended.
+data Joined b c = Joined !(Maybe b) !(Maybe c) !(Maybe SomeException) !Int
+
+-- | What a pair does when one of its halves has ended: it leaves its scopes, and keeps its result, or its failure
+-- if it is the first, which cancels the other half; the half that ends last goes on with the parent: with the
+-- first failure, if there was one.
+pairEnded :: Run -> CancelScope Part -> IORef (Joined b c) -> (SomeException -> IO Step) -> ((b, c) -> IO Step) -> Part -> (x -> Joined b c -> Joined b c) -> Either SomeException x -> IO Step
+pairEnded run scope' joined failure success half record outcome = do
+  endPart half
+  Joined b c failed count <- readIORef joined
+  joined' <- case outcome of
+    Left thrown
+      | isNothing failed -> cancelScope run scope' $> Joined b c (Just thrown) (count + 1)
+      | otherwise -> pure (Joined b c failed (count + 1))
+    Right result -> pure (record result (Joined b c failed (count + 1)))
+  writeIORef joined joined'
+  case joined' of
+    Joined _ _ (Just thrown) 2 -> failure thrown
+    Joined (Just b') (Just c') _ 2 -> success (b', c')
+    Joined{} -> pure Ended
+
+-- | What a race does when one of its halves has ended: the first to end is the winner, which cancels the other;
+-- the loser, once it has ended, lets the race go on with the parent, with the winner's failure, or the loser's
+-- if it isn't its cancellation, or else the winner's result.
+raceEnded :: Run -> CancelScope Part -> IORef (Maybe (Either SomeException (Either b c))) -> (SomeException -> IO Step) -> (Either b c -> IO Step) -> Part -> Either SomeException (Either b c) -> IO Step
+raceEnded run scope' winner failure success half outcome = do
+  endPart half
+  readIORef winner >>= \case
+    Nothing -> do
+      writeIORef winner (Just outcome)
+      cancelScope run scope'
+      pure Ended
+    Just won -> case (won, outcome) of
+      (Left thrown, _) -> failure thrown
+      (Right _, Left thrown) | isNothing (cancelledBy thrown) -> failure thrown
+      (Right result, _) -> success result
+
+-- | What goes on with a part that waits, from its step.
+resumeOf :: Step -> IO () -> IO Step
+resumeOf (Suspended _ _ resume) = resume
+resumeOf _ = const (pure Ended)
+
+-- | The step of the wait, and the others.
+takeEntry :: Int -> [Step] -> (Maybe (IO () -> IO Step), [Step])
+takeEntry ident = go []
+  where
+    go before = \case
+      [] -> (Nothing, reverse before)
+      entry@(Suspended _ other resume) : after
+        | other == ident -> (Just resume, reverse before <> after)
+        | otherwise -> go (entry : before) after
+      entry : after -> go (entry : before) after
 
 -- | Runs the first part, and the parts it forks, until the result is there:
 -- each part that can go on in turn, entered with the given action, for up to
 -- 64 steps, which are mostly the receives and sends it makes. At the end it
 -- closes the run's mailbox, so that those that give parts to it after that are
 -- told they didn't; the run's poller stays until 'freeRun'.
+--
+-- An asynchronous exception reaches the scheduler where it waits for a
+-- descriptor or a watch, and at the start of each round: the parts that are in
+-- a scope are cancelled, and the run goes on until they have ended, and then
+-- fails with the exception. The exception of a part that no scope holds fails
+-- the run at once.
 schedule :: Run -> (IO Step -> IO Step) -> IORef (Maybe b) -> IO Step -> IO (b, Report)
-schedule run enter result start = go [start] [] [] 0 0 `finally` closeInbox run
+schedule run enterPart result start = (go [start] [] `catch` failed) `finally` closeInbox run
   where
-    -- The parts that can go on in this round, and in the next; the parts that
-    -- wait on watches; how many wait on descriptors; and how many tickets hold.
-    -- The counts are strict: a count left as a thunk keeps the parts it was
-    -- computed from, and their continuations, alive.
-    go ready later watching !descriptors !parked = case ready of
+    -- A shutdown fails the run with its exception, whatever the parts failed with, which is their cancellation.
+    failed :: SomeException -> IO a
+    failed failure = readIORef (runShutdown run) >>= throwIO . fromMaybe (unescaped failure)
+    unescaped failure = maybe failure (\(Escaped inner) -> inner) (fromException failure)
+    -- The parts that can go on in this round, and in the next.
+    go ready later = case ready of
       part : others -> do
         setCounter run 0 64
-        step <- enter part
+        step <- enterPart part
         readIORef result >>= \case
           Just value -> (\steps waits -> (value, Report steps waits)) <$> counter run 1 <*> counter run 2
           Nothing -> case step of
-            Ended -> go others later watching descriptors parked
-            Parked -> go others later watching descriptors (parked + 1)
-            ParkedRemote -> (counter run 3 >>= setCounter run 3 . (+ 1)) *> go others later watching descriptors parked
-            Yielded part' -> go others (part' : later) watching descriptors parked
-            Forked one two -> go others (two : one : later) watching descriptors parked
-            Suspended (Readable fd) part' -> waitOn fd True part' *> go others later watching (descriptors + 1) parked
-            Suspended (Writable fd) part' -> waitOn fd False part' *> go others later watching (descriptors + 1) parked
-            Suspended (Watched register) part' -> register >>= \watch -> go others later ((watch, part') : watching) descriptors parked
+            Ended -> go others later
+            Parked -> adjust run 5 1 *> go others later
+            ParkedRemote -> adjust run 3 1 *> go others later
+            Yielded part' -> go others (part' : later)
+            Forked one two -> go others (two : one : later)
+            Suspended (Readable fd) _ _ -> waitOn fd True step *> adjust run 4 1 *> go others later
+            Suspended (Writable fd) _ _ -> waitOn fd False step *> adjust run 4 1 *> go others later
+            Suspended (Watched register) ident resume -> register >>= \watch -> modifyIORef' (runWatching run) (Watching ident watch resume :) *> go others later
       [] -> do
         -- Each round, the parts that tickets woke, that other cores gave, and
         -- that descriptors became ready for join.
+        rounds <- counter run 7
+        setCounter run 7 (rounds + 1)
+        when (rounds .&. 63 == 0) (interruptedBy allowInterrupt)
         tickets <- readIORef (runTickets run)
         writeIORef (runTickets run) []
         given <- takeInbox run >>= arrivals run
-        polled <- if descriptors > (0 :: Int) then poll c_pollerPoll 0 else pure []
+        descriptors <- counter run 4
+        polled <- if descriptors > 0 then pollNow else pure []
         case reverse later <> reverse tickets <> given <> polled of
-          [] -> counter run 3 >>= \remote -> idle remote watching descriptors parked
-          next -> go next [] watching (descriptors - length polled) (parked - length tickets)
-    idle !remote watching !descriptors !parked
-      | null watching && descriptors == 0 && remote == 0 =
-          ioError . userError $
-            if parked > (0 :: Int)
-              then "the parts wait for tickets that nothing will give a value"
-              else "the program ended without a result"
-      | null watching = do
-          -- Unless a part was given since the round began: the next to give
-          -- one wakes the poller.
-          early <- beforeSleep run >>= arrivals run
-          if null early
-            then do
+          [] -> idle
+          next -> go next []
+    idle = do
+      remote <- counter run 3
+      descriptors <- counter run 4
+      parked <- counter run 5
+      watching <- readIORef (runWatching run)
+      shutdown <- readIORef (runShutdown run)
+      members <- readIORef (scopeMembers (runRoot run))
+      case () of
+        _
+          | Just failure <- shutdown, null members -> throwIO failure
+          | null watching && descriptors == 0 && remote == 0 ->
+              ioError . userError $
+                if parked > (0 :: Int)
+                  then "the parts wait for tickets that nothing will give a value"
+                  else "the program ended without a result"
+          | null watching -> do
+              -- Unless a part was given since the round began: the next to give
+              -- one wakes the poller.
+              early <- beforeSleep run >>= arrivals run
+              if null early
+                then do
+                  countWait
+                  polled <- pollWait
+                  given <- afterSleep run >>= arrivals run
+                  go (given <> polled) []
+                else go early []
+          | otherwise -> do
               countWait
-              polled <- poll c_pollerWait (-1)
-              given <- afterSleep run >>= arrivals run
-              go (given <> polled) [] watching (descriptors - length polled) parked
-            else go early [] watching descriptors parked
-      | otherwise = do
-          countWait
-          -- Watches, and descriptors too, and the mailbox: the watches for a
-          -- millisecond at most, then the descriptors without waiting, and the
-          -- parts that other cores gave in the round that follows.
-          delay <- if descriptors > 0 || remote > 0 then Just <$> registerDelay 1000 else pure Nothing
-          atomically $ maybe retry (readTVar >=> check) delay `orElse` foldr (orElse . watchReady . fst) retry watching
-          checked <- traverse (\entry -> (,) entry <$> hasFired (fst entry)) watching
-          let (fired, still) = partition snd checked
-          mapM_ (watchCancel . fst . fst) fired
-          polled <- if descriptors > 0 then poll c_pollerPoll 0 else pure []
-          go (map (snd . fst) fired <> polled) [] (map fst still) (descriptors - length polled) parked
+              -- Watches, and descriptors too, and the mailbox: the watches for a
+              -- millisecond at most, then the descriptors without waiting, and the
+              -- parts that other cores gave in the round that follows.
+              delay <- if descriptors > 0 || remote > 0 then Just <$> registerDelay 1000 else pure Nothing
+              interruptedBy . atomically $ maybe retry (readTVar >=> check) delay `orElse` foldr (orElse . (\(Watching _ watch _) -> watchReady watch)) retry watching
+              watched <- readIORef (runWatching run)
+              checked <- traverse (\entry@(Watching _ watch _) -> (,) entry <$> hasFired watch) watched
+              let (fired, still) = partition snd checked
+              mapM_ (\(Watching _ watch _, _) -> watchCancel watch) fired
+              writeIORef (runWatching run) (map fst still)
+              polled <- if descriptors > 0 then pollNow else pure []
+              go (map (\(Watching _ _ resume, _) -> resume (pure ())) fired <> polled) []
     countWait = counter run 2 >>= setCounter run 2 . (+ 1)
+    -- An asynchronous exception that arrives at a wait begins a shutdown: every part that is in a scope is
+    -- cancelled. One that arrives again is the same.
+    shuttingDown failure =
+      readIORef (runShutdown run) >>= \case
+        Nothing -> writeIORef (runShutdown run) (Just failure) *> cancelScope run (runRoot run)
+        Just _ -> pure ()
+    interruptedBy wait = try wait >>= either shuttingDown pure
     -- Registers the descriptor with the poller the first time a part waits on
     -- it, and adds the part to its waiters.
-    waitOn (Fd fd) reading part = do
+    waitOn (Fd fd) reading entry = do
       waiters <- readIORef (runWaiters run)
       let key = fromIntegral fd
           Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
       if IntMap.member key waiters then pure () else throwErrnoIfMinus1_ "directions_poller_add" (c_pollerAdd (runPoller run) fd)
       writeIORef (runWaiters run) $
-        IntMap.insert key (if reading then Waiters (part : readers) writers else Waiters readers (part : writers)) waiters
-    -- Asks the poller what became ready, waiting as the timeout says, and gives
-    -- the parts that wait on it.
-    poll call timeout = do
-      count <-
-        unsafeWithForeignPtr (runReady run) $ \fds ->
-          unsafeWithForeignPtr (runKinds run) $ \kinds ->
-            call (runPoller run) fds kinds (fromIntegral batch) timeout
-      if count < 0
-        then getErrno >>= \errno -> if errno == eINTR then pure [] else throwErrno "directions_poller_wait"
-        else do
-          ready <-
+        IntMap.insert key (if reading then Waiters (entry : readers) writers else Waiters readers (entry : writers)) waiters
+    -- Asks the poller what became ready, without waiting.
+    pollNow = rawPoll c_pollerPoll 0 >>= afterPoll
+    -- Waits in the poller, which an asynchronous exception can interrupt: it begins a shutdown. No part runs
+    -- while the scheduler waits, so it waits unmasked: a masked thread in an interruptible foreign call returns
+    -- from it with the exception still to come.
+    pollWait =
+      try (interruptible (rawPoll c_pollerWait (-1))) >>= \case
+        Left failure -> [] <$ shuttingDown failure
+        Right count -> afterPoll count
+    rawPoll call timeout =
+      unsafeWithForeignPtr (runReady run) $ \fds ->
+        unsafeWithForeignPtr (runKinds run) $ \kinds ->
+          call (runPoller run) fds kinds (fromIntegral batch) timeout
+    -- The parts that wait on what became ready.
+    afterPoll count
+      | count < 0 = getErrno >>= \errno -> if errno == eINTR then pure [] else throwErrno "directions_poller_wait"
+      | otherwise = do
+          readied <-
             unsafeWithForeignPtr (runReady run) $ \fds ->
               unsafeWithForeignPtr (runKinds run) $ \kinds ->
                 traverse (\index -> (,) <$> peekElemOff fds index <*> peekElemOff kinds index) [0 .. fromIntegral count - 1]
           waiters <- readIORef (runWaiters run)
-          let (woken, waiters') = foldl wake ([], waiters) ready
-          woken <$ writeIORef (runWaiters run) waiters'
+          let (woken, waiters') = foldl wake ([], waiters) readied
+          writeIORef (runWaiters run) waiters'
+          adjust run 4 (negate (length woken))
+          pure (map (\entry -> resumeOf entry (pure ())) woken)
     wake (woken, waiters) (fd, kind) =
       let key = fromIntegral fd
           Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters

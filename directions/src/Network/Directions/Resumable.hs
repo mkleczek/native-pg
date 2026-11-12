@@ -28,7 +28,7 @@ import Foreign.ForeignPtr (plusForeignPtr)
 import Foreign.Marshal.Utils (moveBytes)
 import Foreign.Ptr (castPtr)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
-import Network.Directions.Classes
+import Network.Directions.Classes hiding (Exit (..))
 
 -- | Where a parser is: done, with the bytes it left in hand, or in need of
 -- bytes, or with a piece of a field to give away.

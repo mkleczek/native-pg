@@ -10,6 +10,14 @@
 module Network.Directions.Classes
   ( Link (..),
     Concurrent (..),
+    Exit (..),
+    ScopeId (..),
+    Cancelled (..),
+    ReleaseFailed (..),
+    cancelledBy,
+    exitOf,
+    Scope (..),
+    Race (..),
     Effect (..),
     GiveWay (..),
     Block (..),
@@ -31,6 +39,7 @@ module Network.Directions.Classes
 where
 
 import Control.Arrow (ArrowChoice, first, returnA, (>>>), (^>>), (|||))
+import Control.Exception (Exception, SomeException, fromException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
@@ -109,6 +118,63 @@ newtype Giver a = Giver (a -> IO Bool)
 -- after the other: the result is both outputs, once both have ended.
 class Concurrent arr where
   concurrently :: arr a b -> arr a c -> arr a (b, c)
+
+-- | How the body of a 'scope' ended.
+data Exit = Done | Failed SomeException | Cancelled'
+  deriving (Show)
+
+-- | Which cancel scope a cancellation is of: the scope of a deadline, or of a half of a concurrent pair. The
+-- parts inside a cancelled scope are cancelled at their next wait.
+newtype ScopeId = ScopeId Int
+  deriving (Eq, Ord, Show)
+
+-- | The exception that cancels a part, thrown at its wait. It carries the scope that was cancelled, so that a
+-- deadline or a race can tell its own cancellation from one that comes from outside. It is not a failure: 'tryA'
+-- lets it pass, and a 'scope' reports it to its release as 'Cancelled''.
+newtype Cancelled = Cancelled ScopeId
+  deriving (Show)
+
+instance Exception Cancelled
+
+-- | A release failed. It carries how the scope's body had ended, and the release's failure, which replaces the
+-- body's exit: the resource is not released, and the failure is the part's.
+data ReleaseFailed = ReleaseFailed Exit SomeException
+  deriving (Show)
+
+instance Exception ReleaseFailed
+
+-- | The scope that a failure cancels, if it is a cancellation.
+cancelledBy :: SomeException -> Maybe ScopeId
+cancelledBy failure = (\(Cancelled ident) -> ident) <$> fromException failure
+
+-- | How a body that ended as the result says ended.
+exitOf :: Either SomeException a -> Exit
+exitOf = either (\failure -> maybe (Failed failure) (const Cancelled') (cancelledBy failure)) (const Done)
+
+-- | Resources and failures, and what cancellation reaches.
+--
+-- A part is cancelled at its waits only ('block', 'await', 'awaitRemote', and 'giveWay'): a part that waits gets it
+-- at once, and one that runs, at its next wait, so that no 'now' is ever interrupted. A cancellation is of a
+-- scope, and is delivered to the parts inside it, unless a 'shield' lies between: then it is kept until the part
+-- has left the shield.
+class Scope arr where
+  -- | Acquires, runs the body with what it acquired, and releases it on every exit, however the body ended: the
+  -- release is shielded, so no cancellation reaches it, and it may wait. A failure of the release is reported
+  -- as 'ReleaseFailed'.
+  scope :: arr a r -> arr (r, Exit) () -> arr (r, a) b -> arr a b
+
+  -- | The failure of the body as a value. A cancellation is not caught: it passes on.
+  tryA :: arr a b -> arr a (Either SomeException b)
+
+  -- | Runs the arrow with the cancellations of scopes outside it kept until it ends. A deadline inside it still
+  -- fires.
+  shield :: arr a b -> arr a b
+
+-- | Two arrows that run at once, until the first ends.
+class Race arr where
+  -- | The first half to end is the result, and the other is cancelled and waited for: 'race' returns once its
+  -- scopes are released. If the first to end failed, its failure is rethrown then.
+  race :: arr a b -> arr a c -> arr a (Either b c)
 
 -- | An action that never waits, as an arrow.
 class Effect arr where

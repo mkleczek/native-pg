@@ -17,6 +17,13 @@
 -- what it makes with 'newTicket' or 'newRemote' belongs to that @s@, so that
 -- it can't leave the run it was made in, or be used by the program of another
 -- core. What crosses cores is a 'Giver', which has no @s@.
+--
+-- A scope is plain IO code in the part: the continuation that a wait captures
+-- holds the part's handlers, so a release runs once, after the resume, however
+-- the part ended. A part is cancelled by resuming it, where it waits, with the
+-- cancellation to raise there. The scheduler runs and resumes every part
+-- masked, so that the part sees one masking state everywhere, as if it never
+-- suspended.
 module Network.Directions.Delimited
   ( Delimited,
     runDelimited,
@@ -28,19 +35,21 @@ where
 
 import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
-import Control.Concurrent (forkOn, killThread)
+import Control.Concurrent (forkOnWithUnmask, killThread)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
-import Control.Exception (SomeException, finally, mask, throwIO, try)
-import Control.Monad (when)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Control.Exception (SomeException, mask, mask_, onException, throwIO, try)
+import Control.Monad (replicateM_, when)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Kind (Type)
 import Data.List (sortOn)
 import GHC.Exts (PromptTag#, control0#, newPromptTag#, prompt#)
 import GHC.IO (IO (..))
 import Network.Directions.Atomic (update)
+import Network.Directions.Cancel
 import Network.Directions.Classes
 import Network.Directions.Loop (Report)
 import Network.Directions.Scheduler
+import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
 -- | An arrow as a function to IO, which runs under the scheduler's prompt, on
@@ -50,8 +59,8 @@ newtype Delimited (s :: Type) a b = Delimited (Context -> a -> IO b)
 
 type role Delimited nominal representational representational
 
--- | The run, and the prompt that a part's continuation is captured up to.
-data Context = Context !Run !(PromptTag Step)
+-- | The run, the prompt that a part's continuation is captured up to, and the part.
+data Context = Context !Run !(PromptTag Step) !Part
 
 data PromptTag a = PromptTag (PromptTag# a)
 
@@ -104,23 +113,83 @@ instance GiveWay (Delimited s) where
   {-# INLINE giveWay #-}
 
 instance Block (Delimited s) where
-  block = Delimited (\(Context run tag) event -> control0 tag (\resume -> counted run (Suspended event (resume (pure ())))))
+  block = Delimited $ \(Context run tag part) event ->
+    readIORef (partFrames part) >>= \case
+      [] -> control0 tag (counted run . Suspended event 0)
+      frames ->
+        cancelledIn frames >>= \case
+          Just ident -> throwIO (Cancelled ident)
+          Nothing -> do
+            ident <- nextWait run
+            writeIORef (partWait part) $ case event of
+              Readable (Fd fd) -> OnFd (fromIntegral fd) True ident
+              Writable (Fd fd) -> OnFd (fromIntegral fd) False ident
+              Watched _ -> OnWatch ident
+            control0 tag (counted run . Suspended event ident)
   {-# INLINE block #-}
 
--- | The part that starts the pair hands its continuation to the pair, and the
--- half that ends last goes on with it.
+-- | Runs the action behind a shield.
+shielded :: Context -> IO a -> IO a
+shielded (Context run _ part) action = do
+  pushFrame run part Shielded
+  outcome <- try action
+  popFrame run part
+  either (\failure -> throwIO (failure :: SomeException)) pure outcome
+
+instance Scope (Delimited s) where
+  scope (Delimited acquire) (Delimited release) (Delimited body) = Delimited $ \context@(Context run _ part) value -> do
+    acquired <- acquire context value
+    -- A part that is in no scope is in the root scope while it holds what it acquired, so that a shutdown
+    -- reaches it, and its release runs.
+    held <- readIORef (partFrames part) >>= \case [] -> True <$ pushFrame run part Held; _ -> pure False
+    outcome <- try (body context (acquired, value))
+    let exit = exitOf outcome
+    -- The release runs behind a shield.
+    pushFrame run part Shielded
+    released <- try (release context (acquired, exit))
+    popFrame run part
+    when held (popFrame run part)
+    case released of
+      Left failure -> throwIO (ReleaseFailed exit failure)
+      Right () -> either (\failure -> throwIO (failure :: SomeException)) pure outcome
+
+  tryA (Delimited inner) = Delimited $ \context value ->
+    try (inner context value) >>= \case
+      Left failure | Just _ <- cancelledBy failure -> throwIO failure
+      other -> pure other
+
+  shield (Delimited inner) = Delimited (\context value -> shielded context (inner context value))
+
+-- | The part that starts the pair hands its continuation to the pair, and the half that ends last goes on
+-- with it. The halves are parts in a cancel scope of their own, which the first failure cancels: the other
+-- half is cancelled where it waits, and its scopes are released before the pair ends, which rethrows the first
+-- failure. A failure of the second half is dropped.
 instance Concurrent (Delimited s) where
-  concurrently (Delimited one) (Delimited two) = Delimited $ \context@(Context _ tag) value ->
+  concurrently (Delimited one) (Delimited two) = Delimited $ \(Context run tag part) value ->
     control0 tag $ \resume -> do
-      joined <- newIORef Neither
-      let finish b c = resume (pure (b, c))
+      scope' <- newCancelScope
+      first' <- childPart run part scope'
+      second' <- childPart run part scope'
+      joined <- newIORef (Joined Nothing Nothing Nothing 0)
       pure $
         Forked
-          (one context value >>= \b -> readIORef joined >>= \case SecondDone c -> finish b c; _ -> Ended <$ writeIORef joined (FirstDone b))
-          (two context value >>= \c -> readIORef joined >>= \case FirstDone b -> finish b c; _ -> Ended <$ writeIORef joined (SecondDone c))
+          (try (one (Context run tag first') value) >>= pairEnded run scope' joined (resume . throwIO) (resume . pure) first' (\b (Joined _ c failure count) -> Joined (Just b) c failure count))
+          (try (two (Context run tag second') value) >>= pairEnded run scope' joined (resume . throwIO) (resume . pure) second' (\c (Joined b _ failure count) -> Joined b (Just c) failure count))
 
--- | What a concurrent pair has of its halves' results.
-data Half b c = Neither | FirstDone b | SecondDone c
+-- | The first half to end is the result: the other is cancelled where it waits, and the pair ends once its
+-- scopes are released. If the first to end failed, its failure is rethrown then. A failure of the loser that
+-- isn't its cancellation is rethrown too.
+instance Race (Delimited s) where
+  race (Delimited one) (Delimited two) = Delimited $ \(Context run tag part) value ->
+    control0 tag $ \resume -> do
+      scope' <- newCancelScope
+      first' <- childPart run part scope'
+      second' <- childPart run part scope'
+      winner <- newIORef Nothing
+      pure $
+        Forked
+          (try (Left <$> one (Context run tag first') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) first')
+          (try (Right <$> two (Context run tag second') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) second')
 
 -- | A ticket is a slot on this core: a part that waits for it is parked in it,
 -- as its captured continuation, and goes back among those that can go on when
@@ -129,24 +198,24 @@ data Half b c = Neither | FirstDone b | SecondDone c
 instance Exchange (Delimited s) where
   newtype Ticket (Delimited s) a = DelimitedTicket (IORef (Slot a))
   newTicket = Delimited (\_ () -> DelimitedTicket <$> newIORef Empty)
-  fulfil = Delimited $ \context@(Context run _) (DelimitedTicket slot, value) ->
+  fulfil = Delimited $ \context@(Context run _ _) (DelimitedTicket slot, value) ->
     readIORef slot >>= \case
       Empty -> writeIORef slot (Given value) *> step context
-      Waiter resume -> writeIORef slot (Given value) *> wakeTicket run (resume value) *> step context
+      Waiter resume -> writeIORef slot (Given value) *> wakeTicket run (resume (pure value)) *> step context
       Given _ -> ioError (userError "a ticket was given a value twice")
-  await = Delimited $ \context@(Context _ tag) (DelimitedTicket slot) ->
+  await = Delimited $ \context@(Context _ tag part) (DelimitedTicket slot) ->
     readIORef slot >>= \case
-      Given value -> value <$ step context
-      Empty -> control0 tag (\resume -> Parked <$ writeIORef slot (Waiter (resume . pure)))
+      Given value -> checkpoint part *> (value <$ step context)
+      Empty -> registering part (OnTicket slot) *> control0 tag (\resume -> Parked <$ writeIORef slot (Waiter resume))
       Waiter _ -> ioError (userError "two parts wait for one ticket")
 
 -- | What a remote ticket's slot holds, and what a core that gives it a value
 -- finds: nothing yet, the value, the part that waits for it, or that the waiter
 -- has gone. Several cores read and change it, atomically.
-data RemoteSlot a = RemoteEmpty | RemoteGiven a | RemoteWaiter (a -> IO Step) | RemoteAbandoned
+data RemoteSlot a = RemoteEmpty | RemoteGiven a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
 
 -- | What a give did to the slot.
-data Giving a = Stored | Resume (a -> IO Step) | Gone | Twice
+data Giving a = Stored | Resume (IO a -> IO Step) | Gone | Twice
 
 -- | What a waiter's parking did to the slot.
 data Parking a = Parking | Ready a | Misused
@@ -157,16 +226,17 @@ data Parking a = Parking | Ready a | Misused
 -- wakes that scheduler if it sleeps in its poller.
 instance Remote (Delimited s) where
   newtype Awaiting (Delimited s) a = DelimitedAwaiting (IORef (RemoteSlot a))
-  newRemote = Delimited $ \(Context run _) () -> do
+  newRemote = Delimited $ \(Context run _ _) () -> do
     slot <- newIORef RemoteEmpty
     pure (DelimitedAwaiting slot, Giver (giveRemote (runMailbox run) slot))
-  awaitRemote = Delimited $ \context@(Context _ tag) (DelimitedAwaiting slot) ->
+  awaitRemote = Delimited $ \context@(Context run tag part) (DelimitedAwaiting slot) ->
     readIORef slot >>= \case
-      RemoteGiven value -> value <$ step context
-      RemoteEmpty ->
+      RemoteGiven value -> checkpoint part *> (value <$ step context)
+      RemoteEmpty -> do
+        registering part (Other (stopRemote run slot))
         control0 tag $ \resume -> do
           parking <- update slot $ \case
-            RemoteEmpty -> (RemoteWaiter (resume . pure), Parking)
+            RemoteEmpty -> (RemoteWaiter resume, Parking)
             RemoteGiven value -> (RemoteGiven value, Ready value)
             other -> (other, Misused)
           case parking of
@@ -181,6 +251,14 @@ instance Remote (Delimited s) where
       RemoteGiven value -> (RemoteAbandoned, Just value)
       _ -> (RemoteAbandoned, Nothing)
 
+-- | Takes the part off the slot, if it still waits there: not if a value was given since, which has put the
+-- part in the mailbox, and which the part finds at its next wait.
+stopRemote :: Run -> IORef (RemoteSlot a) -> Cancelled -> IO (Maybe (IO Step))
+stopRemote run slot cancelled =
+  update slot (\case RemoteWaiter resume -> (RemoteEmpty, Just resume); other -> (other, Nothing)) >>= \case
+    Nothing -> pure Nothing
+    Just resume -> Just (resume (throwIO cancelled)) <$ adjust run 3 (-1)
+
 -- | Gives the slot its value, and if a part waits for it, puts the part in the
 -- mailbox of the scheduler that owns it. It says whether the waiter takes it.
 giveRemote :: Mailbox -> IORef (RemoteSlot a) -> a -> IO Bool
@@ -192,14 +270,15 @@ giveRemote mailbox slot value = do
     given -> (given, Twice)
   case giving of
     Stored -> pure True
-    Resume resume -> post mailbox (resume value)
+    Resume resume -> post mailbox (resume (pure value))
     Gone -> pure False
     Twice -> ioError (userError "a remote ticket was given a value twice")
 
 -- | Counts a step, and once the part has used its steps, yields: captures what
--- follows and gives it back to the scheduler.
+-- follows and gives it back to the scheduler. When the part goes on, it
+-- raises the cancellation that came meanwhile, if it is in a scope.
 step :: Context -> IO ()
-step (Context run tag) = spent run >>= \yields -> when yields (control0 tag (\resume -> pure (Yielded (resume (pure ())))))
+step (Context run tag part) = spent run >>= \yields -> when yields (control0 tag (\resume -> pure (Yielded (resume (checkpoint part)))))
 {-# INLINE step #-}
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
@@ -219,7 +298,8 @@ runIn :: Run -> Delimited s a b -> a -> IO (b, Report)
 runIn run (Delimited program) input = do
   tag <- newPromptTag
   result <- newIORef Nothing
-  schedule run (prompt tag) result (program (Context run tag) input >>= \value -> Ended <$ writeIORef result (Just value))
+  root <- newPart run
+  mask_ $ schedule run (prompt tag) result (program (Context run tag root) input >>= \value -> Ended <$ writeIORef result (Just value))
 
 -- | Runs the program of each of the cores, each on a thread of its own, pinned
 -- to a capability (@forkOn@: core @n@ to capability @n@, modulo their number,
@@ -240,18 +320,26 @@ runCoresReport cores setup program = do
   shared <- setup
   withRuns cores $ \runs -> do
     outcomes <- newChan
+    pending <- newIORef cores
     mask $ \restore -> do
+      -- Masked, so that a core always says how it ended: a stop reaches it where its scheduler waits.
       threads <-
         traverse
-          (\(core, run) -> forkOn core (restore (try (runIn run (program shared core) ())) >>= writeChan outcomes . (,) core))
+          (\(core, run) -> forkOnWithUnmask core (\unmask -> try (unmask (runIn run (program shared core) ())) >>= writeChan outcomes . (,) core))
           (zip [0 ..] runs)
-      let collect results remaining
-            | remaining == (0 :: Int) = pure (map snd (sortOn fst results))
-            | otherwise =
-                readChan outcomes >>= \case
-                  (_, Left failure) -> throwIO (failure :: SomeException)
-                  (core, Right result) -> collect ((core :: Int, result) : results) (remaining - 1)
-      restore (collect [] cores) `finally` mapM_ killThread threads
+      let collect results
+            | length results == cores = pure (map snd (sortOn fst results))
+            | otherwise = do
+                (core, outcome) <- readChan outcomes
+                modifyIORef' pending (subtract 1)
+                case outcome of
+                  Left failure -> throwIO (failure :: SomeException)
+                  Right result -> collect ((core :: Int, result) : results)
+          -- Stops the cores that still run, and waits until each has released what its parts hold.
+          stopAll = do
+            mapM_ killThread threads
+            readIORef pending >>= \remaining -> replicateM_ remaining (readChan outcomes)
+      restore (collect []) `onException` stopAll
 
 -- | The runs of that many cores, all freed once the action ends: after the
 -- threads that use them have.

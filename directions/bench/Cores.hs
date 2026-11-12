@@ -12,14 +12,19 @@
 --   threads).
 -- * @wake KIND SAMPLES@: how long a part waiting for a ticket on a core whose scheduler waits in its poller takes
 --   to go on after another core gives it a value. KIND is @delimited@ or @threads@.
+-- * @scope KIND VARIANT ROUNDS@: what a scope costs, entered and left, in ns and bytes, above the loop it is in. KIND
+--   is @threads@, @delimited@ or @compiled@; VARIANT is @bare@ (in the first part, which is in no cancel scope) or
+--   @half@ (in a half of a concurrent pair, which is in one).
+-- * @cancel KIND SAMPLES@: how long a part that waits for a ticket takes to run its release, after the first to end
+--   of a race, which cancels it, has ended. KIND is as above.
 module Main (main) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, returnA, (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (evaluate)
 import Control.Monad (replicateM, unless, void, when)
 import Data.Functor (($>))
-import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
+import Data.IORef (IORef, atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.List (sort)
 import Data.Maybe (isJust)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtr, withForeignPtr)
@@ -27,6 +32,7 @@ import Foreign.Storable (peek, poke)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.Classes
+import Network.Directions.Combinators (timesWith)
 import Network.Directions.Compiled
 import Network.Directions.Delimited
 import Network.Directions.Loop (Report (..))
@@ -47,7 +53,9 @@ main = do
     ["pingpong", kind, rounds] -> pingPongRun kind (read rounds)
     ["pool", kind, cores, parts, conns, seconds] -> poolRun kind (read cores) (read parts) (read conns) (read seconds)
     ["wake", kind, samples] -> wakeRun kind (read samples)
-    _ -> ioError (userError "usage: directions-cores-bench (pingpong KIND ROUNDS | pool KIND CORES PARTS CONNECTIONS SECONDS | wake KIND SAMPLES) +RTS -T -N..")
+    ["scope", kind, variant, rounds] -> scopeRun kind variant (read rounds)
+    ["cancel", kind, samples] -> cancelRun kind (read samples)
+    _ -> ioError (userError "usage: directions-cores-bench (pingpong KIND ROUNDS | pool KIND CORES PARTS CONNECTIONS SECONDS | wake KIND SAMPLES | scope KIND VARIANT ROUNDS | cancel KIND SAMPLES) +RTS -T -N..")
 
 -- | Bytes allocated by every thread so far, once a major collection has counted them.
 allocated :: IO Integer
@@ -91,7 +99,7 @@ count :: Counter -> IO Int
 count (Counter pointer) = withForeignPtr pointer peek
 
 -- | A part that checks a connection out, works a little while it has it, and releases it, until told to stop.
-part :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr) => Pool Int -> IORef Bool -> Counter -> arr () ()
+part :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr, Scope arr) => Pool Int -> IORef Bool -> Counter -> arr () ()
 part pool stop counter = loop
   where
     loop = now (\() -> readIORef stop) >>> (\stopped -> if stopped then Left () else Right ()) ^>> (returnA ||| turn)
@@ -154,3 +162,50 @@ wakeRun kind samples = do
   let at :: Double -> Double
       at fraction = latencies !! min (length latencies - 1) (floor (fraction * fromIntegral (length latencies)))
   printf "wake %s samples=%d blocked=%s median_us=%.1f p90_us=%.1f p99_us=%.1f min_us=%.1f max_us=%.1f\n" kind samples (maybe "-" show waits) (at 0.5 / 1000) (at 0.9 / 1000) (at 0.99 / 1000) (minimum latencies / 1000) (maximum latencies / 1000)
+
+-- | A program for every arrow that has scopes.
+type Program a = forall arr. (ArrowChoice arr, Effect arr, Concurrent arr, Exchange arr, Scope arr, Race arr) => arr () a
+
+runProgram :: String -> Program a -> IO a
+runProgram kind program = case kind of
+  "threads" -> runThreads program ()
+  "delimited" -> fst <$> runDelimited program ()
+  "compiled" -> fst <$> runCompiled program ()
+  _ -> ioError (userError ("no kind " <> kind))
+
+-- | Rounds of a scope, and of nothing, in the part or in a half of a pair: the difference, per round.
+scopeRun :: String -> String -> Int -> IO ()
+scopeRun kind variant rounds = do
+  let inside :: (Arrow arr, Concurrent arr) => arr () () -> arr () ()
+      inside loop = case variant of
+        "half" -> concurrently loop returnA >>^ const ()
+        _ -> loop
+      bare :: Program ()
+      bare = inside (timesWith rounds returnA)
+      scoped :: Program ()
+      scoped = inside (timesWith rounds (scope returnA (arr (const ())) (arr snd)))
+  -- Once to warm up, then each measured.
+  void (measured (runProgram kind bare))
+  (baseSeconds, baseBytes) <- measured (runProgram kind bare)
+  (scopeSeconds, scopeBytes) <- measured (runProgram kind scoped)
+  printf "scope %s %s rounds=%d ns_per_scope=%.1f bytes_per_scope=%.1f\n" kind variant rounds ((scopeSeconds - baseSeconds) * 1e9 / fromIntegral rounds) (fromIntegral (scopeBytes - baseBytes) / fromIntegral rounds :: Double)
+
+-- | How long a part that waits takes to run its release, after the part that cancels it has ended.
+cancelRun :: String -> Int -> IO ()
+cancelRun kind samples = do
+  stamp <- newIORef 0
+  latencies <- newIORef []
+  let released :: (Effect arr) => arr a ()
+      released = now (\_ -> getMonotonicTimeNSec >>= \late -> readIORef stamp >>= \early -> modifyIORef' latencies ((late - early) :))
+      -- The other part waits a little first, so that this one waits when it ends.
+      winner :: (Effect arr) => arr () ()
+      winner = now (\() -> threadDelay 200 *> getMonotonicTimeNSec >>= atomicWriteIORef stamp)
+      waits :: (Arrow arr, Exchange arr) => arr a ()
+      waits = arr (const ()) >>> newTicket >>> await
+      program :: Program ()
+      program = timesWith samples (race (scope returnA released (arr snd >>> waits)) winner >>^ const ())
+  runProgram kind program
+  sorted <- sort . map fromIntegral <$> readIORef latencies :: IO [Double]
+  let at :: Double -> Double
+      at fraction = sorted !! min (length sorted - 1) (floor (fraction * fromIntegral (length sorted)))
+  printf "cancel %s samples=%d median_us=%.1f p90_us=%.1f p99_us=%.1f min_us=%.1f max_us=%.1f\n" kind samples (at 0.5 / 1000) (at 0.9 / 1000) (at 0.99 / 1000) (minimum sorted / 1000) (maximum sorted / 1000)

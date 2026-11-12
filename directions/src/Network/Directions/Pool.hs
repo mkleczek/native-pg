@@ -35,9 +35,13 @@ free :: Pool conn -> IO [conn]
 free (Pool ref) = (\(State conns _) -> conns) <$> readIORef ref
 
 -- | A connection, once one is free: the first part to ask has the first that
--- is released.
-checkout :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr) => Pool conn -> arr () conn
-checkout pool = reserve pool >>> (awaitRemote ||| returnA)
+-- is released. A part that is cancelled while it waits gives up its place, and
+-- a connection that was given to it meanwhile goes back to the pool, so that
+-- none is lost.
+checkout :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr, Scope arr) => Pool conn -> arr () conn
+checkout pool = reserve pool >>> (scope returnA giveUp (arr fst >>> awaitRemote) ||| returnA)
+  where
+    giveUp = (\(awaiting, exit) -> case exit of Done -> Left (); _ -> Right awaiting) ^>> (returnA ||| (abandon >>> (maybe (Left ()) Right ^>> (returnA ||| release pool))))
 
 -- | A connection if one is free, or else the end to wait at for the one that
 -- is released to this part: it queues the part's giver. The waiter can
