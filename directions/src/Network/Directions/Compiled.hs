@@ -79,8 +79,8 @@ data Half b c = Neither | FirstDone b | SecondDone c
 -- way: a ticket is where parts coordinate, and none is on a parser's path.
 instance Exchange Compiled where
   newtype Ticket Compiled a = CompiledTicket (IORef (Slot a))
-  newTicket = CompiledTicket <$> newIORef Empty
-  fulfil (CompiledTicket slot) = Compiled $ \run value next ->
+  newTicket = Compiled (\_ () next -> newIORef Empty >>= next . CompiledTicket)
+  fulfil = Compiled $ \run (CompiledTicket slot, value) next ->
     readIORef slot >>= \case
       Empty -> writeIORef slot (Given value) *> stepped run (next ())
       Waiter resume -> do
@@ -88,7 +88,7 @@ instance Exchange Compiled where
         wakeTicket run (resume value)
         stepped run (next ())
       Given _ -> ioError (userError "a ticket was given a value twice")
-  await (CompiledTicket slot) = Compiled $ \run () next ->
+  await = Compiled $ \run (CompiledTicket slot) next ->
     readIORef slot >>= \case
       Given value -> stepped run (next value)
       Empty -> Parked <$ writeIORef slot (Waiter next)
@@ -100,6 +100,5 @@ instance Exchange Compiled where
 -- wakes one, or a watch fires.
 runCompiled :: Compiled a b -> a -> IO (b, Report)
 runCompiled (Compiled program) input = do
-  run <- newRun
   result <- newIORef Nothing
-  schedule run Function.id result (program run input (\value -> Ended <$ writeIORef result (Just value)))
+  withRun $ \run -> schedule run Function.id result (program run input (\value -> Ended <$ writeIORef result (Just value)))

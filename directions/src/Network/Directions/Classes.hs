@@ -16,6 +16,8 @@ module Network.Directions.Classes
     Event (..),
     Events (..),
     Exchange (..),
+    Remote (..),
+    Giver (..),
     HalfClose (..),
     receiveTrying,
     sendAllTrying,
@@ -57,17 +59,51 @@ class Link arr link where
 
 -- | Values that one direction gives another, once each: the way directions
 -- exchange what they know. How a ticket is kept and waited for is the arrow's.
+-- A ticket is made when the program runs, and passed through arrows like any
+-- value, so a part can make one for each thing it waits for. An arrow whose
+-- parts run on one core, as "Network.Directions.Delimited" does, makes a ticket
+-- belong to that core in its type: it can be given and waited for by the parts
+-- of that core only.
 class Exchange arr where
   data Ticket arr a
 
-  -- | A ticket, made while the program is built.
-  newTicket :: IO (Ticket arr a)
+  newTicket :: arr () (Ticket arr a)
 
   -- | Gives the ticket its value. A ticket is given one once.
-  fulfil :: Ticket arr a -> arr a ()
+  fulfil :: arr (Ticket arr a, a) ()
 
   -- | Waits until the ticket has its value, and gives it.
-  await :: Ticket arr a -> arr () a
+  await :: arr (Ticket arr a) a
+
+-- | A ticket that the parts of other cores can give a value, for a part that
+-- waits for it on its own core: one end to wait at, which belongs to that core
+-- as a 'Ticket' does, and one to give at, which doesn't, so that shared
+-- structures can hold it. A pool of connections keeps the givers of those that
+-- wait for one.
+class Remote arr where
+  data Awaiting arr a
+
+  -- | A pair of ends of a new ticket, made on this core.
+  newRemote :: arr () (Awaiting arr a, Giver a)
+
+  -- | Waits until the ticket is given its value, and gives it. Only on the core
+  -- that made it, which its type says.
+  awaitRemote :: arr (Awaiting arr a) a
+
+  -- | Gives the value to the part that waits at the other end, from any core,
+  -- and says whether it did: it didn't if the waiter has gone, and the value
+  -- is the giver's again.
+  give :: arr (Giver a, a) Bool
+
+  -- | The waiter stops wanting the value, before it waits for it: a later
+  -- 'give' says it didn't. If the value was given already, it is the waiter's,
+  -- and this gives it back.
+  abandon :: arr (Awaiting arr a) (Maybe a)
+
+-- | The giving end of a remote ticket: it says whether the value was given.
+-- It mentions no core, so it can be sent to others and kept in structures that
+-- they share.
+newtype Giver a = Giver (a -> IO Bool)
 
 -- | Two arrows that run at once on the same input, as '&&&' runs them one
 -- after the other: the result is both outputs, once both have ended.

@@ -1,0 +1,76 @@
+-- | A pool of connections as library code, on the primitives of the classes
+-- alone: one atomically updated reference to the connections that are free
+-- and the 'Giver's of those that wait for one, and an arrow's 'Remote' tickets
+-- for the waiting. It is written once, for any arrow that has them: parts on the
+-- cores of "Network.Directions.Delimited" share it, and so do the threads of
+-- "Network.Directions.Threads".
+module Network.Directions.Pool
+  ( Pool,
+    newPool,
+    checkout,
+    reserve,
+    release,
+    free,
+  )
+where
+
+import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (^>>), (|||))
+import Data.IORef (IORef, newIORef, readIORef)
+import Data.Sequence (Seq, ViewL (..), viewl, (|>))
+import qualified Data.Sequence as Seq
+import Network.Directions.Atomic (update)
+import Network.Directions.Classes
+
+-- | The connections that are free, and the givers of those that wait for one,
+-- in the order they came. While there are waiters, none is free.
+data State conn = State [conn] (Seq (Giver conn))
+
+newtype Pool conn = Pool (IORef (State conn))
+
+newPool :: [conn] -> IO (Pool conn)
+newPool conns = Pool <$> newIORef (State conns Seq.empty)
+
+-- | The connections that are free now.
+free :: Pool conn -> IO [conn]
+free (Pool ref) = (\(State conns _) -> conns) <$> readIORef ref
+
+-- | A connection, once one is free: the first part to ask has the first that
+-- is released.
+checkout :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr) => Pool conn -> arr () conn
+checkout pool = reserve pool >>> (awaitRemote ||| returnA)
+
+-- | A connection if one is free, or else the end to wait at for the one that
+-- is released to this part: it queues the part's giver. The waiter can
+-- 'abandon' it instead, which gives back a connection that came meanwhile.
+-- Asking is a point to give way at, as a link's receive is: a part that does
+-- nothing else than check connections out and release them doesn't keep the
+-- others of its core from running.
+reserve :: (ArrowChoice arr, Effect arr, GiveWay arr, Remote arr) => Pool conn -> arr () (Either (Awaiting arr conn) conn)
+reserve (Pool ref) = giveWay >>> now (\() -> update ref takeFree) >>> (queue ||| arr Right)
+  where
+    takeFree (State conns waiters) = case conns of
+      conn : others -> (State others waiters, Right conn)
+      [] -> (State [] waiters, Left ())
+    -- Only now is there a ticket to make; a connection released between the
+    -- look and the queueing is there for this part to take.
+    queue = newRemote >>> now (\(awaiting, giver) -> update ref (enqueue giver awaiting))
+    enqueue giver awaiting (State conns waiters) = case conns of
+      conn : others -> (State others waiters, Right conn)
+      [] -> (State [] (waiters |> giver), Left awaiting)
+
+-- | Gives the connection to the first part that waits for one. A waiter that
+-- has gone doesn't take it, and the next is tried; with none left, the
+-- connection is free.
+release :: (ArrowChoice arr, Effect arr, Remote arr) => Pool conn -> arr conn ()
+release (Pool ref) = loop
+  where
+    loop = now (update ref . hand) >>> (returnA ||| handOver)
+    hand conn (State conns waiters) = case viewl waiters of
+      giver :< others -> (State conns others, Right (giver, conn))
+      EmptyL -> (State (conn : conns) waiters, Left ())
+    -- Gives it, and goes on with it if the waiter wasn't there.
+    handOver =
+      (\(giver, conn) -> ((giver, conn), conn))
+        ^>> first give
+        >>> (\(taken, conn) -> if taken then Left () else Right conn)
+        ^>> (returnA ||| loop)

@@ -1,3 +1,5 @@
+{-# LANGUAGE QuantifiedConstraints #-}
+
 -- | Moves bytes from a client through the proxy to an echo server and back,
 -- with each way to run the program, and says what each did per MiB that went
 -- each way: how fast, how many steps and waits (one thread only), and how much
@@ -35,14 +37,14 @@ main = do
       picked name = all (`isPrefixOf` name) (take 1 (drop 1 arguments))
       measure name size run = when (picked name) (measureRun name size run)
   printf "%-24s %6s %9s %10s %10s %12s\n" "run" "MiB" "MiB/s" "steps/MiB" "waits/MiB" "alloc/MiB"
-  measure "threads, sockets" mib (overSockets (\program -> Nothing <$ runThreads program ()))
-  measure "loop, sockets" mib (overSockets (\program -> Just . snd <$> runLoop program ()))
-  measure "compiled, sockets" mib (overSockets (\program -> Just . snd <$> runCompiled program ()))
-  measure "delimited, sockets" mib (overSockets (\program -> Just . snd <$> runDelimited program ()))
-  measure "loop, simulated" mib (overSimulated (\program -> Just . snd <$> runLoop program ()))
-  measure "compiled, simulated" mib (overSimulated (\program -> Just . snd <$> runCompiled program ()))
-  measure "delimited, simulated" mib (overSimulated (\program -> Just . snd <$> runDelimited program ()))
-  measure "simulation" (min mib 8) (overSimulated (\program -> Just . simulatedReport <$> runSimulation 1 maxBound program ()))
+  measure "threads, sockets" mib (overSockets (\built -> built >>= \program -> Nothing <$ runThreads program ()))
+  measure "loop, sockets" mib (overSockets (\built -> built >>= \program -> Just . snd <$> runLoop program ()))
+  measure "compiled, sockets" mib (overSockets (\built -> built >>= \program -> Just . snd <$> runCompiled program ()))
+  measure "delimited, sockets" mib (overSockets (\built -> Just . snd <$> runDelimitedWith built ()))
+  measure "loop, simulated" mib (overSimulated (\built -> built >>= \program -> Just . snd <$> runLoop program ()))
+  measure "compiled, simulated" mib (overSimulated (\built -> built >>= \program -> Just . snd <$> runCompiled program ()))
+  measure "delimited, simulated" mib (overSimulated (\built -> Just . snd <$> runDelimitedWith built ()))
+  measure "simulation" (min mib 8) (overSimulated (\built -> built >>= \program -> Just . simulatedReport <$> runSimulation 1 maxBound program ()))
 
 -- | Runs the round trip of this many MiB, and prints what it did per MiB.
 measureRun :: String -> Int -> (Int -> IO (Maybe Report, Int)) -> IO ()
@@ -62,7 +64,7 @@ measureRun name mib run = do
 
 -- | The round trip over socket pairs: the run's report, and how many bytes the
 -- client got back.
-overSockets :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => (arr () () -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
+overSockets :: (Built -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
 overSockets run size = withPair $ \client front -> withPair $ \back server -> roundTrip run size (client, front, back, server)
   where
     withPair :: (Socket -> Socket -> IO a) -> IO a
@@ -71,29 +73,33 @@ overSockets run size = withPair $ \client front -> withPair $ \back server -> ro
         . uncurry
 
 -- | The round trip over simulated links that hold 64 KiB each way.
-overSimulated :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => (arr () () -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
+overSimulated :: (Built -> IO (Maybe Report)) -> Int -> IO (Maybe Report, Int)
 overSimulated run size = do
   (client, front) <- connect 65536
   (back, server) <- connect 65536
   roundTrip run size (client, front, back, server)
 
-roundTrip :: (ArrowChoice arr, Concurrent arr, Effect arr, Link arr end) => (arr () () -> IO (Maybe Report)) -> Int -> (end, end, end, end) -> IO (Maybe Report, Int)
+roundTrip :: (forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Link arr end) => (Built -> IO (Maybe Report)) -> Int -> (end, end, end, end) -> IO (Maybe Report, Int)
 roundTrip run size (client, front, back, server) = do
   received <- newIORef 0
-  forSending <- newBuffer 16384
-  forCounting <- newBuffer 16384
-  requests <- newBuffer 16384
-  answers <- newBuffer 16384
-  forServer <- newBuffer 16384
   report <-
-    run $
-      together
-        [ sending forSending size client,
-          counting forCounting client received,
-          proxy requests answers front back,
-          echo forServer server
-        ]
+    run $ do
+      forSending <- newBuffer 16384
+      forCounting <- newBuffer 16384
+      requests <- newBuffer 16384
+      answers <- newBuffer 16384
+      forServer <- newBuffer 16384
+      pure $
+        together
+          [ sending forSending size client,
+            counting forCounting client received,
+            proxy requests answers front back,
+            echo forServer server
+          ]
   (,) report <$> readIORef received
+
+-- | A program made in IO, which each arrow runs.
+type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => IO (arr () ())
 
 -- | Sends this many bytes from the buffer, whatever is in it, then ends the
 -- output.

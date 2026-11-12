@@ -14,7 +14,7 @@ import Control.Arrow (Arrow, ArrowChoice, Kleisli (..), returnA)
 import Control.Category (Category)
 import Control.Concurrent (forkIO, killThread, threadWaitRead, threadWaitWrite)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
-import Control.Concurrent.STM (TMVar, atomically, newEmptyTMVarIO, readTMVar, tryPutTMVar)
+import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, finally, throwIO, try)
 import Control.Monad (unless)
 import Network.Directions.Classes
@@ -67,8 +67,29 @@ instance Block Threads where
 -- | A ticket is a 'TMVar', which blocks the thread that waits for it.
 instance Exchange Threads where
   newtype Ticket Threads a = ThreadTicket (TMVar a)
-  newTicket = ThreadTicket <$> newEmptyTMVarIO
-  fulfil (ThreadTicket var) = threads $ \value -> do
+  newTicket = threads (\() -> ThreadTicket <$> newEmptyTMVarIO)
+  fulfil = threads $ \(ThreadTicket var, value) -> do
     given <- atomically (tryPutTMVar var value)
     unless given $ ioError (userError "a ticket was given a value twice")
-  await (ThreadTicket var) = threads (\() -> atomically (readTMVar var))
+  await = threads (\(ThreadTicket var) -> atomically (readTMVar var))
+
+-- | The two ends of a remote ticket are the same 'TMVar', and whether the
+-- waiter has gone. Every thread can reach both: there is no core to belong to.
+instance Remote Threads where
+  data Awaiting Threads a = ThreadAwaiting (TMVar a) (TVar Bool)
+  newRemote = threads $ \() -> do
+    var <- newEmptyTMVarIO
+    abandoned <- newTVarIO False
+    pure (ThreadAwaiting var abandoned, Giver (giveThread var abandoned))
+  awaitRemote = threads (\(ThreadAwaiting var _) -> atomically (readTMVar var))
+  give = threads (\(Giver giving, value) -> giving value)
+  abandon = threads $ \(ThreadAwaiting var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
+
+giveThread :: TMVar a -> TVar Bool -> a -> IO Bool
+giveThread var abandoned value = atomically $ do
+  gone <- readTVar abandoned
+  if gone
+    then pure False
+    else do
+      given <- tryPutTMVar var value
+      if given then pure True else throwSTM (userError "a remote ticket was given a value twice")

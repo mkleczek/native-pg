@@ -10,6 +10,7 @@ module Network.Directions.Proxy
     proxyThrough,
     echo,
     together,
+    times,
     receiveAll,
     exchange,
     sendThenReceive,
@@ -18,7 +19,7 @@ module Network.Directions.Proxy
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
@@ -58,13 +59,20 @@ echo :: (ArrowChoice arr, Link arr end) => Buffer -> end -> arr () ()
 echo buffer end = pump buffer end end
 {-# INLINABLE echo #-}
 
--- | Runs the arrows at once, until all have ended.
-together :: (Arrow arr, Concurrent arr) => [arr () ()] -> arr () ()
+-- | Runs the arrows at once on the same input, until all have ended.
+together :: (Arrow arr, Concurrent arr) => [arr a ()] -> arr a ()
 together = \case
-  [] -> returnA
+  [] -> arr (const ())
   [one] -> one
   one : others -> concurrently one (together others) >>^ const ()
 {-# INLINABLE together #-}
+
+-- | Runs the arrow this many times.
+times :: (ArrowChoice arr) => Int -> arr () () -> arr () ()
+times count act = const count ^>> loop
+  where
+    loop = (\k -> if k == 0 then Left () else Right (k - 1)) ^>> (returnA ||| (((),) ^>> first act >>> arr snd >>> loop))
+{-# INLINABLE times #-}
 
 -- | Keeps a copy of what arrives, the latest first, until the end of the
 -- stream.
@@ -115,16 +123,24 @@ receiveBytes buffer end total = const BS.empty ^>> loop
 -- | A transaction's two directions, as a client of a server that answers each
 -- line: the request side sends the batch, waits for the decision that the
 -- answer side gives it, and sends the ending that was decided; the answer side
--- reads the batch's answer, decides from it, and keeps what follows.
-transaction :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, Link arr end) => Ticket arr Bool -> Buffer -> end -> ByteString -> (ByteString -> Bool) -> IORef [ByteString] -> arr () ()
-transaction decision buffer end batch commits kept = together [requests, answers]
+-- reads the batch's answer, decides from it, and keeps what follows. The
+-- decision is a ticket that the transaction makes when it runs, and both
+-- sides are given.
+transaction :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, Link arr end) => Buffer -> end -> ByteString -> (ByteString -> Bool) -> IORef [ByteString] -> arr () ()
+transaction buffer end batch commits kept = newTicket >>> together [requests, answers]
   where
     requests =
-      const [batch]
-        ^>> sendAll end
-        >>> await decision
+      ([batch],)
+        ^>> first (sendAll end)
+        >>> snd
+        ^>> await
         >>> (\commit -> [BS8.pack (if commit then "COMMIT\n" else "ROLLBACK\n")])
         ^>> sendAll end
         >>> shutdownSend end
-    answers = receiveBytes buffer end (BS.length batch) >>> commits ^>> fulfil decision >>> receiveAll buffer end kept
+    answers =
+      ((),)
+        ^>> first (receiveBytes buffer end (BS.length batch))
+        >>> (\(answer, decision) -> (decision, commits answer))
+        ^>> fulfil
+        >>> receiveAll buffer end kept
 {-# INLINABLE transaction #-}

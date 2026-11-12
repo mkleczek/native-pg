@@ -18,6 +18,9 @@ library
                    Network.Directions.Scheduler
                    Network.Directions.Compiled
                    Network.Directions.Delimited
+                   Network.Directions.Atomic
+                   Network.Directions.Pool
+                   Network.Directions.PingPong
                    Network.Directions.Simulated
                    Network.Directions.Proxy
                    Network.Directions.Reader
@@ -34,7 +37,9 @@ test-suite directions-spec
   main-is: Main.hs
   other-modules: DirectionsSpec
                  ReaderSpec
-  ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
+                 CoresSpec
+                 RegionSpec
+  ghc-options: -Wall -threaded -rtsopts -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, network, directions, skeletest >=0.4.2 && <0.5
 
@@ -44,3 +49,10 @@ executable directions-bench
   main-is: Main.hs
   ghc-options: -Wall -threaded -rtsopts
   build-depends: base, network, directions
+
+executable directions-cores-bench
+  default-language: GHC2021
+  hs-source-dirs: bench
+  main-is: Cores.hs
+  ghc-options: -Wall -threaded -rtsopts
+  build-depends: base, directions

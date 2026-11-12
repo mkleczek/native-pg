@@ -42,8 +42,8 @@ data Loop a b where
   Both :: Loop a b -> Loop a c -> Loop a (b, c)
   Now :: (a -> IO b) -> Loop a b
   Block :: Loop Event ()
-  Fulfil :: IORef (Slot a) -> Loop a ()
-  Await :: IORef (Slot a) -> Loop () a
+  Fulfil :: Loop (IORef (Slot a), a) ()
+  Await :: Loop (IORef (Slot a)) a
 
 instance Category Loop where
   id = Arr Function.id
@@ -77,9 +77,9 @@ instance Block Loop where
 -- is given its value.
 instance Exchange Loop where
   newtype Ticket Loop a = LoopTicket (IORef (Slot a))
-  newTicket = LoopTicket <$> newIORef Empty
-  fulfil (LoopTicket slot) = Fulfil slot
-  await (LoopTicket slot) = Await slot
+  newTicket = Now (\() -> LoopTicket <$> newIORef Empty)
+  fulfil = Seq (Arr (\(LoopTicket slot, value) -> (slot, value))) Fulfil
+  await = Seq (Arr (\(LoopTicket slot) -> slot)) Await
 
 -- | A ticket's slot: empty, given its value, or holding the part that waits for
 -- it, as what puts the part back among those that can go on.
@@ -139,15 +139,16 @@ advance fuel wake = go 0
               pure (steps, Forked (Run one input (JoinFirst joined frames)) (Run two input (JoinSecond joined frames)))
             Now action -> action input >>= \output -> go (steps + 1) (Give output frames)
             Block -> pure (steps + 1, Waits (watchOf input) (Give () frames))
-            Fulfil slot ->
-              readIORef slot >>= \case
-                Empty -> writeIORef slot (Given input) *> go (steps + 1) (Give () frames)
-                Waiter resume -> writeIORef slot (Given input) *> resume input *> go (steps + 1) (Give () frames)
-                Given _ -> ioError (userError "a ticket was given a value twice")
-            Await slot ->
-              readIORef slot >>= \case
+            Fulfil -> case input of
+              (slot, value) ->
+                readIORef slot >>= \case
+                  Empty -> writeIORef slot (Given value) *> go (steps + 1) (Give () frames)
+                  Waiter resume -> writeIORef slot (Given value) *> resume value *> go (steps + 1) (Give () frames)
+                  Given _ -> ioError (userError "a ticket was given a value twice")
+            Await ->
+              readIORef input >>= \case
                 Given value -> go (steps + 1) (Give value frames)
-                Empty -> (steps + 1, Parked) <$ writeIORef slot (Waiter (\value -> wake (Give value frames)))
+                Empty -> (steps + 1, Parked) <$ writeIORef input (Waiter (\value -> wake (Give value frames)))
                 Waiter _ -> ioError (userError "two parts wait for one ticket")
           Give value frames -> case frames of
             Return -> pure (steps, Finished value)

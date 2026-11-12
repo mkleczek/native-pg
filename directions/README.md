@@ -8,7 +8,9 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   `close`); and what an arrow can do: `Effect` (`now`, an action that never
   waits), `Block` (wait until a watch fires), `Concurrent` (two arrows at
   once) and `Exchange` (a ticket that one direction gives a value and another
-  waits for). None has a superclass: instances and users add what they need.
+  waits for; made as the program runs, `newTicket :: arr () (Ticket arr a)`,
+  and passed through arrows like any value). None has a superclass: instances
+  and users add what they need.
 - **A link's instance is written once, for any arrow:** the socket's and the
   simulated end's are `(ArrowChoice arr, Effect arr, Block arr) => Link arr _`,
   a try with `now`, and a `block` on the link's watch while nothing is ready.
@@ -34,9 +36,26 @@ it. Nothing in native-pg, streaming-io or Warp depends on it.
   request side waits for the decision of its answer side to send COMMIT or
   ROLLBACK.
 
+- **Cores** (`Network.Directions.Delimited`, `Pool`, `PingPong`): thread per
+  core is one `Delimited` scheduler for each core, with its own poller and
+  mailbox. The core is in the arrow's type, as `ST`'s state thread is:
+  `Delimited s a b`, run by `runDelimited :: (forall s. Delimited s a b) -> ...`
+  or by `runCores`, so a `Ticket (Delimited s) a` belongs to the one scheduler
+  and can't be given a value, or waited for, by the program of another core
+  (`RegionSpec` shows the compiler refusing, with `-fdefer-type-errors`). What
+  crosses cores is a `Remote` ticket: an `Awaiting` end, on the core that made
+  it, and a `Giver`, which has no core in its type and can be kept in shared
+  structures. A `give` to a parked waiter puts its continuation in the
+  waiter's core's mailbox and wakes that core's poller (`EVFILT_USER` on
+  kqueue, an eventfd on epoll) if it sleeps in it; the scheduler takes its
+  mailbox each round and before it sleeps. `Pool` is a connection pool written
+  once for any arrow with `Remote`, with one reference to the free connections
+  and the givers of the waiters.
+
 Run from the repository's root, in its `nix-shell`:
 
 ```sh
-cabal test directions
+cabal test directions --test-options='+RTS -N4'
 cabal run directions-bench -- 64 +RTS -T
+cabal run directions-cores-bench -- pool delimited 4 16 8 2 +RTS -T -N4
 ```

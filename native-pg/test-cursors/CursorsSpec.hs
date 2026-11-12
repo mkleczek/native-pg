@@ -163,25 +163,28 @@ type Fixeds = 'PayloadChoice '[FramedMessage 'k' ('PayloadCounted16 ('FixedBytes
 -- | A program over a reader of a memory link, for every arrow.
 type Program a b = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Reader Memory -> IO (arr a b)
 
+-- | A program that is made in IO, once the reader is there, for every arrow.
+type Made a b = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr a b)
+
 -- | Runs the program on the wire with each arrow, a reader of the capacity,
 -- and a link that gives at most the limit at once: what each gave, or how it
 -- failed.
 runAll' :: forall a b. Program a b -> a -> ByteString -> Int -> Int -> IO [Either String b]
 runAll' program input wire limit capacity =
   sequence
-    [ over (`runThreads` input),
-      over (\arrow -> fst <$> runCompiled arrow input),
-      over (\arrow -> fst <$> runDelimited arrow input)
+    [ over (\made -> made >>= (`runThreads` input)),
+      over (\made -> made >>= \arrow -> fst <$> runCompiled arrow input),
+      over (\made -> fst <$> runDelimitedWith made input)
     ]
   where
-    over :: (ArrowChoice arr, Effect arr, GiveWay arr) => (arr a b -> IO b) -> IO (Either String b)
+    over :: (Made a b -> IO b) -> IO (Either String b)
     over run =
       outcome
         <$> try
           ( do
               memory <- newMemory wire limit
               reader <- newReader memory capacity
-              program reader >>= run >>= evaluate
+              run (program reader) >>= evaluate
           )
 
 -- | Runs a program that adds up into a counter, with each arrow.

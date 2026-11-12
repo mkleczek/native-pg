@@ -55,9 +55,9 @@ spec = describe "directions" $ do
 
   describe "the simulation" $ do
     it "runs the same way for the same seed, and differently for another" $ do
-      first <- simulatedTrace . fst <$> roundTrip plain request (\program -> runSimulation 1 limit program ())
-      again <- simulatedTrace . fst <$> roundTrip plain request (\program -> runSimulation 1 limit program ())
-      other <- simulatedTrace . fst <$> roundTrip plain request (\program -> runSimulation 2 limit program ())
+      first <- simulatedTrace . fst <$> roundTrip plain request (\built -> built >>= \program -> runSimulation 1 limit program ())
+      again <- simulatedTrace . fst <$> roundTrip plain request (\built -> built >>= \program -> runSimulation 1 limit program ())
+      other <- simulatedTrace . fst <$> roundTrip plain request (\built -> built >>= \program -> runSimulation 2 limit program ())
       again `shouldBe` first
       (other == first) `shouldBe` False
 
@@ -87,8 +87,7 @@ spec = describe "directions" $ do
         transact (== batch) (simulate seed) `shouldReturn` (Completed (), BS8.pack "COMMIT\n")
 
     it "show, in a simulation, a part that waits for a ticket nothing gives a value" $ do
-      ticket <- newTicket :: IO (Ticket Loop ())
-      (simulatedOutcome <$> runSimulation 1 limit (await ticket) ()) `shouldReturn` Deadlocked [0]
+      (simulatedOutcome <$> runSimulation 1 limit (newTicket >>> await :: Loop () ()) ()) `shouldReturn` Deadlocked [0]
 
   describe "giving way, with every part on one thread" $
     it "happens at a link's receives, after 64 of them, and not at actions that never wait" $ do
@@ -128,16 +127,21 @@ effects order ident _ _ = const 1000 ^>> replicateA (now (\() -> modifyIORef' or
 -- | Runs two of the parts at once, compiled and on delimited continuations:
 -- how many steps each turn of a part had, in order, and the run's report.
 twoParts :: Part -> IO [([Int], Report)]
-twoParts part = sequence [measured (`runCompiled` ()), measured (`runDelimited` ())]
+twoParts part = sequence [measured compiled', measured delimited']
   where
-    measured :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr) => (arr () () -> IO ((), Report)) -> IO ([Int], Report)
+    measured :: (Built -> IO ((), Report)) -> IO ([Int], Report)
     measured run = do
       order <- newIORef []
-      one <- newMemory (BS.replicate 1000 0) 1
-      two <- newMemory (BS.replicate 1000 0) 1
-      buffer <- newBuffer 16
-      (_, report) <- run (together [part order 1 one buffer, part order 2 two buffer])
+      (_, report) <-
+        run $ do
+          one <- newMemory (BS.replicate 1000 0) 1
+          two <- newMemory (BS.replicate 1000 0) 1
+          buffer <- newBuffer 16
+          pure (together [part order 1 one buffer, part order 2 two buffer])
       (\notes -> (map length (group (reverse notes)), report)) <$> readIORef order
+    compiled', delimited' :: Built -> IO ((), Report)
+    compiled' built = built >>= \program -> runCompiled program ()
+    delimited' built = runDelimitedWith built ()
 
 batch :: ByteString
 batch = BS8.pack "BATCH\n"
@@ -145,14 +149,13 @@ batch = BS8.pack "BATCH\n"
 -- | A transaction against an echo server over simulated links, deciding to
 -- commit by the batch's answer: what the run gave, and what came back after
 -- the batch.
-transact :: (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, GiveWay arr, Block arr) => (ByteString -> Bool) -> (arr () () -> IO a) -> IO (a, ByteString)
+transact :: (ByteString -> Bool) -> (Built -> IO a) -> IO (a, ByteString)
 transact commits run = do
   (client, server) <- connect 1000
-  decision <- newTicket
   forClient <- newBuffer 4096
   forServer <- newBuffer 4096
   kept <- newIORef []
-  result <- run (together [transaction decision forClient client batch commits kept, echo forServer server])
+  result <- run (pure (together [transaction forClient client batch commits kept, echo forServer server]))
   (,) result . BS.concat . reverse <$> readIORef kept
 
 -- | How the client and the proxy are made.
@@ -183,22 +186,25 @@ world setup bytes kept (client, front, back, server) = do
         echo forServer server
       ]
 
+-- | A program made in IO, which each arrow runs: what the tests run.
+type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr, GiveWay arr, Block arr) => IO (arr () ())
+
 -- | The round trip over simulated links that hold 1000 bytes each way: what
 -- the run gave, and what the client kept.
-roundTrip :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Setup -> ByteString -> (arr () () -> IO a) -> IO (a, ByteString)
+roundTrip :: Setup -> ByteString -> (Built -> IO a) -> IO (a, ByteString)
 roundTrip setup bytes run = do
   (client, front) <- connect 1000
   (back, server) <- connect 1000
   kept <- newIORef []
-  result <- run =<< world setup bytes kept (client, front, back, server)
+  result <- run (world setup bytes kept (client, front, back, server))
   (,) result . BS.concat . reverse <$> readIORef kept
 
 -- | The same over socket pairs: what the client kept.
-overSockets :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => (arr () () -> IO ()) -> IO ByteString
+overSockets :: (Built -> IO ()) -> IO ByteString
 overSockets run =
   withPair $ \client front -> withPair $ \back server -> do
     kept <- newIORef []
-    run =<< world plain request kept (client, front, back, server)
+    run (world plain request kept (client, front, back, server))
     BS.concat . reverse <$> readIORef kept
   where
     withPair :: (Socket -> Socket -> IO a) -> IO a
@@ -206,20 +212,20 @@ overSockets run =
       bracket (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) (\(a, b) -> Socket.close a *> Socket.close b)
         . uncurry
 
-threaded :: Threads () () -> IO ()
-threaded program = runThreads program ()
+threaded :: Built -> IO ()
+threaded built = built >>= \program -> runThreads program ()
 
-looped :: Loop () () -> IO ()
-looped program = fst <$> runLoop program ()
+looped :: Built -> IO ()
+looped built = built >>= \program -> fst <$> runLoop program ()
 
-compiled :: Compiled () () -> IO ()
-compiled program = fst <$> runCompiled program ()
+compiled :: Built -> IO ()
+compiled built = built >>= \program -> fst <$> runCompiled program ()
 
-delimited :: Delimited () () -> IO ()
-delimited program = fst <$> runDelimited program ()
+delimited :: Built -> IO ()
+delimited built = fst <$> runDelimitedWith built ()
 
-simulate :: Word64 -> Loop () () -> IO (Outcome ())
-simulate seed program = simulatedOutcome <$> runSimulation seed limit program ()
+simulate :: Word64 -> Built -> IO (Outcome ())
+simulate seed built = built >>= \program -> simulatedOutcome <$> runSimulation seed limit program ()
 
 limit :: Int
 limit = 10000000
