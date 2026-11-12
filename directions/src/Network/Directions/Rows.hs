@@ -27,6 +27,7 @@ module Network.Directions.Rows
     Counter,
     newCounter,
     counting,
+    adding,
     counted,
   )
 where
@@ -193,6 +194,11 @@ newCounter = do
 counting :: (Effect arr) => Counter -> arr ByteString ()
 counting (Counter total) = now (\piece -> unsafeWithForeignPtr total (\pointer -> peek pointer >>= \sofar -> poke pointer $! sofar + BS.length piece))
 {-# INLINABLE counting #-}
+
+-- | Adds the numbers it is given.
+adding :: (Effect arr) => Counter -> arr Int ()
+adding (Counter total) = now (\number -> unsafeWithForeignPtr total (\pointer -> peek pointer >>= \sofar -> poke pointer $! sofar + number))
+{-# INLINABLE adding #-}
 
 counted :: Counter -> IO Int
 counted (Counter total) = unsafeWithForeignPtr total peek

@@ -143,6 +143,25 @@ benchmark parsers-bench
   default-language:   GHC2021
   hs-source-dirs:     src bench
   main-is:            ParsersBench.hs
-  other-modules:      Database.PostgreSQL.Internal.Protocol.Codec.Input
+  other-modules:      Database.PostgreSQL.Internal.Protocol.Codec.Cursor
+                      Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
+                      Database.PostgreSQL.Internal.Protocol.Codec.Input
+                      Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ghc-options:        -Wall -threaded -rtsopts
   build-depends:      base, bytestring, directions, streaming-io
+
+-- Tests of the streaming cursors that are derived from the payload schema.
+-- They read through a reader of the directions prototype, which the library
+-- doesn't depend on, so the suite compiles the cursors' sources.
+test-suite cursors-spec
+  type:               exitcode-stdio-1.0
+  default-language:   GHC2021
+  hs-source-dirs:     src test-cursors
+  main-is:            Main.hs
+  other-modules:      CursorsSpec
+                      Database.PostgreSQL.Internal.Protocol.Codec.Cursor
+                      Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
+                      Database.PostgreSQL.Internal.Protocol.Codec.Payload
+  ghc-options:        -Wall -threaded -F -pgmF=skeletest-preprocessor
+  build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
+  build-depends:      base, bytestring, directions, skeletest >= 0.4.2 && < 0.5

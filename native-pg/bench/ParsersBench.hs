@@ -9,16 +9,20 @@
 -- that counts it; each with a link that gives what the room takes, and one
 -- that gives 1,460 bytes at most.
 --
--- Usage: @parsers-bench [rounds [rows [MiB]]]@. Every variant runs once in each
--- round, in turn; the end of the output has the range over the rounds.
+-- Usage: @parsers-bench [rounds [rows [MiB [variants]]]]@. Every variant runs
+-- once in each round, in turn; the end of the output has the range over the
+-- rounds. The variants are the names of those to run, separated by commas, and
+-- all of them if there are none.
 module Main (main) where
 
 import Control.Arrow (Arrow, returnA, (>>^))
 import Control.Exception (evaluate)
 import Control.Monad (forM, forM_, replicateM, replicateM_, unless, void, when)
+import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word64)
+import Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
 import Database.PostgreSQL.Internal.Protocol.Codec.Input
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
@@ -51,7 +55,9 @@ data Variant = Variant
 
 variants :: [Variant]
 variants =
-  [ Variant "A input" (`inputRun` inputRows) (`inputRun` inputStream),
+  [ Variant "A copy" (`inputRun` inputRows) (`inputRun` inputStream),
+    -- The field of this one is read as the field of the copying one is, in views.
+    Variant "A in place" (`inputRun` inputRowsInPlace) (`inputRun` inputStream),
     Variant
       "B threads"
       (\memory -> withReader memory (\reader -> runThreads (foldRows checksum reader) 0))
@@ -71,7 +77,15 @@ variants =
     Variant
       "C delimited"
       (\memory -> resumable (\buffer -> fst . fst <$> runDelimited (parse memory buffer ignored rowsResumable) BS.empty))
-      (streamedResumable (\memory buffer counter -> void (runDelimited (parse memory buffer (counting counter) streamResumable) BS.empty)))
+      (streamedResumable (\memory buffer counter -> void (runDelimited (parse memory buffer (counting counter) streamResumable) BS.empty))),
+    Variant
+      "D threads"
+      (streamed (\counter reader -> runThreads (foldRowsCursors reader counter) ()))
+      (streamed (\counter reader -> runThreads (streamCursors reader (counting counter)) ())),
+    Variant
+      "D delimited"
+      (streamed (\counter reader -> fst <$> runDelimited (foldRowsCursors reader counter) ()))
+      (streamed (\counter reader -> fst <$> runDelimited (streamCursors reader (counting counter)) ()))
   ]
 
 withReader :: Memory -> (Reader Memory -> IO a) -> IO a
@@ -115,6 +129,32 @@ inputRows = loop 0
         67 -> readInputWord32 >>= \size -> total <$ readInputExactly (fromIntegral size - 4)
         _ -> failInput ("a message with the tag " <> show tag)
     row = readInputWord16 >>= \count -> replicateM (fromIntegral count) (readInputWord32 >>= readInputExactly . fromIntegral)
+
+-- | The same checksum, with the ints decoded in place by reading them as
+-- numbers, and the texts skipped: nothing is copied and no list is built.
+inputRowsInPlace :: Input Int
+inputRowsInPlace = loop 0
+  where
+    loop !total =
+      readInputWord8 >>= \tag -> case tag of
+        68 -> readInputWord32 *> row total >>= loop
+        67 -> readInputWord32 >>= \size -> total <$ readInputExactly (fromIntegral size - 4)
+        _ -> failInput ("a message with the tag " <> show tag)
+    row !total = do
+      fields <- readInputWord16
+      when (fields /= 5) $ failInput ("a row of " <> show fields <> " fields")
+      _ <- readInputWord32
+      int4 <- readInputWord32
+      _ <- readInputWord32
+      high <- readInputWord32
+      low <- readInputWord32
+      size16 <- readInputWord32
+      skipInput (fromIntegral size16)
+      size40 <- readInputWord32
+      skipInput (fromIntegral size40)
+      _ <- readInputWord32
+      bool <- readInputWord8
+      pure $! total + fromIntegral int4 + (fromIntegral high `shiftL` 32 .|. fromIntegral low) + fromIntegral size16 + fromIntegral size40 + fromIntegral bool
 
 -- | The bytes of the fields, counted in the chunks that native-pg's own reads
 -- of a field give.
@@ -169,6 +209,8 @@ main = do
       rowCount = number 1 1000000 :: Int
       mebibytes = number 2 128 :: Int
       limits = [("unlimited", maxBound), ("1460", 1460)] :: [(String, Int)]
+      names = maybe (variantName <$> variants) (splitOn ',') (lookup 3 (zip [0 :: Int ..] arguments))
+      chosen = filter ((`elem` names) . variantName) variants
   rowsBytes <- evaluate (rowsWire rowCount)
   streamedWire <- evaluate (streamWire (BS.replicate (mebibytes * 1048576) 97))
   let wire Rows = rowsBytes
@@ -178,7 +220,7 @@ main = do
       run Rows = variantRows
       run Stream = variantStream
   printf "rows %d (%d bytes), field %d MiB, buffer %d, rounds %d\n" rowCount (BS.length rowsBytes) mebibytes capacity rounds
-  agreed <- forM variants $ \variant -> do
+  agreed <- forM chosen $ \variant -> do
     results <- forM limits $ \(_, limit) -> do
       memory <- newMemory (rowsWire 1000) limit
       variantRows variant memory
@@ -187,7 +229,7 @@ main = do
   when (any (any (/= rowsChecksum 1000) . snd) agreed) $ die "the checksums of the small wire differ"
   samples <- fmap concat . forM [1 .. rounds] $ \roundNumber -> do
     printf "== round %d\n" roundNumber
-    fmap concat . forM [Rows, Stream] $ \workload -> fmap concat . forM limits $ \(limitName, limit) -> forM variants $ \variant -> do
+    fmap concat . forM [Rows, Stream] $ \workload -> fmap concat . forM limits $ \(limitName, limit) -> forM chosen $ \variant -> do
       let pass = do
             memory <- newMemory (wire workload) limit
             result <- run workload variant memory
@@ -196,10 +238,16 @@ main = do
       report workload rowCount mebibytes (BS.length (wire workload)) limitName (variantName variant) measured
       pure ((workload, limitName, variantName variant), measured)
   printf "\n== ranges over %d rounds, one pass of each workload\n" rounds
-  forM_ [Rows, Stream] $ \workload -> forM_ limits $ \(limitName, _) -> forM_ variants $ \variant -> do
+  forM_ [Rows, Stream] $ \workload -> forM_ limits $ \(limitName, _) -> forM_ chosen $ \variant -> do
     let key = (workload, limitName, variantName variant)
         measured = [one | (found, one) <- samples, found == key]
     summary workload rowCount mebibytes (BS.length (wire workload)) limitName (variantName variant) measured
+
+-- | The parts of the text between the separators.
+splitOn :: Char -> String -> [String]
+splitOn separator text = case break (== separator) text of
+  (part, []) -> [part]
+  (part, _ : rest) -> part : splitOn separator rest
 
 -- | What one pass did: for the rows, per row, and for the stream, per MiB.
 rates :: Workload -> Int -> Int -> Int -> Sample -> (Double, Double, Double)

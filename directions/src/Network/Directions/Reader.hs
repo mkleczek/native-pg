@@ -9,7 +9,7 @@
 -- A reader belongs to one direction: its parts run one after the other, and
 -- none but the part that streams a field takes bytes while it does.
 module Network.Directions.Reader
-  ( Reader,
+  ( Reader (..),
     newReader,
     bytes,
     word8,
@@ -17,6 +17,18 @@ module Network.Directions.Reader
     word32,
     stream,
     replicateA,
+
+    -- * What cursors over a reader are built from
+    mark,
+    setMark,
+    markStart,
+    markEnd,
+    markWanted,
+    markLimit,
+    markFrame,
+    scalar,
+    refill,
+    roomAfter,
   )
 where
 
@@ -38,9 +50,10 @@ data Reader link = Reader
   { readerLink :: !link,
     readerMemory :: !(ForeignPtr Word8),
     readerCapacity :: !Int,
-    -- | Where the bytes in hand start and end, and how many bytes the atom
-    -- that receives, or the stream, still wants: unboxed, so that taking
-    -- bytes allocates nothing.
+    -- | Where the bytes in hand start and end, how many bytes the atom that
+    -- receives, or the stream, still wants, where the body that cursors stand
+    -- in ends, and what each level of a cursor has left: unboxed, so that
+    -- taking bytes allocates nothing.
     readerMarks :: !(ForeignPtr Int)
   }
 
@@ -50,15 +63,30 @@ newReader link capacity
   | capacity <= 0 = ioError (userError "a reader's buffer needs a positive capacity")
   | otherwise = do
       memory <- mallocPlainForeignPtrBytes capacity
-      marks <- mallocForeignPtrArray 3
-      unsafeWithForeignPtr marks (\pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0, 1, 2])
+      marks <- mallocForeignPtrArray markCount
+      unsafeWithForeignPtr marks (\pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. markCount - 1])
       pure (Reader link memory capacity marks)
 
--- | Where the bytes in hand start, where they end, and how many are wanted.
-markStart, markEnd, markWanted :: Int
+-- | Where the bytes in hand start, where they end, how many are wanted, and
+-- where the body ends that cursors read in. The last is a place in the buffer
+-- like the others, which the receives keep when they move the bytes in hand,
+-- and which is behind the start once the body is read.
+markStart, markEnd, markWanted, markLimit :: Int
 markStart = 0
 markEnd = 1
 markWanted = 2
+markLimit = 3
+
+-- | What the cursor at this depth has left: elements or bytes.
+markFrame :: Int -> Int
+markFrame depth = 4 + depth
+
+-- | How deep cursors can go.
+maxDepth :: Int
+maxDepth = 8
+
+markCount :: Int
+markCount = markFrame maxDepth
 
 mark :: Reader link -> Int -> IO Int
 mark reader index = unsafeWithForeignPtr (readerMarks reader) (`peekElemOff` index)
@@ -135,6 +163,8 @@ refill reader = now prepare >>> loop
       end <- mark reader markEnd
       let held = end - from
       when (from > 0) $ unsafeWithForeignPtr (readerMemory reader) (\memory -> moveBytes memory (memory `plusPtr` from) held)
+      limit <- mark reader markLimit
+      setMark reader markLimit (limit - from)
       setMark reader markStart 0
       setMark reader markEnd held
       setMark reader markWanted size
@@ -182,6 +212,9 @@ stream reader consumer = now begin >>> loop
     more =
       now
         ( \() -> do
+            end <- mark reader markEnd
+            limit <- mark reader markLimit
+            setMark reader markLimit (limit - end)
             setMark reader markStart 0
             setMark reader markEnd 0
             pure (roomAfter reader 0)
