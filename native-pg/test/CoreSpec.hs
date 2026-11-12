@@ -13,7 +13,6 @@ import qualified Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Foldable (forM_, toList)
-import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text.Encoding (encodeUtf8)
@@ -23,20 +22,16 @@ import Database.PostgreSQL.Diagnostics
 import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
 import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Internal.Protocol
-import FeedSupport (staticBytes)
-import PullSourceTestSupport (PullSource (..), noWatch)
 import Database.PostgreSQL.Internal.Protocol.Codec
-import Database.PostgreSQL.Internal.Protocol.Codec.Input (InputBuffer, InputSource (..), emptyInputBuffer, runInput)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
-import qualified Database.PostgreSQL.Transaction as Tx
+import Database.PostgreSQL.Types (Param (..))
 import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions, serverEndPoint)
-import Foreign.Marshal.Utils (copyBytes)
-import Foreign.Ptr (castPtr)
-import Network.Streaming.Source (Pulled (..))
+import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import Skeletest
 import qualified Skeletest.Predicate as P
+import System.IO.Unsafe (unsafeDupablePerformIO)
 
 spec :: Spec
 spec = do
@@ -75,121 +70,10 @@ spec = do
     it "rejects a zero byte inside a C string" $
       evaluate (staticBytes (serialize (Query "a\0b" :: Query ByteString)))
         `shouldSatisfy` P.throws (P.anything @ErrorCall)
-    it "round-trips every frontend message" $ do
-      roundTrip @(StartupMessage ByteString) startupMessage
-      roundTrip @SSLRequest SSLRequest
-      roundTrip @GSSENCRequest GSSENCRequest
-      roundTrip @(CancelRequest ByteString) cancelRequest
-      roundTrip @(PasswordMessage ByteString) (PasswordMessage "secret")
-      roundTrip @(GSSResponse ByteString) (GSSResponse "token")
-      roundTrip @(SASLInitialResponse ByteString) (SASLInitialResponse "SCRAM-SHA-256" (Just "n,,n=,r=nonce"))
-      roundTrip @(SASLInitialResponse ByteString) (SASLInitialResponse "SCRAM-SHA-256" Nothing)
-      roundTrip @(SASLResponse ByteString) (SASLResponse "c=biws,r=nonce,p=proof")
-      roundTrip @(Bind ByteString) (Bind (BindBody "portal" "statement" [TextFormat, BinaryFormat] [Just "", Nothing] []))
-      roundTrip @(Close ByteString) (Close PreparedStatement "statement")
-      roundTrip @(Describe ByteString) (Describe PreparedStatement "statement")
-      roundTrip @(Execute ByteString) (Execute "portal" 100)
-      roundTrip @Flush Flush
-      roundTrip @(FunctionCall ByteString) (FunctionCall (Scalar 1) [BinaryFormat] [Just "x"] TextFormat)
-      roundTrip @(Parse ByteString) (Parse "statement" "SELECT $1, $2" [Just (Scalar 23), Nothing])
-      roundTrip @(Query ByteString) (Query "SELECT 1")
-      roundTrip @Sync Sync
-      roundTrip @Terminate Terminate
-      roundTrip @(CopyData ByteString) (CopyData "1\t2\n")
-      roundTrip @CopyDone CopyDone
-      roundTrip @(CopyFail ByteString) (CopyFail "client gave up")
-
   describe "primitive field schemas" $
     it "keeps schema selection explicit for the same byte value" $ do
       staticBytes (serializeField @ByteString @'CStringAtom "value") `shouldBe` "value\0"
       staticBytes (serializeField @ByteString @'RemainingBytesAtom "value") `shouldBe` "value"
-
-  describe "backend messages" $ do
-    it "decodes AuthenticationOk" $
-      decodes @AuthenticationOk ("R" <> int32 8 <> int32 0) AuthenticationOk
-    it "decodes AuthenticationSASL" $
-      decodes
-        @(AuthenticationSASL ByteString)
-        ("R" <> int32 42 <> int32 10 <> "SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0")
-        (AuthenticationSASL ["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"])
-    it "decodes BackendKeyData with a protocol 3.2 secret key" $
-      decodes
-        @(BackendKeyData ByteString)
-        ("K" <> int32 40 <> int32 42 <> BS.replicate 32 7)
-        (BackendKeyData (Scalar (Scalar 42, Scalar (BS.replicate 32 7))))
-    it "decodes NegotiateProtocolVersion" $
-      decodes
-        @(NegotiateProtocolVersion ByteString)
-        ("v" <> int32 24 <> int32 196608 <> int32 1 <> "_pq_.option\0")
-        (NegotiateProtocolVersion protocolVersion3_0 ["_pq_.option"])
-    it "decodes ReadyForQuery" $
-      decodes @ReadyForQuery ("Z" <> int32 5 <> "T") (ReadyForQuery TxInTransaction)
-    it "rejects an unknown transaction status" $
-      parseMessage @ReadyForQuery ("Z" <> int32 5 <> "X")
-        `shouldSatisfy` P.left P.anything
-    it "rejects a message whose fields don't fill its length" $
-      parseMessage @(CommandComplete ByteString) ("C" <> int32 12 <> "SELECT\0x")
-        `shouldSatisfy` P.left P.anything
-    it "round-trips every backend message" $ do
-      roundTrip @AuthenticationOk AuthenticationOk
-      roundTrip @AuthenticationKerberosV5 AuthenticationKerberosV5
-      roundTrip @AuthenticationCleartextPassword AuthenticationCleartextPassword
-      roundTrip @(AuthenticationMD5Password ByteString) (AuthenticationMD5Password "salt")
-      roundTrip @AuthenticationGSS AuthenticationGSS
-      roundTrip @(AuthenticationGSSContinue ByteString) (AuthenticationGSSContinue "token")
-      roundTrip @AuthenticationSSPI AuthenticationSSPI
-      roundTrip @(AuthenticationSASL ByteString) (AuthenticationSASL ["SCRAM-SHA-256"])
-      roundTrip @(AuthenticationSASLContinue ByteString) (AuthenticationSASLContinue "r=nonce,s=salt,i=4096")
-      roundTrip @(AuthenticationSASLFinal ByteString) (AuthenticationSASLFinal "v=signature")
-      roundTrip @(BackendKeyData ByteString) (BackendKeyData (Scalar (Scalar 7, Scalar "key!")))
-      roundTrip @BindComplete BindComplete
-      roundTrip @CloseComplete CloseComplete
-      roundTrip @(CommandComplete ByteString) (CommandComplete "SELECT 1")
-      roundTrip @CopyInResponse (CopyInResponse (Scalar (CopyText, [TextFormat])))
-      roundTrip @CopyOutResponse (CopyOutResponse (Scalar (CopyBinary, [BinaryFormat, BinaryFormat])))
-      roundTrip @CopyBothResponse (CopyBothResponse (Scalar (CopyBinary, [])))
-      roundTrip @(DataRow ByteString) (DataRow [Just "1", Nothing, Just ""])
-      roundTrip @EmptyQueryResponse EmptyQueryResponse
-      roundTrip @(ErrorResponse ByteString) (ErrorResponse errorFields)
-      roundTrip @(FunctionCallResponse ByteString) (FunctionCallResponse Nothing)
-      roundTrip @(NegotiateProtocolVersion ByteString) (NegotiateProtocolVersion protocolVersion3_0 [])
-      roundTrip @NoData NoData
-      roundTrip @(NoticeResponse ByteString) (NoticeResponse errorFields)
-      roundTrip @(NotificationResponse ByteString) (NotificationResponse (Notification (Scalar 9) "channel" "payload"))
-      roundTrip @ParameterDescription (ParameterDescription [Scalar 23, Scalar 114])
-      roundTrip @(ParameterStatus ByteString) (ParameterStatus (Scalar ("server_version", "18.0")))
-      roundTrip @ParseComplete ParseComplete
-      roundTrip @PortalSuspended PortalSuspended
-      roundTrip @ReadyForQuery (ReadyForQuery TxFailedTransaction)
-      roundTrip @(RowDescription ByteString) (RowDescription [rowField, rowField {rowFieldTableOid = Nothing, rowFieldColumnAttributeNumber = Nothing}])
-
-  describe "choice" $ do
-    it "dispatches on the message tag" $
-      dispatch ("1" <> int32 4) `shouldBe` Right ["ParseComplete"]
-    it "dispatches 'R' messages on the subcode after the length" $ do
-      dispatch ("R" <> int32 8 <> int32 0) `shouldBe` Right ["AuthenticationOk"]
-      dispatch ("R" <> int32 12 <> int32 5 <> "salt") `shouldBe` Right ["AuthenticationMD5Password \"salt\""]
-    it "doesn't peek past the end of a short message" $
-      dispatch ("2" <> int32 4) `shouldBe` Right ["BindComplete"]
-    it "parses consecutive messages from one input" $
-      dispatch ("1" <> int32 4 <> "2" <> int32 4 <> "Z" <> int32 5 <> "I")
-        `shouldBe` Right ["ParseComplete", "BindComplete", "ReadyForQuery TxIdle"]
-    it "rejects a message no alternative accepts" $
-      dispatch ("D" <> int32 6 <> int16 0) `shouldSatisfy` P.left P.anything
-
-  describe "input" $ do
-    it "parses messages arriving a byte at a time into small buffers" $ do
-      source <- chunkedSource (map BS.singleton (BS.unpack conversation)) 8
-      replies <- pullAll source emptyInputBuffer
-      map fst replies `shouldBe` ["ParseComplete", "DataRow", "CommandComplete", "ReadyForQuery TxIdle"]
-    it "keeps slices it returned valid after later reads" $ do
-      source <- chunkedSource [BS.take 20 conversation, BS.drop 20 conversation] 16
-      replies <- pullAll source emptyInputBuffer
-      concatMap snd replies `shouldBe` [Just "42", Nothing, Just "a longer value", Just "SELECT 1"]
-    it "reads some bytes until they're all there, or the buffer is full, without copying" $ do
-      source <- chunkedSource (replicate 40 (BS.replicate 1000 0x78)) 16384
-      (chunks, _) <- runInput source emptyInputBuffer (sequence [readInputSome 5000, readInputSome 20000, readInputSome 20000])
-      map BS.length chunks `shouldBe` [5000, 11384, 16384]
 
   describe "diagnostics" $ do
     it "decodes an error's fields, preferring the untranslated severity" $
@@ -433,11 +317,6 @@ spec = do
     it "numbers the placeholders in the order of the parameters" $
       fmap (map paramView) (Snippet.render snippet)
         `shouldBe` ("SELECT $1, $2 WHERE true", [(Just 705, TextFormat, Just "1"), (Just 17, BinaryFormat, Nothing)])
-    it "makes a statement of the SQL and the parameters" $ do
-      let statement = Snippet.dynamicallyParameterized snippet Tx.noResult
-      Tx.statementSql statement `shouldBe` "SELECT $1, $2 WHERE true"
-      map paramView (Tx.statementParams statement ()) `shouldBe` [(Just 705, TextFormat, Just "1"), (Just 17, BinaryFormat, Nothing)]
-
   describe "encoders" $ do
     it "sends the type OIDs, formats and bytes of hasql's encoders" $ do
       paramView (Encoders.param (Encoders.nonNullable Encoders.text) "zażółć") `shouldBe` (Just 25, BinaryFormat, Just (encodeUtf8 "zażółć"))
@@ -447,20 +326,17 @@ spec = do
     forM_ [("unknown", Encoders.unknown, 705, TextFormat), ("bytea", Encoders.bytea, 17, BinaryFormat)] $ \(label, encoder, oid, format) ->
       it ("sends strict bytes as they are through " <> label) $ do
         let value = BS.replicate 100 65
-            sentAsIs (Tx.Param _ _ (Just (ParameterBytes sent))) = sharesMemory sent value
+            sentAsIs (Param _ _ (Just (ParameterBytes sent))) = sharesMemory sent value
             sentAsIs _ = pure False
         sentAsIs (Encoders.param (Encoders.nonNullable encoder) value) `shouldReturn` True
         sentAsIs (Encoders.param (Encoders.nullable encoder) (Just value)) `shouldReturn` True
         paramView (Encoders.param (Encoders.nonNullable encoder) value) `shouldBe` (Just oid, format, Just value)
         paramView (Encoders.param (Encoders.nullable encoder) Nothing) `shouldBe` (Just oid, format, Nothing)
-    it "sends bytes as they are, at hand or streamed" $ do
+    it "sends bytes as they are" $ do
       paramView (Encoders.rawParam Encoders.rawJson (Just (ParameterBytes "{}"))) `shouldBe` (Just 114, BinaryFormat, Just "{}")
       paramView (Encoders.rawParam Encoders.rawJsonb (Just (ParameterBytes "{}"))) `shouldBe` (Just 3802, TextFormat, Just "{}")
       paramView (Encoders.rawParam Encoders.rawBytea (Just (ParameterBytes "\0"))) `shouldBe` (Just 17, BinaryFormat, Just "\0")
       paramView (Encoders.rawParam Encoders.rawUnknown Nothing) `shouldBe` (Just 705, TextFormat, Nothing)
-      case Encoders.rawParam Encoders.rawJsonb (Just (ParameterBorrowedStream 2 (PullSource (pure (Just Ended)) noWatch))) of
-        Tx.Param oid format (Just (ParameterBorrowedStream size _)) -> (oid, format, size) `shouldBe` (Just 3802, TextFormat, 2)
-        _ -> failTest "the parameter isn't streamed"
     it "sends a one-dimensional array of the elements' type" $
       paramView (Encoders.param (Encoders.nonNullable (Encoders.foldableArray (Encoders.nonNullable Encoders.text))) ["a", "bc"])
         `shouldBe` ( Just 1009,
@@ -477,89 +353,8 @@ spec = do
 rfc7677ServerFirst :: ByteString
 rfc7677ServerFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
 
--- | A server's replies to an extended query.
-conversation :: ByteString
-conversation =
-  BS.concat
-    [ staticBytes (serialize ParseComplete),
-      staticBytes (serialize (DataRow [Just "42", Nothing, Just "a longer value"] :: DataRow ByteString)),
-      staticBytes (serialize (CommandComplete "SELECT 1" :: CommandComplete ByteString)),
-      staticBytes (serialize (ReadyForQuery TxIdle))
-    ]
-
-type QueryReplies =
-  '[ 'PayloadField 'ParseCompleteType,
-     'PayloadField 'DataRowType,
-     'PayloadField 'CommandCompleteType,
-     'PayloadField 'ReadyForQueryType
-   ]
-
--- | Pulls messages until the source ends, keeping the byte strings they
--- carry.
-pullAll :: InputSource -> InputBuffer -> IO [(String, [Maybe ByteString])]
-pullAll source buffer = do
-  (reply, buffer') <- runInput source buffer (parseChoice @QueryReplies replies)
-  case reply of
-    ("ReadyForQuery TxIdle", _) -> pure [reply]
-    _ -> (reply :) <$> pullAll source buffer'
-  where
-    replies =
-      (\ParseComplete -> ("ParseComplete", []))
-        :|: (\(DataRow values) -> ("DataRow", values))
-        :|: (\(CommandComplete tag) -> ("CommandComplete", [Just tag]))
-        :|: (\(ReadyForQuery status) -> ("ReadyForQuery " <> show status, []))
-        :|: NoAlternatives
-
--- | A source that delivers the chunks one read at a time, in pieces no
--- larger than a read asks for.
-chunkedSource :: [ByteString] -> Int -> IO InputSource
-chunkedSource chunks readSize = do
-  queue <- newIORef chunks
-  pure
-    InputSource
-      { readInputInto = \pointer size -> do
-          remaining <- readIORef queue
-          case remaining of
-            [] -> pure 0
-            chunk : others -> do
-              let (now, later) = BS.splitAt size chunk
-              writeIORef queue (if BS.null later then others else later : others)
-              BS.useAsCStringLen now $ \(origin, count) -> copyBytes pointer (castPtr origin) count
-              pure (BS.length now),
-        inputReadSize = readSize
-      }
-
--- | Messages a client may receive after a Parse, Bind and Sync, plus two
--- authentication messages that share the 'R' tag.
-type Replies =
-  '[ 'PayloadField 'AuthenticationOkType,
-     'PayloadField 'AuthenticationMD5PasswordType,
-     'PayloadField 'ParseCompleteType,
-     'PayloadField 'BindCompleteType,
-     'PayloadField 'ReadyForQueryType
-   ]
-
-dispatch :: ByteString -> Either String [String]
-dispatch input = do
-  (reply, rest) <- runBodyParser input (parseChoice @Replies replies)
-  if BS.null rest then pure [reply] else (reply :) <$> dispatch rest
-  where
-    replies =
-      (\AuthenticationOk -> "AuthenticationOk")
-        :|: (\(AuthenticationMD5Password salt) -> "AuthenticationMD5Password " <> show (salt :: ByteString))
-        :|: (\ParseComplete -> "ParseComplete")
-        :|: (\BindComplete -> "BindComplete")
-        :|: (\(ReadyForQuery status) -> "ReadyForQuery " <> show status)
-        :|: NoAlternatives
-
 encodes :: forall message a s. (message ~ Envelope a s, Serializable message s) => message -> ByteString -> IO ()
 encodes message expected = staticBytes (serialize message) `shouldBe` expected
-
-decodes :: forall message a s. (message ~ Envelope a s, Parsable message s, Eq message, Show message) => ByteString -> message -> IO ()
-decodes input expected = parseMessage @message input `shouldBe` Right expected
-
-roundTrip :: forall message a s. (message ~ Envelope a s, Parsable message s, Serializable message s, Eq message, Show message) => message -> IO ()
-roundTrip message = parseMessage @message (staticBytes (serialize message)) `shouldBe` Right message
 
 startupMessage :: StartupMessage ByteString
 startupMessage =
@@ -577,21 +372,6 @@ cancelRequest = CancelRequest (Scalar (Scalar 42, Scalar (BS.pack [0xDE, 0xAD, 0
 
 cancelRequestBytes :: ByteString
 cancelRequestBytes = int32 16 <> int32 80877102 <> int32 42 <> BS.pack [0xDE, 0xAD, 0xBE, 0xEF]
-
-errorFields :: [ErrorNoticeField ByteString]
-errorFields = [Scalar (byte 'S', "ERROR"), Scalar (byte 'C', "42P01"), Scalar (byte 'M', "relation does not exist")]
-
-rowField :: RowField ByteString
-rowField =
-  RowField
-    { rowFieldName = "id",
-      rowFieldTableOid = Just (Scalar 16384),
-      rowFieldColumnAttributeNumber = Just 1,
-      rowFieldTypeOid = Scalar 23,
-      rowFieldTypeSize = 4,
-      rowFieldTypeModifier = -1,
-      rowFieldFormat = BinaryFormat
-    }
 
 int32 :: Int32 -> ByteString
 int32 value = BS.pack [fromIntegral (value `div` 16777216), fromIntegral (value `div` 65536), fromIntegral (value `div` 256), fromIntegral value]
@@ -630,12 +410,19 @@ sharesMemory left right =
       pure (leftStart == rightStart && leftSize == rightSize)
 
 -- | A parameter's type, format and bytes, which can be compared.
-paramView :: Tx.Param -> (Maybe Word32, FormatCode, Maybe ByteString)
-paramView (Tx.Param oid format value) = (oid, format, bytes <$> value)
+paramView :: Param -> (Maybe Word32, FormatCode, Maybe ByteString)
+paramView (Param oid format value) = (oid, format, bytes <$> value)
   where
     bytes (ParameterBytes strict) = strict
-    bytes (ParameterBorrowedStream _ _) = error "a borrowed streamed parameter"
     bytes (ParameterChunks chunks) = BS.concat chunks
 
 failsWith :: String -> Predicate IO (Either String a)
 failsWith message = P.left (P.hasInfix message)
+
+-- | The bytes of an output that has no streams, for serializer fixtures.
+staticBytes :: Output -> ByteString
+staticBytes output = unsafeDupablePerformIO $ do
+  parts <- (`writeOutput` output) =<< mallocPlainForeignPtrBytes (outputCopied output)
+  pure . BS.concat $ map (either id uncopied) parts
+  where
+    uncopied (UncopiedBytes value) = value

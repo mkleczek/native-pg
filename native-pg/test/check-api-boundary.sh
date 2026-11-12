@@ -46,21 +46,16 @@ for removed_export in Resources ResourceSettings newResources withResources Leas
   fi
 done
 
-reject_module Database.PostgreSQL.Transaction.Pull
-reject_module Database.PostgreSQL.Pipeline
-reject_module Database.PostgreSQL.Statement
 reject_module Network.Streaming.Resources
 reject_module Network.Streaming.Resources.Internal
 reject_module Network.Streaming.BufferPool.Internal
 reject_module Network.Streaming.Internal.ListPrefix
+reject_module Network.Streaming.Internal.Socket
+reject_module Network.Streaming.Internal.Tickets
 
 for private_module in \
-  Authentication Buffer Internal.Context Internal.Session Internal.Transport \
-  Internal.ConnectionString Internal.Statement Internal.Diagnostics \
-  Internal.Channel Internal.Exchange Internal.HostSelection Internal.Result \
-  Internal.Execution Internal.Row \
-  Internal.Socket Internal.Startup \
-  Protocol Protocol.Codec Protocol.Codec.Input Protocol.Codec.Output \
+  Authentication Buffer Internal.Diagnostics \
+  Protocol Protocol.Codec Protocol.Codec.Output \
   Protocol.Codec.Payload Protocol.Messages Protocol.Messages.AuthBackend \
   Protocol.Messages.AuthFrontend Protocol.Messages.BackendSession \
   Protocol.Messages.Copy Protocol.Messages.FrontendSession \
@@ -77,52 +72,7 @@ for private_symbol in \
   'Transport (channelClose)' \
   'Transport (OutputBuffer)' \
   'Transport (connectSocket)' \
-  'Diagnostics (diagnostics)' \
-  'Session (Context)' \
-  'Session (sessionFromContext)' \
-  'Session (closeConnection)' \
-  'Session (isConnectionUsable)' \
-  'Transaction (withTransaction)' \
-  'Transaction (withTransactionWith)' \
-  'Transaction (runTransactionWith)' \
-  'Transaction (Prepare)' \
-  'Transaction (Prepared)' \
-  'Transaction (transactionNoRetryIn)' \
-  'Transaction (transactionNoRetryWithIn)' \
-  'Session (connect)' \
-  'Session (ConnectSettings)' \
-  'Session (ConnectionError)' \
-  'Session (ProtocolVersion)' \
-  'Session (Phase)' \
-  'Session (Ready)' \
-  'Session (Execution)' \
-  'Session (Statement)' \
-  'Session (Batch)' \
-  'Session (prepare)' \
-  'Session (execute)' \
-  'Session (batched)' \
-  'Session (runBatch)' \
-  'Session (awaitNotification)' \
-  'Session (executeWithContext)' \
-  'Session (Row)' \
-  'Session (Column)' \
-  'Session (DecodeRow)' \
-  'Session (columnBytes)' \
-  'Session (decodeRow)' \
-  'Session (nextColumn)' \
-  'Session (backendProcessId)' \
-  'Transaction (Transaction(Transaction))' \
-  'Transaction (Pipeline(Pipeline))' \
-  'Transaction (Result(Result))' \
-  'Transaction (Preparation(Preparation))' \
-  'Transaction (prepareAs)' \
-  'Transaction (Field(Field))' \
-  'Transaction (Tx(Tx))' \
-  'Transaction (FieldSource(FieldSource))' \
-  'Pool (Checkout(Checkout))' \
-  'Transaction (RowDecoder(RowDecoder))' \
-  'Transaction (Runtime)' \
-  'Transaction (ApplicationFailure)'; do
+  'Diagnostics (diagnostics)'; do
   printf 'module Hidden where\nimport Database.PostgreSQL.%s\n' "$private_symbol" >"$output_dir/Hidden.hs"
   if check "$output_dir/Hidden.hs" >"$output_dir/error.log" 2>&1; then
     echo "Unexpected public implementation detail: $private_symbol" >&2

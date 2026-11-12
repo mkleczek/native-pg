@@ -7,33 +7,39 @@
 -- itself, and one loop is enough. At -O1 the flag does nothing.
 {-# OPTIONS_GHC -fno-liberate-case #-}
 
--- | The private TLS 'Link' implementation, through rustls-ffi. The handshake
--- drives its own I/O. Reads and writes take what's ready;
--- the transport waits through the 'Link' readiness operations.
+-- | The private TLS implementation, through rustls-ffi: the configuration of
+-- a client, and a connection's calls that never wait. They read and write what
+-- the socket and rustls have ready; what waits for the socket is not here.
 --
--- Construction and handshaking require exclusive access to the socket and
--- connection. Subsequent I/O follows the 'Link' exclusive-access contract.
+-- A connection's calls must not overlap: one part uses it at a time.
 module Database.PostgreSQL.Tls.Internal
-  ( -- * For native-pg's connections
-    tlsClient,
-
-    -- * Configurations
+  ( -- * Configurations
     TlsConfig,
     newTlsConfig,
 
     -- * Connections
     TlsConnection,
-    startTls,
+    clientConnection,
+    newTlsConnection,
+
+    -- * A connection's calls that never wait
+    receiveTls,
+    sendTls,
+    flushTls,
+    closeTls,
+    Records (..),
+    readRecords,
+    isHandshaking,
+    alpnProtocol,
+    channelBinding,
 
     -- * Connections rustls made elsewhere, e.g. a test's server
     RustlsConnection,
-    newTlsConnection,
-    handshake,
   )
 where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
-import Control.Exception (IOException, bracket, catch, finally, mask, mask_, onException, throwIO)
+import Control.Exception (IOException, bracket, catch, finally, mask_, onException, throwIO)
 import Control.Monad (unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import Data.ByteString (ByteString)
@@ -42,7 +48,7 @@ import qualified Data.ByteString.Unsafe as BS
 import Data.Foldable (for_)
 import Data.Int (Int64)
 import Data.Word (Word16, Word32, Word8)
-import Database.PostgreSQL.Transport (Blocked (..), Interest (..), Link (..), RootCertificates (..), ServerVerification (..), TlsChannel (..), TlsClient (..), TlsError (..), TlsSettings (..), TlsVersion (..), newChannel, serverEndPoint)
+import Database.PostgreSQL.Transport (RootCertificates (..), ServerVerification (..), TlsError (..), TlsSettings (..), TlsVersion (..), serverEndPoint)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString, withCStringLen)
@@ -73,23 +79,6 @@ peekCStringAt bytes len =
 -- | Flushes an alert, ignoring I/O errors: the connection is ending anyway.
 flushAlert :: TlsConnection -> IO ()
 flushAlert tls = void (flushTls tls) `catch` \(_ :: IOException) -> pure ()
-
--- | Starts TLS for native-pg's connections, with a new configuration each
--- time, so that changed certificate files count, as with libpq.
-tlsClient :: TlsClient
-tlsClient = TlsClient $ \settings serverName sock -> do
-  config <- newTlsConfig settings serverName
-  tls <- startTls config sock
-  when (tlsAlpnRequired settings) $ do
-    protocol <- withConnection tls $ \connection ->
-      alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
-        c_connection_get_alpn_protocol connection (castPtr bytes) len
-        peekCStringAt bytes len
-    unless (protocol == "postgresql") $ do
-      closeTls tls
-      throwIO (TlsError "direct SSL connection was established without ALPN protocol negotiation extension")
-  binding <- channelBinding tls
-  pure (TlsChannel (newChannel tls) binding)
 
 -- | Supplies authentication with tls-server-end-point data. An unsupported
 -- certificate hash is kept as an error for authentication to report only
@@ -191,44 +180,24 @@ systemVerifierMade :: MVar (Maybe (Ptr ServerCertVerifier))
 systemVerifierMade = unsafePerformIO (newMVar Nothing)
 {-# NOINLINE systemVerifierMade #-}
 
--- | A TLS connection over a socket, used through its 'Link' instance.
+-- | A TLS connection over a socket.
 data TlsConnection = TlsConnection
   { -- | The socket it reads and writes.
     tlsSocket :: Socket,
     tlsConnection :: ForeignPtr RustlsConnection
   }
 
-instance Link TlsConnection where
-  watchReadable = watchReadable . tlsSocket
-  {-# NOINLINE watchReadable #-}
-  watchWritable = watchWritable . tlsSocket
-  {-# NOINLINE watchWritable #-}
-  awaitAny = awaitAny . tlsSocket
-  {-# INLINE awaitAny #-}
-  awaitReadOrWrite = awaitReadOrWrite . tlsSocket
-  {-# INLINE awaitReadOrWrite #-}
-  receiveReady = receiveTls
-  {-# INLINE receiveReady #-}
-  sendReady = sendTls
-  {-# INLINE sendReady #-}
-  flushReady = flushTls
-  {-# INLINE flushReady #-}
-  closeLink = closeTls
-  {-# INLINE closeLink #-}
-
--- | Starts TLS over the socket for the configuration's server, and waits
--- for the handshake to finish. Throws 'TlsError' if the name is invalid or
--- the handshake fails.
-startTls :: TlsConfig -> Socket -> IO TlsConnection
-startTls (TlsConfig config name) sock = mask $ \restore -> do
+-- | A client's connection over the socket, for the configuration's server,
+-- before its handshake, which this doesn't do: it is done with 'readRecords'
+-- and 'flushTls' until 'isHandshaking' says it is over.
+clientConnection :: TlsConfig -> Socket -> IO TlsConnection
+clientConnection (TlsConfig config name) sock = mask_ $ do
   connection <- withForeignPtr config $ \configPointer ->
     withForeignPtr name $ \namePointer ->
       built "could not create the TLS client connection" (c_client_connection_new (ConstPtr configPointer) namePointer)
   -- rustls retains the native config. Independently keep the name's storage
   -- alive through connection teardown, even if the Haskell config is gone.
-  tls <- ownTlsConnection sock connection (withForeignPtr name $ \_ -> c_connection_free connection)
-  restore (handshake tls) `onException` finalizeForeignPtr (tlsConnection tls)
-  pure tls
+  ownTlsConnection sock connection (withForeignPtr name $ \_ -> c_connection_free connection)
 
 -- | Takes over a connection rustls made, to read and write it over the
 -- socket. It's freed when it's closed, or when it's no longer used.
@@ -243,19 +212,16 @@ ownTlsConnection sock connection release = do
   c_connection_set_buffer_limit connection 65536
   TlsConnection sock <$> Foreign.newForeignPtr connection release
 
--- | Sends and receives the handshake's messages until it's done.
-handshake :: TlsConnection -> IO ()
-handshake tls = do
-  flushed <- flushTls tls
-  handshaking <- withConnection tls c_connection_is_handshaking
-  if
-    | not flushed -> awaitAny tls (Interest False OnWritable) *> handshake tls
-    | handshaking == CBool 0 -> pure ()
-    | otherwise ->
-        readRecords tls >>= \case
-          Read -> handshake tls
-          WouldBlock -> awaitAny tls (Interest True Done) *> handshake tls
-          Ended -> throwIO (TlsError "the connection closed during the handshake")
+-- | Whether the handshake is still going on.
+isHandshaking :: TlsConnection -> IO Bool
+isHandshaking tls = (/= CBool 0) <$> withConnection tls c_connection_is_handshaking
+
+-- | The protocol that the handshake chose with ALPN, if any.
+alpnProtocol :: TlsConnection -> IO ByteString
+alpnProtocol tls = withConnection tls $ \connection ->
+  alloca $ \(bytes :: Ptr (Ptr Word8)) -> alloca $ \len -> do
+    c_connection_get_alpn_protocol connection (castPtr bytes) len
+    peekCStringAt bytes len
 
 -- | Reads what's ready into the buffer, up to its size, without waiting:
 -- 'Nothing' if nothing is, and 0 at the end of the stream. One foreign call

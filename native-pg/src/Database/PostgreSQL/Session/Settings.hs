@@ -10,7 +10,7 @@ module Database.PostgreSQL.Session.Settings
 import Data.ByteString (ByteString)
 import Database.PostgreSQL.Internal.Protocol.Messages.Types (BackendKey)
 import Database.PostgreSQL.Types (ProtocolVersion, protocolVersion3_0)
-import Database.PostgreSQL.Transport (Address, RootCertificates, TcpOptions, TlsClient, TlsVersion, defaultTcpOptions)
+import Database.PostgreSQL.Transport (Address, RootCertificates, TcpOptions, TlsVersion, defaultTcpOptions)
 import Network.Socket (HostName)
 
 data ConnectSettings = ConnectSettings
@@ -34,9 +34,6 @@ data ConnectSettings = ConnectSettings
     -- | The server's name for TLS, if the address's host isn't, e.g. because
     -- it's an IP address the name resolved to.
     connectServerName :: Maybe HostName,
-    -- | What starts TLS: native-pg-tls's, which this library doesn't depend
-    -- on. Without it, a connection that requires TLS fails.
-    connectTlsClient :: Maybe TlsClient,
     -- | A client certificate and its private key, in PEM files, used if the
     -- certificate file exists, as with libpq.
     connectSslCertificate :: Maybe (FilePath, FilePath),
@@ -99,7 +96,6 @@ connectSettings address user =
       connectTcpOptions = defaultTcpOptions,
       connectSslMode = SslDisable,
       connectServerName = Nothing,
-      connectTlsClient = Nothing,
       connectSslCertificate = Nothing,
       connectSslRevocationList = Nothing,
       connectSslRevocationListDirectory = Nothing,

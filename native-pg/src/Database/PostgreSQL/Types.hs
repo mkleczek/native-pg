@@ -2,9 +2,11 @@
 module Database.PostgreSQL.Types
   ( ProtocolVersion (..), protocolVersion3_0, protocolVersion3_2,
     FormatCode (..), TransactionStatus (..),
+    Param (..), Parameter (..),
   ) where
 
-import Data.Word (Word16)
+import Data.ByteString (ByteString)
+import Data.Word (Word16, Word32)
 
 data ProtocolVersion = ProtocolVersion
   { protocolVersionMajor :: Word16,
@@ -37,3 +39,18 @@ data TransactionStatus
 deriving instance Eq TransactionStatus
 deriving instance Ord TransactionStatus
 deriving instance Show TransactionStatus
+
+-- | One encoded parameter. A missing type asks the server to infer it;
+-- a missing value represents SQL NULL.
+data Param = Param
+  { paramType :: Maybe Word32,
+    paramFormat :: FormatCode,
+    paramValue :: Maybe Parameter
+  }
+
+-- | A parameter value the client sends: bytes at hand, whole or in chunks.
+data Parameter
+  = ParameterBytes ByteString
+  | -- | Sent one after another, each from where it is, as the serializer sends a
+    -- long one, so that they aren't copied into one first.
+    ParameterChunks [ByteString]

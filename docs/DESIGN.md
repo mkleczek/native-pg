@@ -3,6 +3,11 @@
 Draft for review. `PLAN.md` is the original plan from haskell-native-pg; where
 the two differ, this document wins.
 
+> **v1.** This document describes v1, whose waiting layer (the session,
+> transactions, the pool, the transport, `Network.Streaming.Link`, `Source`,
+> `Sender` and `Scope`) is removed from this branch and stays at the tag that
+> PostgREST pins. v2, written against the classes of `streaming-io`, replaces it.
+
 ## Goals
 
 - Replace hasql in PostgREST with a pure-Haskell PostgreSQL client.

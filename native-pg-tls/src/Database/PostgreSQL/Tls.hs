@@ -1,8 +1,8 @@
--- | TLS for native-pg through rustls-ffi. Supply 'tlsClient' in the session's
--- @connectTlsClient@ setting.
+-- | TLS for native-pg through rustls-ffi: the configuration of a client.
 module Database.PostgreSQL.Tls
-  ( tlsClient,
+  ( TlsConfig,
+    newTlsConfig,
   )
 where
 
-import Database.PostgreSQL.Tls.Internal (tlsClient)
+import Database.PostgreSQL.Tls.Internal (TlsConfig, newTlsConfig)

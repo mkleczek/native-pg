@@ -11,13 +11,11 @@ module Network.Streaming.Watch
     fdWritable,
     awaitFirst,
     awaitWatch,
-    awaitCallback,
     anyWatch,
   )
 where
 
 import Control.Concurrent (threadWaitReadSTM, threadWaitWriteSTM)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (mask, mask_, onException, uninterruptibleMask_)
 import Control.Monad (unless)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
@@ -79,17 +77,6 @@ awaitFirstMasked entries restore = do
 awaitWatch :: IO Watch -> IO ()
 awaitWatch watch = awaitFirst [(watch, ())]
 {-# NOINLINE awaitWatch #-}
-
--- | Registers a callback with an event source, waits until the source calls
--- it, and gives what it was called with. The registration is released if the
--- wait is interrupted, and by the source once it has called the callback.
--- This is the wait of 'Control.Concurrent.threadWaitRead', for any source.
-awaitCallback :: ((a -> IO ()) -> IO key) -> (key -> IO ()) -> IO a
-awaitCallback register unregister = mask_ $ do
-  called <- newEmptyMVar
-  key <- register (putMVar called)
-  takeMVar called `onException` unregister key
-{-# NOINLINE awaitCallback #-}
 
 -- | Registers the events in order, and gives one watch that fires when any of
 -- them has, and whose release releases them all. If registering one fails, the

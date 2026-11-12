@@ -7,6 +7,11 @@ and native-pg's uploads then use the same code, gather into one `writev`, and
 need no helper threads. `DESIGN.md` remains the native-pg design; the sections
 listed under "Changes to DESIGN.md" would be updated when this lands.
 
+> **v1.** This document describes v1, whose waiting layer (the session,
+> transactions, the pool, the transport, `Network.Streaming.Link`, `Source`,
+> `Sender` and `Scope`) is removed from this branch and stays at the tag that
+> PostgREST pins. v2, written against the classes of `streaming-io`, replaces it.
+
 ## Why
 
 Measured on postgrestream-mt (native-pg `4a51dc34692e`, wai fork `51b66138`),

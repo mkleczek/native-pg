@@ -7,8 +7,8 @@
 # declares a ForeignPtr Word8 field in a data or newtype declaration.
 #
 # Usage: check-one-buffer.sh [FILE...]
-# The files are paths from the repository's root. Without any, it checks the
-# runtime's modules.
+# The files are paths from the repository's root. Without any, it checks every
+# module in the src directories of the packages.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -17,23 +17,7 @@ cd "$root"
 if [ "$#" -gt 0 ]; then
   files=$*
 else
-  files='
-    streaming-io/src/Network/Streaming/Classes.hs
-    streaming-io/src/Network/Streaming/Combinators.hs
-    streaming-io/src/Network/Streaming/Threads.hs
-    streaming-io/src/Network/Streaming/Delimited.hs
-    streaming-io/src/Network/Streaming/Compiled.hs
-    streaming-io/src/Network/Streaming/Loop.hs
-    streaming-io/src/Network/Streaming/Simulated.hs
-    streaming-io/src/Network/Streaming/Reader.hs
-    streaming-io/src/Network/Streaming/Pool.hs
-    streaming-io/src/Network/Streaming/Internal/Scheduler.hs
-    streaming-io/src/Network/Streaming/Internal/Timers.hs
-    streaming-io/src/Network/Streaming/Internal/Tickets.hs
-    streaming-io/src/Network/Streaming/Internal/Cancel.hs
-    streaming-io/src/Network/Streaming/Internal/Atomic.hs
-    streaming-io/src/Network/Streaming/Internal/Socket.hs
-  '
+  files=$(find streaming-io/src native-pg/src native-pg-tls/src resource-admission/src directions/src -name '*.hs' | sort)
 fi
 
 # What is allowed where: a file, what it may do (a name below, or * for all of
@@ -41,6 +25,7 @@ fi
 allow_list='
 streaming-io/src/Network/Streaming/Buffer.hs * the one buffer type
 streaming-io/src/Network/Streaming/Reader.hs create the copying atom: bytes makes an owned ByteString of a value
+native-pg-tls/src/Database/PostgreSQL/Tls/Internal.hs mallocForeignPtrBytes the C string with the name of the server, which rustls borrows
 '
 
 # What is looked for: a name, a tab, and an extended regular expression that
@@ -60,7 +45,7 @@ ForeignPtr-Word8-field	^@@field@@
 
 # The code of each line without its comments, so that the output has a line for
 # each line of the input. Block comments nest; "--" begins a line comment
-# unless an operator character follows it.
+# unless an operator character follows it. String literals are dropped.
 strip='
 FNR == 1 { depth = 0; decl = 0 }
 {
@@ -71,6 +56,13 @@ FNR == 1 { depth = 0; decl = 0 }
       if (two == "-}") { depth--; i += 2 } else if (two == "{-") { depth++; i += 2 } else i++
     } else if (two == "{-") { depth++; i += 2 }
     else if (two == "--" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t(\[,;]/) && (i + 1 == n || substr(line, i + 2, 1) !~ /[!#$%&*+.\/<=>?@\\^|~:]/)) break
+    else if (substr(line, i, 3) == "\x27\"\x27") { out = out "\"\""; i += 3 }
+    else if (substr(line, i, 1) == "\"") {
+      # a string literal: dropped, with its escapes
+      i++
+      while (i <= n && substr(line, i, 1) != "\"") i += (substr(line, i, 1) == "\\") ? 2 : 1
+      out = out "\"\""; i++
+    }
     else { out = out substr(line, i, 1); i++ }
   }
   if (out ~ /^(data|newtype)[ \t]/) decl = 1

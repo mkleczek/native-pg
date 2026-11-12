@@ -37,9 +37,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LBS
 import Data.Text (Text)
 import Data.Word (Word32)
-import Database.PostgreSQL.Types (FormatCode (..))
-import Database.PostgreSQL.Streaming.Types (Parameter (..))
-import Database.PostgreSQL.Transaction (Param (..))
+import Database.PostgreSQL.Types (FormatCode (..), Param (..), Parameter (..))
 import qualified PostgreSQL.Binary.Encoding as Binary
 
 -- | How a value of type @a@ is encoded: its type's OID, the OID of the

@@ -18,20 +18,14 @@ module Database.PostgreSQL.Internal.Protocol.Messages.Startup
     pattern GSSENCRequest,
     CancelRequest,
     pattern CancelRequest,
-    parseStartupMessage,
-    parseCancelRequest,
   )
 where
 
-import Data.ByteString (ByteString)
 import Database.PostgreSQL.Internal.Protocol.Codec
   ( HasConstructor (..),
   )
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload
   ( Payload (..),
-  )
-import Database.PostgreSQL.Internal.Protocol.Messages.Parse
-  ( parseMessage,
   )
 import Database.PostgreSQL.Internal.Protocol.Messages.Types
   ( BackendKey,
@@ -138,9 +132,3 @@ instance HasConstructor 'CancelRequestType (CancelRequest bytes) where
   type ConstructorOf 'CancelRequestType (CancelRequest bytes) r = BackendKey bytes -> r
   constructorOf = CancelRequest
   destructorOf (CancelRequest key) k = k key
-
-parseStartupMessage :: ByteString -> Either String (StartupMessage ByteString)
-parseStartupMessage = parseMessage
-
-parseCancelRequest :: ByteString -> Either String (CancelRequest ByteString)
-parseCancelRequest = parseMessage

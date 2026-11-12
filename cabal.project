@@ -1,5 +1,4 @@
-packages: .
-          resource-admission
+packages: resource-admission
           streaming-io
           native-pg
           native-pg-tls

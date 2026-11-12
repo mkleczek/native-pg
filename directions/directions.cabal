@@ -16,7 +16,7 @@ library
                    Network.Directions.Resumable
                    Network.Directions.Memory
                    Network.Directions.Rows
-  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, stm >=2.5 && <2.6, streaming-io
+  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, streaming-io
 
 test-suite directions-spec
   type: exitcode-stdio-1.0

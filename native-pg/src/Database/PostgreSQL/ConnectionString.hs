@@ -5,8 +5,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | libpq's connection strings, URIs and key/value strings, with the defaults
--- libpq takes from the environment, and connecting to the first suitable host
--- one names.
+-- libpq takes from the environment.
 --
 -- TLS is used as @sslmode@ asks, except for @verify-ca@, and @require@ with a
 -- root certificate file, which libpq verifies as @verify-ca@. Options this
@@ -24,8 +23,7 @@ module Database.PostgreSQL.ConnectionString
     parseConnectionString,
     readConnectionString,
     ConnectFailure (..),
-    HostFailure (..),
-    connectFirst
+    HostFailure (..)
   ) where
 
 import Control.Applicative ((<|>))
@@ -48,10 +46,7 @@ import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word8)
 import Database.PostgreSQL.ConnectionString.Types
-import qualified Database.PostgreSQL.Internal.HostSelection as HostSelection
-import Database.PostgreSQL.Session (Session, close, connection)
 import Database.PostgreSQL.Types (protocolVersion3_0, protocolVersion3_2)
-import Database.PostgreSQL.Internal.Startup (connectOwned)
 import Database.PostgreSQL.Session.Settings
 import Database.PostgreSQL.Transport (RootCertificates (..), TcpOptions (..), TlsVersion (..))
 import System.Directory (doesFileExist)
@@ -632,14 +627,6 @@ resolve option defaults localUser = do
       value : _ -> value
       [] -> ""
     commaSeparated value = if BS.null value then [""] else Char8.split ',' value
-
--- | Connects to the first host that accepts the connection and qualifies
--- under @target_session_attrs@, giving each host the connect timeout. With
--- @prefer-standby@, the hosts are tried for a standby first, and then for any
--- server. The settings for each host can be adjusted, e.g. for a bigger read
--- buffer. Throws 'ConnectFailure' when no host qualifies.
-connectFirst :: (ConnectSettings -> ConnectSettings) -> ConnectionString -> IO (Session, ServerInfo, Host)
-connectFirst = HostSelection.connectFirstUsing connectOwned (close . connection) HostSelection.queryValue
 
 -- | C's isspace, which libpq uses, in the C locale.
 isBlank :: Char -> Bool

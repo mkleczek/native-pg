@@ -1,8 +1,6 @@
-{-# LANGUAGE BangPatterns #-}
-
--- | Parses the same bytes with native-pg's 'Input' monad and with arrows over
--- a 'Reader' of the directions prototype, under each way to run an arrow, and
--- says what each did: how fast, and how much it allocated (needs @+RTS -T@).
+-- | Parses the same bytes with arrows over a 'Reader', under each way to run
+-- an arrow, and says what each did: how fast, and how much it allocated
+-- (needs @+RTS -T@).
 -- The bytes are in memory and the link never waits, so only the parsing is
 -- measured. Two workloads: a million DataRow messages of five fields, and one
 -- DataRow of one field that is a whole response body, streamed to a consumer
@@ -17,13 +15,11 @@ module Main (main) where
 
 import Control.Arrow (Arrow, returnA, (>>^))
 import Control.Exception (evaluate)
-import Control.Monad (forM, forM_, replicateM, replicateM_, unless, void, when)
-import Data.Bits (shiftL, (.|.))
+import Control.Monad (forM, forM_, replicateM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word64)
 import Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
-import Database.PostgreSQL.Internal.Protocol.Codec.Input
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.Memory
@@ -54,10 +50,7 @@ data Variant = Variant
 
 variants :: [Variant]
 variants =
-  [ Variant "A copy" (`inputRun` inputRows) (`inputRun` inputStream),
-    -- The field of this one is read as the field of the copying one is, in views.
-    Variant "A in place" (`inputRun` inputRowsInPlace) (`inputRun` inputStream),
-    Variant
+  [ Variant
       "B threads"
       (\memory -> withReader memory (\reader -> runThreads (foldRows checksum reader) 0))
       (streamed (\counter reader -> runThreads (streamMessages reader (counting counter)) ())),
@@ -119,66 +112,6 @@ streamedResumable run memory = do
 -- | The consumer of a parser that yields nothing.
 ignored :: (Arrow arr) => arr ByteString ()
 ignored = returnA >>^ const ()
-
--- | Runs the parser of today's input over the link, in a buffer of the size.
-inputRun :: Memory -> Input a -> IO a
-inputRun memory parser = do
-  storage <- bufferOf capacity
-  fst <$> runInput (InputSource (memoryReceive memory) capacity) (reusableInputBuffer storage) parser
-
--- | The rows' checksum, as the arrows' 'foldRows' gives it.
-inputRows :: Input Int
-inputRows = loop 0
-  where
-    loop !total =
-      readInputWord8 >>= \tag -> case tag of
-        68 -> readInputWord32 *> row >>= \fields -> loop (checksum total fields)
-        67 -> readInputWord32 >>= \size -> total <$ readInputExactly (fromIntegral size - 4)
-        _ -> failInput ("a message with the tag " <> show tag)
-    row = readInputWord16 >>= \count -> replicateM (fromIntegral count) (readInputWord32 >>= readInputExactly . fromIntegral)
-
--- | The same checksum, with the ints decoded in place by reading them as
--- numbers, and the texts skipped: nothing is copied and no list is built.
-inputRowsInPlace :: Input Int
-inputRowsInPlace = loop 0
-  where
-    loop !total =
-      readInputWord8 >>= \tag -> case tag of
-        68 -> readInputWord32 *> row total >>= loop
-        67 -> readInputWord32 >>= \size -> total <$ readInputExactly (fromIntegral size - 4)
-        _ -> failInput ("a message with the tag " <> show tag)
-    row !total = do
-      fields <- readInputWord16
-      when (fields /= 5) $ failInput ("a row of " <> show fields <> " fields")
-      _ <- readInputWord32
-      int4 <- readInputWord32
-      _ <- readInputWord32
-      high <- readInputWord32
-      low <- readInputWord32
-      size16 <- readInputWord32
-      skipInput (fromIntegral size16)
-      size40 <- readInputWord32
-      skipInput (fromIntegral size40)
-      _ <- readInputWord32
-      bool <- readInputWord8
-      pure $! total + fromIntegral int4 + (fromIntegral high `shiftL` 32 .|. fromIntegral low) + fromIntegral size16 + fromIntegral size40 + fromIntegral bool
-
--- | The bytes of the fields, counted in the chunks that native-pg's own reads
--- of a field give.
-inputStream :: Input Int
-inputStream = loop 0
-  where
-    loop !total =
-      readInputWord8 >>= \tag -> case tag of
-        68 -> readInputWord32 *> readInputWord16 >>= \count -> fields (fromIntegral count) total >>= loop
-        67 -> readInputWord32 >>= \size -> total <$ readInputExactly (fromIntegral size - 4)
-        _ -> failInput ("a message with the tag " <> show tag)
-    fields :: Int -> Int -> Input Int
-    fields 0 total = pure total
-    fields count total = readInputWord32 >>= \size -> chunks (fromIntegral size) total >>= fields (count - 1)
-    chunks :: Int -> Int -> Input Int
-    chunks 0 total = pure total
-    chunks left total = readInputBorrowedSome left >>= \chunk -> chunks (left - BS.length chunk) (total + BS.length chunk)
 
 -- | The two workloads, and what a variant has to give for each.
 data Workload = Rows | Stream

@@ -74,7 +74,6 @@ import Data.Int (Int16, Int32)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word32, Word8)
 import Database.PostgreSQL.Types
-import Database.PostgreSQL.Streaming.Types (Parameter (..))
 import Database.PostgreSQL.Internal.Protocol.Codec
   ( Alternatives (..),
     HasConstructor (..),

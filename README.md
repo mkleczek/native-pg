@@ -4,9 +4,19 @@ A PostgreSQL client in Haskell that speaks PostgreSQL's protocol over a socket,
 without libpq. It reads only when asked to, supports borrowed result and
 parameter streams through caller-owned workspace, and sends statements in pipelines.
 
-- **`native-pg`:** connections (libpq's connection strings, SCRAM), statements,
-  pipelines and transactions, with streamed results and parameters, connection
-  pooling.
+**This is v2 in progress.** v1's waiting layer (the session, transactions, the
+pool, the transport and the integration suite, which wait in the code that runs
+them) is removed from this branch, and stays at the tag that PostgREST pins.
+What is left compiles and has its unit tests: the protocol's messages and their
+serialisation, parameters and their encoders, decoding, snippets, connection
+strings, authentication and TLS's configuration. v2 replaces what was removed
+with code written against the classes of `streaming-io`. The sections below
+that describe sessions, transactions and the pool describe v1.
+
+- **`native-pg`:** the protocol's messages and their serialisation, libpq's
+  connection strings, SCRAM and MD5 authentication, parameter encoders, row
+  decoding and snippets (modules `ConnectionString`, `Decoding`, `Diagnostics`,
+  `Encoders`, `Session.Settings`, `Snippet`, `Transport` and `Types`).
 - **`streaming-io`:** borrowed streams, shared request buffer capabilities and bounded body/setup pools,
   and the arrow runtime (`Network.Streaming.Classes`, with the arrows `Threads`, `Loop`,
   `Compiled` and `Delimited`), with one `Buffer` type for all memory.
@@ -243,7 +253,7 @@ the tests. Select a suite and optionally filter its test names:
 
 ```bash
 cabal test native-pg-spec --test-show-details=direct
-cabal test native-pg-integration --test-show-details=direct --test-option='[close]'
+cabal test streaming-io-spec --test-show-details=direct --test-option='[watches]'
 ```
 
 Check the installed client API, including rejected imports of private modules:
@@ -253,13 +263,17 @@ cabal build native-pg
 cabal exec -- sh native-pg/test/check-api-boundary.sh
 ```
 
-The integration tests start one temporary PostgreSQL cluster with the `initdb`
-and `pg_ctl` found on the path. Each session wrapper opens a fresh connection
-and closes it after the test, including on failure. The integration runner
-registers its spec explicitly so that cluster setup stays outside the tests;
-the core and TLS runners discover `*Spec.hs` modules automatically. The repository
-root contains a test-only integration package that compiles both implementations
-to exercise their private operations without adding client-facing exports.
+Two checks read the sources of every package, and fail on what the design
+keeps out of them. They are plain shell scripts, with an explicit allow-list:
+
+```bash
+sh streaming-io/test/check-one-buffer.sh   # only Network.Streaming.Buffer allocates bytes
+sh streaming-io/test/check-no-io-waits.sh  # only the arrows' own code waits in IO
+```
+
+The suites discover `*Spec.hs` modules automatically. v1's integration suite,
+which started a temporary PostgreSQL cluster, is at the v1 tag; it will be
+ported to the v2 API.
 
 For a test-first jj change, first run the regression without a marker and check
 that it fails for the intended reason. Then mark that individual test with

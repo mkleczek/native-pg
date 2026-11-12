@@ -31,7 +31,6 @@ import Foreign.ForeignPtr (ForeignPtr, plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import Foreign.Storable (pokeByteOff)
-import Network.Streaming.Source (AnySource, AnyWaitingSource)
 
 -- | Bytes that arrive in chunks, with their total length known up front.
 data ByteStream = ByteStream
@@ -46,7 +45,7 @@ data ByteStream = ByteStream
 data Output = Output
   { outputLength :: {-# UNPACK #-} !Int,
     -- | The bytes 'writeOutput' copies to its buffer: all but long byte
-    -- strings and sources.
+    -- strings.
     outputCopied :: {-# UNPACK #-} !Int,
     outputBuild :: Writer -> Writer
   }
@@ -70,11 +69,6 @@ outputWriter Output {outputBuild} = outputBuild (Writer (\_ _ used -> pure (Fini
 -- | A part of an output that's sent from where it is, rather than copied.
 data Uncopied
   = UncopiedBytes ByteString
-  | -- | A pull source, and how many bytes it declares it will give.
-    UncopiedSource !Int !AnySource
-  | -- | A source that is waited for in place, and how many bytes it declares
-    -- it will give.
-    UncopiedWaiting !Int !AnyWaitingSource
 
 instance Semigroup Output where
   Output leftLength leftCopied left <> Output rightLength rightCopied right =

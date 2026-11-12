@@ -6,7 +6,6 @@ license: AGPL-3.0-or-later
 license-file: LICENSE
 build-type: Simple
 extra-source-files: test/check-positive-int.sh
-                    test/check-scope-escape.sh
                     test/check-one-buffer.sh
                     test/check-no-io-waits.sh
                     test/compile/*.hs
@@ -15,15 +14,10 @@ library
   default-language: GHC2021
   hs-source-dirs: src
   ghc-options: -Wall
-  exposed-modules: Network.Streaming
-                   Network.Streaming.Link
-                   Network.Streaming.Output
+  exposed-modules: Network.Streaming.Output
                    Network.Streaming.PositiveInt
                    Network.Streaming.BufferPool
                    Network.Streaming.Buffer
-                   Network.Streaming.Sender
-                   Network.Streaming.Scope
-                   Network.Streaming.Source
                    Network.Streaming.Watch
                    Network.Streaming.Classes
                    Network.Streaming.Combinators
@@ -52,17 +46,11 @@ test-suite streaming-io-spec
   other-modules: ListPrefixSpec
                       AcquisitionTestSupport
                  AdmissionResourcesSpec
-                 FakeStreams
                  Network.Streaming.Internal.ListPrefix
-                 Network.Streaming
-                 Network.Streaming.Link
                  Network.Streaming.Output
                  Network.Streaming.PositiveInt
                  Network.Streaming.BufferPool
                  Network.Streaming.Buffer
-                 Network.Streaming.Scope
-                 Network.Streaming.Sender
-                 Network.Streaming.Source
                  Network.Streaming.Watch
                  Network.Streaming.Classes
                  Network.Streaming.Combinators
@@ -82,10 +70,6 @@ test-suite streaming-io-spec
                  PositiveIntSpec
                  RequestBuffersSpec
                  ResourcesSpec
-                 ScopeSpec
-                 SenderSpec
-                 SourceSpec
-                 StreamingSpec
                  WatchSpec
                  CoresSpec
                  RegionSpec

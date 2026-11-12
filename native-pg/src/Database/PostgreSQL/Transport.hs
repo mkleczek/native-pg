@@ -7,16 +7,8 @@
 module Database.PostgreSQL.Transport
   ( Address (..),
     ConnectError (..),
-    StreamLengthError (..),
     TcpOptions (..),
     defaultTcpOptions,
-    Link (..),
-    Interest (..),
-    Blocked (..),
-    Channel,
-    newChannel,
-    TlsClient (..),
-    TlsChannel (..),
     TlsSettings (..),
     ServerVerification (..),
     RootCertificates (..),
@@ -34,11 +26,9 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.List (intercalate)
 import Data.Word (Word8)
-import Database.PostgreSQL.Internal.Channel (Channel, newChannel)
-import Database.PostgreSQL.Transport.Link
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
 import GHC.IO.Exception (IOException (..))
-import Network.Socket (HostName, PortNumber, Socket)
+import Network.Socket (HostName, PortNumber)
 
 data Address
   = -- | A host name or IP address, and a port.
@@ -103,27 +93,6 @@ instance Exception ConnectError where
       socketHint errno
         | errno == eNOENT || errno == eCONNREFUSED = "\n\tIs the server running locally and accepting connections on that socket?"
         | otherwise = ""
-
--- | Starts TLS over a connected socket, as a client of the named server, and
--- gives its channel builder and channel-binding data. A library apart,
--- native-pg-tls, has one, so that this one has no C. Throws 'TlsError' if TLS
--- fails.
-newtype TlsClient = TlsClient
-  { startTlsChannel :: TlsSettings -> HostName -> Socket -> IO TlsChannel
-  }
-
--- | The result of TLS setup. Authentication consumes the binding data;
--- the link and channel only carry bytes.
-data TlsChannel = TlsChannel
-  { -- | The transport channel. Pending output is supplied separately for
-    -- each operation's input source.
-    tlsChannel :: Channel,
-    -- | The @tls-server-end-point@ binding: the hash of the server's
-    -- certificate, or why it couldn't be computed. 'Nothing' means binding
-    -- is unavailable. A 'Left' is reported only if authentication selects
-    -- SCRAM-PLUS; it mustn't prevent TLS use without channel binding.
-    tlsServerEndPoint :: Maybe (Either String ByteString)
-  }
 
 -- | How a TLS link is configured.
 data TlsSettings = TlsSettings
