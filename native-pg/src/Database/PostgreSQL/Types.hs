@@ -2,7 +2,7 @@
 module Database.PostgreSQL.Types
   ( ProtocolVersion (..), protocolVersion3_0, protocolVersion3_2,
     FormatCode (..), TransactionStatus (..),
-    Param (..), Parameter (..),
+    Oid, Param (..), Parameter (..),
   ) where
 
 import Data.ByteString (ByteString)
@@ -22,6 +22,9 @@ protocolVersion3_0 = ProtocolVersion 3 0
 
 protocolVersion3_2 :: ProtocolVersion
 protocolVersion3_2 = ProtocolVersion 3 2
+
+-- | The OID of a type.
+type Oid = Word32
 
 data FormatCode
   = TextFormat

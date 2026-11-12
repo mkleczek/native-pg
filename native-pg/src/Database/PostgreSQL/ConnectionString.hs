@@ -20,6 +20,7 @@ module Database.PostgreSQL.ConnectionString
     TargetSessionAttrs (..),
     hostConnectSettings,
     hostSocketAddress,
+    fromConnectionString,
     parseConnectionString,
     readConnectionString,
     ConnectFailure (..),
@@ -39,7 +40,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_, toList)
 import Data.Functor ((<&>))
-import Data.List.NonEmpty (nonEmpty)
+import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe)
 import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
@@ -58,6 +59,13 @@ import System.Posix.User (getEffectiveUserID, getEffectiveUserName, getUserEntry
 import System.Posix.Files (fileMode, getFdStatus, isRegularFile)
 import System.Posix.IO (OpenMode (ReadOnly), OpenFileFlags (..), closeFd, defaultFileFlags, dup, fdToHandle, openFd)
 #endif
+
+-- | The settings of one 'Database.PostgreSQL.Connection.connect' that tries all
+-- the hosts of the connection string: the first host's, with the settings of
+-- the others to try after it, in order.
+fromConnectionString :: ConnectionString -> Either String ConnectSettings
+fromConnectionString string = case connectionHosts string of
+  first :| others -> Right (hostConnectSettings string first) {connectFallbacks = map (hostConnectSettings string) others}
 
 -- | Parses the connection string, and fills in what it leaves out from the
 -- environment and the defaults as libpq does.

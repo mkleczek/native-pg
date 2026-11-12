@@ -26,7 +26,7 @@ import Control.Category (Category (..))
 import Control.Exception (SomeException, mask_, throwIO, toException)
 import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Network.Streaming.Classes
+import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets

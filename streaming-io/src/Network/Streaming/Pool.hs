@@ -9,6 +9,9 @@
 -- do the threads of "Network.Streaming.Threads".
 module Network.Streaming.Pool
   ( Pool,
+    PoolError (..),
+    withLoan,
+    urgently,
     newPool,
     checkout,
     checkoutWithin,
@@ -19,17 +22,42 @@ module Network.Streaming.Pool
 where
 
 import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (^>>), (|||))
+import Control.Exception (Exception)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Sequence (Seq, ViewL (..), viewl, (|>))
 import qualified Data.Sequence as Seq
 import Network.Streaming.Classes
 import Network.Streaming.Internal.Atomic (update)
+import Network.Streaming.NotImplemented (notImplemented)
 
 -- | The connections that are free, and the givers of those that wait for one,
 -- in the order they came. While there are waiters, none is free.
 data State conn = State [conn] (Seq (Giver 'Anywhere conn))
 
 newtype Pool conn = Pool (IORef (State conn))
+
+-- | Why a pool gave nothing to use.
+data PoolError
+  = -- | None was free before the pool's checkout deadline.
+    CheckoutTimedOut
+  | -- | The pool has been closed.
+    PoolClosed
+  deriving (Eq, Show)
+
+instance Exception PoolError
+
+-- | The body, with a connection or whatever else the pool lends, checked out
+-- for as long as it runs and given back when it ends, however it ends: one pool
+-- for connections and anything else that is loaned. A stub, which fails with
+-- 'Network.Streaming.NotImplemented.NotImplemented'.
+withLoan :: (Runtime arr) => Pool c -> arr (c, a) b -> arr a (Either PoolError b)
+withLoan _ _ = notImplemented "withLoan"
+
+-- | The body, as a holder of what the pool lent goes: the pool serves those
+-- that hold something first, so that they can give it back. A stub, which
+-- fails with 'Network.Streaming.NotImplemented.NotImplemented'.
+urgently :: (Runtime arr) => arr a b -> arr a b
+urgently _ = notImplemented "urgently"
 
 newPool :: [conn] -> IO (Pool conn)
 newPool conns = Pool <$> newIORef (State conns Seq.empty)

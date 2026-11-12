@@ -73,7 +73,7 @@ import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word32, Word8)
-import Database.PostgreSQL.Types
+import Database.PostgreSQL.Types hiding (Oid)
 import Database.PostgreSQL.Internal.Protocol.Codec
   ( Alternatives (..),
     HasConstructor (..),

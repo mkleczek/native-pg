@@ -29,6 +29,8 @@ library
                    Network.Streaming.Reader
                    Network.Streaming.With
                    Network.Streaming.Pool
+                   Network.Streaming.Loans
+                   Network.Streaming.NotImplemented
                    Network.Streaming.Internal.Scheduler
                    Network.Streaming.Internal.Timers
                    Network.Streaming.Internal.Cancel
@@ -63,6 +65,8 @@ test-suite streaming-io-spec
                  Network.Streaming.Reader
                  Network.Streaming.With
                  Network.Streaming.Pool
+                 Network.Streaming.Loans
+                 Network.Streaming.NotImplemented
                  Network.Streaming.Internal.Scheduler
                  Network.Streaming.Internal.Timers
                  Network.Streaming.Internal.Cancel

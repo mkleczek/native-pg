@@ -28,7 +28,7 @@ import Foreign.Marshal.Utils (moveBytes)
 import Foreign.Ptr (castPtr)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Buffer (Buffer (..))
-import Network.Streaming.Classes hiding (Exit (..))
+import Network.Streaming.Classes hiding (Exit (..), Stream (..))
 import Network.Streaming.With
 
 -- | Where a parser is: done, with the bytes it left in hand, or in need of

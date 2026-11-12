@@ -54,7 +54,7 @@ reject_module Network.Streaming.Internal.Socket
 reject_module Network.Streaming.Internal.Tickets
 
 for private_module in \
-  Authentication Buffer Internal.Diagnostics \
+  Authentication Buffer Connection.Internal Internal.Diagnostics \
   Protocol Protocol.Codec Protocol.Codec.Output \
   Protocol.Codec.Payload Protocol.Messages Protocol.Messages.AuthBackend \
   Protocol.Messages.AuthFrontend Protocol.Messages.BackendSession \

@@ -95,7 +95,7 @@ import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peekByteOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import GHC.TypeLits (KnownChar, KnownNat, Nat, charVal, natVal)
-import Network.Streaming.Classes
+import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Reader
 import Network.Streaming.With (With (..), asks, lift, with, withOnly)
 

@@ -9,7 +9,8 @@
 -- another type is reported instead of misread: an @int4@ value doesn't
 -- decode as 'Int64'.
 module Database.PostgreSQL.Decoding
-  ( DecodeField (..),
+  ( InPlace,
+    DecodeField (..),
     DecodeValue (..),
     DecodingError (..),
     Json (..),
@@ -58,6 +59,12 @@ instance DecodeValue a => DecodeField (Maybe a) where
   {-# INLINE arrayElement #-}
   compositeField = Binary.nullableValueComposite valueDecoder
   {-# INLINE compositeField #-}
+
+-- | What a column's value is decoded where it is from, its bytes in the read
+-- buffer: any value of the types here, and of the composites that 'composite'
+-- makes of them, which may be NULL where the type is 'Maybe'. The value is the
+-- caller's own allocation, and nothing is copied for it but what its type keeps.
+type InPlace = DecodeField
 
 data DecodingError
   = -- | The row has a different number of columns than were decoded.

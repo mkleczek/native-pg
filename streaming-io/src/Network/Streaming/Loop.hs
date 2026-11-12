@@ -39,7 +39,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (partition, sort)
 import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
-import Network.Streaming.Classes
+import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))

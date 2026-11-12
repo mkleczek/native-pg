@@ -9,6 +9,7 @@ module Database.PostgreSQL.Transport
     ConnectError (..),
     TcpOptions (..),
     defaultTcpOptions,
+    TlsClient (..),
     TlsSettings (..),
     ServerVerification (..),
     RootCertificates (..),
@@ -93,6 +94,11 @@ instance Exception ConnectError where
       socketHint errno
         | errno == eNOENT || errno == eCONNREFUSED = "\n\tIs the server running locally and accepting connections on that socket?"
         | otherwise = ""
+
+-- | The TLS implementation that a connection starts TLS with, which native-pg-tls
+-- supplies: without one, a connection can't encrypt, as libpq built without TLS
+-- can't. A stub, until a connection can use one.
+data TlsClient = TlsClient
 
 -- | How a TLS link is configured.
 data TlsSettings = TlsSettings

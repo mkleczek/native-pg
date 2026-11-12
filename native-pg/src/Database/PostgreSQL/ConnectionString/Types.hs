@@ -79,19 +79,6 @@ data Host = Host
   }
   deriving (Eq, Show)
 
--- | Which servers qualify, from @target_session_attrs@.
-data TargetSessionAttrs
-  = AnySession
-  | -- | Not in hot standby, and not read-only by default.
-    ReadWriteSession
-  | ReadOnlySession
-  | -- | Not in hot standby.
-    PrimarySession
-  | StandbySession
-  | -- | A standby if a host is one, or else any server.
-    PreferStandbySession
-  deriving (Eq, Show)
-
 -- | A connection string that can't be used, for the reason given.
 newtype InvalidConnectionString = InvalidConnectionString String
   deriving (Show)
@@ -128,6 +115,8 @@ hostConnectSettings string host =
       connectSslServerNameIndication = connectionSslServerNameIndication string,
       connectSslDirect = connectionSslDirect string,
       connectChannelBinding = connectionChannelBinding string,
+      connectTargetSessionAttrs = connectionTargetSessionAttrs string,
+      connectTimeout = connectionTimeout string,
       -- With hostaddr, the address is the IP address the name resolved to.
       connectServerName = Just (hostName host)
     }

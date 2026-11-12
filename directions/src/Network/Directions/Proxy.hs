@@ -22,7 +22,7 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.IORef (IORef, modifyIORef')
 import Data.Tuple (swap)
 import Network.Streaming.Buffer (Buffer)
-import Network.Streaming.Classes
+import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators
 import Network.Streaming.With
 

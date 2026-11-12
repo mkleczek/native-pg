@@ -1,3 +1,4 @@
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -11,6 +12,8 @@
 -- the link's own calls that never wait.
 module Network.Streaming.Classes
   ( Link (..),
+    Stream (..),
+    Runtime,
     Concurrent (..),
     Exit (..),
     ScopeId (..),
@@ -82,6 +85,28 @@ class Link arr link where
   shutdownSend :: arr link ()
 
   close :: arr link ()
+
+-- | A stream of byte views: a field's value, a request body. A piece is a view,
+-- valid until the next step on the stream; the end is 'Nothing'.
+class Stream arr s where
+  next :: arr s (Maybe ByteString)
+
+-- | What a program needs of the arrow it runs in, so that it can be written
+-- once and run by any of them: the capabilities of its classes, and tickets
+-- at both reaches.
+type Runtime arr =
+  ( ArrowChoice arr,
+    Effect arr,
+    Block arr,
+    GiveWay arr,
+    Scope arr,
+    Race arr,
+    Within arr,
+    Time arr,
+    Concurrent arr,
+    Exchange arr (Local arr),
+    Exchange arr 'Anywhere
+  )
 
 -- | Values that one direction gives another, once each: the way directions
 -- exchange what they know. A ticket has two ends, a 'Waiting' end that the

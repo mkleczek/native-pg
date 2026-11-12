@@ -143,8 +143,6 @@ data StatementError
     ServerFailed ServerError
   | -- | A row couldn't be decoded.
     RowFailed DecodingError
-  | -- | The result had this many rows, which its shape doesn't allow.
-    UnexpectedAmountOfRows Int
   deriving (Eq, Show)
 
 -- | Whether the server ends the session after this error.

@@ -28,7 +28,7 @@ import Control.Arrow (Arrow, ArrowChoice, arr, (>>>), (>>^), (^>>))
 import Control.Concurrent (threadDelay)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.Word (Word64)
-import Network.Streaming.Classes
+import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators
 
 -- | A request: the giver of the answer.

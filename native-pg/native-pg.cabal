@@ -20,7 +20,8 @@ common implementation
   default-extensions: QuasiQuotes
   hs-source-dirs:     src
   ghc-options:        -Wall
-  other-modules:      Database.PostgreSQL.Internal.Authentication
+  other-modules:      Database.PostgreSQL.Connection.Internal
+                      Database.PostgreSQL.Internal.Authentication
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
@@ -56,13 +57,19 @@ common implementation
 
 library
   import:             implementation
-  exposed-modules:    Database.PostgreSQL.ConnectionString
+  exposed-modules:    Database.PostgreSQL.Connection
+                      Database.PostgreSQL.ConnectionString
                       Database.PostgreSQL.ConnectionString.Types
                       Database.PostgreSQL.Decoding
                       Database.PostgreSQL.Diagnostics
                       Database.PostgreSQL.Encoders
+                      Database.PostgreSQL.Errors
+                      Database.PostgreSQL.Notifications
+                      Database.PostgreSQL.Pool
+                      Database.PostgreSQL.Pool.Observation
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
+                      Database.PostgreSQL.Transaction
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Types
 
@@ -70,13 +77,19 @@ test-suite native-pg-spec
   import:             implementation
   type:               exitcode-stdio-1.0
   hs-source-dirs:     test
-  other-modules:      Database.PostgreSQL.ConnectionString
+  other-modules:      Database.PostgreSQL.Connection
+                      Database.PostgreSQL.ConnectionString
                       Database.PostgreSQL.ConnectionString.Types
                       Database.PostgreSQL.Decoding
                       Database.PostgreSQL.Diagnostics
                       Database.PostgreSQL.Encoders
+                      Database.PostgreSQL.Errors
+                      Database.PostgreSQL.Notifications
+                      Database.PostgreSQL.Pool
+                      Database.PostgreSQL.Pool.Observation
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
+                      Database.PostgreSQL.Transaction
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Types
                       CoreSpec

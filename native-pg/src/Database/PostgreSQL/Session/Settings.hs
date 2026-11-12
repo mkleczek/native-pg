@@ -3,14 +3,17 @@ module Database.PostgreSQL.Session.Settings
   ( ConnectSettings (..),
     SslMode (..),
     ChannelBindingMode (..),
+    TargetSessionAttrs (..),
     connectSettings,
     ServerInfo (..),
+    serverProcessId,
   ) where
 
 import Data.ByteString (ByteString)
-import Database.PostgreSQL.Internal.Protocol.Messages.Types (BackendKey)
+import Data.Int (Int32)
+import Database.PostgreSQL.Internal.Protocol.Messages.Types (BackendKey, Scalar (..))
 import Database.PostgreSQL.Types (ProtocolVersion, protocolVersion3_0)
-import Database.PostgreSQL.Transport (Address, RootCertificates, TcpOptions, TlsVersion, defaultTcpOptions)
+import Database.PostgreSQL.Transport (Address, RootCertificates, TcpOptions, TlsClient, TlsVersion, defaultTcpOptions)
 import Network.Socket (HostName)
 
 data ConnectSettings = ConnectSettings
@@ -50,8 +53,36 @@ data ConnectSettings = ConnectSettings
     -- | Whether to start TLS without asking the server first, as
     -- PostgreSQL 17 takes it.
     connectSslDirect :: Bool,
-    connectChannelBinding :: ChannelBindingMode
+    connectChannelBinding :: ChannelBindingMode,
+    -- | What starts TLS, as libpq's TLS support does: without it a connection
+    -- can't encrypt, whatever 'connectSslMode' says.
+    connectTlsClient :: Maybe TlsClient,
+    -- | The settings of the hosts to try after this one, in order, which a
+    -- connection string with several hosts makes. Each has its own address,
+    -- password and server name, and none has hosts of its own.
+    connectFallbacks :: [ConnectSettings],
+    -- | Which of the hosts qualify, and the seconds that each has to connect,
+    -- authenticate and qualify.
+    connectTargetSessionAttrs :: TargetSessionAttrs,
+    connectTimeout :: Maybe Int,
+    -- | For tests: what SCRAM's channel binding takes as the TLS end-point
+    -- data in place of the server's certificate's: the bytes, or why there are
+    -- none, or none. Set through "Database.PostgreSQL.Connection.Internal".
+    connectEndPointOverride :: Maybe (Maybe (Either String ByteString))
   }
+
+-- | Which servers qualify, from @target_session_attrs@.
+data TargetSessionAttrs
+  = AnySession
+  | -- | Not in hot standby, and not read-only by default.
+    ReadWriteSession
+  | ReadOnlySession
+  | -- | Not in hot standby.
+    PrimarySession
+  | StandbySession
+  | -- | A standby if a host is one, or else any server.
+    PreferStandbySession
+  deriving (Eq, Show)
 
 -- | Whether to bind SCRAM to TLS, from libpq's channel_binding.
 data ChannelBindingMode
@@ -102,7 +133,12 @@ connectSettings address user =
       connectSslVersions = [minBound .. maxBound],
       connectSslServerNameIndication = True,
       connectSslDirect = False,
-      connectChannelBinding = ChannelBindingPrefer
+      connectChannelBinding = ChannelBindingPrefer,
+      connectTlsClient = Nothing,
+      connectFallbacks = [],
+      connectTargetSessionAttrs = AnySession,
+      connectTimeout = Nothing,
+      connectEndPointOverride = Nothing
     }
 
 data ServerInfo = ServerInfo
@@ -113,3 +149,7 @@ data ServerInfo = ServerInfo
     serverBackendKey :: Maybe (BackendKey ByteString)
   }
   deriving (Eq, Show)
+
+-- | The process id of the backend, if the server sent its key.
+serverProcessId :: ServerInfo -> Maybe Int32
+serverProcessId info = (\(Scalar (Scalar pid, _)) -> pid) <$> serverBackendKey info

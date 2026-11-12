@@ -47,7 +47,7 @@ import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peekByteOff, peekElemOff, pokeElemOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Buffer (Buffer (..))
-import Network.Streaming.Classes
+import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.With (With (..), asks, lift, with)
 
 -- | One direction's reader.
