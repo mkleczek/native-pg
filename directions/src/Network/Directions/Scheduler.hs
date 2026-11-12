@@ -557,8 +557,11 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
             Suspended (Until (Instant at)) _ resume -> addTimer (runWheel run) at (modifyIORef' (runTickets run) (resume (pure ()) :)) *> go others later
             Suspended (Watched register) ident resume -> register >>= \watch -> modifyIORef' (runWatching run) (Watching ident watch resume :) *> go others later
       [] -> do
-        -- Each round, the parts that tickets woke, that other cores gave, and
-        -- that descriptors became ready for join.
+        -- Each round, the parts that descriptors became ready for, that other
+        -- cores gave, and that tickets or timers woke, or a cancellation took
+        -- off what they waited at, go before those that yielded: a part that
+        -- waited for something is woken at the start of the next round, not at
+        -- its end. Those that yielded run every round, so they are not starved.
         rounds <- counter run 7
         setCounter run 7 (rounds + 1)
         setCounter run 8 0
@@ -571,7 +574,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
         given <- takeInbox run >>= arrivals run
         descriptors <- counter run 4
         polled <- if descriptors > 0 then pollNow else pure []
-        case reverse later <> reverse tickets <> given <> polled of
+        case polled <> given <> reverse tickets <> reverse later of
           [] -> idle
           next -> go next []
     idle = do
@@ -600,7 +603,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
                   until' <- untilNextTimer
                   polled <- pollWait (maybe (-1) (fromIntegral . min 2000000000 . (`div` 1000000) . (+ 999999)) until')
                   given <- afterSleep run >>= arrivals run
-                  go (given <> polled) []
+                  go (polled <> given) []
                 else go early []
           | otherwise -> do
               countWait
@@ -621,7 +624,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
               mapM_ (\(Watching _ watch _, _) -> watchCancel watch) fired
               writeIORef (runWatching run) (map fst still)
               polled <- if descriptors > 0 then pollNow else pure []
-              go (map (\(Watching _ _ resume, _) -> resume (pure ())) fired <> polled) []
+              go (polled <> map (\(Watching _ _ resume, _) -> resume (pure ())) fired) []
     countWait = counter run 2 >>= setCounter run 2 . (+ 1)
     -- How long until the next timer is due, in nanoseconds.
     untilNextTimer =
