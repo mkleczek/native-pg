@@ -13,7 +13,7 @@ import Database.PostgreSQL.Diagnostics ()
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectionError (..), PoolError (..), QueryError, UsageError (..))
 import Database.PostgreSQL.Encoders (Parameter (..))
 import Database.PostgreSQL.Notifications (Notification, listen, notification)
-import Database.PostgreSQL.Pool (ConnectionPoolSettings, connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings, connectionPoolSettings, withConnection, withConnectionPool)
 import Database.PostgreSQL.Session.Settings ()
 import Database.PostgreSQL.Snippet (fromSnippet)
 import Database.PostgreSQL.Transaction
@@ -25,7 +25,6 @@ import Network.Streaming.BufferPool (BufferGrant, BufferPool, BufferPoolSettings
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.Classes (Runtime, scope)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers, withSetupBuffers)
-import Network.Streaming.Pool (Pool)
 import Network.Streaming.PositiveInt (positiveInt)
 
 misordered :: UsageError -> Maybe Int
@@ -48,7 +47,7 @@ timedOut failure = failure == CheckoutTimedOut
 
 -- | A request's program, from the public API alone: a transaction on a pooled
 -- connection, whose pipeline carries the COMMIT.
-countRequest :: Runtime arr => Pool Connection -> arr Loans (Either PoolError (Either QueryError Int64))
+countRequest :: Runtime arr => ConnectionPool -> arr Loans (Either PoolError (Either QueryError Int64))
 countRequest pool =
   (, ((), ()))
     ^>> withConnection pool (transaction ReadCommitted Read (pipeline Final (statement count) single))
@@ -57,7 +56,7 @@ countRequest pool =
     count = Statement "SELECT count(*) FROM t" (const []) (one column)
 
 -- | The statement that a snippet makes, and a fold of its rows.
-foldRequest :: Runtime arr => Pool Connection -> arr Loans (Either PoolError (Either QueryError Int))
+foldRequest :: Runtime arr => ConnectionPool -> arr Loans (Either PoolError (Either QueryError Int))
 foldRequest pool =
   (, ((), ()))
     ^>> withConnection pool (transaction ReadCommitted Read (pipeline Final (statement ones) (foldRows (\n (_ :: Int64) -> n + 1) (0 :: Int))))
@@ -72,7 +71,7 @@ settingsOf = Right (connectSettings (UnixAddress "/tmp") "postgres")
 hostOf :: Connection -> (Bool, Bool)
 hostOf connection = (serverInfo connection `seq` True, connectedHost connection `seq` cancelKey connection `seq` True)
 
-poolFor :: ConnectionPoolSettings -> (Pool Connection -> IO a) -> IO a
+poolFor :: ConnectionPoolSettings -> (ConnectionPool -> IO a) -> IO a
 poolFor = withConnectionPool
 
 poolOf :: ConnectSettings -> ConnectionPoolSettings
