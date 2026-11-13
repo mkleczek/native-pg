@@ -504,7 +504,7 @@ maybeBody :: (Runtime arr) => Rows arr (Int32, Maybe Tx.Field)
 maybeBody = Tx.any (Tx.column &&& Tx.nullableField)
 
 -- | An unnamed statement, a preparation and its execution, with the parameters that tell them apart.
-wire :: (Runtime arr) => ByteString -> Tx.Pipeline arr () (Tx.Result Int32, Tx.Preparation, Tx.Result Int32)
+wire :: (Runtime arr) => ByteString -> Tx.Pipeline arr () (Tx.Result arr Int32, Tx.Preparation, Tx.Result arr Int32)
 wire name = (,,) <$> Tx.statement (answerFor "1") <*> Tx.prepare name (answerFor "2") <*> Tx.executePrepared name (answerFor "3")
 
 -- | The names the server has prepared on the connection.
@@ -525,7 +525,7 @@ shaped :: (Runtime arr) => Rows arr Int32 -> Int -> OnConn arr (Either QueryErro
 shaped rows count = query (numbers rows count)
 
 -- | A failing statement, and a preparation and an execution after it.
-skippingPipeline :: (Runtime arr) => Tx.Pipeline arr () (Tx.Result (), Tx.Preparation, Tx.Result Int32)
+skippingPipeline :: (Runtime arr) => Tx.Pipeline arr () (Tx.Result arr (), Tx.Preparation, Tx.Result arr Int32)
 skippingPipeline = (,,) <$> Tx.statement dividingByZero <*> Tx.prepare "skipped" (dividedBy "1") <*> Tx.executePrepared "skipped" (dividedBy "1")
 
 -- | Reads one more, and keeps what came before it.
@@ -539,7 +539,7 @@ wrongAmount = \case
   other -> failTest ("expected UnexpectedAmountOfRows, got " <> show other)
 
 -- | The command tag of a result, once its rows are read.
-tagged :: (Runtime arr) => Tx.Result row -> With Tx.Tx arr () ByteString
+tagged :: (Runtime arr) => Tx.Result arr row -> With Tx.Tx arr () ByteString
 tagged result = countRows result >>> arr (const ()) >>> Tx.commandTag result
 
 -- | After the step, the value goes on.
@@ -547,10 +547,10 @@ thenDo :: (Runtime arr) => With Tx.Tx arr () () -> With Tx.Tx arr a a
 thenDo step = (returnA &&& (arr (const ()) >>> step)) >>^ fst
 
 -- | The length that a field declares, and the bytes that its pieces add up to.
-lengths :: (Runtime arr) => Tx.Result (Int32, Tx.Field) -> With Tx.Tx arr () (Int32, (Int, Int))
+lengths :: (Runtime arr) => Tx.Result arr (Int32, Tx.Field) -> With Tx.Tx arr () (Int32, (Int, Int))
 lengths result = Tx.single result >>> (arr fst &&& (arr (Tx.fieldLength . snd) &&& (arr snd >>> measure >>^ fst)))
 
-maybeLengths :: (Runtime arr) => Tx.Result (Int32, Maybe Tx.Field) -> With Tx.Tx arr () (Int32, Maybe (Int, Int))
+maybeLengths :: (Runtime arr) => Tx.Result arr (Int32, Maybe Tx.Field) -> With Tx.Tx arr () (Int32, Maybe (Int, Int))
 maybeLengths result = Tx.single result >>> (arr fst &&& (arr snd >>> lengthOf))
   where
     lengthOf = maybe (Left ()) Right ^>> (arr (const Nothing) ||| ((arr Tx.fieldLength &&& (measure >>^ fst)) >>^ Just))

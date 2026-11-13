@@ -273,7 +273,7 @@ field100000 =
   transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT repeat('x', 100000)" (Tx.any Tx.field))) (\result -> Tx.single result >>> measure >>^ fst)
 
 -- | The declared length of the field, and the bytes that it gave, after a column.
-lengthsOf :: (Runtime arr) => Tx.Result (Int64, Tx.Field) -> With Tx.Tx arr () (Int64, Int, Int)
+lengthsOf :: (Runtime arr) => Tx.Result arr (Int64, Tx.Field) -> With Tx.Tx arr () (Int64, Int, Int)
 lengthsOf result = Tx.single result >>> (arr fst &&& (arr (Tx.fieldLength . snd) &&& (arr snd >>> measure >>^ fst))) >>^ \(a, (b, c)) -> (a, b, c)
 
 -- | A statement that gives a column and a field.

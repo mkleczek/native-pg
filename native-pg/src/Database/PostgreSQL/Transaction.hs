@@ -115,7 +115,6 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import qualified Database.PostgreSQL.Internal.Protocol.Messages as Wire
 import Database.PostgreSQL.Types (FormatCode (..), Oid, Parameter (..))
-import GHC.Exts (Any)
 import Network.Socket (Socket)
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
@@ -123,7 +122,6 @@ import Network.Streaming.NotImplemented (notImplemented, notImplementedIO)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity)
 import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
-import Unsafe.Coerce (unsafeCoerce)
 
 -- | A statement: its SQL, the parameters that it takes from the input of the
 -- program, and how its rows are read. The SQL is evaluated only when it is sent,
@@ -174,22 +172,23 @@ instance Applicative (Pipeline arr p) where
     Pipeline (count' + count'') (sent <> sent') (\base -> value base (value' (base + count')))
 
 -- | How the rows of a result are read, which only the statement knows: how many
--- there may be, and the step of the cursor for each, with its arrow forgotten. The
--- arrow is the one that the pipeline is for, and so the one that reads it.
-data Reading = Reading Cardinality Any | Silent
+-- there may be, and the step of the cursor for each.
+data Reading arr row = Reading Cardinality (arr Columns row) | Silent
 
--- | The position of the answers to one statement, and how its rows are read.
-data Result (row :: Type) = Result !Int !Reading
+-- | The position of the answers to one statement, and how its rows are read, as the
+-- arrow of its pipeline reads them: a result is read only under that arrow, and
+-- under @Delimited s@ only in the run that made it.
+data Result arr (row :: Type) = Result !Int !(Reading arr row)
 
 -- | The position of a preparation's acknowledgement.
 newtype Preparation = Preparation Int
 
 -- | The reading of the rows of a statement, as the result keeps it.
-readingOf :: Rows arr row -> Reading
-readingOf (Rows cardinality cursor) = Reading cardinality (unsafeCoerce cursor)
+readingOf :: Rows arr row -> Reading arr row
+readingOf (Rows cardinality cursor) = Reading cardinality cursor
 
 -- | A statement with its parameters, which the server parses, binds and executes.
-statement :: Statement arr p row -> Pipeline arr p (Result row)
+statement :: Statement arr p row -> Pipeline arr p (Result arr row)
 statement given = Pipeline 1 [Execute given] (\base -> Result base (readingOf (rows given)))
 
 -- | Parses the statement under the name. Parse sends no parameters, so what the
@@ -198,16 +197,16 @@ prepare :: ByteString -> Statement arr p row -> Pipeline arr q Preparation
 prepare name given = Pipeline 1 [Prepare name (given {params = const []})] Preparation
 
 -- | Binds and executes the statement that the connection has under the name.
-executePrepared :: ByteString -> Statement arr p row -> Pipeline arr p (Result row)
+executePrepared :: ByteString -> Statement arr p row -> Pipeline arr p (Result arr row)
 executePrepared name given = Pipeline 1 [ExecutePrepared name given] (\base -> Result base (readingOf (rows given)))
 
 -- | Closes the statement that the connection has under the name.
-closeStatement :: ByteString -> Pipeline arr p (Result ())
+closeStatement :: ByteString -> Pipeline arr p (Result arr ())
 closeStatement name = Pipeline 1 [Close name] (`Result` Silent)
 
 -- | A command with no parameters and no rows, as an unnamed statement: its SQL is
 -- one statement.
-command :: ByteString -> Pipeline arr p (Result ())
+command :: ByteString -> Pipeline arr p (Result arr ())
 command given = Pipeline 1 [Command given] (`Result` Silent)
 
 -- | The pipeline, with its parameters taken from another input: where a
@@ -488,13 +487,13 @@ seek target = loop
 -- the order of their statements: reading a later one while an earlier one is
 -- unread fails with 'ResultOutOfOrder'. A result whose statement failed raises
 -- its 'QueryError' here.
-nextRow :: (Runtime arr) => Result row -> With Tx arr () (Maybe row)
+nextRow :: (Runtime arr) => Result arr row -> With Tx arr () (Maybe row)
 nextRow (Result position reading) =
   moved >>> seek position >>> ((\found -> if found then Right () else Left ()) ^>> (arr (const Nothing) ||| loop))
   where
     loop = pull >>> withTx arrived >>> (loop ||| (decoding ||| arr (const Nothing)))
     decoding = case reading of
-      Reading _ cursor -> decodeRow (unsafeCoerce cursor) >>^ Just
+      Reading _ cursor -> decodeRow cursor >>^ Just
       Silent -> now (\_ -> throwIO (UnexpectedAmountOfRows 1))
     cardinality = case reading of Reading how _ -> how; Silent -> NoRows
     -- A row is checked against what the statement allows as it comes: the first one too many fails.
@@ -536,7 +535,7 @@ failedColumns (Columns _ _ state _ _) reason = do
   throwIO (QueryError (case stPending s of entry : _ -> entrySql entry; [] -> BS.empty) reason)
 
 -- | Drops the rest of the result.
-discard :: (Runtime arr) => Result row -> With Tx arr () ()
+discard :: (Runtime arr) => Result arr row -> With Tx arr () ()
 discard (Result position _) = moved >>> seek position >>> ((\found -> if found then Right () else Left ()) ^>> (returnA ||| finishEntry True))
 
 -- | Awaits the server's acknowledgement of a preparation.
@@ -544,7 +543,7 @@ prepared :: (Runtime arr) => Preparation -> With Tx arr () ()
 prepared _ = notImplemented "prepared"
 
 -- | The command tag of the result, once its rows are read: of the one that is being read, what is left of it is dropped.
-commandTag :: (Runtime arr) => Result row -> With Tx arr () ByteString
+commandTag :: (Runtime arr) => Result arr row -> With Tx arr () ByteString
 commandTag (Result position _) =
   moved
     >>> seek position
@@ -558,11 +557,11 @@ ending = tryA finishing >>> now (either (\failure -> maybe (throwIO failure) (pu
 
 -- | The one row of the result, which 'UnexpectedAmountOfRows' is raised without. The program is done with the result
 -- then: what follows the row is read past when a later result is read, and the field of the row stays valid until then.
-single :: (Runtime arr) => Result row -> With Tx arr () row
+single :: (Runtime arr) => Result arr row -> With Tx arr () row
 single result@(Result position _) = nextRow result >>> now (maybe (throwIO (UnexpectedAmountOfRows 0)) pure) >>> concluded position
 
 -- | The row of the result, if it has one, as 'single' gives it.
-optional :: (Runtime arr) => Result row -> With Tx arr () (Maybe row)
+optional :: (Runtime arr) => Result arr row -> With Tx arr () (Maybe row)
 optional result@(Result position _) = nextRow result >>> concluded position
 
 -- | The program is done with the result: it is no longer one that has to be read to its end before a later one is read,
@@ -573,7 +572,7 @@ concluded position = withTx (\tx input -> input <$ modify tx (\s -> if stBase s 
     skippable = \case entry : others -> entry {entrySkippable = True} : others; [] -> []
 
 -- | Folds the rows of the result, one at a time, from the first to the last.
-foldRows :: (Runtime arr) => (s -> row -> s) -> s -> Result row -> With Tx arr () s
+foldRows :: (Runtime arr) => (s -> row -> s) -> s -> Result arr row -> With Tx arr () s
 foldRows step start result = const start ^>> loop
   where
     loop =

@@ -849,7 +849,7 @@ batchWhileReading =
       (Tx.single large >>> measure >>^ fst) &&& Tx.single long
 
 -- | A result with a large field, and a statement whose parameter is large.
-largeThenLong :: (Runtime arr) => Tx.Pipeline arr () (Tx.Result Tx.Field, Tx.Result Int32)
+largeThenLong :: (Runtime arr) => Tx.Pipeline arr () (Tx.Result arr Tx.Field, Tx.Result arr Int32)
 largeThenLong =
   (,)
     <$> Tx.statement (plain "SELECT repeat('x', 1000000)" (Tx.any Tx.field))

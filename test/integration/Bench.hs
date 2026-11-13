@@ -104,7 +104,7 @@ request ::
   BufferPool ->
   ConnectionPool ->
   Tx.Statement arr () row ->
-  (Tx.Result row -> With Tx.Tx arr () ()) ->
+  (Tx.Result arr row -> With Tx.Tx arr () ()) ->
   arr () ()
 request buffers pool given reading =
   withRequestBuffers
