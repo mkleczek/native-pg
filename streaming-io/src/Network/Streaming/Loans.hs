@@ -10,10 +10,11 @@ module Network.Streaming.Loans
     withRequestBuffers,
     borrow,
     release,
+    withSetupBuffers,
   )
 where
 
-import Network.Streaming.BufferPool (BufferAccess, BufferLoan, BufferPool, loanBuffer)
+import Network.Streaming.BufferPool (BufferAccess, BufferGrant, BufferLoan, BufferPool, loanBuffer)
 import Network.Streaming.Classes (Effect, Runtime)
 import Network.Streaming.NotImplemented (notImplemented)
 
@@ -35,3 +36,8 @@ borrow = notImplemented "borrow"
 
 release :: (Effect arr) => arr Loan ()
 release = notImplemented "release"
+
+-- | The program with setup buffers, granted all at once from the pool's own inventory for them, which requests
+-- don't draw on: for setting up a connection. They are given back when the program ends, however it ends.
+withSetupBuffers :: forall grant arr a b. (Runtime arr, BufferGrant grant) => BufferPool -> arr (grant, a) b -> arr a b
+withSetupBuffers _ _ = notImplemented "withSetupBuffers"

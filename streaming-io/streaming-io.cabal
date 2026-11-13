@@ -49,6 +49,9 @@ test-suite streaming-io-spec
   other-modules: ListPrefixSpec
                       AcquisitionTestSupport
                  AdmissionResourcesSpec
+                 LoansSpec
+                 LoansTestSupport
+                 SetupBuffersSpec
                  Network.Streaming.Internal.ListPrefix
                  Network.Streaming.Output
                  Network.Streaming.PositiveInt
