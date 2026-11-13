@@ -1,5 +1,7 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- | The calls that a part's waits and receives make on the system, which "Network.Streaming.Counters" counts: the
 -- same programs for every arrow that has what they need, over socket pairs. A thread of the test is the other end of
@@ -12,18 +14,19 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, replicateM_, void, when)
 import qualified Data.ByteString as BS
-import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
+import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef, writeIORef)
+import Data.Word (Word64)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Buffer (newBuffer)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (timesWith, untilJust)
+import Network.Streaming.Combinators (call, expect, timesWith, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Counters
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Descriptors (fresh)
-import Network.Streaming.Internal.Scheduler (Turn, defaultTurn)
+import Network.Streaming.Internal.Scheduler (Turn, defaultTurn, microseconds)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Threads
@@ -67,6 +70,39 @@ spec = describe "system calls" $ do
     it "counts nothing in Release, where the exchange that Debug counts leaves every count as it was" $ do
       counts <- counting (echoing 20 run)
       toList counts `shouldBe` [(counter, 0) | counter <- [minBound .. maxBound]]
+
+  forM_ runners $ \(Runner name polls run) -> when polls $ describe name $ do
+    xfail "a poll without a wait is made at the start of every round, and the wait follows it" $
+      it "makes no poll that doesn't wait, and one that waits for each wake-up, while no other part can go on" $ do
+        counts <- counting (echoing 20 run)
+        countOf PollsImmediate counts `shouldBe` 0
+        countOf PollsBlocking counts `shouldBe` countOf DescriptorWaits counts
+
+    xfail "a poll is made at the start of every round that has a descriptor to look at" $
+      it "polls at most once for a turn while other parts can go on, and finds a descriptor that became ready within a few turns" $ do
+        (mine, theirs) <- newPair
+        stamps@(Stamps sent woke finished) <- Stamps <$> newIORef 0 <*> newIORef 0 <*> newIORef 0
+        done <- newEmptyMVar
+        _ <- forkIO (lateByte stamps theirs `finally` putMVar done ())
+        counts <- counting (run (microseconds 100) (busyAndWaiting stamps rounds (mine, theirs)))
+        takeMVar done
+        mapM_ Socket.close [mine, theirs]
+        (sentAt, wokeAt, finishedAt) <- (,,) <$> readIORef sent <*> readIORef woke <*> readIORef finished
+        -- The part that waited was woken while the others still ran, within a few turns of the byte, which a run that
+        -- looked only when it had nothing else to do would not do.
+        (wokeAt < finishedAt) `shouldBe` True
+        (wokeAt - sentAt < 15000000) `shouldBe` True
+        -- A poll at every round is a poll for each of the many rounds of the ping-pong.
+        (countOf PollsImmediate counts < rounds `div` 10) `shouldBe` True
+
+    xfail "a poll is made at the start of every round that has an arming that no poll has taken" $
+      it "polls once the armings that waits cancelled meanwhile have piled up, and not at every round" $ do
+        (mine, theirs) <- newPair
+        counts <- counting (run (microseconds 1000000) (cancelledWaits 1000 20000 mine))
+        mapM_ Socket.close [mine, theirs]
+        countOf Armings counts `shouldBe` 1000
+        (countOf PollsImmediate counts >= 10) `shouldBe` True
+        (countOf PollsImmediate counts <= 100) `shouldBe` True
 
   describe "on two cores" $ do
     it "count an arming of a descriptor that another core armed last as a move" $ do
@@ -153,3 +189,45 @@ handoverDriver (_, theirs) = do
   SocketBytes.sendAll theirs (BS.singleton 7)
   threadDelay 50000
   SocketBytes.sendAll theirs (BS.singleton 7)
+
+-- * Many rounds with something to wait for
+
+-- | How many round trips the ping-pong makes: far more than the polls a run may make.
+rounds :: Int
+rounds = 100000
+
+-- | The ends of the ping-pong's two sides: a request that carries the giver of its answer, and an answer that carries the giver
+-- of the next request.
+newtype Ping r = Ping (Giver r (Pong r))
+
+newtype Pong r = Pong (Giver r (Ping r))
+
+-- | Two parts of one core that give each other a ticket and wait for the answer, this many times: each round is short, and a part
+-- that waits for a ticket never yields.
+pingPong :: forall arr. (Rich arr) => Int -> arr () ()
+pingPong count = ticket @arr @(Local arr) >>> together [arr snd >>> client, arr fst >>> server]
+  where
+    client = timesWith count (call Ping >>^ \(Pong following) -> following) >>^ const ()
+    server = timesWith count (await >>> (\(Ping answer) -> answer) ^>> expect Pong) >>^ const ()
+
+-- | The monotonic time when the thread sent its byte, when the part received it, and when the other parts ended.
+data Stamps = Stamps (IORef Word64) (IORef Word64) (IORef Word64)
+
+-- | A byte, sent a little after the run began.
+lateByte :: Stamps -> Socket -> IO ()
+lateByte (Stamps sent _ _) sock = do
+  threadDelay 5000
+  monotonicNanoseconds >>= writeIORef sent
+  SocketBytes.sendAll sock (BS.singleton 7)
+
+-- | A part that waits for a byte on the socket, and then for another, while a ping-pong runs, after which the other end
+-- sends the second byte. The part is waiting on the descriptor throughout the ping-pong.
+busyAndWaiting :: (Rich arr) => Stamps -> Int -> Pair -> arr () ()
+busyAndWaiting (Stamps _ woke finished) count (mine, theirs) = together [busy, waiting]
+  where
+    busy = pingPong count >>> now (\() -> monotonicNanoseconds >>= writeIORef finished) >>> arr (const (theirs, [BS.singleton 7])) >>> sendAll
+    waiting = arr (const mine) >>> receiveOne >>> now (\_ -> monotonicNanoseconds >>= writeIORef woke) >>> arr (const mine) >>> receiveOne >>> arr (const ())
+
+-- | Waits for a byte on the socket with a deadline that has passed, this many times, while a ping-pong runs.
+cancelledWaits :: (Rich arr) => Int -> Int -> Socket -> arr () ()
+cancelledWaits waits count sock = together [pingPong count, arr (const sock) >>> timesWith waits (within (nanos 1) receiveOne >>^ const sock) >>^ const ()]
