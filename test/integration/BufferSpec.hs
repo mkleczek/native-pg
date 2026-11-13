@@ -179,7 +179,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
                   Tx.ReadCommitted
                   Tx.Read
                   Tx.Final
-                  (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Rows Tx.field)))
+                  (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Tx.any Tx.field)))
                   (\result -> Tx.single result >>> copyOut)
               )
         )
@@ -198,7 +198,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
                   Tx.ReadCommitted
                   Tx.Read
                   Tx.Final
-                  (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Rows Tx.field)))
+                  (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Tx.any Tx.field)))
                   (\result -> Tx.single result >>> copyOut)
               )
         )
@@ -219,7 +219,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
                         <$> Tx.command "CREATE TEMP TABLE context_parent (id int PRIMARY KEY)"
                         <*> Tx.command "CREATE TEMP TABLE context_child (id int REFERENCES context_parent(id) DEFERRABLE INITIALLY DEFERRED)"
                         <*> Tx.command "INSERT INTO context_child VALUES (1)"
-                        <*> Tx.statement (plain sql (Rows shape))
+                        <*> Tx.statement (plain sql (Tx.any shape))
                     )
                     ( \(parent, child, inserted, body) ->
                         Tx.discard parent >>> Tx.discard child >>> Tx.discard inserted >>> Tx.single body >>> measure >>> now (\_ -> writeIORef delivered True)
@@ -269,7 +269,7 @@ selectOne = query (plain "SELECT 1" single)
 -- | How many bytes a field of 100000 has, in a transaction of its own.
 field100000 :: (Runtime arr) => OnConn arr (Either QueryError Int)
 field100000 =
-  transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT repeat('x', 100000)" (Rows Tx.field))) (\result -> Tx.single result >>> measure >>^ fst)
+  transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT repeat('x', 100000)" (Tx.any Tx.field))) (\result -> Tx.single result >>> measure >>^ fst)
 
 -- | The declared length of the field, and the bytes that it gave, after a column.
 lengthsOf :: (Runtime arr) => Tx.Result (Int64, Tx.Field) -> With Tx.Tx arr () (Int64, Int, Int)
@@ -277,7 +277,7 @@ lengthsOf result = Tx.single result >>> (arr fst &&& (arr (Tx.fieldLength . snd)
 
 -- | A statement that gives a column and a field.
 columnAndBody :: (Runtime arr) => Rows arr (Int64, Tx.Field)
-columnAndBody = Rows (Tx.column &&& Tx.field)
+columnAndBody = Tx.any (Tx.column &&& Tx.field)
 
 -- | The shape of a row that has a field in the end, as a value that any arrow takes.
 data Shape = Shape String ByteString (forall arr. (Runtime arr) => arr Tx.Columns Tx.Field)

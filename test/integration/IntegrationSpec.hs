@@ -446,7 +446,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         `shouldReturn` ()
     -- A value larger than the buffer can only be read as a field: this is deliberate, and the cases below pin both sides.
     it "takes a value larger than the buffer as a field, whole" $
-      withSession (transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT repeat('y', 100000)" (Rows Tx.field))) (\result -> Tx.single result >>> copyOut))
+      withSession (transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT repeat('y', 100000)" (Tx.any Tx.field))) (\result -> Tx.single result >>> copyOut))
         `shouldReturn` Right (Char8.replicate 100000 'y')
     -- (v1: the value was copied out whole.)
     it "fails to decode a value larger than the buffer in place, which only a field can take" $
@@ -462,13 +462,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       unless enabled $ skipTest "needs +RTS -T"
       let size = 64 * 1024 * 1024
       -- The field says how long it is, and its pieces add up to that.
-      withSession (transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain ("SELECT repeat('x', " <> Char8.pack (show size) <> ")") (Rows Tx.field))) (\result -> Tx.single result >>> (arr Tx.fieldLength &&& consumeSlowly)))
+      withSession (transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain ("SELECT repeat('x', " <> Char8.pack (show size) <> ")") (Tx.any Tx.field))) (\result -> Tx.single result >>> (arr Tx.fieldLength &&& consumeSlowly)))
         `shouldReturn` Right (size, (size, True, True))
     -- v1: RowMisuse for a row used after its step. A row of v2 can't leave its step, but a field can. API.md names no
     -- constructor for this misuse, so the case says only that it is a 'UsageError'.
     it "rejects a field used after the cursor moved on" $
       withSession
-        ( transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT s::text FROM generate_series(1, 2) s" (Rows Tx.field))) $ \result ->
+        ( transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT s::text FROM generate_series(1, 2) s" (Tx.any Tx.field))) $ \result ->
             Tx.single result
               >>> (returnA &&& (arr (const ()) >>> Tx.nextRow result))
               >>> arr fst
@@ -806,7 +806,7 @@ batchWhileReading =
 largeThenLong :: (Runtime arr) => Tx.Pipeline arr () (Tx.Result Tx.Field, Tx.Result Int32)
 largeThenLong =
   (,)
-    <$> Tx.statement (plain "SELECT repeat('x', 1000000)" (Rows Tx.field))
+    <$> Tx.statement (plain "SELECT repeat('x', 1000000)" (Tx.any Tx.field))
     <*> Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')] single)
 
 -- | Streams the single field slowly, checking its bytes and that no piece is larger than the buffer, while
@@ -869,29 +869,29 @@ withPlaintextServer action =
 
 numbersRow :: (Runtime arr) => Rows arr (Int16, Int32, Int64, Bool, Float, Double, Scientific)
 numbersRow =
-  Rows
+  Tx.any
     ( Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column
         >>^ \(a, (b, (c, (d, (e, (f, g)))))) -> (a, b, c, d, e, f, g)
     )
 
 textsRow :: (Runtime arr) => Rows arr (Text, ByteString, Char, UUID, Json, Jsonb)
 textsRow =
-  Rows
+  Tx.any
     ( Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column
         >>^ \(a, (b, (c, (d, (e, f))))) -> (a, b, c, d, e, f)
     )
 
 -- | A column that may be NULL, and one that may not.
 nullableThen :: (Runtime arr, InPlace a, InPlace b) => Rows arr (Maybe a, b)
-nullableThen = Rows (Tx.nullable &&& Tx.column)
+nullableThen = Tx.any (Tx.nullable &&& Tx.column)
 
 -- | A number, and a field that follows it.
 statusAndBody :: (Runtime arr) => Rows arr (Int32, Tx.Field)
-statusAndBody = Rows (Tx.column &&& Tx.field)
+statusAndBody = Tx.any (Tx.column &&& Tx.field)
 
 snippetRow :: (Runtime arr) => Rows arr (Int32, Text, Text, Text, Bool)
 snippetRow =
-  Rows
+  Tx.any
     ( Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column
         >>^ \(n, (a, (b, (c, d)))) -> (n, a, b, c, d)
     )

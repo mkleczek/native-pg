@@ -46,6 +46,7 @@ module Database.PostgreSQL.Transaction
 
     -- * Rows, read by cursors
     Columns,
+    Cardinality (..),
     Rows (..),
     Field,
     column,
@@ -61,7 +62,7 @@ module Database.PostgreSQL.Transaction
   )
 where
 
-import Control.Arrow (first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (arr, first, returnA, (>>>), (^>>), (|||))
 import Control.Exception (throwIO)
 import Data.ByteString (ByteString)
 import Data.Kind (Type)
@@ -239,8 +240,22 @@ foldRows step start result = const start ^>> loop
 -- | A cursor standing at a DataRow.
 data Columns
 
--- | How the rows of a result are read: a step of the cursor, for each row.
-newtype Rows arr row = Rows (arr Columns row)
+-- | How many rows a result may have, which the read that finds the count wrong
+-- checks.
+data Cardinality
+  = -- | One, no more and no fewer.
+    ExactlyOne
+  | -- | None or one.
+    AtMostOne
+  | -- | Any number.
+    AnyNumber
+  | -- | None: the statement gives no rows.
+    NoRows
+  deriving (Eq, Show)
+
+-- | How the rows of a result are read: how many there may be, and a step of
+-- the cursor, for each row.
+data Rows arr row = Rows Cardinality (arr Columns row)
 
 -- | A column's value as a stream, of the declared length: the last column of a
 -- row, and the way to read a value that is larger than the buffer.
@@ -274,14 +289,14 @@ fieldLength (Field declared) = declared
 skip :: (Runtime arr) => arr Columns ()
 skip = notImplemented "skip"
 
--- | How many rows the result may have, checked by the read that finds the count
--- wrong, which fails with 'UnexpectedAmountOfRows'. These stubs check nothing: the
--- rows don't say how many they expect yet.
-one, atMostOne, any :: Rows arr row -> Rows arr row
-one = id
-atMostOne = id
-any = id
+-- | The rows that a step of the cursor reads, for a result of this many rows,
+-- which the read that finds the count wrong checks: it fails with
+-- 'UnexpectedAmountOfRows'.
+one, atMostOne, any :: arr Columns row -> Rows arr row
+one = Rows ExactlyOne
+atMostOne = Rows AtMostOne
+any = Rows AnyNumber
 
 -- | A result that has no rows to read.
 none :: (Runtime arr) => Rows arr ()
-none = Rows (notImplemented "none")
+none = Rows NoRows (arr (const ()))

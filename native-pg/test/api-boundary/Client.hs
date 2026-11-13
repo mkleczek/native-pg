@@ -17,7 +17,7 @@ import Database.PostgreSQL.Pool (ConnectionPoolSettings, connectionPoolSettings,
 import Database.PostgreSQL.Session.Settings ()
 import Database.PostgreSQL.Snippet (fromSnippet)
 import Database.PostgreSQL.Transaction
-  ( Ending (..), IsolationLevel (..), Mode (..), Rows (..), Statement (..), column, foldRows, pipeline, single, statement, transaction )
+  ( Cardinality (..), Ending (..), IsolationLevel (..), Mode (..), Rows (..), Statement (..), column, foldRows, one, pipeline, single, statement, transaction )
 import Database.PostgreSQL.Transport (serverEndPoint)
 import Database.PostgreSQL.Types (Param, paramType)
 import qualified Control.Concurrent.Resource.Acquisition as Acquisition
@@ -60,7 +60,7 @@ countRequest pool =
     ^>> withConnection pool (transaction ReadCommitted Read (pipeline Final (statement count) single))
   where
     count :: Runtime arr => Statement arr () Int64
-    count = Statement "SELECT count(*) FROM t" (const []) (Rows column)
+    count = Statement "SELECT count(*) FROM t" (const []) (one column)
 
 -- | The statement that a snippet makes, and a fold of its rows.
 foldRequest :: Runtime arr => Pool Connection -> arr Loans (Either PoolError (Either QueryError Int))
@@ -69,7 +69,7 @@ foldRequest pool =
     ^>> withConnection pool (transaction ReadCommitted Read (pipeline Final (statement ones) (foldRows (\n (_ :: Int64) -> n + 1) (0 :: Int))))
   where
     ones :: (Runtime arr, InPlace a) => Statement arr () a
-    ones = fromSnippet "SELECT 1" (Rows column)
+    ones = fromSnippet "SELECT 1" (Rows ExactlyOne column)
 
 -- | What a client can ask of settings, a connection and a pool.
 settingsOf :: Either String ConnectSettings

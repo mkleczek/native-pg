@@ -248,11 +248,11 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
     it "checks how many rows a result has" $
       withSession
         ( steps
-            [ shaped (Tx.one (single @_ @Int32)) 0 `failsAs` wrongAmount,
-              shaped (Tx.one (single @_ @Int32)) 2 `failsAs` wrongAmount,
-              shaped (Tx.atMostOne (single @_ @Int32)) 0 `yields` Right [],
-              shaped (Tx.atMostOne (single @_ @Int32)) 1 `yields` Right [1],
-              shaped (Tx.any (single @_ @Int32)) 3 `yields` Right [1, 2, 3],
+            [ shaped (Tx.one Tx.column) 0 `failsAs` wrongAmount,
+              shaped (Tx.one Tx.column) 2 `failsAs` wrongAmount,
+              shaped (Tx.atMostOne Tx.column) 0 `yields` Right [],
+              shaped (Tx.atMostOne Tx.column) 1 `yields` Right [1],
+              shaped (Tx.any Tx.column) 3 `yields` Right [1, 2, 3],
               committed Tx.Read (Tx.statement (numbers Tx.none 3)) Tx.discard `yields` Right ()
             ]
         )
@@ -261,7 +261,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
       withSession
         ( committed
             Tx.Read
-            ((,) <$> Tx.statement (numbers (Tx.atMostOne (single @_ @Int32)) 0) <*> Tx.statement (numbers (Tx.atMostOne (single @_ @Int32)) 1))
+            ((,) <$> Tx.statement (numbers (Tx.atMostOne (Tx.column @_ @Int32)) 0) <*> Tx.statement (numbers (Tx.atMostOne (Tx.column @_ @Int32)) 1))
             (\(nothing, just) -> Tx.optional nothing &&& Tx.optional just)
             `yields` Right (Nothing, Just 1)
         )
@@ -497,10 +497,10 @@ streamed :: (Runtime arr) => Tx.Statement arr () (Int32, Tx.Field)
 streamed = plain "SELECT 7::int4, repeat('x', 1000000) FROM generate_series(1, 3)" statusAndBody
 
 statusAndBody :: (Runtime arr) => Rows arr (Int32, Tx.Field)
-statusAndBody = Rows (Tx.column &&& Tx.field)
+statusAndBody = Tx.any (Tx.column &&& Tx.field)
 
 maybeBody :: (Runtime arr) => Rows arr (Int32, Maybe Tx.Field)
-maybeBody = Rows (Tx.column &&& Tx.nullableField)
+maybeBody = Tx.any (Tx.column &&& Tx.nullableField)
 
 -- | An unnamed statement, a preparation and its execution, with the parameters that tell them apart.
 wire :: (Runtime arr) => ByteString -> Tx.Pipeline arr () (Tx.Result Int32, Tx.Preparation, Tx.Result Int32)

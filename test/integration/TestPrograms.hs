@@ -364,15 +364,15 @@ diagnosticsOf = \case
 
 -- | One column.
 single :: (Runtime arr, InPlace a) => Rows arr a
-single = Rows Tx.column
+single = Tx.any Tx.column
 
 -- | Two columns. The cursor takes them in order, as '&&&' runs its halves.
 pair :: (Runtime arr, InPlace a, InPlace b) => Rows arr (a, b)
-pair = Rows (Tx.column &&& Tx.column)
+pair = Tx.any (Tx.column &&& Tx.column)
 
 -- | Three columns.
 triple :: (Runtime arr, InPlace a, InPlace b, InPlace c) => Rows arr (a, b, c)
-triple = Rows (Tx.column &&& Tx.column &&& Tx.column >>^ \(a, (b, c)) -> (a, b, c))
+triple = Tx.any (Tx.column &&& Tx.column &&& Tx.column >>^ \(a, (b, c)) -> (a, b, c))
 
 -- | A statement without parameters.
 plain :: ByteString -> Rows arr row -> Tx.Statement arr () row

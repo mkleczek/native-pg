@@ -28,7 +28,6 @@ import Data.Text (Text)
 import Database.PostgreSQL.Connection (ConnectSettings, Connection)
 import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Pool (connectionPoolSettings, newConnectionPool, withConnection)
-import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import Network.Socket (PortNumber)
@@ -328,11 +327,11 @@ brokenAfter env pid = do
 
 -- | A statement with a field of this many bytes.
 bodyOf :: (Runtime arr) => Int -> Tx.Statement arr () Tx.Field
-bodyOf size = plain ("SELECT repeat('x', " <> BC.pack (show size) <> ")") (Rows Tx.field)
+bodyOf size = plain ("SELECT repeat('x', " <> BC.pack (show size) <> ")") (Tx.any Tx.field)
 
 -- | The numbers from 1 to this one, separated by commas, as a field of that size.
 numbersOf :: (Runtime arr) => Int -> Tx.Statement arr () Tx.Field
-numbersOf n = plain ("SELECT string_agg(n::text, ',') FROM generate_series(1, " <> BC.pack (show n) <> ") n") (Rows Tx.field)
+numbersOf n = plain ("SELECT string_agg(n::text, ',') FROM generate_series(1, " <> BC.pack (show n) <> ") n") (Tx.any Tx.field)
 
 numbers :: Int -> ByteString
 numbers n = BC.intercalate "," (map (BC.pack . show) [1 .. n])
@@ -342,14 +341,14 @@ divisionByZero = plain "SELECT 1 / 0::int8" single
 
 -- | A field of the first row, and then the server's failure, which comes with the row after it.
 failingAfterFirstRow :: (Runtime arr) => Tx.Statement arr () Tx.Field
-failingAfterFirstRow = plain "SELECT (1 / (2 - s))::text FROM generate_series(1, 2) s" (Rows Tx.field)
+failingAfterFirstRow = plain "SELECT (1 / (2 - s))::text FROM generate_series(1, 2) s" (Tx.any Tx.field)
 
 -- | Enough rows for the server to send most of them, and then a wait of 30 seconds before the last.
 sleepingAtTheEnd :: (Runtime arr) => Tx.Statement arr () Tx.Field
 sleepingAtTheEnd =
   plain
     "SELECT (CASE WHEN s < 3000 THEN 1 ELSE (SELECT 1 FROM pg_sleep(30)) END)::text FROM generate_series(1, 3000) s"
-    (Rows Tx.field)
+    (Tx.any Tx.field)
 
 sleeping :: (Runtime arr) => Tx.Statement arr () Int64
 sleeping = plain "SELECT 1::int8 FROM pg_sleep(30)" single
