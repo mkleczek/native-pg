@@ -21,6 +21,7 @@ library
                    Network.Streaming.BufferPool
                    Network.Streaming.Buffer
                    Network.Streaming.Watch
+                   Network.Streaming.Mode
                    Network.Streaming.Classes
                    Network.Streaming.Combinators
                    Network.Streaming.Threads
@@ -63,6 +64,7 @@ test-suite streaming-io-spec
                  Network.Streaming.BufferPool
                  Network.Streaming.Buffer
                  Network.Streaming.Watch
+                 Network.Streaming.Mode
                  Network.Streaming.Classes
                  Network.Streaming.Combinators
                  Network.Streaming.Threads

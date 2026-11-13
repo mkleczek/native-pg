@@ -17,7 +17,9 @@
 -- flags when it does, so that a cancellation is neither lost nor early.
 module Network.Streaming.Threads
   ( Threads,
+    ThreadsM,
     runThreads,
+    runThreadsM,
   )
 where
 
@@ -40,6 +42,7 @@ import GHC.IO (IO (..))
 import GHC.IORef (IORef (..), atomicSwapIORef)
 import GHC.STRef (STRef (..))
 import Network.Streaming.Classes
+import Network.Streaming.Mode (Mode (..), ModeOf)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
 import Network.Streaming.Internal.Tickets
@@ -47,8 +50,11 @@ import Network.Streaming.Watch (awaitWatch)
 import System.IO.Unsafe (unsafePerformIO)
 import Prelude hiding (id, (.))
 
--- | An arrow whose concurrent parts run on threads of their own: a function of the part that runs it.
-newtype Threads a b = Threads (Part -> a -> IO b)
+-- | An arrow whose concurrent parts run on threads of their own: a function of the part that runs it. Built in the mode @m@.
+newtype ThreadsM (m :: Mode) a b = Threads (Part -> a -> IO b)
+
+-- | The arrow in 'Release'.
+type Threads = ThreadsM 'Release
 
 -- | A part: its number, its thread, what it is in, innermost first, whether it waits, and whether a cancellation may
 -- have reached it, which its points look at until it is. Only the thread of the part changes its frames; the thread
@@ -97,32 +103,37 @@ casPhase (IORef (STRef var)) old new = IO $ \s -> case casMutVar# var old new s 
 
 -- | Runs the program, masked: the thread that calls it is its first part.
 runThreads :: Threads a b -> a -> IO b
-runThreads (Threads run) input = mask_ $ do
+runThreads = runThreadsM
+{-# INLINE runThreads #-}
+
+-- | 'runThreads' for an arrow of any mode.
+runThreadsM :: ThreadsM m a b -> a -> IO b
+runThreadsM (Threads run) input = mask_ $ do
   thread <- myThreadId
   ident <- nextIdent
   part <- Part ident thread <$> newIORef [] <*> newIORef Running <*> newIORef False
   run part input
 
-instance Category Threads where
+instance Category (ThreadsM m) where
   id = Threads (const pure)
   Threads after . Threads before = Threads (\part value -> before part value >>= after part)
 
-instance Arrow Threads where
+instance Arrow (ThreadsM m) where
   arr function = Threads (\_ value -> pure (function value))
   first (Threads inner) = Threads (\part (a, c) -> (,c) <$> inner part a)
 
-instance ArrowChoice Threads where
+instance ArrowChoice (ThreadsM m) where
   left (Threads inner) = Threads $ \part -> \case
     Left a -> Left <$> inner part a
     Right c -> pure (Right c)
   Threads one ||| Threads two = Threads (\part -> either (one part) (two part))
 
-instance Effect Threads where
+instance Effect (ThreadsM m) where
   now action = Threads (const action)
 
 -- | A point where the part can be cancelled: a part in a scope raises a cancellation that is there, and lets the
 -- exceptions that wait for it in.
-instance GiveWay Threads where
+instance GiveWay (ThreadsM m) where
   giveWay = Threads (\part value -> value <$ givingWay part)
   {-# INLINE giveWay #-}
 
@@ -202,7 +213,7 @@ pushed, popped :: Part -> IO ()
 pushed (Part _ _ frames _ _) = readIORef frames >>= writeIORef frames . (Shielded :)
 popped (Part _ _ frames _ _) = readIORef frames >>= writeIORef frames . drop 1
 
-instance Scope Threads where
+instance Scope (ThreadsM m) where
   scope (Threads acquire) (Threads release) (Threads body) = Threads $ \part value -> do
     acquired <- acquire part value
     outcome <- try (body part (acquired, value))
@@ -273,7 +284,7 @@ failing failure scope' = \case
 -- | Each part on a thread of its own, in a cancel scope that the first failure cancels: the others are cancelled at
 -- their waits, and waited for, and the first failure is rethrown. When several fail, the later are dropped. A part is
 -- entered into the scope of the group and the scopes that enclose it: a group of many parts doesn't make them deeper.
-instance Concurrent Threads where
+instance Concurrent (ThreadsM m) where
   together = \case
     [] -> arr (const ())
     [one] -> one
@@ -286,7 +297,7 @@ instance Concurrent Threads where
 
 -- | The first half to end is the result, and the other is cancelled and waited for. The loser's failure is
 -- rethrown too, unless it is a cancellation.
-instance Race Threads where
+instance Race (ThreadsM m) where
   race (Threads one) (Threads two) = Threads $ \part input -> do
     scope' <- newScope
     winner <- newIORef Nothing
@@ -308,20 +319,20 @@ instance Race Threads where
 
 -- | Blocks the thread: on a descriptor directly, as 'threadWaitRead' does, and
 -- on any other event by its watch.
-instance Block Threads where
+instance Block (ThreadsM m) where
   block = Threads $ \part event -> waiting part $ case event of
     Readable fd -> threadWaitRead fd
     Writable fd -> threadWaitWrite fd
     Watched register -> awaitWatch register
     Until (Instant at) -> monotonicNanoseconds >>= \current -> when (at > current) (threadDelay (fromIntegral ((at - current + 999) `div` 1000)))
 
-instance Time Threads where
+instance Time (ThreadsM m) where
   clock = Threads (\_ () -> Instant <$> monotonicNanoseconds)
 
 -- | The deadline is a timeout of GHC's timer manager, which cancels the scope when it fires, and a cancel scope
 -- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another
 -- passes through.
-instance Within Threads where
+instance Within (ThreadsM m) where
   within (Duration limit) (Threads body) = Threads $ \part value -> do
     scope' <- newScope
     manager <- getSystemTimerManager
@@ -347,12 +358,14 @@ inScope part@(Part _ _ frames _ flag) scope' action = do
   pure outcome
 
 -- | The threads have no cores: every ticket can be given by every thread, so there is one reach.
-type instance Local Threads = 'Anywhere
+type instance Local (ThreadsM m) = 'Anywhere
+
+type instance ModeOf (ThreadsM m) = m
 
 -- | A ticket is a 'TMVar', which blocks the thread that waits for it, and whether the waiter has gone. The two
 -- ends are the same 'TMVar'. Every thread can reach both: there is no core to belong to.
-instance Exchange Threads 'Anywhere where
-  data Waiting Threads 'Anywhere a = ThreadWaiting (TMVar a) (TVar Bool)
+instance Exchange (ThreadsM m) 'Anywhere where
+  data Waiting (ThreadsM m) 'Anywhere a = ThreadWaiting (TMVar a) (TVar Bool)
   ticket = Threads $ \_ () -> do
     var <- newEmptyTMVarIO
     abandoned <- newTVarIO False

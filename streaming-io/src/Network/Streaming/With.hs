@@ -24,6 +24,7 @@ where
 import Control.Arrow (Arrow (..), ArrowChoice (..), (>>>))
 import Control.Category (Category (..))
 import Network.Streaming.Classes
+import Network.Streaming.Mode (ModeOf)
 import Prelude hiding (id, (.))
 
 -- | An arrow of @arr@ that is given an @r@ besides its input.
@@ -128,6 +129,9 @@ instance (Race arr) => Race (With r arr) where
 
 -- | The tickets are the arrow's own, of the same reach.
 type instance Local (With r arr) = Local arr
+
+-- | An arrow with an environment is built in the mode of its inner arrow.
+type instance ModeOf (With r arr) = ModeOf arr
 
 instance (Arrow arr, Exchange arr reach) => Exchange (With r arr) reach where
   newtype Waiting (With r arr) reach a = WithWaiting (Waiting arr reach a)

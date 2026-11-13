@@ -16,8 +16,11 @@
 -- release as an arrow, and then goes on to the scope outside.
 module Network.Streaming.Compiled
   ( Compiled,
+    CompiledM,
     runCompiled,
     runCompiledTurn,
+    runCompiledM,
+    runCompiledTurnM,
   )
 where
 
@@ -32,22 +35,26 @@ import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
+import Network.Streaming.Mode (Mode (..), ModeOf)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
 -- | The run, the part, and what goes on with a failure of the code that runs in it.
 data Context = Context !Run !Part !(SomeException -> IO Step)
 
--- | An arrow as a function of its context, its input, and of what follows it.
-newtype Compiled a b = Compiled (Context -> a -> (b -> IO Step) -> IO Step)
+-- | An arrow as a function of its context, its input, and of what follows it. Built in the mode @m@.
+newtype CompiledM (m :: Mode) a b = Compiled (Context -> a -> (b -> IO Step) -> IO Step)
 
-instance Category Compiled where
+-- | The arrow in 'Release'.
+type Compiled = CompiledM 'Release
+
+instance Category (CompiledM m) where
   id = Compiled (\_ value next -> next value)
   {-# INLINE id #-}
   Compiled after . Compiled before = Compiled (\context value next -> before context value (\middle -> after context middle next))
   {-# INLINE (.) #-}
 
-instance Arrow Compiled where
+instance Arrow (CompiledM m) where
   arr function = Compiled (\_ value next -> next (function value))
   {-# INLINE arr #-}
   first (Compiled inner) = Compiled (\context (a, c) next -> inner context a (\b -> next (b, c)))
@@ -55,7 +62,7 @@ instance Arrow Compiled where
 
 -- | A choice goes on with the branch's continuation itself, so that it wraps
 -- nothing.
-instance ArrowChoice Compiled where
+instance ArrowChoice (CompiledM m) where
   left (Compiled inner) = Compiled $ \context choice next -> case choice of
     Left a -> inner context a (next . Left)
     Right c -> next (Right c)
@@ -65,7 +72,7 @@ instance ArrowChoice Compiled where
     Right c -> two context c next
   {-# INLINE (|||) #-}
 
-instance Effect Compiled where
+instance Effect (CompiledM m) where
   now action = Compiled (\_ value next -> action value >>= next)
   {-# INLINE now #-}
 
@@ -88,11 +95,11 @@ yielded context@(Context _ part _) continue = pure (Yielded (resumed context (ch
 
 -- | Counts a step, and once the part has run for its turn, lets the others go
 -- on before it.
-instance GiveWay Compiled where
+instance GiveWay (CompiledM m) where
   giveWay = Compiled (\context value next -> steppedIn context (next value))
   {-# INLINE giveWay #-}
 
-instance Block Compiled where
+instance Block (CompiledM m) where
   block = Compiled $ \context@(Context run part _) event next ->
     readIORef (partFrames part) >>= \case
       [] -> waitFor context 0 event next
@@ -117,13 +124,13 @@ waitFor context@(Context run part _) ident event next = case event of
 {-# INLINE waitFor #-}
 
 -- | The time of the round of the scheduler.
-instance Time Compiled where
+instance Time (CompiledM m) where
   clock = Compiled (\(Context run _ _) () next -> roundNow run >>= next . Instant)
 
 -- | The deadline is a timer of the scheduler's wheel, which cancels the scope when it fires, and a cancel scope
 -- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another
 -- passes through.
-instance Within Compiled where
+instance Within (CompiledM m) where
   within (Duration limit) (Compiled body) = Compiled $ \(Context run part outer) value next -> do
     scope' <- newScope run
     started <- roundNow run
@@ -136,7 +143,7 @@ instance Within Compiled where
     writeIORef (runFailure run) onFailure
     body (Context run part onFailure) value (\result -> leaves *> next (Just result))
 
-instance Scope Compiled where
+instance Scope (CompiledM m) where
   scope (Compiled acquire) (Compiled release) (Compiled body) = Compiled $ \context@(Context run part outer) value next ->
     acquire context value $ \acquired -> do
       -- A part that is in no scope is in the root scope while it holds what it acquired, so that a shutdown
@@ -178,7 +185,7 @@ instance Scope Compiled where
 -- The parts are in a cancel scope of their own, which the first failure cancels: the others are cancelled where they
 -- wait, and their scopes are released before the group ends, which fails with the first failure. A later failure is
 -- dropped.
-instance Concurrent Compiled where
+instance Concurrent (CompiledM m) where
   together = \case
     [] -> arr (const ())
     [one] -> one
@@ -198,7 +205,7 @@ instance Concurrent Compiled where
 -- | The first half to end is the result: the other is cancelled where it waits, and the race ends once its
 -- scopes are released. If the first to end failed, its failure is the race's then. A failure of the loser that
 -- isn't its cancellation is too.
-instance Race Compiled where
+instance Race (CompiledM m) where
   race (Compiled one) (Compiled two) = Compiled $ \(Context run part outer) value next -> do
     scope' <- newScope run
     first' <- childPart run part scope'
@@ -220,10 +227,12 @@ data Core
 -- and goes back when the ticket is given its value. Giving and waiting count a
 -- step, and can give way: a ticket is where parts coordinate, and none is on a
 -- parser's path.
-type instance Local Compiled = 'Here Core
+type instance Local (CompiledM m) = 'Here Core
 
-instance Exchange Compiled ('Here Core) where
-  newtype Waiting Compiled ('Here Core) a = CompiledWaiting (IORef (Slot a))
+type instance ModeOf (CompiledM m) = m
+
+instance Exchange (CompiledM m) ('Here Core) where
+  newtype Waiting (CompiledM m) ('Here Core) a = CompiledWaiting (IORef (Slot a))
   ticket = Compiled (\_ () next -> newIORef Empty >>= \slot -> next (CompiledWaiting slot, HereGiver slot))
   await = Compiled $ \context@(Context run part _) (CompiledWaiting slot) next ->
     readIORef slot >>= \case
@@ -238,8 +247,8 @@ instance Exchange Compiled ('Here Core) where
 -- giver, on another thread, doesn't run it: it puts it in the mailbox of this scheduler, which goes on with it in
 -- its next round, and wakes the scheduler if it sleeps in its poller. There is one core: a program of this arrow
 -- makes the ticket and waits at it on this thread, and what it gives its value from is any thread, or the same.
-instance Exchange Compiled 'Anywhere where
-  newtype Waiting Compiled 'Anywhere a = CompiledRemoteWaiting (IORef (RemoteSlot a))
+instance Exchange (CompiledM m) 'Anywhere where
+  newtype Waiting (CompiledM m) 'Anywhere a = CompiledRemoteWaiting (IORef (RemoteSlot a))
   ticket = Compiled $ \(Context run _ _) () next -> do
     slot <- newIORef RemoteEmpty
     next (CompiledRemoteWaiting slot, AnywhereGiver (giveRemote (runMailbox run) slot))
@@ -255,9 +264,17 @@ instance Exchange Compiled 'Anywhere where
 runCompiled :: Compiled a b -> a -> IO (b, Report)
 runCompiled = runCompiledTurn defaultTurn
 
+-- | 'runCompiled' for an arrow of any mode.
+runCompiledM :: CompiledM m a b -> a -> IO (b, Report)
+runCompiledM = runCompiledTurnM defaultTurn
+
 -- | 'runCompiled' with a turn of the given length.
 runCompiledTurn :: Turn -> Compiled a b -> a -> IO (b, Report)
-runCompiledTurn turn (Compiled program) input = do
+runCompiledTurn = runCompiledTurnM
+
+-- | 'runCompiledTurn' for an arrow of any mode.
+runCompiledTurnM :: Turn -> CompiledM m a b -> a -> IO (b, Report)
+runCompiledTurnM turn (Compiled program) input = do
   result <- newIORef Nothing
   withRun turn $ \run -> do
     root <- newPart run

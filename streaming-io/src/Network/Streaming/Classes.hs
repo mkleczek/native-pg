@@ -62,6 +62,7 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Internal.Socket (tryReceive, trySend)
+import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Internal.Tickets (Giver, Reach (..))
 import Network.Streaming.Watch (Watch)
 import System.Posix.Types (Fd (..))
@@ -107,7 +108,8 @@ type Runtime arr =
     Time arr,
     Concurrent arr,
     Exchange arr (Local arr),
-    Exchange arr 'Anywhere
+    Exchange arr 'Anywhere,
+    Instrumented (ModeOf arr)
   )
 
 -- | Values that one direction gives another, once each: the way directions

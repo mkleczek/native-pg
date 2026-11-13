@@ -27,6 +27,7 @@
 -- suspended.
 module Network.Streaming.Delimited
   ( Delimited,
+    DelimitedM,
     runDelimited,
     runDelimitedTurn,
     runDelimitedWith,
@@ -35,6 +36,11 @@ module Network.Streaming.Delimited
     runCoresTurn,
     runCoresReport,
     runCoresReportTurn,
+    runDelimitedM,
+    runDelimitedTurnM,
+    runCoresM,
+    runCoresTurnM,
+    runCoresReportTurnM,
   )
 where
 
@@ -55,15 +61,19 @@ import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
+import Network.Streaming.Mode (Mode (..), ModeOf)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
 -- | An arrow as a function to IO, which runs under the scheduler's prompt, on
--- the core that @s@ stands for. Nominal in @s@, so that it can't be coerced
--- to another's.
-newtype Delimited (s :: Type) a b = Delimited (Context -> a -> IO b)
+-- the core that @s@ stands for, built in the mode @m@. Nominal in @s@, so that it can't be coerced
+-- to another's, and in @m@, since what is observed of a run is the mode's.
+newtype DelimitedM (m :: Mode) (s :: Type) a b = Delimited (Context -> a -> IO b)
 
-type role Delimited nominal representational representational
+type role DelimitedM nominal nominal representational representational
+
+-- | The arrow in 'Release'.
+type Delimited = DelimitedM 'Release
 
 -- | The run, the prompt that a part's continuation is captured up to, and the part.
 data Context = Context !Run !(PromptTag Step) !Part
@@ -84,13 +94,13 @@ prompt (PromptTag tag) (IO action) = IO (prompt# tag action)
 control0 :: PromptTag a -> ((IO b -> IO a) -> IO a) -> IO b
 control0 (PromptTag tag) handler = IO (control0# tag (\resume -> case handler (\(IO rest) -> IO (resume rest)) of IO captured -> captured))
 
-instance Category (Delimited s) where
+instance Category (DelimitedM m s) where
   id = Delimited (const pure)
   {-# INLINE id #-}
   Delimited after . Delimited before = Delimited (\context value -> before context value >>= after context)
   {-# INLINE (.) #-}
 
-instance Arrow (Delimited s) where
+instance Arrow (DelimitedM m s) where
   arr function = Delimited (\_ value -> pure (function value))
   {-# INLINE arr #-}
   first (Delimited inner) = Delimited (\context (a, c) -> (,c) <$> inner context a)
@@ -98,7 +108,7 @@ instance Arrow (Delimited s) where
 
 -- | A choice runs its branch in its place, so that a loop through a branch is
 -- a tail call.
-instance ArrowChoice (Delimited s) where
+instance ArrowChoice (DelimitedM m s) where
   left (Delimited inner) = Delimited $ \context -> \case
     Left a -> Left <$> inner context a
     Right c -> pure (Right c)
@@ -108,17 +118,17 @@ instance ArrowChoice (Delimited s) where
     Right c -> two context c
   {-# INLINE (|||) #-}
 
-instance Effect (Delimited s) where
+instance Effect (DelimitedM m s) where
   now action = Delimited (\_ value -> action value)
   {-# INLINE now #-}
 
 -- | Counts a step, and once the part has run for its turn, lets the others go
 -- on before it.
-instance GiveWay (Delimited s) where
+instance GiveWay (DelimitedM m s) where
   giveWay = Delimited (\context value -> value <$ step context)
   {-# INLINE giveWay #-}
 
-instance Block (Delimited s) where
+instance Block (DelimitedM m s) where
   block = Delimited $ \(Context run tag part) event ->
     readIORef (partFrames part) >>= \case
       [] -> waitFor run tag part 0 event
@@ -143,13 +153,13 @@ waitFor run tag part ident event = case event of
 {-# INLINE waitFor #-}
 
 -- | The time of the round of the scheduler.
-instance Time (Delimited s) where
+instance Time (DelimitedM m s) where
   clock = Delimited (\(Context run _ _) () -> Instant <$> roundNow run)
 
 -- | The deadline is a timer of the scheduler's wheel, which cancels the scope when it fires, and a cancel scope
 -- that the part is in while the body runs. The scope is the body's own: the cancellation that ends it is
 -- recognised by it, and another passes through.
-instance Within (Delimited s) where
+instance Within (DelimitedM m s) where
   within (Duration limit) (Delimited body) = Delimited $ \context@(Context run _ part) value -> do
     scope' <- newScope run
     started <- roundNow run
@@ -172,7 +182,7 @@ shielded (Context run _ part) action = do
   popFrame run part
   either (\failure -> throwIO (failure :: SomeException)) pure outcome
 
-instance Scope (Delimited s) where
+instance Scope (DelimitedM m s) where
   scope (Delimited acquire) (Delimited release) (Delimited body) = Delimited $ \context@(Context run _ part) value -> do
     acquired <- acquire context value
     -- A part that is in no scope is in the root scope while it holds what it acquired, so that a shutdown
@@ -200,7 +210,7 @@ instance Scope (Delimited s) where
 -- with it. The parts are in a cancel scope of their own, which the first failure cancels: the others are
 -- cancelled where they wait, and their scopes are released before the group ends, which rethrows the first
 -- failure. A later failure is dropped.
-instance Concurrent (Delimited s) where
+instance Concurrent (DelimitedM m s) where
   together = \case
     [] -> arr (const ())
     [one] -> one
@@ -219,7 +229,7 @@ instance Concurrent (Delimited s) where
 -- | The first half to end is the result: the other is cancelled where it waits, and the race ends once its
 -- scopes are released. If the first to end failed, its failure is rethrown then. A failure of the loser that
 -- isn't its cancellation is rethrown too.
-instance Race (Delimited s) where
+instance Race (DelimitedM m s) where
   race (Delimited one) (Delimited two) = Delimited $ \(Context run tag part) value ->
     control0 tag $ \resume -> do
       scope' <- newScope run
@@ -238,10 +248,12 @@ instance Race (Delimited s) where
 -- can go on, and goes back when the ticket is given its value. Giving and
 -- waiting count a step, and can give way: a ticket is where parts coordinate,
 -- and none is on a parser's path.
-type instance Local (Delimited s) = 'Here s
+type instance Local (DelimitedM m s) = 'Here s
 
-instance Exchange (Delimited s) ('Here s) where
-  newtype Waiting (Delimited s) ('Here s) a = HereWaiting (IORef (Slot a))
+type instance ModeOf (DelimitedM m s) = m
+
+instance Exchange (DelimitedM m s) ('Here s) where
+  newtype Waiting (DelimitedM m s) ('Here s) a = HereWaiting (IORef (Slot a))
   ticket = Delimited (\_ () -> newIORef Empty >>= \slot -> pure (HereWaiting slot, HereGiver slot))
   await = Delimited $ \context@(Context run tag part) (HereWaiting slot) ->
     readIORef slot >>= \case
@@ -256,8 +268,8 @@ instance Exchange (Delimited s) ('Here s) where
 -- giver, on another core, doesn't run it: it puts it in the mailbox of the
 -- scheduler of the waiter's core, which goes on with it in its next round, and
 -- wakes that scheduler if it sleeps in its poller.
-instance Exchange (Delimited s) 'Anywhere where
-  newtype Waiting (Delimited s) 'Anywhere a = AnywhereWaiting (IORef (RemoteSlot a))
+instance Exchange (DelimitedM m s) 'Anywhere where
+  newtype Waiting (DelimitedM m s) 'Anywhere a = AnywhereWaiting (IORef (RemoteSlot a))
   ticket = Delimited $ \(Context run _ _) () -> do
     slot <- newIORef RemoteEmpty
     pure (AnywhereWaiting slot, AnywhereGiver (giveRemote (runMailbox run) slot))
@@ -287,10 +299,20 @@ runDelimited = runDelimitedTurn defaultTurn
 -- dictionaries at run time. Inlined into its caller, the entry point instantiates @s@ and the calls are specialised.
 {-# INLINE runDelimited #-}
 
+-- | 'runDelimited' for an arrow of any mode, which the type application names.
+runDelimitedM :: forall m a b. (forall s. DelimitedM m s a b) -> a -> IO (b, Report)
+runDelimitedM = runDelimitedTurnM @m defaultTurn
+{-# INLINE runDelimitedM #-}
+
 -- | 'runDelimited' with a turn of the given length.
 runDelimitedTurn :: Turn -> (forall s. Delimited s a b) -> a -> IO (b, Report)
-runDelimitedTurn turn program input = withRun turn (\run -> runIn run program input)
+runDelimitedTurn = runDelimitedTurnM @'Release
 {-# INLINE runDelimitedTurn #-}
+
+-- | 'runDelimitedTurn' for an arrow of any mode.
+runDelimitedTurnM :: forall m a b. Turn -> (forall s. DelimitedM m s a b) -> a -> IO (b, Report)
+runDelimitedTurnM turn program input = withRun turn (\run -> runIn run program input)
+{-# INLINE runDelimitedTurnM #-}
 
 -- | 'runDelimited' for a program that is made in IO, by an action that is run
 -- once, for the core that runs the program.
@@ -303,7 +325,7 @@ runDelimitedWithTurn :: Turn -> (forall s. IO (Delimited s a b)) -> a -> IO (b, 
 runDelimitedWithTurn turn setup input = setup >>= \program -> withRun turn (\run -> runIn run program input)
 {-# INLINE runDelimitedWithTurn #-}
 
-runIn :: Run -> Delimited s a b -> a -> IO (b, Report)
+runIn :: Run -> DelimitedM m s a b -> a -> IO (b, Report)
 runIn run (Delimited program) input = do
   tag <- newPromptTag
   result <- newIORef Nothing
@@ -324,10 +346,20 @@ runCores :: Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) ->
 runCores = runCoresTurn defaultTurn
 {-# INLINE runCores #-}
 
+-- | 'runCores' for an arrow of any mode.
+runCoresM :: forall m shared r. Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [r]
+runCoresM = runCoresTurnM @m defaultTurn
+{-# INLINE runCoresM #-}
+
 -- | 'runCores' with turns of the given length.
 runCoresTurn :: Turn -> Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [r]
-runCoresTurn turn cores setup program = map fst <$> runCoresReportTurn turn cores setup program
+runCoresTurn = runCoresTurnM @'Release
 {-# INLINE runCoresTurn #-}
+
+-- | 'runCoresTurn' for an arrow of any mode.
+runCoresTurnM :: forall m shared r. Turn -> Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [r]
+runCoresTurnM turn cores setup program = map fst <$> runCoresReportTurnM @m turn cores setup program
+{-# INLINE runCoresTurnM #-}
 
 -- | 'runCores', with each core's report.
 runCoresReport :: Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [(r, Report)]
@@ -336,7 +368,12 @@ runCoresReport = runCoresReportTurn defaultTurn
 
 -- | 'runCoresReport' with turns of the given length.
 runCoresReportTurn :: Turn -> Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [(r, Report)]
-runCoresReportTurn turn cores setup program = do
+runCoresReportTurn = runCoresReportTurnM @'Release
+{-# INLINE runCoresReportTurn #-}
+
+-- | 'runCoresReportTurn' for an arrow of any mode.
+runCoresReportTurnM :: forall m shared r. Turn -> Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [(r, Report)]
+runCoresReportTurnM turn cores setup program = do
   shared <- setup
   withRuns turn cores $ \runs -> do
     outcomes <- newChan
@@ -360,7 +397,7 @@ runCoresReportTurn turn cores setup program = do
             mapM_ killThread threads
             readIORef pending >>= \remaining -> replicateM_ remaining (readChan outcomes)
       restore (collect []) `onException` stopAll
-{-# INLINE runCoresReportTurn #-}
+{-# INLINE runCoresReportTurnM #-}
 
 -- | The runs of that many cores, all freed once the action ends: after the
 -- threads that use them have.

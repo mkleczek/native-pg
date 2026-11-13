@@ -41,6 +41,7 @@ import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Internal.Tickets
+import Network.Streaming.Mode (Mode (..), ModeOf)
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
@@ -112,6 +113,9 @@ instance GiveWay Loop where
 -- | Suspends the part: the scheduler goes on with it once the watch fires.
 instance Block Loop where
   block = Block
+
+-- | A program as data observes nothing: 'Loop' is built in 'Release'.
+type instance ModeOf Loop = 'Release
 
 -- | The region of the tickets of this arrow: there is one core, the thread that runs it.
 data Core
