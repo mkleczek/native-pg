@@ -60,16 +60,12 @@ conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner 
 -- | The calls that accepting makes, counted by the runners of 'Debug'.
 counted :: Spec
 counted = describe "accepting" $ forM_ debugRunners $ \runner@(Runner runnerName _) -> describe runnerName $
-  withoutFcntl $ it "takes each connection with one call, and where accept4 is there with none to fcntl" $ do
+  it "takes each connection with one call, and where accept4 is there with none to fcntl" $ do
     before <- snapshot
     oneAfterAnother runner
     counts <- (`since` before) <$> snapshot
     countOf Accepts counts `shouldBe` 30
     when (os == "linux") $ countOf Fcntls counts `shouldBe` 0
-
--- | On Linux, where accept4 makes the socket one that doesn't block, accepting is expected to fail until the server uses it.
-withoutFcntl :: Spec -> Spec
-withoutFcntl = if os == "linux" then xfail "accept is followed by calls to fcntl, which accept4 makes unnecessary" else id
 
 -- | Marks a case that is expected to fail, and says why. A case that then passes unexpectedly fails the suite.
 marked :: Case -> Spec -> Spec

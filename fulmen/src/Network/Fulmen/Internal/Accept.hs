@@ -1,4 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE CApiFFI #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 
@@ -13,8 +15,15 @@ where
 
 import Control.Arrow (ArrowChoice, first, returnA, (>>>), (^>>), (|||))
 import Control.Exception (SomeException, try)
+#if !defined(linux_HOST_OS)
 import Control.Monad (when)
-import Data.Bits ((.&.), (.|.))
+#endif
+import Data.Bits
+  ( (.|.),
+#if !defined(linux_HOST_OS)
+    (.&.),
+#endif
+  )
 import qualified Foreign.C.Error as Errno
 import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr, nullPtr)
@@ -24,20 +33,30 @@ import Network.Streaming.Classes (Block (..), Effect (..), Event (..), GiveWay (
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Descriptors (fresh)
 import Network.Streaming.Mode (Instrumented (bump), ModeOf)
-import System.Posix.Internals (c_fcntl_read, c_fcntl_write, const_f_getfl, const_f_setfl, o_NONBLOCK, setNonBlockingFD)
+import System.Posix.Internals
+  ( setNonBlockingFD,
+#if !defined(linux_HOST_OS)
+    c_fcntl_read,
+    c_fcntl_write,
+    const_f_getfl,
+    const_f_setfl,
+    o_NONBLOCK,
+#endif
+  )
 import System.Posix.Types (Fd (..))
 
 -- | Makes the listening socket one that doesn't block, which it may already be.
 listening :: Socket -> IO ()
 listening sock = withFdSocket sock (`setNonBlockingFD` True)
 
--- | The next connection, if one is waiting: a socket that doesn't block, and that doesn't hold back a small write.
--- macOS has no @accept4@, so the socket is made to not block after it is accepted.
+-- | The next connection, if one is waiting: a socket that doesn't block, and that doesn't hold back a small write. Where
+-- there is @accept4@, the socket is made so by the call, which also has it close on exec. macOS has none, so the socket is made
+-- to not block after it is accepted; one that is accepted from a listener that doesn't block already doesn't, on macOS.
 tryAccept :: forall m. (Instrumented m) => Socket -> IO (Maybe Socket)
 tryAccept listener = withFdSocket listener attempt
   where
     attempt fd =
-      c_accept fd nullPtr nullPtr >>= \case
+      acceptFrom fd >>= \case
         -1 ->
           Errno.getErrno >>= \errno ->
             if
@@ -47,12 +66,30 @@ tryAccept listener = withFdSocket listener attempt
               | otherwise -> Errno.throwErrno "accept"
         accepted -> bump @m Accepts *> (Just <$> adopt accepted)
     adopt fd = do
+#if !defined(linux_HOST_OS)
       nonBlocking @m fd
+#endif
       sock <- mkSocket fd
       fresh sock
       -- A socket that isn't a TCP one has no such option.
       _ <- try (setSocketOption sock NoDelay 1) :: IO (Either SomeException ())
       pure sock
+
+#if defined(linux_HOST_OS)
+acceptFrom :: CInt -> IO CInt
+acceptFrom fd = c_accept4 fd nullPtr nullPtr (sockNonblock .|. sockCloexec)
+
+foreign import ccall unsafe "accept4"
+  c_accept4 :: CInt -> Ptr () -> Ptr () -> CInt -> IO CInt
+
+foreign import capi "sys/socket.h value SOCK_NONBLOCK"
+  sockNonblock :: CInt
+
+foreign import capi "sys/socket.h value SOCK_CLOEXEC"
+  sockCloexec :: CInt
+#else
+acceptFrom :: CInt -> IO CInt
+acceptFrom fd = c_accept fd nullPtr nullPtr
 
 -- | Makes the descriptor one that doesn't block, as 'setNonBlockingFD' does, and counts the calls it makes: it reads the
 -- flags, and writes them if the descriptor doesn't have the flag, which a socket accepted from one that doesn't block has on
@@ -67,6 +104,7 @@ nonBlocking fd = do
 
 foreign import ccall unsafe "accept"
   c_accept :: CInt -> Ptr () -> Ptr () -> IO CInt
+#endif
 
 -- | The next connection of the listening socket: it tries, and while there is none, blocks until the socket is
 -- readable and tries again. The part gives way before it tries, as a receive does, so that a listener that always has
