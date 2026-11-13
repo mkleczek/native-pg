@@ -1,6 +1,11 @@
 -- | Connections, one at a time for a part, whatever the link: a socket or TLS. The
 -- steps that connect, close and cancel are stubs, which fail with
 -- 'Network.Streaming.NotImplemented.NotImplemented' until the code is there.
+--
+-- A program that is cancelled leaves its connection usable if and only if nothing
+-- is owed on it in either direction: no reply is still expected, and nothing is
+-- half sent. Otherwise the connection is broken and closed: it is never drained for
+-- a client that has gone away.
 module Database.PostgreSQL.Connection
   ( -- * Settings
     ConnectSettings

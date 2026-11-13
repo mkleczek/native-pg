@@ -26,7 +26,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.Int (Int16, Int32, Int64)
 import Data.List (intercalate)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Scientific (Scientific)
 import Data.Text (Text)
 import Data.Time (Day, DiffTime, UTCTime (..), fromGregorian)
@@ -575,6 +575,41 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                   `yields` (Just "57014", True),
                 selectOne `yields` Right [1]
               ]
+        )
+        `shouldReturn` ()
+
+  -- A program that is cancelled leaves its connection usable if and only if nothing is owed on it in either direction: no
+  -- reply is still expected, and nothing is half sent.
+  notYet $ describe "the cancellation rule" $ do
+    let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
+        withSession body = run (session (unix "postgres" Nothing) body)
+    it "breaks the connection when a statement in flight is cancelled, and doesn't drain its answer" $
+      withSession
+        ( steps
+            [ (timed (withinFor (millis 300) (query sleeping)) >>^ \(result, elapsed) -> (isNothing result, elapsed < 10 * 1000000000)) `yields` (True, True),
+              brokenConnection
+            ]
+        )
+        `shouldReturn` ()
+    it "keeps the connection usable when a wait for a notification is cancelled, and delivers a later one" $
+      run
+        ( session (unix "postgres" Nothing) $
+            alsoOn (unix "postgres" Nothing) $
+              steps
+                [ onFirst (conn (Notify.listen ["events"])),
+                  onFirst (withinFor (millis 100) (conn Notify.notification)) `yields` Nothing,
+                  onFirst selectOne `yields` Right [1],
+                  onSecond (ddl "NOTIFY events, 'later'") `yields` Right (),
+                  (onFirst (conn Notify.notification) >>^ Notify.notificationPayload) `yields` "later"
+                ]
+        )
+        `shouldReturn` ()
+    it "keeps the connection usable when a program is cancelled between statements, where nothing is in flight" $
+      withSession
+        ( steps
+            [ withinFor (millis 100) (after (secs 30) selectOne) `yields` Nothing,
+              selectOne `yields` Right [1]
+            ]
         )
         `shouldReturn` ()
 
