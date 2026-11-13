@@ -143,13 +143,15 @@ microseconds = Turn . (* 1000)
 defaultTurn :: Turn
 defaultTurn = microseconds 10
 
--- | A part: the scopes it is in and the shields between them, innermost first, and where it waits. A part
--- that is in a scope is in the run's root scope too, outermost, which a shutdown cancels; a part that is in
--- none has no frames, and says nothing of where it waits.
+-- | A part: the scopes it is in and the shields between them, innermost first, where it waits, and whether a
+-- cancellation may have reached it, which is all its points look at until it is (see "Network.Streaming.Internal.Cancel").
+-- A part that is in a scope is in the run's root scope too, outermost, which a shutdown cancels; a part that is in none
+-- has no frames, and says nothing of where it waits.
 data Part = Part
   { partIdent :: !Int,
     partFrames :: !(IORef [Frame [Part]]),
-    partWait :: !(IORef Parked)
+    partWait :: !(IORef Parked),
+    partCancelled :: !(IORef Bool)
   }
 
 -- | A scope of a run, with the parts that its body began with: those of the halves of a pair, or the part that
@@ -439,7 +441,7 @@ abandonRemote slot =
 -- | The first part of a run, in no scope: the run's root scope begins with it.
 newPart :: Run -> IO Part
 newPart run = do
-  part <- Part <$> nextWait run <*> newIORef [] <*> newIORef NotWaiting
+  part <- Part <$> nextWait run <*> newIORef [] <*> newIORef NotWaiting <*> newIORef False
   part <$ modifyIORef' (scopeMembers (runRoot run)) (part :)
 
 -- | A scope for a pair or a deadline of the run.
@@ -447,11 +449,13 @@ newScope :: Run -> IO PartScope
 newScope run = nextWait run >>= (`newCancelScope` [])
 
 -- | A part for a half of a pair, in the scope of the pair as well as in those of the part that made it. The
--- parent, which is suspended until the pair has ended, says where its halves are.
+-- parent, which is suspended until the pair has ended, says where its halves are. The part begins with the flag of its
+-- parent, since a cancellation that came before it existed has not visited it; a parent in no scope is in the root's.
 childPart :: Run -> Part -> PartScope -> IO Part
 childPart run parent scope' = do
   outer <- readIORef (partFrames parent)
-  child <- Part <$> nextWait run <*> newIORef (Inside scope' : if null outer then [Inside (runRoot run)] else outer) <*> newIORef NotWaiting
+  flagged <- if null outer then readIORef (scopeCancelled (runRoot run)) else readIORef (partCancelled parent)
+  child <- Part <$> nextWait run <*> newIORef (Inside scope' : if null outer then [Inside (runRoot run)] else outer) <*> newIORef NotWaiting <*> newIORef flagged
   adjust run 9 1
   modifyIORef' (scopeMembers scope') (<> [child])
   child <$ writeIORef (partWait parent) (InPair scope')
@@ -471,7 +475,11 @@ pushFrame :: Run -> Part -> Frame [Part] -> IO ()
 pushFrame run part frame = do
   frames <- readIORef (partFrames part)
   case frames of
-    [] -> adjust run 9 1 *> writeIORef (partFrames part) [frame, Inside (runRoot run)]
+    [] -> do
+      adjust run 9 1
+      writeIORef (partFrames part) [frame, Inside (runRoot run)]
+      -- The root may have been cancelled while the part was in no scope.
+      readIORef (scopeCancelled (runRoot run)) >>= \cancelled -> when cancelled (writeIORef (partCancelled part) True)
     _ -> writeIORef (partFrames part) (frame : frames)
   case frame of Inside s -> writeIORef (scopeMembers s) [part]; _ -> pure ()
 {-# NOINLINE pushFrame #-}
@@ -488,17 +496,18 @@ popFrame run part = do
   where
     forget = \case Inside s -> writeIORef (scopeMembers s) []; _ -> pure ()
 
--- | Raises the cancellation that reaches the part, if there is one.
+-- | Raises the cancellation that reaches the part, if there is one: it looks at the part's scopes only if its flag says
+-- that one may have.
 checkpoint :: Part -> IO ()
 checkpoint part =
-  readIORef (partFrames part) >>= \case
-    [] -> pure ()
-    frames -> cancelledIn frames >>= maybe (pure ()) (throwIO . Cancelled)
+  readIORef (partCancelled part) >>= \flagged ->
+    when flagged (readIORef (partFrames part) >>= reachedBy (partCancelled part) >>= maybe (pure ()) (throwIO . Cancelled))
 
--- | Cancels the scope: its flag is set, and the parts inside it that wait, and whose scope lies above their
--- innermost shield, are taken off what they wait at, and put back among those that can go on, with the
--- cancellation to raise where they wait. The others see the flag at their next wait. The parts inside it are
--- those it began with, and the halves of the pairs that those are suspended at, and so on.
+-- | Cancels the scope: its flag is set, and so is that of every part inside it, whether or not it waits and a shield
+-- holds it. The parts that wait, and whose scope lies above their innermost shield, are taken off what they wait at,
+-- and put back among those that can go on, with the cancellation to raise where they wait. The others see it at their
+-- next wait. The parts inside it are those it began with, and the halves of the pairs that those are suspended at,
+-- and so on.
 cancelScope :: Run -> PartScope -> IO ()
 cancelScope run scope' = do
   writeIORef (scopeCancelled scope') True
@@ -509,6 +518,7 @@ cancelScope run scope' = do
       part : others -> do
         frames <- readIORef (partFrames part)
         waiting <- readIORef (partWait part)
+        writeIORef (partCancelled part) True
         when (deliverable (scopeIdent scope') frames) $
           stopWait run (Cancelled (scopeIdent scope')) waiting >>= \case
             Nothing -> pure ()
@@ -569,7 +579,7 @@ registering :: Part -> Parked -> IO ()
 registering part parked =
   readIORef (partFrames part) >>= \case
     [] -> pure ()
-    frames -> cancelledIn frames >>= maybe (writeIORef (partWait part) parked) (throwIO . Cancelled)
+    frames -> cancelledFlagged (partCancelled part) frames >>= maybe (writeIORef (partWait part) parked) (throwIO . Cancelled)
 {-# INLINE registering #-}
 
 -- | What a pair of halves has of its halves' results, and its first failure, and how many have ended.

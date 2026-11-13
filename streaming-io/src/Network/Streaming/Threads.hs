@@ -40,7 +40,7 @@ import GHC.IORef (IORef (..), atomicSwapIORef)
 import GHC.STRef (STRef (..))
 import Network.Streaming.Classes
 import Network.Streaming.Internal.Atomic (update)
-import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledIn, deliverable, newCancelScope)
+import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Watch (awaitWatch)
 import System.IO.Unsafe (unsafePerformIO)
@@ -49,10 +49,11 @@ import Prelude hiding (id, (.))
 -- | An arrow whose concurrent parts run on threads of their own: a function of the part that runs it.
 newtype Threads a b = Threads (Part -> a -> IO b)
 
--- | A part: its number, its thread, what it is in, innermost first, and whether it waits. Only the thread of the
--- part changes its frames; the thread that cancels it changes its phase, from waiting to thrown, and the part
--- changes it back.
-data Part = Part !Int !ThreadId !(IORef [Frame Members]) !(IORef Phase)
+-- | A part: its number, its thread, what it is in, innermost first, whether it waits, and whether a cancellation may
+-- have reached it, which its points look at until it is. Only the thread of the part changes its frames; the thread
+-- that cancels it changes its phase, from waiting to thrown, and the part changes it back; every thread that
+-- cancels a scope the part is in sets its flag, and the part clears it.
+data Part = Part !Int !ThreadId !(IORef [Frame Members]) !(IORef Phase) !(IORef Bool)
 
 -- | The parts inside a scope, by their numbers, which threads change by compare-and-swap: a scope is entered and
 -- left from every thread that has a part in it.
@@ -71,8 +72,8 @@ newScope = nextIdent >>= \ident -> newCancelScope ident IntMap.empty
 
 -- | The part is inside the scope, or is not any more.
 enter, leave :: CancelScope Members -> Part -> IO ()
-enter s part@(Part ident _ _ _) = update (scopeMembers s) (\parts -> (IntMap.insert ident part parts, ()))
-leave s (Part ident _ _ _) = update (scopeMembers s) (\parts -> (IntMap.delete ident parts, ()))
+enter s part@(Part ident _ _ _ _) = update (scopeMembers s) (\parts -> (IntMap.insert ident part parts, ()))
+leave s (Part ident _ _ _ _) = update (scopeMembers s) (\parts -> (IntMap.delete ident parts, ()))
 
 -- | Sets the scope's flag, and gives the parts that were inside it. The flag is set with a barrier, so that a
 -- part that enters the scope after the parts are read sees it.
@@ -98,7 +99,7 @@ runThreads :: Threads a b -> a -> IO b
 runThreads (Threads run) input = mask_ $ do
   thread <- myThreadId
   ident <- nextIdent
-  part <- Part ident thread <$> newIORef [] <*> newIORef Running
+  part <- Part ident thread <$> newIORef [] <*> newIORef Running <*> newIORef False
   run part input
 
 instance Category Threads where
@@ -127,20 +128,21 @@ instance GiveWay Threads where
 -- | The point itself, which what the part has in hand doesn't go through: the call is not given it, so that a caller
 -- doesn't have to build it, as a link's input is a pair of the link and where it receives, for the call to give it back.
 givingWay :: Part -> IO ()
-givingWay (Part _ _ frames _) =
-  readIORef frames >>= \case
-    [] -> allowInterrupt
-    scopes -> cancelledIn scopes >>= maybe allowInterrupt (throwIO . Cancelled)
+givingWay (Part _ _ frames _ flag) =
+  readIORef flag >>= \flagged ->
+    if flagged
+      then readIORef frames >>= reachedBy flag >>= maybe allowInterrupt (throwIO . Cancelled)
+      else allowInterrupt
 {-# NOINLINE givingWay #-}
 
 -- | A wait of a part that is in scopes: it says it waits, looks for a cancellation that came before, and waits;
 -- a cancellation thrown to it ends the wait. Whatever ended it, the part says it doesn't wait.
 armed :: Part -> [Frame Members] -> IO a -> IO a
-armed (Part _ _ _ phase) frames wait = do
+armed (Part _ _ _ phase flag) frames wait = do
   -- Evaluated, so that what the phase holds is the object that a cancellation compares with.
   let !waits = Waiting frames
   _ <- atomicSwapIORef phase waits
-  cancelledIn frames >>= \case
+  cancelledFlagged flag frames >>= \case
     Just ident ->
       disarm >>= \case
         Thrown -> reached
@@ -157,18 +159,21 @@ armed (Part _ _ _ phase) frames wait = do
 
 -- | A wait of the part.
 waiting :: Part -> IO a -> IO a
-waiting part@(Part _ _ frames _) wait =
+waiting part@(Part _ _ frames _ _) wait =
   readIORef frames >>= \case
     [] -> wait
     scopes -> armed part scopes wait
 {-# INLINE waiting #-}
 
--- | Cancels the scope: the parts inside it that wait, and whose scope lies above their innermost shield, are
--- thrown to, once; the others see its flag at their next wait.
+-- | Cancels the scope: every part inside it has its flag set, whether or not it waits and a shield holds it, and
+-- those that wait, and whose scope lies above their innermost shield, are thrown to, once; the others see it at
+-- their next wait. The flag is set, with a barrier, before the phase is read: a part that begins to wait meanwhile
+-- swaps its phase, and then looks at its flag.
 cancelScope :: CancelScope Members -> IO ()
 cancelScope scope' = mask_ $ do
   parts <- markCancelled scope'
-  forM_ parts $ \(Part _ thread _ phase) -> do
+  forM_ parts $ \(Part _ thread _ phase flag) -> do
+    atomicWriteIORef flag True
     -- A part that began to wait again meanwhile has another phase to look at.
     let attempt' = do
           current <- readIORef phase
@@ -181,7 +186,7 @@ cancelScope scope' = mask_ $ do
 
 -- | Pushes a frame on the part's stack, runs the action, and pops it.
 framed :: Frame Members -> Part -> IO a -> IO a
-framed frame (Part _ _ frames _) action = do
+framed frame (Part _ _ frames _ _) action = do
   readIORef frames >>= writeIORef frames . (frame :)
   outcome <- try action
   readIORef frames >>= writeIORef frames . drop 1
@@ -193,8 +198,8 @@ shielded = framed Shielded
 
 -- | The part goes behind a shield, and leaves it.
 pushed, popped :: Part -> IO ()
-pushed (Part _ _ frames _) = readIORef frames >>= writeIORef frames . (Shielded :)
-popped (Part _ _ frames _) = readIORef frames >>= writeIORef frames . drop 1
+pushed (Part _ _ frames _ _) = readIORef frames >>= writeIORef frames . (Shielded :)
+popped (Part _ _ frames _ _) = readIORef frames >>= writeIORef frames . drop 1
 
 instance Scope Threads where
   scope (Threads acquire) (Threads release) (Threads body) = Threads $ \part value -> do
@@ -219,7 +224,7 @@ instance Scope Threads where
 -- | A part that runs in the scope as well as in those of the part that made it, on a thread of its own, and what
 -- it came to once it ended: the scopes are left before the pair's policy is told.
 spawn :: Part -> CancelScope Members -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO (MVar (Either SomeException a))
-spawn (Part _ _ parent _) scope' run ended = do
+spawn (Part _ _ parent _ parentFlag) scope' run ended = do
   done <- newEmptyMVar
   -- Forked masked, as its part is.
   _ <- forkIO $ do
@@ -228,8 +233,13 @@ spawn (Part _ _ parent _) scope' run ended = do
     frames <- (Inside scope' :) <$> readIORef parent
     state <- newIORef frames
     phase <- newIORef Running
-    let part = Part ident thread state phase
+    -- The part begins with the flag of its parent, which a cancellation that came before it existed has set.
+    flag <- readIORef parentFlag >>= newIORef
+    let part = Part ident thread state phase flag
     forM_ frames (inside part)
+    -- A cancellation that was made while it entered its scopes, and didn't find it in them, has set their flags: the part
+    -- sees them, as it entered them with a barrier after.
+    cancelledAnywhere frames >>= \cancelled -> when cancelled (atomicWriteIORef flag True)
     outcome <- try (run part)
     forM_ frames (outside part)
     ended outcome
@@ -321,9 +331,11 @@ instance Within Threads where
 
 -- | Runs the action as a part that is in the cancel scope, and how it ended.
 inScope :: Part -> CancelScope Members -> IO a -> IO (Either SomeException a)
-inScope part@(Part _ _ frames _) scope' action = do
+inScope part@(Part _ _ frames _ flag) scope' action = do
   readIORef frames >>= writeIORef frames . (Inside scope' :)
   enter scope' part
+  -- The deadline may have passed before the part was among the scope's members.
+  readIORef (scopeCancelled scope') >>= \cancelled -> when cancelled (atomicWriteIORef flag True)
   outcome <- try action
   leave scope' part
   readIORef frames >>= writeIORef frames . drop 1

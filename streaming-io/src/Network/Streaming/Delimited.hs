@@ -123,7 +123,7 @@ instance Block (Delimited s) where
     readIORef (partFrames part) >>= \case
       [] -> waitFor run tag part 0 event
       frames ->
-        cancelledIn frames >>= \case
+        cancelledFlagged (partCancelled part) frames >>= \case
           Just ident -> throwIO (Cancelled ident)
           Nothing -> do
             ident <- nextWait run

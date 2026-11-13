@@ -97,7 +97,7 @@ instance Block Compiled where
     readIORef (partFrames part) >>= \case
       [] -> waitFor context 0 event next
       frames ->
-        cancelledIn frames >>= \case
+        cancelledFlagged (partCancelled part) frames >>= \case
           Just ident -> throwIO (Cancelled ident)
           Nothing -> do
             ident <- nextWait run

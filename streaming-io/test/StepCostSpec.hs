@@ -56,19 +56,19 @@ onLoop program = fst <$> runLoop program ()
 
 spec :: Spec
 spec = describe "a step" $ forM_ runners $ \(Runner name nesting amongSteps scopeSteps run) -> describe name $ do
-  -- Loop looks at the scopes of a part only once some scope of the run has been cancelled: it doesn't fail either case.
-  let expectedToFail why = if name == "loop" then id else xfail why
+  -- Threads enters a part into the scope of every part that encloses it when it spawns it, which, among parts that
+  -- together nests one inside the other, is as many as the parts before it.
+  let expectedToFail = if name == "threads" then xfail "a part is entered into the scope of each of the parts before it" else id
 
-  expectedToFail "together nests its parts one inside the other, so that a part is as many scopes deep as the parts before it" $
+  expectedToFail $
     it "costs the same among thousands of parts as among a few" $ do
       -- The same number of steps in all: 4,096 parts that each give way a number of times, and 64 that give way 64 times as often.
       (few, many) <- leastOfThree (run (amongParts 64 amongSteps)) (run (amongParts 4096 amongSteps))
       atMostFourTimes few many
 
-  expectedToFail "a point walks all the scopes that its part is in, to see whether one of them was cancelled" $
-    it "costs the same deep in scopes as at the top" $ do
-      (shallow, deep) <- leastOfThree (run (inScopes nesting 1 scopeSteps)) (run (inScopes nesting 1024 scopeSteps))
-      atMostFourTimes shallow deep
+  it "costs the same deep in scopes as at the top" $ do
+    (shallow, deep) <- leastOfThree (run (inScopes nesting 1 scopeSteps)) (run (inScopes nesting 1024 scopeSteps))
+    atMostFourTimes shallow deep
 
 -- | Parts that give way, this many steps in all, at once.
 amongParts :: Int -> Int -> Program
