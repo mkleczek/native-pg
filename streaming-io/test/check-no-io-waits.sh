@@ -27,7 +27,6 @@ streaming-io/src/Network/Streaming/Internal/Scheduler.hs * the own wait of the s
 streaming-io/src/Network/Streaming/Loop.hs atomically the own wait of the Loop arrow on its watches, and its cancellation flags
 streaming-io/src/Network/Streaming/Simulated.hs atomically the tries of a simulated link, which never wait
 streaming-io/src/Network/Streaming/Watch.hs * the readiness registrations that the arrows wait on, and the wait of the Threads arrow
-streaming-io/src/Network/Streaming/BufferPool.hs atomically the state of the pool and its wait for a lease, until the pool is built on tickets
 resource-admission/src/Control/Concurrent/Resource/Acquisition.hs atomically the delivery to a waiter, until the pool is built on tickets
 directions/src/Network/Directions/PingPong.hs threadDelay a prototype program that sleeps in IO as a stand-in for slow work
 '

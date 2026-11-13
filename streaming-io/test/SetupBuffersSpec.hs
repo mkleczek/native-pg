@@ -4,8 +4,6 @@
 -- the queue of the grants that wait, by their size, and the setup capacity. A part holds a grant, others ask for theirs,
 -- and the signals and the pool's own count of those who wait say when to go on, so that the order of events is the
 -- test's.
---
--- Every case is marked as an expected failure ('notYet') until the code is there.
 module SetupBuffersSpec (spec) where
 
 import Control.Arrow (arr, (>>>), (>>^), (^>>))
@@ -24,7 +22,7 @@ import Skeletest
 import System.Mem (performMajorGC)
 
 spec :: Spec
-spec = notYet $ describe "the setup buffers" $ do
+spec = describe "the setup buffers" $ do
   forM_ runners $ \runner@(Runner name _) -> describe name $ do
     let run :: Program a -> IO a
         run = runOn runner

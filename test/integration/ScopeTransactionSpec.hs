@@ -31,7 +31,7 @@ import Database.PostgreSQL.Pool (connectionPoolSettings, withConnection, withCon
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import Network.Socket (PortNumber)
-import Network.Streaming.BufferPool (PoolSettings (..))
+import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.Pool (Pool)
 import Network.Streaming.PositiveInt (positiveInt)
 import Skeletest
@@ -306,7 +306,7 @@ onEnv env = runOn (envRunner env) (envBuffers env)
 -- | The environment for the use, with a pool that is closed when the use ends.
 withEnv :: Runner -> ConnectSettings -> Int -> (Env -> IO a) -> IO a
 withEnv runner settings size use = do
-  buffers <- newPool (PoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+  buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
   withConnectionPool (connectionPoolSettings size settings) $ \pool -> use (Env runner buffers pool)
 
 -- | The body in a request: a connection of the pool, which the body uses and gives back. A pool that has none is the

@@ -10,6 +10,7 @@ module Network.Streaming.Internal.Tickets
     Slot (..),
     giveHere,
     abandonHere,
+    giveNow,
   )
 where
 
@@ -35,6 +36,13 @@ newtype instance Giver 'Anywhere a = AnywhereGiver (a -> IO Bool)
 -- waited: the value, or a cancellation to raise. The value is evaluated: a thunk would keep what it was made from
 -- alive as long as the slot.
 data Slot a = Empty | Given !a | Waiter (IO a -> IO ()) | Abandoned
+
+-- | Gives the value to the part that waits at the other end of a ticket of any core, as the arrow's own 'give' does,
+-- but as an action that never waits, so that it is a step of an arrow without a point to give way at: for what hands a
+-- value over together with what must not be left half done if a cancellation came between.
+giveNow :: Giver 'Anywhere a -> a -> IO Bool
+giveNow (AnywhereGiver giving) = giving
+{-# INLINE giveNow #-}
 
 -- | Gives the slot its value, and puts the part that waits for it back among those that can go on. It says
 -- whether the waiter takes it: it doesn't if the waiter has gone. The giver evaluates the value, whether it is

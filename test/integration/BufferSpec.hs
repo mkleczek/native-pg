@@ -45,7 +45,7 @@ import qualified Database.PostgreSQL.Transaction as Tx
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Buffer (Buffer (..))
-import Network.Streaming.BufferPool (PoolSettings (..))
+import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.Loans (Loan, borrow, loanBuffer, release)
 import Network.Streaming.PositiveInt (positiveInt)
 import Skeletest
@@ -61,7 +61,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       scram = unix "native_pg_scram" (Just "scram secret")
       -- A request with room for one primary buffer and one borrowed one, of 256 bytes.
       sharing :: Program a -> IO a
-      sharing = withBuffers (PoolSettings (positiveInt @256) (positiveInt @1) (positiveInt @1) (positiveInt @2)) runner
+      sharing = withBuffers (BufferPoolSettings (positiveInt @256) (positiveInt @1) (positiveInt @1) (positiveInt @2)) runner
       connects settings = session settings selectOne
       -- The setup buffers are two: a connection that was not returned them would be the last that could be set up.
       -- Each of the connections here is set up while the request holds its primary buffer.

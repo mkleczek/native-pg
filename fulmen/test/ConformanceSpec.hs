@@ -14,7 +14,6 @@
 -- Every area of cases is marked as an expected failure until the server is there.
 module ConformanceSpec (spec) where
 
-import AcquisitionTestSupport (getAcquisition)
 import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, tryReadMVar)
@@ -33,7 +32,7 @@ import qualified Network.Fulmen as Fulmen
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
-import Network.Streaming.BufferPool (BufferPool, PoolSettings (..), newBufferPool)
+import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (keeping, sleep)
 import Network.Streaming.Compiled (runCompiled)
@@ -160,8 +159,7 @@ patience c = 3000 + maybe 0 fromIntegral (timeoutMs (caseSettings c))
 
 runCase :: Runner -> Case -> IO ()
 runCase (Runner _ runServer) c = do
-  acquisition <- getAcquisition
-  pool <- newBufferPool acquisition (PoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
+  pool <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
     Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
     Socket.listen accepting 128

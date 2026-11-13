@@ -35,7 +35,8 @@ library
                    Network.Streaming.Internal.Timers
                    Network.Streaming.Internal.Cancel
                    Network.Streaming.Internal.Atomic
-  other-modules: Network.Streaming.Internal.ListPrefix
+  other-modules: Network.Streaming.Internal.BufferPool
+                 Network.Streaming.Internal.ListPrefix
                  Network.Streaming.Internal.Socket
                  Network.Streaming.Internal.Tickets
   c-sources: cbits/poller.c
@@ -47,8 +48,6 @@ test-suite streaming-io-spec
   hs-source-dirs: test src
   main-is: Main.hs
   other-modules: ListPrefixSpec
-                      AcquisitionTestSupport
-                 AdmissionResourcesSpec
                  LoansSpec
                  LoansTestSupport
                  SetupBuffersSpec
@@ -74,10 +73,10 @@ test-suite streaming-io-spec
                  Network.Streaming.Internal.Timers
                  Network.Streaming.Internal.Cancel
                  Network.Streaming.Internal.Atomic
+                 Network.Streaming.Internal.BufferPool
                  Network.Streaming.Internal.Socket
                  Network.Streaming.Internal.Tickets
                  PositiveIntSpec
-                 RequestBuffersSpec
                  ResourcesSpec
                  WatchSpec
                  CoresSpec

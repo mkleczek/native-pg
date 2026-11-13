@@ -12,6 +12,10 @@
 --   and release it, for the time given: checkouts per second, how evenly the parts and cores got them, and
 --   allocation per checkout. KIND is @delimited@ (CORES cores of PARTS parts each) or @threads@ (the same number of
 --   threads).
+-- * @loans KIND VARIANT PARTS ROUNDS@: requests on a pool of buffers, PARTS parts that each make ROUNDS of them one
+--   after another, in ns and bytes per request. KIND is @threads@, @delimited@ or @compiled@; VARIANT is @request@
+--   (its admission and the end of its scope), @primary@ (and one borrow and release of the primary) or @both@
+--   (and an extra loan, from the reserve). The pool has buffers for every part, so no request waits.
 -- * @wake KIND SAMPLES@: how long a part waiting for a ticket on a core whose scheduler waits in its poller takes
 --   to go on after another core gives it a value. KIND is @delimited@ or @threads@.
 -- * @scope KIND VARIANT ROUNDS [PARTS]@: what a scope costs, entered and left, in ns and bytes, above the loop it is
@@ -29,7 +33,7 @@
 -- * @deadline KIND SAMPLES@: how late a deadline of 5 ms passes, on a scheduler that has nothing else to do.
 module Main (main) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (&&&), (***), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (evaluate)
 import Control.Monad (replicateM, unless, void, when)
@@ -41,12 +45,15 @@ import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtr, withForeignPtr)
 import Foreign.Storable (peek, poke)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Directions.PingPong
+import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (keeping, timesWith, together, untilJust)
+import Network.Streaming.Combinators (keeping, times, timesWith, together, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (Report (..))
+import qualified Network.Streaming.Loans as Loans
 import Network.Streaming.Pool
+import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Threads
 import System.Environment (getArgs, lookupEnv)
 import System.IO (hPrint, stderr)
@@ -60,6 +67,7 @@ main = do
   getArgs >>= \case
     ["pingpong", kind, rounds] -> pingPongRun kind (read rounds)
     ["pool", kind, cores, parts, conns, seconds] -> poolRun kind (read cores) (read parts) (read conns) (read seconds)
+    ["loans", kind, variant, parts, rounds] -> loansRun kind variant (read parts) (read rounds)
     ["wake", kind, samples] -> wakeRun kind (read samples)
     ["scope", kind, variant, rounds] -> scopeRun kind variant (read rounds) 0
     ["scope", kind, variant, rounds, parts] -> scopeRun kind variant (read rounds) (read parts)
@@ -67,7 +75,7 @@ main = do
     ["within", kind, variant, rounds] -> withinRun kind variant (read rounds) 0
     ["within", kind, variant, rounds, parts] -> withinRun kind variant (read rounds) (read parts)
     ["deadline", kind, samples] -> deadlineRun kind (read samples)
-    _ -> ioError (userError "usage: directions-cores-bench (pingpong KIND ROUNDS | pool KIND CORES PARTS CONNECTIONS SECONDS | wake KIND SAMPLES | scope KIND VARIANT ROUNDS [PARTS] | cancel KIND SAMPLES | within KIND VARIANT ROUNDS [PARTS] | deadline KIND SAMPLES) +RTS -T -N..")
+    _ -> ioError (userError "usage: directions-cores-bench (pingpong KIND ROUNDS | pool KIND CORES PARTS CONNECTIONS SECONDS | loans KIND VARIANT PARTS ROUNDS | wake KIND SAMPLES | scope KIND VARIANT ROUNDS [PARTS] | cancel KIND SAMPLES | within KIND VARIANT ROUNDS [PARTS] | deadline KIND SAMPLES) +RTS -T -N..")
 
 -- | Bytes allocated by every thread so far, once a major collection has counted them.
 allocated :: IO Integer
@@ -162,6 +170,41 @@ poolRun kind cores parts conns seconds = do
     (maximum parts' / mean)
     (deviation / mean)
     (minimum perCore / maximum perCore)
+
+-- | A program that runs under every arrow that has what 'Runtime' bundles.
+type RuntimeProgram a = forall arr. (Runtime arr) => arr () a
+
+runRuntimeProgram :: String -> RuntimeProgram a -> IO a
+runRuntimeProgram kind program = case kind of
+  "threads" -> runThreads program ()
+  "delimited" -> fst <$> runDelimited program ()
+  "compiled" -> fst <$> runCompiled program ()
+  _ -> ioError (userError ("no kind " <> kind))
+
+loansRun :: String -> String -> Int -> Int -> IO ()
+loansRun kind variant parts rounds = do
+  let positive = maybe (ioError (userError "a count of a pool is positive")) pure . mkPositiveInt . toInteger
+  pool <- do
+    size <- positive 4096
+    ordinary <- positive parts
+    reserved <- positive parts
+    setup <- positive 1
+    newBufferPool (BufferPoolSettings size ordinary reserved setup)
+  let body :: (Runtime arr) => arr Loans.Loans ()
+      body = case variant of
+        "request" -> arr (const ())
+        "primary" -> Loans.borrow >>> Loans.release
+        "both" -> (Loans.borrow &&& Loans.borrow) >>> (Loans.release *** Loans.release) >>> arr (const ())
+        _ -> error ("loans: no variant " <> variant)
+      oneRequest :: (Runtime arr) => arr () ()
+      oneRequest = Loans.withRequestBuffers pool (arr fst >>> body)
+      program :: RuntimeProgram ()
+      program = case kind of
+        "threads" -> balanced (replicate parts (times rounds oneRequest))
+        _ -> together (replicate parts (times rounds oneRequest))
+  (seconds, bytes) <- measured (runRuntimeProgram kind program)
+  let requests = fromIntegral (parts * rounds) :: Double
+  printf "loans %s %s parts=%d requests=%d ns_per_request=%.1f bytes_per_request=%.1f\n" kind variant parts (parts * rounds) (seconds * 1e9 / requests) (fromIntegral bytes / requests :: Double)
 
 wakeRun :: String -> Int -> IO ()
 wakeRun kind samples = do

@@ -20,17 +20,11 @@ import Database.PostgreSQL.Transaction
   ( Cardinality (..), Ending (..), IsolationLevel (..), Mode (..), Rows (..), Statement (..), column, foldRows, one, pipeline, single, statement, transaction )
 import Database.PostgreSQL.Transport (serverEndPoint)
 import Database.PostgreSQL.Types (Param, paramType)
-import qualified Control.Concurrent.Resource.Acquisition as Acquisition
-import Control.Exception (bracket)
 import Data.Word (Word32)
-import Network.Streaming.BufferPool
-  ( BufferPool, PoolSettings (..), newBufferPool
-  , BufferAccess, withRequestBuffers, BufferLoan, borrowBuffer, loanBuffer, releaseBuffer
-  , BufferGrant, withSetupBuffers
-  )
+import Network.Streaming.BufferPool (BufferGrant, BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Buffer (Buffer)
-import Network.Streaming.Classes (Runtime)
-import Network.Streaming.Loans (Loans)
+import Network.Streaming.Classes (Runtime, scope)
+import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers, withSetupBuffers)
 import Network.Streaming.Pool (Pool)
 import Network.Streaming.PositiveInt (positiveInt)
 
@@ -95,23 +89,23 @@ parameterType :: Param -> Maybe Word32
 parameterType = paramType
 
 -- A client can manage short loans while the request owns admission.
-requestBuffer :: BufferPool -> (Buffer -> IO a) -> IO a
-requestBuffer resources use = withRequestBuffers resources $ \access ->
-  bracket (borrowBuffer access) releaseBuffer (use . loanBuffer)
+requestBuffer :: Runtime arr => BufferPool -> arr (Buffer, a) b -> arr a b
+requestBuffer resources use = withRequestBuffers resources $
+  scope (arr fst >>> borrow) (arr fst >>> release) ((\(loan, (_, input)) -> (loanBuffer loan, input)) ^>> use)
 
-manualLoan :: BufferAccess -> IO BufferLoan
-manualLoan = borrowBuffer
+manualLoan :: Runtime arr => arr Loans Loan
+manualLoan = borrow
 
-setupBuffers :: BufferGrant grant => BufferPool -> (grant -> IO a) -> IO a
+setupBuffers :: (Runtime arr, BufferGrant grant) => BufferPool -> arr (grant, a) b -> arr a b
 setupBuffers = withSetupBuffers
 
-resourceSettings :: PoolSettings
-resourceSettings = PoolSettings
+resourceSettings :: BufferPoolSettings
+resourceSettings = BufferPoolSettings
   { bufferSize = positiveInt @4096
   , ordinaryBufferCount = positiveInt @2
   , reserveBufferCount = positiveInt @1
   , setupBufferCount = positiveInt @2
   }
 
-createResources :: Acquisition.Context -> IO BufferPool
-createResources acquisition = newBufferPool acquisition resourceSettings
+createResources :: IO BufferPool
+createResources = newBufferPool resourceSettings

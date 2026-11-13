@@ -1,8 +1,6 @@
 -- | The loans of a request, as arrows, for every arrow that runs a program. A script is a list of steps on the request's
 -- loans, and several parts of a request, or several requests, wait for each other with signals and with what the pool
 -- says of who waits, so that the order of events is the test's and not a matter of timing.
---
--- Every case is marked as an expected failure ('notYet') until the code is there.
 module LoansSpec (spec) where
 
 import Control.Arrow (arr, first, (&&&), (***), (>>>), (>>^), (^>>))
@@ -28,7 +26,7 @@ import System.IO.Error (ioeGetErrorString)
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = notYet $ describe "the loans of a request" $ do
+spec = describe "the loans of a request" $ do
   forM_ runners $ \runner@(Runner name _) -> describe name $ do
     let run :: Program a -> IO a
         run = runOn runner

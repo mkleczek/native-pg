@@ -10,7 +10,6 @@ module LoansTestSupport
     Runner (..),
     runners,
     runOn,
-    notYet,
     newTestPool,
     newSizedPool,
     requestFree,
@@ -49,7 +48,6 @@ module LoansTestSupport
   )
 where
 
-import AcquisitionTestSupport (getAcquisition)
 import Control.Arrow (Arrow, ArrowChoice, arr, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Exception (fromException)
@@ -59,13 +57,14 @@ import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr)
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
-import Network.Streaming.BufferPool (BufferPool, PoolSettings (..), newBufferPool)
+import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (sleep)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited (runDelimited)
+import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.NotImplemented (notImplementedIO)
+import Network.Streaming.Pool (free, waiters)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt)
 import Network.Streaming.Threads (runThreads)
 import Skeletest
@@ -92,11 +91,6 @@ onCompiled program = fst <$> runCompiled program ()
 runOn :: Runner -> Program a -> IO a
 runOn (Runner _ run) program = timeout 10000000 (run program) >>= maybe (failTest "the program did not end in ten seconds") pure
 
--- | Marks every case of the spec as an expected failure: the loans are stubs until the pool's waits are tickets. The
--- mark comes off with the code, and a case that then passes unexpectedly fails the suite.
-notYet :: Spec -> Spec
-notYet = xfail "the buffer pool's loans are not implemented yet"
-
 -- * Pools
 
 -- | A pool of buffers of 8 bytes: this many ordinary, reserve and setup buffers.
@@ -106,15 +100,13 @@ newTestPool = newSizedPool 8
 -- | A pool of buffers of this size, and this many ordinary, reserve and setup buffers.
 newSizedPool :: Int -> Int -> Int -> Int -> IO BufferPool
 newSizedPool size ordinary reserve setup =
-  getAcquisition >>= \acquisition ->
-    newBufferPool
-      acquisition
-      PoolSettings
-        { bufferSize = positive size,
-          ordinaryBufferCount = positive ordinary,
-          reserveBufferCount = positive reserve,
-          setupBufferCount = positive setup
-        }
+  newBufferPool
+    BufferPoolSettings
+      { bufferSize = positive size,
+        ordinaryBufferCount = positive ordinary,
+        reserveBufferCount = positive reserve,
+        setupBufferCount = positive setup
+      }
   where
     positive :: Int -> PositiveInt
     positive = fromMaybe (error "a count of a pool is positive") . mkPositiveInt . toInteger
@@ -122,12 +114,12 @@ newSizedPool size ordinary reserve setup =
 -- | The buffers that are free in the pool of the requests and in the pool of the setup, and how many parts wait for each:
 -- what a case looks at once its programs have ended.
 requestFree, setupFree :: BufferPool -> IO [Buffer]
-requestFree _ = notImplementedIO "requestFree"
-setupFree _ = notImplementedIO "setupFree"
+requestFree = free . requestBuffers
+setupFree = free . setupBuffers
 
 requestWaiting, setupWaiting :: BufferPool -> IO Int
-requestWaiting _ = notImplementedIO "requestWaiting"
-setupWaiting _ = notImplementedIO "setupWaiting"
+requestWaiting = waiters . requestBuffers
+setupWaiting = waiters . setupBuffers
 
 -- | A test's cores need capabilities: it runs with @+RTS -N4@, and sets that if the run was started without.
 ensureCores :: IO ()

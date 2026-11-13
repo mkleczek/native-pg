@@ -102,9 +102,7 @@ import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Types (FormatCode (..))
 import Network.Socket (PortNumber)
-import AcquisitionTestSupport (getAcquisition)
-import Network.Streaming.BufferPool (BufferPool, PoolSettings (..))
-import qualified Network.Streaming.BufferPool as BufferPool
+import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators
 import Network.Streaming.Compiled (runCompiled)
@@ -148,28 +146,24 @@ runOn (Runner _ run) buffers program =
   timeout 60000000 (run buffers program) >>= maybe (failTest "the program did not end in a minute") pure
 
 -- | A pool of buffers of the settings.
---
--- The pool of "Network.Streaming.BufferPool" still takes the context that its waits are made with (a timer manager),
--- until its waits are the arrow's @block@s, as API.md has it: @newBufferPool :: BufferPoolSettings -> IO BufferPool@.
--- This is the one place that changes then.
-newPool :: PoolSettings -> IO BufferPool
-newPool settings = getAcquisition >>= \acquisition -> BufferPool.newBufferPool acquisition settings
+newPool :: BufferPoolSettings -> IO BufferPool
+newPool = newBufferPool
 
 -- | The program on a pool of buffers of the usual size: 1 KiB, so that a few kilobytes of a value already take
 -- several pieces, and a bit more than a request needs of them.
 ordinary :: Runner -> Program a -> IO a
 ordinary runner program = newPool settings >>= \buffers -> runOn runner buffers program
   where
-    settings = PoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2)
+    settings = BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2)
 
 -- | The program on a pool of the settings.
-withBuffers :: PoolSettings -> Runner -> Program a -> IO a
+withBuffers :: BufferPoolSettings -> Runner -> Program a -> IO a
 withBuffers settings runner program = newPool settings >>= \buffers -> runOn runner buffers program
 
 -- | Tiny buffers, for the cases about bounded memory: 16 bytes, two for the requests in flight, one reserved, two
 -- for setting up connections.
-smallBuffers :: PoolSettings
-smallBuffers = PoolSettings (positiveInt @16) (positiveInt @2) (positiveInt @1) (positiveInt @2)
+smallBuffers :: BufferPoolSettings
+smallBuffers = BufferPoolSettings (positiveInt @16) (positiveInt @2) (positiveInt @1) (positiveInt @2)
 
 -- | Marks every case of the spec as an expected failure: the v2 code is not there yet. The mark comes off as the
 -- part that the group covers lands, and a case that then passes unexpectedly fails the suite.

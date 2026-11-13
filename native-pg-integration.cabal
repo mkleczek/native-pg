@@ -54,7 +54,6 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Transaction
                       Database.PostgreSQL.Transport
                       Database.PostgreSQL.Types
-                      AcquisitionTestSupport
                       BufferSpec
                       IntegrationSpec
                       ScopeTransactionSpec

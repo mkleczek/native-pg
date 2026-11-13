@@ -27,8 +27,7 @@ test-suite fulmen-conformance
   default-language: GHC2021
   hs-source-dirs: test
   main-is: Main.hs
-  other-modules: AcquisitionTestSupport
-                 ConformanceCases
+  other-modules: ConformanceCases
                  ConformanceSpec
                  ConformanceWire
   ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
