@@ -73,7 +73,9 @@ class Link arr link where
   -- | Receives into the room: how many bytes, 0 at the end of the stream.
   receive :: arr (link, Room) Int
 
-  -- | Sends all of the pieces, and writes them.
+  -- | Sends all of the pieces, and returns once they may be reused: once the
+  -- kernel has copied them, or, for a link that sends without copying, once
+  -- the kernel no longer reads them.
   sendAll :: arr (link, [ByteString]) ()
 
   -- | Waits until the link has input, and takes none of it: a part that
