@@ -348,7 +348,9 @@ waitFor c client stopped condition other = do
   loop
 
 -- | After the last step: reads on until the server closes the connection, or until it has said what it is going to, which
--- is when the responses of an outcome are all there and nothing has come for 300 ms. Whether the server closed it.
+-- is when the responses of an outcome are all there and nothing has come for 300 ms, since the last byte or the last
+-- step, whichever is later: a response that came before the last step doesn't end the wait for its answer. Whether the
+-- server closed it.
 settle :: Case -> Client -> MVar (Either SomeException ()) -> IO Bool
 settle c client stopped = do
   started <- getMonotonicTimeNSec
@@ -362,7 +364,7 @@ settle c client stopped = do
         if closed
           then pure True
           else
-            if (complete && now' - lastGrew > 300 * 1000000) || now' - started > patience c * 1000000
+            if (complete && now' - max lastGrew started > 300 * 1000000) || now' - started > patience c * 1000000
               then pure False
               else threadDelay 5000 >> loop
   loop
