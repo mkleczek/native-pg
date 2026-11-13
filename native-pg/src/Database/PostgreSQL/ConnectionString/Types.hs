@@ -1,6 +1,4 @@
-{-# LANGUAGE LambdaCase #-}
-
--- | Connection strings, host settings, and connection attempt failures.
+-- | Connection strings and host settings.
 module Database.PostgreSQL.ConnectionString.Types
   ( ConnectionString (..),
     Defaults (..),
@@ -9,19 +7,15 @@ module Database.PostgreSQL.ConnectionString.Types
     TargetSessionAttrs (..),
     hostConnectSettings,
     hostSocketAddress,
-    ConnectFailure (..),
-    HostFailure (..),
   ) where
 
 import Control.Applicative ((<|>))
 import Control.Exception (Exception (..))
 import Data.ByteString (ByteString)
-import Data.List (intercalate)
 import Data.List.NonEmpty (NonEmpty)
-import Database.PostgreSQL.Diagnostics (ConnectionError, ServerError)
 import Database.PostgreSQL.Types (ProtocolVersion)
 import Database.PostgreSQL.Session.Settings
-import Database.PostgreSQL.Transport (Address (..), ConnectError, TcpOptions, TlsVersion)
+import Database.PostgreSQL.Transport (Address (..), TcpOptions, TlsVersion)
 import Network.Socket (PortNumber)
 
 -- | What a connection string asks for, with the environment's defaults.
@@ -132,44 +126,3 @@ hostSocketAddress host = case (hostAddress host, hostName host) of
   (Nothing, name) -> TcpAddress name (hostPort host)
   where
     socketFile directory = directory <> "/.s.PGSQL." <> show (hostPort host)
-
--- | No host qualified: each attempt's host and failure, in order.
--- 'displayException' words it as libpq does.
-newtype ConnectFailure = ConnectFailure [(Host, HostFailure)]
-  deriving (Show)
-
--- | Why a host didn't qualify.
-data HostFailure
-  = -- | The socket didn't connect.
-    NotConnected ConnectError
-  | -- | The server rejected the connection, or the startup failed.
-    NotStarted ConnectionError
-  | -- | The connection broke during the startup.
-    Broke String
-  | -- | The connect timeout passed first.
-    TimedOut
-  | -- | The server doesn't have the session attributes or the protocol
-    -- version asked for.
-    Unsuitable String
-  | -- | Checking the session attributes failed.
-    CheckFailed ServerError
-  deriving (Show)
-
-instance Exception ConnectFailure where
-  displayException (ConnectFailure failures) = intercalate "\n" (map describe failures)
-    where
-      describe = \case
-        (_, NotConnected failure) -> displayException failure
-        (host, failure) -> "connection to server " <> location host <> " failed: " <> reason failure
-      reason = \case
-        NotConnected failure -> displayException failure
-        NotStarted failure -> displayException failure
-        Broke why -> why
-        TimedOut -> "timeout expired"
-        Unsuitable why -> why
-        CheckFailed failure -> displayException failure
-      location host = case hostSocketAddress host of
-        UnixAddress path -> "on socket " <> show path
-        TcpAddress address port
-          | address == hostName host -> "at " <> show address <> ", port " <> show port
-          | otherwise -> "at " <> show (hostName host) <> " (" <> address <> "), port " <> show port

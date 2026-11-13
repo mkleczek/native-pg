@@ -21,13 +21,14 @@ import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Diagnostics
 import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
 import qualified Database.PostgreSQL.Encoders as Encoders
+import Database.PostgreSQL.Errors (ConnectError (..))
 import Database.PostgreSQL.Internal.Protocol
 import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import Database.PostgreSQL.Types (Param (..))
-import Database.PostgreSQL.Transport (Address (..), ConnectError (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions, serverEndPoint)
+import Database.PostgreSQL.Transport (Address (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions, serverEndPoint)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import Skeletest
 import qualified Skeletest.Predicate as P

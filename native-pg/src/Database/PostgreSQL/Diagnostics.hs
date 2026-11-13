@@ -5,7 +5,6 @@ module Database.PostgreSQL.Diagnostics
   ( Diagnostics (..),
     ServerError (..),
     Severity (..),
-    ConnectionError (..),
     QueryError (..),
     StatementError (..),
     isConnectionFatal,
@@ -90,47 +89,6 @@ instance Exception ServerError where
         SeverityInfo -> "INFO"
         SeverityLog -> "LOG"
         SeverityOther other -> text other
-
-data ConnectionError
-  = -- | The server refused the connection.
-    ConnectionRejected ServerError
-  | -- | The server ended the session with this error, e.g. because an
-    -- administrator terminated it.
-    ConnectionTerminated ServerError
-  | -- | The server's messages don't follow the protocol.
-    ProtocolError String
-  | -- | The server asked for an authentication method this client doesn't
-    -- implement.
-    UnsupportedAuthentication String
-  | -- | Authentication failed on the client's side: a password is needed but
-    -- missing, or the server's SCRAM signature doesn't match.
-    AuthenticationError String
-  | -- | The session is busy with another operation, broke in an earlier
-    -- one, or has been closed.
-    SessionUnusable String
-  | -- | A row or a column stream was used out of turn.
-    RowMisuse String
-  | -- | A result was read, or a preparation awaited, while this many earlier
-    -- results of the transaction were neither consumed nor discarded.
-    ResultOutOfOrder Int
-  | -- | TLS couldn't be started, e.g. because the server doesn't take it.
-    TlsFailure String
-  deriving (Eq, Show)
-
-instance Exception ConnectionError where
-  displayException failure = case failure of
-    ConnectionRejected rejection -> displayException rejection
-    ConnectionTerminated termination -> displayException termination
-    ProtocolError reason -> "protocol error: " <> reason
-    UnsupportedAuthentication method -> "the server asks for authentication with " <> method <> ", which isn't supported"
-    AuthenticationError reason -> reason
-    SessionUnusable reason -> reason
-    RowMisuse reason -> reason
-    ResultOutOfOrder unread ->
-      "a result was read, or a preparation awaited, while " <> show unread
-        <> (if unread == 1 then " earlier result was" else " earlier results were")
-        <> " neither consumed nor discarded"
-    TlsFailure reason -> reason
 
 -- | A statement failed: its SQL, and why.
 data QueryError = QueryError ByteString StatementError

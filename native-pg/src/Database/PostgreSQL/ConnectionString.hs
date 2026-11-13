@@ -22,9 +22,7 @@ module Database.PostgreSQL.ConnectionString
     hostSocketAddress,
     fromConnectionString,
     parseConnectionString,
-    readConnectionString,
-    ConnectFailure (..),
-    HostFailure (..)
+    readConnectionString
   ) where
 
 import Control.Applicative ((<|>))

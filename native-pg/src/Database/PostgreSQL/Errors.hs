@@ -28,8 +28,8 @@ module Database.PostgreSQL.Errors
 where
 
 import Control.Exception (Exception (..))
-import Database.PostgreSQL.ConnectionString.Types (Host, HostFailure)
-import qualified Database.PostgreSQL.ConnectionString.Types as ConnectionString
+import Data.List (intercalate)
+import Database.PostgreSQL.ConnectionString.Types (Host (hostName), hostSocketAddress)
 import Database.PostgreSQL.Diagnostics
   ( Diagnostics (..),
     QueryError (..),
@@ -38,13 +38,24 @@ import Database.PostgreSQL.Diagnostics
     StatementError (..),
     isConnectionFatal,
   )
+import Database.PostgreSQL.Transport (Address (..))
+import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
+import GHC.IO.Exception (IOException (..))
+import Network.Socket (HostName, PortNumber)
 import Network.Streaming.Pool (PoolError (..))
 
--- | Connecting failed, in the words of libpq: the server rejected the
--- connection, or the startup failed on the client's side, or, for settings that
--- a connection string made, no host qualified, with each host's failure.
+-- | Connecting failed, in the words of libpq: the socket didn't connect, or the
+-- server rejected the connection, or the startup failed on the client's side,
+-- and each host that was tried has its own reason.
 data ConnectError
-  = -- | The server refused the connection.
+  = -- | The host name doesn't resolve, for the resolver's reason.
+    UnresolvedHost HostName String
+  | -- | Connecting to each address the host name resolved to failed: each
+    -- address, numeric, and its failure.
+    UnreachableHost HostName PortNumber [(String, IOException)]
+  | -- | Connecting to the Unix-domain socket failed.
+    UnreachableSocket FilePath IOException
+  | -- | The server refused the connection.
     ConnectionRejected ServerError
   | -- | The server's messages don't follow the protocol.
     ProtocolError String
@@ -56,18 +67,63 @@ data ConnectError
     AuthenticationError String
   | -- | TLS couldn't be started, e.g. because the server doesn't take it.
     TlsFailure String
+  | -- | The connection broke during the startup.
+    Broke String
+  | -- | The connect timeout passed first.
+    TimedOut
+  | -- | The server doesn't have the session attributes or the protocol
+    -- version asked for.
+    Unsuitable String
+  | -- | Checking the session attributes failed.
+    CheckFailed ServerError
   | -- | No host qualified: each attempt's host and failure, in order.
-    ConnectFailure [(Host, HostFailure)]
+    ConnectFailure [(Host, ConnectError)]
   deriving (Show)
 
 instance Exception ConnectError where
   displayException = \case
+    UnresolvedHost host reason ->
+      "could not translate host name " <> show host <> " to address: " <> reason
+    UnreachableHost host port failures ->
+      intercalate "\n" $
+        [ "connection to server at " <> show host <> numeric address <> ", port " <> show port <> " failed: " <> describe failure tcpHint
+        | (address, failure) <- failures
+        ]
+      where
+        numeric address
+          | address == host = ""
+          | otherwise = " (" <> address <> ")"
+    UnreachableSocket path failure ->
+      "connection to server on socket " <> show path <> " failed: " <> describe failure socketHint
     ConnectionRejected rejection -> displayException rejection
     ProtocolError reason -> "protocol error: " <> reason
     UnsupportedAuthentication method -> "the server asks for authentication with " <> method <> ", which isn't supported"
     AuthenticationError reason -> reason
     TlsFailure reason -> reason
-    ConnectFailure failures -> displayException (ConnectionString.ConnectFailure failures)
+    Broke reason -> reason
+    TimedOut -> "timeout expired"
+    Unsuitable reason -> reason
+    CheckFailed failure -> displayException failure
+    ConnectFailure failures -> intercalate "\n" (map attempt failures)
+    where
+      describe failure hint = ioe_description failure <> maybe "" (hint . Errno) (ioe_errno failure)
+      tcpHint errno
+        | errno == eCONNREFUSED = "\n\tIs the server running on that host and accepting TCP/IP connections?"
+        | otherwise = ""
+      socketHint errno
+        | errno == eNOENT || errno == eCONNREFUSED = "\n\tIs the server running locally and accepting connections on that socket?"
+        | otherwise = ""
+      -- A socket that didn't connect words itself, as libpq does.
+      attempt (host, failure) = case failure of
+        UnresolvedHost {} -> displayException failure
+        UnreachableHost {} -> displayException failure
+        UnreachableSocket {} -> displayException failure
+        _ -> "connection to server " <> location host <> " failed: " <> displayException failure
+      location host = case hostSocketAddress host of
+        UnixAddress path -> "on socket " <> show path
+        TcpAddress address port
+          | address == hostName host -> "at " <> show address <> ", port " <> show port
+          | otherwise -> "at " <> show (hostName host) <> " (" <> address <> "), port " <> show port
 
 -- | The program used the API wrongly, or what it read didn't fit. Each is a
 -- failure of the step that found it, and the transaction it happened in rolls

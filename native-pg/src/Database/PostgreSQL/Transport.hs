@@ -1,4 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
 -- At -O2, liberate-case copies the receive loop once for each place it calls
 -- itself, and one loop is enough. At -O1 the flag does nothing.
 {-# OPTIONS_GHC -fno-liberate-case #-}
@@ -6,7 +5,6 @@
 -- | Public transport API.
 module Database.PostgreSQL.Transport
   ( Address (..),
-    ConnectError (..),
     TcpOptions (..),
     defaultTcpOptions,
     TlsClient (..),
@@ -19,16 +17,13 @@ module Database.PostgreSQL.Transport
   )
 where
 
-import Control.Exception (Exception (..), IOException)
+import Control.Exception (Exception (..))
 import Crypto.Hash (HashAlgorithm, SHA224 (..), SHA256 (..), SHA384 (..), SHA512 (..), hashWith)
 import Data.Bits (shiftL, testBit, (.&.), (.|.))
 import qualified Data.ByteArray as ByteArray
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.List (intercalate)
 import Data.Word (Word8)
-import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
-import GHC.IO.Exception (IOException (..))
 import Network.Socket (HostName, PortNumber)
 
 data Address
@@ -59,41 +54,6 @@ data TcpOptions = TcpOptions
 -- | Keepalives with the system's timings, as libpq has by default.
 defaultTcpOptions :: TcpOptions
 defaultTcpOptions = TcpOptions True Nothing Nothing Nothing Nothing
-
--- | Connecting failed. 'displayException' words it as libpq does.
-data ConnectError
-  = -- | The host name doesn't resolve, for the resolver's reason.
-    UnresolvedHost HostName String
-  | -- | Connecting to each address the host name resolved to failed: each
-    -- address, numeric, and its failure.
-    UnreachableHost HostName PortNumber [(String, IOException)]
-  | -- | Connecting to the Unix-domain socket failed.
-    UnreachableSocket FilePath IOException
-  deriving (Show)
-
-instance Exception ConnectError where
-  displayException = \case
-    UnresolvedHost host reason ->
-      "could not translate host name " <> show host <> " to address: " <> reason
-    UnreachableHost host port failures ->
-      intercalate "\n" $
-        [ "connection to server at " <> show host <> numeric address <> ", port " <> show port <> " failed: " <> describe failure tcpHint
-        | (address, failure) <- failures
-        ]
-      where
-        numeric address
-          | address == host = ""
-          | otherwise = " (" <> address <> ")"
-    UnreachableSocket path failure ->
-      "connection to server on socket " <> show path <> " failed: " <> describe failure socketHint
-    where
-      describe failure hint = ioe_description failure <> maybe "" (hint . Errno) (ioe_errno failure)
-      tcpHint errno
-        | errno == eCONNREFUSED = "\n\tIs the server running on that host and accepting TCP/IP connections?"
-        | otherwise = ""
-      socketHint errno
-        | errno == eNOENT || errno == eCONNREFUSED = "\n\tIs the server running locally and accepting connections on that socket?"
-        | otherwise = ""
 
 -- | The TLS implementation that a connection starts TLS with, which native-pg-tls
 -- supplies: without one, a connection can't encrypt, as libpq built without TLS
