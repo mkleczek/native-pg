@@ -37,6 +37,7 @@ spec = describe "the runtime" $ do
       failsAtTheGive (runCompiled givingErrorLocal ())
       failsAtTheGive (runDelimited givingErrorLocal ())
       failsAtTheGive (runDelimited (givingError @'Anywhere) ())
+      failsAtTheGive (runCompiled (givingError @'Anywhere) ())
       failsAtTheGive (runSimulation 1 limit givingErrorLocal ())
 
   describe "giving way, with every part on one thread" $ do

@@ -43,6 +43,10 @@ module Network.Streaming.Internal.Scheduler
     stepped,
     counted,
     wakeTicket,
+    RemoteSlot (..),
+    awaitRemote,
+    giveRemote,
+    abandonRemote,
     Mailbox,
     runMailbox,
     post,
@@ -354,6 +358,78 @@ counted run step = step <$ (counter run 1 >>= setCounter run 1 . (+ 1))
 -- | Puts a part that a ticket woke back among those that can go on.
 wakeTicket :: Run -> IO Step -> IO ()
 wakeTicket run part = modifyIORef' (runTickets run) (part :) *> adjust run 5 (-1)
+
+-- | What the slot of a ticket of reach @'Anywhere@ holds, and what a thread that gives it a value finds: nothing
+-- yet, the value, the part that waits for it, or that the waiter has gone. Several threads read and change it,
+-- atomically. The value is evaluated, as a local slot's is. The waiter is what puts the part back among those that
+-- can go on, with the action that runs where it waited: the value, or a cancellation to raise.
+data RemoteSlot a = RemoteEmpty | RemoteGiven !a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
+
+-- | What a give did to the slot.
+data Giving a = Stored | Resume (IO a -> IO Step) | Gone | Twice
+
+-- | What a waiter's parking did to the slot.
+data Parking a = Parking | Ready a | Misused
+
+-- | What a part does that waits for a ticket of reach @'Anywhere@, for the two arrows that run parts on one
+-- thread. If the value is there, the arrow goes on with it. If it isn't, the part says where it waits, so that a
+-- cancellation takes it off the slot, and the arrow captures what follows the wait, which it hands to the slot
+-- as the waiter. It is the arrow's own to say how it goes on and how it captures.
+awaitRemote :: Run -> Part -> IORef (RemoteSlot a) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
+awaitRemote run part slot given capture =
+  readIORef slot >>= \case
+    RemoteGiven value -> checkpoint part *> given value
+    RemoteEmpty -> do
+      registering part (Other (stopRemote run slot))
+      capture (parkRemote slot)
+    _ -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
+{-# INLINE awaitRemote #-}
+
+-- | Parks the captured part in the slot, which was empty at the look: unless a value was given since, and then
+-- the part goes on in its turn.
+parkRemote :: IORef (RemoteSlot a) -> (IO a -> IO Step) -> IO Step
+parkRemote slot resume = do
+  parking <- update slot $ \case
+    RemoteEmpty -> (RemoteWaiter resume, Parking)
+    RemoteGiven value -> (RemoteGiven value, Ready value)
+    other -> (other, Misused)
+  case parking of
+    Parking -> pure ParkedRemote
+    -- Given since the look: goes on in its turn.
+    Ready value -> pure (Yielded (resume (pure value)))
+    Misused -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
+
+-- | Takes the part off the slot, if it still waits there: not if a value was given since, which has put the
+-- part in the mailbox, and which the part finds at its next wait.
+stopRemote :: Run -> IORef (RemoteSlot a) -> Cancelled -> IO (Maybe (IO Step))
+stopRemote run slot cancelled =
+  update slot (\case RemoteWaiter resume -> (RemoteEmpty, Just resume); other -> (other, Nothing)) >>= \case
+    Nothing -> pure Nothing
+    Just resume -> Just (resume (throwIO cancelled)) <$ adjust run 3 (-1)
+
+-- | Gives the slot its value, and if a part waits for it, puts the part in the
+-- mailbox of the scheduler that owns it. It says whether the waiter takes it. The value is evaluated before
+-- the compare-and-swap, not between its read and its swap.
+giveRemote :: Mailbox -> IORef (RemoteSlot a) -> a -> IO Bool
+giveRemote mailbox slot !value = do
+  giving <- update slot $ \case
+    RemoteEmpty -> (RemoteGiven value, Stored)
+    RemoteWaiter resume -> (RemoteGiven value, Resume resume)
+    RemoteAbandoned -> (RemoteAbandoned, Gone)
+    given -> (given, Twice)
+  case giving of
+    Stored -> pure True
+    Resume resume -> post mailbox (resume (pure value))
+    Gone -> pure False
+    Twice -> ioError (userError "a ticket was given a value twice")
+
+-- | The waiter stops wanting the value, before it waits for it: a later give says it isn't taken. A value given
+-- already is the waiter's, and this gives it back.
+abandonRemote :: IORef (RemoteSlot a) -> IO (Maybe a)
+abandonRemote slot =
+  update slot $ \case
+    RemoteGiven value -> (RemoteAbandoned, Just value)
+    _ -> (RemoteAbandoned, Nothing)
 
 -- | The first part of a run, in no scope: the run's root scope begins with it.
 newPart :: Run -> IO Part

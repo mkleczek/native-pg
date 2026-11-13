@@ -5,9 +5,9 @@
 --
 -- * @pingpong KIND ROUNDS@: round trips between two parts over tickets made as they go, in ns and bytes per round
 --   trip. KIND is @local@ (two parts on one core, tickets of reach @'Here@), @compiled@ (the same, run by
---   'Compiled'), @anywhere@ (two parts on one core, tickets of reach @'Anywhere@), @remote@ (two cores, tickets of
---   reach @'Anywhere@), @threads@ (two threads, tickets) or @remote-threads@ (two threads, the tickets left in a
---   handoff, as @remote@ does).
+--   'Compiled'), @anywhere@ (two parts on one core, tickets of reach @'Anywhere@), @compiled-anywhere@ (the same, run
+--   by 'Compiled'), @remote@ (two cores, tickets of reach @'Anywhere@), @threads@ (two threads, tickets) or
+--   @remote-threads@ (two threads, the tickets left in a handoff, as @remote@ does).
 -- * @pool KIND CORES PARTS CONNECTIONS SECONDS@: parts that check a connection out of one pool, do a little work,
 --   and release it, for the time given: checkouts per second, how evenly the parts and cores got them, and
 --   allocation per checkout. KIND is @delimited@ (CORES cores of PARTS parts each) or @threads@ (the same number of
@@ -90,6 +90,7 @@ pingPongRun kind rounds = do
     "local" -> void (runDelimited (pingPong rounds) ())
     "compiled" -> void (runCompiled (pingPong rounds) ())
     "anywhere" -> void (runDelimited (pingPongAt @'Anywhere rounds) ())
+    "compiled-anywhere" -> void (runCompiled (pingPongAt @'Anywhere rounds) ())
     "remote" -> void (runCores 2 (pure handoff) (\shared core -> if core == 0 then find shared >>> client rounds else leave shared >>> server rounds))
     "threads" -> runThreads (pingPong rounds) ()
     "remote-threads" -> runThreads (concurrently (find handoff >>> client rounds) (leave handoff >>> server rounds) >>> arr (const ())) ()

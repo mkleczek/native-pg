@@ -3,16 +3,16 @@
 
 module CoresSpec (spec) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (>>>), (^>>), (|||))
-import Control.Concurrent (getNumCapabilities, setNumCapabilities, threadDelay)
-import Control.Exception (ErrorCall (..), IOException, evaluate, throwIO, try)
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (>>>), (^>>), (|||))
+import Control.Concurrent (forkIO, getNumCapabilities, newEmptyMVar, putMVar, setNumCapabilities, takeMVar, threadDelay, yield)
+import Control.Exception (ErrorCall (..), IOException, evaluate, finally, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Either (fromLeft)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf, sort)
 import Data.Maybe (fromMaybe)
 import Network.Streaming.Classes hiding (within)
-import Network.Streaming.Combinators (times, together)
+import Network.Streaming.Combinators (times, timesWith, together)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)
@@ -26,6 +26,7 @@ spec = describe "cores" $ do
   describe "tickets of any core" $ do
     it "give a value to a part that waits on the same core, which goes on in a later round" $ do
       fst <$> runDelimited (sameCore @'Anywhere) () `shouldReturn` (42, True)
+      fst <$> runCompiled (sameCore @'Anywhere) () `shouldReturn` (42, True)
       runThreads (sameCore @'Anywhere) () `shouldReturn` (42, True)
 
     it "give a value to a part on another core, whose scheduler waits in its poller" $ do
@@ -38,15 +39,36 @@ spec = describe "cores" $ do
             else spinUntilJust box >>> now (\giver -> (giver, 7) <$ threadDelay 20000) >>> give >>> arr (\given -> if given then 1 else 0)
       results `shouldBe` Just [7, 1 :: Int]
 
+    it "give a value from another thread to a part on a scheduler that waits in its poller, and to one that finds it given before it waits" $ do
+      fst <$> runDelimited givenAfterTheWait () `shouldReturn` (7, True)
+      fst <$> runCompiled givenAfterTheWait () `shouldReturn` (7, True)
+      runThreads givenAfterTheWait () `shouldReturn` (7, True)
+      fst <$> runDelimited givenBeforeTheWait () `shouldReturn` (7, True)
+      fst <$> runCompiled givenBeforeTheWait () `shouldReturn` (7, True)
+      runThreads givenBeforeTheWait () `shouldReturn` (7, True)
+
+    it "give every value that another thread gives the moment it finds the ticket, whenever that is in the part's wait" $ do
+      ensureCores
+      withGiverThread $ \shelf -> do
+        fst <$> runDelimited (racing shelf 100000) () `shouldReturn` 100000
+        fst <$> runCompiled (racing shelf 100000) () `shouldReturn` 100000
+        runThreads (racing shelf 100000) () `shouldReturn` 100000
+
   describe "tickets of the arrow's own core" $ do
     it "give a value to a part that waits on the same core, which goes on in a later round, with every arrow that has them" $ do
       fst <$> runDelimited sameCoreLocal () `shouldReturn` (42, True)
       fst <$> runCompiled sameCoreLocal () `shouldReturn` (42, True)
       fst <$> runLoop sameCoreLocal () `shouldReturn` (42, True)
 
+  describe "the arrows that have what Runtime bundles" $
+    it "give a program tickets of both reaches" $ do
+      runThreads ticketsOfBothReaches () `shouldReturn` ((42, True), (42, True))
+      fst <$> runDelimited ticketsOfBothReaches () `shouldReturn` ((42, True), (42, True))
+      fst <$> runCompiled ticketsOfBothReaches () `shouldReturn` ((42, True), (42, True))
+
   describe "a ticket of either reach" $ do
     it "fails when a value is given twice" $ do
-      forM_ [void (runDelimited givenTwiceLocal ()), void (runCompiled givenTwiceLocal ()), void (runLoop givenTwiceLocal ()), void (runDelimited (givenTwice @'Anywhere) ()), void (runThreads (givenTwice @'Anywhere) ())] $ \run -> do
+      forM_ [void (runDelimited givenTwiceLocal ()), void (runCompiled givenTwiceLocal ()), void (runLoop givenTwiceLocal ()), void (runDelimited (givenTwice @'Anywhere) ()), void (runCompiled (givenTwice @'Anywhere) ()), void (runThreads (givenTwice @'Anywhere) ())] $ \run -> do
         outcome <- try run
         either (\failure -> "twice" `isInfixOf` show (failure :: IOException)) (const False) outcome `shouldBe` True
 
@@ -55,11 +77,13 @@ spec = describe "cores" $ do
       fst <$> runCompiled goneLocal () `shouldReturn` (Nothing, False)
       fst <$> runLoop goneLocal () `shouldReturn` (Nothing, False)
       fst <$> runDelimited (gone @'Anywhere) () `shouldReturn` (Nothing, False)
+      fst <$> runCompiled (gone @'Anywhere) () `shouldReturn` (Nothing, False)
       runThreads (gone @'Anywhere) () `shouldReturn` (Nothing, False)
       fst <$> runDelimited givenFirstLocal () `shouldReturn` (True, Just (5 :: Int))
       fst <$> runCompiled givenFirstLocal () `shouldReturn` (True, Just 5)
       fst <$> runLoop givenFirstLocal () `shouldReturn` (True, Just 5)
       fst <$> runDelimited (givenFirst @'Anywhere) () `shouldReturn` (True, Just 5)
+      fst <$> runCompiled (givenFirst @'Anywhere) () `shouldReturn` (True, Just 5)
       runThreads (givenFirst @'Anywhere) () `shouldReturn` (True, Just 5)
 
   describe "the pool of connections" $ do
@@ -149,6 +173,43 @@ gone = ticket @arr @r >>> first abandon >>> (\(abandoned, giver) -> (abandoned, 
 -- | The value is given before the waiter abandons: the waiter has it.
 givenFirst :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Bool, Maybe Int)
 givenFirst = ticket @arr @r >>> (\(awaiting, giver) -> (awaiting, (giver, 5))) ^>> second give >>> (\(awaiting, taken) -> (taken, awaiting)) ^>> second abandon
+
+-- | A ticket of any core that a thread of its own gives a value after a while, which the part waits for: the
+-- scheduler of an arrow that runs every part on one thread waits in its poller by then, and the give wakes it.
+givenAfterTheWait :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => arr () (Int, Bool)
+givenAfterTheWait =
+  ticket @_ @'Anywhere
+    >>> now (\(awaiting, giver) -> newEmptyMVar >>= \taken -> (awaiting, taken) <$ forkIO (threadDelay 20000 *> runThreads give (giver, 7) >>= putMVar taken))
+    >>> first await
+    >>> now (\(value, taken) -> (,) value <$> takeMVar taken)
+
+-- | The same, with the value given by a thread before the part waits: it finds the value at its look.
+givenBeforeTheWait :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => arr () (Int, Bool)
+givenBeforeTheWait =
+  ticket @_ @'Anywhere
+    >>> now (\(awaiting, giver) -> newEmptyMVar >>= \taken -> (awaiting,) <$> (forkIO (runThreads give (giver, 7) >>= putMVar taken) *> takeMVar taken))
+    >>> first await
+
+-- | Runs the action with a thread that gives a value to every giver that is left on the shelf, as soon as it is
+-- there, and stops the thread afterwards: with a flag, since a thread that spins like this one may never reach a
+-- point where an exception could stop it.
+withGiverThread :: (IORef (Maybe (Giver 'Anywhere Int)) -> IO a) -> IO a
+withGiverThread action = do
+  shelf <- newIORef Nothing
+  stopped <- newIORef False
+  let spin = readIORef stopped >>= \done -> unless done (atomicModifyIORef' shelf (Nothing,) >>= maybe yield (\giver -> void (runThreads give (giver, 1))) >> spin)
+  _ <- forkIO spin
+  action shelf `finally` atomicWriteIORef stopped True
+
+-- | Makes a ticket of any core this many times, leaves its giver on the shelf, and waits for it at once, while a
+-- thread gives it a value the moment it sees the giver: the give comes before the part looks at the ticket, between
+-- its look and its wait, or after, and the part gets every value.
+racing :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => IORef (Maybe (Giver 'Anywhere Int)) -> Int -> arr () Int
+racing shelf count = arr (const 0) >>> timesWith count (arr (,()) >>> second (ticket @_ @'Anywhere >>> now (\(awaiting, giver) -> awaiting <$ atomicWriteIORef shelf (Just giver)) >>> await) >>> arr (uncurry (+)))
+
+-- | The programs of the two reaches at once, for any arrow that has what 'Runtime' bundles.
+ticketsOfBothReaches :: (Runtime arr) => arr () ((Int, Bool), (Int, Bool))
+ticketsOfBothReaches = sameCoreLocal &&& sameCore @'Anywhere
 
 -- | Those four at the reach of the arrow's own core.
 sameCoreLocal :: forall arr. (ArrowChoice arr, Concurrent arr, Exchange arr (Local arr)) => arr () (Int, Bool)

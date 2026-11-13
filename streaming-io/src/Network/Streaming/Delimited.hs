@@ -50,7 +50,6 @@ import Data.List (sortOn)
 import GHC.Exts (PromptTag#, control0#, newPromptTag#, prompt#)
 import GHC.IO (IO (..))
 import Network.Streaming.Classes
-import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets
@@ -248,17 +247,6 @@ instance Exchange (Delimited s) ('Here s) where
   give = Delimited (\context (HereGiver slot, value) -> giveHere slot value <* step context)
   abandon = Delimited (\_ (HereWaiting slot) -> abandonHere slot)
 
--- | What the slot of a ticket of reach @'Anywhere@ holds, and what a core that gives it a value
--- finds: nothing yet, the value, the part that waits for it, or that the waiter
--- has gone. Several cores read and change it, atomically. The value is evaluated, as a local slot's is.
-data RemoteSlot a = RemoteEmpty | RemoteGiven !a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
-
--- | What a give did to the slot.
-data Giving a = Stored | Resume (IO a -> IO Step) | Gone | Twice
-
--- | What a waiter's parking did to the slot.
-data Parking a = Parking | Ready a | Misused
-
 -- | The waiter of a ticket that any core can give is parked in the slot as a local ticket's is, but the
 -- giver, on another core, doesn't run it: it puts it in the mailbox of the
 -- scheduler of the waiter's core, which goes on with it in its next round, and
@@ -269,50 +257,9 @@ instance Exchange (Delimited s) 'Anywhere where
     slot <- newIORef RemoteEmpty
     pure (AnywhereWaiting slot, AnywhereGiver (giveRemote (runMailbox run) slot))
   await = Delimited $ \context@(Context run tag part) (AnywhereWaiting slot) ->
-    readIORef slot >>= \case
-      RemoteGiven value -> checkpoint part *> (value <$ step context)
-      RemoteEmpty -> do
-        registering part (Other (stopRemote run slot))
-        control0 tag $ \resume -> do
-          parking <- update slot $ \case
-            RemoteEmpty -> (RemoteWaiter resume, Parking)
-            RemoteGiven value -> (RemoteGiven value, Ready value)
-            other -> (other, Misused)
-          case parking of
-            Parking -> pure ParkedRemote
-            -- Given since the look: goes on in its turn.
-            Ready value -> pure (Yielded (resume (pure value)))
-            Misused -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
-      _ -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
+    awaitRemote run part slot (\value -> value <$ step context) (control0 tag)
   give = Delimited $ \context (AnywhereGiver giving, value) -> giving value <* step context
-  abandon = Delimited $ \_ (AnywhereWaiting slot) ->
-    update slot $ \case
-      RemoteGiven value -> (RemoteAbandoned, Just value)
-      _ -> (RemoteAbandoned, Nothing)
-
--- | Takes the part off the slot, if it still waits there: not if a value was given since, which has put the
--- part in the mailbox, and which the part finds at its next wait.
-stopRemote :: Run -> IORef (RemoteSlot a) -> Cancelled -> IO (Maybe (IO Step))
-stopRemote run slot cancelled =
-  update slot (\case RemoteWaiter resume -> (RemoteEmpty, Just resume); other -> (other, Nothing)) >>= \case
-    Nothing -> pure Nothing
-    Just resume -> Just (resume (throwIO cancelled)) <$ adjust run 3 (-1)
-
--- | Gives the slot its value, and if a part waits for it, puts the part in the
--- mailbox of the scheduler that owns it. It says whether the waiter takes it. The value is evaluated before
--- the compare-and-swap, not between its read and its swap.
-giveRemote :: Mailbox -> IORef (RemoteSlot a) -> a -> IO Bool
-giveRemote mailbox slot !value = do
-  giving <- update slot $ \case
-    RemoteEmpty -> (RemoteGiven value, Stored)
-    RemoteWaiter resume -> (RemoteGiven value, Resume resume)
-    RemoteAbandoned -> (RemoteAbandoned, Gone)
-    given -> (given, Twice)
-  case giving of
-    Stored -> pure True
-    Resume resume -> post mailbox (resume (pure value))
-    Gone -> pure False
-    Twice -> ioError (userError "a ticket was given a value twice")
+  abandon = Delimited $ \_ (AnywhereWaiting slot) -> abandonRemote slot
 
 -- | Counts a step, and once the part has run for its turn, yields: captures what
 -- follows and gives it back to the scheduler. When the part goes on, it

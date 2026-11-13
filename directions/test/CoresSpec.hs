@@ -28,6 +28,7 @@ spec = describe "cores" $ do
     it "let two parts ping-pong on one core over tickets of any core" $ do
       runThreads (pingPongAt @'Anywhere 1000) () `shouldReturn` ()
       fst <$> runDelimited (pingPongAt @'Anywhere 1000) () `shouldReturn` ()
+      fst <$> runCompiled (pingPongAt @'Anywhere 1000) () `shouldReturn` ()
 
     it "let two parts ping-pong on two cores over tickets of any core, and in two threads" $ do
       ensureCores

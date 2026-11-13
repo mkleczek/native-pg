@@ -40,7 +40,8 @@ data PoolRunner = PoolRunner String (forall a. PoolProgram a -> IO a)
 poolRunners :: [PoolRunner]
 poolRunners =
   [ PoolRunner "threads" onThreadsPool,
-    PoolRunner "delimited" onDelimitedPool
+    PoolRunner "delimited" onDelimitedPool,
+    PoolRunner "compiled" onCompiledPool
   ]
 
 onThreads :: Program a -> IO a
@@ -51,6 +52,9 @@ onThreadsPool program = runThreads program ()
 
 onDelimitedPool :: PoolProgram a -> IO a
 onDelimitedPool program = fst <$> runDelimited program ()
+
+onCompiledPool :: PoolProgram a -> IO a
+onCompiledPool program = fst <$> runCompiled program ()
 
 runners :: [Runner]
 runners =

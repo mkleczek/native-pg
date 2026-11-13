@@ -176,7 +176,7 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
         run (cancelledWaiterLocal noted True) `shouldReturn` ("second", False, Nothing)
         readLog noted `shouldReturn` ["acquire", "release: cancelled"]
 
-  when (name `elem` ["threads", "delimited"]) $
+  when (name `elem` ["threads", "delimited", "compiled"]) $
     describe "a part that waits for a ticket of any core" $ do
       it "is cancelled where it waits, and a value given to its ticket afterwards is not given to it, but is its waiter's to take back" $ do
         noted <- newLog
@@ -188,13 +188,14 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
         runAnywhere name (cancelledWaiter @'Anywhere noted True) `shouldReturn` ("second", False, Nothing)
         readLog noted `shouldReturn` ["acquire", "release: cancelled"]
 
-  when (name /= "compiled") $ it "lose and duplicate no connection of a pool, and let no part wait for ever, whatever cancels the parts" $ do
+  it "lose and duplicate no connection of a pool, and let no part wait for ever, whatever cancels the parts" $ do
     ensureCores
     forM_ [1, 2] $ \seed -> do
       world <- newWorld 3 seed
       let parts = 4 :: Int
       case name of
         "threads" -> within (runThreads (together [times turns (turn world) | _ <- [1 .. parts * 2]]) ()) >>= (`shouldBe` Just ())
+        "compiled" -> within (fst <$> runCompiled (together [times turns (turn world) | _ <- [1 .. parts * 2]]) ()) >>= (`shouldBe` Just ())
         _ -> within (runCores 2 (pure world) (\shared _ -> together [times turns (turn shared) | _ <- [1 .. parts]])) >>= (`shouldBe` Just [(), ()])
       checkWorld world
 
@@ -312,10 +313,11 @@ describeExit = \case
   Failed failure -> "failed " <> show failure
   Cancelled' -> "cancelled"
 
--- | A program that parts of every core can share tickets in: the arrows of cores and of threads run it.
+-- | A program that parts of every core can share tickets in: the arrows of cores, of threads and of one thread run it.
 runAnywhere :: String -> (forall arr. (Pooled arr) => arr () a) -> IO a
 runAnywhere name program = case name of
   "threads" -> runThreads program ()
+  "compiled" -> fst <$> runCompiled program ()
   _ -> fst <$> runDelimited program ()
 
 -- | The waiting end of a ticket, waited for in a resource whose release notes how the wait ended and, if it is

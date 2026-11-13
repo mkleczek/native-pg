@@ -66,7 +66,8 @@ tests and benchmark use its parsers.
   scheduler takes its mailbox each round and before it sleeps. `Pool` is a
   connection pool written once for any arrow with `Exchange arr 'Anywhere`, with
   one reference to the free connections and the givers of the waiters.
-  `Threads` has the one reach, `'Anywhere`, and `Compiled` and `Loop` only
+  `Threads` has the one reach, `'Anywhere`, `Compiled` has both on its one
+  core (a giver on any thread puts the waiter in its mailbox), and `Loop` only
   `Local`'s.
 - **Helpers** (`Network.Streaming.Combinators`): what programs need so that a
   value is made where it is used and not carried through the arrows between:
