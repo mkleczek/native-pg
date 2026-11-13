@@ -15,7 +15,7 @@ fi
 
 check() {
   "$compiler" -v0 -fno-code -fforce-recomp -XGHC2021 -hide-all-packages \
-    -package base -package bytestring -package resource-admission -package streaming-io -package native-pg -outputdir "$output_dir" "$1"
+    -package base -package bytestring -package streaming-io -package native-pg -outputdir "$output_dir" "$1"
 }
 
 check "$package_dir/test/api-boundary/Client.hs"

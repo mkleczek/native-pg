@@ -32,4 +32,4 @@ test-suite fulmen-conformance
                  ConformanceWire
   ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, bytestring, fulmen, network, resource-admission, streaming-io, skeletest >=0.4.2 && <0.5
+  build-depends: base, bytestring, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5

@@ -17,7 +17,7 @@ cd "$root"
 if [ "$#" -gt 0 ]; then
   files=$*
 else
-  files=$(find streaming-io/src native-pg/src native-pg-tls/src resource-admission/src directions/src fulmen/src -name '*.hs' | sort)
+  files=$(find streaming-io/src native-pg/src native-pg-tls/src directions/src fulmen/src -name '*.hs' | sort)
 fi
 
 # What is allowed where: a file, what it may do (a name below, or * for all of

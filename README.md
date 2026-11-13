@@ -20,8 +20,6 @@ that describe sessions, transactions and the pool describe v1.
 - **`streaming-io`:** borrowed streams, shared request buffer capabilities and bounded body/setup pools,
   and the arrow runtime (`Network.Streaming.Classes`, with the arrows `Threads`, `Loop`,
   `Compiled` and `Delimited`), with one `Buffer` type for all memory.
-- **`resource-admission`:** private waiter delivery, shared deadlines and opaque FIFO
-  queues for independent resource pools.
 - **`native-pg-tls`:** TLS through [rustls-ffi](https://github.com/rustls/rustls-ffi)
   0.15, with libpq's `sslmode`, client certificates and SCRAM channel binding.
   It's a package of its own because it's the only one with C code, and it has
