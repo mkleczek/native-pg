@@ -127,6 +127,6 @@ test-suite cursors-spec
                       Database.PostgreSQL.Internal.Protocol.Codec.Cursor
                       Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
                       Database.PostgreSQL.Internal.Protocol.Codec.Payload
-  ghc-options:        -Wall -threaded -F -pgmF=skeletest-preprocessor
+  ghc-options:        -Wall -threaded -rtsopts "-with-rtsopts=-T" -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   build-depends:      base, bytestring, directions, streaming-io, skeletest >= 0.4.2 && < 0.5

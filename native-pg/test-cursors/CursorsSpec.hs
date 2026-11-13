@@ -16,11 +16,12 @@ import Data.Either (isRight)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int32, Int64)
 import Data.List (isPrefixOf)
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
 import Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Empty, Payload (..))
 import Foreign.Storable (peekByteOff)
+import GHC.Stats (allocated_bytes, getRTSStats)
 import Network.Directions.Memory
 import Network.Directions.Rows (Counter, adding, counted, newCounter, rowsChecksum, rowsWire, streamWire)
 import Network.Streaming.Buffer (Buffer, newBuffer)
@@ -32,6 +33,7 @@ import Network.Streaming.Reader
 import Network.Streaming.Threads
 import Network.Streaming.With (With (..), asks, withOnly)
 import Skeletest
+import System.Mem (performMajorGC)
 
 -- | The messages that some of the tests read: a ParseComplete, rows, and a
 -- CommandComplete.
@@ -53,6 +55,23 @@ spec = describe "cursors derived from the schema" $ do
     it "are the same when the buffer holds less than a row" $
       forM_ [maxBound, 7] $ \limit ->
         runAll foldRowsCursors (rowsWire 3) limit 16 `shouldReturn` replicate 3 (Right (rowsChecksum 3))
+
+  describe "the rows' program, run at one arrow" $ do
+    -- A cursor, a pair or a room that is built for each row shows as bytes for each row, and it is the program's
+    -- allocation, which a client of the library pays for every row it reads: how it grows with the rows is looked at.
+    -- The programs are run here at their arrow, as a client does, and not as a function of every arrow, which
+    -- GHC would not specialise.
+    xfail "a cursor is built for each row" $ it "allocates next to nothing for each row, with threads and with delimited" $ do
+      forM_
+        [ ("threads", runThreads . foldRowsCursors),
+          ("delimited", \counter reader -> fst <$> runDelimited (foldRowsCursors counter) reader)
+        ]
+        $ \(_name :: String, run) -> do
+          few <- allocatedBy run 2000
+          many <- allocatedBy run 52000
+          -- Setup is the same for both, and a Delimited part that gives way costs a few bytes for each row.
+          let perRow = fromIntegral (many - few) / 50000 :: Double
+          (perRow < 8) `shouldBe` True
 
   describe "a value larger than the buffer" $ do
     it "is read as pieces no larger than the buffer, which reassemble to the value" $
@@ -209,6 +228,20 @@ outcome = either (Left . told) Right
     told failure = case fromException failure of
       Just (CursorError what) -> "cursor error: " <> what
       Nothing -> "other: " <> show failure
+
+-- | The bytes that running the program over this many rows allocates (the rts needs -T).
+allocatedBy :: (Counter -> Reader Memory -> IO ()) -> Int -> IO Word64
+allocatedBy run rows = do
+  wire <- evaluate (rowsWire rows)
+  counter <- newCounter
+  performMajorGC
+  before <- allocated_bytes <$> getRTSStats
+  withReader wire maxBound 16384 (run counter)
+  -- The rts counts what was allocated when it collects.
+  performMajorGC
+  after <- allocated_bytes <$> getRTSStats
+  counted counter `shouldReturn` rowsChecksum rows
+  pure (after - before)
 
 -- | A buffer of the capacity, which the runs choose.
 bufferOf :: Int -> IO Buffer
