@@ -81,6 +81,7 @@ import Control.Exception (IOException, SomeAsyncException, SomeException, displa
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BSI
 import Data.Foldable (traverse_)
 import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
@@ -111,7 +112,8 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
     valueLength,
     valueView,
   )
-import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output)
+import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output, outputLength, outputWriter, runWriter)
+import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output (WriteResult (..), bytes)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import qualified Database.PostgreSQL.Internal.Protocol.Messages as Wire
 import Database.PostgreSQL.Types (FormatCode (..), Oid, Parameter (..))
@@ -275,6 +277,8 @@ data State = State
 data Tx = Tx
   { txConnection :: !Connection,
     txBegin :: !ByteString,
+    -- | BEGIN as the messages that carry it, rendered once for the isolation level and the mode.
+    txBeginOutput :: !Output,
     txReader :: !(Reader Socket),
     txCursor :: !(At ('PayloadChoice Replies) Socket),
     txLoan :: !Loan,
@@ -608,8 +612,8 @@ layout :: Tx -> Ending -> [Sent arr p] -> p -> IO (Either () Output)
 layout tx finality sent input = do
   s <- inspect tx
   user <- traverse (rendered input) sent
-  let starting = [(Entry (txBegin tx) True, plain (txBegin tx)) | not (stBegun s), not (null sent) || finality == Final]
-      closing = [(Entry text True, plain text) | finality == Final, let text = if stCondemned s then "ROLLBACK" else "COMMIT"]
+  let starting = [(Entry (txBegin tx) True, txBeginOutput tx) | not (stBegun s), not (null sent) || finality == Final]
+      closing = [(Entry text True, output) | finality == Final, let (text, output) = endingStatement (stCondemned s)]
   case starting <> user <> closing of
     [] -> pure (Left ())
     queued -> do
@@ -626,6 +630,29 @@ layout tx finality sent input = do
       Prepare {} -> notImplementedIO "prepare"
       ExecutePrepared {} -> notImplementedIO "executePrepared"
       Close _ -> notImplementedIO "closeStatement"
+
+-- | The statement that ends a transaction: ROLLBACK if it is condemned, else COMMIT, as its SQL, which the errors name, and
+-- the messages that carry it.
+endingStatement :: Bool -> (ByteString, Output)
+endingStatement condemned = if condemned then ("ROLLBACK", rollbackOutput) else ("COMMIT", commitOutput)
+
+-- | COMMIT and ROLLBACK as messages, rendered once, since they are the same for every transaction.
+commitOutput, rollbackOutput :: Output
+commitOutput = prerendered (statementOutput "COMMIT" [] [] [])
+rollbackOutput = prerendered (statementOutput "ROLLBACK" [] [] [])
+{-# NOINLINE commitOutput #-}
+{-# NOINLINE rollbackOutput #-}
+
+-- | The output rendered into bytes, which are copied where they are sent: for what is the same every time, so that it is
+-- not rendered each time. All of it is copied, and it is given room for all of it, so the writer always finishes.
+prerendered :: Output -> Output
+prerendered output = Output.bytes (BSI.unsafeCreate size render)
+  where
+    size = outputLength output
+    render pointer =
+      runWriter (outputWriter output) pointer size 0 >>= \case
+        Output.Finished _ -> pure ()
+        _ -> error "prerendered: an output that is not all copied"
 
 -- | The messages for an unnamed statement: Parse, Bind with the parameters, which says that the rows come in binary,
 -- and Execute.
@@ -654,13 +681,13 @@ transmit =
 
 -- | A statement of the transaction's own, as a pipeline of its own: ROLLBACK or COMMIT, read as the pipeline's
 -- statements are.
-alone :: (Runtime arr) => Bool -> With Tx arr ByteString ()
+alone :: (Runtime arr) => Bool -> With Tx arr (ByteString, Output) ()
 alone validating =
   moved
     >>> withTx
-      ( \tx text -> do
+      ( \tx (text, carrier) -> do
           s <- inspect tx
-          output <- evaluate (statementOutput text [] [] [] <> sync)
+          output <- evaluate (carrier <> sync)
           modify tx (const s {stPending = [Entry text True], stIndex = 0, stBase = 0, stRows = 0, stTags = [], stOwed = True, stSending = True})
           pure output
       )
@@ -674,7 +701,7 @@ cleanup =
   moved
     >>> drain False
     >>> withTx (\tx _ -> (\s -> if stStatus s /= idle then Right () else Left ()) <$> inspect tx)
-    >>> (returnA ||| (arr (const "ROLLBACK") >>> alone False))
+    >>> (returnA ||| (arr (const (endingStatement True)) >>> alone False))
     >>> withTx (\tx _ -> modify tx (\s -> s {stEnded = True}))
 
 -- | The byte of @I@, which the server's status is when it is idle.
@@ -692,7 +719,7 @@ finishing =
   where
     completing =
       drain True
-        >>> withTx (\tx _ -> (\s -> if stBegun s && not (stFinal s) then Right (if stCondemned s then "ROLLBACK" else "COMMIT") else Left ()) <$> inspect tx)
+        >>> withTx (\tx _ -> (\s -> if stBegun s && not (stFinal s) then Right (endingStatement (stCondemned s)) else Left ()) <$> inspect tx)
         >>> (returnA ||| alone True)
         >>> withTx
           ( \tx _ -> do
@@ -721,13 +748,15 @@ begin level mode =
     >>> now (\(loan, connection) -> either (\failure -> Left (loan, failure)) Right <$> try (open loan connection))
     >>> ((first release >>> now (\((), failure) -> throwIO (failure :: SomeException))) ||| returnA)
   where
+    -- BEGIN is rendered once for the program, when it is built, and not for each transaction.
+    !beginOutput = prerendered (statementOutput (beginning level mode) [] [] [])
     open loan connection = do
       reader <- newReader (sessionSocket (connectionSession connection)) (loanBuffer loan)
       state <- newIORef (State False False False False [] 0 0 0 [] Nothing False idle False False)
       epoch <- newIORef 0
       -- The last, since it can't be undone but by the failure of this.
       claim connection
-      pure (Tx connection (beginning level mode) reader (messages reader) loan state epoch)
+      pure (Tx connection (beginning level mode) beginOutput reader (messages reader) loan state epoch)
 
 -- | BEGIN, with the isolation level and the mode.
 beginning :: IsolationLevel -> Mode -> ByteString

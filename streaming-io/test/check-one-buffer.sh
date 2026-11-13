@@ -25,6 +25,8 @@ fi
 allow_list='
 streaming-io/src/Network/Streaming/Buffer.hs * the one buffer type
 streaming-io/src/Network/Streaming/Reader.hs create the copying atom: bytes makes an owned ByteString of a value
+native-pg/src/Database/PostgreSQL/Transaction.hs create BEGIN, COMMIT and ROLLBACK, rendered once into bytes that are copied where they are sent
+native-pg/src/Database/PostgreSQL/Transaction.hs unsafeCreate BEGIN, COMMIT and ROLLBACK, rendered once into bytes that are copied where they are sent
 native-pg-tls/src/Database/PostgreSQL/Tls/Internal.hs mallocForeignPtrBytes the C string with the name of the server, which rustls borrows
 '
 
