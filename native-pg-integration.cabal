@@ -44,6 +44,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Internal.Protocol.Messages.Parse
                       Database.PostgreSQL.Internal.Protocol.Messages.Startup
                       Database.PostgreSQL.Internal.Protocol.Messages.Types
+                      Database.PostgreSQL.Internal.Socket
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation
