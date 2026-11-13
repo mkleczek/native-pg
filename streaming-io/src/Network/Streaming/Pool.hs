@@ -86,7 +86,7 @@ urgently :: (Runtime arr) => arr a b -> arr a b
 urgently _ = notImplemented "urgently"
 
 newPool :: [conn] -> IO (Pool conn)
-newPool conns = Pool <$> newIORef (State (length conns) conns 0 IntMap.empty)
+newPool conns = Pool <$> (newIORef $! State (length conns) conns 0 IntMap.empty)
 
 -- | The connections that are free now.
 free :: Pool conn -> IO [conn]

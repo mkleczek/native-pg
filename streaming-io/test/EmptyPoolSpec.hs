@@ -37,27 +37,17 @@ onCompiled program = fst <$> runCompiled program ()
 spec :: Spec
 spec = describe "a pool made empty" $
   forM_ runners $ \(Runner name run) -> describe name $ do
-    spinsOn ["threads"] name $ it "gives nothing to a part that takes at once, when it was made of a list that is empty only at run time" $ do
+    it "gives nothing to a part that takes at once, when it was made of a list that is empty only at run time" $ do
       pool <- newPool =<< emptyAtRunTime
       within (run (now (\() -> takeNow pool 1))) `shouldReturn` Just Nothing
 
-    spins $ it "frees what a part releases, when it was made of []" $ do
+    it "frees what a part releases, when it was made of []" $ do
       pool <- newPool []
       within (run (arr (const [7 :: Int]) >>> now (releaseNow pool) >>> now (\() -> free pool))) `shouldReturn` Just [7]
 
     it "gives a part that checks out an item that another part releases, when it was made of []" $ do
       pool <- newPool []
       within (run (concurrently (checkout pool) (arr (const 7) >>> release pool))) `shouldReturn` Just (7 :: Int, ())
-
--- | The pool is made with its state still to be worked out, which compare-and-swap never matches.
-spins :: Spec -> Spec
-spins = xfail "a new pool holds its state unevaluated, and its first change spins"
-
--- | The same, under these arrows only: whether the first change spins depends on the code GHC makes for each.
-spinsOn :: [String] -> String -> Spec -> Spec
-spinsOn names name
-  | name `elem` names = spins
-  | otherwise = id
 
 -- | A list that is empty, and that nothing at compile time says is empty: the state of a pool that is made of it is
 -- built when the pool is made.
