@@ -24,6 +24,7 @@ module TestPrograms
     ordinary,
     withBuffers,
     notYet,
+    needs,
     smallBuffers,
     -- * Settings of the cluster's connections
     unixSettings,
@@ -88,7 +89,7 @@ module TestPrograms
 where
 
 import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
-import Control.Exception (Exception, fromException, throwIO)
+import Control.Exception (Exception, evaluate, fromException, throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
@@ -165,8 +166,12 @@ withBuffers settings runner program = newPool settings >>= \buffers -> runOn run
 smallBuffers :: BufferPoolSettings
 smallBuffers = BufferPoolSettings (positiveInt @16) (positiveInt @2) (positiveInt @1) (positiveInt @2)
 
--- | Marks every case of the spec as an expected failure: the v2 code is not there yet. The mark comes off as the
--- part that the group covers lands, and a case that then passes unexpectedly fails the suite.
+-- | Marks every case of the spec as an expected failure, for what it needs and the v2 code doesn't have yet. The mark
+-- comes off as the part that it waits for lands, and a case that then passes unexpectedly fails the suite.
+needs :: String -> Spec -> Spec
+needs what = xfail ("v2: " <> what <> " is not there yet")
+
+-- | The same, for a spec that waits for the whole of v2.
 notYet :: Spec -> Spec
 notYet = xfail "v2: not implemented"
 
@@ -411,7 +416,7 @@ measure = (, (0, 0)) ^>> foldPieces (\(bytes, pieces) chunk -> pure (bytes + BS.
 
 -- | The bytes of the stream, copied out of the views.
 copyOut :: (Runtime arr, Stream arr s) => arr s ByteString
-copyOut = (, []) ^>> foldPieces (\copies chunk -> pure (BS.copy chunk : copies)) >>^ (BS.concat . reverse)
+copyOut = (, []) ^>> foldPieces (\copies chunk -> (: copies) <$> evaluate (BS.copy chunk)) >>^ (BS.concat . reverse)
 
 -- | A source of pieces, then the end: a parameter that a test streams.
 newtype Chunks = Chunks (IORef [ByteString])

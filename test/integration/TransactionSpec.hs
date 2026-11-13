@@ -14,7 +14,8 @@
 -- Parameters are baked into the statements (@'valued'@). Where the input of the program carries them, "IntegrationSpec" has
 -- the cases.
 --
--- Every group is marked as an expected failure ('notYet') until the v2 code is there.
+-- A case that the v2 code can't pass yet is marked with what it needs ('needs'): the marks come off as the part that
+-- they wait for lands.
 module TransactionSpec (spec) where
 
 import Control.Arrow (arr, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
@@ -40,7 +41,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
       withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
       withSession body = run (session (unixSettings socketPath "postgres" Nothing) body)
 
-  notYet $ describe "ending" $ do
+  describe "ending" $ do
     it "commits" $
       withSession
         ( steps
@@ -114,7 +115,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
         `shouldReturn` ()
 
   -- The pipeline of 'Tx.Final' carries the COMMIT, so that the transaction is one flight to the server.
-  notYet $ describe "the final pipeline" $ do
+  describe "the final pipeline" $ do
     it "commits with the final pipeline" $
       withSession
         ( steps
@@ -165,7 +166,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
         )
         `shouldReturn` ()
 
-  notYet $ describe "pipelines" $ do
+  describe "pipelines" $ do
     it "runs a pipeline's statements in order, and gives their results" $
       withSession
         ( steps
@@ -299,7 +300,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
         )
         `shouldReturn` ()
 
-  notYet $ describe "prepared statements" $ do
+  needs "prepared statements" $ describe "prepared statements" $ do
     it "runs a statement prepared earlier on the connection by its name, without evaluating its SQL" $
       withSession
         ( steps

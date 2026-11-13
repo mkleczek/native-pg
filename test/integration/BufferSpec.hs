@@ -16,7 +16,8 @@
 -- set up again and again with two setup buffers has returned them, and a request that works with the smallest buffers
 -- needs no more.
 --
--- Every group is marked as an expected failure ('notYet') until the v2 code is there.
+-- A case that the v2 code can't pass yet is marked with what it needs ('needs'): the marks come off as the part that
+-- they wait for lands.
 module BufferSpec (spec) where
 
 import Control.Arrow (arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
@@ -69,11 +70,11 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
 
   -- Setting up a connection borrows from the setup buffers of the pool, which are apart from the request buffers. A wait
   -- for them is a wait of the arrow, so a cancellation reaches it.
-  notYet $ describe "connection setup" $ do
+  describe "connection setup" $ do
     it "authenticates with tiny setup buffers while the request's own is busy, and returns them" $
       tiny (thrice scram) `shouldReturn` Just ()
 
-    it "authenticates SCRAM over TLS with required binding and tiny setup buffers" $
+    needs "TLS" $ it "authenticates SCRAM over TLS with required binding and tiny setup buffers" $
       tiny (thrice ((tlsSettings port "native_pg_scram" (Just "scram secret")) {connectChannelBinding = ChannelBindingRequire})) `shouldReturn` Just ()
 
     -- A connection keeps nothing of the setup storage: what it learned there is its own, however the storage is used after.
@@ -102,7 +103,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
     -- v1 closed a TLS host that was unsuitable because its session was read-only, and tried the next, with the same pair
     -- of setup buffers. v2's connection string has one set of options for all its hosts, so the first host is unsuitable
     -- by another reason: the server rejects its role over TLS (pg_hba.conf), and the Unix-domain socket takes it.
-    it "closes a host that rejects the connection and tries the next one with the same setup buffers" $ do
+    needs "TLS and host selection" $ it "closes a host that rejects the connection and tries the next one with the same setup buffers" $ do
       settings <- settingsOf ("host=127.0.0.1," <> Char8.pack (takeDirectory socketPath) <> " port=" <> Char8.pack (show port) <> " dbname=postgres user=native_pg_plaintext sslmode=require")
       tiny
         ( withinFor (secs 10) $
@@ -118,7 +119,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       tiny (withinFor (secs 10) (steps [session settings (arr (hostName . PG.connectedHost . fst)) `yields` takeDirectory socketPath, connects scram `yields` Right [1]]))
         `shouldReturn` Just ()
 
-    it "reports failed hosts in order and returns the setup buffers" $ do
+    needs "host selection" $ it "reports failed hosts in order and returns the setup buffers" $ do
       let missing = ["/missing-native-pg-first", "/missing-native-pg-second"]
       settings <- settingsOf ("host=" <> Char8.intercalate "," (map Char8.pack missing) <> " dbname=postgres user=postgres")
       tiny
@@ -130,7 +131,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
         )
         `shouldReturn` Just ()
 
-    it "asks a server that doesn't report its attributes at startup, with setup buffers" $
+    needs "target_session_attrs" $ it "asks a server that doesn't report its attributes at startup, with setup buffers" $
       withOlderServer $ \scriptedPort -> do
         settings <-
           settingsOf ("host=127.0.0.1 user=postgres dbname=postgres sslmode=disable target_session_attrs=read-write port=" <> Char8.pack (show scriptedPort))
@@ -153,7 +154,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
 
   -- A request works from one primary buffer, and what it borrows besides. Whatever it sends and receives passes
   -- through them, so the smallest ones are enough.
-  notYet $ describe "a request's buffers" $ do
+  needs "TLS" $ describe "a request's buffers" $ do
     -- v1 had a workspace of four bytes and "owned metadata" for what did not fit it. A column that v2 decodes in place has
     -- to fit the buffer, and one that does not is read as a field, so the smallest buffer that takes a request is the largest
     -- column that it decodes in place.

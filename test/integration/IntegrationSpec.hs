@@ -1,4 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -14,7 +15,8 @@
 -- one they come from. Every case is written once, as a program for any arrow that has the capabilities of
 -- 'Runtime', and runs under each runner of "TestPrograms".
 --
--- Every group is marked as an expected failure ('notYet') until the v2 code is there.
+-- A case that the v2 code can't pass yet is marked with what it needs ('needs'): the marks come off as the part that
+-- they wait for lands.
 module IntegrationSpec (spec) where
 
 import Control.Arrow (arr, returnA, second, (&&&), (>>>), (>>^))
@@ -68,7 +70,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       unix = unixSettings socketPath
       encryptedAs = tlsSettings port
 
-  notYet $ describe "connect" $ do
+  describe "connect" $ do
     it "connects a trusted user and reports the server's parameters" $ do
       info <- run (session (unix "postgres" Nothing) (arr (PG.serverInfo . fst)))
       lookup "server_version" (PG.serverParameters info) `shouldSatisfy` P.just P.anything
@@ -95,10 +97,12 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         `shouldBe` (if maybe False (>= 18) major then protocolVersion3_2 else protocolVersion3_0)
 
   -- A connection is closed when its scope ends. Closing it earlier is allowed, and so is closing it again.
-  notYet $ describe "close" $
+  describe "close" $
     forM_ [("without TLS", unix "postgres" Nothing), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
-      describe label $ do
-        it "rejects every operation after closing" $
+      (if label == "with TLS" then needs "TLS" else id) $ describe label $ do
+        -- What listens needs the notifications, and over TLS everything needs TLS.
+        let listening = if label == "with TLS" then id else needs "notifications"
+        listening $ it "rejects every operation after closing" $
           run $
             session connecting $
               steps
@@ -131,7 +135,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 ]
         -- The cancellation rule: v1 left the session unusable after a cancelled wait for a notification, but the reader
         -- is at a message boundary then and nothing is half sent or expected, so v2 leaves the connection usable.
-        it "keeps a connection usable when a wait for a notification is cancelled" $
+        listening $ it "keeps a connection usable when a wait for a notification is cancelled" $
           run $
             session connecting $
               steps
@@ -159,7 +163,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 ]
 
   -- The binding data that SCRAM-PLUS signs comes from the TLS link. These cases replace it.
-  notYet $ describe "channel-binding data from TLS setup" $ do
+  needs "TLS" $ describe "channel-binding data from TLS setup" $ do
     let suppliedBinding supplied mode user =
           PGInternal.withEndPointOverride supplied ((encryptedAs user (Just "scram secret")) {connectChannelBinding = mode})
         bindingFailure = Just (Left "unsupported certificate hash")
@@ -187,7 +191,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         session (unix "postgres" Nothing) $
           cancelling (suppliedBinding bindingFailure ChannelBindingRequire "postgres")
 
-  notYet $ describe "connection strings" $ do
+  describe "connection strings" $ do
     let directory = takeDirectory socketPath
         local extra = "host=" <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres " <> extra
         tcp extra = "host=127.0.0.1 port=" <> Char8.pack (show port) <> " dbname=postgres " <> extra
@@ -199,12 +203,12 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         ("postgresql:///postgres?host=" <> Char8.pack directory <> "&port=" <> Char8.pack (show port))
         (arr (hostName . PG.connectedHost . fst) &&& selectOne)
         `shouldReturn` (directory, Right [1])
-    it "tries the hosts in order" $
+    needs "host selection" $ it "tries the hosts in order" $
       withString
         ("host=/nonexistent," <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres")
         (arr (hostName . PG.connectedHost . fst))
         `shouldReturn` directory
-    it "words each host's failure as libpq does" $
+    needs "host selection" $ it "words each host's failure as libpq does" $
       connectFailure "host=/nonexistent-1,/nonexistent-2"
         `shouldReturn` intercalate
           "\n"
@@ -218,7 +222,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       case result of
         Left (ConnectFailure [(host, ConnectionRejected _)]) -> hostName host `shouldBe` directory
         _ -> failTest "expected the rejection of the one host, in a list of one"
-    it "reports the hosts that failed, in order" $ do
+    needs "host selection" $ it "reports the hosts that failed, in order" $ do
       settings <- settingsOf "host=/missing-native-pg-first,/missing-native-pg-second dbname=postgres"
       result <- run (connectedTo settings (arr (const ())))
       case result of
@@ -231,7 +235,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "names the application, with the fallback name if none is given" $ do
       withString (local "fallback_application_name=fallback") applicationName `shouldReturn` Right ["fallback"]
       withString (local "fallback_application_name=fallback application_name=app") applicationName `shouldReturn` Right ["app"]
-    it "connects only to a server with the session attributes asked for" $ do
+    needs "target_session_attrs" $ it "connects only to a server with the session attributes asked for" $ do
       let readOnly = "options='-c default_transaction_read_only=on' "
       withString (local (readOnly <> "target_session_attrs=read-only")) (arr (const ())) `shouldReturn` ()
       connectFailure (local (readOnly <> "target_session_attrs=read-write"))
@@ -243,13 +247,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       withString (local "target_session_attrs=prefer-standby") (arr (const ())) `shouldReturn` ()
     describe "with TLS" $ do
       let encryptedBy string = withString (tcp string) encrypted
-      it "encrypts with sslmode=require, without verifying the server" $
+      needs "TLS" $ it "encrypts with sslmode=require, without verifying the server" $
         encryptedBy "sslmode=require" `shouldReturn` Right [True]
-      it "sends a large batch while reading its responses over TLS" $
+      needs "TLS" $ it "sends a large batch while reading its responses over TLS" $
         withString (tcp "sslmode=require") batchWhileReading `shouldReturn` Just (Right (1000000, 2000000))
       it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $
         withString (local "sslmode=require") encrypted `shouldReturn` Right [False]
-      it "fails if the server doesn't take TLS" $
+      needs "TLS" $ it "fails if the server doesn't take TLS" $
         withPlaintextServer $ \plaintext ->
           connectFailure ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
             `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show plaintext <> " failed: server does not support SSL, but SSL was required")
@@ -258,39 +262,39 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         result <- run (connectedTo settings {connectTlsClient = Nothing} (arr (const ())))
         either displayException (const "connected") result
           `shouldBe` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in")
-      it "encrypts by default, with sslmode=prefer, as libpq does" $
+      needs "TLS" $ it "encrypts by default, with sslmode=prefer, as libpq does" $
         encryptedBy "" `shouldReturn` Right [True]
       it "falls back to plaintext with sslmode=prefer when the server rejects TLS" $
         encryptedBy "user=native_pg_plaintext" `shouldReturn` Right [False]
-      it "tries plaintext first with sslmode=allow, then TLS" $ do
+      needs "TLS" $ it "tries plaintext first with sslmode=allow, then TLS" $ do
         encryptedBy "sslmode=allow user=native_pg_plaintext" `shouldReturn` Right [False]
         encryptedBy "sslmode=allow" `shouldReturn` Right [True]
       it "connects in plaintext with sslmode=prefer without a TLS client, as libpq without TLS does" $ do
         settings <- settingsOf (tcp "user=native_pg_plaintext")
         run (session settings {connectTlsClient = Nothing} encrypted) `shouldReturn` Right [False]
-      it "verifies the server's certificate and name with sslmode=verify-full" $ do
+      needs "TLS" $ it "verifies the server's certificate and name with sslmode=verify-full" $ do
         encryptedBy ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1")
           `shouldReturn` Right [True]
         encryptedBy ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt")) `shouldReturn` Right [True]
-      it "refuses a server whose certificate no root signed, or that has another name" $ do
+      needs "TLS" $ it "refuses a server whose certificate no root signed, or that has another name" $ do
         let at host = "connection to server at \"" <> host <> "\" (127.0.0.1), port " <> show port <> " failed: "
         connectFailure (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "other-ca.crt") <> " host=localhost hostaddr=127.0.0.1"))
           `shouldReturn` (at "localhost" <> "SSL error: invalid peer certificate: UnknownIssuer")
         connectFailure (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=other.example hostaddr=127.0.0.1"))
           `shouldReturn` (at "other.example" <> "SSL error: invalid peer certificate: NotValidForName")
-      it "verifies against the system's root certificates with sslrootcert=system" $ do
+      needs "TLS" $ it "verifies against the system's root certificates with sslrootcert=system" $ do
         failure <- connectFailure (tcp "sslmode=verify-full sslrootcert=system host=localhost hostaddr=127.0.0.1")
         -- The platforms' verifiers word it differently.
         failure `shouldSatisfy` P.hasPrefix ("connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: ")
-      it "needs the root certificate file, as libpq does" $
+      needs "TLS" $ it "needs the root certificate file, as libpq does" $
         connectFailure (tcp "sslmode=verify-full sslrootcert=/nonexistent/root.crt host=localhost hostaddr=127.0.0.1")
           `shouldReturn` ( "connection to server at \"localhost\" (127.0.0.1), port "
                              <> show port
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
-      it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $
+      needs "TLS" $ it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $
         encryptedBy "sslnegotiation=direct sslmode=require" `shouldReturn` Right [True]
-      it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
+      needs "TLS" $ it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
         settings <- settingsOf (tcp "sslmode=require")
         withPlaintextServer $ \plaintext -> do
           refusing <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
@@ -303,10 +307,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                       TlsFailure reason -> reason `shouldBe` "server does not support SSL, but SSL was required"
                       other -> failTest ("expected TlsFailure, got " <> show other)
                 ]
-      it "binds SCRAM to TLS with channel_binding=require" $
+      needs "TLS" $ it "binds SCRAM to TLS with channel_binding=require" $
         withString (tcp "user=native_pg_scram password='scram secret' sslmode=require channel_binding=require") currentUser
           `shouldReturn` Right ["native_pg_scram"]
-      it "fails as libpq does with channel_binding=require when the server doesn't bind SCRAM to TLS" $ do
+      needs "TLS" $ it "fails as libpq does with channel_binding=require when the server doesn't bind SCRAM to TLS" $ do
         let failure at reason = "connection to server " <> at <> " failed: " <> reason
             socket = "on socket \"" <> socketPath <> "\""
             tlsAt = "at \"127.0.0.1\", port " <> show port
@@ -316,12 +320,12 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           `shouldReturn` failure socket "channel binding required but not supported by server's authentication request"
         connectFailure (tcp "sslmode=require channel_binding=require")
           `shouldReturn` failure tlsAt "channel binding required, but server authenticated client without channel binding"
-      it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do
+      needs "TLS" $ it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do
         let version extra = withString (tcp ("sslmode=require " <> extra)) tlsVersion
         version "" `shouldReturn` Right ["TLSv1.3"]
         version "ssl_max_protocol_version=TLSv1.2" `shouldReturn` Right ["TLSv1.2"]
         version "ssl_min_protocol_version=TLSv1 ssl_max_protocol_version=TLSv1.2" `shouldReturn` Right ["TLSv1.2"]
-      it "checks revocation lists, from sslcrl or sslcrldir" $ do
+      needs "TLS" $ it "checks revocation lists, from sslcrl or sslcrldir" $ do
         let verified extra = tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1 " <> extra)
             revoked = "connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: invalid peer certificate: Revoked"
         withString (verified ("sslcrl=" <> Char8.pack (certificate "empty.crl"))) (arr (const ())) `shouldReturn` ()
@@ -333,13 +337,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           connectFailure (verified ("sslcrldir=" <> Char8.pack lists)) `shouldReturn` revoked
         -- As libpq, a missing file is no list.
         withString (verified "sslcrl=/nonexistent/root.crl") (arr (const ())) `shouldReturn` ()
-      it "authenticates with a client certificate" $ do
+      needs "TLS" $ it "authenticates with a client certificate" $ do
         withKeyCopy ownerReadMode $ \key -> do
           let certified = "user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key
           withString (tcp certified) currentUser `shouldReturn` Right ["native_pg_certificate"]
         failure <- connectFailure (tcp "user=native_pg_certificate sslmode=require sslcert=/nonexistent/client.crt sslkey=/nonexistent/client.key")
         failure `shouldSatisfy` P.hasInfix "connection requires a valid client certificate"
-      it "needs a client certificate's key, readable only by its owner, as libpq does" $ do
+      needs "TLS" $ it "needs a client certificate's key, readable only by its owner, as libpq does" $ do
         let certified key = tcp ("user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key)
             at = "connection to server at \"127.0.0.1\", port " <> show port <> " failed: "
         connectFailure (certified "/nonexistent/client.key")
@@ -356,7 +360,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         elapsed <- subtract started <$> getMonotonicTime
         elapsed `shouldSatisfy` (P.gte 2 P.&& P.lt 5)
 
-  notYet $ describe "execute" $ do
+  describe "execute" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
     it "runs an unprepared statement with parameters" $
@@ -376,7 +380,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "reads many rows, one at a time" $
       withSession (transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT generate_series(1, 10000)" (single @_ @Int32))) countRows)
         `shouldReturn` Right 10000
-    it "runs a prepared statement until it's closed" $
+    needs "prepared statements" $ it "runs a prepared statement until it's closed" $
       withSession
         ( steps
             [ preparing "add_one" (addOneWith "0") `yields` Right (),
@@ -395,7 +399,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    it "streams a parameter from its source" $ do
+    needs "streamed parameters" $ it "streams a parameter from its source" $ do
       let payload = BS.concat (replicate 4096 "0123456789abcdef")
           chunks = 128
       withSession
@@ -409,7 +413,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           pieces = concatMap (\piece -> [BS.take 100 piece, BS.drop 100 piece]) (replicate 128 payload)
       withSession (query (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [piecesText pieces]) (single @_ @Bool)))
         `shouldReturn` Right [True]
-    it "streams a parameter to a prepared statement, whether it returns rows or not" $
+    needs "prepared statements" $ it "streams a parameter to a prepared statement, whether it returns rows or not" $
       withSession
         ( steps
             [ ddl "CREATE TEMPORARY TABLE streamed (value text)" `yields` Right (),
@@ -420,7 +424,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $
+    needs "prepared statements" $ it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $
       withSession
         ( steps
             [ ddl "SET statement_timeout = '200ms'" `yields` Right (),
@@ -431,7 +435,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    it "sends a batch while reading its results, as the server answers before reading all of it" $
+    needs "a connection that sends and reads at once" $ it "sends a batch while reading its results, as the server answers before reading all of it" $
       withSession batchWhileReading `shouldReturn` Just (Right (1000000, 2000000))
     -- The cancellation rule: the reading program is cancelled at its wait while the request side has not finished sending
     -- the 2 MB parameter, so something is half sent, and the connection is broken and closed rather than drained.
@@ -483,7 +487,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
 
-  notYet $ describe "decoding" $ do
+  describe "decoding" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
         decoded :: (forall arr. (Runtime arr) => Rows arr row) -> ByteString -> IO (Either QueryError [row])
@@ -492,7 +496,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       decoded numbersRow "SELECT 1::int2, -2::int4, 3::int8, true, 1.5::float4, 2.5::float8, 3.25::numeric"
         `shouldReturn` Right [(1, -2, 3, True, 1.5, 2.5, 3.25)]
     it "decodes text, bytea, char, uuid and json" $
-      decoded textsRow "SELECT 'héllo'::text, '\\xdeadbeef'::bytea, 'x'::char, '00000000-0000-0000-0000-000000000001'::uuid, '{\"a\":1}'::json, '{\"a\":1}'::jsonb"
+      decoded textsRow "SELECT 'h\195\169llo'::text, '\\xdeadbeef'::bytea, 'x'::char, '00000000-0000-0000-0000-000000000001'::uuid, '{\"a\":1}'::json, '{\"a\":1}'::jsonb"
         `shouldReturn` Right [("héllo", BS.pack [0xde, 0xad, 0xbe, 0xef], 'x', UUID.fromWords 0 0 0 1, Json "{\"a\":1}", Jsonb "{\"a\": 1}")]
     it "decodes dates, timestamps and intervals" $
       decoded (triple @_ @Day @UTCTime @DiffTime) "SELECT '2024-01-02'::date, '2024-01-02 03:04:05+00'::timestamptz, '2 hours'::interval"
@@ -529,7 +533,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` Right (200, 1000000)
 
-  notYet $ describe "errors" $ do
+  describe "errors" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
     it "reports a missing relation with its position in the query" $ do
@@ -565,7 +569,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
 
-  notYet $ describe "cancel" $
+  needs "cancel" $ describe "cancel" $
     it "cancels a running statement, and the connection stays usable" $
       run
         ( session (unix "postgres" Nothing) $
@@ -580,7 +584,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
 
   -- A program that is cancelled leaves its connection usable if and only if nothing is owed on it in either direction: no
   -- reply is still expected, and nothing is half sent.
-  notYet $ describe "the cancellation rule" $ do
+  describe "the cancellation rule" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
     it "breaks the connection when a statement in flight is cancelled, and doesn't drain its answer" $
@@ -591,7 +595,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    it "keeps the connection usable when a wait for a notification is cancelled, and delivers a later one" $
+    needs "notifications" $ it "keeps the connection usable when a wait for a notification is cancelled, and delivers a later one" $
       run
         ( session (unix "postgres" Nothing) $
             alsoOn (unix "postgres" Nothing) $
@@ -613,7 +617,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
 
-  notYet $ describe "notifications" $ do
+  needs "notifications" $ describe "notifications" $ do
     it "delivers a notification from another connection" $
       run
         ( session (unix "postgres" Nothing) $
@@ -657,7 +661,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
 
-  notYet $ describe "snippets" $
+  describe "snippets" $
     it "sends parameters the server reads as their types" $ do
       let snippet =
             "SELECT "
@@ -678,7 +682,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         `shouldReturn` Right [(42, "a,zażółć", "1", "[1, 2]", True)]
 
   -- A parameter stream that breaks its promise leaves the protocol in a state nobody can continue from.
-  notYet $ describe "execute (failures)" $ do
+  needs "streamed parameters" $ describe "execute (failures)" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
     it "breaks the connection when a parameter stream is shorter than declared" $
@@ -865,7 +869,10 @@ consumeSlowly =
     -- the socket pushes back on the server. The pieces are views, no larger than the pool's buffers of 1 KiB.
     step (count, received, small, valid, peak, baseline) piece = do
       peak' <- if count `mod` 256 == 255 then threadDelay 2000 *> (max peak <$> liveBytes) else pure peak
-      pure (count + 1, received + BS.length piece, small && BS.length piece <= 1024, valid && BS.all (== 120) piece, peak', baseline)
+      -- The piece is looked at now: it is a view, and the bytes it is of are the next piece's once it is received.
+      let !small' = small && BS.length piece <= 1024
+          !valid' = valid && BS.all (== 120) piece
+      pure (count + 1, received + BS.length piece, small', valid', peak', baseline)
 
 -- | Live heap bytes after a major collection.
 liveBytes :: IO Int
