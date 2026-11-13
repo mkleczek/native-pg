@@ -1,0 +1,20 @@
+cabal-version: 3.0
+name: v2-slice
+version: 0.1.0.0
+synopsis: PostgREST's request shape served on fulmen and native-pg v2, to measure the runtime
+description: A server that answers GET /rows_16k and GET /rows_1m with the one JSON value of
+             select json_agg(t) from the table, streamed from the database's reply to the client's
+             socket without a copy, and GET /metrics with the bytes the runtime allocated. It is a
+             client of the libraries as PostgREST will be, and it is built for v2compare
+             (data-api-e2e's load/experiments/v2compare), which measures it against postgrestream.
+license: AGPL-3.0-or-later
+build-type: Simple
+
+-- The flags of the run time (the cores, the nursery, -T for the allocation counter) are not defaults in the binary:
+-- they are given with GHCRTS, as for postgrestream.
+executable v2-slice
+  default-language: GHC2021
+  hs-source-dirs: app
+  main-is: Main.hs
+  ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively
+  build-depends: base, bytestring, fulmen, native-pg, network, streaming-io
