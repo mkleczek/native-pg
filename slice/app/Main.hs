@@ -27,8 +27,9 @@
 module Main (main) where
 
 import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Concurrent (rtsSupportsBoundThreads)
 import Control.Exception (bracket)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
@@ -263,6 +264,9 @@ main = do
   -- (the other runners have one core, which is all of them), and a buffer of the pool for each, since a request holds one.
   let runningCores = case optRuntime options of Delimited -> optCores options; _ -> 1
       perCore = (optConnections options + runningCores - 1) `div` runningCores
+  -- The non-threaded run time (-f-threaded) has one OS thread for all the cores of delimited, and a core that waits in its poller
+  -- holds it: the others would not run.
+  when (not rtsSupportsBoundThreads && runningCores > 1) $ die "this build is for the non-threaded run time: delimited takes --cores 1"
   -- The buffers of requests in flight, a reserve for the second loan of a request (the head of a response, while its
   -- transaction holds the first), and the buffers that a connection is set up with, which a pool of connections has of
   -- its own as well.
