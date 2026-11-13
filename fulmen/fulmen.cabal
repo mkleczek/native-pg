@@ -17,17 +17,18 @@ library
                    Network.Fulmen.Request
                    Network.Fulmen.Response
   other-modules: Network.Fulmen.Internal
-                 Network.Fulmen.Internal.Bytes
-                 Network.Fulmen.Internal.Head
-                 Network.Fulmen.Internal.Date
-                 Network.Fulmen.Internal.Response
-                 Network.Fulmen.Internal.Body
                  Network.Fulmen.Internal.Accept
+                 Network.Fulmen.Internal.Body
+                 Network.Fulmen.Internal.Bytes
+                 Network.Fulmen.Internal.Date
+                 Network.Fulmen.Internal.Head
+                 Network.Fulmen.Internal.Response
+                 Network.Fulmen.Internal.Serve
   build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, network >=3.1 && <3.3, streaming-io
 
 -- The HTTP/1.1 conformance cases, which are data of bytes in and bytes out, run against a
--- server that the suite starts for each case. Every area of them is marked as an expected
--- failure until the server is there.
+-- server that the suite starts for each case. The cases that need a part of the server that is
+-- not there yet are marked as expected failures.
 test-suite fulmen-conformance
   type: exitcode-stdio-1.0
   default-language: GHC2021

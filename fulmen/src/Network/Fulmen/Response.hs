@@ -1,6 +1,6 @@
 -- | Answering: the head, which says how long the body is, and the body, which
--- is sent as the views that it is given. The steps are stubs, which fail with
--- 'Network.Streaming.NotImplemented.NotImplemented' until the server is there.
+-- is sent as the views that it is given. The head is held until the first of the body, so that they go out in one
+-- write.
 module Network.Fulmen.Response
   ( Status (..),
     ResponseHeaders,
@@ -12,33 +12,22 @@ module Network.Fulmen.Response
   )
 where
 
+import Control.Arrow ((^>>))
 import Data.ByteString (ByteString)
-import Network.Fulmen.Internal (Answering, Call)
-import Network.Streaming.Classes (Runtime)
-import Network.Streaming.NotImplemented (notImplemented)
+import Network.Fulmen.Internal (Answering (..), Call (..))
+import Network.Fulmen.Internal.Response (Length (..), ResponseHeaders, Status (..), begin, transmit)
+import Network.Streaming.Classes (Effect (..), Runtime)
 
--- | A status code.
-newtype Status = Status Int
-  deriving (Eq, Ord, Show)
-
--- | The header fields of a response, in the order they are sent, besides those
--- that the server adds: @Date@, @Server@, @Connection@ and the framing.
-type ResponseHeaders = [(ByteString, ByteString)]
-
--- | How long the response's body is: declared, or not known, which is sent
--- chunked.
-data Length = Known Int | Unknown
-  deriving (Eq, Show)
-
--- | Sends the head of the response. A response to a request whose method or
--- status forbids a body has none, whatever the length says.
+-- | Says how the request is answered: the head is sent with the first of the body, or at the end of the response. A
+-- response to a request whose method or status forbids a body has none, whatever the length says, and a
+-- 'Known' length that the body doesn't have ends the connection.
 respond :: (Runtime arr) => arr (Call, (Status, ResponseHeaders, Length)) Answering
-respond = notImplemented "respond"
+respond = now (\(Call _ _ exchange, response) -> Answering exchange <$ begin exchange response)
 
 -- | Sends the pieces of the body, in order: views go straight to the write.
 send :: (Runtime arr) => arr (Answering, [ByteString]) ()
-send = notImplemented "send"
+send = (\(Answering exchange, pieces) -> (exchange, (pieces, False))) ^>> transmit
 
 -- | Ends the response, after the last of its body.
 finish :: (Runtime arr) => arr Answering ()
-finish = notImplemented "finish"
+finish = (\(Answering exchange) -> (exchange, ([], True))) ^>> transmit

@@ -11,7 +11,8 @@
 -- Each case is run under each runner of the arrow runtime. A server that stops while a case runs fails the case at once,
 -- with what it stopped with, so that a server that is not there yet is told from one that answers wrongly.
 --
--- Every area of cases is marked as an expected failure until the server is there.
+-- A case that needs a part of the server that is not there yet is marked as an expected failure, and the mark comes
+-- off when the part lands.
 module ConformanceSpec (spec) where
 
 import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
@@ -40,18 +41,57 @@ import Network.Streaming.Delimited (runDelimited)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Threads (runThreads)
 import Skeletest
+import System.Timeout (timeout)
 
 spec :: Spec
-spec = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $
+spec = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
   forM_ [minBound .. maxBound] $ \area ->
     case filter ((== area) . caseArea) cases of
       [] -> pure ()
-      inArea -> notYet $ describe (areaTitle area) $ forM_ inArea $ \c -> it (caseName c) (runCase runner c)
+      inArea -> describe (areaTitle area) $ forM_ inArea $ \c -> marked c $ it (caseName c) (runCase runner c)
+  it "serves connections one after another, each closed by its client, in one run of the server" (oneAfterAnother runner)
 
--- | Marks every case of the area as an expected failure: the server is not there yet. The mark comes off as the part
--- that the area covers lands, and a case that then passes unexpectedly fails the suite.
-notYet :: Spec -> Spec
-notYet = xfail "v2: not implemented"
+-- | Marks a case that is expected to fail, and says why. A case that then passes unexpectedly fails the suite.
+marked :: Case -> Spec -> Spec
+marked c = maybe id xfail (expectedFailure c)
+
+-- | Why a case is expected to fail, if it is: it needs a part of the server that is not there yet. Chunked request
+-- bodies, @Expect: 100-continue@ and the timeouts are step 3.
+expectedFailure :: Case -> Maybe String
+expectedFailure c
+  | caseName c `elem` served = Nothing
+  | caseArea c == AChunked || caseName c `elem` needingChunkedBodies = Just "chunked request bodies are not there yet (step 3)"
+  | caseArea c == AExpect = Just "Expect: 100-continue is not there yet (step 3)"
+  | caseArea c == ATimeouts = Just "the client timeout is not there yet (step 3)"
+  | otherwise = Nothing
+
+-- | The cases of the areas that are not there yet that pass all the same: the server doesn't wait for a client
+-- that sends its body at once, or before the timeout.
+served :: [String]
+served =
+  [ "a client that sends the body without waiting gets the answer, with or without 100 Continue",
+    "a handler that ignores the body of an expecting request does not leave the connection in limbo",
+    "an HTTP/1.0 request with Expect: 100-continue and its body is answered",
+    "a body that arrives slowly but within the timeout is read in full"
+  ]
+
+-- | The cases of the other areas that send a chunked request body that is to be decoded.
+needingChunkedBodies :: [String]
+needingChunkedBodies =
+  [ "a chunked body over the limit is answered 413",
+    "a chunked body exactly at the limit is echoed",
+    "the coding \"chunked \" (trailing space) frames a real chunked body",
+    "the coding \"chunked\" followed by a tab frames a real chunked body",
+    "the coding \"chunked,\" (empty element after) frames a real chunked body",
+    "the coding \", chunked\" (empty element before) frames a real chunked body",
+    "a small chunked body the handler ignores is drained and the next request answered",
+    "non-pipelining, chunked body, read (Echo)",
+    "non-pipelining, chunked body, ignore (Ignore)",
+    "pipelining, chunked body, read (Echo)",
+    "pipelining, chunked body, ignore (Ignore)",
+    "pipelined requests of different kinds are answered in order",
+    "a chunked request body is echoed as it arrives, before the last chunk"
+  ]
 
 -- * Runners
 
@@ -168,6 +208,33 @@ runCase (Runner _ runServer) c = do
     stopped <- newEmptyMVar
     bracket (forkFinally (runServer (settingsOf (caseSettings c) accepting pool) (handling (caseHandler c)) cores) (putMVar stopped)) killThread $ \_ ->
       withClient port $ \client -> exchange c client stopped
+
+-- | Connections one after another, each with one request and closed by its client, in one run of the server. The server's
+-- sockets get the numbers of those it closed before, and its waits on them must not be lost.
+oneAfterAnother :: Runner -> IO ()
+oneAfterAnother (Runner _ runServer) = do
+  pool <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+    Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen accepting 128
+    port <- Socket.socketPort accepting
+    cores <- Fulmen.newCores 1
+    stopped <- newEmptyMVar
+    bracket (forkFinally (runServer (Fulmen.defaultSettings accepting pool) (handling (Fixed 200 [] "ok")) cores) (putMVar stopped)) killThread $ \_ -> do
+      answers <- timeout 20000000 (mapM (const (once port)) [1 .. 30 :: Int])
+      fmap (all answered) answers `shouldBe` Just True
+  where
+    -- One connection: it connects, waits a little so that the server waits for its input, sends a request, reads the
+    -- answer and closes.
+    once port = bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
+      Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1)))
+      threadDelay 10000
+      SocketBytes.sendAll sock "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+      readAnswer sock B.empty
+    readAnswer sock sofar
+      | "\r\n\r\nok" `B.isSuffixOf` sofar = pure sofar
+      | otherwise = SocketBytes.recv sock 4096 >>= \bytes -> if B.null bytes then pure sofar else readAnswer sock (sofar <> bytes)
+    answered answer = "HTTP/1.1 200" `B.isPrefixOf` answer && "\r\n\r\nok" `B.isSuffixOf` answer
 
 -- | The settings of the server: the defaults, and the case's where it names any.
 settingsOf :: Settings -> Socket -> BufferPool -> Fulmen.Settings

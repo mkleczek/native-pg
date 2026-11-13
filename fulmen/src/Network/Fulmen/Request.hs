@@ -1,6 +1,4 @@
--- | The request, and the body that it arrives with. Reading the body is a stub,
--- which fails with 'Network.Streaming.NotImplemented.NotImplemented' until the
--- server is there.
+-- | The request, and the body that it arrives with.
 module Network.Fulmen.Request
   ( Request (..),
     Method (..),
@@ -37,4 +35,4 @@ type Headers = [(ByteString, ByteString)]
 
 -- | The body of the call.
 body :: (Arrow arr) => arr Call Body
-body = arr (\(Call _ requestBody) -> requestBody)
+body = arr (\(Call _ requestBody _) -> requestBody)
