@@ -51,6 +51,7 @@ test-suite streaming-io-spec
   main-is: Main.hs
   other-modules: ListPrefixSpec
                  DescriptorsSpec
+                 GroupCostSpec
                  LoansSpec
                  LoansTestSupport
                  PoolSpec
@@ -91,6 +92,7 @@ test-suite streaming-io-spec
                  StepCostSpec
                  TimeSpec
                  WithSpec
-  ghc-options: -Wall -threaded -rtsopts -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  -- -T counts the live heap that GroupCostSpec reads.
+  ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-T" -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, containers, network, stm, streaming-io, skeletest >=0.4.2 && <0.5
