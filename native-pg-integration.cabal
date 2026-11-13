@@ -89,3 +89,67 @@ test-suite native-pg-integration
                     , uuid              >= 1.3 && < 2
   if os(windows)
     buildable: False
+
+-- What a request costs over a Unix-domain socket, through a pool: transactions and bytes allocated for each, under
+-- each arrow, for a statement that gives one number and for one that gives a field of 16 KiB and of 1 MiB. It starts a
+-- cluster of its own, as the integration tests do. Run it with @cabal bench native-pg-integration@.
+benchmark native-pg-bench
+  default-language: GHC2021
+  default-extensions: QuasiQuotes
+  type: exitcode-stdio-1.0
+  hs-source-dirs: test/integration native-pg/src
+  other-modules:      Database.PostgreSQL.Connection
+                      Database.PostgreSQL.Connection.Internal
+                      Database.PostgreSQL.ConnectionString
+                      Database.PostgreSQL.ConnectionString.Types
+                      Database.PostgreSQL.Decoding
+                      Database.PostgreSQL.Diagnostics
+                      Database.PostgreSQL.Encoders
+                      Database.PostgreSQL.Errors
+                      Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Diagnostics
+                      Database.PostgreSQL.Internal.Protocol
+                      Database.PostgreSQL.Internal.Protocol.Codec
+                      Database.PostgreSQL.Internal.Protocol.Codec.Cursor
+                      Database.PostgreSQL.Internal.Protocol.Codec.Output
+                      Database.PostgreSQL.Internal.Protocol.Codec.Payload
+                      Database.PostgreSQL.Internal.Protocol.Messages
+                      Database.PostgreSQL.Internal.Protocol.Messages.AuthBackend
+                      Database.PostgreSQL.Internal.Protocol.Messages.AuthFrontend
+                      Database.PostgreSQL.Internal.Protocol.Messages.BackendSession
+                      Database.PostgreSQL.Internal.Protocol.Messages.Copy
+                      Database.PostgreSQL.Internal.Protocol.Messages.FrontendSession
+                      Database.PostgreSQL.Internal.Protocol.Messages.MessageType
+                      Database.PostgreSQL.Internal.Protocol.Messages.Parse
+                      Database.PostgreSQL.Internal.Protocol.Messages.Startup
+                      Database.PostgreSQL.Internal.Protocol.Messages.Types
+                      Database.PostgreSQL.Internal.Frontend
+                      Database.PostgreSQL.Internal.Socket
+                      Database.PostgreSQL.Internal.Startup
+                      Database.PostgreSQL.Notifications
+                      Database.PostgreSQL.Pool
+                      Database.PostgreSQL.Pool.Observation
+                      Database.PostgreSQL.Session.Settings
+                      Database.PostgreSQL.Snippet
+                      Database.PostgreSQL.Transaction
+                      Database.PostgreSQL.Transport
+                      Database.PostgreSQL.Types
+                      TestCluster
+  main-is: Bench.hs
+  ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-T"
+  build-depends:      base              >= 4.9 && < 4.22
+                    , base64-bytestring >= 1 && < 1.3
+                    , bytestring        >= 0.10.8 && < 0.13
+                    , crypton           >= 1.0 && < 1.1
+                    , directory         >= 1.2.6 && < 1.4
+                    , filepath          >= 1.4 && < 1.6
+                    , memory            >= 0.18 && < 0.19
+                    , network           >= 3.1 && < 3.3
+                    , postgresql-binary >= 0.14.2 && < 0.15
+                    , process           >= 1.4.2 && < 1.7
+                    , scientific        >= 0.3 && < 0.4
+                    , streaming-io
+                    , text              >= 1.2.2 && < 2.2
+                    , time              >= 1.9 && < 2
+                    , unix              >= 2.7 && < 2.9
+                    , uuid              >= 1.3 && < 2
