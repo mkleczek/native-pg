@@ -42,4 +42,4 @@ executable directions-cores-bench
   hs-source-dirs: bench
   main-is: Cores.hs
   ghc-options: -Wall -threaded -rtsopts
-  build-depends: base, directions, streaming-io
+  build-depends: base, network, directions, streaming-io

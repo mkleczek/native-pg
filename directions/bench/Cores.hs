@@ -16,6 +16,9 @@
 --   after another, in ns and bytes per request. KIND is @threads@, @delimited@ or @compiled@; VARIANT is @request@
 --   (its admission and the end of its scope), @primary@ (and one borrow and release of the primary) or @both@
 --   (and an extra loan, from the reserve). The pool has buffers for every part, so no request waits.
+-- * @sockets KIND PAIRS ROUNDS@: PAIRS pairs of parts, each a client and a server over a socket pair of its own, that send a
+--   byte to each other ROUNDS times each way: in ns and bytes per round trip. A round trip waits twice, once in each
+--   part, so the cost of a wait on a descriptor is in it. KIND is @delimited@, @compiled@ or @threads@.
 -- * @wake KIND SAMPLES@: how long a part waiting for a ticket on a core whose scheduler waits in its poller takes
 --   to go on after another core gives it a value. KIND is @delimited@ or @threads@.
 -- * @scope KIND VARIANT ROUNDS [PARTS]@: what a scope costs, entered and left, in ns and bytes, above the loop it is
@@ -33,9 +36,9 @@
 -- * @deadline KIND SAMPLES@: how late a deadline of 5 ms passes, on a scheduler that has nothing else to do.
 module Main (main) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (&&&), (***), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (***), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (evaluate)
+import Control.Exception (evaluate, finally)
 import Control.Monad (replicateM, unless, void, when)
 import Data.Functor (($>))
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
@@ -44,7 +47,10 @@ import Data.Maybe (isJust)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtr, withForeignPtr)
 import Foreign.Storable (peek, poke)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
+import Network.Socket (Socket)
+import qualified Network.Socket as Socket
 import Network.Directions.PingPong
+import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (keeping, times, timesWith, together, untilJust)
@@ -53,7 +59,7 @@ import Network.Streaming.Delimited
 import Network.Streaming.Loop (Report (..))
 import qualified Network.Streaming.Loans as Loans
 import Network.Streaming.Pool
-import Network.Streaming.PositiveInt (mkPositiveInt)
+import Network.Streaming.PositiveInt (mkPositiveInt, positiveInt)
 import Network.Streaming.Threads
 import System.Environment (getArgs, lookupEnv)
 import System.IO (hPrint, stderr)
@@ -68,6 +74,7 @@ main = do
     ["pingpong", kind, rounds] -> pingPongRun kind (read rounds)
     ["pool", kind, cores, parts, conns, seconds] -> poolRun kind (read cores) (read parts) (read conns) (read seconds)
     ["loans", kind, variant, parts, rounds] -> loansRun kind variant (read parts) (read rounds)
+    ["sockets", kind, pairs, rounds] -> socketsRun kind (read pairs) (read rounds)
     ["wake", kind, samples] -> wakeRun kind (read samples)
     ["scope", kind, variant, rounds] -> scopeRun kind variant (read rounds) 0
     ["scope", kind, variant, rounds, parts] -> scopeRun kind variant (read rounds) (read parts)
@@ -75,7 +82,7 @@ main = do
     ["within", kind, variant, rounds] -> withinRun kind variant (read rounds) 0
     ["within", kind, variant, rounds, parts] -> withinRun kind variant (read rounds) (read parts)
     ["deadline", kind, samples] -> deadlineRun kind (read samples)
-    _ -> ioError (userError "usage: directions-cores-bench (pingpong KIND ROUNDS | pool KIND CORES PARTS CONNECTIONS SECONDS | loans KIND VARIANT PARTS ROUNDS | wake KIND SAMPLES | scope KIND VARIANT ROUNDS [PARTS] | cancel KIND SAMPLES | within KIND VARIANT ROUNDS [PARTS] | deadline KIND SAMPLES) +RTS -T -N..")
+    _ -> ioError (userError "usage: directions-cores-bench (pingpong KIND ROUNDS | pool KIND CORES PARTS CONNECTIONS SECONDS | loans KIND VARIANT PARTS ROUNDS | sockets KIND PAIRS ROUNDS | wake KIND SAMPLES | scope KIND VARIANT ROUNDS [PARTS] | cancel KIND SAMPLES | within KIND VARIANT ROUNDS [PARTS] | deadline KIND SAMPLES) +RTS -T -N..")
 
 -- | Bytes allocated by every thread so far, once a major collection has counted them.
 allocated :: IO Integer
@@ -205,6 +212,32 @@ loansRun kind variant parts rounds = do
   (seconds, bytes) <- measured (runRuntimeProgram kind program)
   let requests = fromIntegral (parts * rounds) :: Double
   printf "loans %s %s parts=%d requests=%d ns_per_request=%.1f bytes_per_request=%.1f\n" kind variant parts (parts * rounds) (seconds * 1e9 / requests) (fromIntegral bytes / requests :: Double)
+
+-- | A client and a server over a socket pair: the client sends a byte and waits for it to come back, and the server
+-- sends back each byte it receives, for the rounds. The buffers are what each receives into.
+socketPingPong :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Buffer -> Buffer -> Int -> arr (Socket, Socket) ()
+socketPingPong forClient forServer rounds = concurrently (arr fst >>> timesWith rounds clientStep) (arr snd >>> timesWith rounds serverStep) >>^ const ()
+  where
+    clientStep = (\end -> ((end, [view forClient 1]), end)) ^>> first sendAll >>> (\((), end) -> ((end, roomOf forClient), end)) ^>> first receive >>^ snd
+    serverStep = (\end -> ((end, roomOf forServer), end)) ^>> first receive >>> (\(_, end) -> ((end, [view forServer 1]), end)) ^>> first sendAll >>^ snd
+
+socketsRun :: String -> Int -> Int -> IO ()
+socketsRun kind pairs rounds = do
+  sockets <- replicateM pairs (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol)
+  buffers <- replicateM pairs ((,) <$> newBuffer (positiveInt @16) <*> newBuffer (positiveInt @16))
+  let program :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => arr () ()
+      program = together [arr (const ends) >>> socketPingPong forClient forServer rounds | (ends, (forClient, forServer)) <- zip sockets buffers]
+  (seconds, bytes) <-
+    measured
+      ( case kind of
+          "delimited" -> void (runDelimited program ())
+          "compiled" -> void (runCompiled program ())
+          "threads" -> runThreads program ()
+          _ -> ioError (userError ("sockets: no kind " <> kind))
+      )
+      `finally` mapM_ (\(one, other) -> Socket.close one *> Socket.close other) sockets
+  let trips = fromIntegral (pairs * rounds) :: Double
+  printf "sockets %s pairs=%d rounds=%d ns_per_rt=%.1f bytes_per_rt=%.1f\n" kind pairs rounds (seconds * 1e9 / trips) (fromIntegral bytes / trips :: Double)
 
 wakeRun :: String -> Int -> IO ()
 wakeRun kind samples = do
