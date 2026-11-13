@@ -36,6 +36,7 @@ import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPool, PoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (keeping, sleep)
+import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited (runDelimited)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Threads (runThreads)
@@ -64,9 +65,8 @@ newtype Handling = Handling (forall arr. (Runtime arr) => arr (Call, Request) ()
 runners :: [Runner]
 runners =
   [ Runner "threads" (\settings (Handling handler) cores -> runThreads (Fulmen.serve settings handler) cores),
-    -- 'Network.Streaming.Compiled' is a third, which can't run a 'Runtime' program yet: it has no tickets of the reach
-    -- 'Anywhere'. It is one more entry here when it has.
-    Runner "delimited" (\settings (Handling handler) cores -> void (runDelimited (Fulmen.serve settings handler) cores))
+    Runner "delimited" (\settings (Handling handler) cores -> void (runDelimited (Fulmen.serve settings handler) cores)),
+    Runner "compiled" (\settings (Handling handler) cores -> void (runCompiled (Fulmen.serve settings handler) cores))
   ]
 
 -- * The handlers of the cases

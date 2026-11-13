@@ -107,6 +107,7 @@ import Network.Streaming.BufferPool (BufferPool, PoolSettings (..))
 import qualified Network.Streaming.BufferPool as BufferPool
 import Network.Streaming.Classes
 import Network.Streaming.Combinators
+import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited (runDelimited)
 import Network.Streaming.Loans (Loans, withRequestBuffers)
 import Network.Streaming.PositiveInt (positiveInt)
@@ -125,14 +126,11 @@ type Program a = forall arr. (Runtime arr) => arr Loans a
 data Runner = Runner String (forall a. BufferPool -> Program a -> IO a)
 
 -- | Every runner the suites run under. A case is written once, as a 'Program'.
---
--- The plan has a third, "Network.Streaming.Compiled", which can't run a 'Program' yet: 'Runtime' has tickets of the
--- reach 'Network.Streaming.Classes.Anywhere' for the pool, and 'Compiled' has none. It is one more entry here, with
--- @onCompiled buffers program = fst \<$\> runCompiled (withRequestBuffers buffers (arr fst >>> program)) ()@, when it has.
 runners :: [Runner]
 runners =
   [ Runner "threads" onThreads,
-    Runner "delimited" onDelimited
+    Runner "delimited" onDelimited,
+    Runner "compiled" onCompiled
   ]
 
 onThreads :: BufferPool -> Program a -> IO a
@@ -140,6 +138,9 @@ onThreads buffers program = runThreads (withRequestBuffers buffers (arr fst >>> 
 
 onDelimited :: BufferPool -> Program a -> IO a
 onDelimited buffers program = fst <$> runDelimited (withRequestBuffers buffers (arr fst >>> program)) ()
+
+onCompiled :: BufferPool -> Program a -> IO a
+onCompiled buffers program = fst <$> runCompiled (withRequestBuffers buffers (arr fst >>> program)) ()
 
 -- | The program, as one request, on the pool. A program that never ends fails the case after a minute.
 runOn :: Runner -> BufferPool -> Program a -> IO a
