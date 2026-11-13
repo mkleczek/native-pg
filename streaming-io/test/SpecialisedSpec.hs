@@ -40,20 +40,17 @@ counting :: (ArrowChoice arr, Effect arr) => Int -> arr () Int
 counting count = arr (const count) >>> countdown
 
 spec :: Spec
-spec = describe "a program written for any arrow" $ forM_ runners $ \(Runner name run) -> do
-  let expectedToFail = if name == "delimited, by runCores" then xfail "runCores is not inlined, so that the program is given the arrow's dictionaries when it runs" else id
-
-  expectedToFail $
-    it ("is specialised to the arrow, so that its steps allocate under 64 bytes each: " <> name) $ do
-      -- The first run is for the code to be loaded and the nurseries to be as they will be.
-      run 1000
-      few <- allocatedBy (run 1000)
-      many <- allocatedBy (run 101000)
-      -- The allocation of a specialised loop is so small that the difference of the runs can be below zero.
-      let perIteration = (fromIntegral many - fromIntegral few) / 100000 :: Double
-      if perIteration < 64
-        then pure ()
-        else failTest ("an iteration allocates " <> show (round perIteration :: Int) <> " bytes")
+spec = describe "a program written for any arrow" $ forM_ runners $ \(Runner name run) ->
+  it ("is specialised to the arrow, so that its steps allocate under 64 bytes each: " <> name) $ do
+    -- The first run is for the code to be loaded and the nurseries to be as they will be.
+    run 1000
+    few <- allocatedBy (run 1000)
+    many <- allocatedBy (run 101000)
+    -- The allocation of a specialised loop is so small that the difference of the runs can be below zero.
+    let perIteration = (fromIntegral many - fromIntegral few) / 100000 :: Double
+    if perIteration < 64
+      then pure ()
+      else failTest ("an iteration allocates " <> show (round perIteration :: Int) <> " bytes")
 
 -- | The bytes that the action allocated: the runtime counts a nursery when it is collected, so a collection is made on both sides.
 allocatedBy :: IO () -> IO Word64

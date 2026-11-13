@@ -281,19 +281,27 @@ step (Context run tag part) = spent run >>= \yields -> when yields (control0 tag
 -- run.
 runDelimited :: (forall s. Delimited s a b) -> a -> IO (b, Report)
 runDelimited = runDelimitedTurn defaultTurn
+-- The entry points are INLINE so that GHC specialises the program they run to the Delimited arrow. The program has type
+-- @forall s. Delimited s a b@, and GHC does not specialise a call at a type that contains a lambda-bound type variable
+-- such as @s@. Without inlining, the functions the program calls (the server, the transactions) take the arrow's class
+-- dictionaries at run time. Inlined into its caller, the entry point instantiates @s@ and the calls are specialised.
+{-# INLINE runDelimited #-}
 
 -- | 'runDelimited' with a turn of the given length.
 runDelimitedTurn :: Turn -> (forall s. Delimited s a b) -> a -> IO (b, Report)
 runDelimitedTurn turn program input = withRun turn (\run -> runIn run program input)
+{-# INLINE runDelimitedTurn #-}
 
 -- | 'runDelimited' for a program that is made in IO, by an action that is run
 -- once, for the core that runs the program.
 runDelimitedWith :: (forall s. IO (Delimited s a b)) -> a -> IO (b, Report)
 runDelimitedWith = runDelimitedWithTurn defaultTurn
+{-# INLINE runDelimitedWith #-}
 
 -- | 'runDelimitedWith' with a turn of the given length.
 runDelimitedWithTurn :: Turn -> (forall s. IO (Delimited s a b)) -> a -> IO (b, Report)
 runDelimitedWithTurn turn setup input = setup >>= \program -> withRun turn (\run -> runIn run program input)
+{-# INLINE runDelimitedWithTurn #-}
 
 runIn :: Run -> Delimited s a b -> a -> IO (b, Report)
 runIn run (Delimited program) input = do
@@ -314,14 +322,17 @@ runIn run (Delimited program) input = do
 -- are stopped, even if they wait, and its exception is rethrown.
 runCores :: Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [r]
 runCores = runCoresTurn defaultTurn
+{-# INLINE runCores #-}
 
 -- | 'runCores' with turns of the given length.
 runCoresTurn :: Turn -> Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [r]
 runCoresTurn turn cores setup program = map fst <$> runCoresReportTurn turn cores setup program
+{-# INLINE runCoresTurn #-}
 
 -- | 'runCores', with each core's report.
 runCoresReport :: Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [(r, Report)]
 runCoresReport = runCoresReportTurn defaultTurn
+{-# INLINE runCoresReport #-}
 
 -- | 'runCoresReport' with turns of the given length.
 runCoresReportTurn :: Turn -> Int -> IO shared -> (forall s. shared -> Int -> Delimited s () r) -> IO [(r, Report)]
@@ -349,6 +360,7 @@ runCoresReportTurn turn cores setup program = do
             mapM_ killThread threads
             readIORef pending >>= \remaining -> replicateM_ remaining (readChan outcomes)
       restore (collect []) `onException` stopAll
+{-# INLINE runCoresReportTurn #-}
 
 -- | The runs of that many cores, all freed once the action ends: after the
 -- threads that use them have.
