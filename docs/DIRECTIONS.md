@@ -229,10 +229,10 @@ class Effect arr where
 class Block arr where
   block :: arr (IO Watch) ()
 
--- | Two arrows at once on the same input, as '&&&' runs them one after the
--- other: both outputs, once both have ended.
+-- | Arrows at once on the same input, in one scope: they end when all have
+-- ended, and the first failure stops the others and is rethrown.
 class Concurrent arr where
-  concurrently :: arr a b -> arr a c -> arr a (b, c)
+  together :: [arr a ()] -> arr a ()
 ```
 
 - **A link's instance is written once, for any arrow** that can run its tries
@@ -249,7 +249,7 @@ class Concurrent arr where
   ```
 
 - **The arrows know nothing of links.** They provide `now`, `block` and
-  `concurrently`, and that is all a link or a direction needs from them.
+  `together`, and that is all a link or a direction needs from them.
 - **Programs read as what they do:** `^>>` and `>>^` put a function before or
   after an arrow, in place of `arr` chains, and there is no arrow notation,
   whose desugaring would decide what `Loop` builds. All three operators are
@@ -266,8 +266,8 @@ class Concurrent arr where
 `streaming-io/src/Network/Streaming/Threads.hs`: a newtype over `Kleisli IO`.
 
 - **`now`** is the action, and **`block`** is `awaitWatch`: the thread waits.
-- **`concurrently`** runs each arrow on a thread of its own and joins them; a
-  failure of either stops both and is rethrown.
+- **`together`** runs each arrow on a thread of its own and joins them; a
+  failure of one stops the others and is rethrown.
 - **The directions may run in parallel,** on different capabilities.
 
 ### Loop: every part on one thread

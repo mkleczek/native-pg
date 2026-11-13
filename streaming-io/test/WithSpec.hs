@@ -8,7 +8,7 @@ module WithSpec (spec) where
 import Control.Arrow (ArrowChoice, arr, returnA, (&&&), (>>>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (keeping, sleep)
+import Network.Streaming.Combinators (concurrently, keeping, sleep)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop

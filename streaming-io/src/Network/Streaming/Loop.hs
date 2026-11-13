@@ -52,7 +52,7 @@ data Loop a b where
   Seq :: Loop a b -> Loop b c -> Loop a c
   First :: Loop a b -> Loop (a, c) (b, c)
   Choose :: Loop a b -> Loop (Either a c) (Either b c)
-  Both :: Loop a b -> Loop a c -> Loop a (b, c)
+  Together :: [Loop a ()] -> Loop a ()
   Now :: (a -> IO b) -> Loop a b
   Clock :: Loop () Instant
   Block :: Loop Event ()
@@ -74,7 +74,10 @@ instance ArrowChoice Loop where
   left = Choose
 
 instance Concurrent Loop where
-  concurrently = Both
+  together = \case
+    [] -> arr (const ())
+    [one] -> one
+    parts -> Together parts
 
 instance Effect Loop where
   now = Now
@@ -169,8 +172,7 @@ data Frames b r where
   Then :: Loop b c -> Frames c r -> Frames b r
   Beside :: c -> Frames (b, c) r -> Frames b r
   OnLeft :: Frames (Either b c) r -> Frames b r
-  JoinFirst :: Pair b d -> Frames (b, d) r -> Frames b r
-  JoinSecond :: Pair b d -> Frames (b, d) r -> Frames d r
+  Joining :: Group -> Frames () r -> Frames () r
   RaceFirst :: Contest b d -> Frames (Either b d) r -> Frames b r
   RaceSecond :: Contest b d -> Frames (Either b d) r -> Frames d r
   -- | What was acquired is there: the body goes on with it.
@@ -182,11 +184,11 @@ data Frames b r where
   Trying :: Frames (Either SomeException b) r -> Frames b r
   Shielding :: Frames b r -> Frames b r
 
--- | A concurrent pair: the cancel scope of its halves, and what it has of their results.
-data Pair b d = Pair !LoopScope !(IORef (Joined b d))
+-- | A group of concurrent parts: the cancel scope of its parts, how many there are, and what it has of how they ended.
+data Group = Group !LoopScope !Int !(IORef Joined)
 
--- | What a pair has of its halves' results, and its first failure, and how many have ended.
-data Joined b d = Joined !(Maybe b) !(Maybe d) !(Maybe SomeException) !Int
+-- | What a group has of its first failure, and how many of its parts have ended.
+data Joined = Joined !(Maybe SomeException) !Int
 
 -- | A race: the cancel scope of its halves, and its winner, once there is one.
 data Contest b d = Contest !LoopScope !(IORef (Maybe (Either SomeException (Either b d))))
@@ -202,8 +204,7 @@ cancelledSTM = go Nothing
       Then _ rest -> go found rest
       Beside _ rest -> go found rest
       OnLeft rest -> go found rest
-      JoinFirst (Pair scope' _) rest -> inside scope' found rest
-      JoinSecond (Pair scope' _) rest -> inside scope' found rest
+      Joining (Group scope' _ _) rest -> inside scope' found rest
       RaceFirst (Contest scope' _) rest -> inside scope' found rest
       RaceSecond (Contest scope' _) rest -> inside scope' found rest
       Acquired _ _ _ rest -> go found rest
@@ -230,25 +231,19 @@ data Advanced r
     Parked
   | -- | It used its steps, and can go on.
     Yielded (Process r)
-  | Forked (Process r) (Process r)
+  | Forked [Process r]
   | Waits Event (Process r)
 
--- | A half of a pair has ended with a result, or with a failure: the first failure cancels the other half, and the
--- half that ends last goes on with the parent, with the failure if there was one.
-joinHalf :: Pair b d -> Frames (b, d) r -> (Joined b d -> Joined b d) -> Maybe SomeException -> IO (Maybe (Process r))
-joinHalf (Pair scope' ref) rest record failure = do
-  Joined b d failed count <- readIORef ref
+-- | A part of a group has ended, with a failure or without: the first failure cancels the others, and the part that
+-- ends last goes on with the parent, with the failure if there was one.
+joinPart :: Group -> Frames () r -> Maybe SomeException -> IO (Maybe (Process r))
+joinPart (Group scope' size ref) rest failure = do
+  Joined failed count <- readIORef ref
   failed' <- case failure of
     Just thrown | isNothing failed -> cancelLoopScope scope' $> Just thrown
     _ -> pure failed
-  let joined' = case failure of
-        Nothing -> record (Joined b d failed' (count + 1))
-        Just _ -> Joined b d failed' (count + 1)
-  writeIORef ref joined'
-  pure $ case joined' of
-    Joined _ _ (Just thrown) 2 -> Just (Fail thrown rest)
-    Joined (Just b') (Just d') _ 2 -> Just (Give (b', d') rest)
-    _ -> Nothing
+  writeIORef ref (Joined failed' (count + 1))
+  pure $ if count + 1 < size then Nothing else Just (maybe (Give () rest) (`Fail` rest) failed')
 
 -- | A half of a race has ended: the first is the winner, which cancels the other; the loser lets the race go on
 -- with the winner's failure, or its own if it isn't its cancellation, or the winner's result.
@@ -279,14 +274,14 @@ advance env time fuel wake = go 0
             Choose inner -> case input of
               Left a -> go steps (Run inner a (OnLeft frames))
               Right c -> go steps (Give (Right c) frames)
-            Both one two -> do
+            Together parts -> do
               scope' <- newLoopScope env
-              pair <- Pair scope' <$> newIORef (Joined Nothing Nothing Nothing 0)
-              pure (steps, Forked (Run one input (JoinFirst pair frames)) (Run two input (JoinSecond pair frames)))
+              group <- Group scope' (length parts) <$> newIORef (Joined Nothing 0)
+              pure (steps, Forked [Run part input (Joining group frames) | part <- parts])
             Race' one two -> do
               scope' <- newLoopScope env
               contest <- Contest scope' <$> newIORef Nothing
-              pure (steps, Forked (Run one input (RaceFirst contest frames)) (Run two input (RaceSecond contest frames)))
+              pure (steps, Forked [Run one input (RaceFirst contest frames), Run two input (RaceSecond contest frames)])
             Now action -> try (action input) >>= either (\failure -> go steps (Fail failure frames)) (\output -> go (steps + 1) (Give output frames))
             Clock -> time >>= \instant -> go (steps + 1) (Give instant frames)
             Block ->
@@ -307,8 +302,7 @@ advance env time fuel wake = go 0
             Then next rest -> go steps (Run next value rest)
             Beside c rest -> go steps (Give (value, c) rest)
             OnLeft rest -> go steps (Give (Left value) rest)
-            JoinFirst pair rest -> joinHalf pair rest (\(Joined _ d failed count) -> Joined (Just value) d failed count) Nothing >>= endHalf steps
-            JoinSecond pair rest -> joinHalf pair rest (\(Joined b _ failed count) -> Joined b (Just value) failed count) Nothing >>= endHalf steps
+            Joining group rest -> joinPart group rest Nothing >>= endHalf steps
             RaceFirst contest rest -> raceHalf contest rest (Right (Left value)) >>= endHalf steps
             RaceSecond contest rest -> raceHalf contest rest (Right (Right value)) >>= endHalf steps
             Acquired release body input rest -> go steps (Run body (value, input) (Guarded value release rest))
@@ -321,8 +315,7 @@ advance env time fuel wake = go 0
             Then _ rest -> go steps (Fail failure rest)
             Beside _ rest -> go steps (Fail failure rest)
             OnLeft rest -> go steps (Fail failure rest)
-            JoinFirst pair rest -> joinHalf pair rest id (Just failure) >>= endHalf steps
-            JoinSecond pair rest -> joinHalf pair rest id (Just failure) >>= endHalf steps
+            Joining group rest -> joinPart group rest (Just failure) >>= endHalf steps
             RaceFirst contest rest -> raceHalf contest rest (Left failure) >>= endHalf steps
             RaceSecond contest rest -> raceHalf contest rest (Left failure) >>= endHalf steps
             Acquired _ _ _ rest -> go steps (Fail failure rest)
@@ -382,7 +375,7 @@ runLoop program input = do
           Ended -> go report' parked others waiting
           Parked -> go report' (parked + 1) others waiting
           Yielded process' -> go report' parked (others <> [process']) waiting
-          Forked one two -> go report' parked (others <> [one, two]) waiting
+          Forked parts -> go report' parked (others <> parts) waiting
           Waits event process' -> go report' parked others ((watchFor env event process', process') : waiting)
       []
         | null waiting && parked > (0 :: Int) -> ioError (userError "runLoop: parts wait for tickets that nothing will give a value")
@@ -455,7 +448,7 @@ runSimulation seed limit program input = do
             Ended -> go random' next report' trace' parked others waiting
             Parked -> go random' next report' trace' (ident : parked) others waiting
             Yielded process' -> go random' next report' trace' parked ((ident, process') : others) waiting
-            Forked one two -> go random' (next + 2) report' trace' parked ((next, one) : (next + 1, two) : others) waiting
+            Forked parts -> go random' (next + length parts) report' trace' parked (zip [next ..] parts <> others) waiting
             Waits event process' -> go random' next report' trace' parked others ((ident, (event, process')) : waiting)
       where
         finish outcome = pure (Simulated outcome report (reverse trace))

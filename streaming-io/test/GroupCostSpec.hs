@@ -21,8 +21,8 @@ import Control.Monad (forM_, replicateM)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
-import Network.Streaming.Classes (Block, Concurrent, Effect (..), Exchange (..), GiveWay, Giver, Local, Time, millis, monotonicNanoseconds)
-import Network.Streaming.Combinators (sleep, together)
+import Network.Streaming.Classes (Block, Concurrent (..), Effect (..), Exchange (..), GiveWay, Giver, Local, Time, millis, monotonicNanoseconds)
+import Network.Streaming.Combinators (sleep)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)
@@ -53,26 +53,20 @@ data Probe = Probe !Word64 !Word64
 
 spec :: Spec
 spec = describe "the parts of a group" $ forM_ runners $ \(Runner name run) -> describe name $ do
-  -- Threads enters each part into the scope of every part that encloses it, and together nests its parts one inside the
-  -- other: a part is entered into the scopes of the parts before it, and 4,096 of them hold a million entries.
-  let expectedToFail = if name == "threads" then xfail "a part is entered into the scope of each of the parts before it" else id
+  it "cost a few KiB each of live heap" $ do
+    few <- liveWith run 64
+    many <- liveWith run 4096
+    let perPart = (fromIntegral many - fromIntegral few) / 4032 :: Double
+    if perPart < 8192
+      then pure ()
+      else failTest ("a part costs " <> show (round perPart :: Int) <> " bytes of live heap, " <> show (many `div` 1024) <> " KiB for 4,096 and " <> show (few `div` 1024) <> " KiB for 64")
 
-  expectedToFail $
-    it "cost a few KiB each of live heap" $ do
-      few <- liveWith run 64
-      many <- liveWith run 4096
-      let perPart = (fromIntegral many - fromIntegral few) / 4032 :: Double
-      if perPart < 8192
-        then pure ()
-        else failTest ("a part costs " <> show (round perPart :: Int) <> " bytes of live heap, " <> show (many `div` 1024) <> " KiB for 4,096 and " <> show (few `div` 1024) <> " KiB for 64")
-
-  expectedToFail $
-    it "start in under a second when there are thousands" $ do
-      took <- replicateM 3 (startingWith run 4096)
-      let least = minimum took
-      if least < 1000000000
-        then pure ()
-        else failTest ("starting 4,096 parts took " <> show (least `div` 1000000) <> " ms")
+  it "start in under a second when there are thousands" $ do
+    took <- replicateM 3 (startingWith run 4096)
+    let least = minimum took
+    if least < 1000000000
+      then pure ()
+      else failTest ("starting 4,096 parts took " <> show (least `div` 1000000) <> " ms")
 
 -- | The program: this many parts that wait for a ticket nothing gives, and the one that looks at them all waiting.
 idleGroup :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Time arr, Concurrent arr, Exchange arr (Local arr)) => IORef (Maybe Probe) -> Int -> arr () ()

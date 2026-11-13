@@ -13,7 +13,7 @@ import Data.Tuple (Solo)
 import LoansTestSupport
 import Network.Streaming.Buffer (Buffer, bufferCapacity)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (keeping, together)
+import Network.Streaming.Combinators (keeping)
 import Network.Streaming.Loans (withSetupBuffersOf)
 import Network.Streaming.Pool
 import Skeletest

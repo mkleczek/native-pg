@@ -37,7 +37,6 @@ import Network.Fulmen.Request (Method (..), Request (..), Version (..))
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (together)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
 import Network.Streaming.Pool (queueNow, releaseNow)
 

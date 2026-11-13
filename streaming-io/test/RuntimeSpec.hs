@@ -13,7 +13,7 @@ import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (newBuffer)
 import Network.Streaming.Classes hiding (within)
 import qualified Network.Streaming.Classes as Classes (within)
-import Network.Streaming.Combinators (sleep, together)
+import Network.Streaming.Combinators (sleep)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..))

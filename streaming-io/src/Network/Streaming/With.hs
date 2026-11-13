@@ -117,10 +117,10 @@ instance (Arrow arr, Scope arr) => Scope (With r arr) where
   shield (With inner) = With (shield inner)
   {-# INLINE shield #-}
 
--- | Both parts are given the environment.
+-- | Every part is given the environment.
 instance (Concurrent arr) => Concurrent (With r arr) where
-  concurrently (With one) (With two) = With (concurrently one two)
-  {-# INLINE concurrently #-}
+  together parts = With (together [part | With part <- parts])
+  {-# INLINE together #-}
 
 instance (Race arr) => Race (With r arr) where
   race (With one) (With two) = With (race one two)

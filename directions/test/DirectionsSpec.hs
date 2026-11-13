@@ -18,7 +18,6 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes hiding (within)
-import Network.Streaming.Combinators (together)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..), microseconds)

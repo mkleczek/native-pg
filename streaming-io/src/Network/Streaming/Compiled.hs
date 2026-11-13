@@ -174,29 +174,29 @@ instance Scope Compiled where
     writeIORef (runFailure run) failed
     inner (Context run part failed) value (\result -> leaves *> next result)
 
--- | The part that starts the pair hands what follows it to the pair, and the half that ends last goes on with it.
--- The halves are parts in a cancel scope of their own, which the first failure cancels: the other half is
--- cancelled where it waits, and its scopes are released before the pair ends, which fails with the first
--- failure. A failure of the second half is dropped.
+-- | The part that starts the group hands what follows it to the group, and the part that ends last goes on with it.
+-- The parts are in a cancel scope of their own, which the first failure cancels: the others are cancelled where they
+-- wait, and their scopes are released before the group ends, which fails with the first failure. A later failure is
+-- dropped.
 instance Concurrent Compiled where
-  concurrently (Compiled one) (Compiled two) = Compiled $ \(Context run part outer) value next -> do
-    scope' <- newScope run
-    first' <- childPart run part scope'
-    second' <- childPart run part scope'
-    joined <- newIORef (Joined Nothing Nothing Nothing 0)
-    let failure thrown = writeIORef (runFailure run) outer *> outer thrown
-        success result = writeIORef (runFailure run) outer *> next result
-        ended1 = pairEnded run scope' joined failure success first' (\b (Joined _ c thrown count) -> Joined (Just b) c thrown count)
-        ended2 = pairEnded run scope' joined failure success second' (\c (Joined b _ thrown count) -> Joined b (Just c) thrown count)
-        failing1 = Context run first' (ended1 . Left)
-        failing2 = Context run second' (ended2 . Left)
-    pure $
-      Forked
-        (resumed failing1 (one failing1 value (ended1 . Right)))
-        (resumed failing2 (two failing2 value (ended2 . Right)))
+  together = \case
+    [] -> arr (const ())
+    [one] -> one
+    parts -> Compiled $ \(Context run part outer) value next -> do
+      let size = length parts
+      scope' <- newScope run
+      children <- childParts run part scope' size
+      joined <- newIORef (Joined Nothing 0)
+      let failure thrown = writeIORef (runFailure run) outer *> outer thrown
+          success () = writeIORef (runFailure run) outer *> next ()
+          started (Compiled body) child =
+            let ended = groupEnded run scope' size joined failure success child
+                failing = Context run child (ended . Left)
+             in resumed failing (body failing value (ended . Right))
+      pure (Forked (zipWith started parts children))
 
--- | The first half to end is the result: the other is cancelled where it waits, and the pair ends once its
--- scopes are released. If the first to end failed, its failure is the pair's then. A failure of the loser that
+-- | The first half to end is the result: the other is cancelled where it waits, and the race ends once its
+-- scopes are released. If the first to end failed, its failure is the race's then. A failure of the loser that
 -- isn't its cancellation is too.
 instance Race Compiled where
   race (Compiled one) (Compiled two) = Compiled $ \(Context run part outer) value next -> do
@@ -210,10 +210,7 @@ instance Race Compiled where
         ended2 = raceEnded run scope' winner failure success second'
         failing1 = Context run first' (ended1 . Left)
         failing2 = Context run second' (ended2 . Left)
-    pure $
-      Forked
-        (resumed failing1 (one failing1 value (ended1 . Right . Left)))
-        (resumed failing2 (two failing2 value (ended2 . Right . Right)))
+    pure (Forked [resumed failing1 (one failing1 value (ended1 . Right . Left)), resumed failing2 (two failing2 value (ended2 . Right . Right))])
 
 -- | The region of the tickets of this arrow: there is one core, the thread that runs it.
 data Core

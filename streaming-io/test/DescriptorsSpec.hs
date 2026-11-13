@@ -16,7 +16,7 @@ import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes hiding (within)
 import qualified Network.Streaming.Classes as Classes (within)
-import Network.Streaming.Combinators (keeping, sleep, untilJust)
+import Network.Streaming.Combinators (concurrently, keeping, sleep, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.PositiveInt (positiveInt)
@@ -25,7 +25,7 @@ import Skeletest
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Time arr, Within arr)
+type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Time arr, Within arr, Exchange arr (Local arr))
 
 type Program a = forall arr. (Rich arr) => arr () a
 

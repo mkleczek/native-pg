@@ -17,7 +17,7 @@ import Control.Monad (forM_, replicateM)
 import Data.Word (Word64)
 import Network.Streaming.Classes (Concurrent (..), GiveWay (..), Within, monotonicNanoseconds, secs)
 import qualified Network.Streaming.Classes as Classes (within)
-import Network.Streaming.Combinators (times, together)
+import Network.Streaming.Combinators (times)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..))
@@ -56,15 +56,10 @@ onLoop program = fst <$> runLoop program ()
 
 spec :: Spec
 spec = describe "a step" $ forM_ runners $ \(Runner name nesting amongSteps scopeSteps run) -> describe name $ do
-  -- Threads enters a part into the scope of every part that encloses it when it spawns it, which, among parts that
-  -- together nests one inside the other, is as many as the parts before it.
-  let expectedToFail = if name == "threads" then xfail "a part is entered into the scope of each of the parts before it" else id
-
-  expectedToFail $
-    it "costs the same among thousands of parts as among a few" $ do
-      -- The same number of steps in all: 4,096 parts that each give way a number of times, and 64 that give way 64 times as often.
-      (few, many) <- leastOfThree (run (amongParts 64 amongSteps)) (run (amongParts 4096 amongSteps))
-      atMostFourTimes few many
+  it "costs the same among thousands of parts as among a few" $ do
+    -- The same number of steps in all: 4,096 parts that each give way a number of times, and 64 that give way 64 times as often.
+    (few, many) <- leastOfThree (run (amongParts 64 amongSteps)) (run (amongParts 4096 amongSteps))
+    atMostFourTimes few many
 
   it "costs the same deep in scopes as at the top" $ do
     (shallow, deep) <- leastOfThree (run (inScopes nesting 1 scopeSteps)) (run (inScopes nesting 1024 scopeSteps))
@@ -82,7 +77,7 @@ inScopes nesting depth steps = foldr (\_ inner -> nest nesting inner) (times ste
 nest :: (ArrowChoice arr, Concurrent arr, Within arr) => Nesting -> arr () () -> arr () ()
 nest nesting inner = case nesting of
   Deadlines -> Classes.within (secs 3600) inner >>^ const ()
-  Pairs -> concurrently returnA inner >>^ const ()
+  Pairs -> together [returnA, inner]
 
 -- | The least time, over three runs of each, of one program and of the other, in nanoseconds. The runs alternate, so that
 -- what the host does meanwhile is shared.

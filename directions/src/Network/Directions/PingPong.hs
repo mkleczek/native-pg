@@ -52,7 +52,7 @@ server rounds = timesWith rounds (await >>> (\(Ping answer) -> answer) ^>> expec
 -- as parts on one core do when each has to wait for the other. With the reach of the arrow's own core, the
 -- parts are on one core; with 'Anywhere' they could be on two, and this runs them on one.
 pingPongAt :: forall r arr. (ArrowChoice arr, Concurrent arr, Exchange arr r) => Int -> arr () ()
-pingPongAt rounds = ticket @arr @r >>> concurrently (arr snd >>> client rounds) (arr fst >>> server rounds) >>^ const ()
+pingPongAt rounds = ticket @arr @r >>> together [arr snd >>> client rounds, arr fst >>> server rounds]
 
 -- | 'pingPongAt' with the reach that costs the least: that of the arrow's own core.
 pingPong :: forall arr. (ArrowChoice arr, Concurrent arr, Exchange arr (Local arr)) => Int -> arr () ()

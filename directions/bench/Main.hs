@@ -22,7 +22,6 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer, bufferCapacity, newBuffer)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (together)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop

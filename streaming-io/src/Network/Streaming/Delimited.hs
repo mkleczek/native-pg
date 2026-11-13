@@ -196,23 +196,27 @@ instance Scope (Delimited s) where
 
   shield (Delimited inner) = Delimited (\context value -> shielded context (inner context value))
 
--- | The part that starts the pair hands its continuation to the pair, and the half that ends last goes on
--- with it. The halves are parts in a cancel scope of their own, which the first failure cancels: the other
--- half is cancelled where it waits, and its scopes are released before the pair ends, which rethrows the first
--- failure. A failure of the second half is dropped.
+-- | The part that starts the group hands its continuation to the group, and the part that ends last goes on
+-- with it. The parts are in a cancel scope of their own, which the first failure cancels: the others are
+-- cancelled where they wait, and their scopes are released before the group ends, which rethrows the first
+-- failure. A later failure is dropped.
 instance Concurrent (Delimited s) where
-  concurrently (Delimited one) (Delimited two) = Delimited $ \(Context run tag part) value ->
-    control0 tag $ \resume -> do
-      scope' <- newScope run
-      first' <- childPart run part scope'
-      second' <- childPart run part scope'
-      joined <- newIORef (Joined Nothing Nothing Nothing 0)
-      pure $
-        Forked
-          (try (one (Context run tag first') value) >>= pairEnded run scope' joined (resume . throwIO) (resume . pure) first' (\b (Joined _ c failure count) -> Joined (Just b) c failure count))
-          (try (two (Context run tag second') value) >>= pairEnded run scope' joined (resume . throwIO) (resume . pure) second' (\c (Joined b _ failure count) -> Joined b (Just c) failure count))
+  together = \case
+    [] -> arr (const ())
+    [one] -> one
+    parts -> Delimited $ \(Context run tag part) value ->
+      control0 tag $ \resume -> do
+        let size = length parts
+        scope' <- newScope run
+        children <- childParts run part scope' size
+        joined <- newIORef (Joined Nothing 0)
+        pure $
+          Forked
+            [ try (body (Context run tag child) value) >>= groupEnded run scope' size joined (resume . throwIO) (resume . pure) child
+              | (Delimited body, child) <- zip parts children
+            ]
 
--- | The first half to end is the result: the other is cancelled where it waits, and the pair ends once its
+-- | The first half to end is the result: the other is cancelled where it waits, and the race ends once its
 -- scopes are released. If the first to end failed, its failure is rethrown then. A failure of the loser that
 -- isn't its cancellation is rethrown too.
 instance Race (Delimited s) where
@@ -224,8 +228,9 @@ instance Race (Delimited s) where
       winner <- newIORef Nothing
       pure $
         Forked
-          (try (Left <$> one (Context run tag first') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) first')
-          (try (Right <$> two (Context run tag second') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) second')
+          [ try (Left <$> one (Context run tag first') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) first',
+            try (Right <$> two (Context run tag second') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) second'
+          ]
 
 -- | The tickets that belong to this core: a slot, which the parts of this core read
 -- and write as plain memory. A part that waits for the ticket is parked in the

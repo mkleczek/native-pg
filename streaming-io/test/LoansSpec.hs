@@ -17,7 +17,7 @@ import LoansTestSupport
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Network.Streaming.BufferPool (BufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (sleep, timesWith, together)
+import Network.Streaming.Combinators (sleep, timesWith)
 import Network.Streaming.Delimited (runCores)
 import Network.Streaming.Loans
 import Network.Streaming.Threads (runThreads)

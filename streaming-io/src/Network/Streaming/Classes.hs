@@ -150,16 +150,19 @@ class Exchange arr (r :: Reach) where
 -- @'Anywhere@ for one that has no cores to belong to.
 type family Local (arr :: Type -> Type -> Type) :: Reach
 
--- | Two arrows that run at once on the same input, as '&&&' runs them one
--- after the other: the result is both outputs, once both have ended.
+-- | Arrows that run at once on the same input, as '&&&' runs two of them one after the other.
 class Concurrent arr where
-  concurrently :: arr a b -> arr a c -> arr a (b, c)
+  -- | Runs the parts, each on the input, as the parts of one cancel scope of their own, and ends when all have ended.
+  -- The first failure cancels the others where they wait, and is rethrown once they have ended; a later failure is
+  -- dropped. No part is made while it runs: the parts are known when the program is built. @together []@ ends at
+  -- once, and one part may run as it is.
+  together :: [arr a ()] -> arr a ()
 
 -- | How the body of a 'scope' ended.
 data Exit = Done | Failed SomeException | Cancelled'
   deriving (Show)
 
--- | Which cancel scope a cancellation is of: the scope of a deadline, or of a half of a concurrent pair. The
+-- | Which cancel scope a cancellation is of: the scope of a deadline, or of a group of concurrent parts or the halves of a race. The
 -- parts inside a cancelled scope are cancelled at their next wait.
 newtype ScopeId = ScopeId Int
   deriving (Eq, Ord, Show)

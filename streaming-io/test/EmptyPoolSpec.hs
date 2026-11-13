@@ -11,6 +11,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forM_)
 import Data.IORef (newIORef, readIORef)
 import Network.Streaming.Classes hiding (within)
+import Network.Streaming.Combinators (concurrently)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Pool

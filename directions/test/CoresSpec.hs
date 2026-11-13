@@ -9,6 +9,7 @@ import Control.Monad (when)
 import Data.List (sort)
 import Network.Directions.PingPong
 import Network.Streaming.Classes hiding (within)
+import Network.Streaming.Combinators (concurrently)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (Report (..), runLoop)

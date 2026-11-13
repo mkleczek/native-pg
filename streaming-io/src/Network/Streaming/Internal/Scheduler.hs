@@ -29,7 +29,7 @@
 -- at and puts it back among those that can go on, with the cancellation to
 -- raise where it waits. A part in no scope says nothing, and waits as it always
 -- did. A scope holds only the parts it began with, and a part that is suspended
--- at a pair says so: cancelling a scope finds the others through those, so that
+-- at a group of parts or a race says so: cancelling a scope finds the others through those, so that
 -- a part enters and leaves a scope without anything but its own frames
 -- changing, however many parts there are. The scheduler runs masked, and an
 -- asynchronous exception reaches it where it waits for a descriptor, and once
@@ -62,6 +62,7 @@ module Network.Streaming.Internal.Scheduler
     newPart,
     newScope,
     childPart,
+    childParts,
     endPart,
     pushFrame,
     popFrame,
@@ -71,7 +72,7 @@ module Network.Streaming.Internal.Scheduler
     nextWait,
     adjust,
     Joined (..),
-    pairEnded,
+    groupEnded,
     raceEnded,
     Escaped (..),
     guardedBy,
@@ -84,9 +85,8 @@ where
 
 import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDelay, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, try)
-import Control.Monad (foldM, when, (>=>))
+import Control.Monad (foldM, replicateM, when, (>=>))
 import Data.Bits ((.&.), (.|.))
-import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.List (partition)
@@ -115,8 +115,8 @@ data Step
     -- wait is called by when it is in a scope, and 0 otherwise. The action is what runs where the part
     -- waits: nothing, or the cancellation to raise.
     Suspended !Event !Int (IO () -> IO Step)
-  | -- | Two parts that go on at once.
-    Forked (IO Step) (IO Step)
+  | -- | Parts that go on at once: the halves of a race, or the parts of a group.
+    Forked [IO Step]
   | -- | It waits for a ticket, whose slot holds it.
     Parked
   | -- | It waits for a ticket that another core gives, whose slot holds it; the
@@ -154,9 +154,9 @@ data Part = Part
     partCancelled :: !(IORef Bool)
   }
 
--- | A scope of a run, with the parts that its body began with: those of the halves of a pair, or the part that
--- entered a deadline. The others inside it are reached through those: a part that is suspended at a pair says so
--- (see 'InPair'), and the halves are inside what the part is inside.
+-- | A scope of a run, with the parts that its body began with: those of a group or the halves of a race, or the part
+-- that entered a deadline. The others inside it are reached through those: a part that is suspended at a group says so
+-- (see 'InGroup'), and its parts are inside what the part is inside.
 type PartScope = CancelScope [Part]
 
 -- | Where a part waits, as what takes it off that.
@@ -170,9 +170,9 @@ data Parked
   | -- | Anything else: takes the part off, and gives it with the cancellation raised where it waits, if it was
     -- still there.
     Other !(Cancelled -> IO (Maybe (IO Step)))
-  | -- | A pair, whose halves are the parts to look at next: the part is suspended until they have ended, and
-    -- is not taken off anything.
-    InPair !PartScope
+  | -- | A group of parts or the halves of a race, which are the parts to look at next: the part is suspended until
+    -- they have ended, and is not taken off anything.
+    InGroup !PartScope
 
 -- | What the parts of a run share.
 data Run = Run
@@ -444,12 +444,12 @@ newPart run = do
   part <- Part <$> nextWait run <*> newIORef [] <*> newIORef NotWaiting <*> newIORef False
   part <$ modifyIORef' (scopeMembers (runRoot run)) (part :)
 
--- | A scope for a pair or a deadline of the run.
+-- | A scope for a group, a race or a deadline of the run.
 newScope :: Run -> IO PartScope
 newScope run = nextWait run >>= (`newCancelScope` [])
 
--- | A part for a half of a pair, in the scope of the pair as well as in those of the part that made it. The
--- parent, which is suspended until the pair has ended, says where its halves are. The part begins with the flag of its
+-- | A part for a half of a race, in the scope of the race as well as in those of the part that made it. The
+-- parent, which is suspended until the race has ended, says where its halves are. The part begins with the flag of its
 -- parent, since a cancellation that came before it existed has not visited it; a parent in no scope is in the root's.
 childPart :: Run -> Part -> PartScope -> IO Part
 childPart run parent scope' = do
@@ -458,7 +458,20 @@ childPart run parent scope' = do
   child <- Part <$> nextWait run <*> newIORef (Inside scope' : if null outer then [Inside (runRoot run)] else outer) <*> newIORef NotWaiting <*> newIORef flagged
   adjust run 9 1
   modifyIORef' (scopeMembers scope') (<> [child])
-  child <$ writeIORef (partWait parent) (InPair scope')
+  child <$ writeIORef (partWait parent) (InGroup scope')
+
+-- | The parts of a group of this many, in the scope of the group as well as in those of the part that made it. The
+-- parent, which is suspended until the group has ended, says where they are, and the scope holds them: it is given
+-- them once, not one at a time. Each begins with the flag of the parent, as a half of a race does.
+childParts :: Run -> Part -> PartScope -> Int -> IO [Part]
+childParts run parent scope' count = do
+  outer <- readIORef (partFrames parent)
+  flagged <- if null outer then readIORef (scopeCancelled (runRoot run)) else readIORef (partCancelled parent)
+  let frames = Inside scope' : if null outer then [Inside (runRoot run)] else outer
+  children <- replicateM count (Part <$> nextWait run <*> newIORef frames <*> newIORef NotWaiting <*> newIORef flagged)
+  adjust run 9 count
+  writeIORef (scopeMembers scope') children
+  children <$ writeIORef (partWait parent) (InGroup scope')
 
 -- | A part that has ended is in no scope any more.
 endPart :: Run -> Part -> IO ()
@@ -506,8 +519,8 @@ checkpoint part =
 -- | Cancels the scope: its flag is set, and so is that of every part inside it, whether or not it waits and a shield
 -- holds it. The parts that wait, and whose scope lies above their innermost shield, are taken off what they wait at,
 -- and put back among those that can go on, with the cancellation to raise where they wait. The others see it at their
--- next wait. The parts inside it are those it began with, and the halves of the pairs that those are suspended at,
--- and so on.
+-- next wait. The parts inside it are those it began with, and the parts of the groups and the halves of the races that
+-- those are suspended at, and so on.
 cancelScope :: Run -> PartScope -> IO ()
 cancelScope run scope' = do
   writeIORef (scopeCancelled scope') True
@@ -524,7 +537,7 @@ cancelScope run scope' = do
             Nothing -> pure ()
             Just resume -> modifyIORef' (runTickets run) (resume :)
         case waiting of
-          InPair halves -> readIORef (scopeMembers halves) >>= \more -> inside (more <> others)
+          InGroup members -> readIORef (scopeMembers members) >>= \more -> inside (more <> others)
           _ -> inside others
 
 -- | Takes the part off what it waits at, if it still does: what goes on with the part.
@@ -555,7 +568,7 @@ stopWait run cancelled = \case
       ([Watching _ watch resume], rest) -> Just (resume (throwIO cancelled)) <$ (writeIORef (runWatching run) rest *> watchCancel watch)
       _ -> pure Nothing
   Other stop -> stop cancelled
-  InPair _ -> pure Nothing
+  InGroup _ -> pure Nothing
 
 -- | A failure that nothing in the part handles: it leaves the run.
 newtype Escaped = Escaped SomeException
@@ -582,26 +595,25 @@ registering part parked =
     frames -> cancelledFlagged (partCancelled part) frames >>= maybe (writeIORef (partWait part) parked) (throwIO . Cancelled)
 {-# INLINE registering #-}
 
--- | What a pair of halves has of its halves' results, and its first failure, and how many have ended.
-data Joined b c = Joined !(Maybe b) !(Maybe c) !(Maybe SomeException) !Int
+-- | What a group has of its first failure, and how many of its parts have ended.
+data Joined = Joined !(Maybe SomeException) !Int
 
--- | What a pair does when one of its halves has ended: it leaves its scopes, and keeps its result, or its failure
--- if it is the first, which cancels the other half; the half that ends last goes on with the parent: with the
--- first failure, if there was one.
-pairEnded :: Run -> PartScope -> IORef (Joined b c) -> (SomeException -> IO Step) -> ((b, c) -> IO Step) -> Part -> (x -> Joined b c -> Joined b c) -> Either SomeException x -> IO Step
-pairEnded run scope' joined failure success half record outcome = do
-  endPart run half
-  Joined b c failed count <- readIORef joined
-  joined' <- case outcome of
+-- | What a group does when one of its parts, of this many, has ended: the part leaves its scopes, and the group
+-- keeps its failure, if it is the first, which cancels the others; the part that ends last goes on with the parent:
+-- with the first failure, if there was one.
+groupEnded :: Run -> PartScope -> Int -> IORef Joined -> (SomeException -> IO Step) -> (() -> IO Step) -> Part -> Either SomeException () -> IO Step
+groupEnded run scope' size joined failure success part outcome = do
+  endPart run part
+  Joined failed count <- readIORef joined
+  failed' <- case outcome of
     Left thrown
-      | isNothing failed -> cancelScope run scope' $> Joined b c (Just thrown) (count + 1)
-      | otherwise -> pure (Joined b c failed (count + 1))
-    Right result -> pure (record result (Joined b c failed (count + 1)))
-  writeIORef joined joined'
-  case joined' of
-    Joined _ _ (Just thrown) 2 -> writeIORef (scopeMembers scope') [] *> failure thrown
-    Joined (Just b') (Just c') _ 2 -> writeIORef (scopeMembers scope') [] *> success (b', c')
-    Joined{} -> pure Ended
+      | isNothing failed -> Just thrown <$ cancelScope run scope'
+      | otherwise -> pure failed
+    Right () -> pure failed
+  writeIORef joined (Joined failed' (count + 1))
+  if count + 1 < size
+    then pure Ended
+    else writeIORef (scopeMembers scope') [] *> maybe (success ()) failure failed'
 
 -- | What a race does when one of its halves has ended: the first to end is the winner, which cancels the other;
 -- the loser, once it has ended, lets the race go on with the parent, with the winner's failure, or the loser's
@@ -669,7 +681,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
             Parked -> adjust run 5 1 *> go others later
             ParkedRemote -> adjust run 3 1 *> go others later
             Yielded part' -> go others (part' : later)
-            Forked one two -> go others (two : one : later)
+            Forked parts -> go others (foldl (flip (:)) later parts)
             Suspended (Readable fd) _ _ -> waitOn fd True step *> adjust run 4 1 *> go others later
             Suspended (Writable fd) _ _ -> waitOn fd False step *> adjust run 4 1 *> go others later
             Suspended (Until (Instant at)) _ resume -> addTimer (runWheel run) at (modifyIORef' (runTickets run) (resume (pure ()) :)) *> go others later

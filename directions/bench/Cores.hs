@@ -53,7 +53,7 @@ import Network.Directions.PingPong
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (keeping, times, timesWith, together, untilJust)
+import Network.Streaming.Combinators (concurrently, keeping, times, timesWith, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (Report (..))
@@ -140,7 +140,7 @@ part pool stop counter = loop
 
 -- | Runs the arrows at once as a tree of pairs: with 'together', a chain, each thread is forked by the one before
 -- it, and with threads that never wait, the last of a hundred starts when the others have had a time slice each.
-balanced :: (Arrow arr, Concurrent arr) => [arr () ()] -> arr () ()
+balanced :: (Arrow arr, Concurrent arr, Exchange arr (Local arr)) => [arr () ()] -> arr () ()
 balanced [] = returnA
 balanced [one] = one
 balanced parts' = let (front, back) = splitAt (length parts' `div` 2) parts' in concurrently (balanced front) (balanced back) >>> arr (const ())
@@ -216,7 +216,7 @@ loansRun kind variant parts rounds = do
 -- | A client and a server over a socket pair: the client sends a byte and waits for it to come back, and the server
 -- sends back each byte it receives, for the rounds. The buffers are what each receives into.
 socketPingPong :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Buffer -> Buffer -> Int -> arr (Socket, Socket) ()
-socketPingPong forClient forServer rounds = concurrently (arr fst >>> timesWith rounds clientStep) (arr snd >>> timesWith rounds serverStep) >>^ const ()
+socketPingPong forClient forServer rounds = together [arr fst >>> timesWith rounds clientStep >>^ const (), arr snd >>> timesWith rounds serverStep >>^ const ()]
   where
     clientStep = (\end -> ((end, [view forClient 1]), end)) ^>> first sendAll >>> (\((), end) -> ((end, roomOf forClient), end)) ^>> first receive >>^ snd
     serverStep = (\end -> ((end, roomOf forServer), end)) ^>> first receive >>> (\(_, end) -> ((end, [view forServer 1]), end)) ^>> first sendAll >>^ snd

@@ -29,6 +29,7 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forM_, when)
+import Data.Foldable (traverse_)
 import Data.Functor (($>))
 import Data.IORef (atomicWriteIORef, newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
@@ -249,13 +250,19 @@ spawn (Part _ _ parent _ parentFlag) scope' run ended = do
     inside part = \case Inside s -> enter s part; _ -> pure ()
     outside part = \case Inside s -> leave s part; _ -> pure ()
 
--- | Waits for both, and if it is interrupted, cancels them and waits for them still: no part outlives the pair.
+-- | Waits for both, and if it is interrupted, cancels them and waits for them still: no part outlives the race.
 awaitBoth :: CancelScope Members -> MVar a -> MVar b -> IO (a, b)
 awaitBoth scope' one other =
   ((,) <$> readMVar one <*> readMVar other)
     `onException` (cancelScope scope' *> uninterruptibleMask_ (readMVar one *> readMVar other $> ()))
 
--- | What a pair of halves does when one has ended: the first failure is kept, and cancels the scope.
+-- | Waits for all, and if it is interrupted, cancels them and waits for them still: no part outlives the group.
+awaitAll :: CancelScope Members -> [MVar a] -> IO [a]
+awaitAll scope' dones =
+  traverse readMVar dones
+    `onException` (cancelScope scope' *> uninterruptibleMask_ (traverse_ readMVar dones))
+
+-- | What a group does when one of its parts has ended: the first failure is kept, and cancels the scope.
 failing :: IORef (Maybe SomeException) -> CancelScope Members -> Either SomeException x -> IO ()
 failing failure scope' = \case
   Left failed -> do
@@ -263,21 +270,19 @@ failing failure scope' = \case
     when first' (cancelScope scope')
   Right _ -> pure ()
 
--- | Each on a thread of its own, in a cancel scope that the first failure cancels: the other half is cancelled
--- at its wait, and waited for, and the first failure is rethrown. When both fail, the second is dropped.
+-- | Each part on a thread of its own, in a cancel scope that the first failure cancels: the others are cancelled at
+-- their waits, and waited for, and the first failure is rethrown. When several fail, the later are dropped. A part is
+-- entered into the scope of the group and the scopes that enclose it: a group of many parts doesn't make them deeper.
 instance Concurrent Threads where
-  concurrently (Threads one) (Threads two) = Threads $ \part input -> do
-    scope' <- newScope
-    failure <- newIORef Nothing
-    first' <- spawn part scope' (`one` input) (failing failure scope')
-    second' <- spawn part scope' (`two` input) (failing failure scope')
-    (b, d) <- awaitBoth scope' first' second'
-    readIORef failure >>= \case
-      Just failed -> throwIO failed
-      Nothing -> case (b, d) of
-        (Right b', Right d') -> pure (b', d')
-        (Left failed, _) -> throwIO failed
-        (_, Left failed) -> throwIO failed
+  together = \case
+    [] -> arr (const ())
+    [one] -> one
+    parts -> Threads $ \part input -> do
+      scope' <- newScope
+      failure <- newIORef Nothing
+      dones <- traverse (\(Threads body) -> spawn part scope' (`body` input) (failing failure scope')) parts
+      _ <- awaitAll scope' dones
+      readIORef failure >>= maybe (pure ()) throwIO
 
 -- | The first half to end is the result, and the other is cancelled and waited for. The loser's failure is
 -- rethrown too, unless it is a cancellation.

@@ -19,7 +19,7 @@ import Data.Word (Word64)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as Socket
 import Network.Streaming.Classes hiding (within)
-import Network.Streaming.Combinators (times, together, untilJust)
+import Network.Streaming.Combinators (concurrently, times, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)

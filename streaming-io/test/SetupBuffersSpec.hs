@@ -16,7 +16,7 @@ import LoansTestSupport
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Network.Streaming.BufferPool (BufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (sleep, together)
+import Network.Streaming.Combinators (sleep)
 import Network.Streaming.Loans
 import Skeletest
 import System.Mem (performMajorGC)

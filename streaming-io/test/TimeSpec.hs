@@ -13,7 +13,7 @@ import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIO
 import Data.Word (Word64)
 import qualified Network.Socket as Socket
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (releaseWithin, sleep, times, together)
+import Network.Streaming.Combinators (releaseWithin, sleep, times)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Timers

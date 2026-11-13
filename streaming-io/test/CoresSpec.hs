@@ -12,7 +12,7 @@ import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', ne
 import Data.List (isInfixOf, sort)
 import Data.Maybe (fromMaybe)
 import Network.Streaming.Classes hiding (within)
-import Network.Streaming.Combinators (times, timesWith, together)
+import Network.Streaming.Combinators (concurrently, times, timesWith)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)
@@ -160,7 +160,7 @@ waitsForEver :: (Arrow arr, Exchange arr 'Anywhere) => arr () Int
 waitsForEver = ticket @_ @'Anywhere >>> arr fst >>> await
 
 -- | A ticket given a value by the other half of a pair on its core, in a part that waits for it.
-sameCore :: forall r arr. (ArrowChoice arr, Concurrent arr, Exchange arr r) => arr () (Int, Bool)
+sameCore :: forall r arr. (ArrowChoice arr, Concurrent arr, Exchange arr r, Exchange arr (Local arr)) => arr () (Int, Bool)
 sameCore = ticket @arr @r >>> concurrently (arr fst >>> await) (arr (\(_, giver) -> (giver, 42)) >>> give)
 
 givenTwice :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
