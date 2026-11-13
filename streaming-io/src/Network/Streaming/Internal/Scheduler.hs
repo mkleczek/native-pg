@@ -5,11 +5,16 @@
 -- | The scheduler of the arrows that run every part of a program on one thread
 -- as code: "Network.Streaming.Compiled" and "Network.Streaming.Delimited". A
 -- part is an action that runs until it ends, waits, forks or yields, and says
--- which. The scheduler owns a poller (kqueue, or epoll on Linux): a descriptor
--- is registered with it once, for edges of both readability and writability,
--- and the scheduler asks it what became ready when no part can go on, or once
--- a round otherwise, so that a wait costs neither a registration nor a thread
--- of GHC's IO manager. A part that waits for a ticket is held by the ticket.
+-- which. The scheduler owns a poller (kqueue, or epoll on Linux): a part that
+-- blocks on a descriptor's readability or writability has the poller arm that
+-- interest, once, for its next poll, and the scheduler asks the poller what
+-- became ready when no part can go on, or once a round otherwise. A wait costs
+-- no thread of GHC's IO manager, and on kqueue no system call of its own: the
+-- armings go with the poll. A descriptor is armed at each wait, not once for a
+-- run, so that a number that a new socket got after a close is waited on like
+-- any other, and a readiness that came before the wait is found by it. The
+-- scheduler keeps a descriptor's waiting parts only while there are some. A part
+-- that waits for a ticket is held by the ticket.
 -- A part runs for a turn, a length of time: at a point to give way at, once it
 -- has run longer than that, it lets the others go on before it.
 --
@@ -79,8 +84,8 @@ where
 
 import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDelay, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, try)
-import Control.Monad (when, (>=>))
-import Data.Bits ((.&.))
+import Control.Monad (foldM, when, (>=>))
+import Data.Bits ((.&.), (.|.))
 import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
@@ -175,8 +180,8 @@ data Run = Run
     -- waits, the parts that wait for tickets that other cores give and are not
     -- yet back from the mailbox, the parts that wait on descriptors, those that
     -- wait for tickets, the number of the next wait, the rounds, the time that
-    -- the round began at, or 0 before it is read, and the parts that are in a
-    -- scope: unboxed, so that counting allocates nothing. A step is a point to
+    -- the round began at, or 0 before it is read, the parts that are in a
+    -- scope, and the armings that no poll has taken yet: unboxed, so that counting allocates nothing. A step is a point to
     -- give way at, which a link's receive or send is, or a wait, or a ticket
     -- given or waited for.
     runCounters :: !(ForeignPtr Int),
@@ -188,7 +193,7 @@ data Run = Run
     -- | Where the poller writes what became ready: descriptors, and kinds.
     runReady :: !(ForeignPtr CInt),
     runKinds :: !(ForeignPtr CInt),
-    -- | The parts that wait on each registered descriptor: to read, to write.
+    -- | The parts that wait on each descriptor that some wait on: to read, to write.
     runWaiters :: !(IORef (IntMap.IntMap Waiters)),
     -- | The parts that wait on watches.
     runWatching :: !(IORef [Watching]),
@@ -231,8 +236,8 @@ batch = 64
 -- parts run for turns of that length.
 newRun :: Turn -> IO Run
 newRun (Turn turn) = do
-  counters <- mallocForeignPtrArray 10
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 9]
+  counters <- mallocForeignPtrArray 11
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 10]
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
   Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel)
@@ -300,7 +305,7 @@ setCounter run index value = unsafeWithForeignPtr (runCounters run) (\pointer ->
 {-# INLINE setCounter #-}
 
 -- | Adds to a counter: 3 the parts that wait for tickets of other cores, 4 those that wait on descriptors, 5
--- those that wait for tickets, 9 the parts that are in a scope.
+-- those that wait for tickets, 9 the parts that are in a scope, 10 the armings that no poll has taken yet.
 adjust :: Run -> Int -> Int -> IO ()
 adjust run index delta = counter run index >>= setCounter run index . (+ delta)
 {-# INLINE adjust #-}
@@ -531,7 +536,7 @@ stopWait run cancelled = \case
          in case found of
               Nothing -> pure Nothing
               Just resume -> do
-                writeIORef (runWaiters run) (IntMap.insert fd (if reading then Waiters rest writers else Waiters readers rest) waiters)
+                writeIORef (runWaiters run) (settle fd (if reading then Waiters rest writers else Waiters readers rest) waiters)
                 adjust run 4 (-1)
                 pure (Just (resume (throwIO cancelled)))
   OnWatch ident -> do
@@ -676,7 +681,9 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
         writeIORef (runTickets run) []
         given <- takeInbox run >>= arrivals run
         descriptors <- counter run 4
-        polled <- if descriptors > 0 then pollNow else pure []
+        armed <- counter run 10
+        -- A poll in each round that has an arming, so that the armings of parts that were cancelled by then are not left.
+        polled <- if descriptors + armed > 0 then pollNow else pure []
         case polled <> given <> reverse tickets <> reverse later of
           [] -> idle
           next -> go next []
@@ -726,7 +733,8 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
               let (fired, still) = partition snd checked
               mapM_ (\(Watching _ watch _, _) -> watchCancel watch) fired
               writeIORef (runWatching run) (map fst still)
-              polled <- if descriptors > 0 then pollNow else pure []
+              armed <- counter run 10
+              polled <- if descriptors + armed > 0 then pollNow else pure []
               go (polled <> map (\(Watching _ _ resume, _) -> resume (pure ())) fired) []
     countWait = counter run 2 >>= setCounter run 2 . (+ 1)
     -- How long until the next timer is due, in nanoseconds.
@@ -741,15 +749,18 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
         Nothing -> writeIORef (runShutdown run) (Just failure) *> cancelScope run (runRoot run)
         Just _ -> pure ()
     interruptedBy wait = try wait >>= either shuttingDown pure
-    -- Registers the descriptor with the poller the first time a part waits on
-    -- it, and adds the part to its waiters.
+    -- Adds the part to the waiters of the descriptor, and has the poller arm the descriptor for the interest, unless
+    -- parts that wait for it have already: it is armed until it reports.
     waitOn (Fd fd) reading entry = do
       waiters <- readIORef (runWaiters run)
       let key = fromIntegral fd
           Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
-      if IntMap.member key waiters then pure () else throwErrnoIfMinus1_ "streaming_io_poller_add" (c_pollerAdd (runPoller run) fd)
-      writeIORef (runWaiters run) $
-        IntMap.insert key (if reading then Waiters (entry : readers) writers else Waiters readers (entry : writers)) waiters
+          waiting = if reading then Waiters (entry : readers) writers else Waiters readers (entry : writers)
+      when (null (if reading then readers else writers)) $
+        arm fd (if reading then kindReadable else kindWritable) waiting *> adjust run 10 1
+      writeIORef (runWaiters run) (IntMap.insert key waiting waiters)
+    -- The poller arms the descriptor for the kinds that the waiters wait for, of which added are new.
+    arm fd added waiting = throwErrnoIfMinus1_ "streaming_io_poller_arm" (c_pollerArm (runPoller run) fd added (kindsOf waiting))
     -- Asks the poller what became ready, without waiting.
     pollNow = rawPoll c_pollerPoll 0 >>= afterPoll
     -- Waits in the poller, which an asynchronous exception can interrupt: it begins a shutdown. No part runs
@@ -767,21 +778,41 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
     afterPoll count
       | count < 0 = getErrno >>= \errno -> if errno == eINTR then pure [] else throwErrno "streaming_io_poller_wait"
       | otherwise = do
+          setCounter run 10 0
           readied <-
             unsafeWithForeignPtr (runReady run) $ \fds ->
               unsafeWithForeignPtr (runKinds run) $ \kinds ->
                 traverse (\index -> (,) <$> peekElemOff fds index <*> peekElemOff kinds index) [0 .. fromIntegral count - 1]
           waiters <- readIORef (runWaiters run)
-          let (woken, waiters') = foldl wake ([], waiters) readied
+          (woken, waiters') <- foldM wake ([], waiters) readied
           writeIORef (runWaiters run) waiters'
           adjust run 4 (negate (length woken))
           pure (map (\entry -> resumeOf entry (pure ())) woken)
-    wake (woken, waiters) (fd, kind) =
+    -- Takes the parts that wait for what was reported off the descriptor, and arms it again for the others: a report
+    -- may have used up the arming of a kind that nothing waits for any more, or, on epoll, the arming of both.
+    wake (woken, waiters) (fd, kind) = do
       let key = fromIntegral fd
           Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
-          (fromReaders, readers') = if kind .&. 1 /= (0 :: CInt) then (readers, []) else ([], readers)
-          (fromWriters, writers') = if kind .&. 2 /= 0 then (writers, []) else ([], writers)
-       in (woken <> reverse fromReaders <> reverse fromWriters, IntMap.insert key (Waiters readers' writers') waiters)
+          (fromReaders, readers') = if kind .&. kindReadable /= 0 then (readers, []) else ([], readers)
+          (fromWriters, writers') = if kind .&. kindWritable /= 0 then (writers, []) else ([], writers)
+          waiting = Waiters readers' writers'
+      when (kindsOf waiting /= 0) (arm fd 0 waiting)
+      pure (woken <> reverse fromReaders <> reverse fromWriters, settle key waiting waiters)
+
+-- | The kinds of readiness that the poller reports and is armed for: those of C, which are bits.
+kindReadable, kindWritable :: CInt
+kindReadable = 1
+kindWritable = 2
+
+-- | The kinds that the waiters wait for.
+kindsOf :: Waiters -> CInt
+kindsOf (Waiters readers writers) = (if null readers then 0 else kindReadable) .|. (if null writers then 0 else kindWritable)
+
+-- | The waiters of a descriptor in the map, or the map without the descriptor when none are left.
+settle :: Int -> Waiters -> IntMap.IntMap Waiters -> IntMap.IntMap Waiters
+settle key waiting@(Waiters readers writers) waiters
+  | null readers && null writers = IntMap.delete key waiters
+  | otherwise = IntMap.insert key waiting waiters
 
 -- | Whether the watch has fired, without waiting.
 hasFired :: Watch -> IO Bool
@@ -793,8 +824,9 @@ foreign import ccall unsafe "streaming_io_poller_new"
 foreign import ccall unsafe "streaming_io_poller_free"
   c_pollerFree :: Ptr Poller -> IO ()
 
-foreign import ccall unsafe "streaming_io_poller_add"
-  c_pollerAdd :: Ptr Poller -> CInt -> IO CInt
+-- | Arms the descriptor for the next poll: for the kinds that are new, and for all that parts wait for.
+foreign import ccall unsafe "streaming_io_poller_arm"
+  c_pollerArm :: Ptr Poller -> CInt -> CInt -> CInt -> IO CInt
 
 -- | Ends the poller's wait, or its next one, from any thread.
 foreign import ccall unsafe "streaming_io_poller_wake"

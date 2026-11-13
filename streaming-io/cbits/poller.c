@@ -1,7 +1,12 @@
 /*
- * A poller for one scheduler thread: descriptors registered once, for edges
- * of readability and writability both, and one call that waits for any of
- * them. kqueue on macOS and the BSDs, epoll on Linux.
+ * A poller for one scheduler thread: descriptors that are armed when a part
+ * waits on them, for one report each, and one call that waits for any of them.
+ * A descriptor is armed for the directions, readable and writable, that parts
+ * wait for, and is reported once: arming it again is what a part's next wait
+ * does. Arming reports the readiness that is already there, as a new
+ * descriptor's is, so a part that waits for input that arrived before it did
+ * is woken; and a descriptor number that a new socket got after a close needs
+ * nothing but the wait. kqueue on macOS and the BSDs, epoll on Linux.
  *
  * The poller also has a wake handle, registered with it once when it is made,
  * which any other thread can trigger to end the scheduler's wait: an
@@ -20,11 +25,6 @@
 #define STREAMING_IO_WRITABLE 2
 #define STREAMING_IO_EVENTS 64
 
-typedef struct streaming_io_poller {
-  int fd;
-  int wake; /* the eventfd on Linux, unused on kqueue */
-} streaming_io_poller;
-
 /* A monotonic clock, in nanoseconds. macOS's CLOCK_MONOTONIC ticks in whole
  * microseconds, so there it is the uptime clock, which doesn't. */
 uint64_t streaming_io_clock_ns(void) {
@@ -42,13 +42,30 @@ uint64_t streaming_io_clock_ns(void) {
 #include <sys/types.h>
 
 #define STREAMING_IO_WAKE_IDENT 1
+#define STREAMING_IO_FIRST_CHANGES 64
+
+typedef struct streaming_io_poller {
+  int fd;
+  /* The armings that the next wait submits with its own call: a part's wait
+   * costs no system call of its own. */
+  struct kevent *changes;
+  int changes_count;
+  int changes_capacity;
+} streaming_io_poller;
 
 streaming_io_poller *streaming_io_poller_new(void) {
   streaming_io_poller *poller = malloc(sizeof(streaming_io_poller));
   if (poller == NULL) return NULL;
-  poller->wake = -1;
+  poller->changes_count = 0;
+  poller->changes_capacity = STREAMING_IO_FIRST_CHANGES;
+  poller->changes = malloc(sizeof(struct kevent) * poller->changes_capacity);
+  if (poller->changes == NULL) {
+    free(poller);
+    return NULL;
+  }
   poller->fd = kqueue();
   if (poller->fd < 0) {
+    free(poller->changes);
     free(poller);
     return NULL;
   }
@@ -57,6 +74,7 @@ streaming_io_poller *streaming_io_poller_new(void) {
   if (kevent(poller->fd, &change, 1, NULL, 0, NULL) < 0) {
     int saved = errno;
     close(poller->fd);
+    free(poller->changes);
     free(poller);
     errno = saved;
     return NULL;
@@ -66,14 +84,37 @@ streaming_io_poller *streaming_io_poller_new(void) {
 
 void streaming_io_poller_free(streaming_io_poller *poller) {
   close(poller->fd);
+  free(poller->changes);
   free(poller);
 }
 
-int streaming_io_poller_add(streaming_io_poller *poller, int fd) {
-  struct kevent changes[2];
-  EV_SET(&changes[0], fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, 0);
-  EV_SET(&changes[1], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, 0);
-  return kevent(poller->fd, changes, 2, NULL, 0, NULL);
+/* Arms the descriptor for the kinds in added, those that parts began to wait
+ * for. Each filter has a registration of its own that reports once, so it goes
+ * in the list of changes that the next wait submits with its own call. A filter
+ * that is armed already is armed again, which evaluates it again. What parts
+ * still wait for after a report needs nothing, since the filters that did not
+ * report are armed still: waiting is not used here. A change that fails, for a
+ * descriptor that was closed meanwhile, comes back from the wait as an event
+ * for the descriptor. */
+int streaming_io_poller_arm(streaming_io_poller *poller, int fd, int added, int waiting) {
+  (void)waiting;
+  int needed = ((added & STREAMING_IO_READABLE) != 0) + ((added & STREAMING_IO_WRITABLE) != 0);
+  if (needed == 0) return 0;
+  if (poller->changes_count + needed > poller->changes_capacity) {
+    int capacity = poller->changes_capacity * 2;
+    struct kevent *grown = realloc(poller->changes, sizeof(struct kevent) * capacity);
+    if (grown == NULL) {
+      errno = ENOMEM;
+      return -1;
+    }
+    poller->changes = grown;
+    poller->changes_capacity = capacity;
+  }
+  if (added & STREAMING_IO_READABLE)
+    EV_SET(&poller->changes[poller->changes_count++], fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, 0);
+  if (added & STREAMING_IO_WRITABLE)
+    EV_SET(&poller->changes[poller->changes_count++], fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, 0, 0, 0);
+  return 0;
 }
 
 /* From any thread: ends the wait of the thread that owns the poller, or the
@@ -93,7 +134,9 @@ int streaming_io_poller_wait(streaming_io_poller *poller, int *fds, int *kinds, 
     timeout.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
     until = &timeout;
   }
-  int count = kevent(poller->fd, NULL, 0, events, max, until);
+  int count = kevent(poller->fd, poller->changes, poller->changes_count, events, max, until);
+  /* A wait that a signal ended may not have taken the changes: they go again. */
+  if (count >= 0 || errno != EINTR) poller->changes_count = 0;
   int reported = 0;
   for (int i = 0; i < count; i++) {
     if (events[i].filter == EVFILT_USER) continue;
@@ -110,6 +153,11 @@ int streaming_io_poller_wait(streaming_io_poller *poller, int *fds, int *kinds, 
 #include <stdint.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+
+typedef struct streaming_io_poller {
+  int fd;
+  int wake; /* the eventfd */
+} streaming_io_poller;
 
 streaming_io_poller *streaming_io_poller_new(void) {
   streaming_io_poller *poller = malloc(sizeof(streaming_io_poller));
@@ -140,10 +188,24 @@ void streaming_io_poller_free(streaming_io_poller *poller) {
   free(poller);
 }
 
-int streaming_io_poller_add(streaming_io_poller *poller, int fd) {
+/* Arms the descriptor for the kinds in waiting, all that parts wait for, once.
+ * A descriptor has one registration, for both kinds, which a report disables,
+ * so it is armed again for what parts still wait for after one, and then added
+ * is not needed. Modifying a registration that is there arms it and evaluates
+ * it again, so that readiness already there is reported; one that isn't there,
+ * for a descriptor that was not armed before, or that was closed and its number
+ * reused, is added. A descriptor that waits again is far more often one that is
+ * registered, so the modification is tried first, which costs one system call. */
+int streaming_io_poller_arm(streaming_io_poller *poller, int fd, int added, int waiting) {
+  (void)added;
+  if (waiting == 0) return 0;
   struct epoll_event event;
-  event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+  event.events = EPOLLONESHOT;
+  if (waiting & STREAMING_IO_READABLE) event.events |= EPOLLIN | EPOLLRDHUP;
+  if (waiting & STREAMING_IO_WRITABLE) event.events |= EPOLLOUT;
   event.data.fd = fd;
+  if (epoll_ctl(poller->fd, EPOLL_CTL_MOD, fd, &event) == 0) return 0;
+  if (errno != ENOENT) return -1;
   return epoll_ctl(poller->fd, EPOLL_CTL_ADD, fd, &event);
 }
 

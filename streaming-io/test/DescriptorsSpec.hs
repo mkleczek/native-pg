@@ -49,23 +49,23 @@ onCompiled program = fst <$> runCompiled program ()
 spec :: Spec
 spec = describe "descriptors" $ do
   forM_ runners $ \(Runner name run) -> describe name $ do
-    registeredOnce name $ it "are waited on when a closed socket's numbers are reused for another pair, in the same run" $ do
+    it "are waited on when a closed socket's numbers are reused for another pair, in the same run" $ do
       within (run reusedNumber) `shouldReturn` Just (True, 1, 1)
 
-    registeredOnce name $ it "are waited on for input that arrived while nothing waited for it" $ do
+    it "are waited on for input that arrived while nothing waited for it" $ do
       within (run arrivedBefore) `shouldReturn` Just 1
 
     it "are waited on for reading and for writing at once, by two parts" $ do
       within (run bothWays) `shouldReturn` Just (1, flood)
 
-    registeredOnce name $ it "are waited on for input that arrived after a wait was cancelled by a deadline" $ do
+    it "are waited on for input that arrived after a wait was cancelled by a deadline" $ do
       within (run cancelledThenArrived) `shouldReturn` Just (True, 1)
 
-    registeredOnce name $ it "are waited on again when a wait was cancelled by a deadline, and the numbers are reused" $ do
+    it "are waited on again when a wait was cancelled by a deadline, and the numbers are reused" $ do
       within (run cancelledThenReused) `shouldReturn` Just (True, True, 1)
 
   describe "on two cores" $ do
-    registeredOnce "delimited" $ it "are waited on when a socket that was waited on at one core is served at another and closed, and its number is reused at the first (delimited)" $ do
+    it "are waited on when a socket that was waited on at one core is served at another and closed, and its number is reused at the first (delimited)" $ do
       ensureCores
       shared <- newShared
       within (runCores 2 (pure shared) handedOver) `shouldReturn` Just [(True, 1), (True, 1)]
@@ -74,14 +74,6 @@ spec = describe "descriptors" $ do
       ensureCores
       shared <- newShared
       within (runThreads (concurrently (handedOver shared 0) (handedOver shared 1)) ()) `shouldReturn` Just ((True, 1), (True, 1))
-
--- | Marks a case as an expected failure for the arrows that register a descriptor once for a run, and that a number
--- that is reused, or a readiness that came while nothing waited, escapes. The mark comes off with the fix, and a case that
--- then passes unexpectedly fails the suite. Threads waits through GHC's IO manager, which registers at each wait.
-registeredOnce :: String -> Spec -> Spec
-registeredOnce name
-  | name == "threads" = id
-  | otherwise = xfail "the scheduler registers a descriptor with the poller once for a run"
 
 -- | A test that waits for ever fails instead: the scheduler stops where it waits for a descriptor.
 within :: IO a -> IO (Maybe a)
