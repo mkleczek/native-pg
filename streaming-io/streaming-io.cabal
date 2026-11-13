@@ -51,6 +51,7 @@ test-suite streaming-io-spec
                  DescriptorsSpec
                  LoansSpec
                  LoansTestSupport
+                 PoolSpec
                  SetupBuffersSpec
                  Network.Streaming.Internal.ListPrefix
                  Network.Streaming.Output
