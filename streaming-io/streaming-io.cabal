@@ -77,6 +77,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Internal.BufferPool
                  Network.Streaming.Internal.Socket
                  Network.Streaming.Internal.Tickets
+                 EmptyPoolSpec
                  PositiveIntSpec
                  ResourcesSpec
                  WatchSpec
@@ -86,6 +87,6 @@ test-suite streaming-io-spec
                  ScopesSpec
                  TimeSpec
                  WithSpec
-  ghc-options: -Wall -threaded -rtsopts -F -pgmF=skeletest-preprocessor
+  ghc-options: -Wall -threaded -rtsopts -fno-omit-yields -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, containers, network, stm, streaming-io, skeletest >=0.4.2 && <0.5
