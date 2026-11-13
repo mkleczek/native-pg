@@ -72,37 +72,34 @@ spec = describe "system calls" $ do
       toList counts `shouldBe` [(counter, 0) | counter <- [minBound .. maxBound]]
 
   forM_ runners $ \(Runner name polls run) -> when polls $ describe name $ do
-    xfail "a poll without a wait is made at the start of every round, and the wait follows it" $
-      it "makes no poll that doesn't wait, and one that waits for each wake-up, while no other part can go on" $ do
-        counts <- counting (echoing 20 run)
-        countOf PollsImmediate counts `shouldBe` 0
-        countOf PollsBlocking counts `shouldBe` countOf DescriptorWaits counts
+    it "makes no poll that doesn't wait, and one that waits for each wake-up, while no other part can go on" $ do
+      counts <- counting (echoing 20 run)
+      countOf PollsImmediate counts `shouldBe` 0
+      countOf PollsBlocking counts `shouldBe` countOf DescriptorWaits counts
 
-    xfail "a poll is made at the start of every round that has a descriptor to look at" $
-      it "polls at most once for a turn while other parts can go on, and finds a descriptor that became ready within a few turns" $ do
-        (mine, theirs) <- newPair
-        stamps@(Stamps sent woke finished) <- Stamps <$> newIORef 0 <*> newIORef 0 <*> newIORef 0
-        done <- newEmptyMVar
-        _ <- forkIO (lateByte stamps theirs `finally` putMVar done ())
-        counts <- counting (run (microseconds 100) (busyAndWaiting stamps rounds (mine, theirs)))
-        takeMVar done
-        mapM_ Socket.close [mine, theirs]
-        (sentAt, wokeAt, finishedAt) <- (,,) <$> readIORef sent <*> readIORef woke <*> readIORef finished
-        -- The part that waited was woken while the others still ran, within a few turns of the byte, which a run that
-        -- looked only when it had nothing else to do would not do.
-        (wokeAt < finishedAt) `shouldBe` True
-        (wokeAt - sentAt < 15000000) `shouldBe` True
-        -- A poll at every round is a poll for each of the many rounds of the ping-pong.
-        (countOf PollsImmediate counts < rounds `div` 10) `shouldBe` True
+    it "polls at most once for a turn while other parts can go on, and finds a descriptor that became ready within a few turns" $ do
+      (mine, theirs) <- newPair
+      stamps@(Stamps sent woke finished) <- Stamps <$> newIORef 0 <*> newIORef 0 <*> newIORef 0
+      done <- newEmptyMVar
+      _ <- forkIO (lateByte stamps theirs `finally` putMVar done ())
+      counts <- counting (run (microseconds 100) (busyAndWaiting stamps rounds (mine, theirs)))
+      takeMVar done
+      mapM_ Socket.close [mine, theirs]
+      (sentAt, wokeAt, finishedAt) <- (,,) <$> readIORef sent <*> readIORef woke <*> readIORef finished
+      -- The part that waited was woken while the others still ran, within a few turns of the byte, which a run that
+      -- looked only when it had nothing else to do would not do.
+      (wokeAt < finishedAt) `shouldBe` True
+      (wokeAt - sentAt < 15000000) `shouldBe` True
+      -- A poll at every round is a poll for each of the many rounds of the ping-pong.
+      (countOf PollsImmediate counts < rounds `div` 10) `shouldBe` True
 
-    xfail "a poll is made at the start of every round that has an arming that no poll has taken" $
-      it "polls once the armings that waits cancelled meanwhile have piled up, and not at every round" $ do
-        (mine, theirs) <- newPair
-        counts <- counting (run (microseconds 1000000) (cancelledWaits 1000 20000 mine))
-        mapM_ Socket.close [mine, theirs]
-        countOf Armings counts `shouldBe` 1000
-        (countOf PollsImmediate counts >= 10) `shouldBe` True
-        (countOf PollsImmediate counts <= 100) `shouldBe` True
+    it "polls once the armings that waits cancelled meanwhile have piled up, and not at every round" $ do
+      (mine, theirs) <- newPair
+      counts <- counting (run (microseconds 1000000) (cancelledWaits 1000 20000 mine))
+      mapM_ Socket.close [mine, theirs]
+      countOf Armings counts `shouldBe` 1000
+      (countOf PollsImmediate counts >= 10) `shouldBe` True
+      (countOf PollsImmediate counts <= 100) `shouldBe` True
 
   describe "on two cores" $ do
     it "count an arming of a descriptor that another core armed last as a move" $ do

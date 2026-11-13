@@ -8,8 +8,9 @@
 -- part is an action that runs until it ends, waits, forks or yields, and says
 -- which. The scheduler owns a poller (kqueue, or epoll on Linux): a part that
 -- blocks on a descriptor's readability or writability has the poller arm that
--- interest, once, for its next poll, and the scheduler asks the poller what
--- became ready when no part can go on, or once a round otherwise. A wait costs
+-- interest, once, for its next poll. When no part can go on, the scheduler waits in the poller,
+-- which gives what is ready at once if something is; while others can go on, it asks
+-- the poller, without waiting, once every few turns. A wait costs
 -- no thread of GHC's IO manager, and on kqueue no system call of its own: the
 -- armings go with the poll. A descriptor is armed at each wait, not once for a
 -- run, so that a number that a new socket got after a close is waited on like
@@ -187,7 +188,8 @@ data Run = Run
     -- yet back from the mailbox, the parts that wait on descriptors, those that
     -- wait for tickets, the number of the next wait, the rounds, the time that
     -- the round began at, or 0 before it is read, the parts that are in a
-    -- scope, the armings that no poll has taken yet, and the run's own number: unboxed, so that counting allocates nothing. A step is a point to
+    -- scope, the armings that no poll has taken yet, the run's own number, and the time of the last poll: unboxed, so that
+    -- counting allocates nothing. A step is a point to
     -- give way at, which a link's receive or send is, or a wait, or a ticket
     -- given or waited for.
     runCounters :: !(ForeignPtr Int),
@@ -237,13 +239,26 @@ data Posting = Posted | Wake | Refused
 batch :: Int
 batch = 64
 
+-- | How many turns may pass while other parts can go on before the scheduler polls without waiting: a part that is woken
+-- waits at most that long, on top of what it waits for the parts that run before it. A poll costs about a tenth of a turn,
+-- so a poll at each turn spends a tenth of the time on polls when parts are short of work, and many rounds are short: with
+-- one turn, a 16 KiB request made 2.6 polls that found nothing at 800 requests a second, with four 0.86 and with sixteen
+-- none (the VM of the checks, 2 cores).
+pollTurns :: Int
+pollTurns = 4
+
+-- | How many armings that no poll has taken yet make a poll before the turns are over: kqueue keeps them as changes for the
+-- next call, which this keeps from growing without end.
+pendingArmings :: Int
+pendingArmings = 64
+
 -- | A run with a poller, which 'freeRun' closes: whoever makes it frees it,
 -- once nothing that is given parts through its mailbox can run any more. Its
 -- parts run for turns of that length.
 newRun :: Turn -> IO Run
 newRun (Turn turn) = do
-  counters <- mallocForeignPtrArray 12
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 11]
+  counters <- mallocForeignPtrArray 13
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 12]
   number <- newRunNumber
   unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
@@ -708,13 +723,23 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
         tickets <- readIORef (runTickets run)
         writeIORef (runTickets run) []
         given <- takeInbox run >>= arrivals run
-        descriptors <- counter run 4
-        armed <- counter run 10
-        -- A poll in each round that has an arming, so that the armings of parts that were cancelled by then are not left.
-        polled <- if descriptors + armed > 0 then pollNow else pure []
-        case polled <> given <> reverse tickets <> reverse later of
+        case given <> reverse tickets <> reverse later of
+          -- No part can go on: the blocking poll in 'idle' returns at once if a descriptor is ready.
           [] -> idle
-          next -> go next []
+          others -> looking >>= \polled -> go (polled <> others) []
+    -- Polls without waiting, if 'pollTurns' turns have passed since the last poll or enough armings are waiting for one, and
+    -- gives the parts it woke. The armings are those of waits that were cancelled: they stay armed until a poll, and on kqueue
+    -- they are changes that the poll submits.
+    looking = do
+      descriptors <- counter run 4
+      armed <- counter run 10
+      if descriptors + armed == 0
+        then pure []
+        else do
+          -- Not the time of the round, which the clock arrow gives to the parts and which is read when it is first asked for.
+          began <- clock
+          polledAt <- counter run 12
+          if armed >= pendingArmings || began - polledAt >= pollTurns * runTurn run then pollNow else pure []
     idle = do
       remote <- counter run 3
       descriptors <- counter run 4
@@ -815,6 +840,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
       | count < 0 = getErrno >>= \errno -> if errno == eINTR then pure [] else throwErrno "streaming_io_poller_wait"
       | otherwise = do
           setCounter run 10 0
+          clock >>= setCounter run 12
           readied <-
             unsafeWithForeignPtr (runReady run) $ \fds ->
               unsafeWithForeignPtr (runKinds run) $ \kinds ->
