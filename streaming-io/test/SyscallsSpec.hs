@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- | The calls that a part's waits and receives make on the system, which "Network.Streaming.Counters" counts: the
@@ -21,7 +22,7 @@ import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Buffer (newBuffer)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (call, expect, timesWith, untilJust)
+import Network.Streaming.Combinators (call, expect, sleep, timesWith, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Counters
 import Network.Streaming.Delimited
@@ -70,6 +71,66 @@ spec = describe "system calls" $ do
     it "counts nothing in Release, where the exchange that Debug counts leaves every count as it was" $ do
       counts <- counting (echoing 20 run)
       toList counts `shouldBe` [(counter, 0) | counter <- [minBound .. maxBound]]
+
+  forM_ runners $ \(Runner name _ run) -> describe name $ do
+    xfail "a receive tries before it waits, whatever came before it" $
+      it "receives once without finding anything, and then waits before each receive, when each one follows a short one" $ do
+        counts <- counting (echoing 20 run)
+        countOf ReceivesEmpty counts `shouldBe` 1
+        countOf ReceivesSkipped counts `shouldBe` 19
+        countOf Receives counts `shouldBe` 21
+        countOf DescriptorWaits counts `shouldBe` 20
+
+    xfail "a receive tries before it waits, whatever came before it" $
+      it "receives first after a read that filled the buffer, and waits first after a short one that a send followed" $ do
+        (mine, theirs) <- newPair
+        SocketBytes.sendAll theirs (BS.replicate 40 7)
+        done <- newEmptyMVar
+        _ <- forkIO (lateByte' theirs `finally` putMVar done ())
+        counts <- counting (run defaultTurn (arr (const mine) >>> received >>> received >>> received >>> sending >>> received >>> arr (const ())))
+        takeMVar done
+        mapM_ Socket.close [mine, theirs]
+        -- Two reads of 16 bytes, one of the 8 that were left, a send, and then the byte that came later, which the fourth receive waits for.
+        countOf Receives counts `shouldBe` 4
+        countOf ReceivesEmpty counts `shouldBe` 0
+        countOf ReceivesSkipped counts `shouldBe` 1
+        countOf DescriptorWaits counts `shouldBe` 1
+
+    it "receives first after a short read that no send followed, since the rest of what the other end sends may be on its way" $ do
+      pair@(mine, theirs) <- newPair
+      done <- newEmptyMVar
+      _ <- forkIO (handoverDriver pair `finally` putMVar done ())
+      counts <- counting (run defaultTurn (arr (const mine) >>> received >>> pausing >>> pausing >>> pausing >>> received >>> arr (const ())))
+      takeMVar done
+      mapM_ Socket.close [mine, theirs]
+      countOf Receives counts `shouldBe` 3
+      countOf ReceivesEmpty counts `shouldBe` 1
+      countOf ReceivesSkipped counts `shouldBe` 0
+      countOf DescriptorWaits counts `shouldBe` 1
+
+    xfail "a receive tries before it waits, whatever came before it" $
+      it "finds what arrived between a short read and a send and the next receive, by waiting for it" $ do
+        pair@(mine, theirs) <- newPair
+        done <- newEmptyMVar
+        _ <- forkIO (handoverDriver pair `finally` putMVar done ())
+        counts <- counting (run defaultTurn (arr (const mine) >>> received >>> sending >>> pausing >>> pausing >>> pausing >>> received >>> arr (const ())))
+        takeMVar done
+        mapM_ Socket.close [mine, theirs]
+        countOf Receives counts `shouldBe` 3
+        countOf ReceivesEmpty counts `shouldBe` 1
+        countOf ReceivesSkipped counts `shouldBe` 1
+        countOf DescriptorWaits counts `shouldBe` 2
+
+    it "receives first after a wait for input, which found the input that the receive then takes" $ do
+      pair@(mine, theirs) <- newPair
+      done <- newEmptyMVar
+      _ <- forkIO (handoverDriver pair `finally` putMVar done ())
+      counts <- counting (run defaultTurn (arr (const mine) >>> received >>> awaiting >>> received >>> arr (const ())))
+      takeMVar done
+      mapM_ Socket.close [mine, theirs]
+      countOf Receives counts `shouldBe` 3
+      countOf ReceivesSkipped counts `shouldBe` 0
+      countOf DescriptorWaits counts `shouldBe` 2
 
   forM_ runners $ \(Runner name polls run) -> when polls $ describe name $ do
     it "makes no poll that doesn't wait, and one that waits for each wake-up, while no other part can go on" $ do
@@ -148,11 +209,26 @@ newPair = do
 receiveOne :: (Rich arr) => arr Socket Int
 receiveOne = now (\sock -> (\buffer -> (sock, roomOf buffer)) <$> newBuffer (positiveInt @16)) >>> receive
 
+-- | Receives into a buffer of 16 bytes, and goes on with the socket.
+received :: (Rich arr) => arr Socket Socket
+received = (\sock -> (sock, sock)) ^>> first receiveOne >>^ snd
+
+-- | Waits for 30 milliseconds, and goes on with the socket.
+pausing :: (Rich arr) => arr Socket Socket
+pausing = ((),) ^>> first (sleep (millis 30)) >>^ snd
+
+-- | Sends a byte on the socket, and goes on with it.
+sending :: (Rich arr) => arr Socket Socket
+sending = (\sock -> ((sock, [BS.singleton 7]), sock)) ^>> first sendAll >>^ snd
+
+-- | Waits until the socket has input, and goes on with it.
+awaiting :: (Rich arr) => arr Socket Socket
+awaiting = (\sock -> (sock, sock)) ^>> first awaitInput >>^ snd
+
 -- | Receives a byte on the socket and sends it back, this many times.
 echoes :: (Rich arr) => Int -> arr Socket ()
 echoes count = timesWith count (received >>> echo) >>> arr (const ())
   where
-    received = (\sock -> (sock, sock)) ^>> first receiveOne >>^ snd
     echo = (\sock -> ((sock, [BS.singleton 7]), sock)) ^>> first sendAll >>^ snd
 
 -- | The part receives and sends back this many bytes, one at a time, with a thread that sends a byte and waits for the
@@ -228,3 +304,7 @@ busyAndWaiting (Stamps _ woke finished) count (mine, theirs) = together [busy, w
 -- | Waits for a byte on the socket with a deadline that has passed, this many times, while a ping-pong runs.
 cancelledWaits :: (Rich arr) => Int -> Int -> Socket -> arr () ()
 cancelledWaits waits count sock = together [pingPong count, arr (const sock) >>> timesWith waits (within (nanos 1) receiveOne >>^ const sock) >>^ const ()]
+
+-- | One byte, a little after the run began.
+lateByte' :: Socket -> IO ()
+lateByte' sock = threadDelay 100000 *> SocketBytes.sendAll sock (BS.singleton 7)
