@@ -12,7 +12,9 @@ build-type: Simple
 library
   default-language: GHC2021
   hs-source-dirs: src
-  ghc-options: -Wall
+  -- The unfoldings are exposed and the overloaded functions specialised, so that a program that is built where its arrow
+  -- is known is specialised to the arrow.
+  ghc-options: -Wall -fexpose-all-unfoldings -fspecialise-aggressively
   exposed-modules: Network.Fulmen
                    Network.Fulmen.Request
                    Network.Fulmen.Response
@@ -37,7 +39,7 @@ test-suite fulmen-conformance
   other-modules: ConformanceCases
                  ConformanceSpec
                  ConformanceWire
-  ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
+  ghc-options: -Wall -threaded -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5
 
@@ -47,5 +49,5 @@ executable fulmen-bench
   default-language: GHC2021
   hs-source-dirs: bench
   main-is: Main.hs
-  ghc-options: -Wall -threaded -rtsopts
+  ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively
   build-depends: base, bytestring, fulmen, network, streaming-io

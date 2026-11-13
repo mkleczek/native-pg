@@ -65,7 +65,7 @@ test-suite native-pg-integration
                       TestPrograms
                       TransactionSpec
   main-is: Main.hs
-  ghc-options: -Wall -threaded "-with-rtsopts=-T"
+  ghc-options: -Wall -threaded "-with-rtsopts=-T" -fspecialise-aggressively
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   c-sources: native-pg-tls/src/cbits/native-pg-tls.c
   include-dirs: native-pg-tls/src/cbits
@@ -92,7 +92,8 @@ test-suite native-pg-integration
 
 -- What a request costs over a Unix-domain socket, through a pool: transactions and bytes allocated for each, under
 -- each arrow, for a statement that gives one number and for one that gives a field of 16 KiB and of 1 MiB. It starts a
--- cluster of its own, as the integration tests do. Run it with @cabal bench native-pg-integration@.
+-- cluster of its own, as the integration tests do. Run it with @cabal bench native-pg-integration@. It compiles native-pg's
+-- sources, so it exposes their unfoldings as the library does: without them GHC cannot specialise a request to its arrow.
 benchmark native-pg-bench
   default-language: GHC2021
   default-extensions: QuasiQuotes
@@ -136,7 +137,7 @@ benchmark native-pg-bench
                       Database.PostgreSQL.Types
                       TestCluster
   main-is: Bench.hs
-  ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-T"
+  ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-T" -fexpose-all-unfoldings -fspecialise-aggressively
   build-depends:      base              >= 4.9 && < 4.22
                     , base64-bytestring >= 1 && < 1.3
                     , bytestring        >= 0.10.8 && < 0.13

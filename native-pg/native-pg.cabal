@@ -61,6 +61,9 @@ common implementation
 
 library
   import:             implementation
+  -- The unfoldings are exposed and the overloaded functions specialised, so that a program that is built where its arrow
+  -- is known is specialised to the arrow.
+  ghc-options:        -fexpose-all-unfoldings -fspecialise-aggressively
   exposed-modules:    Database.PostgreSQL.Connection
                       Database.PostgreSQL.ConnectionString
                       Database.PostgreSQL.ConnectionString.Types
@@ -99,7 +102,7 @@ test-suite native-pg-spec
                       CoreSpec
                       PasswordFileSpec
   main-is:            Main.hs
-  ghc-options:        -Wall -threaded -F -pgmF=skeletest-preprocessor
+  ghc-options:        -Wall -threaded -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   -- Whitebox tests compile the sources so hidden modules stay unavailable
   -- to clients without requiring a separate implementation library.
@@ -116,7 +119,7 @@ benchmark parsers-bench
   other-modules:      Database.PostgreSQL.Internal.Protocol.Codec.Cursor
                       Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
                       Database.PostgreSQL.Internal.Protocol.Codec.Payload
-  ghc-options:        -Wall -threaded -rtsopts
+  ghc-options:        -Wall -threaded -rtsopts -fspecialise-aggressively
   build-depends:      base, bytestring, directions, streaming-io
 
 -- Tests of the streaming cursors that are derived from the payload schema.
@@ -131,6 +134,6 @@ test-suite cursors-spec
                       Database.PostgreSQL.Internal.Protocol.Codec.Cursor
                       Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
                       Database.PostgreSQL.Internal.Protocol.Codec.Payload
-  ghc-options:        -Wall -threaded -rtsopts "-with-rtsopts=-T" -F -pgmF=skeletest-preprocessor
+  ghc-options:        -Wall -threaded -rtsopts "-with-rtsopts=-T" -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   build-depends:      base, bytestring, directions, streaming-io, skeletest >= 0.4.2 && < 0.5

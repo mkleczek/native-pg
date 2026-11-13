@@ -26,7 +26,7 @@ test-suite directions-spec
   other-modules: DirectionsSpec
                  ReaderSpec
                  CoresSpec
-  ghc-options: -Wall -threaded -rtsopts -F -pgmF=skeletest-preprocessor
+  ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, network, directions, streaming-io, skeletest >=0.4.2 && <0.5
 
@@ -34,12 +34,12 @@ executable directions-bench
   default-language: GHC2021
   hs-source-dirs: bench
   main-is: Main.hs
-  ghc-options: -Wall -threaded -rtsopts
+  ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively
   build-depends: base, network, directions, streaming-io
 
 executable directions-cores-bench
   default-language: GHC2021
   hs-source-dirs: bench
   main-is: Cores.hs
-  ghc-options: -Wall -threaded -rtsopts
+  ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively
   build-depends: base, network, directions, streaming-io

@@ -13,7 +13,7 @@
 -- allocation (@GET /reset@), runs its connections for the time with the path, and asks for the difference
 -- (@GET /report@), over a connection of its own that it keeps all the while: the server needs a worker for it besides
 -- the ones for the connections that the client runs. The server is the arrow runtime's, the client is plain IO: a GHC thread for each connection, which
--- blocks on its socket.
+-- blocks on its socket. The server builds its program where its arrow is known, in 'server', so that GHC specialises it to the arrow.
 module Main (main) where
 
 import Control.Arrow (arr, first, (>>>), (^>>))

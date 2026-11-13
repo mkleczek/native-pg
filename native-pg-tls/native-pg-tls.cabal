@@ -47,7 +47,7 @@ test-suite native-pg-tls-spec
   other-modules:      TlsSpec
                       Database.PostgreSQL.Tls.Internal
   main-is:            Main.hs
-  ghc-options:        -Wall -threaded -F -pgmF=skeletest-preprocessor
+  ghc-options:        -Wall -threaded -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   c-sources:          src/cbits/native-pg-tls.c
   include-dirs:       src/cbits

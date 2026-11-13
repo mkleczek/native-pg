@@ -1,7 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- | What a request costs: transactions per second and bytes allocated for each, over a Unix-domain socket and a pool of
@@ -10,11 +9,14 @@
 -- Every request is as a server's: a transaction on a pooled connection, in loans of its own, whose pipeline carries the
 -- COMMIT. Nothing is gated: the numbers are what it prints.
 --
+-- Each arrow runs a program that is built where the arrow is known, as a server builds its own, so that GHC specialises
+-- the program to the arrow: one that is given the arrow's dictionaries at run time allocates a few times as much.
+--
 -- Usage: @native-pg-bench [scale]@, which multiplies the number of requests of each workload (1 by default).
 module Main (main) where
 
 import Control.Arrow (first, returnA, (>>>), (>>^), (^>>), (|||))
-import Control.Monad (forM_, unless)
+import Control.Monad (forM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int32)
@@ -40,24 +42,32 @@ import System.Process (readProcess)
 import TestCluster (withCluster)
 import Text.Printf (printf)
 
--- | A program for any arrow that has what 'Runtime' bundles.
-type Program a = forall arr. (Runtime arr) => arr () a
+-- | What a request asks the server for.
+data Workload = SelectOne | Field16 | Field1M
+  deriving (Eq, Show, Enum, Bounded)
 
--- | A way to run a program: an arrow's runner.
-data Runner = Runner String (forall a. Program a -> IO a)
+-- | The name of a workload, and how many requests a measurement makes of it.
+label :: Workload -> String
+label = \case
+  SelectOne -> "select 1"
+  Field16 -> "json field, ~16 KiB"
+  Field1M -> "json field, ~1 MiB"
 
-runners :: [Runner]
-runners = [Runner "threads" onThreads, Runner "delimited" onDelimited, Runner "compiled" onCompiled]
+requestsOf :: Workload -> Int
+requestsOf = \case
+  SelectOne -> 20000
+  Field16 -> 10000
+  Field1M -> 500
 
--- | Each arrow runs a program for the unit: a function of its own, since a program is for any arrow.
-onThreads, onDelimited, onCompiled :: Program a -> IO a
-onThreads program = runThreads program ()
-onDelimited program = fst <$> runDelimited program ()
-onCompiled program = fst <$> runCompiled program ()
-
--- | What a request asks the server for: its name, how many requests a measurement makes of it, and the request, for a
--- pool of buffers and a pool of connections.
-data Workload = Workload String Int (forall arr. (Runtime arr) => BufferPool -> ConnectionPool -> arr () ())
+-- | The arrows, each of which runs a request of a workload the given number of times, for a pool of buffers and a pool
+-- of connections. A server builds its program where its arrow is known, and so does each of these: 'build' is for any
+-- arrow, and is specialised to each.
+runners :: [(String, Workload -> BufferPool -> ConnectionPool -> Int -> IO ())]
+runners =
+  [ ("threads", \workload buffers pool n -> runThreads (times n (build workload buffers pool)) ()),
+    ("delimited", \workload buffers pool n -> void (runDelimited (times n (build workload buffers pool)) ())),
+    ("compiled", \workload buffers pool n -> void (runCompiled (times n (build workload buffers pool)) ()))
+  ]
 
 main :: IO ()
 main = do
@@ -83,19 +93,19 @@ main = do
       size <- readProcess "psql" ["--host", takeDirectory socketPath, "--port", show port, "--username", "postgres", "--dbname", "postgres", "--no-psqlrc", "--tuples-only", "--no-align", "--command", "SELECT length(json_agg(" <> table <> ")::text) FROM " <> table] ""
       printf "the field of %s has %s bytes\n" (table :: String) (filter (/= '\n') size)
     printf "%-10s %-22s %12s %14s\n" ("arrow" :: String) ("workload" :: String) ("tx/s" :: String) ("bytes/tx" :: String)
-    forM_ runners $ \runner -> forM_ (workloads scale) $ \workload ->
+    forM_ runners $ \(name, run) -> forM_ [minBound .. maxBound] $ \workload ->
       -- A pool for each measurement, so that its connection is made under the arrow that measures it.
-      withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> measure runner buffers pool workload
+      withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> measure name workload (requestsOf workload * scale) (run workload buffers pool)
 
 -- | A statement that gives one number, and ones that give one JSON value, of the tables' rows, as a field.
-workloads :: Int -> [Workload]
-workloads scale =
-  [ Workload "select 1" (20000 * scale) (\buffers pool -> request buffers pool (Tx.Statement "SELECT 1" (const []) (Tx.one (Tx.column @_ @Int32))) (\result -> Tx.single result >>^ const ())),
-    Workload "json field, ~16 KiB" (10000 * scale) (field "SELECT json_agg(small) FROM small"),
-    Workload "json field, ~1 MiB" (500 * scale) (field "SELECT json_agg(large) FROM large")
-  ]
+build :: (Runtime arr) => Workload -> BufferPool -> ConnectionPool -> arr () ()
+build workload buffers pool = case workload of
+  SelectOne -> request buffers pool (Tx.Statement "SELECT 1" (const []) (Tx.one (Tx.column @_ @Int32))) (\result -> Tx.single result >>^ const ())
+  Field16 -> field "SELECT json_agg(small) FROM small"
+  Field1M -> field "SELECT json_agg(large) FROM large"
   where
-    field sql buffers pool = request buffers pool (Tx.Statement sql (const []) (Tx.one Tx.field)) (\result -> Tx.single result >>> drained >>^ const ())
+    field sql = request buffers pool (Tx.Statement sql (const []) (Tx.one Tx.field)) (\result -> Tx.single result >>> drained >>^ const ())
+{-# INLINABLE build #-}
 
 -- | One request: a transaction on a pooled connection, in loans of its own, whose pipeline carries the COMMIT, and the
 -- reading program that takes its one result.
@@ -132,17 +142,17 @@ commands buffers pool texts =
 
 -- | The workload under the arrow: transactions per second, and the bytes that each allocated. The first requests make
 -- the pool's connection, and are not measured.
-measure :: Runner -> BufferPool -> ConnectionPool -> Workload -> IO ()
-measure (Runner arrowName run) buffers pool (Workload label requests build) = do
-  run (times 100 (build buffers pool))
+measure :: String -> Workload -> Int -> (Int -> IO ()) -> IO ()
+measure arrowName workload requests run = do
+  run 100
   performGC
   before <- allocated_bytes <$> getRTSStats
   started <- getMonotonicTime
-  run (times requests (build buffers pool))
+  run requests
   ended <- getMonotonicTime
   performGC
   after <- allocated_bytes <$> getRTSStats
-  printf "%-10s %-22s %12.0f %14.0f\n" arrowName label (fromIntegral requests / (ended - started)) (fromIntegral (after - before) / fromIntegral requests :: Double)
+  printf "%-10s %-22s %12.0f %14.0f\n" arrowName (label workload) (fromIntegral requests / (ended - started)) (fromIntegral (after - before) / fromIntegral requests :: Double)
 
 headMaybe :: [a] -> Maybe a
 headMaybe = \case [] -> Nothing; first' : _ -> Just first'

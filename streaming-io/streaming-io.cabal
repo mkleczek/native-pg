@@ -13,7 +13,9 @@ extra-source-files: test/check-positive-int.sh
 library
   default-language: GHC2021
   hs-source-dirs: src
-  ghc-options: -Wall
+  -- The unfoldings are exposed and the overloaded functions specialised, so that a program that is built where its arrow
+  -- is known is specialised to the arrow, in the library that uses it too.
+  ghc-options: -Wall -fexpose-all-unfoldings -fspecialise-aggressively
   exposed-modules: Network.Streaming.Output
                    Network.Streaming.PositiveInt
                    Network.Streaming.BufferPool
@@ -88,6 +90,6 @@ test-suite streaming-io-spec
                  ScopesSpec
                  TimeSpec
                  WithSpec
-  ghc-options: -Wall -threaded -rtsopts -fno-omit-yields -F -pgmF=skeletest-preprocessor
+  ghc-options: -Wall -threaded -rtsopts -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, containers, network, stm, streaming-io, skeletest >=0.4.2 && <0.5
