@@ -258,7 +258,8 @@ data Cardinality
 data Rows arr row = Rows Cardinality (arr Columns row)
 
 -- | A column's value as a stream, of the declared length: the last column of a
--- row, and the way to read a value that is larger than the buffer.
+-- row, and the way to read a value that is larger than the buffer. It is valid
+-- until its row moves on, and then fails with 'FieldExpired'.
 newtype Field = Field Int
 
 instance (Effect arr) => Stream arr Field where

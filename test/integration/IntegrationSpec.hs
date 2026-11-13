@@ -464,17 +464,24 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       -- The field says how long it is, and its pieces add up to that.
       withSession (transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain ("SELECT repeat('x', " <> Char8.pack (show size) <> ")") (Tx.any Tx.field))) (\result -> Tx.single result >>> (arr Tx.fieldLength &&& consumeSlowly)))
         `shouldReturn` Right (size, (size, True, True))
-    -- v1: RowMisuse for a row used after its step. A row of v2 can't leave its step, but a field can. API.md names no
-    -- constructor for this misuse, so the case says only that it is a 'UsageError'.
+    -- v1: RowMisuse for a row used after its step. A row of v2 can't leave its step, but a field can: it fails with
+    -- 'FieldExpired', once the cursor has moved on, and once its transaction has ended.
     it "rejects a field used after the cursor moved on" $
       withSession
         ( transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT s::text FROM generate_series(1, 2) s" (Tx.any Tx.field))) $ \result ->
             Tx.single result
               >>> (returnA &&& (arr (const ()) >>> Tx.nextRow result))
               >>> arr fst
-              >>> (next `failsAs` \(_ :: UsageError) -> pure ())
+              >>> (next `failsWith` FieldExpired)
         )
         `shouldReturn` Right ()
+    it "rejects a field used after its transaction ended" $
+      withSession
+        ( transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT 'x'::text" (Tx.any Tx.field))) Tx.single
+            >>> now (either (\failure -> failTest ("the statement failed: " <> show failure)) pure)
+            >>> (next `failsWith` FieldExpired)
+        )
+        `shouldReturn` ()
 
   notYet $ describe "decoding" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b

@@ -48,6 +48,8 @@ withConnectionPool _ _ = notImplementedIO "withConnectionPool"
 
 -- | The body, with a connection of the pool for as long as it runs, as 'withLoan'
 -- does, and as a holder that is served first ('urgently'). The checkout waits
--- inside the deadline of the arrow's 'Network.Streaming.Classes.within'.
+-- inside the deadline of the arrow's 'Network.Streaming.Classes.within'. The
+-- connection is the body's alone: used after the body ended, it fails with
+-- 'Database.PostgreSQL.Errors.ConnectionReleased'.
 withConnection :: (Runtime arr) => Pool Connection -> arr (Connection, a) b -> arr a (Either PoolError b)
 withConnection pool body = withLoan pool (urgently body)

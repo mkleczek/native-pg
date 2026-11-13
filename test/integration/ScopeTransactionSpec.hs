@@ -278,6 +278,18 @@ spec socketPath port = describe "operations and transactions in a request" $ for
       -- The failure was seen, and the connection is fine
       pidOf env `shouldReturn` pid
 
+  -- A connection is the body's alone: one that leaves its 'withConnection', in the body's result, fails with
+  -- 'ConnectionReleased' when it is used, whoever has the connection of the pool by then.
+  notYet $ describe "a connection after its request" $ do
+    it "rejects a connection used after the request ended" $ withEnv' $ \env -> do
+      released <- onEnv env (request env (arr fst))
+      onEnv env (arr (released,) >>> (selectOne `failsWith` ConnectionReleased)) `shouldReturn` ()
+
+    it "rejects it while the pool has lent the connection to another request, and doesn't disturb that request" $ withEnv' $ \env -> do
+      released <- onEnv env (request env (arr fst))
+      onEnv env (request env (steps [arr (\(_, loans) -> (released, loans)) >>> (selectOne `failsWith` ConnectionReleased), selectOne `yields` Right [1]]))
+        `shouldReturn` ()
+
 -- * The pool of the cases
 
 -- | The pool of real connections over the request buffers, and the way to run a program over them.

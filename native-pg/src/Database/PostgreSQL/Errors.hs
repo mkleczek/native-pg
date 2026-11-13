@@ -141,8 +141,14 @@ data UsageError
     ResultOutOfOrder Int
   | -- | A second part used a connection that one part was using.
     ConnectionBusy
+  | -- | A connection was used after the 'withConnection' that gave it to the
+    -- body ended.
+    ConnectionReleased
   | -- | A statement was sent after the final pipeline.
     AfterFinal
+  | -- | A field was used after its row moved on: its bytes are the buffer's
+    -- now, and the next row's.
+    FieldExpired
   | -- | A column of this many bytes doesn't fit the buffer, so it can only be
     -- read as a field.
     ValueTooLarge Int
@@ -161,7 +167,9 @@ instance Exception UsageError where
         <> (if unread == 1 then " earlier result was" else " earlier results were")
         <> " neither read nor discarded"
     ConnectionBusy -> "the connection is busy with another operation"
+    ConnectionReleased -> "the connection was used after it was released"
     AfterFinal -> "a statement followed the final pipeline"
+    FieldExpired -> "a field was used after its row moved on"
     ValueTooLarge size -> "a value of " <> show size <> " bytes doesn't fit the buffer, and can only be read as a field"
     UnexpectedAmountOfRows count -> "the result had " <> show count <> " rows, which its shape doesn't allow"
     StreamLengthError declared delivered ->
