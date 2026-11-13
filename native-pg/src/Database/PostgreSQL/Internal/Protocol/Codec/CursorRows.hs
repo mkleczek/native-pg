@@ -82,7 +82,9 @@ column :: (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('P
 column = withOnly (asks advance >>> present ^>> (missing "fewer fields" ||| value))
   where
     value = asks (child ^>> valueLength) >>> isNull ^>> (asks (child ^>> decode) ||| missing "a NULL")
-    missing what = now (\() -> throwIO (CursorError ("a row with " <> what)))
+    -- The environment is looked at (as 'child' does) on the failing path too, so that every path is strict in the cursor,
+    -- and it is passed unboxed through the joins of the sums, not built once for each row.
+    missing what = With (now (\(cursor, ()) -> child cursor `seq` throwIO (CursorError ("a row with " <> what))))
 {-# INLINE column #-}
 
 -- | A length that is NULL is 'Right'. The sums of these are the same constants

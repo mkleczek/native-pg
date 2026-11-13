@@ -61,7 +61,7 @@ spec = describe "cursors derived from the schema" $ do
     -- allocation, which a client of the library pays for every row it reads: how it grows with the rows is looked at.
     -- The programs are run here at their arrow, as a client does, and not as a function of every arrow, which
     -- GHC would not specialise.
-    xfail "a cursor is built for each row" $ it "allocates next to nothing for each row, with threads and with delimited" $ do
+    it "allocates next to nothing for each row, with threads and with delimited" $ do
       forM_
         [ ("threads", runThreads . foldRowsCursors),
           ("delimited", \counter reader -> fst <$> runDelimited (foldRowsCursors counter) reader)
