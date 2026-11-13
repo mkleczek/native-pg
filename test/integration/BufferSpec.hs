@@ -282,13 +282,13 @@ columnAndBody = Rows (Tx.column &&& Tx.field)
 -- | The shape of a row that has a field in the end, as a value that any arrow takes.
 data Shape = Shape String ByteString (forall arr. (Runtime arr) => arr Tx.Columns Tx.Field)
 
-rejection :: Either ConnectError a -> Maybe ByteString
+rejection :: Either ConnectFailure a -> Maybe ByteString
 rejection = \case
-  Left (ConnectionRejected (ServerError diagnostics)) -> Just (diagnosticCode diagnostics)
+  Left (ConnectFailure [(_, ConnectionRejected (ServerError diagnostics))]) -> Just (diagnosticCode diagnostics)
   _ -> Nothing
 
 -- | The names of the hosts that failed, in order.
-failedHosts :: Either ConnectError a -> Maybe [String]
+failedHosts :: Either ConnectFailure a -> Maybe [String]
 failedHosts = \case
   Left (ConnectFailure failures) -> Just (map (hostName . fst) failures)
   _ -> Nothing

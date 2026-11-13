@@ -21,7 +21,7 @@ import Database.PostgreSQL.ConnectionString
 import Database.PostgreSQL.Diagnostics
 import Database.PostgreSQL.Internal.Diagnostics (diagnostics)
 import qualified Database.PostgreSQL.Encoders as Encoders
-import Database.PostgreSQL.Errors (ConnectError (..))
+import Database.PostgreSQL.Errors (ConnectError (..), ConnectFailure (..))
 import Database.PostgreSQL.Internal.Protocol
 import Database.PostgreSQL.Internal.Protocol.Codec
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))

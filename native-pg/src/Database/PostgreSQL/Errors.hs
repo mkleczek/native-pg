@@ -3,7 +3,7 @@
 -- | Every error and failure type of the v2 API, in one place. The three kinds of
 -- outcome are told apart by their types:
 --
--- * Errors the caller decides about are values: a 'QueryError', a 'ConnectError'
+-- * Errors the caller decides about are values: a 'QueryError', a 'ConnectFailure'
 --   and a 'PoolError' are the 'Left' of the operation that makes them.
 -- * Failures are exceptions: a 'UsageError' is the program's own mistake, and a
 --   'ConnectionError' is the connection's end.
@@ -19,6 +19,7 @@ module Database.PostgreSQL.Errors
     QueryError (..),
     StatementError (..),
     ConnectError (..),
+    ConnectFailure (..),
     PoolError (..),
 
     -- * Failures
@@ -44,9 +45,8 @@ import GHC.IO.Exception (IOException (..))
 import Network.Socket (HostName, PortNumber)
 import Network.Streaming.Pool (PoolError (..))
 
--- | Connecting failed, in the words of libpq: the socket didn't connect, or the
--- server rejected the connection, or the startup failed on the client's side,
--- and each host that was tried has its own reason.
+-- | Why connecting to one host failed, in the words of libpq. 'connect' reports
+-- the failure of each host it tried in a 'ConnectFailure'.
 data ConnectError
   = -- | The host name doesn't resolve, for the resolver's reason.
     UnresolvedHost HostName String
@@ -76,8 +76,6 @@ data ConnectError
     Unsuitable String
   | -- | Checking the session attributes failed.
     CheckFailed ServerError
-  | -- | No host qualified: each attempt's host and failure, in order.
-    ConnectFailure [(Host, ConnectError)]
   deriving (Show)
 
 instance Exception ConnectError where
@@ -104,7 +102,6 @@ instance Exception ConnectError where
     TimedOut -> "timeout expired"
     Unsuitable reason -> reason
     CheckFailed failure -> displayException failure
-    ConnectFailure failures -> intercalate "\n" (map attempt failures)
     where
       describe failure hint = ioe_description failure <> maybe "" (hint . Errno) (ioe_errno failure)
       tcpHint errno
@@ -113,6 +110,16 @@ instance Exception ConnectError where
       socketHint errno
         | errno == eNOENT || errno == eCONNREFUSED = "\n\tIs the server running locally and accepting connections on that socket?"
         | otherwise = ""
+
+-- | No host qualified: each attempt's host and failure, in order, for one host
+-- as for many. 'connect' always fails with it, and 'displayException' words it
+-- as libpq does.
+newtype ConnectFailure = ConnectFailure [(Host, ConnectError)]
+  deriving (Show)
+
+instance Exception ConnectFailure where
+  displayException (ConnectFailure failures) = intercalate "\n" (map attempt failures)
+    where
       -- A socket that didn't connect words itself, as libpq does.
       attempt (host, failure) = case failure of
         UnresolvedHost {} -> displayException failure

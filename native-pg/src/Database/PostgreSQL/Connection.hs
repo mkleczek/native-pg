@@ -51,7 +51,7 @@ where
 
 import Database.PostgreSQL.Connection.Internal (CancelKey, Connection (..))
 import Database.PostgreSQL.ConnectionString.Types (Host)
-import Database.PostgreSQL.Errors (ConnectError)
+import Database.PostgreSQL.Errors (ConnectFailure)
 import Database.PostgreSQL.Session.Settings
 import Database.PostgreSQL.Transport (Address (..), TlsClient)
 import Network.Streaming.Classes (Effect, Runtime)
@@ -61,8 +61,12 @@ import Network.Streaming.NotImplemented (notImplemented)
 -- | Connects to the first host that qualifies, as the settings say: host
 -- selection, @connect_timeout@ (a deadline of the arrow), TLS and the
 -- authentication, with SCRAM's channel binding, MD5 or a cleartext password.
--- It borrows from the loans only while it sets up.
-connect :: (Runtime arr) => ConnectSettings -> arr Loans (Either ConnectError Connection)
+-- TLS starts through the settings' @connectTlsClient@, and without one a
+-- connection can't encrypt. It borrows from the loans only while it sets up.
+--
+-- It always fails with @ConnectFailure@: an entry for each host it tried, in
+-- order, for one host as for many.
+connect :: (Runtime arr) => ConnectSettings -> arr Loans (Either ConnectFailure Connection)
 connect _ = notImplemented "connect"
 
 -- | Closes the connection, once or again.

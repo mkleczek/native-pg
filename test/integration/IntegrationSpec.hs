@@ -84,7 +84,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       (rejection <$> run (connectedTo (unix "native_pg_scram" (Just "wrong")) (arr (const ())))) `shouldReturn` Just "28P01"
     it "reports a missing password" $ do
       result <- run (connectedTo (unix "native_pg_scram" Nothing) (arr (const ())))
-      result `shouldSatisfy` P.left (P.con (AuthenticationError P.anything))
+      authenticationFailure result `shouldSatisfy` P.just P.anything
     it "reports a missing database" $
       (rejection <$> run (connectedTo ((unix "postgres" Nothing) {connectDatabase = Just "missing"}) (arr (const ()))))
         `shouldReturn` Just "3D000"
@@ -211,6 +211,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           [ "connection to server on socket \"" <> path <> "/.s.PGSQL.5432\" failed: No such file or directory\n\tIs the server running locally and accepting connections on that socket?"
           | path <- ["/nonexistent-1", "/nonexistent-2"]
           ]
+    -- connect fails with the same shape for one host as for many: a list with an entry for each host it tried.
+    it "reports the one host that failed as a list of one" $ do
+      settings <- settingsOf (local "user=native_pg_scram password=wrong")
+      result <- run (connectedTo settings (arr (const ())))
+      case result of
+        Left (ConnectFailure [(host, ConnectionRejected _)]) -> hostName host `shouldBe` directory
+        _ -> failTest "expected the rejection of the one host, in a list of one"
     it "reports the hosts that failed, in order" $ do
       settings <- settingsOf "host=/missing-native-pg-first,/missing-native-pg-second dbname=postgres"
       result <- run (connectedTo settings (arr (const ())))
@@ -709,16 +716,16 @@ terminatingTheFirst =
     )
     >>> query' (Tx.Statement "SELECT pg_terminate_backend($1::int)" (\pid -> [textual (Just pid)]) single)
 
--- | A reason a connection string's host failed, as a text, or a failure of the case.
-rejection :: Either ConnectError a -> Maybe ByteString
+-- | The SQLSTATE of the rejection that the one host tried gave.
+rejection :: Either ConnectFailure a -> Maybe ByteString
 rejection = \case
-  Left (ConnectionRejected (ServerError diagnostics)) -> Just (diagnosticCode diagnostics)
+  Left (ConnectFailure [(_, ConnectionRejected (ServerError diagnostics))]) -> Just (diagnosticCode diagnostics)
   _ -> Nothing
 
--- | The reason that authentication failed on the client's side.
-authenticationFailure :: Either ConnectError a -> Maybe String
+-- | The reason that authentication failed on the client's side, at the one host tried.
+authenticationFailure :: Either ConnectFailure a -> Maybe String
 authenticationFailure = \case
-  Left (AuthenticationError reason) -> Just reason
+  Left (ConnectFailure [(_, AuthenticationError reason)]) -> Just reason
   _ -> Nothing
 
 -- | The settings of a connection string, with the TLS client of native-pg-tls.

@@ -96,7 +96,7 @@ import Data.Word (Word64)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), Connection, SslMode (..), connect, connectSettings)
 import qualified Database.PostgreSQL.Connection as PG
 import Database.PostgreSQL.Decoding (InPlace)
-import Database.PostgreSQL.Errors (ConnectError, Diagnostics, QueryError (..), ServerError (..), StatementError (..), diagnosticCode)
+import Database.PostgreSQL.Errors (ConnectFailure, Diagnostics, QueryError (..), ServerError (..), StatementError (..), diagnosticCode)
 import Database.PostgreSQL.Tls (tlsClient)
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
@@ -209,7 +209,7 @@ session settings body =
     >>> now (either (\failure -> fail ("no connection: " <> show failure)) pure)
 
 -- | The same, with the failure to connect as a value, and the body not run.
-connectedTo :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans (Either ConnectError b)
+connectedTo :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans (Either ConnectFailure b)
 connectedTo settings body =
   scope
     (connect settings)
