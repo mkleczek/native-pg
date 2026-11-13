@@ -95,7 +95,8 @@ void streaming_io_poller_free(streaming_io_poller *poller) {
  * still wait for after a report needs nothing, since the filters that did not
  * report are armed still: waiting is not used here. A change that fails, for a
  * descriptor that was closed meanwhile, comes back from the wait as an event
- * for the descriptor. */
+ * for the descriptor. Gives the number of system calls it made, which is none
+ * here, or -1. */
 int streaming_io_poller_arm(streaming_io_poller *poller, int fd, int added, int waiting) {
   (void)waiting;
   int needed = ((added & STREAMING_IO_READABLE) != 0) + ((added & STREAMING_IO_WRITABLE) != 0);
@@ -195,7 +196,8 @@ void streaming_io_poller_free(streaming_io_poller *poller) {
  * it again, so that readiness already there is reported; one that isn't there,
  * for a descriptor that was not armed before, or that was closed and its number
  * reused, is added. A descriptor that waits again is far more often one that is
- * registered, so the modification is tried first, which costs one system call. */
+ * registered, so the modification is tried first, which costs one system call.
+ * Gives the number of system calls it made, one or two, or -1. */
 int streaming_io_poller_arm(streaming_io_poller *poller, int fd, int added, int waiting) {
   (void)added;
   if (waiting == 0) return 0;
@@ -204,9 +206,9 @@ int streaming_io_poller_arm(streaming_io_poller *poller, int fd, int added, int 
   if (waiting & STREAMING_IO_READABLE) event.events |= EPOLLIN | EPOLLRDHUP;
   if (waiting & STREAMING_IO_WRITABLE) event.events |= EPOLLOUT;
   event.data.fd = fd;
-  if (epoll_ctl(poller->fd, EPOLL_CTL_MOD, fd, &event) == 0) return 0;
+  if (epoll_ctl(poller->fd, EPOLL_CTL_MOD, fd, &event) == 0) return 1;
   if (errno != ENOENT) return -1;
-  return epoll_ctl(poller->fd, EPOLL_CTL_ADD, fd, &event);
+  return epoll_ctl(poller->fd, EPOLL_CTL_ADD, fd, &event) == 0 ? 2 : -1;
 }
 
 /* From any thread: ends the wait of the thread that owns the poller, or the

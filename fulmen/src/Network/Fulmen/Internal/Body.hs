@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 -- | The body of a request, as the views of the request's primary buffer that the handler reads one at a time, and
 -- what the server does with a body that was not read.
@@ -28,6 +29,7 @@ import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes (Block, Effect (..), GiveWay, Link (..), Room (..), Stream (..))
 import Network.Streaming.Loans (Loan, release)
+import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.NotImplemented (notImplementedIO)
 
 -- | A request body.
@@ -62,7 +64,7 @@ instance Exception ConnectionLost where
 -- | What reading a body comes to once the bytes in hand are looked at: a receive, the end of the body, or a piece.
 type Reading = Either (BodyState, Room) (Either BodyState (Maybe ByteString))
 
-instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Stream arr Body where
+instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Stream arr Body where
   next = loop
     where
       loop = now advance >>> (receiving ||| (ending ||| returnA))
@@ -109,7 +111,7 @@ keepFollowing state = do
 -- | Reads what is left of the body and drops it, so that the next request on the connection begins where it should:
 -- whether it did, which it doesn't if the body is longer than the server will read for a client that doesn't use it,
 -- or can't be read.
-drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => arr Body Bool
+drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr Body Bool
 drain = (\body -> case body of ChunkedBody -> Left False; _ -> Right (body, 0 :: Int)) ^>> (returnA ||| loop)
   where
     loop =

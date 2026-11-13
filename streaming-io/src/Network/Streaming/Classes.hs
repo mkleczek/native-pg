@@ -1,7 +1,9 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 -- | The classes of the design: a link whose calls block in the arrow that runs
 -- them, what an arrow can do for a link (run an action that never waits, give
@@ -283,10 +285,10 @@ data Event = Readable !Fd | Writable !Fd | Watched (IO Watch) | Until !Instant
 -- | A socket, in any arrow that can run its tries, block, and give way: the
 -- tries are the socket's own calls that never wait, and while one finds
 -- nothing ready, the part blocks until the descriptor is readable or writable.
-instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Link arr Socket where
-  receive = receiveWith tryReceive readable
+instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Link arr Socket where
+  receive = receiveWith (tryReceive @(ModeOf arr)) readable
   {-# INLINE receive #-}
-  sendAll = sendAllWith trySend (\_ -> pure True) writable
+  sendAll = sendAllWith (trySend @(ModeOf arr)) (\_ -> pure True) writable
   {-# INLINE sendAll #-}
   awaitInput = now readable >>> block
   {-# INLINE awaitInput #-}

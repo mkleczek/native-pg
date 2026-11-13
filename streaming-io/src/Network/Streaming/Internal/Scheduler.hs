@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE InterruptibleFFI #-}
 {-# LANGUAGE LambdaCase #-}
@@ -92,18 +93,21 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.List (partition)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word64)
-import Foreign.C.Error (eINTR, getErrno, throwErrno, throwErrnoIfMinus1_, throwErrnoIfNull)
+import Foreign.C.Error (eINTR, getErrno, throwErrno, throwErrnoIfNull)
 import Foreign.C.Types (CInt (..))
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Classes (Cancelled (..), Event (..), Instant (..), cancelledBy, monotonicNanoseconds)
+import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel
+import Network.Streaming.Internal.Descriptors (armedBy, newRunNumber)
 import Network.Streaming.Internal.Tickets (Slot (..))
 import Network.Streaming.Internal.Timers
 import Network.Streaming.Loop (Report (..))
+import Network.Streaming.Mode (Instrumented (bump, bumpBy, debugging))
 import Network.Streaming.Watch (Watch (..))
 import System.Posix.Types (Fd (..))
 
@@ -183,7 +187,7 @@ data Run = Run
     -- yet back from the mailbox, the parts that wait on descriptors, those that
     -- wait for tickets, the number of the next wait, the rounds, the time that
     -- the round began at, or 0 before it is read, the parts that are in a
-    -- scope, and the armings that no poll has taken yet: unboxed, so that counting allocates nothing. A step is a point to
+    -- scope, the armings that no poll has taken yet, and the run's own number: unboxed, so that counting allocates nothing. A step is a point to
     -- give way at, which a link's receive or send is, or a wait, or a ticket
     -- given or waited for.
     runCounters :: !(ForeignPtr Int),
@@ -238,8 +242,10 @@ batch = 64
 -- parts run for turns of that length.
 newRun :: Turn -> IO Run
 newRun (Turn turn) = do
-  counters <- mallocForeignPtrArray 11
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 10]
+  counters <- mallocForeignPtrArray 12
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 11]
+  number <- newRunNumber
+  unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
   Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel)
@@ -661,7 +667,7 @@ takeEntry ident = go []
 -- a scope are cancelled, and the run goes on until they have ended, and then
 -- fails with the exception. The exception of a part that no scope holds fails
 -- the run at once.
-schedule :: Run -> (IO Step -> IO Step) -> IORef (Maybe b) -> IO Step -> IO (b, Report)
+schedule :: forall m b. (Instrumented m) => Run -> (IO Step -> IO Step) -> IORef (Maybe b) -> IO Step -> IO (b, Report)
 schedule run enterPart result start = (go [start] [] `catch` failed) `finally` closeInbox run
   where
     -- A shutdown fails the run with its exception, whatever the parts failed with, which is their cancellation.
@@ -778,18 +784,26 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
       let key = fromIntegral fd
           Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
           waiting = if reading then Waiters (entry : readers) writers else Waiters readers (entry : writers)
-      when (null (if reading then readers else writers)) $
+      bump @m DescriptorWaits
+      when (null (if reading then readers else writers)) $ do
+        debugging @m $ do
+          number <- counter run 11
+          moved <- armedBy key (fromIntegral number)
+          when moved (bump @m DescriptorMoves)
+        bump @m Armings
         arm fd (if reading then kindReadable else kindWritable) waiting *> adjust run 10 1
       writeIORef (runWaiters run) (IntMap.insert key waiting waiters)
     -- The poller arms the descriptor for the kinds that the waiters wait for, of which added are new.
-    arm fd added waiting = throwErrnoIfMinus1_ "streaming_io_poller_arm" (c_pollerArm (runPoller run) fd added (kindsOf waiting))
+    arm fd added waiting =
+      c_pollerArm (runPoller run) fd added (kindsOf waiting) >>= \calls ->
+        if calls < 0 then throwErrno "streaming_io_poller_arm" else bumpBy @m ArmCalls (fromIntegral calls)
     -- Asks the poller what became ready, without waiting.
-    pollNow = rawPoll c_pollerPoll 0 >>= afterPoll
+    pollNow = bump @m PollsImmediate *> rawPoll c_pollerPoll 0 >>= afterPoll
     -- Waits in the poller, which an asynchronous exception can interrupt: it begins a shutdown. No part runs
     -- while the scheduler waits, so it waits unmasked: a masked thread in an interruptible foreign call returns
     -- from it with the exception still to come.
     pollWait timeout =
-      try (interruptible (rawPoll c_pollerWait timeout)) >>= \case
+      bump @m PollsBlocking *> try (interruptible (rawPoll c_pollerWait timeout)) >>= \case
         Left failure -> [] <$ shuttingDown failure
         Right count -> afterPoll count
     rawPoll call timeout =
@@ -846,7 +860,8 @@ foreign import ccall unsafe "streaming_io_poller_new"
 foreign import ccall unsafe "streaming_io_poller_free"
   c_pollerFree :: Ptr Poller -> IO ()
 
--- | Arms the descriptor for the next poll: for the kinds that are new, and for all that parts wait for.
+-- | Arms the descriptor for the next poll: for the kinds that are new, and for all that parts wait for. Gives the
+-- number of system calls it made, or -1 and the error.
 foreign import ccall unsafe "streaming_io_poller_arm"
   c_pollerArm :: Ptr Poller -> CInt -> CInt -> CInt -> IO CInt
 

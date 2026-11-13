@@ -57,6 +57,7 @@ import Network.Streaming.Combinators (concurrently, keeping, times, timesWith, u
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (Report (..))
+import Network.Streaming.Mode (Instrumented, ModeOf)
 import qualified Network.Streaming.Loans as Loans
 import Network.Streaming.Pool
 import Network.Streaming.PositiveInt (mkPositiveInt, positiveInt)
@@ -215,7 +216,7 @@ loansRun kind variant parts rounds = do
 
 -- | A client and a server over a socket pair: the client sends a byte and waits for it to come back, and the server
 -- sends back each byte it receives, for the rounds. The buffers are what each receives into.
-socketPingPong :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Buffer -> Buffer -> Int -> arr (Socket, Socket) ()
+socketPingPong :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Buffer -> Buffer -> Int -> arr (Socket, Socket) ()
 socketPingPong forClient forServer rounds = together [arr fst >>> timesWith rounds clientStep >>^ const (), arr snd >>> timesWith rounds serverStep >>^ const ()]
   where
     clientStep = (\end -> ((end, [view forClient 1]), end)) ^>> first sendAll >>> (\((), end) -> ((end, roomOf forClient), end)) ^>> first receive >>^ snd
@@ -225,7 +226,7 @@ socketsRun :: String -> Int -> Int -> IO ()
 socketsRun kind pairs rounds = do
   sockets <- replicateM pairs (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol)
   buffers <- replicateM pairs ((,) <$> newBuffer (positiveInt @16) <*> newBuffer (positiveInt @16))
-  let program :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => arr () ()
+  let program :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr () ()
       program = together [arr (const ends) >>> socketPingPong forClient forServer rounds | (ends, (forClient, forServer)) <- zip sockets buffers]
   (seconds, bytes) <-
     measured

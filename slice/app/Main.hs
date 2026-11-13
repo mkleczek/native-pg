@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -7,15 +9,17 @@
 -- @GET /rows_16k@ and @GET /rows_1m@ (the query string is ignored) run @select json_agg(t) from rows_16k t@ or @rows_1m@ in
 -- one read-only transaction on a pooled connection, take the one field and answer with its bytes: the pieces of the
 -- field go from the reply of the database, where they are views of the request's buffer, to @writev@, without a copy.
--- @GET /metrics@ gives the bytes that the runtime allocated, and any other request is answered 404.
+-- @GET /metrics@ gives the bytes that the runtime allocated and, in debug mode, what the runtime counts (its polls, its
+-- armings of descriptors, and the calls on sockets that cost a system call), and any other request is answered 404.
 --
 -- It does far less than PostgREST (no JWT, no role switch, no query planning, no @set_config@): what it gives is a bound
 -- on what the runtime can, not a like-for-like comparison.
 --
 -- > v2-slice --listen 127.0.0.1:3000 --database postgres://postgres@127.0.0.1:5432/postgres [--runtime threads|delimited|compiled]
--- >          [--cores N] [--pool N] [--connections N]
+-- >          [--mode debug|release] [--cores N] [--pool N] [--connections N]
 --
--- The arrow is chosen where the program is built, as in @fulmen-bench@, so that GHC specialises the handler to it:
+-- The debug mode is built only with @-f debug-mode@: a binary that holds the programs of both modes runs the 'Compiled' one of 'Release'
+-- allocating 6% more than a binary that holds the one, which is not what a release build is for. The arrow is chosen where the program is built, as in @fulmen-bench@, so that GHC specialises the handler to it:
 -- @threads@ is GHC threads, which the RTS runs on the cores of @+RTS -N@, @delimited@ is one thread for each of
 -- @--cores@ cores (2 by default), and @compiled@ is one core. The flags of the run time are not defaults of the binary:
 -- they are @GHCRTS@, and @-T@ is what makes the allocation counter of @\/metrics@.
@@ -26,7 +30,6 @@ import Control.Monad (void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
-import Data.Functor ((<&>))
 import Database.PostgreSQL.Connection (ConnectSettings)
 import Database.PostgreSQL.ConnectionString (Defaults (..), fromConnectionString, readConnectionString)
 import Database.PostgreSQL.Pool (ConnectionPool, connectionPoolSettings, withConnection, withConnectionPool)
@@ -39,9 +42,16 @@ import qualified Network.Socket as Socket
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (Effect (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Compiled (runCompiled)
+import Network.Streaming.Counters (Counts, counterName, toList)
 import Network.Streaming.Delimited (runCores)
+import Network.Streaming.Mode (Instrumented (counted), Mode (..))
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt)
 import Network.Streaming.Threads (runThreads)
+#if defined(DEBUG_MODE)
+import Network.Streaming.Compiled (runCompiledM)
+import Network.Streaming.Delimited (runCoresM)
+import Network.Streaming.Threads (runThreadsM)
+#endif
 import Network.Streaming.With (With)
 import System.Environment (getArgs)
 import System.Exit (die)
@@ -53,12 +63,12 @@ import Text.Read (readMaybe)
 
 -- | What a request is answered with: the rows of the tables that the list names, which are fixed, and the metrics. The
 -- arrow is the caller's, which has to know it for the program to be specialised: see 'main'.
-handler :: (Runtime arr) => ConnectionPool -> arr (Call, Request) ()
-handler pool =
+handler :: (Runtime arr) => IO (Maybe Counts) -> ConnectionPool -> arr (Call, Request) ()
+handler counts pool =
   routed
     [ ("/rows_16k", rows pool "select json_agg(t) from rows_16k t"),
       ("/rows_1m", rows pool "select json_agg(t) from rows_1m t"),
-      ("/metrics", metrics)
+      ("/metrics", metrics counts)
     ]
 {-# INLINABLE handler #-}
 
@@ -107,17 +117,24 @@ pieces = loop
         >>> (\(piece, (answering, source)) -> maybe (Left answering) (\chunk -> Right ((answering, [chunk]), (answering, source))) piece)
         ^>> (Fulmen.finish ||| (first Fulmen.send >>> arr snd >>> loop))
 
--- | The metrics: the bytes that the runtime allocated, as Prometheus text. It needs @+RTS -T@: without it the answer
--- says so, and is a 503. The runtime counts what a nursery held when it is collected, and not before: with the nurseries
--- of @-A16m@ the counter lags by up to as many bytes as there are cores times 16 MiB, which is a good part of what a few
--- thousand small requests allocate. So a minor collection is made before it is read.
-metrics :: (Runtime arr) => arr Call ()
-metrics = now (\call -> (,) call <$> exposition) >>> plain
+-- | The metrics: the bytes that the runtime allocated, and in debug mode the counts of "Network.Streaming.Counters", as Prometheus text.
+-- It needs @+RTS -T@: without it the answer says so, and is a 503. The runtime counts what a nursery held when it is
+-- collected, and not before: with the nurseries of @-A16m@ the counter lags by up to as many bytes as there are cores times
+-- 16 MiB, which is a good part of what a few thousand small requests allocate. So a minor collection is made before it is
+-- read.
+metrics :: (Runtime arr) => IO (Maybe Counts) -> arr Call ()
+metrics counts = now (\call -> (,) call <$> exposition) >>> plain
   where
     exposition =
       getRTSStatsEnabled >>= \case
         False -> pure (503, "the runtime keeps no statistics: run with +RTS -T\n")
-        True -> performMinorGC *> getRTSStats <&> (\stats -> (200, "# TYPE ghc_allocated_bytes_total counter\nghc_allocated_bytes_total " <> C.pack (show (allocated_bytes stats)) <> "\n"))
+        True -> do
+          performMinorGC
+          stats <- getRTSStats
+          counted' <- foldMap (\(counter, count) -> counting ("streaming_io_" <> counterName counter <> "_total") (toInteger count)) . maybe [] toList <$> counts
+          pure (200, counting "ghc_allocated_bytes_total" (fromIntegral (allocated_bytes stats)) <> counted')
+    counting :: String -> Integer -> ByteString
+    counting name count = C.pack ("# TYPE " <> name <> " counter\n" <> name <> " " <> show count <> "\n")
 
 -- | An answer of one piece of text: the head with its length, the text and the end.
 plain :: (Runtime arr) => arr (Call, (Int, ByteString)) ()
@@ -138,6 +155,7 @@ data Options = Options
   { optListen :: Maybe (String, String),
     optDatabase :: Maybe String,
     optRuntime :: Kind,
+    optMode :: Mode,
     optCores :: Int,
     optPool :: Int,
     optConnections :: Int
@@ -147,22 +165,24 @@ usage :: String
 usage =
   unlines
     [ "usage: v2-slice --listen HOST:PORT --database postgres://USER@HOST:PORT/DB [--runtime threads|delimited|compiled]",
-      "                 [--cores N] [--pool N] [--connections N]",
+      "                 [--mode debug|release] [--cores N] [--pool N] [--connections N]",
       "  --listen       a numeric address and a port",
       "  --runtime      the arrow that runs the server (default delimited)",
+      "  --mode         debug counts what the runtime does, and /metrics lists the counts; release (the default) counts nothing",
       "  --cores        the cores of delimited (default 2): threads takes its cores from +RTS -N, and compiled has one",
       "  --pool         the connections to the database (default 10)",
       "  --connections  the connections that the server holds at once (default 1200)"
     ]
 
 parseOptions :: [String] -> Either String Options
-parseOptions = go (Options Nothing Nothing Delimited 2 10 1200)
+parseOptions = go (Options Nothing Nothing Delimited Release 2 10 1200)
   where
     go options = \case
       [] -> Right options
       "--listen" : value : rest -> address value >>= \listen -> go options {optListen = Just listen} rest
       "--database" : value : rest -> go options {optDatabase = Just value} rest
       "--runtime" : value : rest -> kind value >>= \chosen -> go options {optRuntime = chosen} rest
+      "--mode" : value : rest -> chosenMode value >>= \chosen -> go options {optMode = chosen} rest
       "--cores" : value : rest -> count "--cores" value >>= \n -> go options {optCores = n} rest
       "--pool" : value : rest -> count "--pool" value >>= \n -> go options {optPool = n} rest
       "--connections" : value : rest -> count "--connections" value >>= \n -> go options {optConnections = n} rest
@@ -172,6 +192,10 @@ parseOptions = go (Options Nothing Nothing Delimited 2 10 1200)
       "delimited" -> Right Delimited
       "compiled" -> Right Compiled
       other -> Left ("--runtime is threads, delimited or compiled, not " <> other)
+    chosenMode = \case
+      "debug" -> Right Debug
+      "release" -> Right Release
+      other -> Left ("--mode is debug or release, not " <> other)
     count flag text = case readMaybe text of
       Just n | n > 0 -> Right n
       _ -> Left (flag <> " takes a number above 0, not " <> text)
@@ -232,7 +256,14 @@ main = do
   shared <- Fulmen.newCores runningCores
   putStrLn ("listening on " <> fst listen <> ":" <> snd listen)
   -- The arrow is known where the handler is built, so that GHC specialises it to the arrow.
-  withConnectionPool (connectionPoolSettings (optPool options) connect) $ \pool -> case optRuntime options of
-    Threads -> runThreads (Fulmen.serve settings (handler pool)) shared
-    Delimited -> void (runCores runningCores (pure shared) (\cores core -> arr (const (Fulmen.onCore cores core)) >>> Fulmen.serve settings (handler pool)))
-    Compiled -> void (runCompiled (Fulmen.serve settings (handler pool)) shared)
+  withConnectionPool (connectionPoolSettings (optPool options) connect) $ \pool -> case (optMode options, optRuntime options) of
+    (Release, Threads) -> runThreads (Fulmen.serve settings (handler (counted @'Release) pool)) shared
+    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> arr (const (Fulmen.onCore cores core)) >>> Fulmen.serve settings (handler (counted @'Release) pool)))
+    (Release, Compiled) -> void (runCompiled (Fulmen.serve settings (handler (counted @'Release) pool)) shared)
+#if defined(DEBUG_MODE)
+    (Debug, Threads) -> runThreadsM @'Debug (Fulmen.serve settings (handler (counted @'Debug) pool)) shared
+    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> arr (const (Fulmen.onCore cores core)) >>> Fulmen.serve settings (handler (counted @'Debug) pool)))
+    (Debug, Compiled) -> void (runCompiledM @'Debug (Fulmen.serve settings (handler (counted @'Debug) pool)) shared)
+#else
+    (Debug, _) -> die "this build has no debug mode: build the slice with -f debug-mode"
+#endif

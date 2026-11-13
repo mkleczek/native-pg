@@ -19,13 +19,14 @@ import qualified Network.Streaming.Classes as Classes (within)
 import Network.Streaming.Combinators (concurrently, keeping, sleep, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
+import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Threads
 import Skeletest
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Time arr, Within arr, Exchange arr (Local arr))
+type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Time arr, Within arr, Exchange arr (Local arr), Instrumented (ModeOf arr))
 
 type Program a = forall arr. (Rich arr) => arr () a
 
@@ -165,7 +166,7 @@ bothWays = now (const setup) >>> concurrently reading (concurrently writing drai
         >>^ snd
 
 -- | Receives from the socket until the bytes of 'flood' have come: how many came.
-drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => arr (Socket, Buffer) Int
+drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr (Socket, Buffer) Int
 drain = (\(end, buffer) -> (end, buffer, 0)) ^>> loop
   where
     loop = (\state@(_, _, got) -> if got >= flood then Left got else Right state) ^>> (returnA ||| step)

@@ -61,7 +61,7 @@ import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
-import Network.Streaming.Mode (Mode (..), ModeOf)
+import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -300,7 +300,7 @@ runDelimited = runDelimitedTurn defaultTurn
 {-# INLINE runDelimited #-}
 
 -- | 'runDelimited' for an arrow of any mode, which the type application names.
-runDelimitedM :: forall m a b. (forall s. DelimitedM m s a b) -> a -> IO (b, Report)
+runDelimitedM :: forall m a b. (Instrumented m) => (forall s. DelimitedM m s a b) -> a -> IO (b, Report)
 runDelimitedM = runDelimitedTurnM @m defaultTurn
 {-# INLINE runDelimitedM #-}
 
@@ -310,7 +310,7 @@ runDelimitedTurn = runDelimitedTurnM @'Release
 {-# INLINE runDelimitedTurn #-}
 
 -- | 'runDelimitedTurn' for an arrow of any mode.
-runDelimitedTurnM :: forall m a b. Turn -> (forall s. DelimitedM m s a b) -> a -> IO (b, Report)
+runDelimitedTurnM :: forall m a b. (Instrumented m) => Turn -> (forall s. DelimitedM m s a b) -> a -> IO (b, Report)
 runDelimitedTurnM turn program input = withRun turn (\run -> runIn run program input)
 {-# INLINE runDelimitedTurnM #-}
 
@@ -325,12 +325,12 @@ runDelimitedWithTurn :: Turn -> (forall s. IO (Delimited s a b)) -> a -> IO (b, 
 runDelimitedWithTurn turn setup input = setup >>= \program -> withRun turn (\run -> runIn run program input)
 {-# INLINE runDelimitedWithTurn #-}
 
-runIn :: Run -> DelimitedM m s a b -> a -> IO (b, Report)
+runIn :: forall m s a b. (Instrumented m) => Run -> DelimitedM m s a b -> a -> IO (b, Report)
 runIn run (Delimited program) input = do
   tag <- newPromptTag
   result <- newIORef Nothing
   root <- newPart run
-  mask_ $ schedule run (prompt tag) result (program (Context run tag root) input >>= \value -> Ended <$ writeIORef result (Just value))
+  mask_ $ schedule @m run (prompt tag) result (program (Context run tag root) input >>= \value -> Ended <$ writeIORef result (Just value))
 
 -- | Runs the program of each of the cores, each on a thread of its own, pinned
 -- to a capability (@forkOn@: core @n@ to capability @n@, modulo their number,
@@ -347,7 +347,7 @@ runCores = runCoresTurn defaultTurn
 {-# INLINE runCores #-}
 
 -- | 'runCores' for an arrow of any mode.
-runCoresM :: forall m shared r. Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [r]
+runCoresM :: forall m shared r. (Instrumented m) => Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [r]
 runCoresM = runCoresTurnM @m defaultTurn
 {-# INLINE runCoresM #-}
 
@@ -357,7 +357,7 @@ runCoresTurn = runCoresTurnM @'Release
 {-# INLINE runCoresTurn #-}
 
 -- | 'runCoresTurn' for an arrow of any mode.
-runCoresTurnM :: forall m shared r. Turn -> Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [r]
+runCoresTurnM :: forall m shared r. (Instrumented m) => Turn -> Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [r]
 runCoresTurnM turn cores setup program = map fst <$> runCoresReportTurnM @m turn cores setup program
 {-# INLINE runCoresTurnM #-}
 
@@ -372,7 +372,7 @@ runCoresReportTurn = runCoresReportTurnM @'Release
 {-# INLINE runCoresReportTurn #-}
 
 -- | 'runCoresReportTurn' for an arrow of any mode.
-runCoresReportTurnM :: forall m shared r. Turn -> Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [(r, Report)]
+runCoresReportTurnM :: forall m shared r. (Instrumented m) => Turn -> Int -> IO shared -> (forall s. shared -> Int -> DelimitedM m s () r) -> IO [(r, Report)]
 runCoresReportTurnM turn cores setup program = do
   shared <- setup
   withRuns turn cores $ \runs -> do

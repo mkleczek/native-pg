@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
@@ -42,7 +43,8 @@ import GHC.IO (IO (..))
 import GHC.IORef (IORef (..), atomicSwapIORef)
 import GHC.STRef (STRef (..))
 import Network.Streaming.Classes
-import Network.Streaming.Mode (Mode (..), ModeOf)
+import Network.Streaming.Counters (Counter (..))
+import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
 import Network.Streaming.Internal.Tickets
@@ -319,12 +321,16 @@ instance Race (ThreadsM m) where
 
 -- | Blocks the thread: on a descriptor directly, as 'threadWaitRead' does, and
 -- on any other event by its watch.
-instance Block (ThreadsM m) where
+instance (Instrumented m) => Block (ThreadsM m) where
   block = Threads $ \part event -> waiting part $ case event of
-    Readable fd -> threadWaitRead fd
-    Writable fd -> threadWaitWrite fd
+    Readable fd -> waited @m *> threadWaitRead fd
+    Writable fd -> waited @m *> threadWaitWrite fd
     Watched register -> awaitWatch register
     Until (Instant at) -> monotonicNanoseconds >>= \current -> when (at > current) (threadDelay (fromIntegral ((at - current + 999) `div` 1000)))
+
+-- | A wait on a descriptor is counted as a wait and as an arming: GHC's IO manager registers the descriptor at each.
+waited :: forall m. (Instrumented m) => IO ()
+waited = bump @m DescriptorWaits *> bump @m Armings
 
 instance Time (ThreadsM m) where
   clock = Threads (\_ () -> Instant <$> monotonicNanoseconds)

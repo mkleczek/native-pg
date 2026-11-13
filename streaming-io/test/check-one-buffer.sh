@@ -28,6 +28,7 @@ streaming-io/src/Network/Streaming/Reader.hs create the copying atom: bytes make
 native-pg/src/Database/PostgreSQL/Transaction.hs create BEGIN, COMMIT and ROLLBACK, rendered once into bytes that are copied where they are sent
 native-pg/src/Database/PostgreSQL/Transaction.hs unsafeCreate BEGIN, COMMIT and ROLLBACK, rendered once into bytes that are copied where they are sent
 native-pg-tls/src/Database/PostgreSQL/Tls/Internal.hs mallocForeignPtrBytes the C string with the name of the server, which rustls borrows
+streaming-io/src/Network/Streaming/Internal/Descriptors.hs callocBytes the table of what the runtime knows of each descriptor number, two bytes each, which the system gives as zero pages that stay unused until a descriptor needs them: it holds no data of a connection
 '
 
 # What is looked for: a name, a tab, and an extended regular expression that

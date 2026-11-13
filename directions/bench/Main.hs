@@ -1,3 +1,4 @@
+{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuantifiedConstraints #-}
 
@@ -25,6 +26,7 @@ import Network.Streaming.Classes
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop
+import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Simulated
 import Network.Streaming.Threads
@@ -81,7 +83,7 @@ overSimulated run size = do
   (back, server) <- connect 65536
   roundTrip run size (client, front, back, server)
 
-roundTrip :: (forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => Link arr end) => (Built end -> Ends end -> IO (Maybe Report)) -> Int -> Ends end -> IO (Maybe Report, Int)
+roundTrip :: (forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Link arr end) => (Built end -> Ends end -> IO (Maybe Report)) -> Int -> Ends end -> IO (Maybe Report, Int)
 roundTrip run size ends = do
   received <- newIORef 0
   report <-
@@ -107,7 +109,7 @@ roundTrip run size ends = do
 type Ends end = (end, end, end, end)
 
 -- | A program made in IO, which each arrow runs, and which is given the ends.
-type Built end = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr) => IO (arr (Ends end) ())
+type Built end = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => IO (arr (Ends end) ())
 
 -- | Sends this many bytes from the buffer, whatever is in it, then ends the
 -- output.

@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeApplications #-}
@@ -33,6 +34,7 @@ import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (Duration, Effect (..), Runtime, Scope (..))
 import Network.Streaming.Loans (withRequestBuffers)
+import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Pool (Pool, PoolError (..), closePool, newPool, urgently, withLoan, withLoanWithin)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 
@@ -111,12 +113,12 @@ withConnection pool body = checkingOut (poolSlots pool) (urgently (using pool bo
 
 -- | The body on the connection of the slot: the one that the slot holds if it is as it was left, and else one that is
 -- made. What the body leaves of the connection stays in the slot, unless the body broke it.
-using :: (Runtime arr) => ConnectionPool -> arr (Connection, a) b -> arr (Slot, a) b
+using :: forall arr a b. (Runtime arr) => ConnectionPool -> arr (Connection, a) b -> arr (Slot, a) b
 using pool body = scope acquire release run
   where
     acquire =
       (\(Slot ref, _) -> ref)
-        ^>> now (\ref -> either (const (Left ref)) (Right . (ref,)) <$> existing ref)
+        ^>> now (\ref -> either (const (Left ref)) (Right . (ref,)) <$> existing @(ModeOf arr) ref)
         >>> (making ||| arr id)
         >>> now (\(ref, connection) -> (ref,) <$> leased connection)
     making =
@@ -134,13 +136,13 @@ using pool body = scope acquire release run
 
 -- | The connection that the slot holds, if it is as it was left: idle, with nothing from the server to read, which is
 -- so until the server ends it. One that isn't is closed, and dropped.
-existing :: IORef (Maybe Connection) -> IO (Either () Connection)
+existing :: forall m. (Instrumented m) => IORef (Maybe Connection) -> IO (Either () Connection)
 existing ref =
   readIORef ref >>= \case
     Nothing -> pure (Left ())
     Just connection -> do
       status <- readIORef (sessionStatus (connectionSession connection))
-      quiet <- if status == Idle then isQuiet (sessionSocket (connectionSession connection)) else pure False
+      quiet <- if status == Idle then isQuiet @m (sessionSocket (connectionSession connection)) else pure False
       if quiet
         then pure (Right connection)
         else do

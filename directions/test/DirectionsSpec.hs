@@ -22,6 +22,7 @@ import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..), microseconds)
 import Network.Streaming.Loop
+import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Reader (replicateA)
 import Network.Streaming.Simulated
@@ -206,7 +207,7 @@ world setup bytes kept (client, front, back, server) = do
       ]
 
 -- | A program made in IO, which each arrow runs: what the tests run.
-type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr) => IO (arr () ())
+type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr, Instrumented (ModeOf arr)) => IO (arr () ())
 
 -- | The round trip over simulated links that hold 1000 bytes each way: what
 -- the run gave, and what the client kept.

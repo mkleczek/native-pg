@@ -10,6 +10,13 @@ description: A server that answers GET /rows_16k and GET /rows_1m with the one J
 license: AGPL-3.0-or-later
 build-type: Simple
 
+-- The debug mode of the arrows, which counts what the runtime does, is in the binary only with this flag: a binary that has the programs of both
+-- modes allocates more in the release mode of 'Network.Streaming.Compiled', and a release build must not.
+flag debug-mode
+  description: build the debug mode of the arrows into the server, for --mode debug
+  default: False
+  manual: True
+
 -- The flags of the run time (the cores, the nursery, -T for the allocation counter) are not defaults in the binary:
 -- they are given with GHCRTS, as for postgrestream.
 executable v2-slice
@@ -18,3 +25,5 @@ executable v2-slice
   main-is: Main.hs
   ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively
   build-depends: base, bytestring, fulmen, native-pg, network, streaming-io
+  if flag(debug-mode)
+    cpp-options: -DDEBUG_MODE

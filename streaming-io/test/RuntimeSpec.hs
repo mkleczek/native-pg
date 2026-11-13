@@ -18,6 +18,7 @@ import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..))
 import Network.Streaming.Loop
+import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Reader (replicateA)
 import Network.Streaming.Simulated
@@ -85,7 +86,7 @@ spec = describe "the runtime" $ do
       within (try (runThreads (together [receiving, failing]) ())) `shouldReturn` Just (Left (ErrorCall "the part failed"))
 
 -- | The programs of the same kind that scope their resources, race, and keep time.
-type Cancelling = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Scope arr, Race arr, Time arr, Within arr) => IO (arr () ())
+type Cancelling = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Scope arr, Race arr, Time arr, Within arr, Instrumented (ModeOf arr)) => IO (arr () ())
 
 compiledScoped, delimitedScoped :: Turn -> Cancelling -> IO ((), Report)
 compiledScoped turn built = built >>= \program -> runCompiledTurn turn program ()
@@ -160,7 +161,7 @@ failsAtTheGive :: IO a -> IO ()
 failsAtTheGive run = try (void run) `shouldReturn` (Left valueError :: Either ErrorCall ())
 
 -- | A program made in IO, which each arrow runs: what the tests run.
-type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr) => IO (arr () ())
+type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr, Instrumented (ModeOf arr)) => IO (arr () ())
 
 -- | A pair of connected sockets, closed after the action.
 withPair :: (Socket -> Socket -> IO a) -> IO a

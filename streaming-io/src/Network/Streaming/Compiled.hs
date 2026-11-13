@@ -35,7 +35,7 @@ import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
-import Network.Streaming.Mode (Mode (..), ModeOf)
+import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -265,7 +265,7 @@ runCompiled :: Compiled a b -> a -> IO (b, Report)
 runCompiled = runCompiledTurn defaultTurn
 
 -- | 'runCompiled' for an arrow of any mode.
-runCompiledM :: CompiledM m a b -> a -> IO (b, Report)
+runCompiledM :: (Instrumented m) => CompiledM m a b -> a -> IO (b, Report)
 runCompiledM = runCompiledTurnM defaultTurn
 
 -- | 'runCompiled' with a turn of the given length.
@@ -273,7 +273,7 @@ runCompiledTurn :: Turn -> Compiled a b -> a -> IO (b, Report)
 runCompiledTurn = runCompiledTurnM
 
 -- | 'runCompiledTurn' for an arrow of any mode.
-runCompiledTurnM :: Turn -> CompiledM m a b -> a -> IO (b, Report)
+runCompiledTurnM :: forall m a b. (Instrumented m) => Turn -> CompiledM m a b -> a -> IO (b, Report)
 runCompiledTurnM turn (Compiled program) input = do
   result <- newIORef Nothing
   withRun turn $ \run -> do
@@ -281,4 +281,4 @@ runCompiledTurnM turn (Compiled program) input = do
     let failure = throwIO . Escaped
         context = Context run root failure
     writeIORef (runFailure run) failure
-    mask_ $ schedule run (guardedBy run) result (program context input (\value -> Ended <$ writeIORef result (Just value)))
+    mask_ $ schedule @m run (guardedBy run) result (program context input (\value -> Ended <$ writeIORef result (Just value)))

@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 
@@ -47,11 +48,14 @@ import Network.Socket
   )
 import Network.Socket.Address (pokeSocketAddress, sizeOfSocketAddress)
 import Network.Streaming.Classes (Block (..), Effect (..), Event (..), Exit (..), Runtime, Scope (..))
+import Network.Streaming.Counters (Counter (..))
+import Network.Streaming.Internal.Descriptors (fresh)
+import Network.Streaming.Mode (Instrumented (bump, debugging), ModeOf)
 import qualified System.Posix.Types as Posix
 
 -- | Connects to the address, or says why it couldn't. The socket is closed if the part is cancelled while it
 -- connects, or if it didn't connect.
-connectSocket :: (Runtime arr) => TcpOptions -> arr Address (Either ConnectError Socket)
+connectSocket :: forall arr. (Runtime arr) => TcpOptions -> arr Address (Either ConnectError Socket)
 connectSocket options =
   (\case UnixAddress path -> Left path; TcpAddress host port -> Right (host, port)) ^>> (unix ||| tcp)
   where
@@ -71,7 +75,7 @@ connectSocket options =
                 (setSocketOption sock NoDelay 1 *> setTcpOptions sock options) `onException` close sock
                 pure sock
           pure (Right (opening, addrAddress found, \failure -> UnreachableHost host port [(numeric, failure)]))
-    reaching = scope (now (\(opening, _, _) -> try opening)) (now released) body
+    reaching = scope (now (\(opening, _, _) -> try (opening >>= \sock -> sock <$ debugging @(ModeOf arr) (fresh sock)))) (now released) body
     released (opened, exit) = case exit of
       Done -> pure ()
       _ -> either (\(_ :: IOException) -> pure ()) close opened
@@ -105,9 +109,9 @@ foreign import ccall unsafe "connect"
 
 -- | Whether the socket has nothing to read now, as a connection that waits for the next statement has: it has when
 -- the server ended it, or said something that nobody asked for. It looks without taking the byte.
-isQuiet :: Socket -> IO Bool
+isQuiet :: forall m. (Instrumented m) => Socket -> IO Bool
 isQuiet sock = withFdSocket sock $ \fd -> allocaBytes 1 $ \pointer ->
-  c_recv fd pointer 1 msgPeek >>= \case
+  bump @m Probes *> c_recv fd pointer 1 msgPeek >>= \case
     -1 -> (\errno -> errno == eAGAIN || errno == eWOULDBLOCK) <$> getErrno
     _ -> pure False
   where

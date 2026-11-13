@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -7,11 +8,12 @@
 module Network.Streaming.Mode
   ( Mode (..),
     ModeOf,
-    Instrumented,
+    Instrumented (..),
   )
 where
 
 import Data.Kind (Type)
+import Network.Streaming.Counters (Counter, Counts, increment, incrementBy, snapshot)
 
 -- | What a build observes of its runs. There is nothing to observe in 'Release'.
 data Mode = Debug | Release
@@ -20,9 +22,36 @@ data Mode = Debug | Release
 -- wraps another has the other's.
 type family ModeOf (arr :: Type -> Type -> Type) :: Mode
 
--- | What a mode lets code observe of a run, which is a hook that is called in 'Debug' and does nothing in 'Release'.
-class Instrumented (m :: Mode)
+-- | What a mode lets code observe of a run: the hooks are called in 'Debug' and do nothing in 'Release', where each is a
+-- constant, so that a program that is built for a known mode has none of them. They are called with the mode of the arrow
+-- that the code runs in, @bump \@(ModeOf arr)@, or with the mode that a run is made in.
+class Instrumented (m :: Mode) where
+  -- | Adds one to the count of the counter of "Network.Streaming.Counters".
+  bump :: Counter -> IO ()
 
-instance Instrumented 'Debug
+  -- | Adds to the count of the counter.
+  bumpBy :: Counter -> Int -> IO ()
 
-instance Instrumented 'Release
+  -- | Runs the action, which only a build that observes needs.
+  debugging :: IO () -> IO ()
+
+  -- | The counts, which a build that observes nothing has none of.
+  counted :: IO (Maybe Counts)
+
+instance Instrumented 'Debug where
+  bump = increment
+  {-# INLINE bump #-}
+  bumpBy = incrementBy
+  {-# INLINE bumpBy #-}
+  debugging = id
+  {-# INLINE debugging #-}
+  counted = Just <$> snapshot
+
+instance Instrumented 'Release where
+  bump _ = pure ()
+  {-# INLINE bump #-}
+  bumpBy _ _ = pure ()
+  {-# INLINE bumpBy #-}
+  debugging _ = pure ()
+  {-# INLINE debugging #-}
+  counted = pure Nothing

@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 
@@ -20,20 +21,22 @@ import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.Storable (pokeByteOff, sizeOf)
 import Network.Socket (Socket, withFdSocket)
+import Network.Streaming.Counters (Counter (..))
+import Network.Streaming.Mode (Instrumented (bump))
 import qualified System.Posix.Types as Posix
 
 -- | Reads what the socket has into the buffer, without waiting: 'Nothing' if
 -- it has nothing, and 0 at the end of the stream.
-tryReceive :: Socket -> Ptr Word8 -> Int -> IO (Maybe Int)
+tryReceive :: forall m. (Instrumented m) => Socket -> Ptr Word8 -> Int -> IO (Maybe Int)
 tryReceive sock pointer size =
   withFdSocket sock $ \fd ->
     let attempt =
-          c_recv fd pointer (fromIntegral size) 0 >>= \case
+          bump @m Receives *> c_recv fd pointer (fromIntegral size) 0 >>= \case
             -1 ->
               Errno.getErrno >>= \errno ->
                 if
                   | errno == Errno.eINTR -> attempt
-                  | errno == Errno.eAGAIN || errno == Errno.eWOULDBLOCK -> pure Nothing
+                  | errno == Errno.eAGAIN || errno == Errno.eWOULDBLOCK -> Nothing <$ bump @m ReceivesEmpty
                   | otherwise -> Errno.throwErrno "recv"
             received -> pure (Just (fromIntegral received))
      in attempt
@@ -46,7 +49,7 @@ foreign import ccall unsafe "recv"
 -- pieces at a time, which is the iovec limit it uses: a caller offers no more.
 -- It offers at least one piece, since an empty send fails with @EINVAL@ on
 -- macOS.
-trySend :: Socket -> [ByteString] -> IO Int
+trySend :: forall m. (Instrumented m) => Socket -> [ByteString] -> IO Int
 trySend sock pieces =
   withFdSocket sock $ \fd ->
     allocaBytes (length pieces * iovecSize) $ \iovecs ->
@@ -58,7 +61,7 @@ trySend sock pieces =
               pokeByteOff iovecs (offset + sizeOf pointer) (fromIntegral size :: CSize)
               describe (offset + iovecSize) others
           attempt =
-            c_writev fd iovecs (fromIntegral (length pieces)) >>= \case
+            bump @m Sends *> c_writev fd iovecs (fromIntegral (length pieces)) >>= \case
               -1 ->
                 Errno.getErrno >>= \errno ->
                   if
