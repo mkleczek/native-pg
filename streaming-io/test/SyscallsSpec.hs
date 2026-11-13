@@ -73,28 +73,26 @@ spec = describe "system calls" $ do
       toList counts `shouldBe` [(counter, 0) | counter <- [minBound .. maxBound]]
 
   forM_ runners $ \(Runner name _ run) -> describe name $ do
-    xfail "a receive tries before it waits, whatever came before it" $
-      it "receives once without finding anything, and then waits before each receive, when each one follows a short one" $ do
-        counts <- counting (echoing 20 run)
-        countOf ReceivesEmpty counts `shouldBe` 1
-        countOf ReceivesSkipped counts `shouldBe` 19
-        countOf Receives counts `shouldBe` 21
-        countOf DescriptorWaits counts `shouldBe` 20
+    it "receives once without finding anything, and then waits before each receive, when each one follows a short one" $ do
+      counts <- counting (echoing 20 run)
+      countOf ReceivesEmpty counts `shouldBe` 1
+      countOf ReceivesSkipped counts `shouldBe` 19
+      countOf Receives counts `shouldBe` 21
+      countOf DescriptorWaits counts `shouldBe` 20
 
-    xfail "a receive tries before it waits, whatever came before it" $
-      it "receives first after a read that filled the buffer, and waits first after a short one that a send followed" $ do
-        (mine, theirs) <- newPair
-        SocketBytes.sendAll theirs (BS.replicate 40 7)
-        done <- newEmptyMVar
-        _ <- forkIO (lateByte' theirs `finally` putMVar done ())
-        counts <- counting (run defaultTurn (arr (const mine) >>> received >>> received >>> received >>> sending >>> received >>> arr (const ())))
-        takeMVar done
-        mapM_ Socket.close [mine, theirs]
-        -- Two reads of 16 bytes, one of the 8 that were left, a send, and then the byte that came later, which the fourth receive waits for.
-        countOf Receives counts `shouldBe` 4
-        countOf ReceivesEmpty counts `shouldBe` 0
-        countOf ReceivesSkipped counts `shouldBe` 1
-        countOf DescriptorWaits counts `shouldBe` 1
+    it "receives first after a read that filled the buffer, and waits first after a short one that a send followed" $ do
+      (mine, theirs) <- newPair
+      SocketBytes.sendAll theirs (BS.replicate 40 7)
+      done <- newEmptyMVar
+      _ <- forkIO (lateByte' theirs `finally` putMVar done ())
+      counts <- counting (run defaultTurn (arr (const mine) >>> received >>> received >>> received >>> sending >>> received >>> arr (const ())))
+      takeMVar done
+      mapM_ Socket.close [mine, theirs]
+      -- Two reads of 16 bytes, one of the 8 that were left, a send, and then the byte that came later, which the fourth receive waits for.
+      countOf Receives counts `shouldBe` 4
+      countOf ReceivesEmpty counts `shouldBe` 0
+      countOf ReceivesSkipped counts `shouldBe` 1
+      countOf DescriptorWaits counts `shouldBe` 1
 
     it "receives first after a short read that no send followed, since the rest of what the other end sends may be on its way" $ do
       pair@(mine, theirs) <- newPair
@@ -108,18 +106,17 @@ spec = describe "system calls" $ do
       countOf ReceivesSkipped counts `shouldBe` 0
       countOf DescriptorWaits counts `shouldBe` 1
 
-    xfail "a receive tries before it waits, whatever came before it" $
-      it "finds what arrived between a short read and a send and the next receive, by waiting for it" $ do
-        pair@(mine, theirs) <- newPair
-        done <- newEmptyMVar
-        _ <- forkIO (handoverDriver pair `finally` putMVar done ())
-        counts <- counting (run defaultTurn (arr (const mine) >>> received >>> sending >>> pausing >>> pausing >>> pausing >>> received >>> arr (const ())))
-        takeMVar done
-        mapM_ Socket.close [mine, theirs]
-        countOf Receives counts `shouldBe` 3
-        countOf ReceivesEmpty counts `shouldBe` 1
-        countOf ReceivesSkipped counts `shouldBe` 1
-        countOf DescriptorWaits counts `shouldBe` 2
+    it "finds what arrived between a short read and a send and the next receive, by waiting for it" $ do
+      pair@(mine, theirs) <- newPair
+      done <- newEmptyMVar
+      _ <- forkIO (handoverDriver pair `finally` putMVar done ())
+      counts <- counting (run defaultTurn (arr (const mine) >>> received >>> sending >>> pausing >>> pausing >>> pausing >>> received >>> arr (const ())))
+      takeMVar done
+      mapM_ Socket.close [mine, theirs]
+      countOf Receives counts `shouldBe` 3
+      countOf ReceivesEmpty counts `shouldBe` 1
+      countOf ReceivesSkipped counts `shouldBe` 1
+      countOf DescriptorWaits counts `shouldBe` 2
 
     it "receives first after a wait for input, which found the input that the receive then takes" $ do
       pair@(mine, theirs) <- newPair

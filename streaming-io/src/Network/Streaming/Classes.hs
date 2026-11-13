@@ -63,7 +63,7 @@ import Foreign.Ptr (Ptr, plusPtr)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer (..))
-import Network.Streaming.Internal.Socket (tryReceive, trySend)
+import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Internal.Tickets (Giver, Reach (..))
 import Network.Streaming.Watch (Watch)
@@ -290,7 +290,8 @@ instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (Mod
   {-# INLINE receive #-}
   sendAll = sendAllWith (trySend @(ModeOf arr)) (\_ -> pure True) writable
   {-# INLINE sendAll #-}
-  awaitInput = now readable >>> block
+  -- What the wait finds is for the receive after it to read: it doesn't wait first because of a short read before the wait.
+  awaitInput = now (\sock -> receiveFirst sock *> readable sock) >>> block
   {-# INLINE awaitInput #-}
   shutdownSend = now (`Socket.shutdown` Socket.ShutdownSend)
   {-# INLINE shutdownSend #-}

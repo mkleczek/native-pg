@@ -50,12 +50,12 @@ import Network.Socket.Address (pokeSocketAddress, sizeOfSocketAddress)
 import Network.Streaming.Classes (Block (..), Effect (..), Event (..), Exit (..), Runtime, Scope (..))
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Descriptors (fresh)
-import Network.Streaming.Mode (Instrumented (bump, debugging), ModeOf)
+import Network.Streaming.Mode (Instrumented (bump))
 import qualified System.Posix.Types as Posix
 
 -- | Connects to the address, or says why it couldn't. The socket is closed if the part is cancelled while it
 -- connects, or if it didn't connect.
-connectSocket :: forall arr. (Runtime arr) => TcpOptions -> arr Address (Either ConnectError Socket)
+connectSocket :: (Runtime arr) => TcpOptions -> arr Address (Either ConnectError Socket)
 connectSocket options =
   (\case UnixAddress path -> Left path; TcpAddress host port -> Right (host, port)) ^>> (unix ||| tcp)
   where
@@ -75,7 +75,7 @@ connectSocket options =
                 (setSocketOption sock NoDelay 1 *> setTcpOptions sock options) `onException` close sock
                 pure sock
           pure (Right (opening, addrAddress found, \failure -> UnreachableHost host port [(numeric, failure)]))
-    reaching = scope (now (\(opening, _, _) -> try (opening >>= \sock -> sock <$ debugging @(ModeOf arr) (fresh sock)))) (now released) body
+    reaching = scope (now (\(opening, _, _) -> try (opening >>= \sock -> sock <$ fresh sock))) (now released) body
     released (opened, exit) = case exit of
       Done -> pure ()
       _ -> either (\(_ :: IOException) -> pure ()) close opened

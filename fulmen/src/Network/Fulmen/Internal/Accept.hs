@@ -23,7 +23,7 @@ import qualified Network.Socket as Socket
 import Network.Streaming.Classes (Block (..), Effect (..), Event (..), GiveWay (..))
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Descriptors (fresh)
-import Network.Streaming.Mode (Instrumented (bump, debugging), ModeOf)
+import Network.Streaming.Mode (Instrumented (bump), ModeOf)
 import System.Posix.Internals (c_fcntl_read, c_fcntl_write, const_f_getfl, const_f_setfl, o_NONBLOCK, setNonBlockingFD)
 import System.Posix.Types (Fd (..))
 
@@ -49,7 +49,7 @@ tryAccept listener = withFdSocket listener attempt
     adopt fd = do
       nonBlocking @m fd
       sock <- mkSocket fd
-      debugging @m (fresh sock)
+      fresh sock
       -- A socket that isn't a TCP one has no such option.
       _ <- try (setSocketOption sock NoDelay 1) :: IO (Either SomeException ())
       pure sock
