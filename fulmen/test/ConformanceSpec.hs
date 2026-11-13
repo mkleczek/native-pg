@@ -19,7 +19,7 @@ import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, tryReadMVar)
 import Control.Exception (IOException, SomeException, bracket, displayException, throwIO, try)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
 import ConformanceCases
 import ConformanceWire
 import Data.ByteString (ByteString)
@@ -36,20 +36,40 @@ import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (keeping, sleep)
-import Network.Streaming.Compiled (runCompiled)
-import Network.Streaming.Delimited (runDelimited)
+import Network.Streaming.Counters (Counter (..), countOf, since, snapshot)
+import Network.Streaming.Compiled (runCompiled, runCompiledM)
+import Network.Streaming.Delimited (runDelimited, runDelimitedM)
+import Network.Streaming.Mode (Mode (..))
 import Network.Streaming.PositiveInt (positiveInt)
-import Network.Streaming.Threads (runThreads)
+import Network.Streaming.Threads (runThreads, runThreadsM)
 import Skeletest
+import System.Info (os)
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
+spec = conformance *> counted
+
+conformance :: Spec
+conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
   forM_ [minBound .. maxBound] $ \area ->
     case filter ((== area) . caseArea) cases of
       [] -> pure ()
       inArea -> describe (areaTitle area) $ forM_ inArea $ \c -> marked c $ it (caseName c) (runCase runner c)
   it "serves connections one after another, each closed by its client, in one run of the server" (oneAfterAnother runner)
+
+-- | The calls that accepting makes, counted by the runners of 'Debug'.
+counted :: Spec
+counted = describe "accepting" $ forM_ debugRunners $ \runner@(Runner runnerName _) -> describe runnerName $
+  withoutFcntl $ it "takes each connection with one call, and where accept4 is there with none to fcntl" $ do
+    before <- snapshot
+    oneAfterAnother runner
+    counts <- (`since` before) <$> snapshot
+    countOf Accepts counts `shouldBe` 30
+    when (os == "linux") $ countOf Fcntls counts `shouldBe` 0
+
+-- | On Linux, where accept4 makes the socket one that doesn't block, accepting is expected to fail until the server uses it.
+withoutFcntl :: Spec -> Spec
+withoutFcntl = if os == "linux" then xfail "accept is followed by calls to fcntl, which accept4 makes unnecessary" else id
 
 -- | Marks a case that is expected to fail, and says why. A case that then passes unexpectedly fails the suite.
 marked :: Case -> Spec -> Spec
@@ -106,6 +126,14 @@ runners =
   [ Runner "threads" (\settings (Handling handler) cores -> runThreads (Fulmen.serve settings handler) cores),
     Runner "delimited" (\settings (Handling handler) cores -> void (runDelimited (Fulmen.serve settings handler) cores)),
     Runner "compiled" (\settings (Handling handler) cores -> void (runCompiled (Fulmen.serve settings handler) cores))
+  ]
+
+-- | The same in 'Debug', which counts the calls that the server makes.
+debugRunners :: [Runner]
+debugRunners =
+  [ Runner "threads" (\settings (Handling handler) cores -> runThreadsM @'Debug (Fulmen.serve settings handler) cores),
+    Runner "delimited" (\settings (Handling handler) cores -> void (runDelimitedM @'Debug (Fulmen.serve settings handler) cores)),
+    Runner "compiled" (\settings (Handling handler) cores -> void (runCompiledM @'Debug (Fulmen.serve settings handler) cores))
   ]
 
 -- * The handlers of the cases
