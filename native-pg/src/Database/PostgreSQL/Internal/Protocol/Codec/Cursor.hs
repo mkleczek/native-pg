@@ -39,7 +39,7 @@
 -- 'cstring', 'fixed') are written for the atoms and the counted payload.
 module Database.PostgreSQL.Internal.Protocol.Codec.Cursor
   ( -- * Cursors
-    At,
+    At (..),
     CursorError (..),
     Cursor (..),
     Skippable (..),
@@ -65,6 +65,8 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Cursor
     piece,
     eachPiece,
     skipValue,
+    valueView,
+    remaining,
     InPlace (..),
     Decoder (..),
     Length (..),
@@ -174,6 +176,14 @@ instance Cursor ('PayloadStruct '[]) where
 
 instance (KnownNat n) => Cursor ('FixedBytesAtom n) where
   begin reader depth = setMark reader (markFrame depth) (natAsInt @n)
+  {-# INLINE begin #-}
+
+-- | What the body has left, which is the rest of it: its size, so that it is read as a value of that length.
+instance Cursor 'RemainingBytesAtom where
+  begin reader depth = do
+    from <- mark reader markStart
+    limit <- mark reader markLimit
+    setMark reader (markFrame depth) (limit - from)
   {-# INLINE begin #-}
 
 -- | The shapes that can be left before they are read to the end: what a
@@ -404,6 +414,17 @@ piece = withOnly (asks (now attempt) >>> (more ||| returnA))
           )
 {-# INLINE piece #-}
 
+-- | The rest of the message's body, copied out whole, in whichever size of buffer: for the messages that are few and
+-- small, such as those of the startup, and the errors. It is read as the pieces of a value that has the body's length.
+remaining :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'RemainingBytesAtom link) ByteString
+remaining = (\at -> (retyped at, [])) ^>> loop
+  where
+    retyped :: At 'RemainingBytesAtom l -> At 'MaybeBytes32Atom l
+    retyped (At reader depth) = At reader depth
+    -- Each piece is copied before the next is received, whose bytes may be where it was.
+    loop = (\(cursor, copies) -> (cursor, (cursor, copies))) ^>> first piece >>> (\(got, (cursor, copies)) -> maybe (Left (BS.concat (reverse copies))) (\chunk -> let !copied = BS.copy chunk in Right (cursor, copied : copies)) got) ^>> (returnA ||| loop)
+{-# INLINE remaining #-}
+
 -- | The pieces of the value, one after the other, given to the consumer.
 eachPiece :: (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (At 'MaybeBytes32Atom link) ()
 eachPiece consumer = withOnly loop
@@ -427,6 +448,29 @@ skipLeft = withOnly (asks (now starting) >>> (\size -> (size, size)) ^>> first (
 skipValue :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) ()
 skipValue = skipLeft >>^ const ()
 {-# INLINE skipValue #-}
+
+-- | The value's bytes in hand, whole, as a view of the buffer that is valid until the next step: they are received if
+-- they are not in hand, and taken. Its length must have been read, and it is an error if it is larger than the buffer.
+valueView :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) ByteString
+valueView = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks (now taken))
+  where
+    ready (At reader depth) = do
+      size <- mark reader (markFrame depth)
+      when (size < 0) $ failing "the length of a value was not read"
+      from <- mark reader markStart
+      end <- mark reader markEnd
+      if end - from >= size
+        then pure (Right ())
+        else do
+          when (size > readerCapacity reader) $ unfitting "a value" size (readerCapacity reader)
+          pure (Left size)
+    taken (At reader depth) = do
+      size <- mark reader (markFrame depth)
+      from <- mark reader markStart
+      setMark reader markStart (from + size)
+      setMark reader (markFrame depth) 0
+      pure (BSI.BS (readerMemory reader `plusForeignPtr` from) size)
+{-# INLINE valueView #-}
 
 -- | How a type is decoded from the bytes of a value.
 data Decoder a

@@ -32,6 +32,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
+                      Database.PostgreSQL.Internal.Protocol.Codec.Cursor
                       Database.PostgreSQL.Internal.Protocol.Codec.Output
                       Database.PostgreSQL.Internal.Protocol.Codec.Payload
                       Database.PostgreSQL.Internal.Protocol.Messages
@@ -44,7 +45,9 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Internal.Protocol.Messages.Parse
                       Database.PostgreSQL.Internal.Protocol.Messages.Startup
                       Database.PostgreSQL.Internal.Protocol.Messages.Types
+                      Database.PostgreSQL.Internal.Frontend
                       Database.PostgreSQL.Internal.Socket
+                      Database.PostgreSQL.Internal.Startup
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation

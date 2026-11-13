@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Decode wire error fields into owned diagnostics.
-module Database.PostgreSQL.Internal.Diagnostics (diagnostics) where
+module Database.PostgreSQL.Internal.Diagnostics (diagnostics, bodyDiagnostics) where
 
 import Control.Applicative ((<|>))
 import Data.ByteString (ByteString)
@@ -10,6 +10,15 @@ import qualified Data.ByteString.Char8 as Char8
 import Data.Word (Word8)
 import Database.PostgreSQL.Diagnostics (Diagnostics (..), Severity (..))
 import Database.PostgreSQL.Internal.Protocol.Messages.Types (ErrorNoticeField, Scalar (..))
+
+-- | Decodes the body of an ErrorResponse or a NoticeResponse, copied out whole: a byte for each field and its C
+-- string, up to the byte that is zero.
+bodyDiagnostics :: ByteString -> Either String Diagnostics
+bodyDiagnostics = diagnostics . fieldsOf
+  where
+    fieldsOf body = case BS.uncons body of
+      Just (field, rest) | field /= 0 -> let (value, after) = BS.break (== 0) rest in Scalar (field, value) : fieldsOf (BS.drop 1 after)
+      _ -> []
 
 -- | Decodes the fields, which have to include the severity, the SQLSTATE
 -- and the message. Of a repeated field the first occurrence counts, and
