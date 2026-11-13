@@ -18,12 +18,14 @@ module Network.Streaming.Loans
     borrow,
     release,
     withSetupBuffers,
+    withSetupBuffersOf,
   )
 where
 
 import Control.Arrow (arr, first, returnA, (>>>), (^>>), (|||))
 import Control.Exception (throwIO)
 import Control.Monad (unless, when, (>=>))
+import Data.Functor (($>))
 import Data.IORef (IORef, newIORef)
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.BufferPool (BufferGrant)
@@ -32,7 +34,7 @@ import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
 import Network.Streaming.Internal.Tickets (Giver (..), giveNow)
-import Network.Streaming.Pool (checkoutAt, checkoutMany, queueNow, releaseNow, takeNow)
+import Network.Streaming.Pool (checkoutAt, checkoutMany, checkoutManyOf, queueNow, releaseNow, takeNow)
 
 -- | What a request borrows buffers with: the pool, its primary buffer, and what is lent of them.
 data Loans = Loans !BufferPool !Buffer !(IORef State)
@@ -224,3 +226,15 @@ withSetupBuffers pool = scope acquire (now (\(grant, _) -> releaseNow (setupBuff
       now (\_ -> when (size > setupCount pool) (ioError (userError "buffer count must fit capacity")))
         >>> checkoutMany size size (setupBuffers pool)
         >>> now (\buffers -> maybe (ioError (userError "a grant of the wrong number of buffers")) (pure . fst) (takePrefix buffers :: Maybe (grant, [Buffer])))
+
+-- | The same, for the setup buffers of the pool that the loans in the input belong to: a program that is built without
+-- a pool, as a connection's setup is, and is run in whichever request it is called in. The program takes the loans
+-- besides its input, after the grant.
+withSetupBuffersOf :: forall grant arr a b. (Runtime arr, BufferGrant grant) => arr (grant, (Loans, a)) b -> arr (Loans, a) b
+withSetupBuffersOf body = scope acquire (now (\((setups, grant), _) -> releaseNow setups (prepend grant []))) ((\((_, grant), input) -> (grant, input)) ^>> body)
+  where
+    size = prefixSize @grant
+    acquire =
+      now (\(Loans pool _ _, _) -> when (size > setupCount pool) (ioError (userError "buffer count must fit capacity")) $> setupBuffers pool)
+        >>> checkoutManyOf size size
+        >>> now (\(setups, buffers) -> maybe (ioError (userError "a grant of the wrong number of buffers")) (pure . (setups,) . fst) (takePrefix buffers :: Maybe (grant, [Buffer])))
