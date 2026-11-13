@@ -27,7 +27,7 @@ import Data.Int (Int64)
 import Data.Text (Text)
 import Database.PostgreSQL.Connection (ConnectSettings, Connection)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (connectionPoolSettings, newConnectionPool, withConnection)
+import Database.PostgreSQL.Pool (connectionPoolSettings, withConnection, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import Network.Socket (PortNumber)
@@ -291,12 +291,11 @@ data Env = Env
 onEnv :: Env -> Program a -> IO a
 onEnv env = runOn (envRunner env) (envBuffers env)
 
--- | API.md has no way to stop a pool, so the environment doesn't: its connections end with the cluster.
+-- | The environment for the use, with a pool that is closed when the use ends.
 withEnv :: Runner -> ConnectSettings -> Int -> (Env -> IO a) -> IO a
 withEnv runner settings size use = do
   buffers <- newPool (PoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-  pool <- newConnectionPool (connectionPoolSettings size settings)
-  use (Env runner buffers pool)
+  withConnectionPool (connectionPoolSettings size settings) $ \pool -> use (Env runner buffers pool)
 
 -- | The body in a request: a connection of the pool, which the body uses and gives back. A pool that has none is the
 -- program's failure.

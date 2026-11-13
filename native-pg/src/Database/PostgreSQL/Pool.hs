@@ -1,9 +1,9 @@
--- | A pool of connections. Making one is a stub, which fails with
+-- | A pool of connections. Running with one is a stub, which fails with
 -- 'Network.Streaming.NotImplemented.NotImplemented' until the code is there.
 module Database.PostgreSQL.Pool
   ( ConnectionPoolSettings (..),
     connectionPoolSettings,
-    newConnectionPool,
+    withConnectionPool,
     withConnection,
     Observation (..),
     ConnectionStatus (..),
@@ -40,10 +40,11 @@ data ConnectionPoolSettings = ConnectionPoolSettings
 connectionPoolSettings :: Int -> ConnectSettings -> ConnectionPoolSettings
 connectionPoolSettings size settings = ConnectionPoolSettings size settings Nothing Nothing Nothing (const (pure ()))
 
--- | The pool, which keeps its connections and maintains them (lifetime, idle
--- time) in parts of its own.
-newConnectionPool :: ConnectionPoolSettings -> IO (Pool Connection)
-newConnectionPool _ = notImplementedIO "newConnectionPool"
+-- | The body, with a pool that keeps its connections and maintains them
+-- (lifetime, idle time) in parts of its own. The pool is closed when the body
+-- ends, however it ends: its parts stop and its connections close.
+withConnectionPool :: ConnectionPoolSettings -> (Pool Connection -> IO a) -> IO a
+withConnectionPool _ _ = notImplementedIO "withConnectionPool"
 
 -- | The body, with a connection of the pool for as long as it runs, as 'withLoan'
 -- does, and as a holder that is served first ('urgently'). The checkout waits

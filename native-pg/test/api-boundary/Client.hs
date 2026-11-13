@@ -13,7 +13,7 @@ import Database.PostgreSQL.Diagnostics ()
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectionError (..), PoolError (..), QueryError, UsageError (..))
 import Database.PostgreSQL.Encoders (Parameter (..))
 import Database.PostgreSQL.Notifications (Notification, listen, notification)
-import Database.PostgreSQL.Pool (ConnectionPoolSettings, connectionPoolSettings, newConnectionPool, withConnection)
+import Database.PostgreSQL.Pool (ConnectionPoolSettings, connectionPoolSettings, withConnection, withConnectionPool)
 import Database.PostgreSQL.Session.Settings ()
 import Database.PostgreSQL.Snippet (fromSnippet)
 import Database.PostgreSQL.Transaction
@@ -78,8 +78,8 @@ settingsOf = Right (connectSettings (UnixAddress "/tmp") "postgres")
 hostOf :: Connection -> (Bool, Bool)
 hostOf connection = (serverInfo connection `seq` True, connectedHost connection `seq` cancelKey connection `seq` True)
 
-makePool :: ConnectionPoolSettings -> IO (Pool Connection)
-makePool = newConnectionPool
+poolFor :: ConnectionPoolSettings -> (Pool Connection -> IO a) -> IO a
+poolFor = withConnectionPool
 
 poolOf :: ConnectSettings -> ConnectionPoolSettings
 poolOf = connectionPoolSettings 4
