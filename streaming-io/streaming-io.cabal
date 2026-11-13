@@ -48,6 +48,7 @@ test-suite streaming-io-spec
   hs-source-dirs: test src
   main-is: Main.hs
   other-modules: ListPrefixSpec
+                 DescriptorsSpec
                  LoansSpec
                  LoansTestSupport
                  SetupBuffersSpec
