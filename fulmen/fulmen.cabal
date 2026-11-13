@@ -40,3 +40,12 @@ test-suite fulmen-conformance
   ghc-options: -Wall -threaded -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5
+
+-- A quick measurement: a client of C keep-alive connections and a server that answers with a static body, run as two
+-- processes of this one program. Its numbers are for looking at, and nothing checks them.
+executable fulmen-bench
+  default-language: GHC2021
+  hs-source-dirs: bench
+  main-is: Main.hs
+  ghc-options: -Wall -threaded -rtsopts
+  build-depends: base, bytestring, fulmen, network, streaming-io
