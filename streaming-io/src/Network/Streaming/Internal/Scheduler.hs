@@ -94,6 +94,7 @@ module Network.Streaming.Internal.Scheduler
   )
 where
 
+import Control.Concurrent (rtsSupportsBoundThreads, yield)
 import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDelay, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, toException, try)
 import Control.Monad (foldM, replicateM, when, (>=>))
@@ -936,9 +937,9 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
     -- while the scheduler waits, so it waits unmasked: a masked thread in an interruptible foreign call returns
     -- from it with the exception still to come.
     pollWait timeout =
-      bump @m PollsBlocking *> try (interruptible (rawPoll c_pollerWait timeout)) >>= \case
+      bump @m PollsBlocking *> try (interruptible (rawPoll c_pollerWait (bounded timeout))) >>= \case
         Left failure -> [] <$ shuttingDown failure
-        Right count -> afterPoll count
+        Right count -> afterPoll count >>= \ready -> ready <$ when (null ready && not rtsSupportsBoundThreads) yield
     rawPoll call timeout =
       unsafeWithForeignPtr (runReady run) $ \fds ->
         unsafeWithForeignPtr (runKinds run) $ \kinds ->
@@ -968,6 +969,18 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
           waiting = Waiters readers' writers'
       when (kindsOf waiting /= 0) (arm fd 0 waiting)
       pure (woken <> reverse fromReaders <> reverse fromWriters, settle key waiting waiters)
+
+-- | How long the scheduler waits in its poller at most on the non-threaded run time, in milliseconds. That run time has
+-- one OS thread, which a blocking foreign call holds: no other thread of the program runs while the scheduler waits,
+-- and a signal that ends the wait has the handler's thread started only once the scheduler thread has gone back to the
+-- run time's scheduler, which it doesn't do by itself when it waits again at once. So the wait is short, and the scheduler
+-- thread yields when it ends with nothing ready, so that the handler's thread, and the thread that it tells to stop the
+-- run, get their turns. The threaded run time runs the others on OS threads of their own, and waits as long as it is told.
+bounded :: CInt -> CInt
+bounded timeout
+  | rtsSupportsBoundThreads = timeout
+  | timeout < 0 || timeout > 100 = 100
+  | otherwise = timeout
 
 -- | The kinds of readiness that the poller reports and is armed for: those of C, which are bits.
 kindReadable, kindWritable :: CInt
