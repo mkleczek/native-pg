@@ -88,6 +88,7 @@ test-suite streaming-io-spec
                  RegionSpec
                  RuntimeSpec
                  ScopesSpec
+                 StepCostSpec
                  TimeSpec
                  WithSpec
   ghc-options: -Wall -threaded -rtsopts -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor

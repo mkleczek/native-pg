@@ -147,6 +147,23 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
       ended <- monotonicNanoseconds
       (ended - started < 2000000000) `shouldBe` True
 
+    -- The part waits for the parts of a group, which a shield protects, when the other half of the race ends: the
+    -- cancellation reaches it there, where it doesn't wait, and what it does next doesn't lose it.
+    describe "that reaches a part where it doesn't wait" $ do
+      it "is kept through the points behind a shield, and raised at the first point after it" $ do
+        noted <- newLog
+        let part :: Program ()
+            part = together [shield longWait, shield longWait] >>> shield (point >>> noting noted "behind the shield") >>> point >>> noting noted "after the shield"
+        (winner <$> run (race part slowWait)) `shouldReturn` "second"
+        readLog noted `shouldReturn` ["behind the shield"]
+
+      it "reaches the parts of a group that the part forks next, at their first points" $ do
+        noted <- newLog
+        let part :: Program ()
+            part = together [shield longWait, shield longWait] >>> together [point >>> noting noted "first half", point >>> noting noted "second half"]
+        (winner <$> run (race part slowWait)) `shouldReturn` "second"
+        readLog noted `shouldReturn` []
+
   describe "shield" $ do
     it "keeps an outside cancellation until it ends" $ do
       noted <- newLog
@@ -350,6 +367,14 @@ cancelledWaiterLocal = cancelledWaiter @(Local arr)
 -- | A wait of about 20 ms, for a descriptor that another thread makes readable.
 slowWait :: (Rich arr) => arr () ()
 slowWait = now (\() -> readableAfter 20000) >>> block
+
+-- | A wait of about 150 ms, for a descriptor that another thread makes readable.
+longWait :: (Rich arr) => arr () ()
+longWait = now (\() -> readableAfter 150000) >>> block
+
+-- | A wait that is over at once: a point where the cancellation that has reached the part is raised.
+point :: (Rich arr) => arr () ()
+point = now (\() -> readableAfter 0) >>> block
 
 -- | A wait that nothing ends.
 waitsForEver :: (Rich arr) => arr a ()
