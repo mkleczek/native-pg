@@ -21,6 +21,7 @@ library
                  Network.Fulmen.Internal.Head
                  Network.Fulmen.Internal.Date
                  Network.Fulmen.Internal.Response
+                 Network.Fulmen.Internal.Body
   build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, network >=3.1 && <3.3, streaming-io
 
 -- The HTTP/1.1 conformance cases, which are data of bytes in and bytes out, run against a
