@@ -29,6 +29,7 @@ module Network.Streaming.Pool
     checkoutMany,
     checkoutManyOf,
     takeNow,
+    takeNowWith,
     releaseNow,
     queueNow,
     waiters,
@@ -184,6 +185,14 @@ claimOne need state@(State count conns arrival lanes) = case conns of
   conn : others | count >= need -> (State (count - 1) others arrival lanes, Right conn)
   _ -> (state, Left ())
 
+-- | The item at the position that the chooser gives in the free items, which are in the order that they are taken in.
+-- Nothing is taken if it gives none, or a position that is not one of the items. It passes no waiter that could be served,
+-- as 'claimOne' doesn't.
+claimAt :: ([conn] -> Maybe Int) -> State conn -> (State conn, Either () conn)
+claimAt choose state@(State count conns arrival lanes) = case choose conns of
+  Just position | position >= 0, (before, conn : after) <- splitAt position conns -> (State (count - 1) (before ++ after) arrival lanes, Right conn)
+  _ -> (state, Left ())
+
 -- | The same for this many items at once, when at least the number that is needed are free.
 claimMany :: Int -> Int -> State conn -> (State conn, Either () [conn])
 claimMany many need state@(State count conns arrival lanes)
@@ -278,6 +287,14 @@ checkoutWithin limit pool = within limit (checkout pool)
 -- served is queued.
 takeNow :: Pool conn -> Int -> IO (Maybe conn)
 takeNow (Pool ref _) need = either (const Nothing) Just <$> update ref (claimOne need)
+
+-- | An item that the caller chooses, if one is free, without waiting: the chooser is given the free items in the order that
+-- the pool takes them in, and says the position of the one to take. With 'Nothing', or a position that is not one of the
+-- items, none is taken. The chooser runs again if another part changes the pool meanwhile, so it must be quick. As 'takeNow'
+-- does, it passes no waiter that could be served: none can be, or it would have been. A pool that has been closed lends
+-- nothing.
+takeNowWith :: ([conn] -> Maybe Int) -> Pool conn -> IO (Maybe conn)
+takeNowWith choose pool@(Pool ref _) = isClosed pool >>= \closed -> if closed then pure Nothing else either (const Nothing) Just <$> update ref (claimAt choose)
 
 -- | Gives the connection to the first part that waits for one. A waiter that
 -- has gone doesn't take it, and the next is tried; with none left, the

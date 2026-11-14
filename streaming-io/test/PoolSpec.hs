@@ -50,6 +50,48 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       pool <- newPool [7 :: Int]
       run (withLoanWithin (millis 20) pool (arr fst)) `shouldReturn` Right 7
 
+  describe "takeNowWith" $ do
+    it "takes the item at the position that the chooser gives, from the free items in the order that the pool takes them in" $ do
+      pool <- newPool [7 :: Int, 8, 9]
+      run (now (const (takeNowWith (\items -> if items == [7, 8, 9] then Just 1 else Nothing) pool))) `shouldReturn` Just 8
+      free pool `shouldReturn` [7, 9]
+      run (now (const (takeNowWith (const (Just 1)) pool))) `shouldReturn` Just 9
+      run (now (const (takeNowWith (const (Just 0)) pool))) `shouldReturn` Just 7
+      free pool `shouldReturn` []
+
+    it "takes the item that takeNow takes, for the position 0" $ do
+      pool <- newPool [7 :: Int, 8, 9]
+      pool' <- newPool [7 :: Int, 8, 9]
+      first' <- run (now (const (takeNowWith (const (Just 0)) pool)))
+      run (now (const (takeNow pool' 1))) `shouldReturn` first'
+
+    it "takes none if the chooser gives none, or a position that is not one of the items" $ do
+      pool <- newPool [7 :: Int, 8]
+      forM_ [Nothing, Just 2, Just (-1)] $ \position ->
+        run (now (const (takeNowWith (const position) pool))) `shouldReturn` Nothing
+      free pool `shouldReturn` [7, 8]
+
+    it "takes none from a pool with no item free" $ do
+      pool <- newPool ([] :: [Int])
+      run (now (const (takeNowWith (const (Just 0)) pool))) `shouldReturn` Nothing
+      pool' <- newPool [7 :: Int]
+      run (now (const (takeNowWith (const (Just 0)) pool'))) `shouldReturn` Just 7
+      run (now (const (takeNowWith (const (Just 0)) pool'))) `shouldReturn` Nothing
+
+    it "takes none from a pool that has been closed" $ do
+      pool <- newPool [7 :: Int, 8]
+      closePool pool `shouldReturn` [7, 8]
+      run (now (const (takeNowWith (const (Just 0)) pool))) `shouldReturn` Nothing
+      releaseNow pool [9]
+      run (now (const (takeNowWith (const (Just 0)) pool))) `shouldReturn` Nothing
+      free pool `shouldReturn` [9]
+
+    it "counts the item that it took as taken, so that an item is taken only if enough are free" $ do
+      pool <- newPool [7 :: Int, 8, 9]
+      run (now (const (takeNowWith (const (Just 1)) pool))) `shouldReturn` Just 8
+      run (now (const (takeNow pool 3))) `shouldReturn` Nothing
+      run (now (const (takeNow pool 2))) `shouldReturn` Just 7
+
   describe "the setup buffers of the pool that the loans belong to" $ do
     it "grants them, whichever pool the request is of, and gives them back" $ do
       buffers <- newTestPool 1 1 2
