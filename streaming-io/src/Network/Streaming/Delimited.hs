@@ -107,6 +107,18 @@ instance Arrow (DelimitedM m s) where
   first (Delimited inner) = Delimited (\context (a, c) -> (,c) <$> inner context a)
   {-# INLINE first #-}
 
+instance Functor (DelimitedM m s a) where
+  fmap function (Delimited inner) = Delimited (\context value -> function <$> inner context value)
+  {-# INLINE fmap #-}
+
+instance Applicative (DelimitedM m s a) where
+  pure result = Delimited (\_ _ -> pure result)
+  {-# INLINE pure #-}
+  Delimited function <*> Delimited argument = Delimited (\context value -> function context value <*> argument context value)
+  {-# INLINE (<*>) #-}
+
+instance ArrowApplicative (DelimitedM m s)
+
 -- | A choice runs its branch in its place, so that a loop through a branch is
 -- a tail call.
 instance ArrowChoice (DelimitedM m s) where

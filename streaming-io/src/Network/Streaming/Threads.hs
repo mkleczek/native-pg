@@ -125,6 +125,15 @@ instance Arrow (ThreadsM m) where
   arr function = Threads (\_ value -> pure (function value))
   first (Threads inner) = Threads (\part (a, c) -> (,c) <$> inner part a)
 
+instance Functor (ThreadsM m a) where
+  fmap function (Threads inner) = Threads (\part value -> function <$> inner part value)
+
+instance Applicative (ThreadsM m a) where
+  pure result = Threads (\_ _ -> pure result)
+  Threads function <*> Threads argument = Threads (\part value -> function part value <*> argument part value)
+
+instance ArrowApplicative (ThreadsM m)
+
 instance ArrowChoice (ThreadsM m) where
   left (Threads inner) = Threads $ \part -> \case
     Left a -> Left <$> inner part a

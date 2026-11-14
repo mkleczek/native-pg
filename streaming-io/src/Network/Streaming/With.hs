@@ -89,6 +89,18 @@ instance (Effect arr) => Effect (With r arr) where
   now action = With (now (action . snd))
   {-# INLINE now #-}
 
+instance (Functor (arr (r, a))) => Functor (With r arr a) where
+  fmap function (With inner) = With (fmap function inner)
+  {-# INLINE fmap #-}
+
+instance (Applicative (arr (r, a))) => Applicative (With r arr a) where
+  pure result = With (pure result)
+  {-# INLINE pure #-}
+  With function <*> With argument = With (function <*> argument)
+  {-# INLINE (<*>) #-}
+
+instance (ArrowApplicative arr) => ArrowApplicative (With r arr)
+
 instance (Arrow arr, GiveWay arr) => GiveWay (With r arr) where
   giveWay = With (snd ^>> giveWay)
   {-# INLINE giveWay #-}

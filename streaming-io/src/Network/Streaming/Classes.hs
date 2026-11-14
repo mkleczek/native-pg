@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -35,6 +36,7 @@ module Network.Streaming.Classes
   ( Link (..),
     Stream (..),
     Runtime,
+    ArrowApplicative,
     Concurrent (..),
     Exit (..),
     ScopeId (..),
@@ -116,11 +118,16 @@ class Link arr link where
 class Stream arr s where
   next :: arr s (Maybe ByteString)
 
+-- | Arrows whose programs from one input are applicative functors, so that steps that don't depend on each other's
+-- results are combined with '<$>' and '<*>'. The effects run from left to right, as with '&&&'.
+class (forall x. Applicative (arr x)) => ArrowApplicative arr
+
 -- | What a program needs of the arrow it runs in, so that it can be written
 -- once and run by any of them: the capabilities of its classes, and tickets
 -- at both reaches.
 type Runtime arr =
   ( ArrowChoice arr,
+    ArrowApplicative arr,
     Effect arr,
     Block arr,
     GiveWay arr,

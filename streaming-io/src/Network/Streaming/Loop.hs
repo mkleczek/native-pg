@@ -72,6 +72,15 @@ instance Arrow Loop where
   arr = Arr
   first = First
 
+instance Functor (Loop a) where
+  fmap function step = Seq step (Arr function)
+
+instance Applicative (Loop a) where
+  pure result = Arr (const result)
+  one <*> two = Seq (Seq (Arr (\a -> (a, a))) (First one)) (Seq (Arr (\(f, a) -> (a, f))) (Seq (First two) (Arr (\(x, f) -> f x))))
+
+instance ArrowApplicative Loop
+
 instance ArrowChoice Loop where
   left = Choose
 

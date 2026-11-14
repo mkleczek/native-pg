@@ -61,6 +61,19 @@ instance Arrow (CompiledM m) where
   first (Compiled inner) = Compiled (\context (a, c) next -> inner context a (\b -> next (b, c)))
   {-# INLINE first #-}
 
+instance Functor (CompiledM m a) where
+  fmap function (Compiled inner) = Compiled (\context value next -> inner context value (next . function))
+  {-# INLINE fmap #-}
+
+instance Applicative (CompiledM m a) where
+  pure result = Compiled (\_ _ next -> next result)
+  {-# INLINE pure #-}
+  Compiled function <*> Compiled argument =
+    Compiled (\context value next -> function context value (\applied -> argument context value (next . applied)))
+  {-# INLINE (<*>) #-}
+
+instance ArrowApplicative (CompiledM m)
+
 -- | A choice goes on with the branch's continuation itself, so that it wraps
 -- nothing.
 instance ArrowChoice (CompiledM m) where
