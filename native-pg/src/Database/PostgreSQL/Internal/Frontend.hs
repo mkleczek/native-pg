@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | Sending what the client says: an output of the protocol's writers is rendered into a buffer and sent, as often
@@ -9,7 +10,7 @@ module Database.PostgreSQL.Internal.Frontend
   )
 where
 
-import Control.Arrow (first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (first, returnA, (>>>), (>>^), (^>>), (|||))
 import Data.ByteString (ByteString)
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output, Uncopied (..), WriteResult (..), Writer, outputWriter, runWriter)
 import Database.PostgreSQL.Internal.Protocol.Messages (pattern Sync, serialize)
@@ -17,24 +18,45 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes (Effect (..), Link (..), Runtime, view)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, iterateA)
+
+-- | What is left to send: the socket, the buffer that the writer renders into, and the writer.
+data Outgoing = Outgoing {outSocket :: Socket, outBuffer :: Buffer, outWriter :: Writer}
+
+-- | What a writer rendered into the buffer: the socket to send it on, the pieces to send, and what is left to send, if
+-- the writer was not finished.
+data Rendered = Rendered {rendSocket :: Socket, rendPieces :: [ByteString], rendMore :: Maybe Outgoing}
 
 -- | The output, rendered into the buffer: it is sent in as many pieces as the buffer takes, with the long byte
 -- strings, which aren't copied, between them. The buffer is reused for each piece, since a send returns once its
 -- pieces may be reused.
 sendOutput :: (Runtime arr) => arr (Socket, Buffer, Output) ()
-sendOutput = (\(sock, buffer, output) -> (sock, buffer, outputWriter output)) ^>> loop
+sendOutput =
+  (\(sock, buffer, output) -> Outgoing sock buffer (outputWriter output))
+    ^>> iterateA
+      ( now render
+          >>> sendable
+          ^>> first sendPieces
+          >>^ continued
+      )
   where
-    loop =
-      now render
-        >>> (\(sock, buffer, sent, rest) -> ((sock, sent), (sock, buffer, rest))) ^>> first sendPieces
-        >>> (\((), (sock, buffer, rest)) -> maybe (Left ()) (\writer -> Right (sock, buffer, writer)) rest) ^>> (returnA ||| loop)
-    sendPieces = (\(sock, pieces) -> if null pieces then Left () else Right (sock, pieces)) ^>> (returnA ||| sendAll)
-    render :: (Socket, Buffer, Writer) -> IO (Socket, Buffer, [ByteString], Maybe Writer)
-    render (sock, buffer, writer) =
-      withForeignPtr (bufferMemory buffer) (\pointer -> runWriter writer pointer (bufferCapacity buffer) 0) >>= \case
-        Finished used -> pure (sock, buffer, copied buffer used [], Nothing)
-        NeedSpace used rest -> pure (sock, buffer, copied buffer used [], Just rest)
-        Yield used (UncopiedBytes long) rest -> pure (sock, buffer, copied buffer used [long], Just rest)
+    sendable Rendered {rendSocket, rendPieces, rendMore} = ((rendSocket, rendPieces), rendMore)
+    continued ((), more) = maybe (Finish ()) Again more
+    sendPieces = somePieces ^>> (returnA ||| sendAll)
+    somePieces (sock, pieces) = if null pieces then Left () else Right (sock, pieces)
+    render :: Outgoing -> IO Rendered
+    render Outgoing {outSocket, outBuffer, outWriter} =
+      withForeignPtr (bufferMemory outBuffer) (\pointer -> runWriter outWriter pointer (bufferCapacity outBuffer) 0) >>= \case
+        Finished used -> pure (rendered used [] Nothing)
+        NeedSpace used rest -> pure (rendered used [] (Just rest))
+        Yield used (UncopiedBytes long) rest -> pure (rendered used [long] (Just rest))
+      where
+        rendered used following rest =
+          Rendered
+            { rendSocket = outSocket,
+              rendPieces = copied outBuffer used following,
+              rendMore = Outgoing outSocket outBuffer <$> rest
+            }
     copied buffer used following = [view buffer used | used > 0] <> following
 
 -- | The Sync that ends the messages of a pipeline.

@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | The startup of a session, on a socket that is connected: the startup message, the authentication that the server
 -- asks for, and the parameters and the key that it reports, up to the point where it is ready for a statement.
@@ -12,7 +13,7 @@ module Database.PostgreSQL.Internal.Startup
   )
 where
 
-import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (arr, returnA, (>>>), (>>^), (^>>), (|||))
 import Control.Exception (IOException, SomeException, fromException, throwIO)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -40,6 +41,7 @@ import GHC.IO.Exception (IOException (..))
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.Classes (Effect (..), Runtime, Scope (..))
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, consume, iterateWith, keeping)
 import Network.Streaming.Reader (Reader, newReader)
 import Network.Streaming.With (With (..), asks, lift, withOnly)
 import System.IO.Error (isUserError)
@@ -96,13 +98,20 @@ failed failure
       | otherwise = ioe_description io
 
 opening :: (Runtime arr) => ConnectSettings -> With Setup arr () ServerInfo
-opening settings = arr (const (startupMessage settings)) >>> send >>> arr (const (Negotiating (connectProtocolVersion settings))) >>> loop settings
+opening settings =
+  const (startupMessage settings)
+    ^>> send
+    >>> const (Negotiating (connectProtocolVersion settings))
+    ^>> loop settings
 
 -- | The loop: the message that comes, and what the phase makes of it.
 loop :: (Runtime arr) => ConnectSettings -> With Setup arr Phase ServerInfo
-loop settings = (returnA &&& (arr (const ()) >>> received)) >>> now (uncurry (react settings)) >>> (returnA ||| continuing)
+loop settings =
+  iterateWith
+    (keeping received >>> now (uncurry (react settings)))
+    (answered ^>> (returnA ||| consume send))
   where
-    continuing = (\(answer, phase) -> maybe (Left phase) (\output -> Right (output, phase)) answer) ^>> (loop settings ||| (first send >>> arr snd >>> loop settings))
+    answered (answer, phase) = maybe (Left phase) (Right . (,phase)) answer
 
 -- | Sends the output, rendered into the buffer.
 send :: (Runtime arr) => With Setup arr Output ()
@@ -121,8 +130,8 @@ received = asks (arr (\(Setup _ _ reader) -> reader)) >>> lift readMessage
 
 -- | What the client makes of a message of the server in the phase: the server's report when it is ready, or what to
 -- answer, if anything, and the phase that follows. A rejection and what the client can't accept are thrown.
-react :: ConnectSettings -> Phase -> (Char, ByteString) -> IO (Either ServerInfo (Maybe Output, Phase))
-react settings phase (tag, body) = case (tag, phase) of
+react :: ConnectSettings -> (Char, ByteString) -> Phase -> IO (Step (Maybe Output, Phase) ServerInfo)
+react settings (tag, body) phase = case (tag, phase) of
   ('E', _) -> either (throwIO . ProtocolError) (throwIO . ConnectionRejected . ServerError) (bodyDiagnostics body)
   ('N', _) -> continuing phase
   ('v', Negotiating _) -> continuing (Negotiating (versionOf (be32 body)))
@@ -138,14 +147,14 @@ react settings phase (tag, body) = case (tag, phase) of
   ('R', Authenticated version) | code == 0 -> continuing (Initializing version [] Nothing)
   ('S', Initializing version parameters key) -> continuing (Initializing version (parameterOf body : parameters) key)
   ('K', Initializing version parameters _) -> continuing (Initializing version parameters (Just (keyOf body)))
-  ('Z', Initializing version parameters key) -> pure (Left (ServerInfo version (reverse parameters) key))
+  ('Z', Initializing version parameters key) -> pure (Finish (ServerInfo version (reverse parameters) key))
   _ -> throwIO (ProtocolError ("unexpected message " <> show tag <> " in the startup"))
   where
     code = be32 body
     rest = BS.drop 4 body
     required = connectChannelBinding settings == ChannelBindingRequire
-    continuing next = pure (Right (Nothing, next))
-    answering output next = pure (Right (Just output, next))
+    continuing next = pure (Again (Nothing, next))
+    answering output next = pure (Again (Just output, next))
     requirePassword = maybe (throwIO (AuthenticationError "the server asks for a password, but none is set")) pure (connectPassword settings)
     -- The server's first message: what it asks for.
     requested version = case code of

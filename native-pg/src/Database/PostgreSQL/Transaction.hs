@@ -3,7 +3,9 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 -- | Statements, pipelines and transactions, and the cursors that read their rows.
@@ -76,7 +78,7 @@ module Database.PostgreSQL.Transaction
   )
 where
 
-import Control.Arrow (Arrow, arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (IOException, SomeAsyncException, SomeException, displayException, evaluate, fromException, throwIO, toException, try)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
@@ -119,6 +121,7 @@ import qualified Database.PostgreSQL.Internal.Protocol.Messages as Wire
 import Database.PostgreSQL.Types (FormatCode (..), Oid, Parameter (..))
 import Network.Socket (Socket)
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, boolA, consume, done, iterateA, iterateWith, keeping, tap)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
 import Network.Streaming.NotImplemented (notImplemented, notImplementedIO)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity)
@@ -329,20 +332,23 @@ events =
             ( arr Row
                 :> (cstring >>^ Complete)
                 :> (fixed >>^ Ready)
-                :> arr (const Other)
-                :> arr (const Other)
+                :> other
+                :> other
                 :> (remaining >>^ Rejected)
                 :> arr (const EmptyQuery)
-                :> arr (const Other)
-                :> arr (const Other)
-                :> arr (const Other)
-                :> arr (const Other)
-                :> arr (const Other)
-                :> arr (const Other)
-                :> arr (const Other)
+                :> other
+                :> other
+                :> other
+                :> other
+                :> other
+                :> other
+                :> other
                 :> NoCases
             )
         )
+  where
+    other :: (Arrow a) => a b Event
+    other = arr (const Other)
 
 -- | What the transaction makes of a message: what the reading goes on with.
 data Step
@@ -359,7 +365,22 @@ data Step
 
 -- | The step that is given the transaction of its environment, besides its input.
 withTx :: (Arrow arr, Effect arr) => (Tx -> a -> IO b) -> With Tx arr a b
-withTx step = (ask &&& returnA) >>> now (uncurry step)
+withTx step = With (now (uncurry step))
+
+-- | The step that is given the transaction of its environment, and ignores its input.
+inTx :: (Arrow arr, Effect arr) => (Tx -> IO b) -> With Tx arr a b
+inTx step = withTx (\tx _ -> step tx)
+{-# INLINE inTx #-}
+
+-- | The step that gives what the function makes of the state of the transaction.
+inState :: (Arrow arr, Effect arr) => (State -> b) -> With Tx arr a b
+inState view = inTx (fmap view . inspect)
+{-# INLINE inState #-}
+
+-- | The step that changes the state of the transaction.
+modifying :: (Arrow arr, Effect arr) => (State -> State) -> With Tx arr a ()
+modifying change = inTx (`modify` change)
+{-# INLINE modifying #-}
 
 modify :: Tx -> (State -> State) -> IO ()
 modify tx = modifyIORef' (txState tx)
@@ -367,6 +388,12 @@ modify tx = modifyIORef' (txState tx)
 -- | The transaction as it is.
 inspect :: Tx -> IO State
 inspect = readIORef . txState
+
+-- | The program's value, or the 'QueryError' that failed it, as a result; any other failure is raised again.
+queryOutcome :: Either SomeException a -> IO (Either QueryError a)
+queryOutcome = either failed (pure . Right)
+  where
+    failed failure = maybe (throwIO failure) (pure . Left) (fromException failure)
 
 -- | What the server said that it should not have: it ends the connection.
 unexpected :: String -> ConnectionError
@@ -417,29 +444,31 @@ pull = (ask &&& (asks (arr txCursor) >>> lift events)) >>> now (uncurry settleEv
 moved :: (Arrow arr, Effect arr) => With Tx arr a a
 moved = withTx (\tx input -> input <$ (modifyIORef' (txEpoch tx) (+ 1) *> modify tx (\s -> s {stField = False})))
 
+-- | Takes the messages of the server one after the other, until what the function makes of one is 'Finish'.
+pullUntil :: (Runtime arr) => (Step -> IO (Either () ())) -> With Tx arr () ()
+pullUntil interpret = iterateA (pull >>> now interpret)
+
 -- | Reads until the statement that is being read is answered. Its rows are skipped, the bytes of each with the next
 -- message. The failure of the server is raised if the read validates, and else it is only noted, and the statements
 -- that the server skipped are answered with it.
 finishEntry :: (Runtime arr) => Bool -> With Tx arr () ()
-finishEntry validating = loop
+finishEntry validating = pullUntil interpret
   where
-    loop = pull >>> now interpret >>> (loop ||| returnA)
     interpret = \case
-      Completed _ -> pure (Right ())
+      Completed _ -> pure (Finish ())
       Refused failure | validating -> throwIO failure
-      Refused _ -> pure (Right ())
+      Refused _ -> pure (Finish ())
       Synced -> throwIO (unexpected "the pipeline ended before the statement was answered")
-      _ -> pure (Left ())
+      _ -> pure (Again ())
 
 -- | Reads everything that is owed, up to the ReadyForQuery that ends the pipeline, as 'finishEntry' reads a statement.
 drain :: (Runtime arr) => Bool -> With Tx arr () ()
-drain validating = withTx (\tx _ -> (\s -> if stOwed s then Right () else Left ()) <$> inspect tx) >>> (returnA ||| loop)
+drain validating = inState stOwed >>> boolA returnA (pullUntil interpret)
   where
-    loop = pull >>> now interpret >>> (loop ||| returnA)
     interpret = \case
-      Synced -> pure (Right ())
+      Synced -> pure (Finish ())
       Refused failure | validating -> throwIO failure
-      _ -> pure (Left ())
+      _ -> pure (Again ())
 
 -- | Where a result is, among the statements that the server has yet to answer.
 data Located
@@ -458,15 +487,11 @@ data Located
 seek :: (Runtime arr) => Int -> With Tx arr () Bool
 seek target = loop
   where
-    loop =
-      withTx (\tx _ -> locate tx)
-        >>> ( \case
-                Finished -> Left False
-                Current -> Left True
-                Skippable -> Right (Left ())
-                Misordered unread -> Right (Right unread)
-            )
-          ^>> (returnA ||| ((finishEntry True >>> loop) ||| misordered))
+    loop = inTx locate >>> byLocation ^>> (returnA ||| ((finishEntry True >>> loop) ||| misordered))
+    byLocation Finished = Left False
+    byLocation Current = Left True
+    byLocation Skippable = Right (Left ())
+    byLocation (Misordered unread) = Right (Right unread)
     locate tx = do
       s <- inspect tx
       traverse_ throwIO (stFailure s)
@@ -479,11 +504,10 @@ seek target = loop
               entry : _ | entrySkippable entry -> Skippable
               pending -> Misordered (length (filter (not . entrySkippable) (take (wanted - stIndex s) pending)))
     -- The statements before it are read to their ends, which finds the failure of one of them if there is one.
-    misordered = (returnA &&& (arr (const ()) >>> settling)) >>> withTx (\tx (unread, ()) -> outOfOrder tx unread)
-    settling =
-      withTx (\tx _ -> (\s -> if stIndex s < stBase s + target && not (null (stPending s)) then Right () else Left ()) <$> inspect tx)
-        >>> (returnA ||| (finishEntry True >>> settling))
-    outOfOrder tx unread = do
+    misordered = keeping settling >>> withTx outOfOrder
+    settling = iterateWith (inState unsettled) (finishEntry True)
+    unsettled s = if stIndex s < stBase s + target && not (null (stPending s)) then Again () else Finish ()
+    outOfOrder tx ((), unread) = do
       modify tx (\s -> s {stFailure = Just (fromMaybe (toException (ResultOutOfOrder unread)) (stFailure s))})
       throwIO (ResultOutOfOrder unread)
 
@@ -493,54 +517,65 @@ seek target = loop
 -- its 'QueryError' here.
 nextRow :: (Runtime arr) => Result arr row -> With Tx arr () (Maybe row)
 nextRow (Result position reading) =
-  moved >>> seek position >>> ((\found -> if found then Right () else Left ()) ^>> (arr (const Nothing) ||| loop))
+  moved >>> seek position >>> boolA noRow loop
   where
-    loop = pull >>> withTx arrived >>> (loop ||| (decoding ||| arr (const Nothing)))
+    noRow = arr (const Nothing)
+    loop = iterateA (pull >>> withTx arrived) >>> (decoding ||| noRow)
     decoding = case reading of
       Reading _ cursor -> decodeRow cursor >>^ Just
-      Silent -> now (\_ -> throwIO (UnexpectedAmountOfRows 1))
+      Silent -> now (const (throwIO (UnexpectedAmountOfRows 1)))
     cardinality = case reading of Reading how _ -> how; Silent -> NoRows
     -- A row is checked against what the statement allows as it comes: the first one too many fails.
     arrived tx = \case
-      Stepped -> pure (Left ())
+      Stepped -> pure (Again ())
       Rowed cursor -> do
         s <- inspect tx
         case cardinality of
           ExactlyOne | stRows s > 1 -> throwIO (UnexpectedAmountOfRows (stRows s))
           AtMostOne | stRows s > 1 -> throwIO (UnexpectedAmountOfRows (stRows s))
           NoRows -> throwIO (UnexpectedAmountOfRows (stRows s))
-          _ -> pure (Right (Left cursor))
+          _ -> pure (Finish (Left cursor))
       Completed rowsRead -> do
         when (cardinality == ExactlyOne && rowsRead /= 1) (throwIO (UnexpectedAmountOfRows rowsRead))
-        pure (Right (Right ()))
+        pure (Finish (Right ()))
       Refused failure -> throwIO failure
       Synced -> throwIO (unexpected "the pipeline ended before the statement was answered")
 
 -- | The row of the cursor, read by the program's step, which has to take its columns, and no more.
 decodeRow :: (Runtime arr) => arr Columns row -> With Tx arr (At ('PayloadCounted16 'MaybeBytes32Atom) Socket) row
 decodeRow rowArrow =
-  (\cursor -> (cursor, cursor))
-    ^>> first (lift count)
-    >>> withTx (\tx (total, cursor) -> Columns cursor total (txState tx) (txEpoch tx) <$> readIORef (txEpoch tx))
-    >>> (returnA &&& lift rowArrow)
-    >>> withTx (\_ (columns, row) -> row <$ leftover columns)
+  alongside (lift count)
+    >>> withTx columnsAt
+    >>> alongside (lift rowArrow)
+    >>> now (\(row, columns) -> row <$ leftover columns)
+  where
+    columnsAt tx (total, cursor) = do
+      stamp <- readIORef (txEpoch tx)
+      pure
+        Columns
+          { colsCursor = cursor,
+            colsTotal = total,
+            colsState = txState tx,
+            colsEpoch = txEpoch tx,
+            colsStamp = stamp
+          }
 
 -- | A row has more columns than the program read: it is one that the program doesn't describe, which isn't decoded
 -- wrong, but isn't what was asked for.
 leftover :: Columns -> IO ()
-leftover columns@(Columns (At reader depth) total _ _ _) = do
-  left <- mark reader (markFrame depth)
-  when (left > 0) (failedColumns columns (RowFailed (ColumnCountMismatch (total - left) total)))
+leftover columns@Columns {colsCursor = At reader depth, colsTotal} = do
+  unread <- mark reader (markFrame depth)
+  when (unread > 0) (failedColumns columns (RowFailed (ColumnCountMismatch (colsTotal - unread) colsTotal)))
 
 -- | A column that can't be taken: the row's statement fails with the reason.
 failedColumns :: Columns -> StatementError -> IO a
-failedColumns (Columns _ _ state _ _) reason = do
-  s <- readIORef state
+failedColumns Columns {colsState} reason = do
+  s <- readIORef colsState
   throwIO (QueryError (case stPending s of entry : _ -> entrySql entry; [] -> BS.empty) reason)
 
 -- | Drops the rest of the result.
 discard :: (Runtime arr) => Result arr row -> With Tx arr () ()
-discard (Result position _) = moved >>> seek position >>> ((\found -> if found then Right () else Left ()) ^>> (returnA ||| finishEntry True))
+discard (Result position _) = moved >>> seek position >>> boolA returnA (finishEntry True)
 
 -- | Awaits the server's acknowledgement of a preparation.
 prepared :: (Runtime arr) => Preparation -> With Tx arr () ()
@@ -548,16 +583,14 @@ prepared _ = notImplemented "prepared"
 
 -- | The command tag of the result, once its rows are read: of the one that is being read, what is left of it is dropped.
 commandTag :: (Runtime arr) => Result arr row -> With Tx arr () ByteString
-commandTag (Result position _) =
-  moved
-    >>> seek position
-    >>> ((\found -> if found then Right () else Left ()) ^>> (returnA ||| finishEntry True))
-    >>> withTx (\tx _ -> (\s -> fromMaybe BS.empty (lookup (stBase s + position) (stTags s))) <$> inspect tx)
+commandTag result@(Result position _) = discard result >>> inState tagOf
+  where
+    tagOf s = fromMaybe BS.empty (lookup (stBase s + position) (stTags s))
 
 -- | The transaction is over, as far as the program is concerned: COMMIT's own reply as a value. Anything that the server
 -- said failed, and that wasn't read, is that reply, as the failure of the statement is.
 ending :: (Runtime arr) => With Tx arr () (Either QueryError ())
-ending = tryA finishing >>> now (either (\failure -> maybe (throwIO failure) (pure . Left) (fromException failure)) (pure . Right))
+ending = tryA finishing >>> now queryOutcome
 
 -- | The one row of the result, which 'UnexpectedAmountOfRows' is raised without. The program is done with the result
 -- then: what follows the row is read past when a later result is read, and the field of the row stays valid until then.
@@ -577,13 +610,9 @@ concluded position = withTx (\tx input -> input <$ modify tx (\s -> if stBase s 
 
 -- | Folds the rows of the result, one at a time, from the first to the last.
 foldRows :: (Runtime arr) => (s -> row -> s) -> s -> Result arr row -> With Tx arr () s
-foldRows step start result = const start ^>> loop
+foldRows step start result = const start ^>> iterateA (keeping (nextRow result) >>^ folded)
   where
-    loop =
-      ((),)
-        ^>> first (nextRow result)
-        >>> (\(next', accumulated) -> maybe (Left accumulated) (Right . step accumulated) next')
-        ^>> (returnA ||| loop)
+    folded (next', accumulated) = maybe (Finish accumulated) (Again . step accumulated) next'
 
 -- * Sending
 
@@ -592,24 +621,29 @@ foldRows step start result = const start ^>> loop
 -- pipelines in order: what the one before was answered with, and not read, is
 -- dropped, as is the field of a row.
 pipeline :: (Runtime arr) => Ending -> Pipeline arr p a -> (a -> With Tx arr x y) -> With Tx arr (p, x) y
-pipeline finality (Pipeline _ sent value) reading = (first (sending finality sent) >>^ snd) >>> reading (value 0)
+pipeline finality (Pipeline _ sent value) reading = consume (sending finality sent) >>> reading (value 0)
 
 -- | What the server is sent: the statements, and a Sync, in as many sends as the buffer needs, once what the pipeline
 -- before it was answered with is read. BEGIN comes with the first, and the ending with the last.
 sending :: (Runtime arr) => Ending -> [Sent arr p] -> With Tx arr p ()
 sending finality sent =
-  ((returnA &&& (arr (const ()) >>> moved >>> readyToSend)) >>^ fst)
-    >>> withTx (\tx input -> layout tx finality sent input)
+  tap (done >>> moved >>> readyToSend)
+    >>> withTx (layout finality sent)
     >>> (returnA ||| transmit)
 
 -- | The pipeline before this was answered: what is owed is read, and a failure of the server found is raised.
 readyToSend :: (Runtime arr) => With Tx arr () ()
-readyToSend = withTx (\tx _ -> inspect tx >>= \s -> traverse_ throwIO (stFailure s) *> when (stFinal s || stEnded s) (throwIO AfterFinal)) >>> drain True
+readyToSend = inTx check >>> drain True
+  where
+    check tx = do
+      s <- inspect tx
+      traverse_ throwIO (stFailure s)
+      when (stFinal s || stEnded s) (throwIO AfterFinal)
 
 -- | The output of a pipeline of the program, which is nothing if there is nothing to send. What the server is to answer
 -- is put in the queue of the transaction, once all of it is rendered.
-layout :: Tx -> Ending -> [Sent arr p] -> p -> IO (Either () Output)
-layout tx finality sent input = do
+layout :: Ending -> [Sent arr p] -> Tx -> p -> IO (Either () Output)
+layout finality sent tx input = do
   s <- inspect tx
   user <- traverse (rendered input) sent
   let starting = [(Entry (txBegin tx) True, txBeginOutput tx) | not (stBegun s), not (null sent) || finality == Final]
@@ -677,22 +711,18 @@ transmit :: (Runtime arr) => With Tx arr Output ()
 transmit =
   withTx (\tx output -> pure (sessionSocket (connectionSession (txConnection tx)), loanBuffer (txLoan tx), output))
     >>> lift sendOutput
-    >>> withTx (\tx () -> modify tx (\s -> s {stSending = False}))
+    >>> modifying (\s -> s {stSending = False})
 
 -- | A statement of the transaction's own, as a pipeline of its own: ROLLBACK or COMMIT, read as the pipeline's
 -- statements are.
 alone :: (Runtime arr) => Bool -> With Tx arr (ByteString, Output) ()
-alone validating =
-  moved
-    >>> withTx
-      ( \tx (text, carrier) -> do
-          s <- inspect tx
-          output <- evaluate (carrier <> sync)
-          modify tx (const s {stPending = [Entry text True], stIndex = 0, stBase = 0, stRows = 0, stTags = [], stOwed = True, stSending = True})
-          pure output
-      )
-    >>> transmit
-    >>> drain validating
+alone validating = moved >>> withTx queued >>> transmit >>> drain validating
+  where
+    queued tx (text, carrier) = do
+      s <- inspect tx
+      output <- evaluate (carrier <> sync)
+      modify tx (const s {stPending = [Entry text True], stIndex = 0, stBase = 0, stRows = 0, stTags = [], stOwed = True, stSending = True})
+      pure output
 
 -- | Ends the transaction as the program didn't: what is owed is read, and what the server may have left open is rolled
 -- back. The failures that are read are the program's to have seen.
@@ -700,9 +730,9 @@ cleanup :: (Runtime arr) => With Tx arr () ()
 cleanup =
   moved
     >>> drain False
-    >>> withTx (\tx _ -> (\s -> if stStatus s /= idle then Right () else Left ()) <$> inspect tx)
-    >>> (returnA ||| (arr (const (endingStatement True)) >>> alone False))
-    >>> withTx (\tx _ -> modify tx (\s -> s {stEnded = True}))
+    >>> inState ((/= idle) . stStatus)
+    >>> boolA returnA (const (endingStatement True) ^>> alone False)
+    >>> modifying (\s -> s {stEnded = True})
 
 -- | The byte of @I@, which the server's status is when it is idle.
 idle :: Int
@@ -714,19 +744,21 @@ idle = 73
 -- read, which raises the failure of COMMIT.
 finishing :: (Runtime arr) => With Tx arr () ()
 finishing =
-  withTx (\tx _ -> (\s -> if stEnded s then Left () else Right (isJust (stFailure s))) <$> inspect tx)
-    >>> (returnA ||| ((\handled -> if handled then Left () else Right ()) ^>> (cleanup ||| completing)))
+  inState finished >>> (returnA ||| boolA completing cleanup)
   where
+    -- Whether the transaction is over, and else whether a failure of the server was reported.
+    finished s = if stEnded s then Left () else Right (isJust (stFailure s))
     completing =
       drain True
-        >>> withTx (\tx _ -> (\s -> if stBegun s && not (stFinal s) then Right (endingStatement (stCondemned s)) else Left ()) <$> inspect tx)
+        >>> inState unsent
         >>> (returnA ||| alone True)
-        >>> withTx
-          ( \tx _ -> do
-              s <- inspect tx
-              when (stBegun s && stStatus s /= idle) (throwIO (unexpected "the transaction's ending did not leave the session idle"))
-              modify tx (\t -> t {stEnded = True})
-          )
+        >>> inTx ended
+    -- The ending, unless the pipeline carried it, or nothing began.
+    unsent s = if stBegun s && not (stFinal s) then Right (endingStatement (stCondemned s)) else Left ()
+    ended tx = do
+      s <- inspect tx
+      when (stBegun s && stStatus s /= idle) (throwIO (unexpected "the transaction's ending did not leave the session idle"))
+      modify tx (\t -> t {stEnded = True})
 
 -- | The transaction, with the connection and the loans of its input: it is the work of the part that runs it, for as
 -- long as it takes, and it ends as the program ended: with the failure of the program, of a statement or of the ending,
@@ -735,16 +767,16 @@ finishing =
 transaction :: (Runtime arr) => IsolationLevel -> Mode -> With Tx arr x y -> arr (Connection, (Loans, x)) (Either QueryError y)
 transaction level mode program =
   tryA (scope (begin level mode) leaving body)
-    >>> now (either (\failure -> maybe (throwIO failure) (pure . Left) (fromException failure)) (pure . Right))
+    >>> now queryOutcome
   where
-    body = (\(tx, (_, (_, input))) -> (tx, input)) ^>> with (program >>> (returnA &&& (arr (const ()) >>> finishing)) >>^ fst)
+    body = second (snd . snd) ^>> with (program >>> tap (done >>> finishing))
 
 -- | Takes the connection for the transaction, and the loan that it works in, which is the primary if the request has not
 -- lent it. A connection that is used by another part, or is broken, or one that the body has given up, is a failure,
 -- and the loan goes back.
 begin :: (Runtime arr) => IsolationLevel -> Mode -> arr (Connection, (Loans, x)) Tx
 begin level mode =
-  (\(connection, (loans, _)) -> (loans, connection)) ^>> first borrow
+  (fst . snd &&& fst) ^>> first borrow
     >>> now (\(loan, connection) -> either (\failure -> Left (loan, failure)) Right <$> try (open loan connection))
     >>> ((first release >>> now (\((), failure) -> throwIO (failure :: SomeException))) ||| returnA)
   where
@@ -752,11 +784,38 @@ begin level mode =
     !beginOutput = prerendered (statementOutput (beginning level mode) [] [] [])
     open loan connection = do
       reader <- newReader (sessionSocket (connectionSession connection)) (loanBuffer loan)
-      state <- newIORef (State False False False False [] 0 0 0 [] Nothing False idle False False)
+      state <-
+        newIORef
+          State
+            { stBegun = False,
+              stFinal = False,
+              stCondemned = False,
+              stEnded = False,
+              stPending = [],
+              stIndex = 0,
+              stBase = 0,
+              stRows = 0,
+              stTags = [],
+              stFailure = Nothing,
+              stOwed = False,
+              stStatus = idle,
+              stSending = False,
+              stField = False
+            }
       epoch <- newIORef 0
       -- The last, since it can't be undone but by the failure of this.
       claim connection
-      pure (Tx connection (beginning level mode) beginOutput reader (messages reader) loan state epoch)
+      pure
+        Tx
+          { txConnection = connection,
+            txBegin = beginning level mode,
+            txBeginOutput = beginOutput,
+            txReader = reader,
+            txCursor = messages reader,
+            txLoan = loan,
+            txState = state,
+            txEpoch = epoch
+          }
 
 -- | BEGIN, with the isolation level and the mode.
 beginning :: IsolationLevel -> Mode -> ByteString
@@ -772,11 +831,16 @@ beginning level mode = "BEGIN ISOLATION LEVEL " <> levelText <> " " <> modeText
 leaving :: (Runtime arr) => arr (Tx, Exit) ()
 leaving =
   now (\(tx, exit) -> (tx,) <$> plan tx exit)
-    >>> ((\(tx, how) -> case how of Recover -> Right tx; Keep -> Left (tx, Nothing); Break why -> Left (tx, Just why)) ^>> (now (\(tx, why) -> tx <$ settle (connectionSession (txConnection tx)) why) ||| recovering))
+    >>> planned ^>> (now settled ||| recovering)
     >>> now (\tx -> modifyIORef' (txEpoch tx) (+ 1) $> txLoan tx)
     >>> release
   where
-    recovering = (\tx -> (tx, tx)) ^>> first (tryA ((, ()) ^>> with cleanup)) >>> now (\(done, tx) -> tx <$ settle (connectionSession (txConnection tx)) (either (Just . ("the transaction could not be rolled back: " <>) . displayException) (const Nothing) done))
+    planned (tx, Recover) = Right tx
+    planned (tx, Keep) = Left (tx, Nothing)
+    planned (tx, Break why) = Left (tx, Just why)
+    settled (tx, why) = tx <$ settle (connectionSession (txConnection tx)) why
+    recovering = alongside (tryA ((, ()) ^>> with cleanup)) >>> now (uncurry recovered)
+    recovered rolledBack tx = settled (tx, either (Just . ("the transaction could not be rolled back: " <>) . displayException) (const Nothing) rolledBack)
 
 -- | What is to be done with the connection: nothing, or reading and rolling back, or breaking it for the reason.
 data Plan = Keep | Recover | Break String
@@ -825,13 +889,32 @@ recoverable failure
 
 -- | Rolls back at the end, and a later 'Final' pipeline carries ROLLBACK.
 condemn :: (Runtime arr) => With Tx arr () ()
-condemn = withTx (\tx () -> inspect tx >>= \s -> when (stFinal s || stEnded s) (throwIO AfterFinal) *> modify tx (\t -> t {stCondemned = True}))
+condemn = inTx condemned
+  where
+    condemned tx = do
+      s <- inspect tx
+      when (stFinal s || stEnded s) (throwIO AfterFinal)
+      modify tx (\t -> t {stCondemned = True})
 
 -- * Rows, read by cursors
 
 -- | A cursor standing at a DataRow: the cursor of its columns, how many there are, and what a failure of a column and
 -- a field need to know.
-data Columns = Columns !(At ('PayloadCounted16 'MaybeBytes32Atom) Socket) !Int !(IORef State) !(IORef Int) !Int
+data Columns = Columns
+  { colsCursor :: !(At ('PayloadCounted16 'MaybeBytes32Atom) Socket),
+    colsTotal :: !Int,
+    colsState :: !(IORef State),
+    colsEpoch :: !(IORef Int),
+    colsStamp :: !Int
+  }
+
+-- | A column that was taken from its row: the cursor of its value, which has its length read, the length, which is
+-- negative for NULL, and the columns of the row.
+data Column = Column
+  { columnValue :: At 'MaybeBytes32Atom Socket,
+    columnSize :: !Int,
+    columnRow :: !Columns
+  }
 
 -- | How many rows a result may have, which the read that finds the count wrong
 -- checks.
@@ -858,32 +941,36 @@ data Field = Field !Int !(At 'MaybeBytes32Atom Socket) !(IORef Int) !Int
 instance (Runtime arr) => Stream arr Field where
   next = now (\(Field _ cursor epoch stamp) -> readIORef epoch >>= \current -> if current == stamp then pure cursor else throwIO FieldExpired) >>> piece
 
--- | The next column: the cursor of its value, which has its length read, and the length, which is negative for NULL.
-nextValue :: (Runtime arr) => arr Columns (At 'MaybeBytes32Atom Socket, Int, Columns)
+-- | The next column, with its length read.
+nextValue :: (Runtime arr) => arr Columns Column
 nextValue =
-  (\columns@(Columns cursor _ _ _ _) -> (cursor, columns))
+  (\columns@Columns {colsCursor} -> (colsCursor, columns))
     ^>> first advance
-    >>> now (\(found, columns@(Columns cursor _ _ _ _)) -> if found then pure (child cursor, columns) else failedColumns columns (RowFailed (ColumnCountMismatch (columnsOf columns + 1) (columnsOf columns))))
+    >>> now (\(found, columns@Columns {colsCursor, colsTotal}) -> if found then pure (child colsCursor, columns) else failedColumns columns (RowFailed (ColumnCountMismatch (colsTotal + 1) colsTotal)))
     >>> (\(value, columns) -> (value, (value, columns)))
     ^>> first valueLength
-    >>^ \(size, (value, columns)) -> (value, size, columns)
+    >>^ taken
   where
-    columnsOf (Columns _ total _ _ _) = total
+    taken (size, (value, columns)) = Column {columnValue = value, columnSize = size, columnRow = columns}
 
 -- | The column decoded by the type's decoder, from its bytes in the buffer, or from none if it is NULL. A column that
 -- is larger than the buffer is a failure of its use, and one that doesn't decode is a failure of its statement.
 decoded :: (Runtime arr) => (Maybe ByteString -> Either Text r) -> arr Columns r
 decoded decode =
   nextValue
-    >>> (\(value, size, columns) -> if size < 0 then Left columns else Right (value, size, columns))
+    >>> nullOrValue
     ^>> (now (\columns -> outcome columns (decode Nothing)) ||| (now fits >>> first valueView >>> now (\(bytes, columns) -> outcome columns (decode (Just bytes)))))
   where
-    fits (value, size, columns@(Columns (At reader _) _ _ _ _)) = (value, columns) <$ when (size > readerCapacity reader) (throwIO (ValueTooLarge size))
-    outcome columns@(Columns (At reader depth) total _ _ _) = \case
+    nullOrValue col
+      | columnSize col < 0 = Left (columnRow col)
+      | otherwise = Right col
+    fits Column {columnValue, columnSize, columnRow = columns@Columns {colsCursor = At reader _}} =
+      (columnValue, columns) <$ when (columnSize > readerCapacity reader) (throwIO (ValueTooLarge columnSize))
+    outcome columns@Columns {colsCursor = At reader depth, colsTotal} = \case
       Right decodedValue -> pure $! decodedValue
       Left reason -> do
-        left <- mark reader (markFrame depth)
-        failedColumns columns (RowFailed (ColumnDecodingFailed (total - left) reason))
+        unread <- mark reader (markFrame depth)
+        failedColumns columns (RowFailed (ColumnDecodingFailed (colsTotal - unread) reason))
 
 -- | The next column, decoded from the buffer. A column larger than the buffer
 -- fails with 'ValueTooLarge'.
@@ -896,17 +983,18 @@ nullable = decoded (maybe (Right Nothing) (fmap Just . decodeField . Just))
 
 -- | The last column, as a stream.
 field :: (Runtime arr) => arr Columns Field
-field = nextValue >>> now (\(value, size, columns) -> if size < 0 then failedColumns columns (nullField columns) else opened value size columns)
+field = nextValue >>> now (\col@Column {columnSize, columnRow} -> if columnSize < 0 then failedColumns columnRow (nullField columnRow) else opened col)
   where
-    nullField (Columns _ total _ _ _) = RowFailed (ColumnDecodingFailed total "unexpected NULL")
+    nullField Columns {colsTotal} = RowFailed (ColumnDecodingFailed colsTotal "unexpected NULL")
 
 -- | The last column, as a stream, if it isn't NULL.
 nullableField :: (Runtime arr) => arr Columns (Maybe Field)
-nullableField = nextValue >>> now (\(value, size, columns) -> if size < 0 then pure Nothing else Just <$> opened value size columns)
+nullableField = nextValue >>> now (\col -> if columnSize col < 0 then pure Nothing else Just <$> opened col)
 
 -- | The field of a value, whose turn lasts until the row moves on.
-opened :: At 'MaybeBytes32Atom Socket -> Int -> Columns -> IO Field
-opened value size (Columns _ _ state epoch stamp) = Field size value epoch stamp <$ modifyIORef' state (\s -> s {stField = True})
+opened :: Column -> IO Field
+opened Column {columnValue, columnSize, columnRow = Columns {colsState, colsEpoch, colsStamp}} =
+  Field columnSize columnValue colsEpoch colsStamp <$ modifyIORef' colsState (\s -> s {stField = True})
 
 -- | How many bytes the field has, as it declares.
 fieldLength :: Field -> Int
@@ -914,7 +1002,7 @@ fieldLength (Field declared _ _ _) = declared
 
 -- | Passes the next column.
 skip :: (Runtime arr) => arr Columns ()
-skip = nextValue >>> (\(value, _, _) -> value) ^>> skipValue
+skip = nextValue >>> columnValue ^>> skipValue
 
 -- | The rows that a step of the cursor reads, for a result of this many rows,
 -- which the read that finds the count wrong checks: it fails with
@@ -926,4 +1014,4 @@ any = Rows AnyNumber
 
 -- | A result that has no rows to read.
 none :: (Runtime arr) => Rows arr ()
-none = Rows NoRows (arr (const ()))
+none = Rows NoRows done

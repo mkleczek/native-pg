@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | The programs over cursors that the tests and the benchmark run: a stream
 -- of DataRow messages ended by a CommandComplete, as "Network.Directions.Rows"
@@ -8,21 +9,20 @@ module Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
     foldRowsCursors,
     streamCursors,
     column,
-    absent,
-    present,
-    isNull,
   )
 where
 
-import Control.Arrow (ArrowChoice, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (ArrowChoice, returnA, (>>>), (>>^), (^>>))
 import Control.Exception (throwIO)
 import Control.Monad (when)
+import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import Data.Int (Int32, Int64)
 import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Network.Directions.Rows (Counter, adding)
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (pattern Again, pattern Finish, boolA, done, iterateA, iterateWith)
 import Network.Streaming.Reader (Reader)
 import Network.Streaming.With (With (..), asks, withOnly)
 
@@ -41,9 +41,9 @@ foldRowsCursors :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link)
 foldRowsCursors total = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
     loop :: With (At ResultStream link) arr () ()
-    loop = asks message >>> With (cases (row :> complete :> NoCases)) >>> (loop ||| returnA)
-    row = columns >>^ const (Left ())
-    complete = cstring >>^ const (Right ())
+    loop = iterateA (asks message >>> With (cases (row :> complete :> NoCases)))
+    row = columns >>^ const (Again ())
+    complete = cstring >>^ const (Finish ())
     -- The columns of a row, which each takes the next element of the body.
     columns :: arr (At ('PayloadCounted16 'MaybeBytes32Atom) link) ()
     columns =
@@ -67,36 +67,22 @@ streamCursors :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) =
 streamCursors consumer = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
     loop :: With (At ResultStream link) arr () ()
-    loop = asks message >>> With (cases (row :> complete :> NoCases)) >>> (loop ||| returnA)
-    row = withOnly (asks (count >>^ const ()) >>> elements) >>^ const (Left ())
-    complete = cstring >>^ const (Right ())
+    loop = iterateA (asks message >>> With (cases (row :> complete :> NoCases)))
+    row = withOnly (asks (count >>> done) >>> elements) >>^ const (Again ())
+    complete = cstring >>^ const (Finish ())
     -- The values of the body, one after the other.
     elements :: With (At ('PayloadCounted16 'MaybeBytes32Atom) link) arr () ()
-    elements = asks advance >>> absent ^>> ((asks (child ^>> value) >>> elements) ||| returnA)
-    value = withOnly (asks valueLength >>> isNull ^>> (asks (eachPiece consumer) ||| returnA))
+    elements = iterateWith (asks advance >>^ bool (Finish ()) (Again ())) (asks (child ^>> value))
+    value = withOnly (asks valueLength >>> (< 0) ^>> boolA (asks (eachPiece consumer)) returnA)
 {-# INLINABLE streamCursors #-}
 
 -- | The next element of the body, decoded in place; its absence, and a NULL, are
 -- errors.
 column :: (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 'MaybeBytes32Atom) link) a
-column = withOnly (asks advance >>> present ^>> (missing "fewer fields" ||| value))
+column = withOnly (asks advance >>> boolA (missing "fewer fields") value)
   where
-    value = asks (child ^>> valueLength) >>> isNull ^>> (asks (child ^>> decode) ||| missing "a NULL")
+    value = asks (child ^>> valueLength) >>> (< 0) ^>> boolA (asks (child ^>> decode)) (missing "a NULL")
     -- The environment is looked at (as 'child' does) on the failing path too, so that every path is strict in the cursor,
     -- and it is passed unboxed through the joins of the sums, not built once for each row.
     missing what = With (now (\(cursor, ()) -> child cursor `seq` throwIO (CursorError ("a row with " <> what))))
 {-# INLINE column #-}
-
--- | A length that is NULL is 'Right'. The sums of these are the same constants
--- whichever way they go, so whatever follows them can share its code.
-isNull :: Int -> Either () ()
-isNull size = if size < 0 then Right () else Left ()
-
--- | There being no more is 'Right', as in a loop that goes on with something and
--- ends with nothing.
-absent :: Bool -> Either () ()
-absent found = if found then Left () else Right ()
-
--- | There being one is 'Right', and none is what has no alternative.
-present :: Bool -> Either () ()
-present found = if found then Right () else Left ()

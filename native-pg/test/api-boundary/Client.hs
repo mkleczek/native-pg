@@ -3,7 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Client where
 
-import Control.Arrow (arr, returnA, (&&&), (>>>), (^>>))
+import Control.Arrow ((***), (>>>), (^>>))
 import Data.Int (Int64)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings, Connection, cancelKey, connectSettings, connectedHost, serverInfo)
 import Database.PostgreSQL.ConnectionString (ConnectionString, fromConnectionString)
@@ -24,6 +24,7 @@ import Data.Word (Word32)
 import Network.Streaming.BufferPool (BufferGrant, BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.Classes (Runtime, scope)
+import Network.Streaming.Combinators (tap)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers, withSetupBuffers)
 import Network.Streaming.PositiveInt (positiveInt)
 
@@ -82,7 +83,7 @@ allHosts = fromConnectionString
 
 -- | Listens, and waits for a notification, on a connection of its own.
 notified :: Runtime arr => arr Connection Notification
-notified = (listen ["events"] &&& returnA) >>> arr snd >>> notification
+notified = tap (listen ["events"]) >>> notification
 
 parameterType :: Param -> Maybe Word32
 parameterType = paramType
@@ -90,7 +91,7 @@ parameterType = paramType
 -- A client can manage short loans while the request owns admission.
 requestBuffer :: Runtime arr => BufferPool -> arr (Buffer, a) b -> arr a b
 requestBuffer resources use = withRequestBuffers resources $
-  scope (arr fst >>> borrow) (arr fst >>> release) ((\(loan, (_, input)) -> (loanBuffer loan, input)) ^>> use)
+  scope (fst ^>> borrow) (fst ^>> release) ((loanBuffer *** snd) ^>> use)
 
 manualLoan :: Runtime arr => arr Loans Loan
 manualLoan = borrow

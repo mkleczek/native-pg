@@ -21,7 +21,7 @@ module Database.PostgreSQL.Pool
   )
 where
 
-import Control.Arrow (arr, second, (>>>), (^>>), (|||))
+import Control.Arrow (arr, (***), (>>>), (^>>), (|||))
 import Control.Exception (finally, throwIO)
 import Control.Monad (replicateM)
 import Data.Foldable (traverse_)
@@ -33,6 +33,7 @@ import Database.PostgreSQL.Internal.Socket (isQuiet)
 import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (Duration, Effect (..), Runtime, Scope (..))
+import Network.Streaming.Combinators (keeping)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Pool (Pool, PoolError (..), closePool, newPool, urgently, withLoan, withLoanWithin)
@@ -117,14 +118,12 @@ using :: forall arr a b. (Runtime arr) => ConnectionPool -> arr (Connection, a) 
 using pool body = scope acquire release run
   where
     acquire =
-      (\(Slot ref, _) -> ref)
-        ^>> now (\ref -> either (const (Left ref)) (Right . (ref,)) <$> existing @(ModeOf arr) ref)
+      now (\(Slot ref, _) -> either (const (Left ref)) (Right . (ref,)) <$> existing @(ModeOf arr) ref)
         >>> (making ||| arr id)
         >>> now (\(ref, connection) -> (ref,) <$> leased connection)
     making =
-      (, ())
-        ^>> second (withRequestBuffers (poolBuffers pool) (arr fst >>> connect (poolConnect (poolSettings pool))) >>> now (either throwIO pure))
-        >>> now (\(ref, connection) -> (ref, connection) <$ writeIORef ref (Just connection))
+      keeping (withRequestBuffers (poolBuffers pool) (fst ^>> connect (poolConnect (poolSettings pool))) >>> now (either throwIO pure))
+        >>> now (\(connection, ref) -> (ref, connection) <$ writeIORef ref (Just connection))
     release = now $ \((ref, connection), _) -> do
       writeIORef (connectionLease connection) False
       status <- readIORef (sessionStatus (connectionSession connection))
@@ -132,7 +131,7 @@ using pool body = scope acquire release run
         Idle -> pure ()
         Busy -> breakSession (connectionSession connection) "the connection was still in use when its request ended" *> writeIORef ref Nothing
         Broken _ -> writeIORef ref Nothing
-    run = (\((_, connection), (_, input)) -> (connection, input)) ^>> body
+    run = (snd *** snd) ^>> body
 
 -- | The connection that the slot holds, if it is as it was left: idle, with nothing from the server to read, which is
 -- so until the server ends it. One that isn't is closed, and dropped.

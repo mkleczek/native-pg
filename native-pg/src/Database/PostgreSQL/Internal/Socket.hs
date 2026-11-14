@@ -80,8 +80,9 @@ connectSocket options =
       Done -> pure ()
       _ -> either (\(_ :: IOException) -> pure ()) close opened
     body =
-      (\(opened, (_, address, wrap)) -> either (Left . wrap) (\sock -> Right ((sock, address), (sock, wrap))) opened)
+      attempted
         ^>> (now (pure . Left) ||| (first reach >>> now (\(reached, (sock, wrap)) -> either (\failure -> Left (wrap failure) <$ close sock) (const (pure (Right sock))) reached)))
+    attempted (opened, (_, address, wrap)) = either (Left . wrap) (\sock -> Right ((sock, address), (sock, wrap))) opened
 
 -- | A connection that is made, or has failed, and why: the connect is started and, if it is under way, waited for
 -- until the descriptor is writable.

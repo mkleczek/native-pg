@@ -13,7 +13,7 @@
 -- all of them if there are none.
 module Main (main) where
 
-import Control.Arrow (Arrow, returnA, (>>^))
+import Control.Arrow (Arrow)
 import Control.Exception (evaluate)
 import Control.Monad (forM, forM_, replicateM_, unless, void, when)
 import Data.ByteString (ByteString)
@@ -26,6 +26,7 @@ import Network.Directions.Memory
 import Network.Directions.Resumable
 import Network.Directions.Rows
 import Network.Streaming.Buffer (Buffer, newBuffer)
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.PositiveInt (mkPositiveInt)
@@ -111,7 +112,7 @@ streamedResumable run memory = do
 
 -- | The consumer of a parser that yields nothing.
 ignored :: (Arrow arr) => arr ByteString ()
-ignored = returnA >>^ const ()
+ignored = done
 
 -- | The two workloads, and what a variant has to give for each.
 data Workload = Rows | Stream
