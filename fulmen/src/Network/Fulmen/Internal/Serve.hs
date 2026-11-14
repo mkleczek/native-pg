@@ -21,7 +21,7 @@ module Network.Fulmen.Internal.Serve
   )
 where
 
-import Control.Arrow (arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (SomeException, fromException)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
@@ -43,7 +43,7 @@ import Network.Fulmen.Request (Method (..), Request (..), Version (..))
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, foreverA, iterateA, iterateWith, keeping, Step, tap, whether)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, foreverA, iterateA, iterateWith, Step, tap, whether, withTicket)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
 import Network.Streaming.Pool (queueNow, releaseNow, takeNowWith)
 
@@ -70,7 +70,7 @@ acceptance settings = now (\cores -> cores <$ listening (listener settings)) >>>
 
 -- | The giver of a free worker of the core that has the most free workers, which is taken from the pool at once. When no
 -- worker is free, the part queues the giver of a ticket of its own in the pool, which gives it the worker that is released
--- first, on any core, and waits at the ticket.
+-- first, on any core, and waits at the ticket. A worker that is given after the wait has ended is put back in the pool.
 checkout :: (Runtime arr) => arr Cores (Giver 'Anywhere Socket)
 checkout =
   alongside (now (\(Cores _ shared) -> takeNowWith freest (sharedWorkers shared)))
@@ -78,10 +78,9 @@ checkout =
     ^>> (queued ||| returnA)
     >>^ freeGiver
   where
-    queued =
-      keeping ticket
-        >>> now (\((waiting, giver), Cores _ shared) -> waiting <$ queueNow (sharedWorkers shared) 1 giver)
-        >>> await
+    queued = withTicket (now queue) (now putBack) >>^ snd
+    queue (giver, Cores _ shared) = queueNow (sharedWorkers shared) 1 giver
+    putBack (free, Cores _ shared) = releaseNow (sharedWorkers shared) [free]
 
 -- | The position of the first free worker, in the order that the pool takes them in, of the core that has the most of
 -- them, which is the first core of those that tie.
@@ -100,12 +99,13 @@ freest workers = busiest >>= \core -> findIndex ((== core) . freeCore) workers
 worker :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
 worker settings handler = foreverA (tap (offered >>> connection settings handler))
 
--- | The worker is free: the giver of a new ticket is in the pool, and the connection that is given it comes.
+-- | The worker is free: the giver of a new ticket is in the pool, and the connection that is given it comes. A
+-- connection that is given after the wait has ended is closed.
 offered :: (Runtime arr) => arr Cores (Shared, Socket)
-offered =
-  keeping ticket
-    >>> now (\((waiting, giver), Cores core shared) -> (shared, waiting) <$ releaseNow (sharedWorkers shared) [Free core giver])
-    >>> second await
+offered = (,) <$> arr sharedOf <*> (withTicket (now offer) (fst ^>> close) >>^ snd)
+  where
+    sharedOf (Cores _ shared) = shared
+    offer (giver, Cores core shared) = releaseNow (sharedWorkers shared) [Free core giver]
 
 -- | What a connection is: its socket, the bytes of the next request that came early, which a request copies out of
 -- its buffer, and what the cores share.

@@ -22,7 +22,7 @@ import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Buffer (newBuffer)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (call, done, expect, keeping, localTicket, sleep, tap, timesWith, untilJust)
+import Network.Streaming.Combinators (done, expect, keeping, localTicket, sleep, tap, timesWith, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Counters
 import Network.Streaming.Delimited
@@ -275,7 +275,7 @@ newtype Pong r = Pong {following :: Giver r (Ping r)}
 pingPong :: (Rich arr) => Int -> arr () ()
 pingPong count = localTicket >>> together [snd ^>> client, fst ^>> server]
   where
-    client = timesWith count (call Ping >>^ following) >>> done
+    client = timesWith count (expect Ping >>> await >>^ following) >>> done
     server = timesWith count (await >>> answer ^>> expect Pong) >>> done
 
 -- | The monotonic time when the thread sent its byte, when the part received it, and when the other parts ended.

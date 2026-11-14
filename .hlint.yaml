@@ -55,3 +55,12 @@
 - warn: {name: Use consume, lhs: first x >>^ snd, rhs: consume x}
 - warn: {name: Use fst, lhs: consume x >>> done, rhs: fst ^>> x}
 - warn: {name: Use deliver, lhs: second x >>> give >>> done, rhs: deliver x}
+
+# The raw ticket primitives are for the library, for the programs of directions that measure them, and for the tests and
+# benchmarks. Anywhere else a ticket is made by withTicket, call or concurrently, which abandon it if the wait is
+# cancelled.
+- functions:
+    - name: [ticket, await, abandon, expect]
+      within: [Network.Streaming.*, Network.Directions.*, "*Spec", LoansTestSupport, Main.waiter, Main.cancelRun, Main.deadlineRun]
+# The default group is off and its "ignore: {}" ignores this hint too, so it is switched on by name.
+- error: {name: Avoid restricted function}

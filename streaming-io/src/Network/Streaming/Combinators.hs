@@ -26,6 +26,8 @@ module Network.Streaming.Combinators
     foreverA,
     localTicket,
     deliver,
+    withTicket,
+    tryTicket,
     expect,
     call,
     sleep,
@@ -33,7 +35,7 @@ module Network.Streaming.Combinators
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, second, (&&&), (***), (>>>), (^>>))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, right, second, (&&&), (***), (>>>), (>>^), (^>>), (|||))
 import Network.Streaming.Classes
 import Network.Streaming.Plumbing
 
@@ -79,22 +81,66 @@ deliver :: (Arrow arr, Exchange arr r) => arr a b -> arr (Giver r b, a) ()
 deliver step = second step >>> give >>> done
 {-# INLINE deliver #-}
 
+-- | Makes a ticket, runs the arrow on its giver and the input, and gives what it gave, and the end to wait at.
+handingOut :: (Arrow arr, Exchange arr r) => arr (Giver r a, b) c -> arr b (c, Waiting arr r a)
+handingOut handOut = keeping ticket >>> handing ^>> first handOut
+  where
+    handing ((waiting, giver), b) = ((giver, b), waiting)
+{-# INLINE handingOut #-}
+
+-- | Makes a ticket, hands out its giver, and waits for the value: gives what the hand-out gave, and the value. If the
+-- wait ends any other way, the ticket is abandoned, and a value given before that goes to the disposal, with the input.
+-- The hand-out must not wait.
+withTicket :: (ArrowChoice arr, Scope arr, Exchange arr r) => arr (Giver r a, b) c -> arr (a, b) () -> arr b (c, a)
+withTicket handOut dispose = scope (alongside (handingOut handOut)) (unawaited ^>> abandoning dispose) (fst . fst ^>> second await)
+  where
+    -- Only a wait that didn't end in 'Done' is abandoned: after an 'await' the slot stays given, so an 'abandon' would
+    -- hand the value out again. The release therefore trusts 'Done' to mean that the end was awaited.
+    unawaited (((_, waiting), b), exit) = case exit of
+      Done -> Left ()
+      _ -> Right (waiting, b)
+{-# INLINE withTicket #-}
+
+-- | Makes a ticket and tries to hand out its giver. Left: the giver wasn't handed out, so the ticket is abandoned at
+-- once, and the result is Left. Right: it waits for the value as 'withTicket' does. The hand-out must not wait.
+tryTicket :: (ArrowChoice arr, Scope arr, Exchange arr r) => arr (Giver r a, b) (Either c d) -> arr (a, b) () -> arr b (Either c (d, a))
+tryTicket handOut dispose = scope (alongside (handingOut handOut)) (unawaited ^>> abandoning dispose) (waited ^>> right (second await))
+  where
+    -- A ticket whose giver wasn't handed out is abandoned too, with whatever was somehow given to it. As in 'withTicket',
+    -- 'Done' after a hand-out means that the end was awaited.
+    unawaited (((handedOut, waiting), b), exit) = case (exit, handedOut) of
+      (Done, Right _) -> Left ()
+      _ -> Right (waiting, b)
+    waited (((handedOut, waiting), _), _) = (,waiting) <$> handedOut
+{-# INLINE tryTicket #-}
+
+-- | The release of a ticket's scope, for what is left of the wait: it does nothing if there is nothing, and else it
+-- abandons the end, and gives a value that was given before to the disposal, with the input.
+abandoning :: (ArrowChoice arr, Exchange arr r) => arr (a, b) () -> arr (Either () (Waiting arr r a, b)) ()
+abandoning dispose = returnA ||| (first abandon >>> late ^>> (returnA ||| dispose))
+  where
+    late (given, b) = maybe (Left ()) (Right . (,b)) given
+{-# INLINE abandoning #-}
+
 -- | Makes a ticket, gives the message that carries its giver, and keeps the end to wait at. It doesn't say whether
 -- the giver took the message: a caller that needs that gives it itself. For any reach: a ticket of the arrow's own
 -- core, whose message goes to a part of that core, or a ticket of any core, whose message crosses cores.
 expect :: (Arrow arr, Exchange arr r) => (Giver r a -> b) -> arr (Giver r b) (Waiting arr r a)
-expect message =
-  keeping ticket
-    >>> addressed
-    ^>> consume (give >>> done)
+expect message = handingOut (addressed ^>> give >>> done) >>^ snd
   where
-    -- The message to send, with the giver of the answer in it, and the end where the answer is awaited.
-    addressed ((end, giver), to) = ((to, message giver), end)
+    -- The giver to give the message to, and the message, which carries the giver of the answer.
+    addressed (giver, to) = (to, message giver)
 {-# INLINE expect #-}
 
--- | Asks: gives the message that carries the giver of the answer, and waits for the answer.
-call :: (Arrow arr, Exchange arr r) => (Giver r a -> b) -> arr (Giver r b) a
-call message = expect message >>> await
+-- | Asks: gives the message that carries the giver of the answer, and waits for the answer, unless the giver the message
+-- was given to has gone: then it is 'Nothing', at once. If the wait ends any other way, the ticket is abandoned, and an
+-- answer that came before goes to the disposal, with the giver the message was given to.
+call :: (ArrowChoice arr, Scope arr, Exchange arr r) => (Giver r a -> b) -> arr (a, Giver r b) () -> arr (Giver r b) (Maybe a)
+call message dispose = tryTicket (addressed ^>> give >>^ delivered) dispose >>^ either (const Nothing) (Just . snd)
+  where
+    -- The giver to give the message to, and the message, which carries the giver of the answer.
+    addressed (giver, to) = (to, message giver)
+    delivered taken = if taken then Right () else Left ()
 {-# INLINE call #-}
 
 -- | Waits for this long. It is a wait, so a cancellation reaches it.

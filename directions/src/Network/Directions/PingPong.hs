@@ -40,7 +40,7 @@ newtype Pong r = Pong (Giver r (Ping r))
 -- | The client of a ping-pong: for each round trip it makes the ticket of the answer, gives the request that
 -- carries its giver, and waits for the answer, which carries the giver of the next request.
 client :: (ArrowChoice arr, Exchange arr r) => Int -> arr (Giver r (Ping r)) ()
-client rounds = timesWith rounds (call Ping >>^ \(Pong next) -> next) >>> done
+client rounds = timesWith rounds (expect Ping >>> await >>^ \(Pong next) -> next) >>> done
 
 -- | The server: it waits for the request at the end it was given, makes the ticket of the next, and answers with its
 -- giver.
