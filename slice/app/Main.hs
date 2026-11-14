@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | PostgREST's request shape on fulmen and native-pg v2, as small as it can be, to measure what the runtime gives
 -- (data-api-e2e's @load/experiments/v2compare@ runs it against postgrestream).
@@ -25,7 +26,7 @@
 -- they are @GHCRTS@, and @-T@ is what makes the allocation counter of @\/metrics@.
 module Main (main) where
 
-import Control.Arrow (arr, first, returnA, second, (&&&), (>>>), (^>>), (|||))
+import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Monad (void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -41,6 +42,7 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (Effect (..), Runtime, Scope (..), Stream (..))
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateWith, keeping)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Counters (Counts, counterName, toList)
 import Network.Streaming.Delimited (runCores)
@@ -80,7 +82,7 @@ routed = foldr step missing
     step (path, serving) rest = (\(call, request) -> if asks path request then Left call else Right (call, request)) ^>> (serving ||| rest)
     asks path request = method request == Method "GET" && B.takeWhile (/= questionMark) (target request) == path
     questionMark = 63
-    missing = (\(call, _) -> (call, (404, "not found\n"))) ^>> plain
+    missing = (,(404, "not found\n")) . fst ^>> plain
 
 -- | The rows of a table: one read-only transaction on a pooled connection, in the loans of the call, whose pipeline
 -- carries the COMMIT. Its reading program takes the one field of the one row and answers with it. A failure of the
@@ -88,11 +90,12 @@ routed = foldr step missing
 -- which fulmen does when a handler gives the head twice.
 rows :: (Runtime arr) => ConnectionPool -> ByteString -> arr Call ()
 rows pool sql =
-  (\call -> (call, call))
-    ^>> first (tryA (Fulmen.loans &&& arr ((),) >>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement query) reading))))
-    >>> (\(outcome, call) -> case outcome of Right (Right (Right ())) -> Right (); _ -> Left call)
+  alongside (tryA (Fulmen.loans &&& arr ((),) >>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement query) reading))))
+    >>> unlessSucceeded
     ^>> (failed ||| returnA)
   where
+    unlessSucceeded (Right (Right (Right ())), _) = Right ()
+    unlessSucceeded (_, call) = Left call
     query = Tx.Statement sql (const []) (Tx.one Tx.field)
     failed = (,(500, "internal error\n")) ^>> plain
 
@@ -100,22 +103,22 @@ rows pool sql =
 -- response.
 reading :: (Runtime arr) => Tx.Result arr Tx.Field -> With Tx.Tx arr Call ()
 reading result =
-  (,())
-    ^>> second (Tx.single result)
-    >>> (\(call, field) -> ((call, (Fulmen.Status 200, [("Content-Type", "application/json; charset=utf-8")], Fulmen.Known (Tx.fieldLength field))), field))
+  keeping (Tx.single result)
+    >>> withHead
     ^>> first Fulmen.respond
     >>> pieces
+  where
+    withHead (field, call) =
+      ((call, (Fulmen.Status 200, [("Content-Type", "application/json; charset=utf-8")], Fulmen.Known (Tx.fieldLength field))), field)
 
 -- | The pieces of the field, one after the other, each sent before the next is taken: they are views, which are valid
 -- until the next step on the field. At its end, the response ends.
 pieces :: (Runtime arr, Stream arr s) => arr (Fulmen.Answering, s) ()
-pieces = loop
+pieces = iterateWith (withSource ^>> first next >>^ chunked) (consume Fulmen.send) >>> Fulmen.finish
   where
-    loop =
-      (\(answering, source) -> (source, (answering, source)))
-        ^>> first next
-        >>> (\(piece, (answering, source)) -> maybe (Left answering) (\chunk -> Right ((answering, [chunk]), (answering, source))) piece)
-        ^>> (Fulmen.finish ||| (first Fulmen.send >>> arr snd >>> loop))
+    withSource (answering, source) = (source, (answering, source))
+    chunked (Nothing, (answering, _)) = Finish answering
+    chunked (Just chunk, (answering, source)) = Again ((answering, [chunk]), (answering, source))
 
 -- | The metrics: the bytes that the runtime allocated, and in debug mode the counts of "Network.Streaming.Counters", as Prometheus text.
 -- It needs @+RTS -T@: without it the answer says so, and is a 503. The runtime counts what a nursery held when it is
@@ -139,12 +142,15 @@ metrics counts = now (\call -> (,) call <$> exposition) >>> plain
 -- | An answer of one piece of text: the head with its length, the text and the end.
 plain :: (Runtime arr) => arr (Call, (Int, ByteString)) ()
 plain =
-  (\(call, (status, text)) -> ((call, (Fulmen.Status status, [("Content-Type", "text/plain; charset=utf-8")], Fulmen.Known (B.length text))), text))
+  withHead
     ^>> first Fulmen.respond
-    >>> (\(answering, text) -> ((answering, [text]), answering))
-    ^>> first Fulmen.send
-    >>> arr snd
+    >>> withBody
+    ^>> consume Fulmen.send
     >>> Fulmen.finish
+  where
+    withHead (call, (status, text)) =
+      ((call, (Fulmen.Status status, [("Content-Type", "text/plain; charset=utf-8")], Fulmen.Known (B.length text))), text)
+    withBody (answering, text) = ((answering, [text]), answering)
 
 -- * The flags
 
@@ -258,11 +264,11 @@ main = do
   -- The arrow is known where the handler is built, so that GHC specialises it to the arrow.
   withConnectionPool (connectionPoolSettings (optPool options) connect) $ \pool -> case (optMode options, optRuntime options) of
     (Release, Threads) -> runThreads (Fulmen.serve settings (handler (counted @'Release) pool)) shared
-    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> arr (const (Fulmen.onCore cores core)) >>> Fulmen.serve settings (handler (counted @'Release) pool)))
+    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings (handler (counted @'Release) pool)))
     (Release, Compiled) -> void (runCompiled (Fulmen.serve settings (handler (counted @'Release) pool)) shared)
 #if defined(DEBUG_MODE)
     (Debug, Threads) -> runThreadsM @'Debug (Fulmen.serve settings (handler (counted @'Debug) pool)) shared
-    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> arr (const (Fulmen.onCore cores core)) >>> Fulmen.serve settings (handler (counted @'Debug) pool)))
+    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings (handler (counted @'Debug) pool)))
     (Debug, Compiled) -> void (runCompiledM @'Debug (Fulmen.serve settings (handler (counted @'Debug) pool)) shared)
 #else
     (Debug, _) -> die "this build has no debug mode: build the slice with -f debug-mode"

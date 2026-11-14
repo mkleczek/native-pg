@@ -21,7 +21,7 @@ instance Exception NotImplemented where
 
 -- | A step that fails with 'NotImplemented', raised through 'now'.
 notImplemented :: (Effect arr) => String -> arr a b
-notImplemented operation = now (\_ -> notImplementedIO operation)
+notImplemented operation = now (const (notImplementedIO operation))
 
 -- | The same, for an operation in IO.
 notImplementedIO :: String -> IO a

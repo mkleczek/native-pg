@@ -15,7 +15,7 @@ module Network.Directions.Proxy
   )
 where
 
-import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (ArrowChoice, first, (>>>), (>>^), (^>>))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
@@ -35,15 +35,18 @@ pump = pumpWith id
 
 -- | 'pump', with what goes through changed on its way.
 pumpWith :: (ArrowChoice arr, Link arr source, Link arr sink) => (ByteString -> ByteString) -> Buffer -> arr (source, sink) ()
-pumpWith change buffer = loop
+pumpWith change buffer =
+  -- The links go through the loop beside what the steps work on, and not in an environment: a generic arrow runs each
+  -- step of a loop as a call of its methods, and an environment adds some to every step.
+  iterateWith
+    (toReceive ^>> first receive >>^ toSend)
+    (consume sendAll)
+    >>> shutdownSend
   where
-    -- The links go through the loop beside what the steps work on, and not in an environment: a generic arrow runs each
-    -- step of a loop as a call of its methods, and an environment adds some to every step.
-    loop =
-      (\links@(source, _) -> ((source, roomOf buffer), links))
-        ^>> first receive
-        >>> (\(count, links@(_, sink)) -> if count == 0 then Left sink else Right ((sink, [change (view buffer count)]), links))
-        ^>> (shutdownSend ||| (first sendAll >>> snd ^>> loop))
+    toReceive links@(source, _) = ((source, roomOf buffer), links)
+    toSend (count, links@(_, sink))
+      | count == 0 = Finish sink
+      | otherwise = Again ((sink, [change (view buffer count)]), links)
 {-# INLINABLE pumpWith #-}
 
 -- | A proxy between a client's link and a server's: a direction each way.
@@ -59,19 +62,15 @@ proxyThrough change requests answers = together [pumpWith change requests, swap 
 -- | A server that sends back what it receives, until its input ends: one
 -- direction, from its link back to it.
 echo :: (ArrowChoice arr, Link arr end) => Buffer -> arr end ()
-echo buffer = (\end -> (end, end)) ^>> pump buffer
+echo buffer = dup ^>> pump buffer
 {-# INLINABLE echo #-}
 
 -- | Keeps a copy of what arrives, the latest first, until the end of the
 -- stream.
 receiveAll :: (ArrowChoice arr, Effect arr, Link arr end) => Buffer -> IORef [ByteString] -> arr end ()
-receiveAll buffer kept = withOnly loop
+receiveAll buffer kept = withOnly (iterateWith (const (roomOf buffer) ^>> With receive >>^ ended) (now keep))
   where
-    loop =
-      const (roomOf buffer)
-        ^>> With receive
-        >>> (\count -> if count == 0 then Left () else Right count)
-        ^>> (returnA ||| (now keep >>> loop))
+    ended count = if count == 0 then Finish () else Again count
     keep count = do
       -- The view is of the buffer, which the next receive reuses, so it's
       -- copied now.
@@ -96,12 +95,11 @@ sendThenReceive buffer request kept =
 -- | Receives this many bytes, or what comes before the end of the stream, and
 -- gives them.
 receiveBytes :: (ArrowChoice arr, Link arr end) => Buffer -> Int -> arr end ByteString
-receiveBytes buffer total = withOnly (const BS.empty ^>> loop)
+receiveBytes buffer total = withOnly (const BS.empty ^>> iterateA ((roomOf buffer,) ^>> first (With receive) >>^ collect))
   where
-    loop = (roomOf buffer,) ^>> first (With receive) >>> collect ^>> (returnA ||| loop)
     collect (count, got)
-      | count == 0 || BS.length next >= total = Left next
-      | otherwise = Right next
+      | count == 0 || BS.length next >= total = Finish next
+      | otherwise = Again next
       where
         -- The view is of the buffer, which the next receive reuses, so it's
         -- copied now.
@@ -116,19 +114,18 @@ receiveBytes buffer total = withOnly (const BS.empty ^>> loop)
 -- it runs, and the request side is given the end to wait at and the answer side
 -- the end to give at.
 transaction :: forall arr end. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), Link arr end) => Buffer -> ByteString -> (ByteString -> Bool) -> IORef [ByteString] -> arr end ()
-transaction buffer batch commits kept = withOnly (ticket @(With end arr) @(Local arr) >>> together [arr fst >>> requests, arr snd >>> answers])
+transaction buffer batch commits kept = withOnly (localTicket >>> together [fst ^>> requests, snd ^>> answers])
   where
     requests =
       keeping (const [batch] ^>> With sendAll)
         >>> snd
         ^>> await
-        >>> (\commit -> [BS8.pack (if commit then "COMMIT\n" else "ROLLBACK\n")])
+        >>> ending
         ^>> With sendAll
         >>> asks shutdownSend
+    ending commit = [BS8.pack (if commit then "COMMIT\n" else "ROLLBACK\n")]
     answers =
-      keeping (asks (receiveBytes buffer (BS.length batch)))
-        >>> (\(answer, decision) -> (decision, commits answer))
-        ^>> give
-        >>> arr (const ())
+      (,())
+        ^>> deliver (asks (receiveBytes buffer (BS.length batch)) >>^ commits)
         >>> asks (receiveAll buffer kept)
 {-# INLINABLE transaction #-}

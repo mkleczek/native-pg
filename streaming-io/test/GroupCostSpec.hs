@@ -13,16 +13,17 @@
 -- cursors' does) for the heap to be counted.
 module GroupCostSpec (spec) where
 
-import Control.Arrow (ArrowChoice, arr, first, returnA, second, (>>>), (^>>), (|||))
+import Control.Arrow (ArrowChoice, returnA, (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad (forM_, replicateM)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (uncons)
 import Data.Word (Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
 import Network.Streaming.Classes (Block, Concurrent (..), Effect (..), Exchange (..), GiveWay, Giver, Local, Time, millis, monotonicNanoseconds)
-import Network.Streaming.Combinators (sleep)
+import Network.Streaming.Combinators (consume, done, keeping, localTicket, sleep)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)
@@ -70,11 +71,11 @@ spec = describe "the parts of a group" $ forM_ runners $ \(Runner name run) -> d
 
 -- | The program: this many parts that wait for a ticket nothing gives, and the one that looks at them all waiting.
 idleGroup :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Time arr, Concurrent arr, Exchange arr (Local arr)) => IORef (Maybe Probe) -> Int -> arr () ()
-idleGroup out count = now (\() -> newIORef []) >>> together (watcher : replicate count waiter)
+idleGroup out count = now (const (newIORef [])) >>> together (watcher : replicate count waiter)
   where
     -- A part gives the giver of its ticket to the registry, which parts on several threads add to, and waits for the ticket.
     waiter :: arr (Registry arr) ()
-    waiter = (, ()) ^>> second (ticket @arr @(Local arr)) >>> now (\(registry, (waiting, giver)) -> waiting <$ atomicModifyIORef' registry (\givers -> (giver : givers, ()))) >>> await
+    waiter = keeping localTicket >>> now (\((waiting, giver), registry) -> waiting <$ atomicModifyIORef' registry (\givers -> (giver : givers, ()))) >>> await
     -- The watcher looks every millisecond whether all have registered, and then takes the heap and the time, and gives
     -- the tickets.
     watcher :: arr (Registry arr) ()
@@ -82,11 +83,11 @@ idleGroup out count = now (\() -> newIORef []) >>> together (watcher : replicate
     looking :: arr (Registry arr) ()
     looking = now (\registry -> (\givers -> if length givers >= count then Right givers else Left registry) <$> readIORef registry) >>> ((patient >>> looking) ||| (probing >>> giving))
     patient :: arr (Registry arr) (Registry arr)
-    patient = (, ()) ^>> second (sleep (millis 1)) >>> arr fst
+    patient = keeping (sleep (millis 1)) >>^ snd
     probing :: arr [Giver (Local arr) ()] [Giver (Local arr) ()]
     probing = now (\givers -> performMajorGC *> (Probe . gcdetails_live_bytes . gc <$> getRTSStats) <*> monotonicNanoseconds >>= \probe -> givers <$ writeIORef out (Just probe))
     giving :: arr [Giver (Local arr) ()] ()
-    giving = (\case [] -> Left (); giver : others -> Right (giver, others)) ^>> (returnA ||| (first ((, ()) ^>> give) >>> arr snd >>> giving))
+    giving = maybe (Left ()) Right . uncons ^>> (returnA ||| (consume ((, ()) ^>> give >>> done) >>> giving))
 
 -- | What the parts of a group register: the givers of their tickets.
 type Registry arr = IORef [Giver (Local arr) ()]

@@ -7,13 +7,13 @@
 -- wheel by itself, in time that the test makes up.
 module TimeSpec (spec) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (>>>))
+import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (>>>), (>>^), (^>>))
 import Control.Monad (forM, forM_, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Word (Word64)
 import qualified Network.Socket as Socket
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (releaseWithin, sleep, times)
+import Network.Streaming.Combinators (done, keeping, localTicket, releaseWithin, sleep, times)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Timers
@@ -90,7 +90,7 @@ spec = describe "time" $ do
 
     it "gives the body's result when it ends first, and leaves no deadline behind" $ do
       run (within (secs 10) (arr (const 'x'))) `shouldReturn` Just 'x'
-      run (within (secs 10) (sleep (millis 5) >>> arr (const 'y'))) `shouldReturn` Just 'y'
+      run (within (secs 10) (sleep (millis 5) >>^ const 'y')) `shouldReturn` Just 'y'
 
     it "gives the outer deadline Nothing when it passes while an inner one is active" $ do
       run (within (millis 30) (within (secs 10) waitsForEver)) `shouldReturn` Nothing
@@ -114,7 +114,7 @@ spec = describe "time" $ do
       winner' <-
         run $
           race
-            (scope returnA (releaseWithin (millis 30) waitsForEver >>> noting noted "release ended" >>> arr (const ())) (arr snd >>> waitsForEver))
+            (scope returnA (releaseWithin (millis 30) waitsForEver >>> noting noted "release ended" >>> done) (snd ^>> waitsForEver))
             giveWayAndEnd
       ended <- monotonicNanoseconds
       either (const "first") (const "second") winner' `shouldBe` "second"
@@ -142,7 +142,7 @@ spec = describe "time" $ do
       (afterwards - earlier >= 5000000) `shouldBe` True
 
     when (name /= "loop") $ it "stops 100,000 deadlines that were set one after the other, none of which passes" $ do
-      result <- withinTime (run (times 100000 (within (secs 10) returnA >>> arr (const ())) >>> arr (const 'z')))
+      result <- withinTime (run (times 100000 (within (secs 10) returnA >>> done) >>^ const 'z'))
       result `shouldBe` Just 'z'
 
   describe "the pool" $
@@ -156,7 +156,7 @@ spec = describe "time" $ do
       it ("gives a part that waits for a connection too long Nothing, and keeps no place for it (" <> name <> ")") $ do
         pool <- newPool [7 :: Int]
         -- The part holds the only connection, and asks for another with a deadline.
-        taken <- run (checkout pool >>> arr (,()) >>> second (checkoutWithin (millis 30) pool) >>> arr (\(conn, other) -> (other, conn)) >>> second (release pool) >>> arr fst)
+        taken <- run (checkout pool >>> keeping (checkoutWithin (millis 30) pool) >>> second (release pool) >>^ fst)
         taken `shouldBe` Nothing
         -- It was given back to the pool, and not to the place that was given up.
         free pool `shouldReturn` [7]
@@ -179,13 +179,13 @@ spec = describe "time" $ do
     it "gives a deadline Nothing at its instant, for every seed, and releases what the body held" $
       forM_ [1 .. 20] $ \seed -> do
         noted <- newLog
-        outcome <- runSimulation seed 100000 (within (secs 5) (bracketed noted "r" returnA (sleep (secs 100))) >>> arr (const ()) >>> clock >>> arr (\(Instant at) -> at)) ()
+        outcome <- runSimulation seed 100000 (within (secs 5) (bracketed noted "r" returnA (sleep (secs 100))) >>> done >>> clock >>^ \(Instant at) -> at) ()
         simulatedOutcome outcome `shouldBe` Completed (5 * 1000000000)
         readLog noted `shouldReturn` ["acquire r", "release r: cancelled"]
 
     it "gives the body's result when it ends before the deadline, and then the clock is where the body left it" $
       forM_ [1 .. 20] $ \seed -> do
-        outcome <- runSimulation seed 100000 (within (secs 100) (sleep (secs 5) >>> arr (const 'x')) >>> arr (const ()) >>> clock) ()
+        outcome <- runSimulation seed 100000 (within (secs 100) (sleep (secs 5) >>^ const 'x') >>> done >>> clock) ()
         simulatedOutcome outcome `shouldBe` Completed (Instant (5 * 1000000000))
 
     it "gives the outer deadline Nothing when it passes first, and the inner one when that does" $
@@ -199,7 +199,7 @@ spec = describe "time" $ do
       first' <- simulatedTrace <$> runSimulation 5 100000 (together [sleep (secs 2), sleep (secs 1)]) ()
       again <- simulatedTrace <$> runSimulation 5 100000 (together [sleep (secs 2), sleep (secs 1)]) ()
       again `shouldBe` first'
-      outcome <- runSimulation 1 1000 (ticket @_ @(Local Loop) >>> arr fst >>> await :: Loop () ()) ()
+      outcome <- runSimulation 1 1000 (localTicket >>> fst ^>> await :: Loop () ()) ()
       simulatedOutcome outcome `shouldBe` Deadlocked [0]
 
     it "reads the clock of the run when it is not a simulation" $ do
@@ -277,8 +277,8 @@ bracketed :: (Rich arr) => Log -> String -> arr () () -> arr () b -> arr () b
 bracketed noted name work body =
   scope
     (noting noted ("acquire " <> name))
-    (arr snd >>> now (\exit -> note noted ("release " <> name <> ": " <> describeExit exit)) >>> work)
-    (arr snd >>> body)
+    (now (\(_, exit) -> note noted ("release " <> name <> ": " <> describeExit exit)) >>> work)
+    (snd ^>> body)
 
 describeExit :: Exit -> String
 describeExit = \case
@@ -288,11 +288,11 @@ describeExit = \case
 
 -- | A wait that nothing ends.
 -- | A wait for a ticket of the arrow's own core that nothing gives a value, and for one of any core.
-waitsForTicket :: forall arr a. (Rich arr) => arr a ()
-waitsForTicket = arr (const ()) >>> ticket @arr @(Local arr) >>> arr fst >>> (await :: arr (Waiting arr (Local arr) ()) ())
+waitsForTicket :: (Rich arr) => arr a ()
+waitsForTicket = done >>> localTicket >>> fst ^>> await
 
 waitsForAnywhereTicket :: forall arr a. (Rich arr, Exchange arr 'Anywhere) => arr a ()
-waitsForAnywhereTicket = arr (const ()) >>> ticket @arr @'Anywhere >>> arr fst >>> (await :: arr (Waiting arr 'Anywhere ()) ())
+waitsForAnywhereTicket = done >>> ticket @arr @'Anywhere >>> fst ^>> (await :: arr (Waiting arr 'Anywhere ()) ())
 
 waitsForEver :: (Rich arr) => arr a ()
 waitsForEver = now (const readableNever) >>> block

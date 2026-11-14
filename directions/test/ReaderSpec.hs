@@ -1,6 +1,6 @@
 module ReaderSpec (spec) where
 
-import Control.Arrow (ArrowChoice, returnA, (>>>), (>>^), (^>>))
+import Control.Arrow (ArrowChoice, second, (>>>), (>>^), (^>>))
 import Control.Exception (IOException, evaluate, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
@@ -12,6 +12,7 @@ import Network.Directions.Resumable
 import Network.Directions.Rows
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.PositiveInt (mkPositiveInt)
@@ -45,17 +46,17 @@ spec = describe "the reader" $ do
   describe "bytes" $
     it "fail for more than the buffer holds, and give as many as it holds, however a receive gives" $
       forM_ [maxBound, 5] $ \limit -> do
-        over <- runAll (pure ((\(reader, ()) -> (reader, 17)) ^>> bytes)) () rowsOf1000 limit 16
+        over <- runAll (pure (second (const 17) ^>> bytes)) () rowsOf1000 limit 16
         all isLeft over `shouldBe` True
         length over `shouldBe` 3
-        exactly <- runAll (pure ((\(reader, ()) -> (reader, 16)) ^>> bytes)) () rowsOf1000 limit 16
+        exactly <- runAll (pure (second (const 16) ^>> bytes)) () rowsOf1000 limit 16
         exactly `shouldBe` replicate 3 (Right (BS.take 16 rowsOf1000))
 
   describe "resumable parsers" $ do
     it "add up the rows to the same checksum, with every arrow, whatever a receive gives" $
       forM_ [maxBound, 1460, 97, 7, 1] $ \limit ->
         forM_ [16384, 64] $ \capacity ->
-          resumed (\buffer -> pure (parse buffer (returnA >>^ const ()) rowsResumable >>^ fst)) rowsOf1000 limit capacity
+          resumed (\buffer -> pure (parse buffer done rowsResumable >>^ fst)) rowsOf1000 limit capacity
             `shouldReturn` replicate 3 (rowsChecksum 1000)
 
     it "yield a field larger than the buffer as pieces that reassemble to it" $
@@ -90,7 +91,7 @@ runAll program input wire limit capacity =
 collected :: Program () [ByteString]
 collected = do
   kept <- newIORef []
-  pure (fst ^>> streamMessages (keeping kept) >>> now (\() -> reverse <$> readIORef kept))
+  pure (fst ^>> streamMessages (keeping kept) >>> now (const (reverse <$> readIORef kept)))
 
 keeping :: (Effect arr) => IORef [ByteString] -> arr ByteString ()
 keeping kept = now (\piece -> evaluate (BS.copy piece) >>= \owned -> modifyIORef' kept (owned :))
@@ -120,7 +121,7 @@ resumed program wire limit capacity =
 resumedPieces :: Resumed [ByteString]
 resumedPieces buffer = do
   kept <- newIORef []
-  pure (parse buffer (keeping kept) streamResumable >>> now (\_ -> reverse <$> readIORef kept))
+  pure (parse buffer (keeping kept) streamResumable >>> now (const (reverse <$> readIORef kept)))
 
 rowsOf1000 :: ByteString
 rowsOf1000 = rowsWire 1000

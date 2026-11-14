@@ -43,6 +43,7 @@ import GHC.IO (IO (..))
 import GHC.IORef (IORef (..), atomicSwapIORef)
 import GHC.STRef (STRef (..))
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
 import Network.Streaming.Internal.Atomic (update)
@@ -123,6 +124,15 @@ instance Category (ThreadsM m) where
 instance Arrow (ThreadsM m) where
   arr function = Threads (\_ value -> pure (function value))
   first (Threads inner) = Threads (\part (a, c) -> (,c) <$> inner part a)
+
+instance Functor (ThreadsM m a) where
+  fmap function (Threads inner) = Threads (\part value -> function <$> inner part value)
+
+instance Applicative (ThreadsM m a) where
+  pure result = Threads (\_ _ -> pure result)
+  Threads function <*> Threads argument = Threads (\part value -> function part value <*> argument part value)
+
+instance ArrowApplicative (ThreadsM m)
 
 instance ArrowChoice (ThreadsM m) where
   left (Threads inner) = Threads $ \part -> \case
@@ -239,7 +249,7 @@ instance Scope (ThreadsM m) where
 -- it came to once it ended: the scopes are left before the pair's policy is told.
 spawn :: Part -> CancelScope Members -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO (MVar (Either SomeException a))
 spawn (Part _ _ parent _ parentFlag) scope' run ended = do
-  done <- newEmptyMVar
+  finished <- newEmptyMVar
   -- Forked masked, as its part is.
   _ <- forkIO $ do
     thread <- myThreadId
@@ -257,8 +267,8 @@ spawn (Part _ _ parent _ parentFlag) scope' run ended = do
     outcome <- try (run part)
     forM_ frames (outside part)
     ended outcome
-    putMVar done outcome
-  pure done
+    putMVar finished outcome
+  pure finished
   where
     inside part = \case Inside s -> enter s part; _ -> pure ()
     outside part = \case Inside s -> leave s part; _ -> pure ()
@@ -288,7 +298,7 @@ failing failure scope' = \case
 -- entered into the scope of the group and the scopes that enclose it: a group of many parts doesn't make them deeper.
 instance Concurrent (ThreadsM m) where
   together = \case
-    [] -> arr (const ())
+    [] -> done
     [one] -> one
     parts -> Threads $ \part input -> do
       scope' <- newScope

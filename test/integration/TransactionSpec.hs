@@ -18,7 +18,7 @@
 -- they wait for lands.
 module TransactionSpec (spec) where
 
-import Control.Arrow (arr, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (arr, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (ErrorCall (..), throwIO)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
@@ -61,7 +61,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
               committed
                 Tx.Write
                 (Tx.statement (insertItem "1"))
-                (\inserted -> Tx.discard inserted >>> Tx.condemn >>> arr (const ((), ())) >>> Tx.pipeline Tx.Final (Tx.statement (insertItem "2")) Tx.discard)
+                (\inserted -> Tx.discard inserted >>> Tx.condemn >>> const ((), ()) ^>> Tx.pipeline Tx.Final (Tx.statement (insertItem "2")) Tx.discard)
                 `yields` Right (),
               items `yields` Right 0
             ]
@@ -71,7 +71,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
       withSession
         ( steps
             [ createItems `yields` Right (),
-              (committed Tx.Write ((,) <$> Tx.statement (insertItem "1") <*> Tx.statement dividingByZero) (\(inserted, dividing) -> Tx.discard inserted >>> Tx.discard dividing) >>^ failedAt)
+              (committed Tx.Write ((,) <$> Tx.statement (insertItem "1") <*> Tx.statement dividingByZero) discardBoth >>^ failedAt)
                 `yields` Just ("SELECT 1 / 0", "22012"),
               items `yields` Right 0
             ]
@@ -96,7 +96,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
               ( committed
                   Tx.Write
                   ((,) <$> Tx.command "INSERT INTO tx_unique VALUES (1)" <*> Tx.command "INSERT INTO tx_unique VALUES (1)")
-                  (\(first', second') -> Tx.discard first' >>> Tx.discard second')
+                  discardBoth
                   >>^ failedAt
               )
                 `yields` Just ("COMMIT", "23505")
@@ -107,7 +107,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
       withSession
         ( steps
             [ createItems `yields` Right (),
-              committed Tx.Write (Tx.statement (insertItem "1")) (\inserted -> Tx.discard inserted >>> now (\() -> throwIO (ErrorCall "boom")))
+              committed Tx.Write (Tx.statement (insertItem "1")) (\inserted -> Tx.discard inserted >>> now (const (throwIO (ErrorCall "boom"))))
                 `failsWith` ErrorCall "boom",
               items `yields` Right 0
             ]
@@ -129,7 +129,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
       withSession
         ( steps
             [ createItems `yields` Right (),
-              ( transact Tx.ReadCommitted Tx.Write Tx.Final ((,) <$> Tx.statement (insertItem "1") <*> Tx.statement dividingByZero) (\(inserted, dividing) -> Tx.discard inserted >>> Tx.discard dividing)
+              ( transact Tx.ReadCommitted Tx.Write Tx.Final ((,) <$> Tx.statement (insertItem "1") <*> Tx.statement dividingByZero) discardBoth
                   >>^ failedAt
               )
                 `yields` Just ("SELECT 1 / 0", "22012"),
@@ -147,7 +147,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
                   Tx.Write
                   Tx.Final
                   ((,) <$> Tx.command "INSERT INTO tx_unique VALUES (1)" <*> Tx.command "INSERT INTO tx_unique VALUES (1)")
-                  (\(first', second') -> Tx.discard first' >>> Tx.discard second')
+                  discardBoth
                   >>^ failedAt
               )
                 `yields` Just ("COMMIT", "23505"),
@@ -159,7 +159,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
       withSession
         ( steps
             [ createItems `yields` Right (),
-              transact Tx.ReadCommitted Tx.Write Tx.Final (Tx.statement (insertItem "1")) (\inserted -> Tx.discard inserted >>> arr (const ((), ())) >>> Tx.pipeline Tx.Open (Tx.command "SELECT 1") Tx.discard)
+              transact Tx.ReadCommitted Tx.Write Tx.Final (Tx.statement (insertItem "1")) (\inserted -> Tx.discard inserted >>> const ((), ()) ^>> Tx.pipeline Tx.Open (Tx.command "SELECT 1") Tx.discard)
                 `failsWith` AfterFinal,
               selectOne `yields` Right [1]
             ]
@@ -204,7 +204,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
             ((,,) <$> Tx.statement streamed <*> Tx.statement streamed <*> Tx.statement (answerFor "1"))
             ( \(unread, halfRead, later) ->
                 Tx.discard unread
-                  >>> (Tx.nextRow halfRead >>> now (maybe (failTest "expected a streamed row") pure) >>> arr snd >>> next >>> arr (const ()))
+                  >>> (Tx.nextRow halfRead >>> now (maybe (failTest "expected a streamed row") pure) >>> snd ^>> next >>> done)
                   >>> Tx.discard halfRead
                   >>> Tx.single later
             )
@@ -225,7 +225,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
         ( steps
             [ createItems `yields` Right (),
               -- Nothing is read: the failure comes when the transaction drains what is left.
-              (committed Tx.Write ((,,) <$> Tx.statement (insertItem "1") <*> Tx.statement dividingByZero <*> Tx.statement (insertItem "2")) (\_ -> arr (const ())) >>^ failedAt)
+              (committed Tx.Write ((,,) <$> Tx.statement (insertItem "1") <*> Tx.statement dividingByZero <*> Tx.statement (insertItem "2")) (const done) >>^ failedAt)
                 `yields` Just ("SELECT 1 / 0", "22012"),
               items `yields` Right 0
             ]
@@ -287,7 +287,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
     it "streams a column larger than the read buffer within the transaction" $
       withSession
         ( committed Tx.Read (Tx.statement (plain "SELECT 7::int4, repeat('x', 1000000)" statusAndBody)) lengths
-            `yields` Right (7, (1000000, 1000000))
+            `yields` Right (7, 1000000, 1000000)
         )
         `shouldReturn` ()
     it "streams a column that may be NULL within a single row's scope" $
@@ -322,7 +322,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
       acknowledged <- newIORef False
       withSession
         ( steps
-            [ (committed Tx.Read ((,) <$> Tx.prepare "divided" (dividedBy "0") <*> Tx.executePrepared "divided" (dividedBy "0")) (\(preparation, result) -> Tx.prepared preparation >>> now (\() -> writeIORef acknowledged True) >>> readAll result) >>^ serverCode)
+            [ (committed Tx.Read ((,) <$> Tx.prepare "divided" (dividedBy "0") <*> Tx.executePrepared "divided" (dividedBy "0")) (\(preparation, result) -> Tx.prepared preparation >>> now (const (writeIORef acknowledged True)) >>> readAll result) >>^ serverCode)
                 `yields` Just "22012",
               preparedNames `yields` Right ["divided"],
               committed Tx.Read (Tx.executePrepared "divided" (unrendered (dividedBy "1"))) Tx.discard `yields` Right (),
@@ -423,10 +423,13 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
                 )
                 ( \(inserted, counted, incremented, again, (insertedAgain, recounted)) ->
                     Tx.discard inserted
-                      >>> (Tx.single counted &&& Tx.single incremented &&& Tx.single again)
-                      >>> thenDo (Tx.discard insertedAgain)
-                      >>> thenRead (Tx.single recounted)
-                      >>^ \((a, (b, c)), d) -> (a, b, c, d)
+                      >>> ( (,,,)
+                              <$> Tx.single counted
+                              <*> Tx.single incremented
+                              <*> Tx.single again
+                              <* Tx.discard insertedAgain
+                              <*> Tx.single recounted
+                          )
                 )
                 `yields` Right (1, 42, 2, 2),
               committed
@@ -528,9 +531,9 @@ shaped rows count = query (numbers rows count)
 skippingPipeline :: (Runtime arr) => Tx.Pipeline arr () (Tx.Result arr (), Tx.Preparation, Tx.Result arr Int32)
 skippingPipeline = (,,) <$> Tx.statement dividingByZero <*> Tx.prepare "skipped" (dividedBy "1") <*> Tx.executePrepared "skipped" (dividedBy "1")
 
--- | Reads one more, and keeps what came before it.
-thenRead :: (Runtime arr) => With Tx.Tx arr () b -> With Tx.Tx arr a (a, b)
-thenRead step = returnA &&& (arr (const ()) >>> step)
+-- | Discards both results, in order.
+discardBoth :: (Runtime arr) => (Tx.Result arr a, Tx.Result arr b) -> With Tx.Tx arr () ()
+discardBoth (one, other) = Tx.discard one >>> Tx.discard other
 
 -- | What the failure of a result with the wrong number of rows is.
 wrongAmount :: UsageError -> IO ()
@@ -540,18 +543,18 @@ wrongAmount = \case
 
 -- | The command tag of a result, once its rows are read.
 tagged :: (Runtime arr) => Tx.Result arr row -> With Tx.Tx arr () ByteString
-tagged result = countRows result >>> arr (const ()) >>> Tx.commandTag result
+tagged result = countRows result >>> done >>> Tx.commandTag result
 
 -- | After the step, the value goes on.
 thenDo :: (Runtime arr) => With Tx.Tx arr () () -> With Tx.Tx arr a a
-thenDo step = (returnA &&& (arr (const ()) >>> step)) >>^ fst
+thenDo step = tap (done >>> step)
 
 -- | The length that a field declares, and the bytes that its pieces add up to.
-lengths :: (Runtime arr) => Tx.Result arr (Int32, Tx.Field) -> With Tx.Tx arr () (Int32, (Int, Int))
-lengths result = Tx.single result >>> (arr fst &&& (arr (Tx.fieldLength . snd) &&& (arr snd >>> measure >>^ fst)))
+lengths :: (Runtime arr) => Tx.Result arr (Int32, Tx.Field) -> With Tx.Tx arr () (Int32, Int, Int)
+lengths result = Tx.single result >>> ((,,) <$> arr fst <*> arr (Tx.fieldLength . snd) <*> (snd ^>> measure >>^ fst))
 
 maybeLengths :: (Runtime arr) => Tx.Result arr (Int32, Maybe Tx.Field) -> With Tx.Tx arr () (Int32, Maybe (Int, Int))
-maybeLengths result = Tx.single result >>> (arr fst &&& (arr snd >>> lengthOf))
+maybeLengths result = Tx.single result >>> (arr fst &&& (snd ^>> lengthOf))
   where
     lengthOf = maybe (Left ()) Right ^>> (arr (const Nothing) ||| ((arr Tx.fieldLength &&& (measure >>^ fst)) >>^ Just))
 

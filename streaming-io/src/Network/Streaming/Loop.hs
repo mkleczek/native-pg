@@ -40,6 +40,7 @@ import Data.List (partition, sort)
 import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
@@ -71,12 +72,21 @@ instance Arrow Loop where
   arr = Arr
   first = First
 
+instance Functor (Loop a) where
+  fmap function step = Seq step (Arr function)
+
+instance Applicative (Loop a) where
+  pure result = Arr (const result)
+  one <*> two = Seq (Seq (Arr (\a -> (a, a))) (First one)) (Seq (Arr (\(f, a) -> (a, f))) (Seq (First two) (Arr (\(x, f) -> f x))))
+
+instance ArrowApplicative Loop
+
 instance ArrowChoice Loop where
   left = Choose
 
 instance Concurrent Loop where
   together = \case
-    [] -> arr (const ())
+    [] -> done
     [one] -> one
     parts -> Together parts
 

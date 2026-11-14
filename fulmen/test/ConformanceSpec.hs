@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -15,7 +16,7 @@
 -- off when the part lands.
 module ConformanceSpec (spec) where
 
-import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, tryReadMVar)
 import Control.Exception (IOException, SomeException, bracket, displayException, throwIO, try)
@@ -26,6 +27,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
+import Data.Tuple (swap)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import Network.Fulmen (Call, Cores, Request (..))
@@ -35,7 +37,7 @@ import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (keeping, sleep)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateA, iterateWith, keeping, sleep, tap)
 import Network.Streaming.Counters (Counter (..), countOf, since, snapshot)
 import Network.Streaming.Compiled (runCompiled, runCompiledM)
 import Network.Streaming.Delimited (runDelimited, runDelimitedM)
@@ -138,10 +140,10 @@ debugRunners =
 handling :: Handler -> Handling
 handling handler = case handler of
   Echo -> Handling echo
-  Fixed status fields content -> Handling ((\(call, _) -> (call, (Fulmen.Status status, fields, content))) ^>> reply)
+  Fixed status fields content -> Handling ((, (Fulmen.Status status, fields, content)) . fst ^>> reply)
   Streamed chunks -> Handling (streamedWith [writing chunk | chunk <- chunks])
-  Headers -> Handling ((\(call, request) -> (call, (Fulmen.Status 200, [], headersOf request))) ^>> reply)
-  Ignore -> Handling ((\(call, _) -> (call, (Fulmen.Status 200, [], ignoreBody))) ^>> reply)
+  Headers -> Handling (second ((Fulmen.Status 200, [],) . headersOf) ^>> reply)
+  Ignore -> Handling ((, (Fulmen.Status 200, [], ignoreBody)) . fst ^>> reply)
   Slow delay chunks -> Handling (streamedWith [pause delay >>> writing chunk | chunk <- chunks])
   EchoStreaming -> Handling echoStreaming
   Fail -> Handling (now (\_ -> throwIO (userError "the handler failed")))
@@ -153,25 +155,26 @@ handling handler = case handler of
 -- | The head, the body, and the end of the response, when the body is known.
 reply :: (Runtime arr) => arr (Call, (Fulmen.Status, Fulmen.ResponseHeaders, ByteString)) ()
 reply =
-  (\(call, (status, fields, content)) -> ((call, (status, fields, Fulmen.Known (B.length content))), content))
+  withLength
     ^>> first Fulmen.respond
-    >>> (\(answering, content) -> (answering, [content]))
-    ^>> (Fulmen.send &&& arr fst)
-    >>> arr snd
+    >>> (second (: []) &&& fst)
+    ^>> consume Fulmen.send
     >>> Fulmen.finish
+  where
+    withLength (call, (status, fields, content)) = ((call, (status, fields, Fulmen.Known (B.length content))), content)
 
 -- | The whole request body, as the response.
 echo :: (Runtime arr) => arr (Call, Request) ()
 echo =
   fst
-    ^>> (returnA &&& (Fulmen.body >>> collect))
-    >>> (\(call, content) -> (call, (Fulmen.Status 200, [], content)))
+    ^>> alongside (Fulmen.body >>> collect)
+    >>> second (Fulmen.Status 200, [],) . swap
     ^>> reply
 
 -- | A 200 of unknown length, whose body the steps send, one after the other.
 streamedWith :: (Runtime arr) => [arr Fulmen.Answering Fulmen.Answering] -> arr (Call, Request) ()
 streamedWith pieces =
-  (\(call, _) -> (call, (Fulmen.Status 200, [], Fulmen.Unknown)))
+  (, (Fulmen.Status 200, [], Fulmen.Unknown)) . fst
     ^>> Fulmen.respond
     >>> foldr (>>>) returnA pieces
     >>> Fulmen.finish
@@ -180,7 +183,7 @@ streamedWith pieces =
 writing :: (Runtime arr) => ByteString -> arr Fulmen.Answering Fulmen.Answering
 writing chunk
   | B.null chunk = returnA
-  | otherwise = (, [chunk]) ^>> (Fulmen.send &&& arr fst) >>^ snd
+  | otherwise = tap ((, [chunk]) ^>> Fulmen.send)
 
 -- | Waits this many milliseconds, which is a wait of the arrow.
 pause :: (Runtime arr) => Int -> arr a a
@@ -190,30 +193,27 @@ pause delay = keeping (sleep (millis (fromIntegral delay))) >>^ snd
 echoStreaming :: (Runtime arr) => arr (Call, Request) ()
 echoStreaming =
   fst
-    ^>> (returnA &&& Fulmen.body)
-    >>> first ((, (Fulmen.Status 200, [], Fulmen.Unknown)) ^>> Fulmen.respond)
-    >>> (\(answering, requestBody) -> (requestBody, answering))
-    ^>> loop
+    ^>> alongside Fulmen.body
+    >>> second ((, (Fulmen.Status 200, [], Fulmen.Unknown)) ^>> Fulmen.respond)
+    >>> iterateWith (alongside (fst ^>> next) >>^ byPiece) (consume Fulmen.send)
+    >>> Fulmen.finish
   where
-    loop =
-      (\(requestBody, answering) -> (requestBody, (requestBody, answering)))
-        ^>> first next
-        >>> (\(piece, (requestBody, answering)) -> maybe (Left answering) (\view' -> Right (view', requestBody, answering)) piece)
-        ^>> (Fulmen.finish ||| ((\(view', requestBody, answering) -> ((answering, [view']), (requestBody, answering))) ^>> first Fulmen.send >>> arr snd >>> loop))
+    byPiece (piece, (requestBody, answering)) =
+      maybe (Finish answering) (\view' -> Again ((answering, [view']), (requestBody, answering))) piece
 
 -- | The pieces of the stream, copied out of the views and put together.
 collect :: (Runtime arr, Stream arr s) => arr s ByteString
-collect = (,[]) ^>> loop >>^ (B.concat . reverse)
-  where
-    loop =
-      (\(source, copies) -> (source, (source, copies)))
-        ^>> first next
-        >>> now
-          ( \(piece, (source, copies)) -> case piece of
-              Nothing -> pure (Left copies)
-              Just view' -> let !copy = B.copy view' in pure (Right (source, copy : copies))
-          )
-        >>> (returnA ||| loop)
+collect =
+  (,[])
+    ^>> iterateA
+      ( alongside (fst ^>> next)
+          >>> now
+            ( \(piece, (source, copies)) -> case piece of
+                Nothing -> pure (Finish copies)
+                Just view' -> let !copy = B.copy view' in pure (Again (source, copy : copies))
+            )
+      )
+    >>^ (B.concat . reverse)
 
 -- * Running a case
 

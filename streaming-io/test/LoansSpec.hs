@@ -3,7 +3,7 @@
 -- says of who waits, so that the order of events is the test's and not a matter of timing.
 module LoansSpec (spec) where
 
-import Control.Arrow (arr, first, (&&&), (***), (>>>), (>>^), (^>>))
+import Control.Arrow ((&&&), (***), (>>>), (^>>))
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (fromException)
@@ -17,7 +17,7 @@ import LoansTestSupport
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Network.Streaming.BufferPool (BufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (sleep, timesWith)
+import Network.Streaming.Combinators (consume, done, sleep, timesWith)
 import Network.Streaming.Delimited (runCores)
 import Network.Streaming.Loans
 import Network.Streaming.Threads (runThreads)
@@ -92,7 +92,7 @@ spec = describe "the loans of a request" $ do
             request pool $
               steps
                 [ -- A request needs its primary and the whole reserve free, and the reserve is not free while one is in.
-                  stillWaits (const () ^>> request pool (arr (const ()))),
+                  stillWaits (idleRequest pool),
                   borrowInto primary,
                   borrowInto extra,
                   differentMemory primary extra,
@@ -113,11 +113,13 @@ spec = describe "the loans of a request" $ do
                 at 1 (borrowInto secondPrimary),
                 at 0 (borrowInto firstExtra),
                 at 1 (borrowInto secondExtra),
-                now (\_ -> mapM memoryOf [firstPrimary, secondPrimary, firstExtra, secondExtra]) >>> now (\memories -> length (nub memories) `shouldBe` 4),
+                now . const $
+                  mapM memoryOf [firstPrimary, secondPrimary, firstExtra, secondExtra]
+                    >>= \memories -> length (nub memories) `shouldBe` 4,
                 giveBack firstExtra,
                 giveBack secondExtra,
                 -- Two are free again, and a request needs its primary and a reserve of two.
-                stillWaits (const () ^>> request pool (arr (const ()))),
+                stillWaits (idleRequest pool),
                 at 0 (proceeds (borrow >>> release)),
                 giveBack firstPrimary,
                 giveBack secondPrimary
@@ -134,10 +136,10 @@ spec = describe "the loans of a request" $ do
               [ at 0 (borrowInto first'),
                 at 1 (borrowInto second'),
                 at 0 (borrowInto extra),
-                now (\_ -> mapM capacityOf [first', second', extra]) >>> now (\sizes -> sizes `shouldBe` [7, 7, 7]),
+                now (const (mapM capacityOf [first', second', extra] >>= \sizes -> sizes `shouldBe` [7, 7, 7])),
                 -- The three buffers of the pool are lent: another extra loan waits, and so does another request.
                 at 1 (stillWaits borrow),
-                stillWaits (const () ^>> request pool (arr (const ()))),
+                stillWaits (idleRequest pool),
                 giveBack extra
               ]
         free <- requestFree pool
@@ -233,7 +235,7 @@ spec = describe "the loans of a request" $ do
           holding 2 pool $
             race
               -- Each of these needs two buffers free, and one is at most.
-              (const () ^>> together (replicate 64 (request pool (arr (const ())))))
+              (done >>> together (replicate 64 (request pool done)))
               ( steps
                   [ at 1 (borrowInto bPrimary),
                     at 1 (borrowInto bExtra),
@@ -243,7 +245,7 @@ spec = describe "the loans of a request" $ do
                     giveBack aExtra
                   ]
               )
-              >>^ const ()
+              >>> done
 
       it "fails a borrow that is still waiting when its request ends" $ do
         pool <- newTestPool 2 1 1
@@ -280,10 +282,10 @@ spec = describe "the loans of a request" $ do
                 [ at 1 (proceeds (borrowInto bExtra)),
                   -- The deadline of the borrow and the return of the buffer that it waits for come together, or one first.
                   together
-                    [ at 0 (within (micros (fromIntegral index * 3)) (scope borrow (arr fst >>> release) blockForever)) >>> arr (const ()),
-                      const () ^>> sleep (micros (fromIntegral index * 3)) >>> giveBack bExtra
+                    [ at 0 (within (micros (fromIntegral index * 3)) (whileBorrowing blockForever)) >>> done,
+                      done >>> sleep (micros (fromIntegral index * 3)) >>> giveBack bExtra
                     ],
-                  now (\_ -> requestFree pool) >>> now (\free -> length free `shouldBe` 1)
+                  now (const (requestFree pool >>= \free -> length free `shouldBe` 1))
                 ]
         run $ holding 2 pool $ steps ([at 0 (borrowInto aPrimary), at 1 (borrowInto bPrimary)] ++ map iteration [0 .. 99])
         length <$> requestFree pool `shouldReturn` 3
@@ -299,14 +301,14 @@ spec = describe "the loans of a request" $ do
               steps
                 [ at 0 (borrowInto aPrimary),
                   together
-                    [ at 0 (within (micros (fromIntegral index * 3)) (scope borrow (arr fst >>> release) blockForever)) >>> arr (const ()),
-                      const () ^>> sleep (micros (fromIntegral index * 3)) >>> giveBack aPrimary
+                    [ at 0 (within (micros (fromIntegral index * 3)) (whileBorrowing blockForever)) >>> done,
+                      done >>> sleep (micros (fromIntegral index * 3)) >>> giveBack aPrimary
                     ],
                   -- The request has its primary again, and it is the same buffer, and nothing was added to the pool.
                   at 0 (proceeds (borrowInto again)),
                   sameMemory aPrimary again,
                   giveBack again,
-                  now (\_ -> requestFree pool) >>> now (\free -> length free `shouldBe` 0)
+                  now (const (requestFree pool >>= \free -> length free `shouldBe` 0))
                 ]
         run $ holding 2 pool $ steps ([at 1 (borrowInto bPrimary), at 1 (borrowInto bExtra)] ++ map iteration [0 .. 99])
 
@@ -319,8 +321,7 @@ spec = describe "the loans of a request" $ do
         escaped <- newIORef Nothing
         run $ request pool (steps [borrowInto primary, borrowInto extra, now (writeIORef escaped . Just)])
         run $
-          now (\_ -> readIORef escaped)
-            >>> now (maybe (failTest "no loans escaped") pure)
+          now (const (readIORef escaped >>= maybe (failTest "no loans escaped") pure))
             >>> failsWith "request buffer access is closed" borrow
         run $
           request pool $
@@ -330,7 +331,7 @@ spec = describe "the loans of a request" $ do
                 giveBack primary,
                 giveBack extra,
                 -- Had those two returned buffers, a request could be admitted.
-                stillWaits (const () ^>> request pool (arr (const ()))),
+                stillWaits (idleRequest pool),
                 giveBack freshExtra,
                 giveBack fresh
               ]
@@ -345,9 +346,9 @@ spec = describe "the loans of a request" $ do
           request pool $
             together
               [ steps [borrowInto primary, borrowInto extra, raise entered, awaitSignal hold, giveBack extra, giveBack primary],
-                steps [awaitSignal entered, stillWaits (const () ^>> request pool (arr (const ()))), raise hold]
+                steps [awaitSignal entered, stillWaits (idleRequest pool), raise hold]
               ]
-        run $ proceeds (request pool (arr (const ())))
+        run $ proceeds (request pool done)
 
       it "gives back the loan of a part that is cancelled, for the other parts of the request to borrow" $ do
         pool <- newTestPool 1 1 1
@@ -357,7 +358,7 @@ spec = describe "the loans of a request" $ do
         run $
           request pool $
             steps
-              [ race (scope borrow (arr fst >>> release) (raise inChild >>> blockForever)) (awaitSignal inChild) >>> arr (const ()),
+              [ race (whileBorrowing (raise inChild >>> blockForever)) (awaitSignal inChild) >>> done,
                 borrowInto first',
                 borrowInto second',
                 differentMemory first' second',
@@ -369,7 +370,7 @@ spec = describe "the loans of a request" $ do
         pool <- newTestPool 1 1 1
         run $
           steps
-            [ failsWith "the script failed" (request pool (borrowTwice >>> now (\_ -> ioError (userError "the script failed")))),
+            [ failsWith "the script failed" (request pool (borrowTwice >>> now (const (ioError (userError "the script failed"))))),
               proceeds (request pool borrowTwice)
             ]
 
@@ -390,13 +391,13 @@ spec = describe "the loans of a request" $ do
                   [ at 1 (borrowInto bPrimary),
                     at 1 (borrowInto bExtra),
                     at 0 (borrowInto aPrimary),
-                    stillWaits (const () ^>> request pool (arr (const ()))),
+                    stillWaits (idleRequest pool),
                     at 0 (stillWaits borrow),
                     giveBack bExtra,
                     at 0 (proceeds (borrowInto aExtra)),
                     giveBack aExtra
                   ],
-              proceeds (holding 2 pool (arr (const ())))
+              proceeds (holding 2 pool done)
             ]
         length <$> requestFree pool `shouldReturn` 3
 
@@ -436,7 +437,7 @@ spec = describe "the loans of a request" $ do
           request pool $
             (borrow &&& borrow)
               >>> now (\(primary, extra) -> map (bufferCapacity . loanBuffer) [primary, extra] `shouldBe` [1, 1])
-              >>> arr (const ())
+              >>> done
 
   describe "across cores" $ do
     it "gives the primary of a request that ends to a request that waits on another core" $ do
@@ -498,7 +499,7 @@ spec = describe "the loans of a request" $ do
                       ++ concat
                         [ [ proceeds (borrowInto bExtra),
                             raise started,
-                            const () ^>> sleep (deadline index) >>> giveBack bExtra,
+                            done >>> sleep (deadline index) >>> giveBack bExtra,
                             awaitSignal finished
                           ]
                           | (index, started, finished) <- turns
@@ -509,7 +510,7 @@ spec = describe "the loans of a request" $ do
                     [borrowInto aPrimary, raise aIn]
                       ++ concat
                         [ [ awaitSignal started,
-                            within (deadline index) (scope borrow (arr fst >>> release) blockForever) >>> arr (const ()),
+                            within (deadline index) (whileBorrowing blockForever) >>> done,
                             raise finished
                           ]
                           | (index, started, finished) <- turns
@@ -535,26 +536,34 @@ spec = describe "the loans of a request" $ do
 -- back, some fail, some are cancelled while they wait to be admitted or to borrow or while they hold their loans, some have
 -- parts of their own that borrow, and some set up.
 stress :: (Runtime arr) => BufferPool -> Int -> arr () ()
-stress pool part = const part ^>> timesWith 40 turn >>> arr (const ())
+stress pool part = const part ^>> timesWith 40 turn >>> done
   where
-    turn = (\index -> (index `mod` 7, index + 1)) ^>> first (choose kinds) >>^ snd
+    turn = (`mod` 7) &&& (+ 1) ^>> consume (choose kinds)
     kinds =
       [ request pool useBoth,
-        within (micros 60) (request pool useBoth) >>> arr (const ()),
-        tryA (request pool ((borrow &&& borrow) >>> now (\_ -> ioError (userError "the script failed")))) >>> arr (const ()),
-        within (micros 80) (withSetupBuffers @(Solo Buffer) pool (arr (const ()))) >>> arr (const ()),
+        within (micros 60) (request pool useBoth) >>> done,
+        tryA (request pool ((borrow &&& borrow) >>> now (const (ioError (userError "the script failed"))))) >>> done,
+        within (micros 80) (withSetupBuffers @(Solo Buffer) pool done) >>> done,
         request pool (together [borrow >>> release, borrow >>> release]),
-        within (micros 120) (request pool ((borrow &&& borrow) >>> blockForever)) >>> arr (const ()),
-        withSetupBuffers @(Buffer, Buffer) pool (arr (const ()))
+        within (micros 120) (request pool ((borrow &&& borrow) >>> blockForever)) >>> done,
+        withSetupBuffers @(Buffer, Buffer) pool done
       ]
+
+-- | A request of the pool that does nothing, whatever the input.
+idleRequest :: (Runtime arr) => BufferPool -> arr x ()
+idleRequest pool = done >>> request pool done
+
+-- | Borrows a loan, runs the body, and releases the loan when the body ends, fails or is cancelled.
+whileBorrowing :: (Runtime arr) => arr (Loan, Loans) b -> arr Loans b
+whileBorrowing = scope borrow (fst ^>> release)
 
 -- | A script that borrows twice, so that the request holds its primary and an extra loan, and keeps them.
 borrowTwice :: (Runtime arr) => arr Loans ()
-borrowTwice = steps [borrow >>> arr (const ()), borrow >>> arr (const ())]
+borrowTwice = steps [borrow >>> done, borrow >>> done]
 
 -- | A script that borrows twice and gives both back.
 useBoth :: (Runtime arr) => arr Loans ()
-useBoth = (borrow &&& borrow) >>> (release *** release) >>> arr (const ())
+useBoth = (borrow &&& borrow) >>> (release *** release) >>> done
 
 -- | Every buffer of the pools is free, once each, and nobody waits.
 checkInventory :: BufferPool -> Int -> Int -> IO ()

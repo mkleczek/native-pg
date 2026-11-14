@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | Measures what crosses cores. Run with @+RTS -T@ (allocation) and @-N@ for the cores it uses:
 --
@@ -36,10 +37,11 @@
 -- * @deadline KIND SAMPLES@: how late a deadline of 5 ms passes, on a scheduler that has nothing else to do.
 module Main (main) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (***), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (&&&), (***), (>>>), (^>>))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (evaluate, finally)
 import Control.Monad (replicateM, unless, void, when)
+import Data.Bool (bool)
 import Data.Functor (($>))
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.List (sort)
@@ -53,7 +55,7 @@ import Network.Directions.PingPong
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (concurrently, keeping, times, timesWith, untilJust)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, concurrently, done, iterateWith, keeping, localTicket, tap, times, timesWith, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (Report (..))
@@ -109,7 +111,7 @@ pingPongRun kind rounds = do
     "compiled-anywhere" -> void (runCompiled (pingPongAt @'Anywhere rounds) ())
     "remote" -> void (runCores 2 (pure handoff) (\shared core -> if core == 0 then find shared >>> client rounds else leave shared >>> server rounds))
     "threads" -> runThreads (pingPong rounds) ()
-    "remote-threads" -> runThreads (concurrently (find handoff >>> client rounds) (leave handoff >>> server rounds) >>> arr (const ())) ()
+    "remote-threads" -> runThreads (concurrently (find handoff >>> client rounds) (leave handoff >>> server rounds) >>> done) ()
     _ -> ioError (userError ("pingpong: no kind " <> kind))
   printf "pingpong %s rounds=%d ns_per_rt=%.1f bytes_per_rt=%.1f\n" kind rounds (seconds * 1e9 / fromIntegral rounds) (fromIntegral bytes / fromIntegral rounds :: Double)
 
@@ -130,10 +132,9 @@ count (Counter pointer) = withForeignPtr pointer peek
 
 -- | A part that checks a connection out, works a little while it has it, and releases it, until told to stop.
 part :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> IORef Bool -> Counter -> arr () ()
-part pool stop counter = loop
+part pool stop counter = iterateWith (now (const (bool (Again ()) (Finish ()) <$> readIORef stop))) turn
   where
-    loop = now (\() -> readIORef stop) >>> (\stopped -> if stopped then Left () else Right ()) ^>> (returnA ||| turn)
-    turn = checkout pool >>> now hold >>> release pool >>> loop
+    turn = checkout pool >>> now hold >>> release pool
     hold conn = (bump counter *> evaluate (work 40 conn)) $> conn
     work :: Int -> Int -> Int
     work 0 acc = acc
@@ -144,7 +145,7 @@ part pool stop counter = loop
 balanced :: (Arrow arr, Concurrent arr, Exchange arr (Local arr)) => [arr () ()] -> arr () ()
 balanced [] = returnA
 balanced [one] = one
-balanced parts' = let (front, back) = splitAt (length parts' `div` 2) parts' in concurrently (balanced front) (balanced back) >>> arr (const ())
+balanced parts' = let (front, back) = splitAt (length parts' `div` 2) parts' in concurrently (balanced front) (balanced back) >>> done
 
 poolRun :: String -> Int -> Int -> Int -> Int -> IO ()
 poolRun kind cores parts conns seconds = do
@@ -200,12 +201,12 @@ loansRun kind variant parts rounds = do
     newBufferPool (BufferPoolSettings size ordinary reserved setup)
   let body :: (Runtime arr) => arr Loans.Loans ()
       body = case variant of
-        "request" -> arr (const ())
+        "request" -> done
         "primary" -> Loans.borrow >>> Loans.release
-        "both" -> (Loans.borrow &&& Loans.borrow) >>> (Loans.release *** Loans.release) >>> arr (const ())
+        "both" -> (Loans.borrow &&& Loans.borrow) >>> (Loans.release *** Loans.release) >>> done
         _ -> error ("loans: no variant " <> variant)
       oneRequest :: (Runtime arr) => arr () ()
-      oneRequest = Loans.withRequestBuffers pool (arr fst >>> body)
+      oneRequest = Loans.withRequestBuffers pool (fst ^>> body)
       program :: RuntimeProgram ()
       program = case kind of
         "threads" -> balanced (replicate parts (times rounds oneRequest))
@@ -217,17 +218,22 @@ loansRun kind variant parts rounds = do
 -- | A client and a server over a socket pair: the client sends a byte and waits for it to come back, and the server
 -- sends back each byte it receives, for the rounds. The buffers are what each receives into.
 socketPingPong :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Buffer -> Buffer -> Int -> arr (Socket, Socket) ()
-socketPingPong forClient forServer rounds = together [arr fst >>> timesWith rounds clientStep >>^ const (), arr snd >>> timesWith rounds serverStep >>^ const ()]
+socketPingPong forClient forServer rounds =
+  together [fst ^>> timesWith rounds clientStep >>> done, snd ^>> timesWith rounds serverStep >>> done]
   where
-    clientStep = (\end -> ((end, [view forClient 1]), end)) ^>> first sendAll >>> (\((), end) -> ((end, roomOf forClient), end)) ^>> first receive >>^ snd
-    serverStep = (\end -> ((end, roomOf forServer), end)) ^>> first receive >>> (\(_, end) -> ((end, [view forServer 1]), end)) ^>> first sendAll >>^ snd
+    clientStep =
+      tap ((,[view forClient 1]) ^>> sendAll)
+        >>> tap ((,roomOf forClient) ^>> receive >>> done)
+    serverStep =
+      tap ((,roomOf forServer) ^>> receive >>> done)
+        >>> tap ((,[view forServer 1]) ^>> sendAll)
 
 socketsRun :: String -> Int -> Int -> IO ()
 socketsRun kind pairs rounds = do
   sockets <- replicateM pairs (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol)
   buffers <- replicateM pairs ((,) <$> newBuffer (positiveInt @16) <*> newBuffer (positiveInt @16))
   let program :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr () ()
-      program = together [arr (const ends) >>> socketPingPong forClient forServer rounds | (ends, (forClient, forServer)) <- zip sockets buffers]
+      program = together [const ends ^>> socketPingPong forClient forServer rounds | (ends, (forClient, forServer)) <- zip sockets buffers]
   (seconds, bytes) <-
     measured
       ( case kind of
@@ -247,7 +253,7 @@ wakeRun kind samples = do
     "delimited" -> do
       reports <- runCoresReport 2 (pure wake) (\shared core -> if core == 0 then sleeper shared samples else waker shared 500 samples)
       pure (Just (sum (map (reportWaits . snd) (take 1 reports))))
-    "threads" -> Nothing <$ runThreads (concurrently (sleeper wake samples) (waker wake 500 samples) >>> arr (const ())) ()
+    "threads" -> Nothing <$ runThreads (concurrently (sleeper wake samples) (waker wake 500 samples) >>> done) ()
     _ -> ioError (userError ("wake: no kind " <> kind))
   latencies <- sort . map fromIntegral <$> wakeLatencies wake :: IO [Double]
   let at :: Double -> Double
@@ -265,17 +271,17 @@ runProgram kind program = case kind of
   _ -> ioError (userError ("no kind " <> kind))
 
 -- | A part that holds nothing, and waits for ever in a scope of its own, once it has counted itself in.
-waiter :: forall arr. (Arrow arr, Effect arr, Exchange arr (Local arr), Scope arr) => IORef Int -> arr () ()
-waiter waiting = scope returnA (arr (const ())) (arr snd >>> now (\() -> atomicModifyIORef' waiting (\n -> (n + 1, ()))) >>> ticket @arr @(Local arr) >>> arr fst >>> await)
+waiter :: (Arrow arr, Effect arr, Exchange arr (Local arr), Scope arr) => IORef Int -> arr () ()
+waiter waiting = scope returnA done (now (const (atomicModifyIORef' waiting (\n -> (n + 1, ())))) >>> localTicket >>> fst ^>> await)
 
 -- | The loop in the first part (VARIANT @bare@), in a half of a pair, or, with that many parts that wait beside it,
 -- in a half of a race with them, which begins once they all wait: so that the run of the loop and the run of
 -- nothing both make and end the parts, and what is measured is the loop.
 inside :: (ArrowChoice arr, Effect arr, GiveWay arr, Concurrent arr, Race arr, Exchange arr (Local arr), Scope arr) => IORef Int -> String -> Int -> arr () () -> arr () ()
 inside waiting variant parts loop
-  | parts > 0 = race (untilJust ((\n -> if n == parts then Just () else Nothing) <$> readIORef waiting) >>> loop) (balanced (replicate parts (waiter waiting))) >>^ const ()
+  | parts > 0 = race (untilJust ((\n -> if n == parts then Just () else Nothing) <$> readIORef waiting) >>> loop) (balanced (replicate parts (waiter waiting))) >>> done
   | variant == "bare" = loop
-  | otherwise = concurrently loop returnA >>^ const ()
+  | otherwise = concurrently loop returnA >>> done
 
 -- | Measures the program that @inside@ makes of the loop: the time and the bytes.
 measuredInside :: String -> String -> Int -> Program () -> IO (Double, Integer)
@@ -288,8 +294,8 @@ scopeRun kind variant rounds parts = do
   when (parts > 0 && variant == "bare") $ ioError (userError "scope: with PARTS the loop is in a half: VARIANT half or pair")
   let step :: Program ()
       step = case variant of
-        "pair" -> concurrently returnA returnA >>^ const ()
-        _ -> scope returnA (arr (const ())) (arr snd)
+        "pair" -> concurrently returnA returnA >>> done
+        _ -> scope returnA done (arr snd)
   -- Once to warm up, then each measured.
   void (measuredInside kind variant parts (timesWith rounds returnA))
   (baseSeconds, baseBytes) <- measuredInside kind variant parts (timesWith rounds returnA)
@@ -302,14 +308,14 @@ cancelRun kind samples = do
   stamp <- newIORef 0
   latencies <- newIORef []
   let released :: (Effect arr) => arr a ()
-      released = now (\_ -> monotonicNanoseconds >>= \late -> readIORef stamp >>= \early -> modifyIORef' latencies ((late - early) :))
+      released = now (const (monotonicNanoseconds >>= \late -> readIORef stamp >>= \early -> modifyIORef' latencies ((late - early) :)))
       -- The other part waits a little first, so that this one waits when it ends.
       winner :: (Effect arr) => arr () ()
-      winner = now (\() -> threadDelay 200 *> monotonicNanoseconds >>= atomicWriteIORef stamp)
-      waits :: forall arr a. (Arrow arr, Exchange arr (Local arr)) => arr a ()
-      waits = arr (const ()) >>> ticket @arr @(Local arr) >>> arr fst >>> await
+      winner = now (const (threadDelay 200 *> monotonicNanoseconds >>= atomicWriteIORef stamp))
+      waits :: (Arrow arr, Exchange arr (Local arr)) => arr a ()
+      waits = done >>> localTicket >>> fst ^>> await
       program :: Program ()
-      program = timesWith samples (race (scope returnA released (arr snd >>> waits)) winner >>^ const ())
+      program = timesWith samples (race (scope returnA released (snd ^>> waits)) winner >>> done)
   runProgram kind program
   sorted <- sort . map fromIntegral <$> readIORef latencies :: IO [Double]
   let at :: Double -> Double
@@ -323,7 +329,7 @@ withinRun kind variant rounds parts = do
   when (parts > 0 && variant == "bare") $ ioError (userError "within: with PARTS the loop is in a half: VARIANT half")
   void (measuredInside kind variant parts (timesWith rounds returnA))
   (baseSeconds, baseBytes) <- measuredInside kind variant parts (timesWith rounds returnA)
-  (limitedSeconds, limitedBytes) <- measuredInside kind variant parts (timesWith rounds (within (secs 10) returnA >>^ const ()))
+  (limitedSeconds, limitedBytes) <- measuredInside kind variant parts (timesWith rounds (within (secs 10) returnA >>> done))
   printf "within %s %s rounds=%d parts=%d ns_per_within=%.1f bytes_per_within=%.1f\n" kind variant rounds parts ((limitedSeconds - baseSeconds) * 1e9 / fromIntegral rounds) (fromIntegral (limitedBytes - baseBytes) / fromIntegral rounds :: Double)
 
 -- | How late a deadline passes: the time from setting it to the end of the part that waits under it, less the
@@ -331,12 +337,12 @@ withinRun kind variant rounds parts = do
 deadlineRun :: String -> Int -> IO ()
 deadlineRun kind samples = do
   lateness <- newIORef []
-  let waits :: forall arr. (Arrow arr, Exchange arr (Local arr)) => arr () ()
-      waits = ticket @arr @(Local arr) >>> arr fst >>> await
+  let waits :: (Arrow arr, Exchange arr (Local arr)) => arr () ()
+      waits = localTicket >>> fst ^>> await
       program :: Program ()
       program =
         timesWith samples $
-          keeping (now (\() -> monotonicNanoseconds))
+          keeping (now (const monotonicNanoseconds))
             >>> second (within (millis 5) waits)
             >>> now (\(started, _) -> monotonicNanoseconds >>= \ended -> modifyIORef' lateness ((ended - started - 5000000) :))
   runProgram kind program

@@ -1,11 +1,12 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | The waits of the arrows that run every part on one thread, on descriptors that are reused, that are ready before
 -- anything waits for them, that two parts wait on, or that move between cores: the same programs for every arrow that
 -- has what they need, over socket pairs.
 module DescriptorsSpec (spec) where
 
-import Control.Arrow (ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (ArrowChoice, arr, first, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Monad (forM_, when)
 import qualified Data.ByteString as BS
@@ -16,7 +17,7 @@ import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes hiding (within)
 import qualified Network.Streaming.Classes as Classes (within)
-import Network.Streaming.Combinators (concurrently, keeping, sleep, untilJust)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, concurrently, consume, done, iterateWith, keeping, sleep, tap, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Mode (Instrumented, ModeOf)
@@ -106,11 +107,15 @@ receiveByte = now (\(reader, _) -> (\buffer -> (reader, roomOf buffer)) <$> newB
 
 -- | Sends a byte on the second socket.
 sendByte :: (Rich arr) => arr Pair Pair
-sendByte = (\pair@(_, sender) -> ((sender, [BS.singleton 7]), pair)) ^>> first sendAll >>^ snd
+sendByte = tap ((,[BS.singleton 7]) . snd ^>> sendAll)
+
+-- | A wait for input with a deadline: whether the deadline passed first.
+timesOut :: (Rich arr) => arr Pair Bool
+timesOut = Classes.within (millis 10) receiveByte >>^ isNothing
 
 -- | Goes on with what came in after the time.
 after :: (Rich arr) => Duration -> arr a a
-after duration = ((),) ^>> first (sleep duration) >>^ snd
+after duration = keeping (sleep duration) >>^ snd
 
 -- | One part waits for a byte, which another part sends a little later: how many bytes the first got.
 exchange :: (Rich arr) => arr Pair Int
@@ -118,18 +123,18 @@ exchange = concurrently receiveByte (after (millis 5) >>> sendByte) >>^ fst
 
 -- | One wait on the pair, which stays as it was.
 exchangeThenKeep :: (Rich arr) => arr Pair Pair
-exchangeThenKeep = (\pair -> (pair, pair)) ^>> first exchange >>^ snd
+exchangeThenKeep = tap (exchange >>> done)
 
 -- | A pair is made, one wait is made on it, and it is closed: the number of its first descriptor and the bytes got.
 used :: (Rich arr) => arr () (Int, Int)
-used = now (const newPair) >>> (\pair -> (pair, pair)) ^>> first exchange >>> now (\(count, pair) -> (, count) <$> closing pair)
+used = now (const newPair) >>> alongside exchange >>> now (\(count, pair) -> (, count) <$> closing pair)
 
 -- * Programs
 
 -- | A pair is used and closed, and a second pair, which gets its numbers, is used the same: whether the numbers are the
 -- same, and the bytes each wait got.
 reusedNumber :: (Rich arr) => arr () (Bool, Int, Int)
-reusedNumber = used >>> (,()) ^>> second used >>^ \((n1, c1), (n2, c2)) -> (n1 == n2, c1, c2)
+reusedNumber = used >>> keeping used >>^ \((n2, c2), (n1, c1)) -> (n1 == n2, c1, c2)
 
 -- | A byte arrives on a socket that a part waited on before, while nothing waits for it, and a few rounds pass; a part
 -- that then waits for input finds it: the bytes it receives once it has.
@@ -143,7 +148,7 @@ arrivedBefore =
 
 -- | Waits for input on the first socket, which may be there already, and receives it: how many bytes.
 awaitThenReceive :: (Rich arr) => arr Pair Int
-awaitThenReceive = (\pair@(reader, _) -> (reader, pair)) ^>> first awaitInput >>> arr snd >>> receiveByte
+awaitThenReceive = tap (fst ^>> awaitInput) >>> receiveByte
 
 -- | The bytes that one part of 'bothWays' sends: more than the buffers of a socket pair hold.
 flood :: Int
@@ -153,38 +158,45 @@ flood = 4194304
 -- too, while a third drains the other end and then sends the byte that the first waits for: the bytes the first got and
 -- the bytes drained.
 bothWays :: (Rich arr) => arr () (Int, Int)
-bothWays = now (const setup) >>> concurrently reading (concurrently writing draining) >>^ (\(got, (_, drained)) -> (got, drained))
+bothWays = now (const setup) >>> concurrently reading (concurrently writing draining) >>^ second snd
   where
-    setup = (,,) <$> newPair <*> newBuffer (positiveInt @16384) <*> newBuffer (positiveInt @16384)
-    reading = now (\((reader, _), _, _) -> (\buffer -> (reader, roomOf buffer)) <$> newBuffer (positiveInt @16)) >>> receive
-    writing = (\((writer, _), big, _) -> (writer, replicate (flood `div` 16384) (view big 16384))) ^>> sendAll
-    draining =
-      (\((_, other), _, big) -> ((other, big), (other, big)))
-        ^>> first drain
-        >>> (\(drained, (other, big)) -> ((other, [view big 1]), drained))
-        ^>> first sendAll
-        >>^ snd
+    setup = Rig <$> newPair <*> newBuffer (positiveInt @16384) <*> newBuffer (positiveInt @16384)
+    reading = rigPair ^>> receiveByte
+    writing = flooding ^>> sendAll
+    flooding rig = (fst (rigPair rig), replicate (flood `div` 16384) (view (rigFloodBuffer rig) 16384))
+    draining = toDrain ^>> alongside drain >>> second (oneByte ^>> sendAll) >>^ fst
+    toDrain rig = (snd (rigPair rig), rigDrainBuffer rig)
+    oneByte (other, big) = (other, [view big 1])
+
+-- | What the parts of 'bothWays' use: the pair of sockets, the buffer that the flood is sent from, and the buffer that
+-- the drain receives into.
+data Rig = Rig {rigPair :: Pair, rigFloodBuffer :: Buffer, rigDrainBuffer :: Buffer}
 
 -- | Receives from the socket until the bytes of 'flood' have come: how many came.
 drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr (Socket, Buffer) Int
-drain = (\(end, buffer) -> (end, buffer, 0)) ^>> loop
+drain = started ^>> iterateWith (arr finished) (alongside (room ^>> receive) >>^ received)
   where
-    loop = (\state@(_, _, got) -> if got >= flood then Left got else Right state) ^>> (returnA ||| step)
-    step = (\(end, buffer, got) -> ((end, roomOf buffer), (end, buffer, got))) ^>> first receive >>> (\(count, (end, buffer, got)) -> (end, buffer, got + count)) ^>> loop
+    started (end, buffer) = Draining end buffer 0
+    finished draining = if drainGot draining >= flood then Finish (drainGot draining) else Again draining
+    room draining = (drainEnd draining, roomOf (drainBuffer draining))
+    received (count, draining) = draining {drainGot = drainGot draining + count}
+
+-- | Where 'drain' is: the socket that it receives from, the buffer that it receives into, and how many bytes came.
+data Draining = Draining {drainEnd :: Socket, drainBuffer :: Buffer, drainGot :: Int}
 
 -- | A part waits for input with a deadline that passes first, and the pair is closed: a second pair, which gets its
 -- numbers, is used for a wait: whether the numbers are the same, whether the first wait was cancelled, and the bytes
 -- the second got.
 cancelledThenReused :: (Rich arr) => arr () (Bool, Bool, Int)
-cancelledThenReused = abandoned >>> (,()) ^>> second used >>^ \((n1, cancelled), (n2, count)) -> (n1 == n2, cancelled, count)
+cancelledThenReused = abandoned >>> keeping used >>^ \((n2, count), (n1, cancelled)) -> (n1 == n2, cancelled, count)
   where
-    abandoned = now (const newPair) >>> (\pair -> (pair, pair)) ^>> first (Classes.within (millis 10) receiveByte >>^ isNothing) >>> now (\(cancelled, pair) -> (, cancelled) <$> closing pair)
+    abandoned = now (const newPair) >>> alongside timesOut >>> now (\(cancelled, pair) -> (, cancelled) <$> closing pair)
 
 -- | A part waits for input with a deadline that passes first, a byte arrives on the socket afterwards, and a few
 -- rounds pass; a part that then waits for input finds it: whether the first wait was cancelled, and the bytes the
 -- second got.
 cancelledThenArrived :: (Rich arr) => arr () (Bool, Int)
-cancelledThenArrived = now (const newPair) >>> (\pair -> (pair, pair)) ^>> first (Classes.within (millis 10) receiveByte >>^ isNothing) >>> second (sendByte >>> after (millis 20) >>> awaitThenReceive)
+cancelledThenArrived = now (const newPair) >>> alongside timesOut >>> second (sendByte >>> after (millis 20) >>> awaitThenReceive)
 
 -- * Two cores
 
@@ -202,20 +214,19 @@ handedOver :: CoresProgram (Bool, Int)
 handedOver (Shared shelf closed) core
   | core == 0 =
       now (const (newPair >>= \pair -> (,) pair <$> number (fst pair)))
-        >>> first (exchangeThenKeep >>> handOver >>> after (millis 20) >>> sendByte >>> closedByTheOther >>> closeOther)
-        >>> arr snd
+        >>> consume (exchangeThenKeep >>> handOver >>> after (millis 20) >>> sendByte >>> closedByTheOther >>> closeOther >>> done)
         >>> now (\n1 -> newPair >>= \pair -> (\n2 -> (n1 == n2, pair)) <$> number (fst pair))
-        >>> second ((\pair -> (pair, pair)) ^>> first exchange >>> now (\(count, pair) -> count <$ closing pair))
+        >>> second (alongside exchange >>> now (\(count, pair) -> count <$ closing pair))
   | otherwise =
       ticket @_ @'Anywhere
         >>> now (\(awaiting, giver) -> awaiting <$ atomicWriteIORef shelf (Just giver))
         >>> await
         >>> now (\socket -> (\buffer -> (socket, roomOf buffer)) <$> newBuffer (positiveInt @16))
-        >>> (\(socket, room) -> ((socket, room), socket)) ^>> first receive
+        >>> (id &&& fst) ^>> first receive
         >>> second (now (\socket -> Socket.close socket *> atomicWriteIORef closed True))
-        >>^ \(count, ()) -> (True, count)
+        >>^ (True,) . fst
   where
     -- Waits for the second core's ticket, and gives it the first socket.
-    handOver = keeping (untilJust (readIORef shelf)) >>> (\(giver, pair@(reader, _)) -> ((giver, reader), pair)) ^>> first give >>^ snd
+    handOver = keeping (untilJust (readIORef shelf)) >>> tap (second fst ^>> give >>> done) >>^ snd
     closedByTheOther = keeping (untilJust (fmap (\raised -> if raised then Just () else Nothing) (readIORef closed))) >>^ snd
     closeOther = now (\pair@(_, other) -> pair <$ Socket.close other)

@@ -21,9 +21,11 @@ module Network.Streaming.With
   )
 where
 
-import Control.Arrow (Arrow (..), ArrowChoice (..), (>>>))
+import Control.Arrow (Arrow (..), ArrowChoice (..), (>>>), (>>^), (^>>))
 import Control.Category (Category (..))
+import Data.Tuple (swap)
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Mode (ModeOf)
 import Prelude hiding (id, (.))
 
@@ -37,12 +39,12 @@ ask = With (arr fst)
 
 -- | The arrow on the environment: what it gives, whatever the input.
 asks :: (Arrow arr) => arr r b -> With r arr a b
-asks step = With (arr fst >>> step)
+asks step = With (fst ^>> step)
 {-# INLINE asks #-}
 
 -- | An arrow of @arr@, which doesn't look at the environment.
 lift :: (Arrow arr) => arr a b -> With r arr a b
-lift step = With (arr snd >>> step)
+lift step = With (snd ^>> step)
 {-# INLINE lift #-}
 
 -- | The arrow of @arr@ that takes the environment before its input.
@@ -52,51 +54,63 @@ with (With step) = step
 
 -- | The arrow of @arr@ that takes only the environment, for a program that is given no other input.
 withOnly :: (Arrow arr) => With r arr () b -> arr r b
-withOnly (With step) = arr (,()) >>> step
+withOnly (With step) = (,()) ^>> step
 {-# INLINE withOnly #-}
 
 instance (Arrow arr) => Category (With r arr) where
   id = With (arr snd)
   {-# INLINE id #-}
-  With after . With before = With (arr (\(r, a) -> ((r, a), r)) >>> first before >>> arr (\(b, r) -> (r, b)) >>> after)
+  With after . With before = With ((\(r, a) -> ((r, a), r)) ^>> first before >>> swap ^>> after)
   {-# INLINE (.) #-}
 
 instance (Arrow arr) => Arrow (With r arr) where
   arr function = With (arr (function . snd))
   {-# INLINE arr #-}
-  first (With inner) = With (arr (\(r, (a, c)) -> ((r, a), c)) >>> first inner)
+  first (With inner) = With ((\(r, (a, c)) -> ((r, a), c)) ^>> first inner)
   {-# INLINE first #-}
-  second (With inner) = With (arr (\(r, (c, a)) -> (c, (r, a))) >>> second inner)
+  second (With inner) = With ((\(r, (c, a)) -> (c, (r, a))) ^>> second inner)
   {-# INLINE second #-}
-  With one *** With two = With (arr (\(r, (a, c)) -> ((r, a), (r, c))) >>> one *** two)
+  With one *** With two = With ((\(r, (a, c)) -> ((r, a), (r, c))) ^>> one *** two)
   {-# INLINE (***) #-}
-  With one &&& With two = With (arr (\(r, a) -> ((r, a), (r, a))) >>> one *** two)
+  With one &&& With two = With ((\(r, a) -> ((r, a), (r, a))) ^>> one *** two)
   {-# INLINE (&&&) #-}
 
 instance (ArrowChoice arr) => ArrowChoice (With r arr) where
-  left (With inner) = With (arr (\(r, choice) -> either (Left . (r,)) Right choice) >>> left inner)
+  left (With inner) = With ((\(r, choice) -> either (Left . (r,)) Right choice) ^>> left inner)
   {-# INLINE left #-}
-  right (With inner) = With (arr (\(r, choice) -> fmap (r,) choice) >>> right inner)
+  right (With inner) = With ((\(r, choice) -> fmap (r,) choice) ^>> right inner)
   {-# INLINE right #-}
-  With one +++ With two = With (arr (\(r, choice) -> either (Left . (r,)) (Right . (r,)) choice) >>> one +++ two)
+  With one +++ With two = With ((\(r, choice) -> either (Left . (r,)) (Right . (r,)) choice) ^>> one +++ two)
   {-# INLINE (+++) #-}
-  With one ||| With two = With (arr (\(r, choice) -> either (Left . (r,)) (Right . (r,)) choice) >>> (one ||| two))
+  With one ||| With two = With ((\(r, choice) -> either (Left . (r,)) (Right . (r,)) choice) ^>> (one ||| two))
   {-# INLINE (|||) #-}
 
 instance (Effect arr) => Effect (With r arr) where
   now action = With (now (action . snd))
   {-# INLINE now #-}
 
+instance (Functor (arr (r, a))) => Functor (With r arr a) where
+  fmap function (With inner) = With (fmap function inner)
+  {-# INLINE fmap #-}
+
+instance (Applicative (arr (r, a))) => Applicative (With r arr a) where
+  pure result = With (pure result)
+  {-# INLINE pure #-}
+  With function <*> With argument = With (function <*> argument)
+  {-# INLINE (<*>) #-}
+
+instance (ArrowApplicative arr) => ArrowApplicative (With r arr)
+
 instance (Arrow arr, GiveWay arr) => GiveWay (With r arr) where
-  giveWay = With (arr snd >>> giveWay)
+  giveWay = With (snd ^>> giveWay)
   {-# INLINE giveWay #-}
 
 instance (Arrow arr, Block arr) => Block (With r arr) where
-  block = With (arr snd >>> block)
+  block = With (snd ^>> block)
   {-# INLINE block #-}
 
 instance (Arrow arr, Time arr) => Time (With r arr) where
-  clock = With (arr (const ()) >>> clock)
+  clock = With (done >>> clock)
   {-# INLINE clock #-}
 
 -- | The deadline is the arrow's: the body is given the environment as it is.
@@ -110,8 +124,8 @@ instance (Arrow arr, Scope arr) => Scope (With r arr) where
     With $
       scope
         (arr fst &&& acquire)
-        (arr (\((r, acquired), exit) -> (r, (acquired, exit))) >>> release)
-        (arr (\((r, acquired), (_, a)) -> (r, (acquired, a))) >>> body)
+        ((\((r, acquired), exit) -> (r, (acquired, exit))) ^>> release)
+        ((\((r, acquired), (_, a)) -> (r, (acquired, a))) ^>> body)
   {-# INLINE scope #-}
   tryA (With inner) = With (tryA inner)
   {-# INLINE tryA #-}
@@ -133,13 +147,18 @@ type instance Local (With r arr) = Local arr
 -- | An arrow with an environment is built in the mode of its inner arrow.
 type instance ModeOf (With r arr) = ModeOf arr
 
+-- | The end of the inner arrow's ticket, from the input that has it beside the environment.
+innerWaiting :: (r, Waiting (With r arr) reach a) -> Waiting arr reach a
+innerWaiting (_, WithWaiting waiting) = waiting
+{-# INLINE innerWaiting #-}
+
 instance (Arrow arr, Exchange arr reach) => Exchange (With r arr) reach where
   newtype Waiting (With r arr) reach a = WithWaiting (Waiting arr reach a)
-  ticket = With (arr (const ()) >>> ticket >>> arr (first WithWaiting))
+  ticket = With (done >>> ticket >>^ first WithWaiting)
   {-# INLINE ticket #-}
-  await = With (arr (\(_, WithWaiting waiting) -> waiting) >>> await)
+  await = With (innerWaiting ^>> await)
   {-# INLINE await #-}
-  give = With (arr snd >>> give)
+  give = With (snd ^>> give)
   {-# INLINE give #-}
-  abandon = With (arr (\(_, WithWaiting waiting) -> waiting) >>> abandon)
+  abandon = With (innerWaiting ^>> abandon)
   {-# INLINE abandon #-}

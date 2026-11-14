@@ -17,7 +17,7 @@
 -- they wait for lands.
 module ScopeTransactionSpec (spec) where
 
-import Control.Arrow (arr, (>>>), (>>^))
+import Control.Arrow (arr, first, (>>>), (>>^), (^>>))
 import Control.Exception (ErrorCall (..), throwIO)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
@@ -57,7 +57,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
 
     it "sends nothing for a transaction that did nothing" $ withEnv' $ \env -> do
       pid <- pidOf env
-      onEnv env (request env (committed Tx.Read (pure ()) (\() -> arr (const ())))) `shouldReturn` Right ()
+      onEnv env (request env (committed Tx.Read (pure ()) (const done))) `shouldReturn` Right ()
       onEnv env (request env selectOne) `shouldReturn` Right [1]
       pidOf env `shouldReturn` pid
 
@@ -73,7 +73,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
 
     it "drains a field that was not read, and keeps the connection" $ withEnv' $ \env -> do
       pid <- pidOf env
-      onEnv env (request env (committed Tx.Read (Tx.statement (bodyOf 5000)) (\result -> Tx.single result >>> arr Tx.fieldLength)))
+      onEnv env (request env (committed Tx.Read (Tx.statement (bodyOf 5000)) (\result -> Tx.single result >>^ Tx.fieldLength)))
         `shouldReturn` Right 5000
       pidOf env `shouldReturn` pid
 
@@ -87,8 +87,8 @@ spec socketPath port = describe "operations and transactions in a request" $ for
         ( request env $
             committed Tx.Write (Tx.statement (plain "INSERT INTO scope_handled VALUES (1)" Tx.none)) $ \inserted ->
               Tx.discard inserted
-                >>> arr (const ((), ()))
-                >>> Tx.pipeline Tx.Open (Tx.statement divisionByZero) (attempt . Tx.single)
+                >>> const ((), ())
+                ^>> Tx.pipeline Tx.Open (Tx.statement divisionByZero) (attempt . Tx.single)
                 >>^ either (const True) (const False)
         )
         `shouldReturn` Right True
@@ -132,7 +132,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
           env
           ( withinFor (secs 2) $
               request env $
-                committed Tx.Read (Tx.statement sleepingAtTheEnd) (\result -> Tx.single result >>> measure >>> now (\_ -> writeIORef bodyDone True))
+                committed Tx.Read (Tx.statement sleepingAtTheEnd) (\result -> Tx.single result >>> measure >>> now (const (writeIORef bodyDone True)))
           )
       -- the request was closing, and not the body running, when the cancellation came
       readIORef bodyDone `shouldReturn` True
@@ -259,7 +259,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
               Tx.Write
               Tx.Final
               ((,) <$> Tx.command "INSERT INTO reply_commit VALUES (1)" <*> Tx.statement (numbersOf 3000))
-              (\(inserted, body) -> Tx.discard inserted >>> Tx.single body >>> copyOut >>> now (\delivered -> delivered `shouldBe` numbers 3000) >>> Tx.ending)
+              (\(inserted, body) -> Tx.discard inserted >>> Tx.single body >>> copyOut >>> now (`shouldBe` numbers 3000) >>> Tx.ending)
         )
         `shouldReturn` Right (Right ())
       count env "reply_commit" `shouldReturn` Right 1
@@ -281,8 +281,8 @@ spec socketPath port = describe "operations and transactions in a request" $ for
                   <*> Tx.command "INSERT INTO reply_child VALUES (1)"
                   <*> Tx.statement (numbersOf 3000)
               )
-              (\(parent, child, inserted, body) -> Tx.discard parent >>> Tx.discard child >>> Tx.discard inserted >>> Tx.single body >>> copyOut >>> now (\delivered -> delivered `shouldBe` numbers 3000) >>> Tx.ending)
-            >>> arr (either (const Nothing) (either failedAtCommit (const Nothing)))
+              (\(parent, child, inserted, body) -> Tx.discard parent >>> Tx.discard child >>> Tx.discard inserted >>> Tx.single body >>> copyOut >>> now (`shouldBe` numbers 3000) >>> Tx.ending)
+            >>^ either (const Nothing) (either failedAtCommit (const Nothing))
         )
         `shouldReturn` Just "23503"
       -- The failure was seen, and the connection is fine
@@ -293,11 +293,11 @@ spec socketPath port = describe "operations and transactions in a request" $ for
   describe "a connection after its request" $ do
     it "rejects a connection used after the request ended" $ withEnv' $ \env -> do
       released <- onEnv env (request env (arr fst))
-      onEnv env (arr (released,) >>> (selectOne `failsWith` ConnectionReleased)) `shouldReturn` ()
+      onEnv env ((released,) ^>> (selectOne `failsWith` ConnectionReleased)) `shouldReturn` ()
 
     it "rejects it while the pool has lent the connection to another request, and doesn't disturb that request" $ withEnv' $ \env -> do
       released <- onEnv env (request env (arr fst))
-      onEnv env (request env (steps [arr (\(_, loans) -> (released, loans)) >>> (selectOne `failsWith` ConnectionReleased), selectOne `yields` Right [1]]))
+      onEnv env (request env (steps [first (const released) ^>> (selectOne `failsWith` ConnectionReleased), selectOne `yields` Right [1]]))
         `shouldReturn` ()
 
   -- What the pool gives besides a connection: the failure of one that can't be made, a checkout that gives up, and a
@@ -314,14 +314,14 @@ spec socketPath port = describe "operations and transactions in a request" $ for
       withConnectionPool ((connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) {poolCheckoutTimeout = Just (millis 50)}) $ \pool -> do
         let env = Env runner buffers pool
         -- The only connection is held by the outer request, so the inner one waits for it.
-        onEnv env (withConnection pool (arr snd >>> withConnection pool (arr (const ()))))
+        onEnv env (withConnection pool (snd ^>> withConnection pool done))
           `shouldReturn` Right (Left CheckoutTimedOut)
         pidOf env >>= \pid -> (pid > 0) `shouldBe` True
 
     it "gives PoolClosed to a checkout after the pool has ended" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
       pool <- withConnectionPool (connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) pure
-      runOn runner buffers (withConnection pool (arr (const ()))) `shouldReturn` Left PoolClosed
+      runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
 
 -- * The pool of the cases
 
@@ -399,10 +399,10 @@ sleeping = plain "SELECT 1::int8 FROM pg_sleep(30)" single
 
 -- | Fails the reading program, as a request that goes wrong does.
 failing :: (Runtime arr) => String -> With Tx.Tx arr a b
-failing reason = now (\_ -> throwIO (ErrorCall reason))
+failing reason = now (const (throwIO (ErrorCall reason)))
 
 sleepFor' :: (Runtime arr) => Duration -> With Tx.Tx arr a ()
-sleepFor' duration = arr (const ()) >>> sleep duration
+sleepFor' duration = done >>> sleep duration
 
 -- | The SQLSTATE of a COMMIT that failed.
 failedAtCommit :: QueryError -> Maybe ByteString

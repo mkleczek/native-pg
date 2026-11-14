@@ -12,10 +12,10 @@ module Network.Fulmen.Response
   )
 where
 
-import Control.Arrow ((^>>))
+import Control.Arrow ((&&&), (***), (^>>))
 import Data.ByteString (ByteString)
 import Network.Fulmen.Internal (Answering (..), Call (..))
-import Network.Fulmen.Internal.Response (Length (..), ResponseHeaders, Status (..), begin, transmit)
+import Network.Fulmen.Internal.Response (Exchange, Length (..), ResponseHeaders, Status (..), begin, transmit)
 import Network.Streaming.Classes (Effect (..), Runtime)
 
 -- | Says how the request is answered: the head is sent with the first of the body, or at the end of the response. A
@@ -26,8 +26,12 @@ respond = now (\(Call _ _ exchange, response) -> Answering exchange <$ begin exc
 
 -- | Sends the pieces of the body, in order: views go straight to the write.
 send :: (Runtime arr) => arr (Answering, [ByteString]) ()
-send = (\(Answering exchange, pieces) -> (exchange, (pieces, False))) ^>> transmit
+send = (exchangeOf *** (, False)) ^>> transmit
 
 -- | Ends the response, after the last of its body.
 finish :: (Runtime arr) => arr Answering ()
-finish = (\(Answering exchange) -> (exchange, ([], True))) ^>> transmit
+finish = (exchangeOf &&& const ([], True)) ^>> transmit
+
+-- | The exchange that the response is made in.
+exchangeOf :: Answering -> Exchange
+exchangeOf (Answering exchange) = exchange

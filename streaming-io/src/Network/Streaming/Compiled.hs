@@ -30,6 +30,7 @@ import Control.Exception (SomeException, mask_, throwIO, toException)
 import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Network.Streaming.Classes hiding (Stream (..))
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets
@@ -59,6 +60,19 @@ instance Arrow (CompiledM m) where
   {-# INLINE arr #-}
   first (Compiled inner) = Compiled (\context (a, c) next -> inner context a (\b -> next (b, c)))
   {-# INLINE first #-}
+
+instance Functor (CompiledM m a) where
+  fmap function (Compiled inner) = Compiled (\context value next -> inner context value (next . function))
+  {-# INLINE fmap #-}
+
+instance Applicative (CompiledM m a) where
+  pure result = Compiled (\_ _ next -> next result)
+  {-# INLINE pure #-}
+  Compiled function <*> Compiled argument =
+    Compiled (\context value next -> function context value (\applied -> argument context value (next . applied)))
+  {-# INLINE (<*>) #-}
+
+instance ArrowApplicative (CompiledM m)
 
 -- | A choice goes on with the branch's continuation itself, so that it wraps
 -- nothing.
@@ -187,7 +201,7 @@ instance Scope (CompiledM m) where
 -- dropped.
 instance Concurrent (CompiledM m) where
   together = \case
-    [] -> arr (const ())
+    [] -> done
     [one] -> one
     parts -> Compiled $ \(Context run part outer) value next -> do
       let size = length parts

@@ -9,7 +9,7 @@
 -- part gives way, and looks for a cancellation, as the steps of a part do when the other parts have been waiting.
 module StepCostSpec (spec) where
 
-import Control.Arrow (ArrowChoice, returnA, (>>^))
+import Control.Arrow (ArrowChoice, returnA, (>>>))
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, try)
@@ -17,7 +17,7 @@ import Control.Monad (forM_, replicateM)
 import Data.Word (Word64)
 import Network.Streaming.Classes (Concurrent (..), GiveWay (..), Within, monotonicNanoseconds, secs)
 import qualified Network.Streaming.Classes as Classes (within)
-import Network.Streaming.Combinators (times)
+import Network.Streaming.Combinators (done, times)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..))
@@ -76,7 +76,7 @@ inScopes nesting depth steps = foldr (\_ inner -> nest nesting inner) (times ste
 -- | The arrow in one more scope.
 nest :: (ArrowChoice arr, Concurrent arr, Within arr) => Nesting -> arr () () -> arr () ()
 nest nesting inner = case nesting of
-  Deadlines -> Classes.within (secs 3600) inner >>^ const ()
+  Deadlines -> Classes.within (secs 3600) inner >>> done
   Pairs -> together [returnA, inner]
 
 -- | The least time, over three runs of each, of one program and of the other, in nanoseconds. The runs alternate, so that

@@ -17,7 +17,7 @@ module Network.Fulmen.Internal.Response
   )
 where
 
-import Control.Arrow (arr, first, (>>>), (|||))
+import Control.Arrow (first, (>>>), (|||))
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -30,6 +30,7 @@ import Network.Fulmen.Internal.Date (Date, currentDate)
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes (Effect (..), Link (..), Runtime)
+import Network.Streaming.Combinators (consume)
 import Network.Streaming.Loans (Loans, borrow, loanBuffer, release)
 import Network.Streaming.Output (Output (..), Uncopied (..), bytes, outputs, word8, writeOutput)
 
@@ -100,13 +101,13 @@ transmit = now plan >>> (sendAll ||| rendered)
   where
     rendered =
       first borrow
-        >>> now (\(loan, (socket, render)) -> (\pieces -> ((socket, pieces), loan)) <$> render (loanBuffer loan))
-        >>> first sendAll
-        >>> arr snd
+        >>> now (\(loan, render) -> (,loan) <$> render (loanBuffer loan))
+        >>> consume sendAll
         >>> release
 
--- | Decides what goes out: the pieces as they are, or what is rendered into a loan, and the pieces after it.
-plan :: (Exchange, ([ByteString], Bool)) -> IO (Either (Socket, [ByteString]) (Loans, (Socket, Buffer -> IO [ByteString])))
+-- | Decides what goes out: the pieces as they are, or what is rendered into a loan, and the pieces after it. Either way
+-- it is the socket and the pieces to send.
+plan :: (Exchange, ([ByteString], Bool)) -> IO (Either (Socket, [ByteString]) (Loans, Buffer -> IO (Socket, [ByteString])))
 plan (exchange, (given, final)) =
   readIORef (exPhase exchange) >>= \case
     Unanswered -> ioError (userError "the body of a response is sent before its head")
@@ -126,11 +127,11 @@ plan (exchange, (given, final)) =
       let out = fromMaybe mempty leading <> leadingBody
        in if outputLength out == 0
             then Left (exSocket exchange, pieces)
-            else Right (exLoans exchange, (exSocket exchange, render out pieces))
+            else Right (exLoans exchange, render out pieces)
     render out pieces buffer = do
       when (outputCopied out > bufferCapacity buffer) $ ioError (userError "the head of the response doesn't fit a buffer")
       parts <- writeOutput (bufferMemory buffer) out
-      pure (map (\case Left copied -> copied; Right (UncopiedBytes uncopied) -> uncopied) parts <> pieces)
+      pure (exSocket exchange, map (\case Left copied -> copied; Right (UncopiedBytes uncopied) -> uncopied) parts <> pieces)
 
 -- | How the body of a response to the request goes out.
 modeOf :: Exchange -> Status -> Length -> Mode

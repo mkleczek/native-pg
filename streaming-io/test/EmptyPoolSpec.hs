@@ -5,7 +5,7 @@
 -- is the one that shows whether the state it was made with is a value or still to be worked out.
 module EmptyPoolSpec (spec) where
 
-import Control.Arrow (arr, (>>>))
+import Control.Arrow ((^>>))
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forM_)
@@ -40,15 +40,15 @@ spec = describe "a pool made empty" $
   forM_ runners $ \(Runner name run) -> describe name $ do
     it "gives nothing to a part that takes at once, when it was made of a list that is empty only at run time" $ do
       pool <- newPool =<< emptyAtRunTime
-      within (run (now (\() -> takeNow pool 1))) `shouldReturn` Just Nothing
+      within (run (now (const (takeNow pool 1)))) `shouldReturn` Just Nothing
 
     it "frees what a part releases, when it was made of []" $ do
       pool <- newPool []
-      within (run (arr (const [7 :: Int]) >>> now (releaseNow pool) >>> now (\() -> free pool))) `shouldReturn` Just [7]
+      within (run (now (const (releaseNow pool [7 :: Int] >> free pool)))) `shouldReturn` Just [7]
 
     it "gives a part that checks out an item that another part releases, when it was made of []" $ do
       pool <- newPool []
-      within (run (concurrently (checkout pool) (arr (const 7) >>> release pool))) `shouldReturn` Just (7 :: Int, ())
+      within (run (concurrently (checkout pool) (const 7 ^>> release pool))) `shouldReturn` Just (7 :: Int, ())
 
 -- | A list that is empty, and that nothing at compile time says is empty: the state of a pool that is made of it is
 -- built when the pool is made.

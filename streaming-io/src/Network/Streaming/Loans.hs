@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 
 -- | The loans of a request, as programs use them: the buffers that the request in flight works in, which a program
 -- gets as an input and borrows more from, and the setup buffers that a connection is set up with. They are steps of
@@ -22,7 +23,7 @@ module Network.Streaming.Loans
   )
 where
 
-import Control.Arrow (arr, first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (first, returnA, (>>>), (^>>), (|||))
 import Control.Exception (throwIO)
 import Control.Monad (unless, when, (>=>))
 import Data.Functor (($>))
@@ -30,6 +31,7 @@ import Data.IORef (IORef, newIORef)
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.BufferPool (BufferGrant)
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (done, keeping)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
@@ -67,9 +69,12 @@ loanBuffer (Loan _ _ _ buffer) = buffer
 -- however it ends. Every loan is returned then, and every alias of a buffer is invalid. A request that has to wait to
 -- be admitted gives up its place when it is cancelled, and a buffer that it was given meanwhile goes back.
 withRequestBuffers :: (Runtime arr) => BufferPool -> arr (Loans, a) b -> arr a b
-withRequestBuffers pool = scope admit (arr fst >>> ended)
+withRequestBuffers pool = scope admit (fst ^>> ended)
   where
-    admit = const () ^>> checkoutAt (1 + reserveCount pool) (requestBuffers pool) >>> now (\buffer -> Loans pool buffer <$> newIORef (Open NotLent NoExtra 0))
+    admit =
+      done
+        >>> checkoutAt (1 + reserveCount pool) (requestBuffers pool)
+        >>> now (\buffer -> Loans pool buffer <$> newIORef (Open NotLent NoExtra 0))
 
 -- | The request has ended. What it holds goes back to the pool, once, and a borrow of it that still waits is told.
 ended :: (Effect arr) => arr Loans ()
@@ -113,35 +118,38 @@ immediately loans@(Loans pool primary ref) = update ref decide >>= either throwI
 -- | What a borrow has when it holds the extra place: the primary, which was given back as it came, or the end it waits at.
 data Registration arr = Got !Loan | Queued !Loans !Int !(Waiting arr 'Anywhere (Maybe Loan))
 
+-- | A borrow that waits for an extra loan: its loans and its number, the giver that the pool queues for it, and the end
+-- it waits at.
+data Asking arr = Asking
+  { askLoans :: !Loans,
+    askNumber :: !Int,
+    askGiver :: !(Giver 'Anywhere (Maybe Loan)),
+    askWaiting :: !(Waiting arr 'Anywhere (Maybe Loan))
+  }
+
 -- | A borrow that waits for an extra loan. It holds the extra place, and waits in the pool's queue for a buffer, and
 -- at its request for the primary to be given back, whichever comes first, and gives up both when it is cancelled.
 wait :: (Runtime arr) => arr Loans Loan
-wait = ((),) ^>> first ticket >>> scope (now register) giveUp body
+wait = keeping ticket >>> scope (now register) giveUp body
   where
-    body =
-      ( \(registration, ((_, giver), _)) -> case registration of
-          Got loan -> Right loan
-          Queued loans number waiting -> Left ((loans, number, giver), waiting)
-      )
-        ^>> (queueAndAwait ||| returnA)
+    body = registered ^>> (queueAndAwait ||| returnA)
+    registered (registration, ((_, giver), _)) = case registration of
+      Got loan -> Right loan
+      Queued loans number waiting -> Left (Asking loans number giver waiting)
+    queueAndAwait = now queueing >>> await >>> now (maybe (throwIO closed) pure)
     -- The pool queues a giver of a buffer, which lends the buffer to this borrow if it is still there to take it.
-    queueAndAwait =
-      first (now (\(loans@(Loans pool _ _), number, giver) -> queueNow (requestBuffers pool) 1 (forwarding loans number giver)))
-        >>> arr snd
-        >>> await
-        >>> now (maybe (throwIO closed) pure)
-    giveUp =
-      ( \(registration, exit) -> case registration of
-          Queued loans number waiting | not (done exit) -> Right (waiting, (loans, number))
-          _ -> Left ()
-      )
-        ^>> (returnA ||| abandoned)
-    done = \case Done -> True; _ -> False
+    queueing Asking {askLoans = loans@(Loans pool _ _), askNumber, askGiver, askWaiting} =
+      askWaiting <$ queueNow (requestBuffers pool) 1 (forwarding loans askNumber askGiver)
+    giveUp = stillQueued ^>> (returnA ||| abandoned)
+    stillQueued (registration, exit) = case registration of
+      Queued loans number waiting | not (isDone exit) -> Right (waiting, (loans, number))
+      _ -> Left ()
+    isDone = \case Done -> True; _ -> False
     -- A loan that was given before the borrow gave up its place is the borrow's, and goes back.
-    abandoned =
-      first abandon
-        >>> (\(given, (loans, number)) -> case given of Just (Just loan) -> Right loan; _ -> Left (loans, number))
-        ^>> (now (uncurry withdraw) ||| release)
+    abandoned = first abandon >>> givenLoan ^>> (now (uncurry withdraw) ||| release)
+    givenLoan (given, (loans, number)) = case given of
+      Just (Just loan) -> Right loan
+      _ -> Left (loans, number)
 
 -- | Takes the extra place, or the primary if it was given back meanwhile.
 register :: ((Waiting arr 'Anywhere (Maybe Loan), Giver 'Anywhere (Maybe Loan)), Loans) -> IO (Registration arr)
@@ -223,7 +231,7 @@ withSetupBuffers pool = scope acquire (now (\(grant, _) -> releaseNow (setupBuff
   where
     size = prefixSize @grant
     acquire =
-      now (\_ -> when (size > setupCount pool) (ioError (userError "buffer count must fit capacity")))
+      now (const (when (size > setupCount pool) (ioError (userError "buffer count must fit capacity"))))
         >>> checkoutMany size size (setupBuffers pool)
         >>> now (\buffers -> maybe (ioError (userError "a grant of the wrong number of buffers")) (pure . fst) (takePrefix buffers :: Maybe (grant, [Buffer])))
 
@@ -231,7 +239,8 @@ withSetupBuffers pool = scope acquire (now (\(grant, _) -> releaseNow (setupBuff
 -- a pool, as a connection's setup is, and is run in whichever request it is called in. The program takes the loans
 -- besides its input, after the grant.
 withSetupBuffersOf :: forall grant arr a b. (Runtime arr, BufferGrant grant) => arr (grant, (Loans, a)) b -> arr (Loans, a) b
-withSetupBuffersOf body = scope acquire (now (\((setups, grant), _) -> releaseNow setups (prepend grant []))) ((\((_, grant), input) -> (grant, input)) ^>> body)
+withSetupBuffersOf body =
+  scope acquire (now (\((setups, grant), _) -> releaseNow setups (prepend grant []))) (first snd ^>> body)
   where
     size = prefixSize @grant
     acquire =

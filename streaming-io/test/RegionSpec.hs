@@ -9,14 +9,14 @@
 -- Each program that doesn't compile has a twin that does, the same with a giver of reach @'Anywhere@.
 module RegionSpec (spec) where
 
-import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (|||))
+import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Exception (TypeError (..), evaluate, try)
 import Control.Monad (void, when)
 import Data.Coerce (coerce)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (keeping)
+import Network.Streaming.Combinators (done, keeping, tap, untilJust)
 import Network.Streaming.Delimited
 import Skeletest
 
@@ -76,9 +76,7 @@ throwsTypeError action =
 
 -- | Waits, giving way, until the reference holds a value.
 found :: (ArrowChoice arr, Effect arr, GiveWay arr) => IORef (Maybe a) -> arr () a
-found box = loop
-  where
-    loop = now (\() -> maybe (Left ()) Right <$> readIORef box) >>> ((giveWay >>> loop) ||| returnA)
+found box = untilJust (readIORef box)
 
 -- | The ends of a ticket of the core of the program, and of one that any core can give a value.
 hereTicket :: Delimited s () (Waiting (Delimited s) ('Here s) a, Giver ('Here s) a)
@@ -89,13 +87,13 @@ anywhereTicket = ticket
 
 -- | A ticket made, given a value, and waited for, on one core.
 ownTickets :: Delimited s () Int
-ownTickets = hereTicket >>> arr (\(end, giver) -> ((giver, 3), end)) >>> first give >>> arr snd >>> await
+ownTickets = hereTicket >>> tap ((,3) . snd ^>> give >>> done) >>> fst ^>> await
 
 -- | Core 0 makes a ticket, leaves its giver where core 1 finds it, and waits; core 1 gives it a value.
 giverAcrossCores :: IORef (Maybe (Giver 'Anywhere Int)) -> Int -> Delimited s () Int
 giverAcrossCores box core
   | core == 0 = anywhereTicket >>> now (\(end, giver) -> end <$ writeIORef box (Just giver)) >>> await
-  | otherwise = found box >>> arr (,4) >>> give >>> arr (const 1)
+  | otherwise = found box >>> (,4) ^>> give >>^ const 1
 
 -- | The same, which is the program that isn't well-typed with the giver of a ticket of reach @'Here@, with the type
 -- of what the cores share given where it is made.
@@ -108,9 +106,8 @@ crossedGivers :: (IORef (Maybe (Giver 'Anywhere Int)), IORef (Maybe (Giver 'Anyw
 crossedGivers (box0, box1) core =
   anywhereTicket
     >>> now (\(end, giver) -> end <$ writeIORef mine (Just giver))
-    >>> keeping (found theirs >>> arr (,core + 10) >>> give)
-    >>> arr snd
-    >>> await
+    >>> keeping (found theirs >>> (,core + 10) ^>> give)
+    >>> snd ^>> await
   where
     (mine, theirs) = if core == 0 then (box0, box1) else (box1, box0)
 
@@ -121,7 +118,7 @@ localGiverAcrossCores = do
   runCores 2 (pure shelf) $ \box core ->
     if core == 0
       then hereTicket >>> now (\(end, giver) -> end <$ writeIORef box (Just giver)) >>> await
-      else found box >>> arr (,4) >>> give >>> arr (const 1)
+      else found box >>> (,4) ^>> give >>^ const 1
 
 -- | And the end that is waited at, of either reach, left for core 1.
 localWaitingAcrossCores :: IO [Int]
@@ -129,7 +126,7 @@ localWaitingAcrossCores = do
   shelf <- newIORef Nothing
   runCores 2 (pure shelf) $ \box core ->
     if core == 0
-      then hereTicket >>> now (\(end, _) -> writeIORef box (Just end)) >>> arr (const 0)
+      then hereTicket >>> now (\(end, _) -> 0 <$ writeIORef box (Just end))
       else found box >>> await
 
 anywhereWaitingAcrossCores :: IO [Int]
@@ -137,7 +134,7 @@ anywhereWaitingAcrossCores = do
   shelf <- newIORef Nothing
   runCores 2 (pure shelf) $ \box core ->
     if core == 0
-      then anywhereTicket >>> now (\(end, _) -> writeIORef box (Just end)) >>> arr (const 0)
+      then anywhereTicket >>> now (\(end, _) -> 0 <$ writeIORef box (Just end))
       else found box >>> await
 
 -- | The shared setup holds a reference for a giver of reach @'Here@, as it can't for the region of any run.
@@ -147,14 +144,14 @@ localGiverInSetup = do
   runCores 2 (pure shelf) $ \box core ->
     if core == 0
       then hereTicket >>> now (\(end, giver) -> end <$ writeIORef box (Just giver)) >>> await
-      else found box >>> arr (,4) >>> give >>> arr (const 1)
+      else found box >>> (,4) ^>> give >>^ const 1
 
 -- | A run whose result is the giver of a ticket of reach @'Here@, and one whose result is the end that waits.
 localGiverEscapes :: IO ()
-localGiverEscapes = void (runDelimited (hereTicket >>> arr snd :: Delimited s () (Giver ('Here s) Int)) ())
+localGiverEscapes = void (runDelimited (hereTicket >>^ snd :: Delimited s () (Giver ('Here s) Int)) ())
 
 waitingEscapes :: IO ()
-waitingEscapes = void (runDelimited (hereTicket >>> arr fst :: Delimited s () (Waiting (Delimited s) ('Here s) Int)) ())
+waitingEscapes = void (runDelimited (hereTicket >>^ fst :: Delimited s () (Waiting (Delimited s) ('Here s) Int)) ())
 
 retag :: Giver ('Here s1) a -> Giver ('Here s2) a
 retag = coerce

@@ -5,10 +5,10 @@
 -- arrow that has the capabilities it uses.
 module WithSpec (spec) where
 
-import Control.Arrow (ArrowChoice, arr, returnA, (&&&), (>>>))
+import Control.Arrow (ArrowChoice, (&&&), (>>>), (>>^), (^>>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (concurrently, keeping, sleep)
+import Network.Streaming.Combinators (alongside, concurrently, done, keeping, localTicket, sleep)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop
@@ -31,13 +31,14 @@ spec = describe "an arrow with an environment" $ do
 
 -- | In a scope that notes what it does, a ticket whose giver gives the input doubled from one half of a pair while
 -- the other half waits for it; then the environment is added to it.
-exchanging :: forall arr. (Rich arr) => IORef [String] -> With Int arr Int Int
-exchanging noted = scope (now (\_ -> note "acquired")) (now (\(_, exit) -> note ("released " <> show exit))) (arr snd >>> doubled) >>> (returnA &&& ask) >>> arr (uncurry (+))
+exchanging :: (Rich arr) => IORef [String] -> With Int arr Int Int
+exchanging noted = scope (now (const (note "acquired"))) (now (\(_, exit) -> note ("released " <> show exit))) (snd ^>> doubled) >>> alongside ask >>^ uncurry (+)
   where
     note what = modifyIORef' noted (what :)
-    doubled = keeping (ticket @(With Int arr) @(Local arr)) >>> concurrently giving waiting >>> arr snd
-    giving = arr (\((_, giver), number) -> (giver, 2 * number)) >>> give >>> arr (const ())
-    waiting = arr (\((waitingEnd, _), _) -> waitingEnd) >>> await
+    doubled = keeping localTicket >>> concurrently giving waiting >>^ snd
+    giving = twice ^>> give >>> done
+    twice ((_, giver), number) = (giver, 2 * number)
+    waiting = fst . fst ^>> await
 
 -- | A deadline that doesn't pass, and a race that the part that doesn't wait wins.
 timed :: (Rich arr) => With Int arr () (Maybe Int, Either Int Int)

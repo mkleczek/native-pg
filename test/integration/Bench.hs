@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeApplications #-}
 
 -- | What a request costs: transactions per second and bytes allocated for each, over a Unix-domain socket and a pool of
@@ -15,7 +16,7 @@
 -- Usage: @native-pg-bench [scale]@, which multiplies the number of requests of each workload (1 by default).
 module Main (main) where
 
-import Control.Arrow (first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (returnA, second, (>>>), (>>^), (^>>))
 import Control.Monad (forM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -27,7 +28,7 @@ import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (times)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, iterateA, times)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited (runDelimited)
 import Network.Streaming.Loans (withRequestBuffers)
@@ -100,11 +101,11 @@ main = do
 -- | A statement that gives one number, and ones that give one JSON value, of the tables' rows, as a field.
 build :: (Runtime arr) => Workload -> BufferPool -> ConnectionPool -> arr () ()
 build workload buffers pool = case workload of
-  SelectOne -> request buffers pool (Tx.Statement "SELECT 1" (const []) (Tx.one (Tx.column @_ @Int32))) (\result -> Tx.single result >>^ const ())
+  SelectOne -> request buffers pool (Tx.Statement "SELECT 1" (const []) (Tx.one (Tx.column @_ @Int32))) (\result -> Tx.single result >>> done)
   Field16 -> field "SELECT json_agg(small) FROM small"
   Field1M -> field "SELECT json_agg(large) FROM large"
   where
-    field sql = request buffers pool (Tx.Statement sql (const []) (Tx.one Tx.field)) (\result -> Tx.single result >>> drained >>^ const ())
+    field sql = request buffers pool (Tx.Statement sql (const []) (Tx.one Tx.field)) (\result -> Tx.single result >>> drained >>> done)
 {-# INLINABLE build #-}
 
 -- | One request: a transaction on a pooled connection, in loans of its own, whose pipeline carries the COMMIT, and the
@@ -119,25 +120,21 @@ request ::
 request buffers pool given reading =
   withRequestBuffers
     buffers
-    ((\(loans, ()) -> (loans, ((), ()))) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement given) reading)))
+    (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement given) reading)))
     >>> now (\case Right (Right ()) -> pure (); other -> die ("a request failed: " <> show other))
 
 -- | The pieces of the field, one after the other, dropped: how many bytes they had.
 drained :: (Runtime arr, Stream arr s) => arr s Int
-drained = (,0) ^>> loop
+drained = (,0) ^>> iterateA (alongside (fst ^>> next) >>^ counted)
   where
-    loop =
-      (\(source, total) -> (source, (source, total)))
-        ^>> first next
-        >>> (\(piece, (source, total)) -> maybe (Left total) (\chunk -> Right (source, total + BS.length chunk)) piece)
-        ^>> (returnA ||| loop)
+    counted (piece, (source, total)) = maybe (Finish total) (\chunk -> Again (source, total + BS.length chunk)) piece
 
 -- | Runs the commands in a transaction of their own, one after the other.
 commands :: (Runtime arr) => BufferPool -> ConnectionPool -> [ByteString] -> arr () ()
 commands buffers pool texts =
   withRequestBuffers
     buffers
-    ((\(loans, ()) -> (loans, ((), ()))) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Write (Tx.pipeline Tx.Final (traverse Tx.command texts) (foldr (\result rest -> Tx.discard result >>> rest) returnA))))
+    (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Write (Tx.pipeline Tx.Final (traverse Tx.command texts) (foldr ((>>>) . Tx.discard) returnA))))
     >>> now (\case Right (Right ()) -> pure (); other -> die ("the setup failed: " <> show other))
 
 -- | The workload under the arrow: transactions per second, and the bytes that each allocated. The first requests make

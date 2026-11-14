@@ -88,7 +88,7 @@ module TestPrograms
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, first, returnA, right, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (Exception, evaluate, fromException, throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -133,13 +133,13 @@ runners =
   ]
 
 onThreads :: BufferPool -> Program a -> IO a
-onThreads buffers program = runThreads (withRequestBuffers buffers (arr fst >>> program)) ()
+onThreads buffers program = runThreads (withRequestBuffers buffers (fst ^>> program)) ()
 
 onDelimited :: BufferPool -> Program a -> IO a
-onDelimited buffers program = fst <$> runDelimited (withRequestBuffers buffers (arr fst >>> program)) ()
+onDelimited buffers program = fst <$> runDelimited (withRequestBuffers buffers (fst ^>> program)) ()
 
 onCompiled :: BufferPool -> Program a -> IO a
-onCompiled buffers program = fst <$> runCompiled (withRequestBuffers buffers (arr fst >>> program)) ()
+onCompiled buffers program = fst <$> runCompiled (withRequestBuffers buffers (fst ^>> program)) ()
 
 -- | The program, as one request, on the pool. A program that never ends fails the case after a minute.
 runOn :: Runner -> BufferPool -> Program a -> IO a
@@ -203,43 +203,44 @@ type OnConn arr b = arr (Connection, Loans) b
 -- | The body on a connection made to the settings, closed when the body ends, however it ends. A connection that
 -- can't be made is the program's failure.
 session :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans b
-session settings body =
-  connectedTo settings body
-    >>> now (either (\failure -> fail ("no connection: " <> show failure)) pure)
+session settings body = connectedTo settings body >>> orFail
 
 -- | The same, with the failure to connect as a value, and the body not run.
 connectedTo :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans (Either ConnectFailure b)
-connectedTo settings body =
-  scope
-    (connect settings)
-    (fst ^>> (arr (const ()) ||| PG.close))
-    ((\(connected, loans) -> fmap (,loans) connected) ^>> (arr Left ||| (body >>^ Right)))
+connectedTo settings body = scope (connect settings) closeConnected (withLoans ^>> right body)
+  where
+    withLoans (connected, loans) = fmap (,loans) connected
 
 -- | The body on a second connection too, which is closed when the body ends. The body takes both connections, the
 -- one of the enclosing 'session' first. A connection that can't be made is the program's failure.
 alsoOn :: (Runtime arr) => ConnectSettings -> arr ((Connection, Connection), Loans) b -> OnConn arr b
-alsoOn settings body =
-  scope
-    (arr snd >>> connect settings)
-    (fst ^>> (arr (const ()) ||| PG.close))
-    ((\(connected, (outer, loans)) -> fmap (\inner -> ((outer, inner), loans)) connected) ^>> (arr Left ||| (body >>^ Right)))
-    >>> now (either (\failure -> fail ("no connection: " <> show failure)) pure)
+alsoOn settings body = scope (snd ^>> connect settings) closeConnected (bothWithLoans ^>> right body) >>> orFail
+  where
+    bothWithLoans (connected, (outer, loans)) = fmap (\inner -> ((outer, inner), loans)) connected
+
+-- | Closes the connection if it was made.
+closeConnected :: (Runtime arr) => arr (Either ConnectFailure Connection, Exit) ()
+closeConnected = fst ^>> (done ||| PG.close)
+
+-- | The result of what needed a connection, or the program's failure if there was none.
+orFail :: (Effect arr) => arr (Either ConnectFailure b) b
+orFail = now (either (\failure -> fail ("no connection: " <> show failure)) pure)
 
 -- | A step that takes the connection only, as a step of the connection.
 conn :: (Arrow arr) => arr Connection b -> OnConn arr b
-conn step = arr fst >>> step
+conn step = fst ^>> step
 
 -- | A step of the first of two connections.
 onFirst :: (Arrow arr) => OnConn arr b -> arr ((Connection, Connection), Loans) b
-onFirst step = (\((first', _), loans) -> (first', loans)) ^>> step
+onFirst step = first fst ^>> step
 
 -- | A step of the second of two connections.
 onSecond :: (Arrow arr) => OnConn arr b -> arr ((Connection, Connection), Loans) b
-onSecond step = (\((_, second'), loans) -> (second', loans)) ^>> step
+onSecond step = first snd ^>> step
 
 -- | The steps one after the other, each on the same input.
 steps :: (Arrow arr) => [arr x ()] -> arr x ()
-steps = foldr (\step rest -> step &&& rest >>^ const ()) (arr (const ()))
+steps = foldr ((>>>) . tap) done
 
 -- | A step whose result must be the expected one.
 yields :: (Runtime arr, Eq b, Show b) => arr x b -> b -> arr x ()
@@ -270,17 +271,14 @@ withinFor = within
 
 -- | The step, after waiting this long: a wait, so that a cancellation reaches it.
 after :: (Runtime arr) => Duration -> arr x b -> arr x b
-after delay step = keeping (sleep delay) >>> arr snd >>> step
+after delay step = keeping (sleep delay) >>> snd ^>> step
 
 -- | The step, and how many nanoseconds it took on the arrow's clock.
 timed :: (Runtime arr) => arr x b -> arr x (b, Word64)
-timed step =
-  keeping clock
-    >>> second step
-    >>> (\(Instant started, result) -> ((), (started, result)))
-    ^>> first clock
-    >>> (\(Instant ended, (started, result)) -> (result, ended - started))
-    ^>> returnA
+timed step = elapsed <$> instant <*> step <*> instant
+  where
+    instant = done >>> clock
+    elapsed (Instant start) result (Instant end) = (result, end - start)
 
 -- * Transactions
 
@@ -295,8 +293,7 @@ transactOn ::
   (a -> With Tx.Tx arr () y) ->
   arr (Connection, (Loans, p)) (Either QueryError y)
 transactOn level mode ending pipeline reading =
-  (\(connection, (loans, parameters)) -> (connection, (loans, (parameters, ()))))
-    ^>> Tx.transaction level mode (Tx.pipeline ending pipeline reading)
+  second (second (,())) ^>> Tx.transaction level mode (Tx.pipeline ending pipeline reading)
 
 -- | A transaction on the connection, for a pipeline that takes no input.
 transact ::
@@ -307,8 +304,7 @@ transact ::
   Tx.Pipeline arr () a ->
   (a -> With Tx.Tx arr () y) ->
   OnConn arr (Either QueryError y)
-transact level mode ending pipeline reading =
-  (\(connection, loans) -> (connection, (loans, ()))) ^>> transactOn level mode ending pipeline reading
+transact level mode ending pipeline reading = second (,()) ^>> transactOn level mode ending pipeline reading
 
 -- | A transaction that stays open after its pipeline, as 'Tx.Open' says, and commits when the reading program ends.
 committedAt :: (Runtime arr) => Tx.IsolationLevel -> Tx.Mode -> Tx.Pipeline arr () a -> (a -> With Tx.Tx arr () y) -> OnConn arr (Either QueryError y)
@@ -365,13 +361,13 @@ diagnosticsOf = \case
 single :: (Runtime arr, InPlace a) => Rows arr a
 single = Tx.any Tx.column
 
--- | Two columns. The cursor takes them in order, as '&&&' runs its halves.
+-- | Two columns. The cursor takes them in order, as '&&&' runs its halves, left first.
 pair :: (Runtime arr, InPlace a, InPlace b) => Rows arr (a, b)
 pair = Tx.any (Tx.column &&& Tx.column)
 
 -- | Three columns.
 triple :: (Runtime arr, InPlace a, InPlace b, InPlace c) => Rows arr (a, b, c)
-triple = Tx.any (Tx.column &&& Tx.column &&& Tx.column >>^ \(a, (b, c)) -> (a, b, c))
+triple = Tx.any ((,,) <$> Tx.column <*> Tx.column <*> Tx.column)
 
 -- | A statement without parameters.
 plain :: ByteString -> Rows arr row -> Tx.Statement arr () row
@@ -402,13 +398,16 @@ streaming source step = now (\(connection, loans) -> (\s -> (connection, (loans,
 -- | The stream to its end, giving each piece to the step with what it has kept. A piece is a view, valid until the
 -- next: the step copies what it keeps.
 foldPieces :: (Runtime arr, Stream arr s) => (acc -> ByteString -> IO acc) -> arr (s, acc) acc
-foldPieces step = loop
+foldPieces step =
+  uncurry Folding
+    ^>> iterateWith
+      (alongside (foldStream ^>> next) >>^ pulled)
+      (now (\(piece, Folding source kept) -> Folding source <$> step kept piece))
   where
-    loop =
-      (\(s, acc) -> (s, (s, acc)))
-        ^>> first next
-        >>> (\(piece, (s, acc)) -> maybe (Left acc) (\piece' -> Right (piece', s, acc)) piece)
-        ^>> (returnA ||| (now (\(piece', s, acc) -> (s,) <$> step acc piece') >>> loop))
+    pulled (piece, folding) = maybe (Finish (foldKept folding)) (Again . (,folding)) piece
+
+-- | The state of 'foldPieces' between the pieces: the stream, and what the step has kept.
+data Folding s acc = Folding {foldStream :: s, foldKept :: acc}
 
 -- | How many bytes the stream has, in how many pieces.
 measure :: (Runtime arr, Stream arr s) => arr s (Int, Int)
@@ -440,13 +439,12 @@ newSlowChunks delay pieces = SlowChunks delay <$> newChunks pieces
 instance (Runtime arr) => Stream arr SlowChunks where
   next =
     (\(SlowChunks delay chunks) -> (delay, chunks))
-      ^>> first sleepIn
-      >>> arr snd
+      ^>> consume sleepIn
       >>> next
 
 -- | Waits as long as the duration.
 sleepIn :: (Runtime arr) => arr Duration ()
-sleepIn = ((),) ^>> first clock >>> (\(started, delay) -> Until (started `plus` delay)) ^>> block
+sleepIn = keeping clock >>> Until . uncurry plus ^>> block
 
 -- | A source that gives its pieces and then fails, as a client that went away does.
 newtype FailingChunks = FailingChunks Chunks
@@ -459,4 +457,4 @@ instance (Effect arr, ArrowChoice arr) => Stream arr FailingChunks where
     (\(FailingChunks chunks) -> chunks)
       ^>> next
       >>> maybe (Left ()) (Right . Just)
-      ^>> (now (\() -> throwIO (userError "the client went away")) ||| returnA)
+      ^>> (now (const (throwIO (userError "the client went away"))) ||| returnA)
