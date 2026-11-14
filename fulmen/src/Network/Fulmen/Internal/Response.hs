@@ -17,7 +17,7 @@ module Network.Fulmen.Internal.Response
   )
 where
 
-import Control.Arrow (first, (>>>), (|||))
+import Control.Arrow (arr, first, (>>>), (|||))
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -101,7 +101,7 @@ transmit = now plan >>> (sendAll ||| rendered)
   where
     rendered =
       first borrow
-        >>> now (\(loan, render) -> (,loan) <$> render (loanBuffer loan))
+        >>> ((,) <$> now (\(loan, render) -> render (loanBuffer loan)) <*> arr fst)
         >>> consume sendAll
         >>> release
 

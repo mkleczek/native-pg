@@ -126,7 +126,7 @@ pieces = iterateWith (withSource ^>> first next >>^ chunked) (consume Fulmen.sen
 -- 16 MiB, which is a good part of what a few thousand small requests allocate. So a minor collection is made before it is
 -- read.
 metrics :: (Runtime arr) => IO (Maybe Counts) -> arr Call ()
-metrics counts = now (\call -> (,) call <$> exposition) >>> plain
+metrics counts = ((,) <$> returnA <*> now (const exposition)) >>> plain
   where
     exposition =
       getRTSStatsEnabled >>= \case

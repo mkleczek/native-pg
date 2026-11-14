@@ -21,19 +21,20 @@ module Database.PostgreSQL.Pool
   )
 where
 
-import Control.Arrow (arr, (***), (>>>), (^>>), (|||))
+import Control.Arrow (arr, second, (***), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (finally, throwIO)
 import Control.Monad (replicateM)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
+import Data.Tuple (swap)
 import Database.PostgreSQL.Connection (ConnectSettings (connectReadSize), connect)
 import Database.PostgreSQL.Connection.Internal (Connection (..), Session (..), Status (..), breakSession, leased)
 import Database.PostgreSQL.Internal.Socket (isQuiet)
 import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (Duration, Effect (..), Runtime, Scope (..))
-import Network.Streaming.Combinators (keeping)
+import Network.Streaming.Combinators (keeping, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Pool (Pool, PoolError (..), closePool, newPool, urgently, withLoan, withLoanWithin)
@@ -120,10 +121,11 @@ using pool body = scope acquire release run
     acquire =
       now (\(Slot ref, _) -> either (const (Left ref)) (Right . (ref,)) <$> existing @(ModeOf arr) ref)
         >>> (making ||| arr id)
-        >>> now (\(ref, connection) -> (ref,) <$> leased connection)
+        >>> second (now leased)
     making =
       keeping (withRequestBuffers (poolBuffers pool) (fst ^>> connect (poolConnect (poolSettings pool))) >>> now (either throwIO pure))
-        >>> now (\(connection, ref) -> (ref, connection) <$ writeIORef ref (Just connection))
+        >>> tap (now (\(connection, ref) -> writeIORef ref (Just connection)))
+        >>^ swap
     release = now $ \((ref, connection), _) -> do
       writeIORef (connectionLease connection) False
       status <- readIORef (sessionStatus (connectionSession connection))

@@ -8,7 +8,7 @@
 -- arrow that has what they need, are run by each.
 module ScopesSpec (spec) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, getNumCapabilities, setNumCapabilities, threadDelay)
 import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
@@ -354,8 +354,8 @@ readCounter :: Counter -> IO Int
 readCounter = readIORef
 
 -- | A part adds one to the count and goes on with what it was given.
-counting :: (Effect arr) => Counter -> arr a a
-counting counter = now (\value -> atomicModifyIORef' counter (\n -> (n + 1, ())) $> value)
+counting :: (Arrow arr, Effect arr) => Counter -> arr a a
+counting counter = tap (now (const (atomicModifyIORef' counter (\n -> (n + 1, ())))))
 
 -- | A part that holds a resource while its body runs, and counts the releases that follow a cancellation.
 holding :: (Rich arr) => Counter -> arr () () -> arr () ()
@@ -376,8 +376,8 @@ newLog = newIORef []
 readLog :: Log -> IO [String]
 readLog = fmap reverse . readIORef
 
-noting :: (Effect arr) => Log -> String -> arr a a
-noting noted entry = now (\value -> note noted entry $> value)
+noting :: (Arrow arr, Effect arr) => Log -> String -> arr a a
+noting noted entry = tap (now (const (note noted entry)))
 
 -- | Adds to the log: parts on several cores write to it.
 note :: Log -> String -> IO ()
@@ -601,7 +601,7 @@ kept = unsafePerformIO (newIORef [])
 
 -- | A wait that another thread ends at once: it may or may not find the value there.
 quickWait :: (Pooled arr) => arr () ()
-quickWait = ticket @_ @'Anywhere >>> now (\(awaiting, giver) -> awaiting <$ forkIO (void (runThreads give (giver, ())))) >>> await
+quickWait = ticket @_ @'Anywhere >>> second (now (\giver -> forkIO (void (runThreads give (giver, ()))))) >>> fst ^>> await
 
 -- | Which half of a race was the first to end.
 winner :: Either a b -> String

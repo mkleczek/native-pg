@@ -37,7 +37,7 @@ spec = describe "cores" $ do
       results <-
         within $ runCores 2 (pure shelf) $ \box core ->
           if core == 0
-            then ticket @_ @'Anywhere >>> now (\(awaiting, giver) -> awaiting <$ atomicWriteIORef box (Just giver)) >>> await
+            then ticket @_ @'Anywhere >>> second (now (atomicWriteIORef box . Just)) >>> fst ^>> await
             else untilJust (readIORef box) >>> now (\giver -> (giver, 7) <$ threadDelay 20000) >>> give >>^ bool 0 1
       results `shouldBe` Just [7, 1 :: Int]
 
@@ -210,7 +210,7 @@ racing :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => IORef (Maybe 
 racing shelf count = const 0 ^>> timesWith count (keeping ticketOnShelf >>^ uncurry (+))
   where
     -- Makes a ticket, leaves its giver on the shelf, and waits for the ticket.
-    ticketOnShelf = ticket @_ @'Anywhere >>> now (\(awaiting, giver) -> awaiting <$ atomicWriteIORef shelf (Just giver)) >>> await
+    ticketOnShelf = ticket @_ @'Anywhere >>> second (now (atomicWriteIORef shelf . Just)) >>> fst ^>> await
 
 -- | The programs of the two reaches at once, for any arrow that has what 'Runtime' bundles.
 ticketsOfBothReaches :: (Runtime arr) => arr () ((Int, Bool), (Int, Bool))

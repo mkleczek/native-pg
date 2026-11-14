@@ -9,7 +9,7 @@
 -- Each program that doesn't compile has a twin that does, the same with a giver of reach @'Anywhere@.
 module RegionSpec (spec) where
 
-import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>))
+import Control.Arrow (ArrowChoice, second, (>>>), (>>^), (^>>))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Exception (TypeError (..), evaluate, try)
 import Control.Monad (void, when)
@@ -92,7 +92,7 @@ ownTickets = hereTicket >>> tap ((,3) . snd ^>> give >>> done) >>> fst ^>> await
 -- | Core 0 makes a ticket, leaves its giver where core 1 finds it, and waits; core 1 gives it a value.
 giverAcrossCores :: IORef (Maybe (Giver 'Anywhere Int)) -> Int -> Delimited s () Int
 giverAcrossCores box core
-  | core == 0 = anywhereTicket >>> now (\(end, giver) -> end <$ writeIORef box (Just giver)) >>> await
+  | core == 0 = anywhereTicket >>> second (now (writeIORef box . Just)) >>> fst ^>> await
   | otherwise = found box >>> (,4) ^>> give >>^ const 1
 
 -- | The same, which is the program that isn't well-typed with the giver of a ticket of reach @'Here@, with the type
@@ -105,8 +105,8 @@ giverInSetup = giverAcrossCores
 crossedGivers :: (IORef (Maybe (Giver 'Anywhere Int)), IORef (Maybe (Giver 'Anywhere Int))) -> Int -> Delimited s () Int
 crossedGivers (box0, box1) core =
   anywhereTicket
-    >>> now (\(end, giver) -> end <$ writeIORef mine (Just giver))
-    >>> keeping (found theirs >>> (,core + 10) ^>> give)
+    >>> second (now (writeIORef mine . Just))
+    >>> fst ^>> keeping (found theirs >>> (,core + 10) ^>> give)
     >>> snd ^>> await
   where
     (mine, theirs) = if core == 0 then (box0, box1) else (box1, box0)
@@ -117,7 +117,7 @@ localGiverAcrossCores = do
   shelf <- newIORef Nothing
   runCores 2 (pure shelf) $ \box core ->
     if core == 0
-      then hereTicket >>> now (\(end, giver) -> end <$ writeIORef box (Just giver)) >>> await
+      then hereTicket >>> second (now (writeIORef box . Just)) >>> fst ^>> await
       else found box >>> (,4) ^>> give >>^ const 1
 
 -- | And the end that is waited at, of either reach, left for core 1.
@@ -143,7 +143,7 @@ localGiverInSetup = do
   shelf <- newIORef Nothing :: IO (IORef (Maybe (Giver ('Here ()) Int)))
   runCores 2 (pure shelf) $ \box core ->
     if core == 0
-      then hereTicket >>> now (\(end, giver) -> end <$ writeIORef box (Just giver)) >>> await
+      then hereTicket >>> second (now (writeIORef box . Just)) >>> fst ^>> await
       else found box >>> (,4) ^>> give >>^ const 1
 
 -- | A run whose result is the giver of a ticket of reach @'Here@, and one whose result is the end that waits.

@@ -13,7 +13,7 @@ import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIO
 import Data.Word (Word64)
 import qualified Network.Socket as Socket
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (done, keeping, localTicket, releaseWithin, sleep, times)
+import Network.Streaming.Combinators (done, keeping, localTicket, releaseWithin, sleep, tap, times)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Timers
@@ -270,8 +270,8 @@ readLog = fmap reverse . readIORef
 note :: Log -> String -> IO ()
 note noted entry = atomicModifyIORef' noted (\entries -> (entry : entries, ()))
 
-noting :: (Effect arr) => Log -> String -> arr a a
-noting noted entry = now (\value -> value <$ note noted entry)
+noting :: (Arrow arr, Effect arr) => Log -> String -> arr a a
+noting noted entry = tap (now (const (note noted entry)))
 
 bracketed :: (Rich arr) => Log -> String -> arr () () -> arr () b -> arr () b
 bracketed noted name work body =

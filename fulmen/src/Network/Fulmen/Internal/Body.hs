@@ -30,7 +30,7 @@ import Foreign.ForeignPtr (plusForeignPtr)
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes (Block, Effect (..), GiveWay, Link (..), Room (..), Stream (..))
-import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, iterateA, iterateWith)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, iterateA, iterateWith, tap)
 import Network.Streaming.Loans (Loan, release)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.NotImplemented (notImplementedIO)
@@ -75,7 +75,7 @@ instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (Mod
   next = iterateWith (now advance) receiving >>> (ending ||| returnA)
     where
       receiving = first receive >>> now arrived
-      ending = now (\state -> bodyLoan state <$ keepFollowing state) >>> release >>^ const Nothing
+      ending = tap (now keepFollowing) >>> bodyLoan ^>> release >>^ const Nothing
   {-# INLINE next #-}
 
 -- | The next piece of the body, from the bytes in hand if there are any, and else the socket and the room to receive

@@ -12,6 +12,7 @@ import Control.Monad (forM_, when)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
 import Data.Maybe (isNothing)
+import Data.Tuple (swap)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer, newBuffer)
@@ -127,7 +128,7 @@ exchangeThenKeep = tap (exchange >>> done)
 
 -- | A pair is made, one wait is made on it, and it is closed: the number of its first descriptor and the bytes got.
 used :: (Rich arr) => arr () (Int, Int)
-used = now (const newPair) >>> alongside exchange >>> now (\(count, pair) -> (, count) <$> closing pair)
+used = now (const newPair) >>> alongside exchange >>> second (now closing) >>^ swap
 
 -- * Programs
 
@@ -190,7 +191,7 @@ data Draining = Draining {drainEnd :: Socket, drainBuffer :: Buffer, drainGot ::
 cancelledThenReused :: (Rich arr) => arr () (Bool, Bool, Int)
 cancelledThenReused = abandoned >>> keeping used >>^ \((n2, count), (n1, cancelled)) -> (n1 == n2, cancelled, count)
   where
-    abandoned = now (const newPair) >>> alongside timesOut >>> now (\(cancelled, pair) -> (, cancelled) <$> closing pair)
+    abandoned = now (const newPair) >>> alongside timesOut >>> second (now closing) >>^ swap
 
 -- | A part waits for input with a deadline that passes first, a byte arrives on the socket afterwards, and a few
 -- rounds pass; a part that then waits for input finds it: whether the first wait was cancelled, and the bytes the
@@ -216,11 +217,11 @@ handedOver (Shared shelf closed) core
       now (const (newPair >>= \pair -> (,) pair <$> number (fst pair)))
         >>> consume (exchangeThenKeep >>> handOver >>> after (millis 20) >>> sendByte >>> closedByTheOther >>> closeOther >>> done)
         >>> now (\n1 -> newPair >>= \pair -> (\n2 -> (n1 == n2, pair)) <$> number (fst pair))
-        >>> second (alongside exchange >>> now (\(count, pair) -> count <$ closing pair))
+        >>> second (alongside exchange >>> second (now closing) >>^ fst)
   | otherwise =
       ticket @_ @'Anywhere
-        >>> now (\(awaiting, giver) -> awaiting <$ atomicWriteIORef shelf (Just giver))
-        >>> await
+        >>> second (now (atomicWriteIORef shelf . Just))
+        >>> fst ^>> await
         >>> now (\socket -> (\buffer -> (socket, roomOf buffer)) <$> newBuffer (positiveInt @16))
         >>> (id &&& fst) ^>> first receive
         >>> second (now (\socket -> Socket.close socket *> atomicWriteIORef closed True))

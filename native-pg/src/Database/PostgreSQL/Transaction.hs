@@ -78,14 +78,13 @@ module Database.PostgreSQL.Transaction
   )
 where
 
-import Control.Arrow (Arrow, arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (IOException, SomeAsyncException, SomeException, displayException, evaluate, fromException, throwIO, toException, try)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Foldable (traverse_)
-import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Kind (Type)
 import Data.Maybe (fromMaybe, isJust)
@@ -547,7 +546,8 @@ decodeRow rowArrow =
   alongside (lift count)
     >>> withTx columnsAt
     >>> alongside (lift rowArrow)
-    >>> now (\(row, columns) -> row <$ leftover columns)
+    >>> second (now leftover)
+    >>^ fst
   where
     columnsAt tx (total, cursor) = do
       stamp <- readIORef (txEpoch tx)
@@ -835,10 +835,10 @@ beginning level mode = "BEGIN ISOLATION LEVEL " <> levelText <> " " <> modeText
 -- it left open is rolled back, before the connection is given back. The loan goes back last.
 leaving :: (Runtime arr) => arr (Tx, Exit) ()
 leaving =
-  now (\(tx, exit) -> (tx,) <$> plan tx exit)
+  (,) <$> arr fst <*> now (uncurry plan)
     >>> planned ^>> (now settled ||| recovering)
-    >>> now (\tx -> modifyIORef' (txEpoch tx) (+ 1) $> txLoan tx)
-    >>> release
+    >>> tap (now (\tx -> modifyIORef' (txEpoch tx) (+ 1)))
+    >>> txLoan ^>> release
   where
     planned (tx, Recover) = Right tx
     planned (tx, Keep) = Left (tx, Nothing)

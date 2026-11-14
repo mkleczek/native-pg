@@ -59,7 +59,7 @@ serve !settings handler = whether isFirst ^>> (together (acceptance settings : w
 -- | Takes a free worker of the core that has the most free workers, accepts a connection, and gives it to the worker. A
 -- connection that the worker is no longer there to take is closed.
 acceptance :: (Runtime arr) => Settings -> arr Cores ()
-acceptance settings = now (\cores -> cores <$ listening (listener settings)) >>> foreverA (tap place)
+acceptance settings = tap (now (const (listening (listener settings)))) >>> foreverA (tap place)
   where
     place =
       ((,) <$> checkout <*> (const (listener settings) ^>> acceptor))

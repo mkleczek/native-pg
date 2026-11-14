@@ -56,6 +56,35 @@
 - warn: {name: Use fst, lhs: consume x >>> done, rhs: fst ^>> x}
 - warn: {name: Use deliver, lhs: second x >>> give >>> done, rhs: deliver x}
 
+# An effect that returns its own input, or a part of it, makes the value flow through the IO step instead of around it:
+# the effect should get only what it reads, and the rest go by tap, alongside, consume, first, second or <*>. The rules
+# for a pair come in two: the first applies if the effect doesn't read the part that is kept, and then it is a plain
+# first, second or consume; the second if it reads it too, and then the effect gets the whole pair.
+- warn: {name: Route around the effect, lhs: "now (\\x -> x <$ e)", rhs: "tap (now (\\x -> () <$ e))"}
+- warn: {name: Route around the effect, lhs: "now (\\x -> f x <$ e)", rhs: "tap (now (\\x -> () <$ e)) >>^ f"}
+- warn: {name: Route around the effect, lhs: "now (\\x -> e $> f x)", rhs: "tap (now (\\x -> () <$ e)) >>^ f"}
+- warn: {name: Route around the effect, lhs: "now (\\x -> e $> x)", rhs: "tap (now (\\x -> () <$ e))"}
+- warn: {name: Route around the effect, lhs: "now (\\x -> (x,) <$> e)", rhs: "alongside (now (\\x -> e)) >>^ swap"}
+- warn: {name: Route around the effect, lhs: "now (\\x -> (,) x <$> e)", rhs: "alongside (now (\\x -> e)) >>^ swap"}
+- warn: {name: Route around the effect, lhs: "now (\\x -> (,x) <$> e)", rhs: "alongside (now (\\x -> e))"}
+
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> x <$ e)", rhs: "second (now (\\y -> () <$ e)) >>^ fst", side: notIn x e}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> x <$ e)", rhs: "tap (now (\\(x, y) -> () <$ e)) >>^ fst", side: not (notIn x e)}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> y <$ e)", rhs: "consume (now (\\x -> () <$ e))", side: notIn y e}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> y <$ e)", rhs: "tap (now (\\(x, y) -> () <$ e)) >>^ snd", side: not (notIn y e)}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (y, x) <$ e)", rhs: "tap (now (\\(x, y) -> () <$ e)) >>^ swap"}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (x,) <$> e)", rhs: "second (now (\\y -> e))", side: notIn x e}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (x,) <$> e)", rhs: "(,) <$> arr fst <*> now (\\(x, y) -> e)", side: not (notIn x e)}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (,y) <$> e)", rhs: "first (now (\\x -> e))", side: notIn y e}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (,y) <$> e)", rhs: "(,) <$> now (\\(x, y) -> e) <*> arr snd", side: not (notIn y e)}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (y,) <$> e)", rhs: "first (now (\\x -> e)) >>^ swap", side: notIn y e}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (y,) <$> e)", rhs: "(,) <$> arr snd <*> now (\\(x, y) -> e)", side: not (notIn y e)}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (,x) <$> e)", rhs: "second (now (\\y -> e)) >>^ swap", side: notIn x e}
+- warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (,x) <$> e)", rhs: "(,) <$> now (\\(x, y) -> e) <*> arr fst", side: not (notIn x e)}
+
+# The pass-through in PingPong measures the raw tickets and has to stay as it is.
+- ignore: {name: Route around the effect, within: Network.Directions.PingPong}
+
 # The raw ticket primitives are for the library, for the programs of directions that measure them, and for the tests and
 # benchmarks. Anywhere else a ticket is made by withTicket, call or concurrently, which abandon it if the wait is
 # cancelled.
