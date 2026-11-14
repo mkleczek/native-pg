@@ -10,6 +10,7 @@ module Network.Streaming.Structure
   ( Tree (..),
     Shape (..),
     unnamedAction,
+    opensInbox,
     readable,
     children,
     identify,
@@ -21,6 +22,7 @@ module Network.Streaming.Structure
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Exception (evaluate)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
@@ -103,6 +105,21 @@ data Shape
 -- | What an action is called in a diagram until the program names it.
 unnamedAction :: String
 unnamedAction = "IO"
+
+-- | The name of the inbox that a tree opens, if it is the step, or what a chain of steps is made of, that opens it, within
+-- as many nodes as the fuel.
+opensInbox :: Int -> Tree -> Maybe String
+opensInbox fuel step
+  | fuel <= 0 = Nothing
+  | otherwise = case step of
+      Leaf _ (OpenInbox name) -> Just name
+      Seq one two -> opensInbox (fuel - 1) one <|> opensInbox (fuel - 1) two
+      First inner -> opensInbox (fuel - 1) inner
+      Second inner -> opensInbox (fuel - 1) inner
+      Wires _ _ inner -> opensInbox (fuel - 1) inner
+      End _ _ inner -> opensInbox (fuel - 1) inner
+      Allowing _ _ inner -> opensInbox (fuel - 1) inner
+      _ -> Nothing
 
 -- | A length of time in the largest unit that has it exactly.
 readable :: Duration -> String

@@ -35,6 +35,10 @@ data Check
     DeadlineWithoutWait
   | -- | A shield is around a wait, which holds the cancellation off for as long as the wait lasts.
     ShieldAroundWait
+  | -- | An inbox has posts and no collects anywhere in the program, or collects and no posts: nothing pairs by its name.
+    DeadInbox
+  | -- | The same name is opened at two sites of the program, so that its posts and collects can't be told apart.
+    InboxOpenedTwice
   deriving (Eq, Show, Enum, Bounded)
 
 -- | Annotations for the diagrams that "Network.Streaming.Diagram" draws of a program, and for its lint. Every other arrow

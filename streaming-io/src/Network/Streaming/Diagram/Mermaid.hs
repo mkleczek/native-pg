@@ -28,7 +28,7 @@ import GHC.Stack (SrcLoc (..))
 import Network.Streaming.Annotate (Side (..))
 import Network.Streaming.Classes (Label (..))
 import Network.Streaming.Diagram
-import Network.Streaming.Structure (children, loopHeads, readable)
+import Network.Streaming.Structure (children, loopHeads, opensInbox, readable)
 import System.Mem.StableName (StableName, makeStableName)
 
 -- | A chart of its own, for a named box.
@@ -145,8 +145,12 @@ data Kind
     Lane
   deriving (Eq)
 
--- | One end of an exchange of a value, which has a name.
-data Mark = Mark Side String
+-- | What a step does at an inbox that an edge is drawn for: opening it, which is the store, posting, and collecting.
+data Use = Opens | Posts | Collects
+  deriving (Eq)
+
+-- | One end of an exchange of a value, or a step at an inbox, each of which has a name.
+data Mark = Mark Side String | Uses Use String
   deriving (Eq)
 
 -- | A node of the chart, with the ends of exchanges that are in the part of the program that it draws.
@@ -555,7 +559,9 @@ drawStep ctx path = \case
   Race one two -> traverse (render ctx path) [one, two] >>= barred ctx "race"
   Leaf text how -> do
     when (text == unnamedAction) $ modifyIORef' (ctxUnnamed ctx) (+ 1)
-    single <$> declare ctx (leafText how text)
+    node <- declare ctx (leafText how text)
+    placing ctx node (leafMarks how)
+    pure (single node)
   Scope acquire release body -> scoped ctx path acquire release body
   Try inner -> grouped ctx "try" (render ctx path inner)
   Shield inner -> grouped ctx "shield" (render ctx path inner)
@@ -882,6 +888,10 @@ grouped ctx title draw = do
 -- junction if the acquire has no node.
 scoped :: Ctx -> Path -> Tree -> Tree -> Tree -> IO Fragment
 scoped ctx path acquire release body = grouped ctx "scope" $ do
+  -- A scope that opens an inbox draws it as a store, a cylinder, which the posts and the collects of its name have edges to.
+  forM_ (opensInbox 16 acquire) $ \name -> do
+    store <- declare ctx (\node -> node ++ "[(" ++ labelOf name ++ ")]")
+    placing ctx store [Uses Opens name]
   acquired <- render ctx path acquire
   running <- render ctx path body
   released <- render ctx path release
@@ -989,7 +999,22 @@ titles fuel step
       Named (Label title _) _ _ -> [title]
       _ -> nub (concatMap (titles (fuel - 1)) (children step))
 
--- | The ends of exchanges that are in the tree, each once, which it walks as it is, into the boxes too.
+-- | The marks of a step at an inbox: a post and a collect have edges of their own to the store of the name.
+leafMarks :: Shape -> [Mark]
+leafMarks = \case
+  PostTo name -> [Uses Posts name]
+  CollectFrom name -> [Uses Collects name]
+  _ -> []
+
+-- | The marks that a box has for the steps in it, which the opening of an inbox is one of: the box stands for the store, on
+-- the page of the box whose own page has no store of that name.
+liftedMarks :: Shape -> [Mark]
+liftedMarks = \case
+  OpenInbox name -> [Uses Opens name]
+  how -> leafMarks how
+
+-- | The ends of exchanges and the steps at inboxes that are in the tree, each once, which it walks as it is, into the boxes
+-- too.
 endsOf :: Tree -> IO [Mark]
 endsOf root = do
   seen <- newIORef []
@@ -1002,6 +1027,7 @@ endsOf root = do
           modifyIORef' seen (name :)
           case tree of
             End side exchanged _ -> modifyIORef' found (\marks -> nub (marks ++ [Mark side exchanged]))
+            Leaf _ how -> modifyIORef' found (\marks -> nub (marks ++ liftedMarks how))
             _ -> pure ()
           traverse_ visit (children tree)
   visit root
@@ -1024,7 +1050,8 @@ ancestry around items =
 
 -- | The edges of the messages of exchanges: from a node that has the answering end to a node that has the asking end of
 -- an exchange of the same name, for each pair of such nodes. An end in a lane is joined at the lane, as an edge to a
--- node in it would make Mermaid forget the lane's direction, unless the other end is in the lane too.
+-- node in it would make Mermaid forget the lane's direction, unless the other end is in the lane too. The edges of the
+-- messages of inboxes are drawn the same way, from the posts to the store of an inbox, and from the store to the collects.
 messages :: [(Node, [(Node, Kind)])] -> [Placed] -> [Item]
 messages around placed =
   [ Edge (joined from to) (joined to from) (Just (envelope ++ exchanged)) Message
@@ -1037,6 +1064,7 @@ messages around placed =
       Mark Asking awaited <- placedMarks ask,
       awaited == exchanged
   ]
+    ++ stores
   where
     groupsAround node = fromMaybe [] (lookup node around)
     joined node other =
@@ -1045,6 +1073,24 @@ messages around placed =
        in case [group | (group, Lane) <- drop shared mine] of
             group : _ -> group
             [] -> node
+    -- The posts to an inbox have an edge to its store, and the store has an edge to the collects from it, which are lifted to
+    -- boxes and lanes as the messages are. A node that the chart doesn't have, as one of a part that was drawn as another, has none.
+    stores =
+      concat
+        [ [Edge (joined user store) (joined store user) Nothing Message | user <- using Posts name, user /= store]
+            ++ [Edge (joined store user) (joined user store) Nothing Message | user <- using Collects name, user /= store]
+          | (store, name) <- nub [(placedNode opening, name) | opening <- placed, Uses Opens name <- placedMarks opening],
+            store `elem` fmap fst around
+        ]
+    using use name =
+      nub
+        [ placedNode user
+          | user <- placed,
+            Uses found called <- placedMarks user,
+            found == use,
+            called == name,
+            placedNode user `elem` fmap fst around
+        ]
 
 -- | The step that a body is, called by the text, if it is a leaf or a function with wires and pure steps about it, within
 -- as many nodes as the fuel, so that a loop of pure steps ends.

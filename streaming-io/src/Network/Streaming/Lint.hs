@@ -9,6 +9,9 @@
 -- can wait if a wait is reachable inside it, through the boxes, wires, exchanges, scopes, parts that run together, races
 -- and deadlines.
 --
+-- The inboxes are checked across the whole program, by their names: a name that has posts and no collects, or collects and
+-- no posts, anywhere, and a name that is opened at two sites.
+--
 -- A part allows a check with 'allowing', for a reason, and a finding inside it is listed apart from the others.
 module Network.Streaming.Lint
   ( Check (..),
@@ -22,7 +25,8 @@ where
 
 import Control.Applicative ((<|>))
 import Data.Foldable (asum)
-import Data.List (intercalate, nubBy)
+import Data.Function (on)
+import Data.List (intercalate, nub, nubBy)
 import Data.Maybe (isNothing, listToMaybe)
 import GHC.Stack (SrcLoc (..))
 import Network.Streaming.Annotate (Check (..))
@@ -69,7 +73,8 @@ lint (Diagram root) = do
   Walked nodes heads <- walk [] allow root
   structural <- concat <$> traverse atNode nodes
   loops <- concat <$> traverse atHead heads
-  pure (settle (structural ++ loops))
+  inboxes <- atInboxes nodes
+  pure (settle (structural ++ loops ++ inboxes))
   where
     allow = \case
       Allowing check reason _ -> \held -> if (check, reason) `elem` held then held else held ++ [(check, reason)]
@@ -162,6 +167,41 @@ found (Met tree held above) check what message = Found (Finding check path sourc
     boxes = [(title, place) | Named (Label title _) place _ <- tree : above]
     path = reverse (fst <$> boxes)
     source = listToMaybe [place | (_, Just place) <- boxes]
+
+-- * Inboxes
+
+-- | The findings about the inboxes of the whole program, which are paired by name: the posts of a name that nothing collects,
+-- the collects of a name that nothing posts to, and the sites that open a name that another site opens.
+atInboxes :: [Met Allowances] -> IO [Found]
+atInboxes nodes = do
+  sites <- traverse (\(name, met) -> (\(site, _) -> (name, site, met)) <$> identify (metTree met)) openers
+  pure (dead ++ opened sites)
+  where
+    posts = [(name, met) | met@(Met (Leaf _ (PostTo name)) _ _) <- nodes]
+    collects = [(name, met) | met@(Met (Leaf _ (CollectFrom name)) _ _) <- nodes]
+    openers = [(name, met) | met@(Met (Scope acquire _ _) _ _) <- nodes, Just name <- [opensInbox 16 acquire]]
+    dead =
+      [ found met DeadInbox ("posts to " ++ name) $
+          "Nothing in the program collects from the inbox " ++ show name ++ ", so what is posted to it stays there: "
+            ++ "collect from it, or drop the posts."
+        | (name, met) <- posts,
+          name `notElem` fmap fst collects
+      ]
+        ++ [ found met DeadInbox ("collects from " ++ name) $
+               "Nothing in the program posts to the inbox " ++ show name ++ ", so this collect waits for ever: "
+                 ++ "post to it, or drop the collect."
+             | (name, met) <- collects,
+               name `notElem` fmap fst posts
+           ]
+    -- A site is a scope, which parts that are replicated share, so that they are one site: its stable name is the same.
+    opened sites =
+      [ found met InboxOpenedTwice ("opens " ++ name ++ " again") $
+          "The inbox " ++ show name ++ " is opened at another site too, so its posts and collects can't be told apart: "
+            ++ "give each inbox a name of its own."
+        | name <- nub [name | (name, _, _) <- sites],
+          (_, _, met) <- drop 1 (nubBy ((==) `on` stable) [site | site@(other, _, _) <- sites, other == name])
+      ]
+    stable (_, name, _) = name
 
 -- * Loops
 

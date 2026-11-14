@@ -92,6 +92,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Loans
                  Network.Streaming.NotImplemented
                  Network.Streaming.Diagram
+                 Network.Streaming.Diagram.Mermaid
                  Network.Streaming.Structure
                  Network.Streaming.Lint
                  Network.Streaming.Internal.Scheduler
@@ -105,6 +106,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Internal.Tickets
                  EmptyPoolSpec
                  InboxSpec
+                 MermaidSpec
                  PositiveIntSpec
                  ResourcesSpec
                  WatchSpec

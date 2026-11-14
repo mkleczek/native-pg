@@ -1,15 +1,17 @@
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | The lint of "Network.Streaming.Lint": small programs, built at the diagram arrow, that each check finds, and near
 -- misses that it doesn't.
 module LintSpec (spec) where
 
-import Control.Arrow (ArrowChoice, arr, (&&&), (>>>), (>>^), (|||))
+import Control.Arrow (ArrowChoice, arr, (&&&), (>>>), (>>^), (^>>), (|||))
 import Data.List (isSuffixOf)
 import GHC.Stack (SrcLoc (..))
+import GHC.TypeLits (KnownSymbol)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, box, done, foreverA, iterateWith)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, box, done, foreverA, iterateWith, withInbox)
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Lint
 import Skeletest
@@ -44,6 +46,7 @@ spec = do
   deadlines
   shields
   allowances
+  inboxes
   findings
 
 -- | A scope whose acquire waits, or does not.
@@ -165,6 +168,68 @@ shields = describe "a shield" $ do
   it "around steps that never wait is not" $ do
     report <- lint (shield (quick >>> quick) :: Diagram () ())
     summary report `shouldBe` ([], [])
+
+-- | A scope that opens the inbox of the name, for a body that is given the inbox and its address.
+owning :: forall name. (KnownSymbol name) => Diagram ((Inbox Diagram name 'Anywhere (), Address name 'Anywhere ()), ()) () -> Diagram () ()
+owning = withInbox @name @'Anywhere (quick :: Diagram ((), ()) ())
+
+-- | A post to the inbox, and a collect from it.
+poster :: forall name. (KnownSymbol name) => Diagram (Address name 'Anywhere ()) ()
+poster = (,()) ^>> post >>> quick
+
+collector :: forall name. (KnownSymbol name) => Diagram (Inbox Diagram name 'Anywhere ()) ()
+collector = collect >>> quick
+
+-- | A body that posts to the inbox and collects from it.
+postAndCollect :: forall name. (KnownSymbol name) => Diagram ((Inbox Diagram name 'Anywhere (), Address name 'Anywhere ()), ()) ()
+postAndCollect = fst ^>> ((snd ^>> poster) &&& (fst ^>> collector) >>> done)
+
+-- | The checks on inboxes, which look at the whole program by the names of its inboxes.
+inboxes :: Spec
+inboxes = describe "an inbox" $ do
+  it "that is posted to and collected from, in a scope, is not found" $ do
+    report <- lint (owning @"jobs" postAndCollect)
+    summary report `shouldBe` ([], [])
+
+  it "that has posts and no collects is found as dead" $ do
+    report <- lint (owning @"jobs" (snd . fst ^>> poster))
+    summary report `shouldBe` ([DeadInbox], [])
+    (findingWhat <$> reportFindings report) `shouldBe` ["posts to jobs"]
+
+  it "that has collects and no posts is found as dead" $ do
+    report <- lint (owning @"jobs" (fst . fst ^>> collector))
+    summary report `shouldBe` ([DeadInbox], [])
+    (findingWhat <$> reportFindings report) `shouldBe` ["collects from jobs"]
+
+  it "is paired by name only: a post and a collect with different names are both dead" $ do
+    report <- lint (owning @"jobs" (snd . fst ^>> poster) >>> owning @"tasks" (fst . fst ^>> collector))
+    (findingWhat <$> reportFindings report) `shouldBe` ["posts to jobs", "collects from tasks"]
+
+  it "is paired across the boxes of the program, as the program is walked into them" $ do
+    report <- lint (owning @"jobs" (fst ^>> ((snd ^>> box "producer" poster) &&& (fst ^>> box "consumer" collector) >>> done)))
+    summary report `shouldBe` ([], [])
+
+  it "that is dead is allowed by a part that says why, with the reason" $ do
+    report <- lint (allowing DeadInbox "what is posted is collected by another program" (owning @"jobs" (snd . fst ^>> poster)))
+    summary report `shouldBe` ([], [(DeadInbox, "what is posted is collected by another program")])
+
+  it "that is opened at two sites of the program is found, at the second" $ do
+    report <- lint (owning @"jobs" postAndCollect >>> owning @"jobs" (postAndCollect >>> quick))
+    summary report `shouldBe` ([InboxOpenedTwice], [])
+    (findingWhat <$> reportFindings report) `shouldBe` ["opens jobs again"]
+
+  it "that is opened at one site that parts share is not found, whatever the number of parts" $ do
+    let site = owning @"jobs" postAndCollect
+    report <- lint (together [site, site, site])
+    summary report `shouldBe` ([], [])
+
+  it "is opened at two sites only if the names are the same: another name is a near miss" $ do
+    report <- lint (owning @"jobs" postAndCollect >>> owning @"tasks" (postAndCollect >>> quick))
+    summary report `shouldBe` ([], [])
+
+  it "that is opened at two sites is allowed by a part that says why, with the reason" $ do
+    report <- lint (allowing InboxOpenedTwice "the sites are in different servers" (owning @"jobs" postAndCollect >>> owning @"jobs" (postAndCollect >>> quick)))
+    summary report `shouldBe` ([], [(InboxOpenedTwice, "the sites are in different servers")])
 
 -- | What a part allows, and what it doesn't.
 allowances :: Spec
