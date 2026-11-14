@@ -113,11 +113,11 @@ strict = BL.toStrict . toLazyByteString
 data Message = DataRow [ByteString] | CommandComplete ByteString
 
 -- | The next message: its tag decides which it is.
-message :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) Message
+message :: (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => arr (Reader link) Message
 message = withOnly readMessage
 {-# INLINABLE message #-}
 
-readMessage :: (ArrowChoice arr, Effect arr, Link arr link) => With (Reader link) arr () Message
+readMessage :: (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => With (Reader link) arr () Message
 readMessage = asks word8 >>> tagged ^>> (row ||| (complete ||| unknown))
   where
     row = asks word32 >>> done >>> dataRow >>^ DataRow
@@ -133,14 +133,14 @@ tagged 67 = Finish (Left ())
 tagged other = Finish (Right other)
 
 -- | A DataRow's body: how many fields, and each one's length and bytes.
-dataRow :: (ArrowChoice arr, Effect arr, Link arr link) => With (Reader link) arr () [ByteString]
+dataRow :: (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => With (Reader link) arr () [ByteString]
 dataRow = asks word16 >>> replicateA field
   where
     field = asks word32 >>> With bytes
 {-# INLINABLE dataRow #-}
 
 -- | Folds the rows of the stream, until its CommandComplete.
-foldRows :: (ArrowChoice arr, Effect arr, Link arr link) => (acc -> [ByteString] -> acc) -> arr (Reader link, acc) acc
+foldRows :: (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => (acc -> [ByteString] -> acc) -> arr (Reader link, acc) acc
 foldRows add = with (iterateA (keeping readMessage >>^ step))
   where
     step (DataRow fields, acc) = Again $! add acc fields
@@ -149,7 +149,7 @@ foldRows add = with (iterateA (keeping readMessage >>^ step))
 
 -- | The stream's messages, until its CommandComplete, with the bytes of every
 -- field given to the consumer as pieces that arrive.
-streamMessages :: (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (Reader link) ()
+streamMessages :: (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => arr ByteString () -> arr (Reader link) ()
 streamMessages consumer = withOnly (iterateWith (asks word8 >>^ tagged) row >>> (complete ||| unknown))
   where
     row = asks word32 >>> asks word16 >>> replicateA (asks word32 >>> With (stream consumer)) >>> done

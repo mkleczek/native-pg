@@ -78,7 +78,7 @@ writable end = pure (Watched (pure (Watch (laneWritable (endOut end)) (pure ()))
 
 -- | A simulated end, in any arrow that can run its tries, block, and give way.
 -- It waits for input as its receive does, on its lane's watch.
-instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => Link arr SimEnd where
+instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => Link arr SimEnd where
   receive = receiveWith receiveReady readable
   {-# INLINE receive #-}
   sendAll = sendAllWith sendReady (\_ -> pure True) writable

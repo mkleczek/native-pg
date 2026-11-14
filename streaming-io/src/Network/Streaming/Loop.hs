@@ -84,6 +84,9 @@ instance ArrowApplicative Loop
 instance ArrowChoice Loop where
   left = Choose
 
+-- | Annotations are for diagrams: the program is run as it is.
+instance Annotate Loop
+
 instance Concurrent Loop where
   together = \case
     [] -> done

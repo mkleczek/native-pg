@@ -24,6 +24,7 @@ where
 import Control.Arrow (Arrow (..), ArrowChoice (..), (>>>), (>>^), (^>>))
 import Control.Category (Category (..))
 import Data.Tuple (swap)
+import Network.Streaming.Annotate (Annotate (exchange))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Mode (ModeOf)
@@ -140,6 +141,16 @@ instance (Concurrent arr) => Concurrent (With r arr) where
 instance (Race arr) => Race (With r arr) where
   race (With one) (With two) = With (race one two)
   {-# INLINE race #-}
+
+-- | The box, the names of the wires and the ends of exchanges are the arrow's: the body is given the environment as it
+-- is.
+instance (Annotate arr) => Annotate (With r arr) where
+  named label (With inner) = With (named label inner)
+  {-# INLINE named #-}
+  wires input output (With inner) = With (wires input output inner)
+  {-# INLINE wires #-}
+  exchange side name (With inner) = With (exchange side name inner)
+  {-# INLINE exchange #-}
 
 -- | The tickets are the arrow's own, of the same reach.
 type instance Local (With r arr) = Local arr

@@ -32,7 +32,7 @@ import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import Skeletest
-import TestPrograms
+import TestPrograms hiding (named)
 
 spec :: FilePath -> Spec
 spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name _) -> describe name $ do

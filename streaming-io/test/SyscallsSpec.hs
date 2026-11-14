@@ -35,7 +35,7 @@ import Skeletest
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Time arr, Within arr, Exchange arr (Local arr), Instrumented (ModeOf arr))
+type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Time arr, Within arr, Annotate arr, Exchange arr (Local arr), Instrumented (ModeOf arr))
 
 type Program a = forall arr. (Rich arr) => arr () a
 

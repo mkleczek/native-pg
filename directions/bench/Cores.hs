@@ -131,7 +131,7 @@ count :: Counter -> IO Int
 count (Counter pointer) = withForeignPtr pointer peek
 
 -- | A part that checks a connection out, works a little while it has it, and releases it, until told to stop.
-part :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> IORef Bool -> Counter -> arr () ()
+part :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> IORef Bool -> Counter -> arr () ()
 part pool stop counter = iterateWith (now (const (bool (Again ()) (Finish ()) <$> readIORef stop))) turn
   where
     turn = checkout pool >>> now hold >>> release pool
@@ -217,7 +217,7 @@ loansRun kind variant parts rounds = do
 
 -- | A client and a server over a socket pair: the client sends a byte and waits for it to come back, and the server
 -- sends back each byte it receives, for the rounds. The buffers are what each receives into.
-socketPingPong :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Buffer -> Buffer -> Int -> arr (Socket, Socket) ()
+socketPingPong :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => Buffer -> Buffer -> Int -> arr (Socket, Socket) ()
 socketPingPong forClient forServer rounds =
   together [fst ^>> timesWith rounds clientStep >>> done, snd ^>> timesWith rounds serverStep >>> done]
   where
@@ -232,7 +232,7 @@ socketsRun :: String -> Int -> Int -> IO ()
 socketsRun kind pairs rounds = do
   sockets <- replicateM pairs (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol)
   buffers <- replicateM pairs ((,) <$> newBuffer (positiveInt @16) <*> newBuffer (positiveInt @16))
-  let program :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr () ()
+  let program :: (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => arr () ()
       program = together [const ends ^>> socketPingPong forClient forServer rounds | (ends, (forClient, forServer)) <- zip sockets buffers]
   (seconds, bytes) <-
     measured
@@ -261,7 +261,7 @@ wakeRun kind samples = do
   printf "wake %s samples=%d blocked=%s median_us=%.1f p90_us=%.1f p99_us=%.1f min_us=%.1f max_us=%.1f\n" kind samples (maybe "-" show waits) (at 0.5 / 1000) (at 0.9 / 1000) (at 0.99 / 1000) (minimum latencies / 1000) (maximum latencies / 1000)
 
 -- | A program for every arrow that has scopes and time.
-type Program a = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Time arr, Within arr) => arr () a
+type Program a = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Time arr, Within arr, Annotate arr) => arr () a
 
 runProgram :: String -> Program a -> IO a
 runProgram kind program = case kind of
@@ -277,7 +277,7 @@ waiter waiting = scope returnA done (now (const (atomicModifyIORef' waiting (\n 
 -- | The loop in the first part (VARIANT @bare@), in a half of a pair, or, with that many parts that wait beside it,
 -- in a half of a race with them, which begins once they all wait: so that the run of the loop and the run of
 -- nothing both make and end the parts, and what is measured is the loop.
-inside :: (ArrowChoice arr, Effect arr, GiveWay arr, Concurrent arr, Race arr, Exchange arr (Local arr), Scope arr) => IORef Int -> String -> Int -> arr () () -> arr () ()
+inside :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Concurrent arr, Race arr, Exchange arr (Local arr), Scope arr) => IORef Int -> String -> Int -> arr () () -> arr () ()
 inside waiting variant parts loop
   | parts > 0 = race (untilJust ((\n -> if n == parts then Just () else Nothing) <$> readIORef waiting) >>> loop) (balanced (replicate parts (waiter waiting))) >>> done
   | variant == "bare" = loop

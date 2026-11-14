@@ -15,7 +15,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad (forM_, replicateM)
 import Data.Word (Word64)
-import Network.Streaming.Classes (Concurrent (..), GiveWay (..), Within, monotonicNanoseconds, secs)
+import Network.Streaming.Classes (Annotate, Concurrent (..), GiveWay (..), Within, monotonicNanoseconds, secs)
 import qualified Network.Streaming.Classes as Classes (within)
 import Network.Streaming.Combinators (done, times)
 import Network.Streaming.Compiled
@@ -27,7 +27,7 @@ import Skeletest
 import System.Timeout (timeout)
 
 -- | What the cases' programs need of an arrow.
-type Program = forall arr. (ArrowChoice arr, GiveWay arr, Concurrent arr, Within arr) => arr () ()
+type Program = forall arr. (ArrowChoice arr, GiveWay arr, Concurrent arr, Within arr, Annotate arr) => arr () ()
 
 -- | What puts a part in many scopes: deadlines, or pairs, one of whose halves does nothing.
 data Nesting = Deadlines | Pairs

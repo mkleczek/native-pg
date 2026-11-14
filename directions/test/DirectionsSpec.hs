@@ -124,7 +124,7 @@ spec = describe "directions" $ do
         (length turns <= 40) `shouldBe` True
 
 -- | A part that notes which part it was, after each of its 1000 steps, and is given its link.
-type Part = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IORef [Int] -> Int -> Buffer -> arr Memory ()
+type Part = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => IORef [Int] -> Int -> Buffer -> arr Memory ()
 
 -- | Each step is a receive from a link that never waits.
 receiving :: Part
@@ -181,8 +181,8 @@ transact commits run = do
 
 -- | How the client and the proxy are made.
 data Setup = Setup
-  { setupClient :: forall arr end. (ArrowChoice arr, Concurrent arr, Effect arr, Link arr end) => Buffer -> ByteString -> IORef [ByteString] -> arr end (),
-    setupProxy :: forall arr end. (ArrowChoice arr, Concurrent arr, Link arr end) => Buffer -> Buffer -> arr (end, end) ()
+  { setupClient :: forall arr end. (ArrowChoice arr, Annotate arr, Concurrent arr, Effect arr, Link arr end) => Buffer -> ByteString -> IORef [ByteString] -> arr end (),
+    setupProxy :: forall arr end. (ArrowChoice arr, Annotate arr, Concurrent arr, Link arr end) => Buffer -> Buffer -> arr (end, end) ()
   }
 
 plain, oneDirection :: Setup
@@ -194,7 +194,7 @@ request = BS.pack (take 100000 (cycle [97 .. 122]))
 
 -- | The whole round trip as one program: the client, the proxy, and an echo
 -- server, over the four ends.
-world :: (ArrowChoice arr, Concurrent arr, Effect arr, Link arr end) => Setup -> ByteString -> IORef [ByteString] -> (end, end, end, end) -> IO (arr () ())
+world :: (ArrowChoice arr, Annotate arr, Concurrent arr, Effect arr, Link arr end) => Setup -> ByteString -> IORef [ByteString] -> (end, end, end, end) -> IO (arr () ())
 world setup bytes kept (client, front, back, server) = do
   forClient <- newBuffer (positiveInt @16384)
   requests <- newBuffer (positiveInt @16384)
@@ -208,7 +208,7 @@ world setup bytes kept (client, front, back, server) = do
       ]
 
 -- | A program made in IO, which each arrow runs: what the tests run.
-type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr, Instrumented (ModeOf arr)) => IO (arr () ())
+type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => IO (arr () ())
 
 -- | The round trip over simulated links that hold 1000 bytes each way: what
 -- the run gave, and what the client kept.

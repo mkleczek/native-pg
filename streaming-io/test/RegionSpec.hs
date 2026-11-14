@@ -75,7 +75,7 @@ throwsTypeError action =
     Right () -> failTest "the program ran: it compiled"
 
 -- | Waits, giving way, until the reference holds a value.
-found :: (ArrowChoice arr, Effect arr, GiveWay arr) => IORef (Maybe a) -> arr () a
+found :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr) => IORef (Maybe a) -> arr () a
 found box = untilJust (readIORef box)
 
 -- | The ends of a ticket of the core of the program, and of one that any core can give a value.

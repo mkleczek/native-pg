@@ -53,3 +53,12 @@ executable fulmen-bench
   main-is: Main.hs
   ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively
   build-depends: base, bytestring, fulmen, network, streaming-io
+
+-- Draws the server as Mermaid flowcharts, one for each named box of its program, with the program built at the arrow that
+-- runs nothing. It writes them into the directory that is its argument.
+executable fulmen-diagram
+  default-language: GHC2021
+  hs-source-dirs: diagram
+  main-is: Main.hs
+  ghc-options: -Wall
+  build-depends: base, fulmen, network, streaming-io

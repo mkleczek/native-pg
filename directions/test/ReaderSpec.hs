@@ -68,7 +68,7 @@ spec = describe "the reader" $ do
           (length pieces > 24) `shouldBe` True
 
 -- | A program that is made in IO, for every arrow: its input is the reader of a memory link, and the other input.
-type Program a b = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory, a) b)
+type Program a b = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => IO (arr (Reader Memory, a) b)
 
 -- | Runs the program on the wire with each arrow, a reader of the capacity,
 -- and a link that gives at most the limit at once: what each gave, or how it
@@ -97,10 +97,10 @@ keeping :: (Effect arr) => IORef [ByteString] -> arr ByteString ()
 keeping kept = now (\piece -> evaluate (BS.copy piece) >>= \owned -> modifyIORef' kept (owned :))
 
 -- | A resumable parser over a memory link, driven by an arrow: its input is the link and the bytes in hand.
-type Resumed a = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Buffer -> IO (arr (Memory, ByteString) a)
+type Resumed a = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => Buffer -> IO (arr (Memory, ByteString) a)
 
 -- | A resumable parser that is made in IO, for every arrow.
-type MadeFrom a = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr (Memory, ByteString) a)
+type MadeFrom a = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => IO (arr (Memory, ByteString) a)
 
 -- | Runs the parser on the wire with each arrow: what each gave.
 resumed :: forall a. Resumed a -> ByteString -> Int -> Int -> IO [a]

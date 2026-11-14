@@ -82,6 +82,29 @@
 - warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (,x) <$> e)", rhs: "second (now (\\y -> e)) >>^ swap", side: notIn x e}
 - warn: {name: Route around the effect, lhs: "now (\\(x, y) -> (,x) <$> e)", rhs: "(,) <$> now (\\(x, y) -> e) <*> arr fst", side: not (notIn x e)}
 
+# The same for an effect that has a name in diagrams.
+- warn: {name: Route around the effect, lhs: "step s (\\x -> x <$ e)", rhs: "tap (step s (\\x -> () <$ e))"}
+- warn: {name: Route around the effect, lhs: "step s (\\x -> f x <$ e)", rhs: "tap (step s (\\x -> () <$ e)) >>^ f"}
+- warn: {name: Route around the effect, lhs: "step s (\\x -> e $> f x)", rhs: "tap (step s (\\x -> () <$ e)) >>^ f"}
+- warn: {name: Route around the effect, lhs: "step s (\\x -> e $> x)", rhs: "tap (step s (\\x -> () <$ e))"}
+- warn: {name: Route around the effect, lhs: "step s (\\x -> (x,) <$> e)", rhs: "alongside (step s (\\x -> e)) >>^ swap"}
+- warn: {name: Route around the effect, lhs: "step s (\\x -> (,) x <$> e)", rhs: "alongside (step s (\\x -> e)) >>^ swap"}
+- warn: {name: Route around the effect, lhs: "step s (\\x -> (,x) <$> e)", rhs: "alongside (step s (\\x -> e))"}
+
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> x <$ e)", rhs: "second (step s (\\y -> () <$ e)) >>^ fst", side: notIn x e}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> x <$ e)", rhs: "tap (step s (\\(x, y) -> () <$ e)) >>^ fst", side: not (notIn x e)}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> y <$ e)", rhs: "consume (step s (\\x -> () <$ e))", side: notIn y e}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> y <$ e)", rhs: "tap (step s (\\(x, y) -> () <$ e)) >>^ snd", side: not (notIn y e)}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (y, x) <$ e)", rhs: "tap (step s (\\(x, y) -> () <$ e)) >>^ swap"}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (x,) <$> e)", rhs: "second (step s (\\y -> e))", side: notIn x e}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (x,) <$> e)", rhs: "(,) <$> arr fst <*> step s (\\(x, y) -> e)", side: not (notIn x e)}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (,y) <$> e)", rhs: "first (step s (\\x -> e))", side: notIn y e}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (,y) <$> e)", rhs: "(,) <$> step s (\\(x, y) -> e) <*> arr snd", side: not (notIn y e)}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (y,) <$> e)", rhs: "first (step s (\\x -> e)) >>^ swap", side: notIn y e}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (y,) <$> e)", rhs: "(,) <$> arr snd <*> step s (\\(x, y) -> e)", side: not (notIn y e)}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (,x) <$> e)", rhs: "second (step s (\\y -> e)) >>^ swap", side: notIn x e}
+- warn: {name: Route around the effect, lhs: "step s (\\(x, y) -> (,x) <$> e)", rhs: "(,) <$> step s (\\(x, y) -> e) <*> arr fst", side: not (notIn x e)}
+
 # The pass-through in PingPong measures the raw tickets and has to stay as it is.
 - ignore: {name: Route around the effect, within: Network.Directions.PingPong}
 

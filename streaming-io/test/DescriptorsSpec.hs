@@ -28,7 +28,7 @@ import Skeletest
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Time arr, Within arr, Exchange arr (Local arr), Instrumented (ModeOf arr))
+type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Time arr, Within arr, Annotate arr, Exchange arr (Local arr), Instrumented (ModeOf arr))
 
 type Program a = forall arr. (Rich arr) => arr () a
 
@@ -174,7 +174,7 @@ bothWays = now (const setup) >>> concurrently reading (concurrently writing drai
 data Rig = Rig {rigPair :: Pair, rigFloodBuffer :: Buffer, rigDrainBuffer :: Buffer}
 
 -- | Receives from the socket until the bytes of 'flood' have come: how many came.
-drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr (Socket, Buffer) Int
+drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => arr (Socket, Buffer) Int
 drain = started ^>> iterateWith (arr finished) (alongside (room ^>> receive) >>^ received)
   where
     started (end, buffer) = Draining end buffer 0

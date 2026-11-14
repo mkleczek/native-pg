@@ -56,6 +56,11 @@ module Network.Streaming.Classes
     plus,
     Time (..),
     Within (..),
+    Label (..),
+    -- The method 'exchange' is left out, as its name is a common one: programs use 'asking' and 'answering'.
+    Annotate (named, wires),
+    taking,
+    giving,
     Effect (..),
     GiveWay (..),
     Block (..),
@@ -83,6 +88,7 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (Ptr, plusPtr)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
+import Network.Streaming.Annotate (Annotate (..), Label (..), box, giving, taking)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)
@@ -136,6 +142,7 @@ type Runtime arr =
     Within arr,
     Time arr,
     Concurrent arr,
+    Annotate arr,
     Exchange arr (Local arr),
     Exchange arr 'Anywhere,
     Instrumented (ModeOf arr)
@@ -312,17 +319,23 @@ data Event = Readable !Fd | Writable !Fd | Watched (IO Watch) | Until !Instant
 -- | A socket, in any arrow that can run its tries, block, and give way: the
 -- tries are the socket's own calls that never wait, and while one finds
 -- nothing ready, the part blocks until the descriptor is readable or writable.
-instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Link arr Socket where
-  receive = receiveWith (tryReceive @(ModeOf arr)) readable
+instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => Link arr Socket where
+  receive =
+    named (Label "receive" "Receives into the room, and blocks while the socket has no input.") $
+      receiveWith (tryReceive @(ModeOf arr)) readable
   {-# INLINE receive #-}
-  sendAll = sendAllWith (trySend @(ModeOf arr)) (\_ -> pure True) writable
+  sendAll =
+    named (Label "send" "Sends all of the pieces, and blocks while the socket takes no more.") $
+      sendAllWith (trySend @(ModeOf arr)) (\_ -> pure True) writable
   {-# INLINE sendAll #-}
   -- What the wait finds is for the receive after it to read: it doesn't wait first because of a short read before the wait.
-  awaitInput = now (\sock -> receiveFirst sock *> readable sock) >>> block
+  awaitInput =
+    named (Label "await input" "Blocks until the socket has input, and takes none of it.") $
+      box "watch for input" (now (\sock -> receiveFirst sock *> readable sock)) >>> block
   {-# INLINE awaitInput #-}
-  shutdownSend = now (`Socket.shutdown` Socket.ShutdownSend)
+  shutdownSend = box "shut down output" (now (`Socket.shutdown` Socket.ShutdownSend))
   {-# INLINE shutdownSend #-}
-  close = now Socket.close
+  close = box "close socket" (now Socket.close)
   {-# INLINE close #-}
 
 -- | The event of a socket's input being ready, and of its output being.
@@ -336,8 +349,10 @@ writable sock = Writable . Fd <$> Socket.unsafeFdSocket sock
 -- the address, up to the size, and gives how many bytes, or 'Nothing' if none
 -- are ready. The part gives way before it tries, so that one whose link always
 -- has bytes ready still does, once for each receive.
-receiveWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => (link -> Ptr Word8 -> Int -> IO (Maybe Int)) -> (link -> IO Event) -> arr (link, Room) Int
-receiveWith try readyToReceive = giveWay >>> iterateWith (now attempt) (consume block)
+receiveWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => (link -> Ptr Word8 -> Int -> IO (Maybe Int)) -> (link -> IO Event) -> arr (link, Room) Int
+receiveWith try readyToReceive =
+  giveWay
+    >>> iterateWith (giving "received?" (box "try receive" (now attempt))) (taking "nothing ready" (consume block))
   where
     attempt (link, room@(Room (Buffer memory _) offset size)) =
       withForeignPtr memory (\pointer -> try link (pointer `plusPtr` offset) size) >>= \case
@@ -351,8 +366,11 @@ receiveWith try readyToReceive = giveWay >>> iterateWith (now attempt) (consume 
 -- and goes on. The send gives how many bytes the link took, without waiting;
 -- the flush writes what it took and hasn't written yet, without waiting, and
 -- says whether nothing is left.
-sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => (link -> [ByteString] -> IO Int) -> (link -> IO Bool) -> (link -> IO Event) -> arr (link, [ByteString]) ()
-sendAllWith send flush readyToSend = giveWay >>> second (filter (not . BS.null)) ^>> iterateWith (now attempt) (consume block)
+sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => (link -> [ByteString] -> IO Int) -> (link -> IO Bool) -> (link -> IO Event) -> arr (link, [ByteString]) ()
+sendAllWith send flush readyToSend =
+  giveWay
+    >>> second (filter (not . BS.null))
+    ^>> iterateWith (giving "all sent?" (box "try send" (now attempt))) (taking "socket full" (consume block))
   where
     attempt (link, pieces) = case pieces of
       [] -> flush link >>= \flushed -> if flushed then pure (Finish ()) else blocked link []

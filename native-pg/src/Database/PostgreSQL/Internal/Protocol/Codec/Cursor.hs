@@ -193,7 +193,7 @@ instance Cursor 'RemainingBytesAtom where
 class (Cursor p) => Skippable (p :: Payload) where
   -- | Skips what is unread of the payload the cursor stands at, receiving if
   -- the bytes are not in hand.
-  skipRest :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At p link) ()
+  skipRest :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At p link) ()
 
 -- | A value whose length was not read is read, to skip it.
 instance Skippable 'MaybeBytes32Atom where
@@ -273,7 +273,7 @@ messages reader = At reader 0
 -- are in hand, and tells which alternative the tag chooses, with its body
 -- begun. It never asks for more than the frame says is there: five bytes, and
 -- then the body's own.
-message :: forall alternatives arr link. (Messages alternatives, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadChoice alternatives) link) (Chosen alternatives)
+message :: forall alternatives arr link. (Messages alternatives, ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At ('PayloadChoice alternatives) link) (Chosen alternatives)
 message = withOnly (asks (now ready) >>> boolA slow returnA >>> asks (now framed))
   where
     -- The frame starts where the previous body ends, if it is in hand.
@@ -312,7 +312,7 @@ child (At reader depth) = At reader (depth + 1)
 {-# INLINE child #-}
 
 -- | The number of elements, which is read before them.
-count :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 e) link) Int
+count :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At ('PayloadCounted16 e) link) Int
 count =
   inBody 2 $ \(At reader depth) from -> do
     elements <- scalar reader from 2
@@ -325,7 +325,7 @@ count =
 -- | Moves on to the next element, with what is unread of the one before
 -- skipped, and says whether there is one. Its cursor is the 'child' of this
 -- one, which is begun. It gives no cursor, so nothing is built for it.
-advance :: forall e arr link. (Skippable e, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 e) link) Bool
+advance :: forall e arr link. (Skippable e, ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At ('PayloadCounted16 e) link) Bool
 advance = withOnly (asks (now ready) >>> boolA slow returnA >>> asks (now next))
   where
     -- Nothing is unread of the one before.
@@ -343,7 +343,7 @@ advance = withOnly (asks (now ready) >>> boolA slow returnA >>> asks (now next))
 
 -- | The next element, or 'Nothing' after the last, with what is unread of the
 -- one before skipped. The element is a cursor that is begun, standing at it.
-element :: forall e arr link. (Skippable e, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 e) link) (Maybe (At e link))
+element :: forall e arr link. (Skippable e, ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At ('PayloadCounted16 e) link) (Maybe (At e link))
 element = alongside advance >>^ \(found, cursor) -> if found then Just (child cursor) else Nothing
 {-# INLINE element #-}
 
@@ -351,7 +351,7 @@ element = alongside advance >>^ \(found, cursor) -> if found then Just (child cu
 -- A value that reaches past the end of its message is an error. This is the
 -- step that allocates nothing: it gives a number, where 'valueSize' gives a
 -- 'Maybe', which is built for whatever follows it when that is large.
-valueLength :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) Int
+valueLength :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At 'MaybeBytes32Atom link) Int
 valueLength =
   inBody 4 $ \(At reader depth) from -> do
     raw <- scalar reader from 4
@@ -366,14 +366,14 @@ valueLength =
 {-# INLINE valueLength #-}
 
 -- | The length of the value, or 'Nothing' for NULL.
-valueSize :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) (Maybe Int)
+valueSize :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At 'MaybeBytes32Atom link) (Maybe Int)
 valueSize = valueLength >>^ \size -> if size < 0 then Nothing else Just size
 {-# INLINE valueSize #-}
 
 -- | The next piece of the value, as a view of the buffer that is valid until
 -- the next pull: the bytes in hand go first, and a receive is made only when
 -- none are. 'Nothing' at the end of the value.
-piece :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) (Maybe ByteString)
+piece :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At 'MaybeBytes32Atom link) (Maybe ByteString)
 piece = withOnly (asks (now attempt) >>> (more ||| returnA))
   where
     attempt (At reader depth) = do
@@ -384,13 +384,13 @@ piece = withOnly (asks (now attempt) >>> (more ||| returnA))
           when (unread < 0) $ failing "the length of a value was not read"
           from <- mark reader markStart
           end <- mark reader markEnd
-          if end == from then pure (Left ()) else Right . Just <$> taking reader depth unread from (end - from)
-    taking reader depth !unread !from !held = do
+          if end == from then pure (Left ()) else Right . Just <$> takeValue reader depth unread from (end - from)
+    takeValue reader depth !unread !from !held = do
       let !size = min unread held
       setMark reader markStart (from + size)
       setMark reader (markFrame depth) (unread - size)
       pure (BSI.BS (readerMemory reader `plusForeignPtr` from) size)
-    {-# INLINE taking #-}
+    {-# INLINE takeValue #-}
     -- Nothing is in hand, so the receive has the whole buffer.
     more =
       asks
@@ -411,14 +411,14 @@ piece = withOnly (asks (now attempt) >>> (more ||| returnA))
                   when (received <= 0) $ ioError (userError "the stream ended inside a value")
                   setMark reader markEnd received
                   unread <- mark reader (markFrame depth)
-                  Just <$> taking reader depth unread 0 received
+                  Just <$> takeValue reader depth unread 0 received
               )
           )
 {-# INLINE piece #-}
 
 -- | The rest of the message's body, copied out whole, in whichever size of buffer: for the messages that are few and
 -- small, such as those of the startup, and the errors. It is read as the pieces of a value that has the body's length.
-remaining :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'RemainingBytesAtom link) ByteString
+remaining :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At 'RemainingBytesAtom link) ByteString
 remaining = (\at -> (retyped at, [])) ^>> iterateA (alongside (fst ^>> piece) >>^ collected)
   where
     retyped :: At 'RemainingBytesAtom l -> At 'MaybeBytes32Atom l
@@ -428,13 +428,13 @@ remaining = (\at -> (retyped at, [])) ^>> iterateA (alongside (fst ^>> piece) >>
 {-# INLINE remaining #-}
 
 -- | The pieces of the value, one after the other, given to the consumer.
-eachPiece :: (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (At 'MaybeBytes32Atom link) ()
+eachPiece :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr ByteString () -> arr (At 'MaybeBytes32Atom link) ()
 eachPiece consumer = withOnly (iterateWith (asks piece >>^ maybe (Finish ()) Again) (lift consumer))
 {-# INLINE eachPiece #-}
 
 -- | Skips what is unread of the value, whose length was read. The size of what
 -- was skipped.
-skipLeft :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At p link) Int
+skipLeft :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At p link) Int
 skipLeft = withOnly (asks (now starting) >>> tap (onReader skipBytes))
   where
     starting (At reader depth) = do
@@ -445,13 +445,13 @@ skipLeft = withOnly (asks (now starting) >>> tap (onReader skipBytes))
 {-# INLINE skipLeft #-}
 
 -- | Skips what is unread of the value, whose length was read.
-skipValue :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) ()
+skipValue :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At 'MaybeBytes32Atom link) ()
 skipValue = skipLeft >>> done
 {-# INLINE skipValue #-}
 
 -- | The value's bytes in hand, whole, as a view of the buffer that is valid until the next step: they are received if
 -- they are not in hand, and taken. Its length must have been read, and it is an error if it is larger than the buffer.
-valueView :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) ByteString
+valueView :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At 'MaybeBytes32Atom link) ByteString
 valueView = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks (now taken))
   where
     ready (At reader depth) = do
@@ -508,7 +508,7 @@ instance InPlace Length where
 -- | The value, decoded in place: with all of its bytes in hand, which a receive
 -- makes if it has to. Its length must have been read. A value that is larger
 -- than the buffer, or that the type has another size for, is an error.
-decode :: forall a arr link. (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => arr (At 'MaybeBytes32Atom link) a
+decode :: forall a arr link. (InPlace a, ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At 'MaybeBytes32Atom link) a
 decode = case decoder @a of
   Peek wire peek -> inValue wire (const peek)
   PeekWhole peek -> inValue (-1) peek
@@ -517,7 +517,7 @@ decode = case decoder @a of
 
 -- | The value's bytes in hand, and what is made of them: how many bytes the
 -- value must have, unless that is negative.
-inValue :: (ArrowChoice arr, Effect arr, Link arr link) => Int -> (Int -> Ptr Word8 -> IO a) -> arr (At 'MaybeBytes32Atom link) a
+inValue :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => Int -> (Int -> Ptr Word8 -> IO a) -> arr (At 'MaybeBytes32Atom link) a
 inValue wire peek = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks (now taken))
   where
     ready (At reader depth) = do
@@ -541,7 +541,7 @@ inValue wire peek = withOnly (asks (now ready) >>> (onReader refill ||| returnA)
 {-# INLINE inValue #-}
 
 -- | A fixed number of bytes, up to eight, as a big-endian number.
-fixed :: forall n arr link. (KnownNat n, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('FixedBytesAtom n) link) Int
+fixed :: forall n arr link. (KnownNat n, ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At ('FixedBytesAtom n) link) Int
 fixed =
   inBody (natAsInt @n) $ \(At reader depth) from -> do
     setMark reader (markFrame depth) 0
@@ -551,7 +551,7 @@ fixed =
 -- | The C string that is the whole body of a control message: a view of the
 -- buffer, without its terminator. A message that doesn't fit the buffer is an
 -- error, since the string is in hand at once.
-cstring :: (ArrowChoice arr, Effect arr, Link arr link) => arr (At 'CStringAtom link) ByteString
+cstring :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (At 'CStringAtom link) ByteString
 cstring = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks (now found))
   where
     ready (At reader _) = do
@@ -577,7 +577,7 @@ cstring = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks 
 -- receives the rest; then it takes them, which is the other. It is an error to
 -- reach past the end of the body, which is checked before anything is received,
 -- so that nothing waits for bytes that the message does not have.
-inBody :: (ArrowChoice arr, Effect arr, Link arr link) => Int -> (At p link -> Int -> IO a) -> arr (At p link) a
+inBody :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => Int -> (At p link -> Int -> IO a) -> arr (At p link) a
 inBody size take' = withOnly (asks (now ready) >>> (onReader refill ||| returnA) >>> asks (now taken))
   where
     ready (At reader _) = do
@@ -598,7 +598,7 @@ inBody size take' = withOnly (asks (now ready) >>> (onReader refill ||| returnA)
 {-# INLINE inBody #-}
 
 -- | Skips this many bytes: the ones in hand, and then the ones that arrive.
-skipBytes :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link, Int) ()
+skipBytes :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (Reader link, Int) ()
 skipBytes = with (With (now attempt) >>> (more ||| returnA))
   where
     attempt (reader, size) = do

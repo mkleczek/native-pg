@@ -48,7 +48,7 @@ import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr)
+type Rich arr = (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Annotate arr)
 
 -- | The same, for the pool, which parts of several cores share.
 type Pooled arr = (Rich arr, Exchange arr 'Anywhere)

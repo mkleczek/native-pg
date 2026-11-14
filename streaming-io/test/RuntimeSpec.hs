@@ -86,14 +86,14 @@ spec = describe "the runtime" $ do
       within (try (runThreads (together [receiving, failing]) ())) `shouldReturn` Just (Left (ErrorCall "the part failed"))
 
 -- | The programs of the same kind that scope their resources, race, and keep time.
-type Cancelling = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Scope arr, Race arr, Time arr, Within arr, Instrumented (ModeOf arr)) => IO (arr () ())
+type Cancelling = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Scope arr, Race arr, Time arr, Within arr, Annotate arr, Instrumented (ModeOf arr)) => IO (arr () ())
 
 compiledScoped, delimitedScoped :: Turn -> Cancelling -> IO ((), Report)
 compiledScoped turn built = built >>= \program -> runCompiledTurn turn program ()
 delimitedScoped turn built = runDelimitedWithTurn turn built ()
 
 -- | A part that gives way this many times, noting its name each time with the function it is given.
-ticks :: (ArrowChoice arr, GiveWay arr, Effect arr) => (String -> IO ()) -> String -> Int -> arr () ()
+ticks :: (ArrowChoice arr, GiveWay arr, Effect arr, Annotate arr) => (String -> IO ()) -> String -> Int -> arr () ()
 ticks note name count = const count ^>> replicateA (giveWay >>> now (const (note name))) >>> done
 
 -- | Two parts race: the loser waits for a byte that never comes in a scope
@@ -162,7 +162,7 @@ failsAtTheGive :: IO a -> IO ()
 failsAtTheGive run = try (void run) `shouldReturn` (Left valueError :: Either ErrorCall ())
 
 -- | A program made in IO, which each arrow runs: what the tests run.
-type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr, Instrumented (ModeOf arr)) => IO (arr () ())
+type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => IO (arr () ())
 
 -- | A pair of connected sockets, closed after the action.
 withPair :: (Socket -> Socket -> IO a) -> IO a

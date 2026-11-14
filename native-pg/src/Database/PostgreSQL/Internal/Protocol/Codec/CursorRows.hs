@@ -37,7 +37,7 @@ type ResultStream =
 -- adds them up into the counter: the ints, the lengths of the texts and the
 -- bools, each decoded in place or skipped, with no list of the fields and no
 -- copy.
-foldRowsCursors :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Counter -> arr (Reader link) ()
+foldRowsCursors :: forall arr link. (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => Counter -> arr (Reader link) ()
 foldRowsCursors total = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
     loop :: With (At ResultStream link) arr () ()
@@ -63,7 +63,7 @@ foldRowsCursors total = (messages :: Reader link -> At ResultStream link) ^>> wi
 
 -- | The bytes of every value of the stream's rows, given to the consumer as the
 -- pieces that arrive, up to the CommandComplete.
-streamCursors :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (Reader link) ()
+streamCursors :: forall arr link. (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => arr ByteString () -> arr (Reader link) ()
 streamCursors consumer = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
     loop :: With (At ResultStream link) arr () ()
@@ -78,7 +78,7 @@ streamCursors consumer = (messages :: Reader link -> At ResultStream link) ^>> w
 
 -- | The next element of the body, decoded in place; its absence, and a NULL, are
 -- errors.
-column :: (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 'MaybeBytes32Atom) link) a
+column :: (InPlace a, ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => arr (At ('PayloadCounted16 'MaybeBytes32Atom) link) a
 column = withOnly (asks advance >>> boolA (missing "fewer fields") value)
   where
     value = asks (child ^>> valueLength) >>> (< 0) ^>> boolA (asks (child ^>> decode)) (missing "a NULL")

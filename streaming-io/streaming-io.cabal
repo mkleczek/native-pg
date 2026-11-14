@@ -22,6 +22,7 @@ library
                    Network.Streaming.Buffer
                    Network.Streaming.Watch
                    Network.Streaming.Mode
+                   Network.Streaming.Annotate
                    Network.Streaming.Classes
                    Network.Streaming.Combinators
                    Network.Streaming.Plumbing
@@ -36,6 +37,8 @@ library
                    Network.Streaming.Pool
                    Network.Streaming.Loans
                    Network.Streaming.NotImplemented
+                   Network.Streaming.Diagram
+                   Network.Streaming.Diagram.Mermaid
                    Network.Streaming.Internal.Scheduler
                    Network.Streaming.Internal.Timers
                    Network.Streaming.Internal.Cancel
@@ -69,6 +72,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Buffer
                  Network.Streaming.Watch
                  Network.Streaming.Mode
+                 Network.Streaming.Annotate
                  Network.Streaming.Classes
                  Network.Streaming.Combinators
                  Network.Streaming.Plumbing

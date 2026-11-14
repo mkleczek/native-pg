@@ -45,7 +45,7 @@ import Data.Sequence (Seq, ViewL (..), viewl, (|>))
 import qualified Data.Sequence as Seq
 import Data.Tuple (swap)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (boolA, done, keeping)
+import Network.Streaming.Combinators (boolA, decide, done, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Tickets (giveNow)
 
@@ -204,15 +204,19 @@ claimMany many need state@(State count conns arrival lanes)
 -- part to take. Asking is a point to give way at, as a link's receive is: a part that does nothing else than check
 -- connections out and release them doesn't keep the others of its core from running.
 reserved ::
-  (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) =>
+  (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr, Exchange arr 'Anywhere) =>
   IORef (State conn) ->
   Int ->
   (State conn -> (State conn, Either () taken)) ->
   (Giver 'Anywhere taken -> Int -> Waiter conn) ->
   arr () (Either (Waiting arr 'Anywhere taken) taken)
-reserved ref need claim handout = giveWay >>> now (const (update ref claim)) >>> (queue ||| arr Right)
+reserved ref need claim handout =
+  named (Label "reserved" "Takes what is free if enough is, and else queues the giver and gives the end to wait at.") $
+    giveWay
+      >>> giving "item free?" (step "claim from free items" (const (update ref claim)))
+      >>> (taking "no" queue ||| taking "yes" (arr Right))
   where
-    queue = ticket >>> now (\(awaiting, giver) -> update ref (queueOrClaim awaiting giver))
+    queue = ticket >>> step "queue giver" (\(awaiting, giver) -> update ref (queueOrClaim awaiting giver))
     queueOrClaim awaiting giver state = case claim state of
       (claimed, Right taken) -> (claimed, Right taken)
       (_, Left ()) -> (queued need (handout giver) state, Left awaiting)
@@ -220,24 +224,35 @@ reserved ref need claim handout = giveWay >>> now (const (update ref claim)) >>>
 -- | A connection if one is free, or else the end to wait at for the one that
 -- is released to this part: it queues the part's giver. The waiter can
 -- 'abandon' it instead, which gives back a connection that came meanwhile.
-reserve :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Either (Waiting arr 'Anywhere conn) conn)
+reserve :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Either (Waiting arr 'Anywhere conn) conn)
 reserve = reserveAt 1
 
 -- | One item if at least this many are free: a waiter for an item that leaves a number free for others, as a reserve is.
-reserveAt :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Int -> Pool conn -> arr () (Either (Waiting arr 'Anywhere conn) conn)
+reserveAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Int -> Pool conn -> arr () (Either (Waiting arr 'Anywhere conn) conn)
 reserveAt need (Pool ref _) = reserved ref need (claimOne need) One
 
 -- | This many items at once, if at least the number needed are free: the waiter queues in the lane of what serves it, which
 -- is never fewer than it takes.
-reserveMany :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Int -> Int -> Pool conn -> arr () (Either (Waiting arr 'Anywhere [conn]) [conn])
+reserveMany :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Int -> Int -> Pool conn -> arr () (Either (Waiting arr 'Anywhere [conn]) [conn])
 reserveMany need many (Pool ref _) = reserved ref (max many need) (claimMany many need) (Many many)
 
 -- | The item or the items once the part's ticket is given them, which the part waits at, and gives up its place at when it is
 -- cancelled, so that what was given to it meanwhile goes back through the arrow.
-waited :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr taken () -> arr (Waiting arr 'Anywhere taken) taken
-waited giveBack = scope returnA giveUp (fst ^>> await)
+waited :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr taken () -> arr (Waiting arr 'Anywhere taken) taken
+waited giveBack =
+  named (Label "waited" "Waits for the item to be given, and gives up the place in the queue if cancelled meanwhile.") $
+    scope returnA giveUp (fst ^>> await)
   where
-    giveUp = unlessDone ^>> (returnA ||| (abandon >>> (maybe (Left ()) Right ^>> (returnA ||| giveBack))))
+    giveUp =
+      decide "got its item?" unlessDone
+        >>> ( taking "yes" returnA
+                ||| taking
+                  "no"
+                  ( abandon
+                      >>> decide "given meanwhile?" (maybe (Left ()) Right)
+                      >>> (taking "no" returnA ||| taking "yes" giveBack)
+                  )
+            )
 
 -- | The input of a release, which it has to give up, unless the body of the scope completed: then there is nothing to give up,
 -- and it is 'Left'.
@@ -248,15 +263,17 @@ unlessDone (input, exit) = case exit of Done -> Left (); _ -> Right input
 -- is released. A part that is cancelled while it waits gives up its place, and
 -- a connection that was given to it meanwhile goes back to the pool, so that
 -- none is lost.
-checkout :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool conn -> arr () conn
+checkout :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool conn -> arr () conn
 checkout = checkoutAt 1
 
 -- | The same for an item that is only given when at least this many are free.
-checkoutAt :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Int -> Pool conn -> arr () conn
-checkoutAt need pool = reserveAt need pool >>> (waited (release pool) ||| returnA)
+checkoutAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Int -> Pool conn -> arr () conn
+checkoutAt need pool =
+  named (Label "checkoutAt" "Takes an item of the pool if enough are free, and else queues for one and waits.") $
+    giving "item free?" (reserveAt need pool) >>> (taking "no" (waited (release pool)) ||| taking "yes" returnA)
 
 -- | The same for this many items at once, when at least the number needed are free.
-checkoutMany :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Int -> Int -> Pool conn -> arr () [conn]
+checkoutMany :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Int -> Int -> Pool conn -> arr () [conn]
 checkoutMany need many pool = reserveMany need many pool >>> (waited (now (releaseNow pool)) ||| returnA)
 
 -- | The same as 'checkoutMany' for a pool that is only known when the program runs, which is the input: it gives the
@@ -280,7 +297,7 @@ checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
 
 -- | A connection, if one is free within the time, as 'checkout' waits for it: 'Nothing' if it isn't, once the
 -- place in the queue is given up.
-checkoutWithin :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Within arr) => Duration -> Pool conn -> arr () (Maybe conn)
+checkoutWithin :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Within arr) => Duration -> Pool conn -> arr () (Maybe conn)
 checkoutWithin limit pool = within limit (checkout pool)
 
 -- | An item if at least this many are free, without waiting: the part that takes it passes no waiter, for none that can be
@@ -299,8 +316,8 @@ takeNowWith choose pool@(Pool ref _) = isClosed pool >>= \closed -> if closed th
 -- | Gives the connection to the first part that waits for one. A waiter that
 -- has gone doesn't take it, and the next is tried; with none left, the
 -- connection is free.
-release :: (Effect arr) => Pool conn -> arr conn ()
-release pool = now (releaseNow pool . pure)
+release :: (Effect arr, Annotate arr) => Pool conn -> arr conn ()
+release pool = step "return item" (releaseNow pool . pure)
 
 -- | Gives the items back to the pool: the oldest waiters that can have them are given them, and the rest are free. It
 -- is one action that never waits, so a part that is cancelled can't lose an item between a waiter that has gone and the

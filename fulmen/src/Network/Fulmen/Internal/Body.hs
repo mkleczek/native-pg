@@ -29,8 +29,19 @@ import Data.IORef (IORef, readIORef, writeIORef)
 import Foreign.ForeignPtr (plusForeignPtr)
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
-import Network.Streaming.Classes (Block, Effect (..), GiveWay, Link (..), Room (..), Stream (..))
-import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, iterateA, iterateWith, tap)
+import Network.Streaming.Classes
+  ( Annotate (named),
+    Block,
+    Effect,
+    GiveWay,
+    Label (..),
+    Link (..),
+    Room (..),
+    Stream (..),
+    giving,
+    taking,
+  )
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, decide, iterateA, iterateWith, step, tap)
 import Network.Streaming.Loans (Loan, release)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.NotImplemented (notImplementedIO)
@@ -71,11 +82,16 @@ instance Exception ConnectionLost where
 -- | What reading a body comes to once the bytes in hand are looked at: a receive, the end of the body, or a piece.
 type Reading = Step ((Socket, Room), BodyState) (Either BodyState (Maybe ByteString))
 
-instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Stream arr Body where
-  next = iterateWith (now advance) receiving >>> (ending ||| returnA)
+instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => Stream arr Body where
+  next =
+    named (Label "next" "Gives the next piece of the request body, from the bytes in hand or else from the socket.") $
+      giving
+        "body ended?"
+        (iterateWith (giving "bytes in hand?" (step "look at bytes in hand" advance)) (taking "no" receiving))
+        >>> (taking "yes" ending ||| taking "no" returnA)
     where
-      receiving = first receive >>> now arrived
-      ending = tap (now keepFollowing) >>> bodyLoan ^>> release >>^ const Nothing
+      receiving = first receive >>> step "record arrival" arrived
+      ending = tap (step "keep carry-over" keepFollowing) >>> bodyLoan ^>> release >>^ const Nothing
   {-# INLINE next #-}
 
 -- | The next piece of the body, from the bytes in hand if there are any, and else the socket and the room to receive
@@ -116,8 +132,13 @@ keepFollowing state = do
 -- | Reads what is left of the body and drops it, so that the next request on the connection begins where it should:
 -- whether it did, which it doesn't if the body is longer than the server will read for a client that doesn't use it,
 -- or can't be read.
-drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr Body Bool
-drain = start ^>> (returnA ||| iterateA ((fst &&& id) ^>> first next >>^ afterPiece))
+drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => arr Body Bool
+drain =
+  named (Label "drain" "Reads what is left of the request body and drops it, and says whether that could be done.") $
+    decide "chunked?" start
+      >>> ( taking "yes" returnA
+              ||| taking "no" (iterateA (giving "body drained?" ((fst &&& id) ^>> first next >>^ afterPiece)))
+          )
   where
     start ChunkedBody = Left False
     start body = Right (body, 0 :: Int)

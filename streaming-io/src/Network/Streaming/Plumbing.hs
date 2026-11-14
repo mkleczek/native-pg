@@ -1,11 +1,13 @@
 {-# LANGUAGE PatternSynonyms #-}
 
--- | Helpers that route values through any arrow and need nothing of the capability classes, so that the classes can
--- use them too. "Network.Streaming.Combinators" re-exports them. All are INLINE, for the reason given there.
+-- | Helpers that route values through any arrow and need nothing of the capability classes but the annotations of
+-- diagrams, so that the classes can use them too. "Network.Streaming.Combinators" re-exports them. All are INLINE, for
+-- the reason given there.
 module Network.Streaming.Plumbing
   ( done,
     dup,
     whether,
+    decide,
     alongside,
     keeping,
     tap,
@@ -22,6 +24,7 @@ where
 
 import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
 import Data.Bool (bool)
+import Network.Streaming.Annotate (Annotate, giving, taking)
 
 -- | What a step of a loop gives: 'Again' with the state to go round with, or 'Finish' with the result. It is 'Either',
 -- so 'Control.Arrow.left', '+++' and '|||' work on it.
@@ -38,16 +41,16 @@ pattern Finish r = Right r
 {-# COMPLETE Again, Finish #-}
 
 -- | Runs the step until it finishes: each 'Again' goes round again with its state.
-iterateA :: (ArrowChoice arr) => arr s (Step s r) -> arr s r
+iterateA :: (ArrowChoice arr, Annotate arr) => arr s (Step s r) -> arr s r
 iterateA step = iterateWith step returnA
 {-# INLINE iterateA #-}
 
 -- | Runs the body until it finishes. On 'Again', runs the second arrow on what the body gave, and goes round again
--- with its result.
-iterateWith :: (ArrowChoice arr) => arr s (Step t r) -> arr t s -> arr s r
+-- with its result. In diagrams the two branches are named "again" and "finish".
+iterateWith :: (ArrowChoice arr, Annotate arr) => arr s (Step t r) -> arr t s -> arr s r
 iterateWith body next = loop
   where
-    loop = body >>> ((next >>> loop) ||| returnA)
+    loop = body >>> (taking "again" (next >>> loop) ||| taking "finish" returnA)
 {-# INLINE iterateWith #-}
 
 -- | Runs the step for ever, each time on what it gave the time before.
@@ -73,6 +76,11 @@ whether :: (a -> Bool) -> a -> Either a a
 whether test a = if test a then Left a else Right a
 {-# INLINE whether #-}
 
+-- | A pure step that chooses a branch, named by the question it answers.
+decide :: (Arrow arr, Annotate arr) => String -> (a -> Either b c) -> arr a (Either b c)
+decide question = giving question . arr
+{-# INLINE decide #-}
+
 -- | Runs the arrow on the input, and pairs its result with the input, unchanged.
 alongside :: (Arrow arr) => arr a b -> arr a (b, a)
 alongside step = dup ^>> first step
@@ -94,7 +102,8 @@ consume :: (Arrow arr) => arr a () -> arr (a, c) c
 consume step = first step >>^ snd
 {-# INLINE consume #-}
 
--- | Runs the first arrow if the input is 'False', and the second if it is 'True', like 'bool'.
-boolA :: (ArrowChoice arr) => arr () b -> arr () b -> arr Bool b
-boolA no yes = bool (Left ()) (Right ()) ^>> (no ||| yes)
+-- | Runs the first arrow if the input is 'False', and the second if it is 'True', like 'bool'. In diagrams the two
+-- branches are named "false" and "true".
+boolA :: (ArrowChoice arr, Annotate arr) => arr () b -> arr () b -> arr Bool b
+boolA no yes = bool (Left ()) (Right ()) ^>> (taking "false" no ||| taking "true" yes)
 {-# INLINE boolA #-}

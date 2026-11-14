@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | Helpers for writing programs over the classes, so that a value is made where it is used and not carried
@@ -13,6 +14,7 @@ module Network.Streaming.Combinators
     done,
     dup,
     whether,
+    decide,
     alongside,
     keeping,
     tap,
@@ -32,22 +34,36 @@ module Network.Streaming.Combinators
     call,
     sleep,
     releaseWithin,
+    box,
+    asking,
+    answering,
+    step,
+    taking,
+    giving,
+    typed,
+    field,
   )
 where
 
 import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (***), (>>>), (>>^), (^>>), (|||))
+import Data.Proxy (Proxy (..))
+import Data.Typeable (Typeable, typeRep)
+import GHC.Records (HasField (..))
+import GHC.Stack (HasCallStack)
+import GHC.TypeLits (KnownSymbol, symbolVal)
+import Network.Streaming.Annotate (answering, asking, box)
 import Network.Streaming.Classes
 import Network.Streaming.Plumbing
 
 -- | The step this many times, each on what the one before gave.
-timesWith :: (ArrowChoice arr) => Int -> arr s s -> arr s s
-timesWith count step = (,count) ^>> iterateWith (arr countDown) (first step)
+timesWith :: (ArrowChoice arr, Annotate arr) => Int -> arr s s -> arr s s
+timesWith count body = (,count) ^>> iterateWith (arr countDown) (first body)
   where
     countDown (s, n) = if n <= 0 then Finish s else Again (s, n - 1)
 {-# INLINE timesWith #-}
 
 -- | Runs the arrow this many times.
-times :: (ArrowChoice arr) => Int -> arr () () -> arr () ()
+times :: (ArrowChoice arr, Annotate arr) => Int -> arr () () -> arr () ()
 times = timesWith
 {-# INLINE times #-}
 
@@ -67,7 +83,7 @@ concurrently one two =
 {-# INLINE concurrently #-}
 
 -- | The action until it gives something, giving way between tries.
-untilJust :: (ArrowChoice arr, Effect arr, GiveWay arr) => IO (Maybe a) -> arr () a
+untilJust :: (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => IO (Maybe a) -> arr () a
 untilJust action = iterateWith (now (const (maybe (Again ()) Finish <$> action))) giveWay
 {-# INLINE untilJust #-}
 
@@ -78,7 +94,7 @@ localTicket = ticket
 
 -- | Runs the arrow on the input and gives its result to the giver, without saying whether the waiter took it.
 deliver :: (Arrow arr, Exchange arr r) => arr a b -> arr (Giver r b, a) ()
-deliver step = second step >>> give >>> done
+deliver body = second body >>> give >>> done
 {-# INLINE deliver #-}
 
 -- | Runs the arrow on the giver of a ticket and the input, and gives what it gave, and the end to wait at.
@@ -94,9 +110,12 @@ handingOut handOut = handing ^>> first handOut
 -- | Makes a ticket, hands out its giver, and waits for the value: gives what the hand-out gave, and the value. If the
 -- hand-out or the wait ends any other way, the ticket is abandoned, and a value given before that goes to the disposal,
 -- with the input. The hand-out may wait, and is cancelled where it does.
-withTicket :: (ArrowChoice arr, Scope arr, Exchange arr r) => arr (Giver r a, b) c -> arr (a, b) () -> arr b (c, a)
+withTicket :: (ArrowChoice arr, Annotate arr, Scope arr, Exchange arr r) => arr (Giver r a, b) c -> arr (a, b) () -> arr b (c, a)
 withTicket handOut dispose =
-  scope (keeping ticket) (unawaited ^>> abandoning dispose) (fst ^>> handingOut handOut >>> second await)
+  scope
+    (keeping ticket)
+    (decide "awaited?" unawaited >>> abandoning dispose)
+    (fst ^>> handingOut handOut >>> second await)
   where
     -- Only a wait that didn't end in 'Done' is abandoned: after an 'await' the slot stays given, so an 'abandon' would
     -- hand the value out again. The release therefore trusts 'Done' to mean that the end was awaited.
@@ -108,12 +127,16 @@ withTicket handOut dispose =
 -- | Makes a ticket and tries to hand out its giver. Left: the giver wasn't handed out, so the ticket is abandoned at
 -- once, a value given before that goes to the disposal, with the input, and the result is Left. Right: it waits for the
 -- value as 'withTicket' does. The hand-out may wait, and is cancelled where it does.
-tryTicket :: (ArrowChoice arr, Scope arr, Exchange arr r) => arr (Giver r a, b) (Either c d) -> arr (a, b) () -> arr b (Either c (d, a))
+tryTicket :: (ArrowChoice arr, Annotate arr, Scope arr, Exchange arr r) => arr (Giver r a, b) (Either c d) -> arr (a, b) () -> arr b (Either c (d, a))
 tryTicket handOut dispose =
   scope
     (keeping ticket)
-    (unawaited ^>> abandoning dispose)
-    (handing . fst ^>> first handOut >>> routed ^>> (declined ||| accepted))
+    (decide "awaited?" unawaited >>> abandoning dispose)
+    ( handing . fst
+        ^>> first handOut
+        >>> decide "handed out?" routed
+        >>> (taking "no" declined ||| taking "yes" accepted)
+    )
   where
     -- The input stays with the end, for the disposal of a value that the hand-out gave before it declined.
     handing ((waiting, giver), b) = ((giver, b), (waiting, b))
@@ -128,8 +151,10 @@ tryTicket handOut dispose =
 
 -- | The release of a ticket's scope, for what is left of the wait: it does nothing if there is nothing, and else it
 -- abandons the end, and gives a value that was given before to the disposal, with the input.
-abandoning :: (ArrowChoice arr, Exchange arr r) => arr (a, b) () -> arr (Either () (Waiting arr r a, b)) ()
-abandoning dispose = returnA ||| (first abandon >>> late ^>> (returnA ||| dispose))
+abandoning :: (ArrowChoice arr, Annotate arr, Exchange arr r) => arr (a, b) () -> arr (Either () (Waiting arr r a, b)) ()
+abandoning dispose =
+  taking "yes" returnA
+    ||| taking "no" (first abandon >>> decide "value given already?" late >>> (taking "no" returnA ||| taking "yes" dispose))
   where
     late (given, b) = maybe (Left ()) (Right . (,b)) given
 {-# INLINE abandoning #-}
@@ -147,7 +172,7 @@ expect message = keeping ticket >>> handingOut (addressed ^>> give >>> done) >>^
 -- | Asks: gives the message that carries the giver of the answer, and waits for the answer, unless the giver the message
 -- was given to has gone: then it is 'Nothing', at once. If the give or the wait ends any other way, the ticket is
 -- abandoned, and an answer that came before goes to the disposal, with the giver the message was given to.
-call :: (ArrowChoice arr, Scope arr, Exchange arr r) => (Giver r a -> b) -> arr (a, Giver r b) () -> arr (Giver r b) (Maybe a)
+call :: (ArrowChoice arr, Annotate arr, Scope arr, Exchange arr r) => (Giver r a -> b) -> arr (a, Giver r b) () -> arr (Giver r b) (Maybe a)
 call message dispose = tryTicket (addressed ^>> give >>^ delivered) dispose >>^ either (const Nothing) (Just . snd)
   where
     -- The giver to give the message to, and the message, which carries the giver of the answer.
@@ -165,3 +190,22 @@ sleep duration = clock >>> Until . (`plus` duration) ^>> block
 releaseWithin :: (Scope arr, Within arr) => Duration -> arr a () -> arr a (Maybe ())
 releaseWithin duration release = shield (within duration release)
 {-# INLINE releaseWithin #-}
+
+-- | An effect with a name, drawn as a box with that name.
+step :: (HasCallStack, Effect arr, Annotate arr) => String -> (a -> IO b) -> arr a b
+step name = box name . now
+{-# INLINE step #-}
+
+-- | The arrow, with its input and output wires named by their types in diagrams. The type @()@ names nothing.
+typed :: forall a b arr. (Typeable a, Typeable b, Annotate arr) => arr a b -> arr a b
+typed = wires (typeName (Proxy @a)) (typeName (Proxy @b))
+  where
+    typeName proxy = case show (typeRep proxy) of
+      "()" -> Nothing
+      name -> Just name
+{-# INLINE typed #-}
+
+-- | The field of a record, whose output wire is named after the field in diagrams.
+field :: forall name r a arr. (HasField name r a, KnownSymbol name, Arrow arr, Annotate arr) => arr r a
+field = giving (symbolVal (Proxy @name)) (arr (getField @name))
+{-# INLINE field #-}

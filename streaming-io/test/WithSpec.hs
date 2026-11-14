@@ -17,7 +17,7 @@ import Network.Streaming.With
 import Skeletest
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Time arr, Within arr)
+type Rich arr = (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Time arr, Within arr, Annotate arr)
 
 spec :: Spec
 spec = describe "an arrow with an environment" $ do
@@ -35,8 +35,8 @@ exchanging :: (Rich arr) => IORef [String] -> With Int arr Int Int
 exchanging noted = scope (now (const (note "acquired"))) (now (\(_, exit) -> note ("released " <> show exit))) (snd ^>> doubled) >>> alongside ask >>^ uncurry (+)
   where
     note what = modifyIORef' noted (what :)
-    doubled = keeping localTicket >>> concurrently giving waiting >>^ snd
-    giving = twice ^>> give >>> done
+    doubled = keeping localTicket >>> concurrently handing waiting >>^ snd
+    handing = twice ^>> give >>> done
     twice ((_, giver), number) = (giver, 2 * number)
     waiting = fst . fst ^>> await
 

@@ -85,7 +85,7 @@ overSimulated run size = do
   (back, server) <- connect 65536
   roundTrip run size (client, front, back, server)
 
-roundTrip :: (forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => Link arr end) => (Built end -> Ends end -> IO (Maybe Report)) -> Int -> Ends end -> IO (Maybe Report, Int)
+roundTrip :: (forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => Link arr end) => (Built end -> Ends end -> IO (Maybe Report)) -> Int -> Ends end -> IO (Maybe Report, Int)
 roundTrip run size ends = do
   received <- newIORef 0
   report <-
@@ -120,18 +120,18 @@ serverEnd :: Ends end -> end
 serverEnd (_, _, _, server) = server
 
 -- | A program made in IO, which each arrow runs, and which is given the ends.
-type Built end = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => IO (arr (Ends end) ())
+type Built end = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => IO (arr (Ends end) ())
 
 -- | Sends this many bytes from the buffer, whatever is in it, then ends the
 -- output.
-sending :: (ArrowChoice arr, Link arr end) => Buffer -> Int -> arr end ()
+sending :: (ArrowChoice arr, Annotate arr, Link arr end) => Buffer -> Int -> arr end ()
 sending buffer total = (,total) ^>> iterateWith (arr remaining) (chunk ^>> consume sendAll) >>> shutdownSend
   where
     remaining (end, unsent) = if unsent == 0 then Finish end else Again (end, unsent)
     chunk (end, unsent) = let count = min unsent (bufferCapacity buffer) in ((end, [view buffer count]), (end, unsent - count))
 
 -- | Counts what arrives, until the end of the stream.
-counting :: (ArrowChoice arr, Effect arr, Link arr end) => Buffer -> IORef Int -> arr end ()
+counting :: (ArrowChoice arr, Annotate arr, Effect arr, Link arr end) => Buffer -> IORef Int -> arr end ()
 counting buffer total =
   iterateWith
     (alongside ((,roomOf buffer) ^>> receive) >>^ received)

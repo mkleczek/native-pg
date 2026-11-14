@@ -195,6 +195,9 @@ instance Scope (CompiledM m) where
     writeIORef (runFailure run) failed
     inner (Context run part failed) value (\result -> leaves *> next result)
 
+-- | Annotations are for diagrams: the arrow is run as it is.
+instance Annotate (CompiledM m)
+
 -- | The part that starts the group hands what follows it to the group, and the part that ends last goes on with it.
 -- The parts are in a cancel scope of their own, which the first failure cancels: the others are cancelled where they
 -- wait, and their scopes are released before the group ends, which fails with the first failure. A later failure is
@@ -268,7 +271,7 @@ instance Exchange (CompiledM m) 'Anywhere where
     next (CompiledRemoteWaiting slot, AnywhereGiver (giveRemote (runMailbox run) slot))
   await = Compiled $ \context@(Context run part _) (CompiledRemoteWaiting slot) next ->
     awaitRemote run part slot (steppedIn context . next) (\park -> park (\action -> resumed context (action >>= next)))
-  give = Compiled $ \context (AnywhereGiver giving, value) next -> giving value >>= \taken -> steppedIn context (next taken)
+  give = Compiled $ \context (AnywhereGiver giver, value) next -> giver value >>= \taken -> steppedIn context (next taken)
   abandon = Compiled $ \_ (CompiledRemoteWaiting slot) next -> abandonRemote slot >>= next
 
 -- | Runs the program and all of its concurrent parts on this thread: each part

@@ -293,6 +293,9 @@ failing failure scope' = \case
     when first' (cancelScope scope')
   Right _ -> pure ()
 
+-- | Annotations are for diagrams: the arrow is run as it is.
+instance Annotate (ThreadsM m)
+
 -- | Each part on a thread of its own, in a cancel scope that the first failure cancels: the others are cancelled at
 -- their waits, and waited for, and the first failure is rethrown. When several fail, the later are dropped. A part is
 -- entered into the scope of the group and the scopes that enclose it: a group of many parts doesn't make them deeper.
@@ -387,7 +390,7 @@ instance Exchange (ThreadsM m) 'Anywhere where
     abandoned <- newTVarIO False
     pure (ThreadWaiting var abandoned, AnywhereGiver (giveThread var abandoned))
   await = Threads (\part (ThreadWaiting var _) -> waiting part (atomically (readTMVar var)))
-  give = Threads (\_ (AnywhereGiver giving, value) -> giving value)
+  give = Threads (\_ (AnywhereGiver giver, value) -> giver value)
   abandon = Threads $ \_ (ThreadWaiting var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
 
 -- | The giver evaluates the value, before the transaction, as the other arrows' givers do.

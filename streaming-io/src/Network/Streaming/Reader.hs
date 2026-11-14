@@ -112,22 +112,22 @@ setMark reader index value = unsafeWithForeignPtr (readerMarks reader) (\pointer
 -- | The next n bytes, copied: they stay valid when the buffer is refilled. It
 -- receives only when fewer than n are in hand. An n larger than the buffer
 -- fails.
-bytes :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link, Int) ByteString
+bytes :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (Reader link, Int) ByteString
 bytes = atom (\reader from size -> unsafeWithForeignPtr (readerMemory reader) (\memory -> BSI.create size (\target -> copyBytes target (memory `plusPtr` from) size)))
 {-# INLINABLE bytes #-}
 
 -- | The next byte, as a number.
-word8 :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) Int
+word8 :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (Reader link) Int
 word8 = (,1) ^>> atom (\reader from _ -> scalar reader from 1)
 {-# INLINABLE word8 #-}
 
 -- | The next two bytes, as a big-endian number.
-word16 :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) Int
+word16 :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (Reader link) Int
 word16 = (,2) ^>> atom (\reader from _ -> scalar reader from 2)
 {-# INLINABLE word16 #-}
 
 -- | The next four bytes, as a big-endian number.
-word32 :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) Int
+word32 :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (Reader link) Int
 word32 = (,4) ^>> atom (\reader from _ -> scalar reader from 4)
 {-# INLINABLE word32 #-}
 
@@ -149,7 +149,7 @@ scalar reader from size = unsafeWithForeignPtr (readerMemory reader) (\memory ->
 -- result is evaluated before the bytes are given up. The steps take the reader
 -- from the environment, and the sum between them has nothing in it, so that
 -- nothing is built for the choice: the size is kept where the receive keeps it.
-atom :: (ArrowChoice arr, Effect arr, Link arr link) => (Reader link -> Int -> Int -> IO a) -> arr (Reader link, Int) a
+atom :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => (Reader link -> Int -> Int -> IO a) -> arr (Reader link, Int) a
 atom take' = with (With (now ready) >>> (With refill ||| returnA) >>> asks (now taken))
   where
     ready (reader, size) = do
@@ -169,7 +169,7 @@ atom take' = with (With (now ready) >>> (With refill ||| returnA) >>> asks (now 
 
 -- | Moves the bytes in hand to the buffer's start, and receives after them
 -- until as many bytes as the input says are there.
-refill :: (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link, Int) ()
+refill :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr (Reader link, Int) ()
 refill = with (With (now prepare) >>> iterateA (With receiveInto >>> With (now arrived)))
   where
     prepare (reader, size) = do
@@ -207,7 +207,7 @@ roomAfter reader held = Room (readerBuffer reader) held (readerCapacity reader -
 -- not a copy, valid until the consumer ends, and no larger than the buffer.
 -- The consumer must not read from the reader. The bytes in hand go first, and
 -- a receive is made only when none are.
-stream :: (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (Reader link, Int) ()
+stream :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => arr ByteString () -> arr (Reader link, Int) ()
 stream consumer = with (With (now begin) >>> iterateWith (asks (now next)) (more ||| lift consumer))
   where
     begin (reader, size) = do
@@ -252,7 +252,7 @@ stream consumer = with (With (now begin) >>> iterateWith (asks (now next)) (more
 
 -- | The action, as many times as the input says, and what it gave each time,
 -- in order.
-replicateA :: (ArrowChoice arr) => arr () b -> arr Int [b]
+replicateA :: (ArrowChoice arr, Annotate arr) => arr () b -> arr Int [b]
 replicateA action = (,[]) ^>> iterateWith (arr leftToDo) (startOne ^>> first action >>^ collect) >>^ reverse
   where
     leftToDo (count, values) = if count <= 0 then Finish values else Again (count, values)

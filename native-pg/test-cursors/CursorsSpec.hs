@@ -186,7 +186,7 @@ spec = describe "cursors derived from the schema" $ do
 type Fixeds = 'PayloadChoice '[FramedMessage 'k' ('PayloadCounted16 ('FixedBytesAtom 4))]
 
 -- | A program that is made in IO, for every arrow: its input is the reader of a memory link.
-type Program b = forall arr. (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory) b)
+type Program b = forall arr. (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr, Annotate arr) => IO (arr (Reader Memory) b)
 
 -- | Runs the program on the wire with each arrow, a reader of the capacity,
 -- and a link that gives at most the limit at once: what each gave, or how it
@@ -210,7 +210,7 @@ runIO program wire limit capacity =
           )
 
 -- | Runs a program that adds up into a counter, with each arrow.
-runAll :: (forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Counter -> arr (Reader Memory) ()) -> ByteString -> Int -> Int -> IO [Either String Int]
+runAll :: (forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => Counter -> arr (Reader Memory) ()) -> ByteString -> Int -> Int -> IO [Either String Int]
 runAll program wire limit capacity = do
   one <- newCounter
   two <- newCounter
@@ -257,7 +257,7 @@ withReader wire limit capacity use = do
   use reader
 
 -- | A program that needs no setup in IO.
-runWith :: forall b. (forall arr. (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr) => arr (Reader Memory) b) -> ByteString -> Int -> Int -> IO [Either String b]
+runWith :: forall b. (forall arr. (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr, Annotate arr) => arr (Reader Memory) b) -> ByteString -> Int -> Int -> IO [Either String b]
 runWith program = runIO (pure program)
 
 isCursorError :: Either String b -> Bool
@@ -317,7 +317,7 @@ dataRowTwoValuesOneInside = frameOf 'D' (be16 2 <> be32 4 <> BS.pack [0, 0, 0, 1
 
 -- | Of three elements of four bytes, skips the first, reads the second as a
 -- number, skips the third, and finds that there is no fourth.
-fixedElements :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory) [Int])
+fixedElements :: forall arr. (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory) [Int])
 fixedElements = do
   seen <- newIORef []
   let row :: With (At ('PayloadCounted16 ('FixedBytesAtom 4)) Memory) arr () [Int]
@@ -334,7 +334,7 @@ fixedElements = do
 
 -- | Reads this many messages, each as a description of what it was, and
 -- reads nothing of the rows.
-messagesRead :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => Int -> IO (arr (Reader Memory) [String])
+messagesRead :: forall arr. (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr) => Int -> IO (arr (Reader Memory) [String])
 messagesRead total = do
   seen <- newIORef []
   let noting :: String -> IO ()
@@ -352,7 +352,7 @@ messagesRead total = do
 
 -- | Skips whatever the stream has, until the CommandComplete, whose tag it
 -- reads.
-tagAfterSkipping :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) String
+tagAfterSkipping :: forall arr link. (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => arr (Reader link) String
 tagAfterSkipping = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
     loop :: With (At ResultStream link) arr () String
@@ -362,7 +362,7 @@ tagAfterSkipping = (messages :: Reader link -> At ResultStream link) ^>> withOnl
 {-# INLINABLE tagAfterSkipping #-}
 
 -- | The first value of the stream's first row, decoded in place.
-firstValue :: forall a arr link. (InPlace a, ArrowChoice arr, Effect arr, Link arr link) => arr (Reader link) a
+firstValue :: forall a arr link. (InPlace a, ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => arr (Reader link) a
 firstValue = (messages :: Reader link -> At ResultStream link) ^>> withOnly (asks message >>> With (cases (row :> unexpected :> NoCases)))
   where
     row = withOnly (asks count >>> asks column)
@@ -371,7 +371,7 @@ firstValue = (messages :: Reader link -> At ResultStream link) ^>> withOnly (ask
 
 -- | The values of the stream's first row: the int4, the int8, the lengths of
 -- the two texts, and the bool.
-firstRow :: forall arr link. (ArrowChoice arr, ArrowApplicative arr, Effect arr, Link arr link) => arr (Reader link) (Int32, (Int64, (Int, (Int, Bool))))
+firstRow :: forall arr link. (ArrowChoice arr, Annotate arr, ArrowApplicative arr, Effect arr, Link arr link) => arr (Reader link) (Int32, (Int64, (Int, (Int, Bool))))
 firstRow = (messages :: Reader link -> At ResultStream link) ^>> withOnly (asks message >>> With (cases (row :> unexpected :> NoCases)))
   where
     unexpected = now (const (ioError (userError "the stream ended before a row")))
@@ -382,7 +382,7 @@ firstRow = (messages :: Reader link -> At ResultStream link) ^>> withOnly (asks 
 
 -- | The sizes of all of the values of the stream's first row, with 'Nothing'
 -- for a NULL, each value skipped after its size is read.
-allValues :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory) [Maybe Int])
+allValues :: forall arr. (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr) => IO (arr (Reader Memory) [Maybe Int])
 allValues = do
   seen <- newIORef []
   let unexpected = now (const (ioError (userError "the stream ended before a row")))
@@ -401,7 +401,7 @@ allValues = do
   pure ((messages :: Reader Memory -> At ResultStream Memory) ^>> withOnly (asks message >>> With (cases (row :> unexpected :> NoCases))))
 
 -- | The first value of each row is added up; nothing else of the row is pulled.
-firstColumns :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Counter -> arr (Reader link) ()
+firstColumns :: forall arr link. (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => Counter -> arr (Reader link) ()
 firstColumns total = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
     loop :: With (At ResultStream link) arr () ()
@@ -412,7 +412,7 @@ firstColumns total = (messages :: Reader link -> At ResultStream link) ^>> withO
 
 -- | The first value, and the last value, are added up. The second value is not
 -- pulled, the third is pulled by its length, and the fourth is read in a piece.
-mixedColumns :: forall arr link. (ArrowChoice arr, Effect arr, Link arr link) => Counter -> arr (Reader link) ()
+mixedColumns :: forall arr link. (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => Counter -> arr (Reader link) ()
 mixedColumns total = (messages :: Reader link -> At ResultStream link) ^>> withOnly loop
   where
     loop :: With (At ResultStream link) arr () ()

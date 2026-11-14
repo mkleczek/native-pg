@@ -43,13 +43,35 @@ import Network.Fulmen.Request (Method (..), Request (..), Version (..))
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, foreverA, iterateA, iterateWith, Step, tap, whether, withTicket)
+import Network.Streaming.Combinators
+  ( pattern Again,
+    pattern Finish,
+    Step,
+    alongside,
+    answering,
+    asking,
+    box,
+    consume,
+    decide,
+    done,
+    foreverA,
+    iterateA,
+    iterateWith,
+    step,
+    tap,
+    typed,
+    whether,
+    withTicket,
+  )
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
 import Network.Streaming.Pool (queueNow, releaseNow, takeNowWith)
 
 -- | The server: for each core, the workers, and for the first, the acceptor.
 serve :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
-serve !settings handler = whether isFirst ^>> (together (acceptance settings : workers) ||| together workers)
+serve !settings handler =
+  named (Label "serve" "Runs the workers of each core, and the acceptor besides on the first core.") $
+    decide "first core?" (whether isFirst)
+      >>> (taking "yes" (together (acceptance settings : workers)) ||| taking "no" (together workers))
   where
     workers = replicate (connectionsPerCore settings) (worker settings handler)
     isFirst (Cores core _) = core == 0
@@ -59,13 +81,21 @@ serve !settings handler = whether isFirst ^>> (together (acceptance settings : w
 -- | Takes a free worker of the core that has the most free workers, accepts a connection, and gives it to the worker. A
 -- connection that the worker is no longer there to take is closed.
 acceptance :: (Runtime arr) => Settings -> arr Cores ()
-acceptance settings = tap (now (const (listening (listener settings)))) >>> foreverA (tap place)
+acceptance settings =
+  named (Label "acceptance" "Accepts connections, and gives each to a free worker of the core that has the most free workers.") $
+    tap (step "make listener non-blocking" (const (listening (listener settings)))) >>> foreverA (tap place)
   where
     place =
-      ((,) <$> checkout <*> (const (listener settings) ^>> acceptor))
-        >>> alongside give
-        >>> untaken
-        ^>> (close ||| returnA)
+      ( (,)
+          <$> giving "worker's giver" checkout
+          <*> giving "accepted socket" accept
+      )
+        >>> alongside (answering "connection" give)
+        >>> decide "worker took it?" untaken
+        >>> (taking "no" close ||| taking "yes" returnA)
+    accept =
+      named (Label "accept" "Accepts the next connection of the listening socket, and blocks while none is waiting.") $
+        const (listener settings) ^>> acceptor
     untaken (taken, (_, socket)) = if taken then Right () else Left socket
 
 -- | The giver of a free worker of the core that has the most free workers, which is taken from the pool at once. When no
@@ -73,12 +103,13 @@ acceptance settings = tap (now (const (listening (listener settings)))) >>> fore
 -- first, on any core, and waits at the ticket. A worker that is given after the wait has ended is put back in the pool.
 checkout :: (Runtime arr) => arr Cores (Giver 'Anywhere Socket)
 checkout =
-  alongside (now (\(Cores _ shared) -> takeNowWith freest (sharedWorkers shared)))
-    >>> (\(taken, cores) -> maybe (Left cores) Right taken)
-    ^>> (queued ||| returnA)
-    >>^ freeGiver
+  named (Label "checkout" "Takes a free worker of the core that has the most free workers at once, and else waits for the worker that is freed first, on any core, and puts back one that comes too late.") $
+    alongside (step "take a free worker" (\(Cores _ shared) -> takeNowWith freest (sharedWorkers shared)))
+      >>> decide "worker free now?" (\(taken, cores) -> maybe (Left cores) Right taken)
+      >>> (taking "no" queued ||| taking "yes" returnA)
+      >>^ freeGiver
   where
-    queued = withTicket (now queue) (now putBack) >>^ snd
+    queued = asking "worker's giver" (withTicket (step "queue for a worker" queue) (step "put the worker back" putBack)) >>^ snd
     queue (giver, Cores _ shared) = queueNow (sharedWorkers shared) 1 giver
     putBack (free, Cores _ shared) = releaseNow (sharedWorkers shared) [free]
 
@@ -97,12 +128,16 @@ freest workers = busiest >>= \core -> findIndex ((== core) . freeCore) workers
 
 -- | A worker: it offers itself as free, waits for a connection, and serves it, for ever.
 worker :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
-worker settings handler = foreverA (tap (offered >>> connection settings handler))
+worker settings handler =
+  named (Label "worker" "Offers itself as free, waits for a connection, and serves it, for ever.") $
+    foreverA (tap (giving "accepted socket" offered >>> connection settings handler))
 
 -- | The worker is free: the giver of a new ticket is in the pool, and the connection that is given it comes. A
 -- connection that is given after the wait has ended is closed.
 offered :: (Runtime arr) => arr Cores (Shared, Socket)
-offered = (,) <$> arr sharedOf <*> (withTicket (now offer) (fst ^>> close) >>^ snd)
+offered =
+  named (Label "offered" "Offers the worker as free in the pool, and waits at a ticket for the connection it is given, and closes one that comes too late.") $
+    (,) <$> arr sharedOf <*> (asking "connection" (withTicket (answering "worker's giver" (step "offer as free" offer)) (box "close late socket" (fst ^>> close))) >>^ snd)
   where
     sharedOf (Cores _ shared) = shared
     offer (giver, Cores core shared) = releaseNow (sharedWorkers shared) [Free core giver]
@@ -118,16 +153,23 @@ data Conn = Conn
 -- | The connection until it ends, which closes its socket however it ends. What goes wrong on a connection is that
 -- connection's: the worker goes on to the next.
 connection :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr (Shared, Socket) ()
-connection settings handler = scope (arr snd) (fst ^>> close) (snd ^>> serving)
+connection settings handler =
+  named (Label "connection" "Serves the connection until it ends, and closes its socket however it ends.") $
+    scope (arr snd) (fst ^>> close) (snd ^>> serving)
   where
     serving =
-      now (\(shared, socket) -> (\carry -> Conn socket carry shared) <$> newIORef B.empty)
+      giving
+        "Conn"
+        (step "make connection state" (\(shared, socket) -> (\carry -> Conn socket carry shared) <$> newIORef B.empty))
         >>> tryA (requests settings handler)
         >>> done
 
 -- | Request after request, while the connection is kept.
 requests :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Conn ()
-requests settings handler = iterateA (alongside one >>^ whileKept)
+requests settings handler =
+  named (Label "requests" "Serves request after request, while the connection is kept.") $
+    typed @Conn @() $
+      iterateA (giving "connection kept?" (alongside one >>^ whileKept))
   where
     whileKept (keep, conn) = if keep then Again conn else Finish ()
     -- An idle connection waits holding no buffer: a request is admitted once there is input.
@@ -135,7 +177,11 @@ requests settings handler = iterateA (alongside one >>^ whileKept)
 
 -- | Waits until the connection has input, which may be its end, unless it has bytes of a request already.
 idle :: (Runtime arr) => arr Conn ()
-idle = now ready >>> (awaitInput ||| returnA)
+idle =
+  named (Label "idle" "Waits until the connection has input, which may be its end, unless it has bytes in hand.") $
+    typed @Conn @() $
+      giving "bytes carried over?" (step "check carry-over" ready)
+        >>> (taking "no" awaitInput ||| taking "yes" returnA)
   where
     ready Conn {connSocket, connCarry} =
       (\carried -> if B.null carried then Left connSocket else Right ()) <$> readIORef connCarry
@@ -184,20 +230,22 @@ data Prepared = Prepared
 -- | Reads a request, runs the handler, and says whether the connection is kept for another.
 request :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr (Loans, Conn) Bool
 request settings handler =
-  (fst &&& id)
-    ^>> first borrow
-    >>> now begin'
-    >>> readHead settings
-    >>> byHead
-    ^>> ((quit ||| refuse) ||| answered handler)
+  named (Label "request" "Reads the head of a request, runs the handler, and says whether the connection is kept.") $
+    (fst &&& id)
+      ^>> first borrow
+      >>> giving "Req" (step "copy carry-over" begin')
+      >>> readHead settings
+      >>> decide "how did the head end?" byHead
+      >>> ((taking "stream ended" quit ||| taking "refused" refuse) ||| taking "good" (answered handler))
   where
     byHead (req, outcome) = case outcome of
       HeadEnded -> Left (Left ())
       HeadRefused status -> Left (Right (req, status))
       HeadGood parsed consumed -> Right (Headed req parsed consumed)
-    quit = arr (const False)
+    quit = giving "keep alive" (arr (const False))
     refuse =
-      now
+      step
+        "render refusal"
         ( \(Req {reqConn = Conn {connSocket, connShared}}, status) ->
             (,) connSocket <$> refusal (sharedDate connShared) status
         )
@@ -214,9 +262,12 @@ request settings handler =
 
 -- | Receives until the head is there, or is refused, or the stream has ended.
 readHead :: (Runtime arr) => Settings -> arr Req (Req, Head)
-readHead settings = iterateWith (now (advance settings)) more
+readHead settings =
+  named (Label "readHead" "Receives until the head is there, or is refused, or the stream has ended.") $
+    typed @Req @(Req, Head) $
+      iterateWith (giving "head complete?" (step "scan head" (advance settings))) (taking "needs more" more)
   where
-    more = first receive >>> now arrived
+    more = first receive >>> step "record arrival" arrived
     arrived (count, req@Req {reqProgress}) = do
       progress@Progress {progressEnd} <- readIORef reqProgress
       writeIORef reqProgress $
@@ -249,11 +300,13 @@ advance settings req@Req {reqConn = Conn {connSocket}, reqLoan, reqProgress} = d
 -- leave it in a state that another request can follow.
 answered :: (Runtime arr) => arr (Call, Request) () -> arr Headed Bool
 answered handler =
-  now prepare
-    >>> heldLoan
-    ^>> (consume release ||| returnA)
-    >>> alongside (tryA handler)
-    >>> aftermath
+  named (Label "answered" "Runs the handler on a request that has a head, and says whether the connection is kept.") $
+    giving "keep alive" $
+      typed @Headed @Prepared (step "prepare call" prepare)
+        >>> decide "give back loan?" heldLoan
+        >>> (taking "yes" (consume release) ||| taking "no" returnA)
+        >>> alongside (tryA handler)
+        >>> aftermath
   where
     heldLoan Prepared {preparedCall, preparedRequest, preparedLoan} =
       maybe (Right (preparedCall, preparedRequest)) (\loan -> Left (loan, (preparedCall, preparedRequest))) preparedLoan
@@ -280,26 +333,45 @@ prepare Headed {headedReq = Req {reqConn = Conn {..}, ..}, headedParsed = Parsed
 -- complete, ends the connection, with a 500 if the handler had not answered; and one that is complete is kept if the
 -- body of the request was read, or could be, and the response didn't end the connection.
 aftermath :: (Runtime arr) => arr (Either SomeException (), (Call, Request)) Bool
-aftermath = byOutcome ^>> ((quit ||| failed) ||| finished)
+aftermath =
+  named (Label "aftermath" "Decides whether the connection is kept, and answers 500 if nothing was answered.") $
+    decide "how did the handler end?" byOutcome
+      >>> ((taking "connection lost" quit ||| taking "failed" failed) ||| taking "returned" finished)
   where
     byOutcome (outcome, (call, _)) = case outcome of
       Left failure
         | Just ConnectionLost <- fromException failure -> Left (Left ())
         | otherwise -> Left (Right call)
       Right () -> Right call
-    quit = arr (const False)
-    failed = now (\(Call _ _ exchange) -> unanswered exchange) >>> internalError
+    quit = giving "keep alive" (arr (const False))
+    failed = step "check if answered" (\(Call _ _ exchange) -> unanswered exchange) >>> internalError
     finished =
-      now
-        ( \call@(Call _ _ exchange) ->
-            readIORef (exPhase exchange) >>= \case
-              Ended -> pure (Right call)
-              Unanswered -> pure (Left (Just exchange))
-              _ -> pure (Left Nothing)
+      giving
+        "response complete?"
+        ( step
+            "read response phase"
+            ( \call@(Call _ _ exchange) ->
+                readIORef (exPhase exchange) >>= \case
+                  Ended -> pure (Right call)
+                  Unanswered -> pure (Left (Just exchange))
+                  _ -> pure (Left Nothing)
+            )
         )
-        >>> (internalError ||| completed)
+        >>> (taking "no" internalError ||| taking "yes" completed)
     -- The body that the handler didn't read is read now and dropped, if it is not too long.
-    completed = (\(Call _ requestBody exchange) -> (requestBody, exchange)) ^>> first drain >>> now (\(drained, exchange) -> (drained &&) <$> readIORef (exKeep exchange))
+    completed =
+      (\(Call _ requestBody exchange) -> (requestBody, exchange))
+        ^>> first drain
+        >>> giving
+          "keep alive"
+          (step "check keep alive" (\(drained, exchange) -> (drained &&) <$> readIORef (exKeep exchange)))
     unanswered exchange = readIORef (exPhase exchange) >>= \case Unanswered -> pure (Just exchange); _ -> pure Nothing
     -- Answers 500 if nothing was answered, and ends the connection.
-    internalError = maybe (Right ()) Left ^>> ((now (\exchange -> (,) (exSocket exchange) <$> refusal (exDate exchange) 500) >>> sendAll) ||| returnA) >>> quit
+    internalError =
+      decide "unanswered?" (maybe (Right ()) Left)
+        >>> ( taking
+                "yes"
+                (step "render 500" (\exchange -> (,) (exSocket exchange) <$> refusal (exDate exchange) 500) >>> sendAll)
+                ||| taking "no" returnA
+            )
+        >>> quit

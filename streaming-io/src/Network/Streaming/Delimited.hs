@@ -219,6 +219,9 @@ instance Scope (DelimitedM m s) where
 
   shield (Delimited inner) = Delimited (\context value -> shielded context (inner context value))
 
+-- | Annotations are for diagrams: the arrow is run as it is.
+instance Annotate (DelimitedM m s)
+
 -- | The part that starts the group hands its continuation to the group, and the part that ends last goes on
 -- with it. The parts are in a cancel scope of their own, which the first failure cancels: the others are
 -- cancelled where they wait, and their scopes are released before the group ends, which rethrows the first
@@ -288,7 +291,7 @@ instance Exchange (DelimitedM m s) 'Anywhere where
     pure (AnywhereWaiting slot, AnywhereGiver (giveRemote (runMailbox run) slot))
   await = Delimited $ \context@(Context run tag part) (AnywhereWaiting slot) ->
     awaitRemote run part slot (\value -> value <$ step context) (control0 tag)
-  give = Delimited $ \context (AnywhereGiver giving, value) -> giving value <* step context
+  give = Delimited $ \context (AnywhereGiver giver, value) -> giver value <* step context
   abandon = Delimited $ \_ (AnywhereWaiting slot) -> abandonRemote slot
 
 -- | Counts a step, and once the part has run for its turn, yields: captures what

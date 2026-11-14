@@ -206,7 +206,7 @@ withGiverThread action = do
 -- | Makes a ticket of any core this many times, leaves its giver on the shelf, and waits for it at once, while a
 -- thread gives it a value the moment it sees the giver: the give comes before the part looks at the ticket, between
 -- its look and its wait, or after, and the part gets every value.
-racing :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => IORef (Maybe (Giver 'Anywhere Int)) -> Int -> arr () Int
+racing :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere, Annotate arr) => IORef (Maybe (Giver 'Anywhere Int)) -> Int -> arr () Int
 racing shelf count = const 0 ^>> timesWith count (keeping ticketOnShelf >>^ uncurry (+))
   where
     -- Makes a ticket, leaves its giver on the shelf, and waits for the ticket.
@@ -230,11 +230,11 @@ givenFirstLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => ar
 givenFirstLocal = givenFirst @(Local arr)
 
 -- | A part's place in the pool's queue, and no connection: for tests that ask for one when none is free.
-queued :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Waiting arr 'Anywhere conn)
+queued :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Waiting arr 'Anywhere conn)
 queued pool = reserve pool >>^ fromLeft (error "a connection was free")
 
 -- | One part that holds a connection, queues two others behind it, one of which abandons its place, and releases.
-nextWaiter :: (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, Int, [Int])
+nextWaiter :: (ArrowChoice arr, Annotate arr, ArrowApplicative arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, Int, [Int])
 nextWaiter pool =
   checkout pool
     >>> keeping (queued pool)
@@ -246,7 +246,7 @@ nextWaiter pool =
             <*> now (const (free pool))
         )
 
-toFreeList :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, [Int])
+toFreeList :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, [Int])
 toFreeList pool =
   checkout pool
     >>> keeping (queued pool)
@@ -254,7 +254,7 @@ toFreeList pool =
     >>> second (release pool)
     >>> now (\(abandoned, ()) -> (,) abandoned <$> free pool)
 
-givenBeforeAbandoned :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, [Int])
+givenBeforeAbandoned :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, [Int])
 givenBeforeAbandoned pool =
   checkout pool
     >>> keeping (queued pool)
@@ -273,19 +273,19 @@ raise :: (Effect arr) => IORef Bool -> arr () ()
 raise flag = now (const (atomicWriteIORef flag True))
 
 -- | Waits, giving way, until the flag is raised.
-spinUntil :: (ArrowChoice arr, Effect arr, GiveWay arr) => IORef Bool -> arr () ()
+spinUntil :: (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => IORef Bool -> arr () ()
 spinUntil flag = untilJust (bool Nothing (Just ()) <$> readIORef flag)
 
 -- | A core holds the only connection; a second queues for it, then a third, the second abandons its place, and
 -- the first releases the connection: the third has it.
-acrossCores :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => (Pool Int, Flags) -> Int -> arr () [Int]
+acrossCores :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Annotate arr) => (Pool Int, Flags) -> Int -> arr () [Int]
 acrossCores (pool, flags) core = case core of
   0 -> checkout pool >>> afterwards (raise (heldFlag flags) >>> spinUntil (firstGoneFlag flags)) >>> release pool >>^ const []
   1 -> spinUntil (heldFlag flags) >>> queued pool >>> afterwards (raise (firstQueuedFlag flags) >>> spinUntil (secondQueuedFlag flags)) >>> abandon >>> afterwards (raise (firstGoneFlag flags)) >>^ maybe [] pure
   _ -> spinUntil (firstQueuedFlag flags) >>> queued pool >>> afterwards (raise (secondQueuedFlag flags)) >>> await >>> tap (release pool) >>^ pure
 
 -- | The same with no third core: the connection is free afterwards.
-acrossCoresOnly :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => (Pool Int, Flags) -> Int -> arr () [Int]
+acrossCoresOnly :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Annotate arr) => (Pool Int, Flags) -> Int -> arr () [Int]
 acrossCoresOnly (pool, flags) core = case core of
   0 -> checkout pool >>> afterwards (raise (heldFlag flags) >>> spinUntil (firstGoneFlag flags)) >>> release pool >>^ const []
   _ -> spinUntil (heldFlag flags) >>> queued pool >>> abandon >>> afterwards (raise (firstGoneFlag flags)) >>^ maybe [] pure
@@ -308,7 +308,7 @@ turns :: Int
 turns = 2000
 
 -- | One turn of a part: it checks a connection out, holds it for a little work, and releases it.
-borrowing :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Conn -> IORef Int -> arr () ()
+borrowing :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Conn -> IORef Int -> arr () ()
 borrowing pool done = checkout pool >>> now (acquire >=> work >=> unacquire) >>> release pool
   where
     acquire conn = do

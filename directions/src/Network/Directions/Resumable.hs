@@ -95,7 +95,7 @@ streamBytes n = Parser (go n)
 -- when it needs more, and gives each piece it yields to the consumer. It gives
 -- the parser's result and the bytes it left in hand. Its input is the link it
 -- receives from, and the bytes in hand.
-parse :: (ArrowChoice arr, Effect arr, Link arr link) => Buffer -> arr ByteString () -> Parser a -> arr (link, ByteString) (a, ByteString)
+parse :: (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => Buffer -> arr ByteString () -> Parser a -> arr (link, ByteString) (a, ByteString)
 parse buffer consumer (Parser parser) = with ((`parser` Done) ^>> iterateWith (arr step) (more ||| chunk))
   where
     more = first (With (fill buffer)) >>^ uncurry (&)
@@ -108,7 +108,7 @@ parse buffer consumer (Parser parser) = with ((`parser` Done) ^>> iterateWith (a
 
 -- | Moves the bytes in hand to the buffer's start, and receives after them
 -- until there are as many as the parser needs.
-fill :: (ArrowChoice arr, Effect arr, Link arr link) => Buffer -> arr (link, (Int, ByteString)) ByteString
+fill :: (ArrowChoice arr, Annotate arr, Effect arr, Link arr link) => Buffer -> arr (link, (Int, ByteString)) ByteString
 fill buffer = now compact >>> iterateWith (arr enough) (first receive >>^ added)
   where
     Buffer memory size = buffer
