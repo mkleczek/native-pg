@@ -1,0 +1,213 @@
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE PatternSynonyms #-}
+
+-- | The lint of "Network.Streaming.Lint": small programs, built at the diagram arrow, that each check finds, and near
+-- misses that it doesn't.
+module LintSpec (spec) where
+
+import Control.Arrow (ArrowChoice, arr, (&&&), (>>>), (>>^), (|||))
+import Data.List (isSuffixOf)
+import GHC.Stack (SrcLoc (..))
+import Network.Streaming.Classes
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, box, done, foreverA, iterateWith)
+import Network.Streaming.Diagram (Diagram)
+import Network.Streaming.Lint
+import Skeletest
+
+-- | What the programs need of an arrow.
+type Program arr =
+  (ArrowChoice arr, Effect arr, GiveWay arr, Scope arr, Race arr, Within arr, Concurrent arr, Annotate arr)
+
+-- | A step that never waits.
+quick :: (Effect arr) => arr a ()
+quick = now (const (pure ()))
+
+-- | A step that goes round again from a number above 0, and finishes at 0, and never waits.
+countDown :: (Effect arr) => arr Int (Step Int ())
+countDown = now (\n -> pure (if n > 0 then Again (n - 1) else Finish ()))
+
+-- | A scope whose acquire waits.
+waitingAcquire :: (Program arr) => arr () ()
+waitingAcquire = scope (giveWay >>> quick) quick quick
+
+-- | The checks that were found, and the checks that were allowed, with their reasons.
+summary :: Report -> ([Check], [(Check, String)])
+summary report =
+  ( findingCheck <$> reportFindings report,
+    [(findingCheck (allowedFinding allowed), allowedReason allowed) | allowed <- reportAllowed report]
+  )
+
+spec :: Spec
+spec = do
+  acquires
+  loops
+  deadlines
+  shields
+  allowances
+  findings
+
+-- | A scope whose acquire waits, or does not.
+acquires :: Spec
+acquires = describe "a scope" $ do
+  it "has a wait in its acquire found" $ do
+    report <- lint (waitingAcquire :: Diagram () ())
+    summary report `shouldBe` ([WaitInAcquire], [])
+
+  it "has a wait in its acquire found, however deep it is in boxes" $ do
+    report <- lint (scope (box "acquire" (box "inner" (giveWay >>> quick))) quick quick :: Diagram () ())
+    summary report `shouldBe` ([WaitInAcquire], [])
+
+  it "is not found when only its body waits" $ do
+    report <- lint (scope quick quick (giveWay >>> quick) :: Diagram () ())
+    summary report `shouldBe` ([], [])
+
+  it "is not found when only its release waits, which is shielded and may" $ do
+    report <- lint (scope quick (giveWay >>> quick) quick :: Diagram () ())
+    summary report `shouldBe` ([], [])
+
+-- | Loops, which are trees that contain themselves.
+loops :: Spec
+loops = describe "a loop" $ do
+  it "whose again path never waits is found" $ do
+    report <- lint (iterateWith countDown (arr id))
+    summary report `shouldBe` ([LoopWithoutWait], [])
+
+  it "whose again path waits is not found" $ do
+    report <- lint (iterateWith countDown giveWay)
+    summary report `shouldBe` ([], [])
+
+  it "whose body waits before it decides is not found, whatever the paths after it" $ do
+    report <- lint (iterateWith (giveWay >>> countDown) (arr id))
+    summary report `shouldBe` ([], [])
+
+  it "that waits only when it finishes is found" $ do
+    report <- lint waitsOnlyWhenDone
+    summary report `shouldBe` ([LoopWithoutWait], [])
+
+  it "with a wait on one of the branches that go round is found, and on both is not" $ do
+    one <- lint (branching giveWay (arr id))
+    both <- lint (branching giveWay giveWay)
+    (summary one, summary both) `shouldBe` (([LoopWithoutWait], []), ([], []))
+
+  it "that goes round with nothing in it is found, and with a wait is not" $ do
+    spinning <- lint (foreverA (arr id) :: Diagram Int ())
+    waiting <- lint (foreverA giveWay :: Diagram Int ())
+    (summary spinning, summary waiting) `shouldBe` (([LoopWithoutWait], []), ([], []))
+
+  it "counts a wait in a part of a fan-out that comes before the way round" $ do
+    report <- lint (foreverA ((giveWay &&& quick) >>^ fst) :: Diagram Int ())
+    summary report `shouldBe` ([], [])
+
+  it "does not count a wait in a part that comes after the way round, which is never reached" $ do
+    report <- lint afterTheWayRound
+    summary report `shouldBe` ([LoopWithoutWait], [])
+
+  it "that is a part of a group that runs together is judged by itself, whatever the other parts wait for" $ do
+    spinning <- lint (together [foreverA (arr id), foreverA giveWay] :: Diagram () ())
+    waiting <- lint (together [foreverA giveWay, foreverA giveWay] :: Diagram () ())
+    (summary spinning, summary waiting) `shouldBe` (([LoopWithoutWait], []), ([], []))
+
+  it "inside a loop whose passes all wait does not make the outer loop found" $ do
+    report <- lint (iterateWith countDown (iterateWith (giveWay >>> countDown) (arr id) >>^ const 3))
+    summary report `shouldBe` ([], [])
+
+  it "inside a loop is found, with the outer loop, when the inner can finish without a wait" $ do
+    report <- lint (iterateWith countDown (box "inner" (iterateWith countDown (arr id)) >>^ const 3))
+    (summary report, findingPath <$> reportFindings report)
+      `shouldBe` (([LoopWithoutWait, LoopWithoutWait], []), [["inner"], []])
+
+-- | A loop that gives way only on the way out.
+waitsOnlyWhenDone :: (Program arr) => arr Int ()
+waitsOnlyWhenDone = loop
+  where
+    loop = countDown >>> (loop ||| giveWay)
+
+-- | A loop that has two ways to go round, which are the steps that are given.
+branching :: (Program arr) => arr Int Int -> arr Int Int -> arr Int ()
+branching even' odd' = loop
+  where
+    loop = now (\n -> pure (if even n then Left n else Right n)) >>> ((even' >>> loop) ||| (odd' >>> loop))
+
+-- | A loop whose way round is in a part, and whose wait is in the part after it.
+afterTheWayRound :: (Program arr) => arr Int ()
+afterTheWayRound = loop
+  where
+    loop = (loop &&& giveWay) >>> done
+
+-- | Deadlines and races, which need a wait to decide anything.
+deadlines :: Spec
+deadlines = describe "a deadline or a race" $ do
+  it "over a body that can't wait is found" $ do
+    report <- lint (within (millis 5) quick :: Diagram () (Maybe ()))
+    summary report `shouldBe` ([DeadlineWithoutWait], [])
+
+  it "over a body that waits is not" $ do
+    report <- lint (within (millis 5) (giveWay >>> quick) :: Diagram () (Maybe ()))
+    summary report `shouldBe` ([], [])
+
+  it "that has a side that can't wait is found, and one that has both sides wait is not" $ do
+    one <- lint (race quick (giveWay >>> quick) :: Diagram () (Either () ()))
+    both <- lint (race (giveWay >>> quick) (giveWay >>> quick) :: Diagram () (Either () ()))
+    (summary one, summary both) `shouldBe` (([DeadlineWithoutWait], []), ([], []))
+
+  it "that has no side that can wait is found once" $ do
+    report <- lint (race quick quick :: Diagram () (Either () ()))
+    summary report `shouldBe` ([DeadlineWithoutWait], [])
+
+-- | Shields.
+shields :: Spec
+shields = describe "a shield" $ do
+  it "around a wait is found, even if a deadline inside it ends the wait" $ do
+    plain <- lint (shield (giveWay >>> quick) :: Diagram () ())
+    bounded <- lint (shield (within (millis 5) (giveWay >>> quick)) :: Diagram () (Maybe ()))
+    (summary plain, summary bounded) `shouldBe` (([ShieldAroundWait], []), ([ShieldAroundWait], []))
+
+  it "around steps that never wait is not" $ do
+    report <- lint (shield (quick >>> quick) :: Diagram () ())
+    summary report `shouldBe` ([], [])
+
+-- | What a part allows, and what it doesn't.
+allowances :: Spec
+allowances = describe "an allowance" $ do
+  it "for the check of a finding inside it makes the finding allowed, with its reason" $ do
+    report <- lint (allowing WaitInAcquire "the acquire cleans up after itself" waitingAcquire :: Diagram () ())
+    summary report `shouldBe` ([], [(WaitInAcquire, "the acquire cleans up after itself")])
+
+  it "for another check does not" $ do
+    report <- lint (allowing ShieldAroundWait "it is meant" waitingAcquire :: Diagram () ())
+    summary report `shouldBe` ([WaitInAcquire], [])
+
+  it "does not reach a finding beside it" $ do
+    report <- lint (allowing WaitInAcquire "it is meant" quick >>> waitingAcquire :: Diagram () ())
+    summary report `shouldBe` ([WaitInAcquire], [])
+
+  it "holds for a loop when the loop is inside it" $ do
+    report <- lint (allowing LoopWithoutWait "it spins on purpose" (foreverA (arr id)) :: Diagram Int ())
+    summary report `shouldBe` ([], [(LoopWithoutWait, "it spins on purpose")])
+
+  it "holds for a part that is shared, only where it is in it" $ do
+    let shared = waitingAcquire :: Diagram () ()
+    report <- lint (allowing WaitInAcquire "it is meant" shared >>> shared)
+    summary report `shouldBe` ([WaitInAcquire], [(WaitInAcquire, "it is meant")])
+
+-- | What a finding says.
+findings :: Spec
+findings = describe "a finding" $ do
+  it "is one for a part that is shared, whatever the number of places it is used in" $ do
+    let shared = waitingAcquire :: Diagram () ()
+    report <- lint (shared >>> shared >>> shared)
+    summary report `shouldBe` ([WaitInAcquire], [])
+
+  it "has the boxes on the way from the top, the place of the nearest box, and the wait" $ do
+    report <- lint (named (Label "outer" "") (box "inner" (scope (giveWay >>> quick) quick quick)) :: Diagram () ())
+    let found = reportFindings report
+    (findingPath <$> found, findingWhat <$> found) `shouldBe` ([["outer", "inner"]], ["waits at give way"])
+    [maybe False (isSuffixOf "LintSpec.hs" . srcLocFile) (findingSource finding) | finding <- found] `shouldBe` [True]
+
+  it "is described, in the text of the report, with where it is, what it is about, and the counts" $ do
+    report <- lint (shield (giveWay >>> quick) :: Diagram () ())
+    case lines (renderReport report) of
+      [place, what, _, counts] ->
+        (place, what, counts)
+          `shouldBe` ("ShieldAroundWait: the program", "  waits at give way", "1 findings, 0 allowed")
+      other -> other `shouldBe` []

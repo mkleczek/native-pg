@@ -1,10 +1,12 @@
--- | The annotations of a program for the diagrams that "Network.Streaming.Diagram" draws of it: a title for a box,
--- names for the wires, and the ends of exchanges. They are in a module of their own so that
--- "Network.Streaming.Plumbing", which the classes use, can use them. Every arrow but the diagram returns the arrow it
--- is given, so that an annotation costs nothing when the program runs.
+-- | The annotations of a program for the diagrams that "Network.Streaming.Diagram" draws of it and the lint that
+-- "Network.Streaming.Lint" makes of it: a title for a box, names for the wires, the ends of exchanges, and the checks of
+-- the lint that a part allows. They are in a module of their own so that "Network.Streaming.Plumbing", which the classes
+-- use, can use them. Every arrow but the diagram returns the arrow it is given, so that an annotation costs nothing when
+-- the program runs.
 module Network.Streaming.Annotate
   ( Label (..),
     Side (..),
+    Check (..),
     Annotate (..),
     box,
     taking,
@@ -23,8 +25,20 @@ data Label = Label {labelTitle :: String, labelComment :: String}
 data Side = Asking | Answering
   deriving (Eq)
 
--- | Annotations for the diagrams that "Network.Streaming.Diagram" draws of a program. Every other arrow returns the arrow
--- it is given, so that an annotation costs nothing when the program runs.
+-- | What the lint of "Network.Streaming.Lint" looks for in the structure of a program.
+data Check
+  = -- | The acquire of a scope can wait, and a cancellation there skips its release.
+    WaitInAcquire
+  | -- | A loop has a way round that passes no wait, so that on one core it never yields.
+    LoopWithoutWait
+  | -- | A deadline or a race is over a part that can't wait, so the deadline can never fire, and the race is decided at once.
+    DeadlineWithoutWait
+  | -- | A shield is around a wait, which holds the cancellation off for as long as the wait lasts.
+    ShieldAroundWait
+  deriving (Eq, Show, Enum, Bounded)
+
+-- | Annotations for the diagrams that "Network.Streaming.Diagram" draws of a program, and for its lint. Every other arrow
+-- returns the arrow it is given, so that an annotation costs nothing when the program runs.
 class Annotate arr where
   -- | The arrow as a box of its own in diagrams. Every runtime returns the arrow unchanged.
   named :: (HasCallStack) => Label -> arr a b -> arr a b
@@ -40,6 +54,12 @@ class Annotate arr where
   exchange :: Side -> String -> arr a b -> arr a b
   exchange _ _ step = step
   {-# INLINE exchange #-}
+
+  -- | The arrow, where the lint doesn't report the check, for the reason given: the part means what the check finds.
+  -- Every runtime returns the arrow unchanged.
+  allowing :: Check -> String -> arr a b -> arr a b
+  allowing _ _ step = step
+  {-# INLINE allowing #-}
 
 -- | The arrow as a box in diagrams, named by its title alone.
 box :: (HasCallStack, Annotate arr) => String -> arr a b -> arr a b

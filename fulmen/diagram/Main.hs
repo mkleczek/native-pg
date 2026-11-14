@@ -1,5 +1,3 @@
-{-# LANGUAGE DataKinds #-}
-
 -- | Draws the server's program, built at the 'Diagram' arrow, which runs nothing: it writes @fulmen-server.html@ and one
 -- @ANCHOR.mmd@ for each page into the directory that is its argument, which has to exist. It then says, for each page,
 -- how many actions have no name, which are drawn as "IO", and how many decisions have no question, which are drawn as
@@ -7,38 +5,42 @@
 -- ends of it are in. The pages are written without the plumbing as @ANCHOR.mmd@ and with it as @ANCHOR.plumbing.mmd@.
 --
 -- > fulmen-diagram DIRECTORY
+--
+-- With @--lint@ it prints the lint of the server's structure instead, and ends with a failure if a finding is not
+-- allowed by a part of the program.
+--
+-- > fulmen-diagram --lint
 module Main (main) where
 
-import Control.Monad (forM_)
+import Control.Monad (forM_, unless)
 import Data.List (intercalate)
-import qualified Network.Fulmen as Fulmen
-import qualified Network.Socket as Socket
-import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
-import Network.Streaming.Classes (Annotate (..), Effect (..), Label (..))
-import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), Pair (..), html, pairs, pages)
-import Network.Streaming.PositiveInt (positiveInt)
+import Network.Streaming.Lint (Report (..), lint, renderReport)
+import ServerProgram (withServer)
 import System.Environment (getArgs)
-import System.Exit (die)
+import System.Exit (die, exitFailure)
 import System.IO (IOMode (..), hPutStr, hSetEncoding, utf8, withFile)
 
 main :: IO ()
 main = do
   args <- getArgs
   case args of
+    ["--lint"] -> lintServer
     [directory] -> draw directory
-    _ -> die "usage: fulmen-diagram DIRECTORY"
+    _ -> die "usage: fulmen-diagram DIRECTORY | fulmen-diagram --lint"
 
--- | Writes the pages of the server. The listener and the pool are the settings' own, and are never used: nothing runs.
--- The server has four workers on each core, so that the pages show a count of them.
+-- | Prints the lint of the server, and fails if a finding is not allowed.
+lintServer :: IO ()
+lintServer = do
+  linted <- withServer lint
+  putStr (renderReport linted)
+  unless (null (reportFindings linted)) exitFailure
+
+-- | Writes the pages of the server.
 draw :: FilePath -> IO ()
 draw directory = do
-  listener <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
-  pool <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @3) (positiveInt @1) (positiveInt @1))
-  let program = server ((Fulmen.defaultSettings listener pool) {Fulmen.connectionsPerCore = 4})
-  found <- pages program
-  exchanges <- pairs program
-  Socket.close listener
+  found <- withServer pages
+  exchanges <- withServer pairs
   write (directory ++ "/fulmen-server.html") (html "Fulmen server" found)
   forM_ found $ \page -> do
     write (directory ++ "/" ++ pageAnchor page ++ ".mmd") (pageMermaid page)
@@ -61,12 +63,6 @@ report found = do
   putStrLn ("total: " ++ counts (sum (pageUnnamed <$> found)) (sum (pageUnquestioned <$> found)))
   where
     counts unnamed unquestioned = show unnamed ++ " unnamed actions, " ++ show unquestioned ++ " unquestioned decisions"
-
--- | The server with a handler that does nothing.
-server :: Fulmen.Settings -> Diagram Fulmen.Cores ()
-server settings = Fulmen.serve settings handler
-  where
-    handler = named (Label "handler" "the application's handler") (now (const (pure ())))
 
 -- | Writes the text as UTF-8, whatever the locale is.
 write :: FilePath -> String -> IO ()

@@ -4,7 +4,8 @@
 -- | An arrow that runs nothing: a program built at 'Diagram' is a description of its own structure, which
 -- "Network.Streaming.Diagram.Mermaid" draws as flowcharts. A step that is an action, a wait or a ticket is a leaf, and
 -- the combinators of the program, the 'Control.Arrow' ones and the capabilities of the classes, are the nodes above it.
--- The annotations of 'Annotate' are nodes too.
+-- The annotations of 'Annotate' are nodes too. The tree and the walks over it are in "Network.Streaming.Structure",
+-- which the lint of "Network.Streaming.Lint" uses as well.
 --
 -- Everything here is lazy in its arrows, because a loop is a tree that contains itself: @iterateWith@ and @foreverA@ tie
 -- the knot, and a constructor or an instance method that looked at its arrows while it built the tree would never
@@ -22,80 +23,17 @@ import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
 import Data.Maybe (listToMaybe)
 import GHC.Stack (CallStack, SrcLoc, callStack, getCallStack)
-import Network.Streaming.Annotate (Annotate (..), Side)
+import Network.Streaming.Annotate (Annotate (..))
 import Network.Streaming.Classes
 import Network.Streaming.Mode (Mode (..), ModeOf)
+import Network.Streaming.Structure (Shape (..), Tree (..), unnamedAction)
 import Prelude hiding (id, (.))
 
 -- | A program as a description of its structure: the input and the output are only types.
 newtype Diagram a b = Diagram Tree
 
--- | What a program is made of.
-data Tree
-  = -- | A step that is only a function, which draws no node.
-    Pure
-  | -- | One step after the other.
-    Seq Tree Tree
-  | -- | A step on the first of a pair, which passes the second on.
-    First Tree
-  | -- | A step on the second of a pair, which passes the first on.
-    Second Tree
-  | -- | Two steps, each on a half of a pair: @***@.
-    Par Tree Tree
-  | -- | Two steps on the same input: @&&&@.
-    Fanout Tree Tree
-  | -- | Two steps on the same input, whose results are combined: @<*>@.
-    Ap Tree Tree
-  | -- | A step on a 'Left', which passes a 'Right' on.
-    Left' Tree
-  | -- | A step on a 'Right', which passes a 'Left' on.
-    Right' Tree
-  | -- | A step for each side of an 'Either': @+++@.
-    Sum Tree Tree
-  | -- | A step for each side of an 'Either', which ends in the same place: @|||@.
-    Choice Tree Tree
-  | -- | Parts that run at once.
-    Together [Tree]
-  | -- | A step that is one node: how it is called, and how it is drawn.
-    Leaf String Shape
-  | -- | A scope: what it acquires, what releases it, and its body.
-    Scope Tree Tree Tree
-  | -- | A body whose failure is a value.
-    Try Tree
-  | -- | A body that cancellations from outside don't reach.
-    Shield Tree
-  | -- | Two steps that run until the first ends.
-    Race Tree Tree
-  | -- | A body with a deadline.
-    Within Duration Tree
-  | -- | A box of its own: its label, the place in the code that named it, and its body.
-    Named Label (Maybe SrcLoc) Tree
-  | -- | A body with names for its input and output wires.
-    Wires (Maybe String) (Maybe String) Tree
-  | -- | One end of an exchange of the named value: which end, and the step that is it.
-    End Side String Tree
-
--- | How a leaf is drawn.
-data Shape
-  = -- | An action that never waits.
-    Action
-  | -- | A wait for a ticket to be given its value.
-    Wait
-  | -- | A block until an event fires.
-    Blocking
-  | -- | A point where the part gives way to the others.
-    Yielding
-  | -- | A value given to another part.
-    Handover
-  | -- | A step that is none of those.
-    Round
-
 -- | The core of the tickets that are of the diagram's own reach. No part runs on it: nothing runs.
 data DiagramCore
-
--- | What an action is called in a diagram until the program names it.
-unnamedAction :: String
-unnamedAction = "IO"
 
 -- | A step that is a leaf.
 leaf :: String -> Shape -> Diagram a b
@@ -161,6 +99,7 @@ instance Annotate Diagram where
   named label (Diagram body) = Diagram (Named label (outermost callStack) body)
   wires input output (Diagram body) = Diagram (Wires input output body)
   exchange side name (Diagram body) = Diagram (End side name body)
+  allowing check reason (Diagram body) = Diagram (Allowing check reason body)
 
 -- | The place of the outermost call in the stack.
 outermost :: CallStack -> Maybe SrcLoc

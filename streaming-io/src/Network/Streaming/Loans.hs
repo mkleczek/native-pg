@@ -71,7 +71,12 @@ loanBuffer (Loan _ _ _ buffer) = buffer
 withRequestBuffers :: (Runtime arr) => BufferPool -> arr (Loans, a) b -> arr a b
 withRequestBuffers pool body =
   named (Label "withRequestBuffers" "Admits a request with its buffers, runs it, and gives them back however it ends.") $
-    scope admit (fst ^>> ended) body
+    allowing
+      WaitInAcquire
+      ( "the acquire waits in the pool's checkout, which if it is cancelled gives up its place in the queue "
+          ++ "and returns a buffer that came meanwhile, so nothing is held for the release to return"
+      )
+      (scope admit (fst ^>> ended) body)
   where
     admit =
       done

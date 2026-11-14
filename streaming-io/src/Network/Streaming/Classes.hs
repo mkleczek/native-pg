@@ -58,7 +58,8 @@ module Network.Streaming.Classes
     Within (..),
     Label (..),
     -- The method 'exchange' is left out, as its name is a common one: programs use 'asking' and 'answering'.
-    Annotate (named, wires),
+    Check (..),
+    Annotate (named, wires, allowing),
     taking,
     giving,
     Effect (..),
@@ -88,7 +89,7 @@ import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (Ptr, plusPtr)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
-import Network.Streaming.Annotate (Annotate (..), Label (..), box, giving, taking)
+import Network.Streaming.Annotate (Annotate (..), Check (..), Label (..), box, giving, taking)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)

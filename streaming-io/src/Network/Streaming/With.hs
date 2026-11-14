@@ -142,8 +142,8 @@ instance (Race arr) => Race (With r arr) where
   race (With one) (With two) = With (race one two)
   {-# INLINE race #-}
 
--- | The box, the names of the wires and the ends of exchanges are the arrow's: the body is given the environment as it
--- is.
+-- | The box, the names of the wires, the ends of exchanges and the allowed checks are the arrow's: the body is given the
+-- environment as it is.
 instance (Annotate arr) => Annotate (With r arr) where
   named label (With inner) = With (named label inner)
   {-# INLINE named #-}
@@ -151,6 +151,8 @@ instance (Annotate arr) => Annotate (With r arr) where
   {-# INLINE wires #-}
   exchange side name (With inner) = With (exchange side name inner)
   {-# INLINE exchange #-}
+  allowing check reason (With inner) = With (allowing check reason inner)
+  {-# INLINE allowing #-}
 
 -- | The tickets are the arrow's own, of the same reach.
 type instance Local (With r arr) = Local arr

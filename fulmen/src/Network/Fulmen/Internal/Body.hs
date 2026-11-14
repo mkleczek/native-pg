@@ -19,7 +19,7 @@ module Network.Fulmen.Internal.Body
   )
 where
 
-import Control.Arrow (ArrowChoice, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, first, returnA, (>>>), (>>^), (^>>), (|||))
 import Control.Exception (Exception (..), throwIO)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
@@ -41,7 +41,7 @@ import Network.Streaming.Classes
     giving,
     taking,
   )
-import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, decide, iterateA, iterateWith, step, tap)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, decide, iterateWith, step, tap)
 import Network.Streaming.Loans (Loan, release)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.NotImplemented (notImplementedIO)
@@ -88,10 +88,9 @@ instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Ins
       giving
         "body ended?"
         (iterateWith (giving "bytes in hand?" (step "look at bytes in hand" advance)) (taking "no" receiving))
-        >>> (taking "yes" ending ||| taking "no" returnA)
+        >>> (taking "yes" (ending Nothing) ||| taking "no" returnA)
     where
       receiving = first receive >>> step "record arrival" arrived
-      ending = tap (step "keep carry-over" keepFollowing) >>> bodyLoan ^>> release >>^ const Nothing
   {-# INLINE next #-}
 
 -- | The next piece of the body, from the bytes in hand if there are any, and else the socket and the room to receive
@@ -108,9 +107,11 @@ advance = \case
           let size = min markRemaining (markEnd - markStart)
           writeIORef (bodyMarks state) marks {markStart = markStart + size, markRemaining = markRemaining - size}
           pure (Finish (Right (Just (BSI.BS (bufferMemory (bodyBuffer state) `plusForeignPtr` markStart) size))))
-      | otherwise ->
-          let room = Room (bodyBuffer state) 0 (min (bufferCapacity (bodyBuffer state)) markRemaining)
-           in pure (Again ((bodySocket state, room), state))
+      | otherwise -> pure (Again ((bodySocket state, receiveRoom state markRemaining), state))
+
+-- | The room that the rest of the body is received into: the buffer, or if the rest is less than that, as much as it.
+receiveRoom :: BodyState -> Int -> Room
+receiveRoom state remaining = Room (bodyBuffer state) 0 (min (bufferCapacity (bodyBuffer state)) remaining)
 
 -- | The bytes that were received: they are the bytes in hand, which are the first of the rest of the body.
 arrived :: (Int, BodyState) -> IO Body
@@ -129,6 +130,11 @@ keepFollowing state = do
     writeIORef (bodyCarry state) $! B.copy (BSI.BS (bufferMemory (bodyBuffer state) `plusForeignPtr` markStart) (markEnd - markStart))
     writeIORef (bodyMarks state) marks {markStart = markEnd}
 
+-- | The body has ended: what follows it is kept for the next request, and the loan of the buffer is given back. It gives
+-- the result.
+ending :: (Arrow arr, Effect arr, Annotate arr) => b -> arr BodyState b
+ending result = tap (step "keep carry-over" keepFollowing) >>> bodyLoan ^>> release >>^ const result
+
 -- | Reads what is left of the body and drops it, so that the next request on the connection begins where it should:
 -- whether it did, which it doesn't if the body is longer than the server will read for a client that doesn't use it,
 -- or can't be read.
@@ -137,16 +143,39 @@ drain =
   named (Label "drain" "Reads what is left of the request body and drops it, and says whether that could be done.") $
     decide "chunked?" start
       >>> ( taking "yes" returnA
-              ||| taking "no" (iterateA (giving "body drained?" ((fst &&& id) ^>> first next >>^ afterPiece)))
+              ||| taking
+                "no"
+                ( giving "body ended?" (iterateWith dropping (taking "no" receiving))
+                    >>> (taking "yes" (ending True) ||| taking "no" returnA)
+                )
           )
   where
     start ChunkedBody = Left False
     start body = Right (body, 0 :: Int)
-    afterPiece (piece, (body, total)) = case piece of
-      Nothing -> Finish True
-      Just view'
-        | total + B.length view' > drainLimit -> Finish False
-        | otherwise -> Again (body, total + B.length view')
+    -- Every way round the loop receives, and so waits: what is in hand is dropped without a wait, once for each receive.
+    dropping = giving "all dropped?" (step "drop bytes in hand" (uncurry dropInHand))
+    receiving = first receive >>> step "record arrival" (\(count, (state, total)) -> (,total) <$> arrived (count, state))
+
+-- | What dropping the bytes in hand comes to: a receive for the rest, which the drain goes on with, or the end of it, with
+-- the state of the body if the body has ended, and else whether the drain could be done.
+type Dropped = Step ((Socket, Room), (BodyState, Int)) (Either BodyState Bool)
+
+-- | Drops the bytes in hand that belong to the body, and counts them towards the total. The drain is done if the body is
+-- not there, or is over the limit, and the body has ended if all of it was in hand; else the rest is received.
+dropInHand :: Body -> Int -> IO Dropped
+dropInHand body total = case body of
+  NoBody -> pure (Finish (Right True))
+  ChunkedBody -> pure (Finish (Right False))
+  Sized state -> do
+    marks@Marks {markStart, markEnd, markRemaining} <- readIORef (bodyMarks state)
+    let size = min markRemaining (markEnd - markStart)
+        remaining = markRemaining - size
+    writeIORef (bodyMarks state) marks {markStart = markStart + size, markRemaining = remaining}
+    pure $
+      if
+        | total + size > drainLimit -> Finish (Right False)
+        | remaining == 0 -> Finish (Left state)
+        | otherwise -> Again ((bodySocket state, receiveRoom state remaining), (state, total + size))
 
 -- | The most that is read of a body that the handler didn't read.
 drainLimit :: Int

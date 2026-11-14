@@ -58,7 +58,21 @@ executable fulmen-bench
 -- runs nothing. It writes them into the directory that is its argument.
 executable fulmen-diagram
   default-language: GHC2021
-  hs-source-dirs: diagram
+  hs-source-dirs: diagram program
   main-is: Main.hs
+  other-modules: ServerProgram
   ghc-options: -Wall
   build-depends: base, fulmen, network, streaming-io
+
+-- The lint of the structure of the server's program, built at the arrow that runs nothing. It fails on a finding that no
+-- part of the program allows.
+test-suite fulmen-lint
+  type: exitcode-stdio-1.0
+  default-language: GHC2021
+  hs-source-dirs: lint program
+  main-is: Main.hs
+  other-modules: ServerLintSpec
+                 ServerProgram
+  ghc-options: -Wall -F -pgmF=skeletest-preprocessor
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
+  build-depends: base, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5

@@ -26,8 +26,9 @@ import Data.List (find, intercalate, nub, partition)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import GHC.Stack (SrcLoc (..))
 import Network.Streaming.Annotate (Side (..))
-import Network.Streaming.Classes (Duration (..), Label (..))
+import Network.Streaming.Classes (Label (..))
 import Network.Streaming.Diagram
+import Network.Streaming.Structure (children, loopHeads, readable)
 import System.Mem.StableName (StableName, makeStableName)
 
 -- | A chart of its own, for a named box.
@@ -314,7 +315,7 @@ closePage (World registry) subject anchor drawing plumbing = atomicModifyIORef' 
 -- | The chart in the view, drawn from the body of a box, and how many of its nodes have no name or no question.
 drawPage :: World -> String -> View -> Subject -> IO Drawing
 drawPage world anchor view subject = do
-  heads <- loopHeads (fst <$> subjectPath subject) (subjectBody subject)
+  heads <- loopHeads boxed (fst <$> subjectPath subject) (subjectBody subject)
   ctx <-
     Ctx world anchor view heads
       <$> newIORef 0
@@ -376,44 +377,13 @@ unique taken anchor = fromMaybe anchor (find (`notElem` taken) candidates)
 
 -- * Cycles
 
--- | The nodes below a chart's top that are met again on their own way down, which are the targets of back edges. It is
--- the walk that 'render' makes, without drawing: it doesn't go into the boxes that have charts of their own.
-loopHeads :: [StableName Tree] -> Tree -> IO [StableName Tree]
-loopHeads path step = do
-  tree <- evaluate step
-  case tree of
-    Named {} -> pure []
-    End Asking _ _ -> pure []
-    _ -> do
-      name <- makeStableName tree
-      if name `elem` path
-        then pure [name]
-        else concat <$> traverse (loopHeads (name : path)) (children tree)
-
--- | The trees that a node is made of.
-children :: Tree -> [Tree]
-children = \case
-  Pure -> []
-  Seq one two -> [one, two]
-  First inner -> [inner]
-  Second inner -> [inner]
-  Par one two -> [one, two]
-  Fanout one two -> [one, two]
-  Ap one two -> [one, two]
-  Left' inner -> [inner]
-  Right' inner -> [inner]
-  Sum one two -> [one, two]
-  Choice one two -> [one, two]
-  Together parts -> parts
-  Leaf _ _ -> []
-  Scope acquire release body -> [acquire, release, body]
-  Try inner -> [inner]
-  Shield inner -> [inner]
-  Race one two -> [one, two]
-  Within _ inner -> [inner]
-  Named _ _ inner -> [inner]
-  Wires _ _ inner -> [inner]
-  End _ _ inner -> [inner]
+-- | The nodes that have a chart of their own. The walk that finds the nodes of a chart that are met again on their own
+-- way down, which is the walk that 'render' makes without drawing, doesn't go into them.
+boxed :: Tree -> Bool
+boxed = \case
+  Named {} -> True
+  End Asking _ _ -> True
+  _ -> False
 
 -- * Drawing
 
@@ -509,15 +479,6 @@ quoted text = "\"" ++ escaped text ++ "\""
 boxText :: Label -> String
 boxText (Label title comment) = if null comment then title else title ++ "\n" ++ comment
 
--- | A length of time in the largest unit that has it exactly.
-readable :: Duration -> String
-readable (Duration count) = case [show (count `div` size) ++ " " ++ unit | (size, unit) <- units, divides size] of
-  text : _ -> text
-  [] -> show count ++ " ns"
-  where
-    units = [(1000000000, "s"), (1000000, "ms"), (1000, "us"), (1, "ns")]
-    divides size = count `mod` size == 0
-
 -- | Draws a part of the tree. A node that is on the path is a loop, drawn as a way in to the node's junction and no way
 -- out, and a node that a loop goes back to gets that junction, if a loop goes back to it.
 render :: Ctx -> Path -> Tree -> IO Fragment
@@ -595,6 +556,7 @@ drawStep ctx path = \case
   Shield inner -> grouped ctx "shield" (render ctx path inner)
   Within duration inner -> grouped ctx ("within " ++ readable duration) (render ctx path inner)
   Wires input output inner -> wired input output <$> render ctx path inner
+  Allowing _ _ inner -> render ctx path inner
   tree@(Named label location body) -> named ctx path tree label location body
   tree@(End Asking exchanged body) -> awaiting ctx tree exchanged body
   End Answering exchanged body -> answered ctx path exchanged body
@@ -987,6 +949,7 @@ marked line = \case
   Named (Label title comment) location body
     | isJust (oneStep 8 "" body) -> Named (Label title (unwords (filter (not . null) [comment, line]))) location body
   Wires input output inner -> Wires input output (marked line inner)
+  Allowing check reason inner -> Allowing check reason (marked line inner)
   step -> step
 
 -- | The names of the steps of a ticket's scope, where the scope is in the tree: the ones that hand the ticket out, and
@@ -1010,6 +973,7 @@ scopeIn fuel step
       Seq one two -> scopeIn (fuel - 1) one <|> scopeIn (fuel - 1) two
       Wires _ _ inner -> scopeIn (fuel - 1) inner
       End _ _ inner -> scopeIn (fuel - 1) inner
+      Allowing _ _ inner -> scopeIn (fuel - 1) inner
       _ -> Nothing
 
 -- | The titles of the boxes in the tree, each once, within as many nodes as the fuel: it doesn't go into a box.
@@ -1086,6 +1050,7 @@ oneStep fuel text step
       Leaf _ how -> Just (Leaf text how)
       Pure -> Just (Leaf text Round)
       Wires input output inner -> Wires input output <$> oneStep (fuel - 1) text inner
+      Allowing _ _ inner -> oneStep (fuel - 1) text inner
       Seq Pure inner -> oneStep (fuel - 1) text inner
       Seq inner Pure -> oneStep (fuel - 1) text inner
       _ -> Nothing
