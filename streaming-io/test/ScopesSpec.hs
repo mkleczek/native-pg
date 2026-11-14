@@ -270,13 +270,12 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
           readLog noted `shouldReturn` []
 
     -- A step that yields raises the cancellation that came meanwhile when the part goes on. The give of the message of
-    -- a call is such a step, and it is in the hand-out, before the scope that would abandon the ticket begins.
+    -- a call is such a step, and it is in the hand-out, which the scope of the ticket covers.
     when (name `elem` ["delimited", "compiled"]) $
-      xfail "call: a cancellation raised at the give of its message leaves the ticket unabandoned" $
-        it "abandons the ticket of a call that is cancelled when the part goes on after the message was given" $ do
-          noted <- newLog
-          promptly (runYielding name (Reached (callCancelledAtGive noted))) `shouldReturn` Just (Right (), Just False)
-          readLog noted `shouldReturn` []
+      it "abandons the ticket of a call that is cancelled when the part goes on after the message was given" $ do
+        noted <- newLog
+        promptly (runYielding name (Reached (callCancelledAtGive noted))) `shouldReturn` Just (Right (), Just False)
+        readLog noted `shouldReturn` []
 
   it "lose and duplicate no connection of a pool, and let no part wait for ever, whatever cancels the parts" $ do
     ensureCores
@@ -509,12 +508,11 @@ withTicketCancelled noted _ =
         )
 
 -- | The part is cancelled behind a shield, which keeps the cancellation until it is out. The hand-out gives a value to
--- its own giver, behind a shield too, so that the first point where the cancellation is raised is the wait, which finds
--- the value already given.
+-- its own giver, and the cancellation is raised there, if the give yields, or at the wait, which finds the value.
 withTicketLate :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either (String, Int) ())
 withTicketLate noted _ =
   race
-    (shield slowWait >>> const "request" ^>> withTicket (shield (givenAtOnce @_ @r)) (disposedOf noted))
+    (shield slowWait >>> const "request" ^>> withTicket (givenAtOnce @_ @r) (disposedOf noted))
     giveWayAndEnd
 
 -- | The hand-out declines: it passes the giver on, and gives Left. Then the giver is given a value, which the abandoned
