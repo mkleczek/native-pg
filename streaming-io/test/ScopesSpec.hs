@@ -8,7 +8,7 @@
 -- arrow that has what they need, are run by each.
 module ScopesSpec (spec) where
 
-import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, getNumCapabilities, setNumCapabilities, threadDelay)
 import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
@@ -16,13 +16,29 @@ import qualified Data.ByteString as BS
 import Data.Functor (($>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
+import Data.Proxy (Proxy (..))
+import Data.Tuple (swap)
 import Data.Word (Word64)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as Socket
 import Network.Streaming.Classes hiding (within)
-import Network.Streaming.Combinators (pattern Again, pattern Finish, concurrently, done, iterateWith, times, untilJust)
+import Network.Streaming.Combinators
+  ( pattern Again,
+    pattern Finish,
+    call,
+    concurrently,
+    consume,
+    done,
+    iterateWith,
+    tap,
+    times,
+    tryTicket,
+    untilJust,
+    withTicket,
+  )
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
+import Network.Streaming.Internal.Scheduler (Turn (..))
 import Network.Streaming.Loop (runLoop)
 import Network.Streaming.Pool
 import Network.Streaming.Threads
@@ -206,6 +222,62 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
         runAnywhere name (cancelledWaiter @'Anywhere noted True) `shouldReturn` Raced "second" False Nothing
         readLog noted `shouldReturn` ["acquire", "release: cancelled"]
 
+  describe "scoped tickets" $ do
+    forM_ (reachings name run) $ \(Reaching reach runAt) -> describe reach $ do
+      describe "withTicket" $ do
+        it "gives what the hand-out gave and the value that a part gave to the giver it was handed" $ do
+          noted <- newLog
+          promptly (runAt (Reached (withTicketGiven noted))) `shouldReturn` Just (("passed on", 7), True)
+          readLog noted `shouldReturn` []
+
+        -- A part of a Loop that waits for a ticket is not cancelled there, so the wait never ends by a cancellation.
+        when (name /= "loop") $ do
+          it "gives nothing when the wait is cancelled, refuses a value given afterwards, and disposes of nothing" $ do
+            noted <- newLog
+            promptly (runAt (Reached (withTicketCancelled noted))) `shouldReturn` Just (Right (), False)
+            readLog noted `shouldReturn` []
+
+          it "disposes once, with the input, of a value that came before the wait ended by a cancellation" $ do
+            noted <- newLog
+            promptly (runAt (Reached (withTicketLate noted))) `shouldReturn` Just (Right ())
+            readLog noted `shouldReturn` ["disposed 7 of request"]
+
+      describe "tryTicket" $ do
+        it "gives Left at once, refuses a value given afterwards, and disposes of nothing" $ do
+          noted <- newLog
+          promptly (runAt (Reached (tryTicketDeclined noted))) `shouldReturn` Just (Left "declined", False)
+          readLog noted `shouldReturn` []
+
+        it "disposes, with the input, of a value that the hand-out gave before it gave Left" $ do
+          noted <- newLog
+          promptly (runAt (Reached (tryTicketDeclinedLate noted))) `shouldReturn` Just (Left "declined")
+          readLog noted `shouldReturn` ["disposed 7 of request"]
+
+        it "gives what the hand-out gave and the value, on Right" $ do
+          noted <- newLog
+          promptly (runAt (Reached (tryTicketGiven noted))) `shouldReturn` Just (Right ("passed on", 7), True)
+          readLog noted `shouldReturn` []
+
+      describe "call" $ do
+        it "gives Nothing at once when the receiver has gone" $ do
+          noted <- newLog
+          promptly (runAt (Reached (callToGone noted))) `shouldReturn` Just Nothing
+          readLog noted `shouldReturn` []
+
+        it "gives the answer of a receiver that answers" $ do
+          noted <- newLog
+          promptly (runAt (Reached (callAnswered noted))) `shouldReturn` Just (Just 42)
+          readLog noted `shouldReturn` []
+
+    -- A step that yields raises the cancellation that came meanwhile when the part goes on. The give of the message of
+    -- a call is such a step, and it is in the hand-out, before the scope that would abandon the ticket begins.
+    when (name `elem` ["delimited", "compiled"]) $
+      xfail "call: a cancellation raised at the give of its message leaves the ticket unabandoned" $
+        it "abandons the ticket of a call that is cancelled when the part goes on after the message was given" $ do
+          noted <- newLog
+          promptly (runYielding name (Reached (callCancelledAtGive noted))) `shouldReturn` Just (Right (), Just False)
+          readLog noted `shouldReturn` []
+
   it "lose and duplicate no connection of a pool, and let no part wait for ever, whatever cancels the parts" $ do
     ensureCores
     forM_ [1, 2] $ \seed -> do
@@ -366,6 +438,136 @@ cancelledWaiter noted giveUp =
 -- | The same at the reach of the arrow's own core.
 cancelledWaiterLocal :: forall arr. (Rich arr) => Log -> Bool -> arr () Raced
 cancelledWaiterLocal = cancelledWaiter @(Local arr)
+
+-- | An arrow that has everything the programs use, and a ticket of the reach.
+type Ticketed r arr = (Rich arr, Exchange arr r)
+
+-- | A program for a ticket of any reach. The proxy says which, since nothing else in the program does.
+newtype Reached a = Reached (forall r arr. (Ticketed r arr) => Proxy r -> arr () a)
+
+-- | A way to run a program for the tickets of one reach.
+data Reaching = Reaching String (forall a. Reached a -> IO a)
+
+-- | The reaches that a runtime has tickets of: its own core's, and, if it has cores, any core's.
+reachings :: String -> (forall a. Program a -> IO a) -> [Reaching]
+reachings name run =
+  Reaching "of the arrow's own core" (\reached -> run (atOwnCore reached))
+    : [Reaching "of any core" (\reached -> runAnywhere name (atAnyCore reached)) | name /= "loop"]
+
+-- | The program for the tickets of the arrow's own core.
+atOwnCore :: forall a arr. (Rich arr) => Reached a -> arr () a
+atOwnCore (Reached program) = program (Proxy @(Local arr))
+
+-- | The program for the tickets of any core.
+atAnyCore :: forall a arr. (Pooled arr) => Reached a -> arr () a
+atAnyCore (Reached program) = program (Proxy @'Anywhere)
+
+-- | Runs the program in an arrow whose turn has no length: every step is a point where the part yields, and goes on by
+-- raising the cancellation that came meanwhile.
+runYielding :: String -> Reached a -> IO a
+runYielding name reached = case name of
+  "compiled" -> fst <$> runCompiledTurn (Turn 0) (atOwnCore reached) ()
+  _ -> fst <$> runDelimitedTurn (Turn 0) (atOwnCore reached) ()
+
+-- | Runs the action, which gives nothing if it waits for ever.
+promptly :: IO a -> IO (Maybe a)
+promptly = timeout 10000000
+
+-- | A hand-out that gives the giver of its ticket, as the value of another ticket whose giver is the input.
+passedOn :: (Arrow arr, Exchange arr r) => arr (Giver r Int, Giver r (Giver r Int)) String
+passedOn = swap ^>> give >>^ const "passed on"
+
+-- | The part that waits for a giver gives it a value, and says whether the waiter took it.
+givesSeven :: (Arrow arr, Exchange arr r) => arr (Waiting arr r (Giver r Int)) Bool
+givesSeven = (await >>^ (,7)) >>> give
+
+-- | A disposal that notes the value it was given.
+disposed :: (Effect arr) => Log -> arr (Int, x) ()
+disposed noted = now (\(value, _) -> note noted ("disposed " <> show value))
+
+-- | A disposal that notes the value, and the request that is its input.
+disposedOf :: (Effect arr) => Log -> arr (Int, String) ()
+disposedOf noted = now (\(value, request) -> note noted ("disposed " <> show value <> " of " <> request))
+
+-- | A hand-out that gives a value to its own giver, and passes the request on.
+givenAtOnce :: (Arrow arr, Exchange arr r) => arr (Giver r Int, String) String
+givenAtOnce = (\(giver, request) -> ((giver, 7), request)) ^>> consume (give >>> done)
+
+-- | The hand-out gives the giver to a part that runs with the wait, and that part gives the value.
+withTicketGiven :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () ((String, Int), Bool)
+withTicketGiven noted _ =
+  ticket @arr @r >>> concurrently (snd ^>> withTicket passedOn (disposed noted)) (fst ^>> givesSeven)
+
+-- | The wait is raced against one that ends first, so the part is cancelled where it waits. Then the giver is given a
+-- value, which the abandoned ticket refuses.
+withTicketCancelled :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either (String, Int) (), Bool)
+withTicketCancelled noted _ =
+  ticket @arr @r
+    >>> ( (,)
+            <$> race (snd ^>> withTicket passedOn (disposed noted)) (done >>> slowWait)
+            <*> (fst ^>> givesSeven)
+        )
+
+-- | The part is cancelled behind a shield, which keeps the cancellation until it is out. The hand-out gives a value to
+-- its own giver, behind a shield too, so that the first point where the cancellation is raised is the wait, which finds
+-- the value already given.
+withTicketLate :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either (String, Int) ())
+withTicketLate noted _ =
+  race
+    (shield slowWait >>> const "request" ^>> withTicket (shield (givenAtOnce @_ @r)) (disposedOf noted))
+    giveWayAndEnd
+
+-- | The hand-out declines: it passes the giver on, and gives Left. Then the giver is given a value, which the abandoned
+-- ticket refuses.
+tryTicketDeclined :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either String (String, Int), Bool)
+tryTicketDeclined noted _ =
+  ticket @arr @r
+    >>> ( (,)
+            <$> (snd ^>> tryTicket declined (disposed noted))
+            <*> (fst ^>> givesSeven)
+        )
+  where
+    declined = swap ^>> give >>^ const (Left "declined")
+
+-- | The hand-out gives a value to its own giver, and then gives Left.
+tryTicketDeclinedLate :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either String (String, Int))
+tryTicketDeclinedLate noted _ =
+  const "request" ^>> tryTicket (givenAtOnce @_ @r >>^ const (Left "declined")) (disposedOf noted)
+
+-- | The hand-out passes the giver on and gives Right, and a part that runs with the wait gives the value.
+tryTicketGiven :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either String (String, Int), Bool)
+tryTicketGiven noted _ =
+  ticket @arr @r >>> concurrently (snd ^>> tryTicket handedOut (disposed noted)) (fst ^>> givesSeven)
+  where
+    handedOut = swap ^>> give >>^ const (Right "passed on")
+
+-- | A message that carries the giver of the answer.
+newtype Ask r = Ask (Giver r Int)
+
+-- | The receiver's waiting end abandoned its ticket, so that the message is not taken.
+callToGone :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Maybe Int)
+callToGone noted _ = ticket @arr @r >>> consume (abandon >>> done) >>> call Ask (disposed noted)
+
+-- | The receiver waits for the message, and gives the answer to the giver that it carries.
+callAnswered :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Maybe Int)
+callAnswered noted _ = ticket @arr @r >>> concurrently (snd ^>> call Ask (disposed noted)) (fst ^>> answers) >>^ fst
+  where
+    answers = await >>> (\(Ask giver) -> (giver, 42)) ^>> give >>> done
+
+-- | The part is cancelled behind a shield, and then calls: the message is given, the part yields, and when it goes on
+-- the cancellation is raised, before it waits. A part with the receiver's end takes the message out, and gives the
+-- answer to the giver in it, which says whether the ticket was abandoned.
+callCancelledAtGive :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either (Maybe Int) (), Maybe Bool)
+callCancelledAtGive noted _ =
+  ticket @arr @r
+    >>> ( (,)
+            <$> race (tap (shield (done >>> slowWait)) >>> snd ^>> call Ask (disposed noted)) (done >>> giveWayAndEnd)
+            <*> (fst ^>> abandon >>> found ^>> (nothing ||| gives))
+        )
+  where
+    found = maybe (Left ()) (\(Ask giver) -> Right (giver, 42))
+    nothing = done >>^ const Nothing
+    gives = give >>^ Just
 
 -- | A wait of about 20 ms, for a descriptor that another thread makes readable.
 slowWait :: (Rich arr) => arr () ()
