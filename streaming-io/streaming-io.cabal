@@ -24,6 +24,7 @@ library
                    Network.Streaming.Mode
                    Network.Streaming.Classes
                    Network.Streaming.Combinators
+                   Network.Streaming.Plumbing
                    Network.Streaming.Counters
                    Network.Streaming.Threads
                    Network.Streaming.Delimited
@@ -70,6 +71,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Mode
                  Network.Streaming.Classes
                  Network.Streaming.Combinators
+                 Network.Streaming.Plumbing
                  Network.Streaming.Counters
                  Network.Streaming.Threads
                  Network.Streaming.Delimited

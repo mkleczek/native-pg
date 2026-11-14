@@ -358,13 +358,13 @@ withOlderServer action =
     Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
     Socket.listen listener 1
     scriptedPort <- Socket.socketPort listener
-    done <- newEmptyMVar
+    served <- newEmptyMVar
     bracket
-      (forkFinally (serve listener) (putMVar done))
-      (\thread -> killThread thread >> readMVar done >> pure ())
+      (forkFinally (serve listener) (putMVar served))
+      (\thread -> killThread thread >> readMVar served >> pure ())
       $ \_ -> do
         result <- timeout 5000000 (action scriptedPort) >>= maybe (failTest "scripted connection timed out") pure
-        outcome <- timeout 1000000 (readMVar done)
+        outcome <- timeout 1000000 (readMVar served)
         case outcome of
           Just (Right ()) -> pure result
           Just (Left failure) -> failTest (show failure)
