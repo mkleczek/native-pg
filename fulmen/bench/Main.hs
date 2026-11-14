@@ -33,7 +33,7 @@ import qualified Network.Fulmen as Fulmen
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
-import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
+import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.Classes (Effect (..), Runtime)
 import Network.Streaming.Combinators (consume)
 import Network.Streaming.Delimited (runCores)
@@ -73,14 +73,18 @@ server kind cores connections = do
   ordinary <- positive (fromIntegral connections + 2)
   reserve <- positive 2
   setup <- positive 1
-  pool <- newBufferPool (BufferPoolSettings size ordinary reserve setup)
   counters <- Counters <$> newIORef 0 <*> newIORef (0, 0)
-  let settings = (Fulmen.defaultSettings listening pool) {Fulmen.connectionsPerCore = connections, Fulmen.clientTimeout = Nothing}
-  shared <- Fulmen.newCores cores
+  let settings =
+        Fulmen.defaultSettings
+          { Fulmen.bufferPool = BufferPoolSettings size ordinary reserve setup,
+            Fulmen.connectionsPerCore = connections,
+            Fulmen.clientTimeout = Nothing
+          }
+  shared <- Fulmen.newCores settings cores
   putStrLn ("port " <> show port)
   case kind of
-    "delimited" -> void (runCores cores (pure shared) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings (handler counters)))
-    "threads" -> runThreads (Fulmen.serve settings (handler counters)) shared
+    "delimited" -> void (runCores cores (pure shared) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings (Fulmen.borrowed listening) (handler counters)))
+    "threads" -> runThreads (Fulmen.serve settings (Fulmen.borrowed listening) (handler counters)) shared
     _ -> die "the server is delimited or threads"
 
 -- | The 16 KiB body, and the 1 MiB body as 64 pieces of 16 KiB, which are made once.

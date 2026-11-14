@@ -1,6 +1,4 @@
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TypeApplications #-}
 
 -- | Where a server that runs on several cores puts its new connections: a client opens connections and keeps them, and
 -- each core is to serve as many of them as the other, instead of one core serving them all while the other has workers
@@ -20,11 +18,9 @@ import qualified Network.Fulmen as Fulmen
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
-import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (consume, keeping)
 import Network.Streaming.Delimited (runCores)
-import Network.Streaming.PositiveInt (positiveInt)
 import Skeletest
 import System.Timeout (timeout)
 
@@ -33,15 +29,16 @@ spec = describe "placement" $
   it "gives new connections that are kept open to the cores in turn, when the workers that are free are all of one core" $ do
     -- Each core runs on the capability of its number.
     getNumCapabilities >>= \capabilities -> when (capabilities < 2) (setNumCapabilities 2)
-    pool <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
     bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
       Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
       Socket.listen accepting 128
       port <- Socket.socketPort accepting
-      cores <- Fulmen.newCores 2
-      let settings = (Fulmen.defaultSettings accepting pool) {Fulmen.connectionsPerCore = 4}
+      let settings = Fulmen.defaultSettings {Fulmen.connectionsPerCore = 4}
+          serving cores =
+            runCores 2 (pure cores) (\shared core -> const (Fulmen.onCore shared core) ^>> Fulmen.serve settings (Fulmen.borrowed accepting) answerWithCore)
+      cores <- Fulmen.newCores settings 2
       stopped <- newEmptyMVar
-      bracket (forkFinally (void (runCores 2 (pure cores) (\shared core -> const (Fulmen.onCore shared core) ^>> Fulmen.serve settings answerWithCore))) (putMVar stopped)) killThread $ \_ -> do
+      bracket (forkFinally (void (serving cores)) (putMVar stopped)) killThread $ \_ -> do
         -- The workers of both cores offer themselves at the start, and the connections come when they all have.
         threadDelay 200000
         placed <- timeout 20000000 $

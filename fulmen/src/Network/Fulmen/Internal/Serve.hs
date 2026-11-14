@@ -7,11 +7,11 @@
 {-# LANGUAGE RecordWildCards #-}
 
 -- | The server as a static network of parts. Each core has its workers from the start, and the first core has the
--- acceptor besides. A worker offers itself as free, in the pool that the cores share, and waits at a ticket for the
--- connection that the acceptor gives it; then it serves the connection, request after request, until it ends, and
--- offers itself again. The acceptor takes a free worker of the core that has the most free workers, so that the
--- connections are shared out between the cores, and waits for one when there is none, so that past the cap on
--- connections they wait in the listen backlog.
+-- acceptor besides, which opens the listener when the server starts and closes it when it ends. A worker offers itself
+-- as free, in the pool that the cores share, and waits at a ticket for the connection that the acceptor gives it; then
+-- it serves the connection, request after request, until it ends, and offers itself again. The acceptor takes a free
+-- worker of the core that has the most free workers, so that the connections are shared out between the cores, and
+-- waits for one when there is none, so that past the cap on connections they wait in the listen backlog.
 --
 -- A request is read into the primary buffer that it was admitted with. The bytes that follow it in the buffer, which
 -- belong to the next request on the connection, are copied out before the buffer is used for anything else, and
@@ -39,6 +39,7 @@ import Network.Fulmen.Internal.Accept (acceptor, listening)
 import Network.Fulmen.Internal.Body (BodyState (..), ConnectionLost (..), Marks (..), drain)
 import Network.Fulmen.Internal.Head (Framing (..), Parsed (..), Scan (..), parseHead, scanHead, startScan)
 import Network.Fulmen.Internal.Response (Exchange (..), Phase (..), newExchange, refusal)
+import Network.Fulmen.Listen (Listen (..))
 import Network.Fulmen.Request (Method (..), Request (..), Version (..))
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
@@ -66,36 +67,37 @@ import Network.Streaming.Combinators
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
 import Network.Streaming.Pool (queueNow, releaseNow, takeNowWith)
 
--- | The server: for each core, the workers, and for the first, the acceptor.
-serve :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
-serve !settings handler =
+-- | The server: for each core, the workers, and for the first, the acceptor, which opens the listener.
+serve :: (Runtime arr) => Settings -> Listen arr -> arr (Call, Request) () -> arr Cores ()
+serve !settings listen handler =
   named (Label "serve" "Runs the workers of each core, and the acceptor besides on the first core.") $
     decide "first core?" (whether isFirst)
-      >>> (taking "yes" (together (acceptance settings : workers)) ||| taking "no" (together workers))
+      >>> (taking "yes" (together (acceptance listen : workers)) ||| taking "no" (together workers))
   where
     workers = replicate (connectionsPerCore settings) (worker settings handler)
     isFirst (Cores core _) = core == 0
 
 -- * The acceptor
 
--- | Takes a free worker of the core that has the most free workers, accepts a connection, and gives it to the worker. A
--- connection that the worker is no longer there to take is closed.
-acceptance :: (Runtime arr) => Settings -> arr Cores ()
-acceptance settings =
-  named (Label "acceptance" "Accepts connections, and gives each to a free worker of the core that has the most free workers.") $
-    tap (step "make listener non-blocking" (const (listening (listener settings)))) >>> foreverA (tap place)
+-- | Opens the listener, and then takes a free worker of the core that has the most free workers, accepts a connection,
+-- and gives it to the worker, for ever. A connection that the worker is no longer there to take is closed. The listener
+-- is closed when the acceptor ends, however it ends.
+acceptance :: (Runtime arr) => Listen arr -> arr Cores ()
+acceptance Listen {openListener, closeListener} =
+  named (Label "acceptance" "Opens the listener, accepts connections, and gives each to a free worker of the core that has the most free workers.") $
+    scope (done >>> giving "listener" openListener) (fst ^>> closeListener) $
+      tap (step "make listener non-blocking" (listening . fst)) >>> foreverA (tap place)
   where
     place =
       ( (,)
-          <$> giving "worker's giver" checkout
-          <*> giving "accepted socket" accept
+          <$> giving "worker's giver" (snd ^>> checkout)
+          <*> giving "accepted socket" (fst ^>> accept)
       )
         >>> alongside (answering "connection" give)
         >>> decide "worker took it?" untaken
         >>> (taking "no" close ||| taking "yes" returnA)
     accept =
-      named (Label "accept" "Accepts the next connection of the listening socket, and blocks while none is waiting.") $
-        const (listener settings) ^>> acceptor
+      named (Label "accept" "Accepts the next connection of the listening socket, and blocks while none is waiting.") acceptor
     untaken (taken, (_, socket)) = if taken then Right () else Left socket
 
 -- | The giver of a free worker of the core that has the most free workers, which is taken from the pool at once. When no
@@ -173,7 +175,10 @@ requests settings handler =
   where
     whileKept (keep, conn) = if keep then Again conn else Finish ()
     -- An idle connection waits holding no buffer: a request is admitted once there is input.
-    one = tap idle >>> withRequestBuffers (buffers settings) (request settings handler)
+    one =
+      tap idle
+        >>> alongside (giving "buffer pool" (arr (sharedBuffers . connShared)))
+        >>> withRequestBuffers (request settings handler)
 
 -- | Waits until the connection has input, which may be its end, unless it has bytes of a request already.
 idle :: (Runtime arr) => arr Conn ()

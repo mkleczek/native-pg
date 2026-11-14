@@ -123,7 +123,7 @@ using pool body = scope acquire release run
         >>> (making ||| arr id)
         >>> second (now leased)
     making =
-      keeping (withRequestBuffers (poolBuffers pool) (fst ^>> connect (poolConnect (poolSettings pool))) >>> now (either throwIO pure))
+      keeping ((poolBuffers pool,) ^>> withRequestBuffers (fst ^>> connect (poolConnect (poolSettings pool))) >>> now (either throwIO pure))
         >>> tap (now (\(connection, ref) -> writeIORef ref (Just connection)))
         >>^ swap
     release = now $ \((ref, connection), _) -> do

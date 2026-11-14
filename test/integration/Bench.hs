@@ -118,9 +118,8 @@ request ::
   (Tx.Result arr row -> With Tx.Tx arr () ()) ->
   arr () ()
 request buffers pool given reading =
-  withRequestBuffers
-    buffers
-    (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement given) reading)))
+  (buffers,)
+    ^>> withRequestBuffers (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement given) reading)))
     >>> now (\case Right (Right ()) -> pure (); other -> die ("a request failed: " <> show other))
 
 -- | The pieces of the field, one after the other, dropped: how many bytes they had.
@@ -132,9 +131,8 @@ drained = (,0) ^>> iterateA (alongside (fst ^>> next) >>^ counted)
 -- | Runs the commands in a transaction of their own, one after the other.
 commands :: (Runtime arr) => BufferPool -> ConnectionPool -> [ByteString] -> arr () ()
 commands buffers pool texts =
-  withRequestBuffers
-    buffers
-    (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Write (Tx.pipeline Tx.Final (traverse Tx.command texts) (foldr ((>>>) . Tx.discard) returnA))))
+  (buffers,)
+    ^>> withRequestBuffers (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Write (Tx.pipeline Tx.Final (traverse Tx.command texts) (foldr ((>>>) . Tx.discard) returnA))))
     >>> now (\case Right (Right ()) -> pure (); other -> die ("the setup failed: " <> show other))
 
 -- | The workload under the arrow: transactions per second, and the bytes that each allocated. The first requests make

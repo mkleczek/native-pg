@@ -16,7 +16,7 @@ import Control.Monad (forM_, unless)
 import Data.List (intercalate)
 import Network.Streaming.Diagram.Mermaid (Page (..), Pair (..), html, pairs, pages)
 import Network.Streaming.Lint (Report (..), lint, renderReport)
-import ServerProgram (withServer)
+import ServerProgram (server)
 import System.Environment (getArgs)
 import System.Exit (die, exitFailure)
 import System.IO (IOMode (..), hPutStr, hSetEncoding, utf8, withFile)
@@ -32,15 +32,15 @@ main = do
 -- | Prints the lint of the server, and fails if a finding is not allowed.
 lintServer :: IO ()
 lintServer = do
-  linted <- withServer lint
+  linted <- lint server
   putStr (renderReport linted)
   unless (null (reportFindings linted)) exitFailure
 
 -- | Writes the pages of the server.
 draw :: FilePath -> IO ()
 draw directory = do
-  found <- withServer pages
-  exchanges <- withServer pairs
+  found <- pages server
+  exchanges <- pairs server
   write (directory ++ "/fulmen-server.html") (html "Fulmen server" found)
   forM_ found $ \page -> do
     write (directory ++ "/" ++ pageAnchor page ++ ".mmd") (pageMermaid page)

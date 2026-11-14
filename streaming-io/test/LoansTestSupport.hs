@@ -161,7 +161,7 @@ sameMemory one other = now (const (uncurry shouldBe =<< ((,) <$> memoryOf one <*
 
 -- | The script as one request of the pool: its input is the request's loans.
 request :: (Runtime arr) => BufferPool -> arr Loans b -> arr () b
-request pool script = withRequestBuffers pool (fst ^>> script)
+request pool script = (pool,) ^>> withRequestBuffers (fst ^>> script)
 
 -- | The script as this many requests at once, which are admitted one after the other: its input is their loans, in
 -- the order they were admitted.
@@ -170,7 +170,7 @@ holding count pool script = const [] ^>> admitted count
   where
     admitted n
       | n <= 0 = script
-      | otherwise = withRequestBuffers pool (inAdmissionOrder ^>> admitted (n - 1))
+      | otherwise = (pool,) ^>> withRequestBuffers (inAdmissionOrder ^>> admitted (n - 1))
     inAdmissionOrder (loans, others) = others ++ [loans]
 
 -- | The script of the request that is at this place among the requests held.

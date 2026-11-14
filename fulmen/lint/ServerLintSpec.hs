@@ -3,11 +3,11 @@
 module ServerLintSpec (spec) where
 
 import Network.Streaming.Lint (Report (..), lint, renderReport)
-import ServerProgram (withServer)
+import ServerProgram (server)
 import Skeletest
 
 spec :: Spec
 spec = describe "the server's program" $ do
   it "has no finding that a part of it doesn't allow" $ do
-    report <- withServer lint
+    report <- lint server
     lines (renderReport report {reportAllowed = []}) `shouldBe` ["0 findings, 0 allowed"]

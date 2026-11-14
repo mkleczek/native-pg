@@ -133,13 +133,13 @@ runners =
   ]
 
 onThreads :: BufferPool -> Program a -> IO a
-onThreads buffers program = runThreads (withRequestBuffers buffers (fst ^>> program)) ()
+onThreads buffers program = runThreads (withRequestBuffers (fst ^>> program)) (buffers, ())
 
 onDelimited :: BufferPool -> Program a -> IO a
-onDelimited buffers program = fst <$> runDelimited (withRequestBuffers buffers (fst ^>> program)) ()
+onDelimited buffers program = fst <$> runDelimited (withRequestBuffers (fst ^>> program)) (buffers, ())
 
 onCompiled :: BufferPool -> Program a -> IO a
-onCompiled buffers program = fst <$> runCompiled (withRequestBuffers buffers (fst ^>> program)) ()
+onCompiled buffers program = fst <$> runCompiled (withRequestBuffers (fst ^>> program)) (buffers, ())
 
 -- | The program, as one request, on the pool. A program that never ends fails the case after a minute.
 runOn :: Runner -> BufferPool -> Program a -> IO a

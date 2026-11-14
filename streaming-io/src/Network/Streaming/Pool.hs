@@ -36,7 +36,7 @@ module Network.Streaming.Pool
   )
 where
 
-import Control.Arrow (ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
 import Control.Exception (Exception)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict (IntMap)
@@ -237,19 +237,21 @@ reserveMany :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange
 reserveMany need many (Pool ref _) = reserved ref (max many need) (claimMany many need) (Many many)
 
 -- | The item or the items once the part's ticket is given them, which the part waits at, and gives up its place at when it is
--- cancelled, so that what was given to it meanwhile goes back through the arrow.
-waited :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr taken () -> arr (Waiting arr 'Anywhere taken) taken
+-- cancelled, so that what was given to it meanwhile goes back through the arrow. The pool that they are of is in the
+-- input, with the ticket's end, and the arrow that gives back takes it with them.
+waited :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr (Pool conn, taken) () -> arr (Pool conn, Waiting arr 'Anywhere taken) taken
 waited giveBack =
   named (Label "waited" "Waits for the item to be given, and gives up the place in the queue if cancelled meanwhile.") $
-    scope returnA giveUp (fst ^>> await)
+    scope returnA giveUp (fst ^>> second await >>^ snd)
   where
     giveUp =
       decide "got its item?" unlessDone
         >>> ( taking "yes" returnA
                 ||| taking
                   "no"
-                  ( abandon
-                      >>> decide "given meanwhile?" (maybe (Left ()) Right)
+                  ( swap
+                      ^>> first abandon
+                      >>> decide "given meanwhile?" (\(given, pool) -> maybe (Left ()) (Right . (pool,)) given)
                       >>> (taking "no" returnA ||| taking "yes" giveBack)
                   )
             )
@@ -264,17 +266,34 @@ unlessDone (input, exit) = case exit of Done -> Left (); _ -> Right input
 -- a connection that was given to it meanwhile goes back to the pool, so that
 -- none is lost.
 checkout :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool conn -> arr () conn
-checkout = checkoutAt 1
+checkout pool = const (1, pool) ^>> checkoutAt
 
--- | The same for an item that is only given when at least this many are free.
-checkoutAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Int -> Pool conn -> arr () conn
-checkoutAt need pool =
+-- | The same for an item that is only given when at least this many are free, which is in the input with the pool: a
+-- part that is cancelled while it waits gives up its place, and an item that was given to it meanwhile goes back to the
+-- pool.
+checkoutAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => arr (Int, Pool conn) conn
+checkoutAt =
   named (Label "checkoutAt" "Takes an item of the pool if enough are free, and else queues for one and waits.") $
-    giving "item free?" (reserveAt need pool) >>> (taking "no" (waited (release pool)) ||| taking "yes" returnA)
+    giveWay
+      >>> giving "item free?" (step "claim from free items" claim)
+      >>> (taking "no" queue ||| taking "yes" returnA)
+  where
+    claim input@(need, Pool ref _) = either (const (Left input)) Right <$> update ref (claimOne need)
+    queue =
+      keeping ticket
+        >>> giving "item free?" (step "queue giver" queueing)
+        >>> ( taking "no" (waited (step "return item" (\(pool, item) -> releaseNow pool [item])))
+                ||| taking "yes" returnA
+            )
+    queueing ((awaiting, giver), (need, pool@(Pool ref _))) =
+      either (Left . (pool,)) Right <$> update ref (queueOrClaim need awaiting giver)
+    queueOrClaim need awaiting giver state = case claimOne need state of
+      (claimed, Right taken) -> (claimed, Right taken)
+      (_, Left ()) -> (queued need (One giver) state, Left awaiting)
 
 -- | The same for this many items at once, when at least the number needed are free.
 checkoutMany :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Int -> Int -> Pool conn -> arr () [conn]
-checkoutMany need many pool = reserveMany need many pool >>> (waited (now (releaseNow pool)) ||| returnA)
+checkoutMany need many pool = reserveMany need many pool >>> (((pool,) ^>> waited (now (uncurry releaseNow))) ||| returnA)
 
 -- | The same as 'checkoutMany' for a pool that is only known when the program runs, which is the input: it gives the
 -- pool again with the items, for the release. A part that is cancelled while it waits gives up its place, and the items

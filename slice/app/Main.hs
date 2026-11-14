@@ -38,9 +38,8 @@ import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
 import Network.Fulmen (Call, Method (..), Request (..))
 import qualified Network.Fulmen as Fulmen
-import Network.Socket (Socket)
 import qualified Network.Socket as Socket
-import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
+import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.Classes (Effect (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateWith, keeping)
 import Network.Streaming.Compiled (runCompiled)
@@ -218,18 +217,20 @@ address text = case break (== ':') (reverse text) of
 
 -- * The server
 
--- | A socket that listens on the numeric address.
-listening :: (String, String) -> IO Socket
-listening (host, port) = do
+-- | The numeric address.
+resolved :: (String, String) -> IO Socket.AddrInfo
+resolved (host, port) = do
   let hints = Socket.defaultHints {Socket.addrFlags = [Socket.AI_NUMERICHOST, Socket.AI_NUMERICSERV, Socket.AI_PASSIVE], Socket.addrSocketType = Socket.Stream}
   Socket.getAddrInfo (Just hints) (Just host) (Just port) >>= \case
     [] -> die ("no address for " <> host <> ":" <> port)
-    found : _ -> do
-      socket <- Socket.socket (Socket.addrFamily found) Socket.Stream Socket.defaultProtocol
-      Socket.setSocketOption socket Socket.ReuseAddr 1
-      Socket.bind socket (Socket.addrAddress found)
-      Socket.listen socket 2048
-      pure socket
+    found : _ -> pure found
+
+-- | A socket that listens on the address, which says so once it does.
+listening :: (Runtime arr) => (String, String) -> Socket.AddrInfo -> Fulmen.Listen arr
+listening (host, port) info = tcp {Fulmen.openListener = Fulmen.openListener tcp >>> now announce}
+  where
+    tcp = Fulmen.tcp info 2048
+    announce socket = socket <$ putStrLn ("listening on " <> host <> ":" <> port)
 
 -- | How the pool connects: the settings of the connection string, which v2compare gives with trust authentication.
 connectSettingsOf :: String -> IO ConnectSettings
@@ -244,7 +245,7 @@ main = do
   options <- getArgs >>= either (\problem -> die (problem <> "\n" <> usage)) pure . parseOptions
   (listen, uri) <- maybe (die ("--listen and --database are needed\n" <> usage)) pure ((,) <$> optListen options <*> optDatabase options)
   connect <- connectSettingsOf uri
-  listener <- listening listen
+  info <- resolved listen
   -- One worker for each connection that is held at once, the connections being shared out among the cores that run them
   -- (the other runners have one core, which is all of them), and a buffer of the pool for each, since a request holds one.
   let runningCores = case optRuntime options of Delimited -> optCores options; _ -> 1
@@ -256,20 +257,25 @@ main = do
   ordinary <- positive (perCore * runningCores)
   reserve <- positive 16
   setup <- positive (optPool options)
-  buffers <- newBufferPool (BufferPoolSettings size ordinary reserve setup)
   -- The client timeout is off, as fulmen-bench has it: the server doesn't enforce it yet.
-  let settings = (Fulmen.defaultSettings listener buffers) {Fulmen.connectionsPerCore = perCore, Fulmen.clientTimeout = Nothing}
-  shared <- Fulmen.newCores runningCores
-  putStrLn ("listening on " <> fst listen <> ":" <> snd listen)
+  let settings =
+        Fulmen.defaultSettings
+          { Fulmen.bufferPool = BufferPoolSettings size ordinary reserve setup,
+            Fulmen.connectionsPerCore = perCore,
+            Fulmen.clientTimeout = Nothing
+          }
+      listener :: (Runtime arr) => Fulmen.Listen arr
+      listener = listening listen info
+  shared <- Fulmen.newCores settings runningCores
   -- The arrow is known where the handler is built, so that GHC specialises it to the arrow.
   withConnectionPool (connectionPoolSettings (optPool options) connect) $ \pool -> case (optMode options, optRuntime options) of
-    (Release, Threads) -> runThreads (Fulmen.serve settings (handler (counted @'Release) pool)) shared
-    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings (handler (counted @'Release) pool)))
-    (Release, Compiled) -> void (runCompiled (Fulmen.serve settings (handler (counted @'Release) pool)) shared)
+    (Release, Threads) -> runThreads (Fulmen.serve settings listener (handler (counted @'Release) pool)) shared
+    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings listener (handler (counted @'Release) pool)))
+    (Release, Compiled) -> void (runCompiled (Fulmen.serve settings listener (handler (counted @'Release) pool)) shared)
 #if defined(DEBUG_MODE)
-    (Debug, Threads) -> runThreadsM @'Debug (Fulmen.serve settings (handler (counted @'Debug) pool)) shared
-    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings (handler (counted @'Debug) pool)))
-    (Debug, Compiled) -> void (runCompiledM @'Debug (Fulmen.serve settings (handler (counted @'Debug) pool)) shared)
+    (Debug, Threads) -> runThreadsM @'Debug (Fulmen.serve settings listener (handler (counted @'Debug) pool)) shared
+    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings listener (handler (counted @'Debug) pool)))
+    (Debug, Compiled) -> void (runCompiledM @'Debug (Fulmen.serve settings listener (handler (counted @'Debug) pool)) shared)
 #else
     (Debug, _) -> die "this build has no debug mode: build the slice with -f debug-mode"
 #endif

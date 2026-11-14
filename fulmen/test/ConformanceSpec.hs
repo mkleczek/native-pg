@@ -18,8 +18,8 @@ module ConformanceSpec (spec) where
 
 import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, tryReadMVar)
-import Control.Exception (IOException, SomeException, bracket, displayException, throwIO, try)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
+import Control.Exception (IOException, SomeException, bracket, displayException, fromException, throwIO, try)
 import Control.Monad (forM_, void, when)
 import ConformanceCases
 import ConformanceWire
@@ -35,21 +35,20 @@ import qualified Network.Fulmen as Fulmen
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
-import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateA, iterateWith, keeping, sleep, tap)
 import Network.Streaming.Counters (Counter (..), countOf, since, snapshot)
 import Network.Streaming.Compiled (runCompiled, runCompiledM)
-import Network.Streaming.Delimited (runDelimited, runDelimitedM)
+import Network.Streaming.Delimited (runCores, runDelimited, runDelimitedM)
 import Network.Streaming.Mode (Mode (..))
-import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Threads (runThreads, runThreadsM)
 import Skeletest
 import System.Info (os)
+import System.IO.Error (ioeGetErrorString, isAlreadyInUseError)
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted
+spec = conformance *> counted *> listenerFailure
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -68,6 +67,51 @@ counted = describe "accepting" $ forM_ debugRunners $ \runner@(Runner runnerName
     counts <- (`since` before) <$> snapshot
     countOf Accepts counts `shouldBe` 30
     when (os == "linux") $ countOf Fcntls counts `shouldBe` 0
+
+-- | A listener that fails to open ends the server with that failure, and the server doesn't wait for a connection: the
+-- first core runs the acceptor, which opens the listener, and the other parts of the server don't keep it from ending.
+listenerFailure :: Spec
+listenerFailure =
+  describe "a listener that fails to open" $ forM_ (runners ++ [coresRunner]) $ \runner@(Runner runnerName _) ->
+    describe runnerName $ do
+      it "ends the server with the failure of the provider" $
+        endedWith runner (Listening failing) >>= shouldEndWith ((== "the listener failed") . ioeGetErrorString)
+      it "ends the server with the failure to bind to a port that is in use" $
+        bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \occupant -> do
+          Socket.bind occupant (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+          Socket.listen occupant 128
+          port <- Socket.socketPort occupant
+          let address =
+                Socket.defaultHints
+                  { Socket.addrFamily = Socket.AF_INET,
+                    Socket.addrSocketType = Socket.Stream,
+                    Socket.addrAddress = Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1))
+                  }
+          endedWith runner (Listening (Fulmen.tcp address 128)) >>= shouldEndWith isAlreadyInUseError
+  where
+    failing :: (Runtime arr) => Fulmen.Listen arr
+    failing =
+      Fulmen.Listen
+        { Fulmen.openListener = now (const (ioError (userError "the listener failed"))),
+          Fulmen.closeListener = now (const (pure ()))
+        }
+
+-- | How the server ended, if it did in time: the runner runs it with a handler that answers 200, on one core made for it.
+endedWith :: Runner -> Listening -> IO (Maybe (Either SomeException ()))
+endedWith (Runner _ runServer) listening = do
+  cores <- Fulmen.newCores Fulmen.defaultSettings 1
+  stopped <- newEmptyMVar
+  let serving = runServer Fulmen.defaultSettings listening (handling (Fixed 200 [] "ok")) cores
+  bracket (forkFinally serving (putMVar stopped)) killThread $ \_ -> timeout 5000000 (readMVar stopped)
+
+-- | Fails the test unless the server ended with an I/O failure of this kind.
+shouldEndWith :: (IOException -> Bool) -> Maybe (Either SomeException ()) -> IO ()
+shouldEndWith kind = \case
+  Nothing -> failTest "the server did not end in time"
+  Just (Right ()) -> failTest "the server returned"
+  Just (Left failure) -> case fromException failure of
+    Just ioFailure | kind ioFailure -> pure ()
+    _ -> failTest ("the server ended with another failure: " <> displayException failure)
 
 -- | Marks a case that is expected to fail, and says why. A case that then passes unexpectedly fails the suite.
 marked :: Case -> Spec -> Spec
@@ -113,26 +157,54 @@ needingChunkedBodies =
 
 -- * Runners
 
--- | A way to run the server: an arrow's runner, given the settings, the handler and the cores.
-data Runner = Runner String (Fulmen.Settings -> Handling -> Cores -> IO ())
+-- | A way to run the server: an arrow's runner, given the settings, the listener, the handler and the cores.
+data Runner = Runner String (Fulmen.Settings -> Listening -> Handling -> Cores -> IO ())
 
 -- | A handler, for any arrow that has what 'Runtime' bundles.
 newtype Handling = Handling (forall arr. (Runtime arr) => arr (Call, Request) ())
 
+-- | A provider of the listening socket, for any arrow that has what 'Runtime' bundles.
+newtype Listening = Listening (forall arr. (Runtime arr) => Fulmen.Listen arr)
+
 runners :: [Runner]
 runners =
-  [ Runner "threads" (\settings (Handling handler) cores -> runThreads (Fulmen.serve settings handler) cores),
-    Runner "delimited" (\settings (Handling handler) cores -> void (runDelimited (Fulmen.serve settings handler) cores)),
-    Runner "compiled" (\settings (Handling handler) cores -> void (runCompiled (Fulmen.serve settings handler) cores))
+  [ Runner
+      "threads"
+      (\settings (Listening listen) (Handling handler) cores -> runThreads (Fulmen.serve settings listen handler) cores),
+    Runner
+      "delimited"
+      (\settings (Listening listen) (Handling handler) cores -> void (runDelimited (Fulmen.serve settings listen handler) cores)),
+    Runner
+      "compiled"
+      (\settings (Listening listen) (Handling handler) cores -> void (runCompiled (Fulmen.serve settings listen handler) cores))
   ]
 
 -- | The same in 'Debug', which counts the calls that the server makes.
 debugRunners :: [Runner]
 debugRunners =
-  [ Runner "threads" (\settings (Handling handler) cores -> runThreadsM @'Debug (Fulmen.serve settings handler) cores),
-    Runner "delimited" (\settings (Handling handler) cores -> void (runDelimitedM @'Debug (Fulmen.serve settings handler) cores)),
-    Runner "compiled" (\settings (Handling handler) cores -> void (runCompiledM @'Debug (Fulmen.serve settings handler) cores))
+  [ Runner
+      "threads"
+      (\settings (Listening listen) (Handling handler) cores -> runThreadsM @'Debug (Fulmen.serve settings listen handler) cores),
+    Runner
+      "delimited"
+      ( \settings (Listening listen) (Handling handler) cores ->
+          void (runDelimitedM @'Debug (Fulmen.serve settings listen handler) cores)
+      ),
+    Runner
+      "compiled"
+      ( \settings (Listening listen) (Handling handler) cores ->
+          void (runCompiledM @'Debug (Fulmen.serve settings listen handler) cores)
+      )
   ]
+
+-- | The runner of two cores, the first of which runs the acceptor.
+coresRunner :: Runner
+coresRunner =
+  Runner
+    "two cores"
+    ( \settings (Listening listen) (Handling handler) cores ->
+        void (runCores 2 (pure cores) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings listen handler))
+    )
 
 -- * The handlers of the cases
 
@@ -222,29 +294,30 @@ patience :: Case -> Word64
 patience c = 3000 + maybe 0 fromIntegral (timeoutMs (caseSettings c))
 
 runCase :: Runner -> Case -> IO ()
-runCase (Runner _ runServer) c = do
-  pool <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
+runCase (Runner _ runServer) c =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
     Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
     Socket.listen accepting 128
     port <- Socket.socketPort accepting
-    cores <- Fulmen.newCores 1
+    let settings = settingsOf (caseSettings c)
+        serving cores = runServer settings (Listening (Fulmen.borrowed accepting)) (handling (caseHandler c)) cores
+    cores <- Fulmen.newCores settings 1
     stopped <- newEmptyMVar
-    bracket (forkFinally (runServer (settingsOf (caseSettings c) accepting pool) (handling (caseHandler c)) cores) (putMVar stopped)) killThread $ \_ ->
+    bracket (forkFinally (serving cores) (putMVar stopped)) killThread $ \_ ->
       withClient port $ \client -> exchange c client stopped
 
 -- | Connections one after another, each with one request and closed by its client, in one run of the server. The server's
 -- sockets get the numbers of those it closed before, and its waits on them must not be lost.
 oneAfterAnother :: Runner -> IO ()
-oneAfterAnother (Runner _ runServer) = do
-  pool <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
+oneAfterAnother (Runner _ runServer) =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
     Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
     Socket.listen accepting 128
     port <- Socket.socketPort accepting
-    cores <- Fulmen.newCores 1
+    cores <- Fulmen.newCores Fulmen.defaultSettings 1
     stopped <- newEmptyMVar
-    bracket (forkFinally (runServer (Fulmen.defaultSettings accepting pool) (handling (Fixed 200 [] "ok")) cores) (putMVar stopped)) killThread $ \_ -> do
+    let serving = runServer Fulmen.defaultSettings (Listening (Fulmen.borrowed accepting)) (handling (Fixed 200 [] "ok")) cores
+    bracket (forkFinally serving (putMVar stopped)) killThread $ \_ -> do
       answers <- timeout 20000000 (mapM (const (once port)) [1 .. 30 :: Int])
       fmap (all answered) answers `shouldBe` Just True
   where
@@ -261,8 +334,8 @@ oneAfterAnother (Runner _ runServer) = do
     answered answer = "HTTP/1.1 200" `B.isPrefixOf` answer && "\r\n\r\nok" `B.isSuffixOf` answer
 
 -- | The settings of the server: the defaults, and the case's where it names any.
-settingsOf :: Settings -> Socket -> BufferPool -> Fulmen.Settings
-settingsOf given accepting pool =
+settingsOf :: Settings -> Fulmen.Settings
+settingsOf given =
   base
     { Fulmen.lineLimit = fromMaybe (Fulmen.lineLimit base) (lineLimit given),
       Fulmen.headLimit = fromMaybe (Fulmen.headLimit base) (headLimit given),
@@ -270,7 +343,7 @@ settingsOf given accepting pool =
       Fulmen.clientTimeout = maybe (Fulmen.clientTimeout base) (Just . millis . fromIntegral) (timeoutMs given)
     }
   where
-    base = Fulmen.defaultSettings accepting pool
+    base = Fulmen.defaultSettings
 
 -- | What the client of a case has: its socket, what it has received, whether the server ended the connection, whether it
 -- reads, and when what it has received last grew.

@@ -23,7 +23,7 @@ module Network.Streaming.Loans
   )
 where
 
-import Control.Arrow (first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (first, returnA, second, (>>>), (^>>), (|||))
 import Control.Exception (throwIO)
 import Control.Monad (unless, when, (>=>))
 import Data.Functor (($>))
@@ -31,7 +31,7 @@ import Data.IORef (IORef, newIORef)
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.BufferPool (BufferGrant)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (decide, done, keeping, step)
+import Network.Streaming.Combinators (alongside, decide, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
@@ -67,23 +67,24 @@ loanBuffer (Loan _ _ _ buffer) = buffer
 
 -- | The program as one request in flight: it is given its loans besides its input, and has them until it ends,
 -- however it ends. Every loan is returned then, and every alias of a buffer is invalid. A request that has to wait to
--- be admitted gives up its place when it is cancelled, and a buffer that it was given meanwhile goes back.
-withRequestBuffers :: (Runtime arr) => BufferPool -> arr (Loans, a) b -> arr a b
-withRequestBuffers pool body =
+-- be admitted gives up its place when it is cancelled, and a buffer that it was given meanwhile goes back. The pool is
+-- in the input, with what the body takes, so that a program is built without one and runs with the pool that is given it.
+withRequestBuffers :: (Runtime arr) => arr (Loans, a) b -> arr (BufferPool, a) b
+withRequestBuffers body =
   named (Label "withRequestBuffers" "Admits a request with its buffers, runs it, and gives them back however it ends.") $
     allowing
       WaitInAcquire
       ( "the acquire waits in the pool's checkout, which if it is cancelled gives up its place in the queue "
           ++ "and returns a buffer that came meanwhile, so nothing is held for the release to return"
       )
-      (scope admit (fst ^>> ended) body)
+      (scope admit (fst ^>> ended) (second snd ^>> body))
   where
     admit =
-      done
-        >>> giving "primary buffer" (checkoutAt (1 + reserveCount pool) (requestBuffers pool))
+      fst
+        ^>> alongside ((\pool -> (1 + reserveCount pool, requestBuffers pool)) ^>> giving "primary buffer" checkoutAt)
         >>> giving
           "request loans"
-          (step "open loans" (\buffer -> Loans pool buffer <$> newIORef (Open NotLent NoExtra 0)))
+          (step "open loans" (\(buffer, pool) -> Loans pool buffer <$> newIORef (Open NotLent NoExtra 0)))
 
 -- | The request has ended. What it holds goes back to the pool, once, and a borrow of it that still waits is told.
 ended :: (Effect arr, Annotate arr) => arr Loans ()

@@ -89,8 +89,8 @@ parameterType :: Param -> Maybe Word32
 parameterType = paramType
 
 -- A client can manage short loans while the request owns admission.
-requestBuffer :: Runtime arr => BufferPool -> arr (Buffer, a) b -> arr a b
-requestBuffer resources use = withRequestBuffers resources $
+requestBuffer :: Runtime arr => arr (Buffer, a) b -> arr (BufferPool, a) b
+requestBuffer use = withRequestBuffers $
   scope (fst ^>> borrow) (fst ^>> release) ((loanBuffer *** snd) ^>> use)
 
 manualLoan :: Runtime arr => arr Loans Loan

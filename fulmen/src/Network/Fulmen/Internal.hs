@@ -19,19 +19,17 @@ import Network.Fulmen.Internal.Body (Body (..))
 import Network.Fulmen.Internal.Date (Date)
 import Network.Fulmen.Internal.Response (Exchange)
 import Network.Socket (Socket)
-import Network.Streaming.BufferPool (BufferPool)
+import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings)
 import Network.Streaming.Classes (Duration, Giver, Reach (..))
 import Network.Streaming.Loans (Loans)
 import Network.Streaming.Pool (Pool)
 
--- | Where the server accepts, how many connections it serves, and its limits and
--- timeouts.
+-- | How the server is configured: the size of the pool of request buffers, how many connections it serves, and its
+-- limits and timeouts.
 data Settings = Settings
-  { -- | A socket that is bound and listening, which the acceptor accepts on. Past
-    -- the connection cap, connections wait in its backlog.
-    listener :: Socket,
-    -- | The pool of the buffers that a request in flight reads and writes in.
-    buffers :: BufferPool,
+  { -- | The size of the pool of the buffers that a request in flight reads and writes in, which
+    -- 'Network.Fulmen.newCores' makes once for all the cores.
+    bufferPool :: BufferPoolSettings,
     -- | How many workers each core has at startup, which is how many connections
     -- it serves at once: its share of the connection cap.
     connectionsPerCore :: Int,
@@ -60,11 +58,12 @@ newtype Answering = Answering Exchange
 -- is the one that runs the acceptor, if it is the first.
 data Cores = Cores !Int !Shared
 
--- | What the cores share: the free workers, which the acceptor hands connections to, and the date that responses
--- carry.
+-- | What the cores share: the free workers, which the acceptor hands connections to, the date that responses carry, and
+-- the buffers that requests in flight work in.
 data Shared = Shared
   { sharedWorkers :: !(Pool Free),
-    sharedDate :: !(IORef Date)
+    sharedDate :: !(IORef Date),
+    sharedBuffers :: !BufferPool
   }
 
 -- | A free worker: the core that it is on, and the giver of the ticket that it waits at for a connection.

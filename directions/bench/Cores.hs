@@ -206,7 +206,7 @@ loansRun kind variant parts rounds = do
         "both" -> (Loans.borrow &&& Loans.borrow) >>> (Loans.release *** Loans.release) >>> done
         _ -> error ("loans: no variant " <> variant)
       oneRequest :: (Runtime arr) => arr () ()
-      oneRequest = Loans.withRequestBuffers pool (fst ^>> body)
+      oneRequest = (pool,) ^>> Loans.withRequestBuffers (fst ^>> body)
       program :: RuntimeProgram ()
       program = case kind of
         "threads" -> balanced (replicate parts (times rounds oneRequest))
