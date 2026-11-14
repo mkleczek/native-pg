@@ -175,6 +175,8 @@ react settings (tag, body) phase = case (tag, phase) of
       7 -> throwIO (UnsupportedAuthentication "GSSAPI")
       9 -> throwIO (UnsupportedAuthentication "SSPI")
       other -> throwIO (ProtocolError ("unknown authentication request " <> show other))
+-- Not inlined: it is plain IO, the same for every runtime, and inlined it was copied into each runtime's startup.
+{-# NOINLINE react #-}
 
 -- | The startup message: the user, the database if there is one, and the other parameters.
 startupMessage :: ConnectSettings -> Output
