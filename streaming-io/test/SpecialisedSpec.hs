@@ -1,5 +1,8 @@
 {-# LANGUAGE RankNTypes #-}
 
+-- The test measures allocation per arrow step, so its pure and IO steps must stay separate.
+{- HLINT ignore "Fuse into now" -}
+
 -- | Checks that a program written for any arrow is specialised to the arrow that runs it. A step called through a class
 -- dictionary is an unknown call that allocates a thunk, so an unspecialised step costs tens of bytes.
 --
@@ -34,10 +37,10 @@ runners =
 -- | The loop, from the number of iterations: a step of each kind that a program is made of, and a choice that is the loop's
 -- end. It is overloaded and recursive, so that it is not inlined: it is specialised where it is called, or it is not.
 countdown :: (ArrowChoice arr, Effect arr) => arr Int Int
-countdown = (\n -> if n <= 0 then Left n else Right (n, n)) ^>> (returnA ||| (first (arr (subtract 1)) >>> arr fst >>> now pure >>> countdown))
+countdown = (\n -> if n <= 0 then Left n else Right (n, n)) ^>> (returnA ||| (first (arr (subtract 1)) >>> fst ^>> now pure >>> countdown))
 
 counting :: (ArrowChoice arr, Effect arr) => Int -> arr () Int
-counting count = arr (const count) >>> countdown
+counting count = const count ^>> countdown
 
 spec :: Spec
 spec = describe "a program written for any arrow" $ forM_ runners $ \(Runner name run) ->

@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 
 -- | What the arrow-level tests of the buffer pool share: the arrows that run a program, pools of tiny buffers, and small
@@ -48,10 +49,11 @@ module LoansTestSupport
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, (&&&), (>>>), (^>>), (|||))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Exception (fromException)
 import Control.Monad (when)
+import Data.Bool (bool)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word8)
@@ -59,7 +61,7 @@ import Foreign.ForeignPtr (ForeignPtr)
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (sleep)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, done, iterateWith, sleep)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited (runDelimited)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
@@ -154,29 +156,30 @@ capacityOf (Slot ref) = bufferCapacity . loanBuffer <$> heldIn ref
 
 -- | The loans of the two slots lend the same buffer, or different ones.
 differentMemory, sameMemory :: (Effect arr) => Slot -> Slot -> arr x ()
-differentMemory one other = now (\_ -> uncurry shouldNotBe =<< ((,) <$> memoryOf one <*> memoryOf other))
-sameMemory one other = now (\_ -> uncurry shouldBe =<< ((,) <$> memoryOf one <*> memoryOf other))
+differentMemory one other = now (const (uncurry shouldNotBe =<< ((,) <$> memoryOf one <*> memoryOf other)))
+sameMemory one other = now (const (uncurry shouldBe =<< ((,) <$> memoryOf one <*> memoryOf other)))
 
 -- | The script as one request of the pool: its input is the request's loans.
 request :: (Runtime arr) => BufferPool -> arr Loans b -> arr () b
-request pool script = withRequestBuffers pool (arr fst >>> script)
+request pool script = withRequestBuffers pool (fst ^>> script)
 
 -- | The script as this many requests at once, which are admitted one after the other: its input is their loans, in
 -- the order they were admitted.
 holding :: (Runtime arr) => Int -> BufferPool -> arr [Loans] b -> arr () b
-holding count pool script = arr (const []) >>> admitted count
+holding count pool script = const [] ^>> admitted count
   where
     admitted n
       | n <= 0 = script
-      | otherwise = withRequestBuffers pool (arr (\(loans, others) -> others ++ [loans]) >>> admitted (n - 1))
+      | otherwise = withRequestBuffers pool (inAdmissionOrder ^>> admitted (n - 1))
+    inAdmissionOrder (loans, others) = others ++ [loans]
 
 -- | The script of the request that is at this place among the requests held.
 at :: (Arrow arr) => Int -> arr Loans b -> arr [Loans] b
-at index script = arr (!! index) >>> script
+at index script = (!! index) ^>> script
 
 -- | The steps one after the other, each on the same input.
 steps :: (Arrow arr) => [arr x ()] -> arr x ()
-steps = foldr (\step rest -> step &&& rest >>^ const ()) (arr (const ()))
+steps = foldr (\step rest -> step &&& rest >>> done) done
 
 -- | A step whose result must be the expected one.
 yields :: (Runtime arr, Eq b, Show b) => arr x b -> b -> arr x ()
@@ -210,23 +213,25 @@ newSignal :: IO Signal
 newSignal = Signal <$> newIORef False
 
 raise :: (Effect arr) => Signal -> arr x ()
-raise (Signal ref) = now (\_ -> writeIORef ref True)
+raise (Signal ref) = now (const (writeIORef ref True))
 
 -- | Waits until the signal is raised.
 awaitSignal :: (Runtime arr) => Signal -> arr x ()
-awaitSignal (Signal ref) = pollUntil (fmap (\raised -> if raised then Just () else Nothing) (readIORef ref))
+awaitSignal (Signal ref) = pollWhen (readIORef ref)
 
 -- | Looks until the action gives something, and between looks sleeps, which is a wait, so that the part is cancelled
 -- there, and so that the parts that wait for it needn't be of the same core.
 pollUntil :: (Runtime arr) => IO (Maybe a) -> arr x a
-pollUntil look = const () ^>> loop
-  where
-    loop = now (const look) >>> (maybe (Left ()) Right ^>> ((sleep (micros 50) >>> loop) ||| returnA))
+pollUntil look = done >>> iterateWith (now (const (maybe (Again ()) Finish <$> look))) (sleep (micros 50))
+
+-- | Waits, as 'pollUntil' does, until the condition holds.
+pollWhen :: (Runtime arr) => IO Bool -> arr x ()
+pollWhen look = pollUntil (bool Nothing (Just ()) <$> look)
 
 -- | Waits until this many parts wait for the pool of the requests, or of the setup.
 awaitRequestWaiting, awaitSetupWaiting :: (Runtime arr) => BufferPool -> Int -> arr x ()
-awaitRequestWaiting pool count = pollUntil (fmap (\waiting -> if waiting >= count then Just () else Nothing) (requestWaiting pool))
-awaitSetupWaiting pool count = pollUntil (fmap (\waiting -> if waiting >= count then Just () else Nothing) (setupWaiting pool))
+awaitRequestWaiting pool count = pollWhen ((>= count) <$> requestWaiting pool)
+awaitSetupWaiting pool count = pollWhen ((>= count) <$> setupWaiting pool)
 
 -- | What happened, in order.
 newtype Journal = Journal (IORef [String])
@@ -235,17 +240,19 @@ newJournal :: IO Journal
 newJournal = Journal <$> newIORef []
 
 note :: (Effect arr) => Journal -> String -> arr x ()
-note (Journal ref) text = now (\_ -> atomicModifyIORef' ref (\noted -> (text : noted, ())))
+note (Journal ref) text = now (const (atomicModifyIORef' ref (\noted -> (text : noted, ()))))
 
 readJournal :: Journal -> IO [String]
 readJournal (Journal ref) = reverse <$> readIORef ref
 
 -- | The step at this place of the list, for an index that counts up for ever.
 choose :: (ArrowChoice arr) => [arr () ()] -> arr Int ()
-choose [] = arr (const ())
-choose [one] = arr (const ()) >>> one
-choose (one : others) = (\index -> if index <= 0 then Left () else Right (index - 1)) ^>> (one ||| choose others)
+choose [] = done
+choose [one] = done >>> one
+choose (one : others) = countDown ^>> (one ||| choose others)
+  where
+    countDown index = if index <= 0 then Left () else Right (index - 1)
 
 -- | A step that ends only when it is cancelled.
 blockForever :: forall arr x. (Runtime arr) => arr x ()
-blockForever = arr (const ()) >>> ticket @arr @'Anywhere >>> arr fst >>> (await :: arr (Waiting arr 'Anywhere ()) ())
+blockForever = done >>> ticket @arr @'Anywhere >>> fst ^>> (await :: arr (Waiting arr 'Anywhere ()) ())

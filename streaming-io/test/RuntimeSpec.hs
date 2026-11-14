@@ -3,7 +3,7 @@
 
 module RuntimeSpec (spec) where
 
-import Control.Arrow (ArrowChoice, arr, (>>>), (>>^), (^>>))
+import Control.Arrow (ArrowChoice, (>>>), (^>>))
 import Control.Exception (ErrorCall (..), bracket, throw, throwIO, try)
 import Control.Monad (forM_, void)
 import qualified Data.ByteString as BS
@@ -13,7 +13,7 @@ import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (newBuffer)
 import Network.Streaming.Classes hiding (within)
 import qualified Network.Streaming.Classes as Classes (within)
-import Network.Streaming.Combinators (sleep)
+import Network.Streaming.Combinators (done, localTicket, sleep)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..))
@@ -30,7 +30,7 @@ spec :: Spec
 spec = describe "the runtime" $ do
   describe "tickets" $ do
     it "show, in a simulation, a part that waits for a ticket nothing gives a value" $ do
-      (simulatedOutcome <$> runSimulation 1 limit (ticket @_ @(Local Loop) >>> arr fst >>> await :: Loop () ()) ()) `shouldReturn` Deadlocked [0]
+      (simulatedOutcome <$> runSimulation 1 limit (localTicket >>> fst ^>> await :: Loop () ()) ()) `shouldReturn` Deadlocked [0]
 
     it "make the giver evaluate the value, so a value that is an error call fails the giver even when no part waits for the ticket yet" $ do
       failsAtTheGive (runThreads givingErrorLocal ())
@@ -81,8 +81,8 @@ spec = describe "the runtime" $ do
     it "stop every part when one fails, and rethrow its failure" $ do
       (_, end) <- connect 1000
       buffer <- newBuffer (positiveInt @1024)
-      let failing = now (\() -> throwIO (ErrorCall "the part failed"))
-          receiving = const (end, roomOf buffer) ^>> receive >>> now (\_ -> pure ())
+      let failing = now (const (throwIO (ErrorCall "the part failed")))
+          receiving = const (end, roomOf buffer) ^>> receive >>> now (const (pure ()))
       within (try (runThreads (together [receiving, failing]) ())) `shouldReturn` Just (Left (ErrorCall "the part failed"))
 
 -- | The programs of the same kind that scope their resources, race, and keep time.
@@ -92,6 +92,10 @@ compiledScoped, delimitedScoped :: Turn -> Cancelling -> IO ((), Report)
 compiledScoped turn built = built >>= \program -> runCompiledTurn turn program ()
 delimitedScoped turn built = runDelimitedWithTurn turn built ()
 
+-- | A part that gives way this many times, noting its name each time with the function it is given.
+ticks :: (ArrowChoice arr, GiveWay arr, Effect arr) => (String -> IO ()) -> String -> Int -> arr () ()
+ticks note name count = const count ^>> replicateA (giveWay >>> now (const (note name))) >>> done
+
 -- | Two parts race: the loser waits for a byte that never comes in a scope
 -- that notes its release, the winner gives way five times and wins, and two
 -- more parts only give way: the order in which they noted themselves.
@@ -99,12 +103,11 @@ cancelledFirst :: (Cancelling -> IO ((), Report)) -> IO [String]
 cancelledFirst run = withPair $ \waiting _ -> do
   notes <- newIORef []
   let note name = modifyIORef' notes (name :)
-      ticks name count = const count ^>> replicateA (giveWay >>> now (\() -> note name)) >>^ const ()
   _ <- run $ do
     buffer <- newBuffer (positiveInt @16)
-    let loser = scope (now (\() -> pure ())) (now (\_ -> note "released")) (const (waiting, roomOf buffer) ^>> receive >>> now (\_ -> pure ()))
-        winner = ticks "winner" 5 >>> now (\() -> note "won")
-    pure $ together [race loser winner >>> now (\_ -> pure ()), ticks "yielder 1" 30, ticks "yielder 2" 30]
+    let loser = scope (now (const (pure ()))) (now (const (note "released"))) (const (waiting, roomOf buffer) ^>> receive >>> now (const (pure ())))
+        winner = ticks note "winner" 5 >>> now (const (note "won"))
+    pure $ together [race loser winner >>> now (const (pure ())), ticks note "yielder 1" 30, ticks note "yielder 2" 30]
   reverse <$> readIORef notes
 
 -- | One part sleeps and another waits for a byte that never comes with a deadline, both for a nanosecond, so
@@ -114,12 +117,11 @@ timedFirst :: (Cancelling -> IO ((), Report)) -> IO [String]
 timedFirst run = withPair $ \waiting _ -> do
   notes <- newIORef []
   let note name = modifyIORef' notes (name :)
-      ticks name count = const count ^>> replicateA (giveWay >>> now (\() -> note name)) >>^ const ()
   _ <- run $ do
     buffer <- newBuffer (positiveInt @16)
-    let sleeper = ticks "sleeper" 5 >>> now (\() -> note "asleep") >>> sleep (nanos 1) >>> now (\() -> note "woke")
-        expiring = ticks "waiter" 5 >>> now (\() -> note "waiting") >>> Classes.within (nanos 1) (const (waiting, roomOf buffer) ^>> receive) >>> now (\_ -> note "expired")
-    pure $ together [sleeper, expiring, ticks "yielder 1" 30, ticks "yielder 2" 30]
+    let sleeper = ticks note "sleeper" 5 >>> now (const (note "asleep")) >>> sleep (nanos 1) >>> now (const (note "woke"))
+        expiring = ticks note "waiter" 5 >>> now (const (note "waiting")) >>> Classes.within (nanos 1) (const (waiting, roomOf buffer) ^>> receive) >>> now (const (note "expired"))
+    pure $ together [sleeper, expiring, ticks note "yielder 1" 30, ticks note "yielder 2" 30]
   reverse <$> readIORef notes
 
 -- | Compiled and on delimited continuations, with turns of that length.
@@ -133,15 +135,14 @@ wokenFirst :: (Built -> IO ((), Report)) -> IO [String]
 wokenFirst run = withPair $ \waiting sending -> do
   notes <- newIORef []
   let note name = modifyIORef' notes (name :)
-      ticks name count = const count ^>> replicateA (giveWay >>> now (\() -> note name)) >>^ const ()
   _ <- run $ do
     buffer <- newBuffer (positiveInt @16)
     pure $
       together
-        [ const (waiting, roomOf buffer) ^>> receive >>> now (\_ -> note "woke"),
-          ticks "writer" 5 >>> (\() -> (sending, [BS.singleton 1])) ^>> sendAll >>> now (\() -> note "sent") >>> ticks "writer" 10,
-          ticks "yielder 1" 30,
-          ticks "yielder 2" 30
+        [ const (waiting, roomOf buffer) ^>> receive >>> now (const (note "woke")),
+          ticks note "writer" 5 >>> const (sending, [BS.singleton 1]) ^>> sendAll >>> now (const (note "sent")) >>> ticks note "writer" 10,
+          ticks note "yielder 1" 30,
+          ticks note "yielder 2" 30
         ]
   reverse <$> readIORef notes
 
@@ -151,7 +152,7 @@ valueError = ErrorCall "the value given was an error call"
 
 -- | A ticket that no part waits for, whose giver gives a value that is an error call.
 givingError :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
-givingError = ticket @arr @r >>> arr (\(_, giver) -> (giver, throw valueError :: Int)) >>> give
+givingError = ticket @arr @r >>> (,throw valueError :: Int) . snd ^>> give
 
 givingErrorLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () Bool
 givingErrorLocal = givingError @(Local arr)

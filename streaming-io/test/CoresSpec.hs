@@ -3,16 +3,18 @@
 
 module CoresSpec (spec) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (>>>), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, first, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (forkIO, getNumCapabilities, newEmptyMVar, putMVar, setNumCapabilities, takeMVar, threadDelay, yield)
 import Control.Exception (ErrorCall (..), IOException, evaluate, finally, throwIO, try)
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (forM_, unless, void, when, (>=>))
+import Data.Bool (bool)
 import Data.Either (fromLeft)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf, sort)
 import Data.Maybe (fromMaybe)
+import Data.Tuple (swap)
 import Network.Streaming.Classes hiding (within)
-import Network.Streaming.Combinators (concurrently, times, timesWith)
+import Network.Streaming.Combinators (concurrently, keeping, tap, times, timesWith, untilJust)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)
@@ -36,7 +38,7 @@ spec = describe "cores" $ do
         within $ runCores 2 (pure shelf) $ \box core ->
           if core == 0
             then ticket @_ @'Anywhere >>> now (\(awaiting, giver) -> awaiting <$ atomicWriteIORef box (Just giver)) >>> await
-            else spinUntilJust box >>> now (\giver -> (giver, 7) <$ threadDelay 20000) >>> give >>> arr (\given -> if given then 1 else 0)
+            else untilJust (readIORef box) >>> now (\giver -> (giver, 7) <$ threadDelay 20000) >>> give >>^ bool 0 1
       results `shouldBe` Just [7, 1 :: Int]
 
     it "give a value from another thread to a part on a scheduler that waits in its poller, and to one that finds it given before it waits" $ do
@@ -140,7 +142,7 @@ spec = describe "cores" $ do
     it "fails when a core fails, instead of waiting for the cores that wait for ever" $ do
       ensureCores
       started <- monotonicNanoseconds
-      outcome <- within (try (runCores 3 (pure ()) (\() core -> if core == 1 then now (\() -> throwIO (ErrorCall "core 1 failed")) >>> arr (const 0) else waitsForEver)))
+      outcome <- within (try (runCores 3 (pure ()) (\() core -> if core == 1 then now (const (throwIO (ErrorCall "core 1 failed"))) else waitsForEver)))
       ended <- monotonicNanoseconds
       outcome `shouldBe` Just (Left (ErrorCall "core 1 failed") :: Either ErrorCall [Int])
       (ended - started < 5000000000) `shouldBe` True
@@ -154,25 +156,25 @@ within = timeout 60000000
 
 -- | Runs the effect, and goes on with what came in.
 afterwards :: (Arrow arr) => arr () () -> arr a a
-afterwards effect = arr (,()) >>> second effect >>> arr fst
+afterwards effect = keeping effect >>^ snd
 
 waitsForEver :: (Arrow arr, Exchange arr 'Anywhere) => arr () Int
-waitsForEver = ticket @_ @'Anywhere >>> arr fst >>> await
+waitsForEver = ticket @_ @'Anywhere >>> fst ^>> await
 
 -- | A ticket given a value by the other half of a pair on its core, in a part that waits for it.
 sameCore :: forall r arr. (ArrowChoice arr, Concurrent arr, Exchange arr r, Exchange arr (Local arr)) => arr () (Int, Bool)
-sameCore = ticket @arr @r >>> concurrently (arr fst >>> await) (arr (\(_, giver) -> (giver, 42)) >>> give)
+sameCore = ticket @arr @r >>> concurrently (fst ^>> await) ((,42) . snd ^>> give)
 
 givenTwice :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
-givenTwice = ticket @arr @r >>> (\(_, giver) -> ((giver, 1 :: Int), giver)) ^>> first give >>> (\(_, giver) -> (giver, 2)) ^>> give
+givenTwice = ticket @arr @r >>> ((,1 :: Int) &&& id) . snd ^>> first give >>> (,2) . snd ^>> give
 
 -- | The waiter abandons before anything is given: nothing for it, and the giver is told.
 gone :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Maybe Int, Bool)
-gone = ticket @arr @r >>> first abandon >>> (\(abandoned, giver) -> (abandoned, (giver, 5))) ^>> second give
+gone = ticket @arr @r >>> first abandon >>> second (,5) ^>> second give
 
 -- | The value is given before the waiter abandons: the waiter has it.
 givenFirst :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Bool, Maybe Int)
-givenFirst = ticket @arr @r >>> (\(awaiting, giver) -> (awaiting, (giver, 5))) ^>> second give >>> (\(awaiting, taken) -> (taken, awaiting)) ^>> second abandon
+givenFirst = ticket @arr @r >>> second (,5) ^>> second give >>> swap ^>> second abandon
 
 -- | A ticket of any core that a thread of its own gives a value after a while, which the part waits for: the
 -- scheduler of an arrow that runs every part on one thread waits in its poller by then, and the give wakes it.
@@ -205,7 +207,10 @@ withGiverThread action = do
 -- thread gives it a value the moment it sees the giver: the give comes before the part looks at the ticket, between
 -- its look and its wait, or after, and the part gets every value.
 racing :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => IORef (Maybe (Giver 'Anywhere Int)) -> Int -> arr () Int
-racing shelf count = arr (const 0) >>> timesWith count (arr (,()) >>> second (ticket @_ @'Anywhere >>> now (\(awaiting, giver) -> awaiting <$ atomicWriteIORef shelf (Just giver)) >>> await) >>> arr (uncurry (+)))
+racing shelf count = const 0 ^>> timesWith count (keeping ticketOnShelf >>^ uncurry (+))
+  where
+    -- Makes a ticket, leaves its giver on the shelf, and waits for the ticket.
+    ticketOnShelf = ticket @_ @'Anywhere >>> now (\(awaiting, giver) -> awaiting <$ atomicWriteIORef shelf (Just giver)) >>> await
 
 -- | The programs of the two reaches at once, for any arrow that has what 'Runtime' bundles.
 ticketsOfBothReaches :: (Runtime arr) => arr () ((Int, Bool), (Int, Bool))
@@ -226,45 +231,36 @@ givenFirstLocal = givenFirst @(Local arr)
 
 -- | A part's place in the pool's queue, and no connection: for tests that ask for one when none is free.
 queued :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Waiting arr 'Anywhere conn)
-queued pool = reserve pool >>> arr (fromLeft (error "a connection was free"))
+queued pool = reserve pool >>^ fromLeft (error "a connection was free")
 
 -- | One part that holds a connection, queues two others behind it, one of which abandons its place, and releases.
-nextWaiter :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, Int, [Int])
+nextWaiter :: (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, Int, [Int])
 nextWaiter pool =
   checkout pool
-    >>> (,())
-    ^>> second (queued pool)
-    >>> (\(held, first') -> ((held, first'), ()))
-    ^>> second (queued pool)
-    >>> (\((held, first'), second') -> (first', (held, second')))
-    ^>> first abandon
-    >>> (\(abandoned, (held, second')) -> (held, (abandoned, second')))
-    ^>> first (release pool)
-    >>> (\((), (abandoned, second')) -> (second', abandoned))
-    ^>> first await
-    >>> now (\(taken, abandoned) -> (,,) abandoned taken <$> free pool)
+    >>> keeping (queued pool)
+    >>> keeping (queued pool)
+    >>> ( (,,)
+            <$> (fst . snd ^>> abandon)
+            <* (snd . snd ^>> release pool)
+            <*> (fst ^>> await)
+            <*> now (const (free pool))
+        )
 
 toFreeList :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, [Int])
 toFreeList pool =
   checkout pool
-    >>> (,())
-    ^>> second (queued pool)
-    >>> (\(held, waiting) -> (waiting, held))
-    ^>> first abandon
-    >>> (\(abandoned, held) -> (held, abandoned))
-    ^>> first (release pool)
-    >>> now (\((), abandoned) -> (,) abandoned <$> free pool)
+    >>> keeping (queued pool)
+    >>> first abandon
+    >>> second (release pool)
+    >>> now (\(abandoned, ()) -> (,) abandoned <$> free pool)
 
 givenBeforeAbandoned :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, [Int])
 givenBeforeAbandoned pool =
   checkout pool
-    >>> (,())
-    ^>> second (queued pool)
-    >>> first (release pool)
-    >>> (\((), waiting) -> waiting)
-    ^>> abandon
-    >>> (\given -> (given, fromMaybe 0 given))
-    ^>> second (release pool)
+    >>> keeping (queued pool)
+    >>> second (release pool)
+    >>> fst ^>> abandon
+    >>> (id &&& fromMaybe 0) ^>> second (release pool)
     >>> now (\(given, ()) -> (,) given <$> free pool)
 
 -- | What the cores of a pool test wait for each other with: a flag for each thing that has happened.
@@ -274,33 +270,25 @@ newFlag :: IO (IORef Bool)
 newFlag = newIORef False
 
 raise :: (Effect arr) => IORef Bool -> arr () ()
-raise flag = now (\() -> atomicWriteIORef flag True)
+raise flag = now (const (atomicWriteIORef flag True))
 
 -- | Waits, giving way, until the flag is raised.
 spinUntil :: (ArrowChoice arr, Effect arr, GiveWay arr) => IORef Bool -> arr () ()
-spinUntil flag = loop
-  where
-    loop = now (\() -> (\raised -> if raised then Right () else Left ()) <$> readIORef flag) >>> ((giveWay >>> loop) ||| returnA)
-
--- | Waits, giving way, until the reference holds a value.
-spinUntilJust :: (ArrowChoice arr, Effect arr, GiveWay arr) => IORef (Maybe a) -> arr () a
-spinUntilJust box = loop
-  where
-    loop = now (\() -> maybe (Left ()) Right <$> readIORef box) >>> ((giveWay >>> loop) ||| returnA)
+spinUntil flag = untilJust (bool Nothing (Just ()) <$> readIORef flag)
 
 -- | A core holds the only connection; a second queues for it, then a third, the second abandons its place, and
 -- the first releases the connection: the third has it.
 acrossCores :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => (Pool Int, Flags) -> Int -> arr () [Int]
 acrossCores (pool, flags) core = case core of
-  0 -> checkout pool >>> afterwards (raise (heldFlag flags) >>> spinUntil (firstGoneFlag flags)) >>> release pool >>> arr (const [])
-  1 -> spinUntil (heldFlag flags) >>> queued pool >>> afterwards (raise (firstQueuedFlag flags) >>> spinUntil (secondQueuedFlag flags)) >>> abandon >>> afterwards (raise (firstGoneFlag flags)) >>> arr (maybe [] pure)
-  _ -> spinUntil (firstQueuedFlag flags) >>> queued pool >>> afterwards (raise (secondQueuedFlag flags)) >>> await >>> (\taken -> (taken, taken)) ^>> second (release pool) >>> arr (pure . fst)
+  0 -> checkout pool >>> afterwards (raise (heldFlag flags) >>> spinUntil (firstGoneFlag flags)) >>> release pool >>^ const []
+  1 -> spinUntil (heldFlag flags) >>> queued pool >>> afterwards (raise (firstQueuedFlag flags) >>> spinUntil (secondQueuedFlag flags)) >>> abandon >>> afterwards (raise (firstGoneFlag flags)) >>^ maybe [] pure
+  _ -> spinUntil (firstQueuedFlag flags) >>> queued pool >>> afterwards (raise (secondQueuedFlag flags)) >>> await >>> tap (release pool) >>^ pure
 
 -- | The same with no third core: the connection is free afterwards.
 acrossCoresOnly :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => (Pool Int, Flags) -> Int -> arr () [Int]
 acrossCoresOnly (pool, flags) core = case core of
-  0 -> checkout pool >>> afterwards (raise (heldFlag flags) >>> spinUntil (firstGoneFlag flags)) >>> release pool >>> arr (const [])
-  _ -> spinUntil (heldFlag flags) >>> queued pool >>> abandon >>> afterwards (raise (firstGoneFlag flags)) >>> arr (maybe [] pure)
+  0 -> checkout pool >>> afterwards (raise (heldFlag flags) >>> spinUntil (firstGoneFlag flags)) >>> release pool >>^ const []
+  _ -> spinUntil (heldFlag flags) >>> queued pool >>> abandon >>> afterwards (raise (firstGoneFlag flags)) >>^ maybe [] pure
 
 -- | A connection, and what the test counts of it: whether a part holds it now, and how often one did.
 data Conn = Conn {connId :: !Int, connBusy :: !(IORef Bool), connUses :: !(IORef Int)}
@@ -321,7 +309,7 @@ turns = 2000
 
 -- | One turn of a part: it checks a connection out, holds it for a little work, and releases it.
 borrowing :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Conn -> IORef Int -> arr () ()
-borrowing pool done = checkout pool >>> now acquire >>> now work >>> now unacquire >>> release pool
+borrowing pool done = checkout pool >>> now (acquire >=> work >=> unacquire) >>> release pool
   where
     acquire conn = do
       wasBusy <- atomicModifyIORef' (connBusy conn) (True,)

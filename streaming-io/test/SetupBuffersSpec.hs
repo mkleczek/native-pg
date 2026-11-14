@@ -6,17 +6,17 @@
 -- test's.
 module SetupBuffersSpec (spec) where
 
-import Control.Arrow (arr, (>>>), (>>^), (^>>))
+import Control.Arrow (Arrow, arr, (***), (>>>))
 import Control.Monad (forM, forM_)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Tuple (Solo (MkSolo))
+import Data.Tuple (Solo (MkSolo), getSolo)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Storable (peek, poke)
 import LoansTestSupport
 import Network.Streaming.Buffer (Buffer, bufferCapacity, bufferMemory)
 import Network.Streaming.BufferPool (BufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (sleep)
+import Network.Streaming.Combinators (done, sleep)
 import Network.Streaming.Loans
 import Skeletest
 import System.Mem (performMajorGC)
@@ -33,9 +33,9 @@ spec = describe "the setup buffers" $ do
         run $
           withSetupBuffers @(Solo Buffer) pool $
             steps
-              [ stillWaits (const () ^>> withSetupBuffers @(Buffer, Buffer, Buffer) pool (arr (const ()))),
+              [ stillWaits (withSetupBuffers @(Buffer, Buffer, Buffer) pool done),
                 -- The grant that waited has given up its place, and the two buffers that remain are lent at once.
-                proceeds (const () ^>> withSetupBuffers @(Buffer, Buffer) pool (arr (\((second', third), ()) -> (bufferMemory second', bufferMemory third))))
+                proceeds (withSetupBuffers @(Buffer, Buffer) pool (arr ((bufferMemory *** bufferMemory) . fst)))
                   >>> now (uncurry shouldNotBe)
               ]
 
@@ -59,7 +59,7 @@ spec = describe "the setup buffers" $ do
 
       it "refuses a grant that exceeds the setup capacity at once, and doesn't queue it" $ do
         pool <- newTestPool 1 1 2
-        run $ failsWith "buffer count must fit capacity" (withSetupBuffers @(Buffer, Buffer, Buffer) pool (arr (const ())))
+        run $ failsWith "buffer count must fit capacity" (withSetupBuffers @(Buffer, Buffer, Buffer) pool done)
         setupWaiting pool `shouldReturn` 0
 
       it "makes buffers of the size of the pool, as many as its setup count" $ do
@@ -68,7 +68,7 @@ spec = describe "the setup buffers" $ do
           withSetupBuffers @(Buffer, Buffer, Buffer) pool $
             steps
               [ now (\((a, b, c), ()) -> map bufferCapacity [a, b, c] `shouldBe` [7, 7, 7]),
-                stillWaits (const () ^>> withSetupBuffers @(Solo Buffer) pool (arr (const ())))
+                stillWaits (withSetupBuffers @(Solo Buffer) pool done)
               ]
         length <$> setupFree pool `shouldReturn` 3
 
@@ -90,8 +90,8 @@ spec = describe "the setup buffers" $ do
                   raise go,
                   awaitSignal firstIn,
                   -- A grant that comes now waits behind both.
-                  stillWaits (const () ^>> withSetupBuffers @(Buffer, Buffer) pool (arr (const ()))),
-                  now (\_ -> readJournal journal) >>> now (\noted -> noted `shouldBe` ["first in"]),
+                  stillWaits (withSetupBuffers @(Buffer, Buffer) pool done),
+                  now (const (readJournal journal >>= \noted -> noted `shouldBe` ["first in"])),
                   raise leaveFirst
                 ]
             ]
@@ -114,10 +114,10 @@ spec = describe "the setup buffers" $ do
               steps
                 [ awaitSignal smallIn,
                   -- The small grant did not wait for the large one: one buffer was free, and the large one needs two.
-                  stillWaits (const () ^>> withSetupBuffers @(Solo Buffer) pool (arr (const ()))),
+                  stillWaits (withSetupBuffers @(Solo Buffer) pool done),
                   raise leaveSmall,
                   awaitSignal smallOut,
-                  now (\_ -> readJournal journal) >>> now (\noted -> noted `shouldBe` ["small in"]),
+                  now (const (readJournal journal >>= \noted -> noted `shouldBe` ["small in"])),
                   raise go,
                   awaitSignal largeIn
                 ]
@@ -159,7 +159,7 @@ spec = describe "the setup buffers" $ do
             [ withSetupBuffers @(Buffer, Buffer) pool (raise held >>> awaitSignal go),
               steps
                 [ awaitSignal held,
-                  stillWaits (const () ^>> withSetupBuffers @(Solo Buffer) pool (note journal "cancelled in")),
+                  stillWaits (withSetupBuffers @(Solo Buffer) pool (note journal "cancelled in")),
                   -- The cancelled one is first in the queue of single buffers, and the pair has not been given back yet.
                   together [withSetupBuffers @(Solo Buffer) pool (note journal "second in"), awaitSetupWaiting pool 2 >>> raise go]
                 ]
@@ -181,7 +181,7 @@ spec = describe "the setup buffers" $ do
               awaitSignal held >>> withSetupBuffers @(Buffer, Buffer) pool (note journal "first in" >>> raise firstIn >>> awaitSignal leaveFirst),
               steps
                 [ awaitSetupWaiting pool 1,
-                  stillWaits (const () ^>> withSetupBuffers @(Buffer, Buffer) pool (note journal "cancelled in")),
+                  stillWaits (withSetupBuffers @(Buffer, Buffer) pool (note journal "cancelled in")),
                   raise go,
                   awaitSignal firstIn,
                   together
@@ -200,10 +200,10 @@ spec = describe "the setup buffers" $ do
         let iteration index held =
               steps
                 [ together
-                    [ withSetupBuffers @(Buffer, Buffer) pool (raise held >>> const () ^>> sleep (micros (fromIntegral index * 2))),
-                      awaitSignal held >>> within (micros (fromIntegral index * 2)) (withSetupBuffers @(Buffer, Buffer) pool (arr (const ()))) >>> arr (const ())
+                    [ withSetupBuffers @(Buffer, Buffer) pool (raise held >>> sleep (micros (fromIntegral index * 2))),
+                      awaitSignal held >>> within (micros (fromIntegral index * 2)) (withSetupBuffers @(Buffer, Buffer) pool done) >>> done
                     ],
-                  proceeds (withSetupBuffers @(Buffer, Buffer) pool (arr (\((input, output), ()) -> (bufferCapacity input, bufferCapacity output))))
+                  proceeds (withSetupBuffers @(Buffer, Buffer) pool bothCapacities)
                     >>> now (\sizes -> sizes `shouldBe` (8, 8))
                 ]
         run $ steps (zipWith iteration [0 :: Int ..] flags)
@@ -219,24 +219,24 @@ spec = describe "the setup buffers" $ do
               awaitSignal held
                 >>> race
                   ( together
-                      [ withSetupBuffers @(Solo Buffer) pool (arr (const ())),
-                        withSetupBuffers @(Buffer, Buffer) pool (arr (const ())),
-                        withSetupBuffers @(Solo Buffer) pool (arr (const ()))
+                      [ withSetupBuffers @(Solo Buffer) pool done,
+                        withSetupBuffers @(Buffer, Buffer) pool done,
+                        withSetupBuffers @(Solo Buffer) pool done
                       ]
                   )
                   (awaitSetupWaiting pool 3)
                 >>> raise go
             ]
         forM_ [1 .. 3 :: Int] $ \_ ->
-          run $ proceeds (withSetupBuffers @(Buffer, Buffer) pool (arr (\((input, output), ()) -> (bufferCapacity input, bufferCapacity output)))) `yields` (8, 8)
+          run $ proceeds (withSetupBuffers @(Buffer, Buffer) pool bothCapacities) `yields` (8, 8)
 
     describe "the scope of a grant" $ do
       it "returns the buffers when the body fails" $ do
         pool <- newTestPool 1 1 1
         run $
           steps
-            [ failsWith "the body failed" (withSetupBuffers @(Solo Buffer) pool (now (\_ -> ioError (userError "the body failed")))),
-              proceeds (withSetupBuffers @(Solo Buffer) pool (arr (const ())))
+            [ failsWith "the body failed" (withSetupBuffers @(Solo Buffer) pool (now (const (ioError (userError "the body failed"))))),
+              proceeds (withSetupBuffers @(Solo Buffer) pool done)
             ]
 
       it "returns the buffers when the body is cancelled" $ do
@@ -244,7 +244,7 @@ spec = describe "the setup buffers" $ do
         run $
           steps
             [ stillWaits (withSetupBuffers @(Solo Buffer) pool blockForever),
-              proceeds (withSetupBuffers @(Solo Buffer) pool (arr (const ())))
+              proceeds (withSetupBuffers @(Solo Buffer) pool done)
             ]
 
       it "keeps a pool that is used after the helper that made it returned and the memory was collected" $ do
@@ -253,8 +253,8 @@ spec = describe "the setup buffers" $ do
         forM_ [1 .. 3 :: Int] $ \_ ->
           run $
             steps
-              [ proceeds (withSetupBuffers @(Solo Buffer) pool (arr (const ()))),
-                proceeds (request pool (arr (const ())))
+              [ proceeds (withSetupBuffers @(Solo Buffer) pool done),
+                proceeds (request pool done)
               ]
 
     describe "setup against requests" $ do
@@ -267,7 +267,7 @@ spec = describe "the setup buffers" $ do
             steps
               [ borrowInto primary,
                 borrowInto extra,
-                proceeds (const () ^>> withSetupBuffers @(Solo Buffer) pool (arr (\(MkSolo setup, ()) -> bufferMemory setup)))
+                proceeds (withSetupBuffers @(Solo Buffer) pool (arr (bufferMemory . getSolo . fst)))
                   >>> now
                     ( \memory -> do
                         mine <- mapM memoryOf [primary, extra]
@@ -282,9 +282,9 @@ spec = describe "the setup buffers" $ do
         run $
           holding 2 pool $
             race
-              (const () ^>> request pool (arr (const ())))
-              (awaitRequestWaiting pool 1 >>> proceeds (const () ^>> withSetupBuffers @(Solo Buffer) pool (arr (const ()))))
-              >>^ const ()
+              (done >>> request pool done)
+              (awaitRequestWaiting pool 1 >>> proceeds (withSetupBuffers @(Solo Buffer) pool done))
+              >>> done
 
       it "lends the same setup buffer again, without taking a buffer of the requests" $ do
         pool <- newTestPool 1 1 1
@@ -295,9 +295,13 @@ spec = describe "the setup buffers" $ do
           request pool $
             steps
               [ borrowInto primary,
-                proceeds (const () ^>> withSetupBuffers @(Solo Buffer) pool (now (\(MkSolo buffer, ()) -> readIORef written >>= \memory -> Just (bufferMemory buffer) `shouldBe` memory))),
+                proceeds (done >>> withSetupBuffers @(Solo Buffer) pool (now (\(MkSolo buffer, ()) -> readIORef written >>= \memory -> Just (bufferMemory buffer) `shouldBe` memory))),
                 giveBack primary
               ]
+
+-- | The capacities of the two buffers of a grant.
+bothCapacities :: (Arrow arr) => arr ((Buffer, Buffer), a) (Int, Int)
+bothCapacities = arr ((bufferCapacity *** bufferCapacity) . fst)
 
 -- | The setup buffers are free, once each, and nobody waits for them.
 checkSetup :: BufferPool -> IO ()
