@@ -78,7 +78,7 @@ module Database.PostgreSQL.Transaction
   )
 where
 
-import Control.Arrow (Arrow, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (IOException, SomeAsyncException, SomeException, displayException, evaluate, fromException, throwIO, toException, try)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
@@ -720,7 +720,7 @@ alone validating = moved >>> withTx queued >>> transmit >>> drain validating
   where
     queued tx (text, carrier) = do
       s <- inspect tx
-      output <- evaluate (carrier <> sync)
+      let !output = carrier <> sync
       modify tx (const s {stPending = [Entry text True], stIndex = 0, stBase = 0, stRows = 0, stTags = [], stOwed = True, stSending = True})
       pure output
 
@@ -759,6 +759,7 @@ finishing =
       s <- inspect tx
       when (stBegun s && stStatus s /= idle) (throwIO (unexpected "the transaction's ending did not leave the session idle"))
       modify tx (\t -> t {stEnded = True})
+{-# INLINE finishing #-}
 
 -- | The transaction, with the connection and the loans of its input: it is the work of the part that runs it, for as
 -- long as it takes, and it ends as the program ended: with the failure of the program, of a statement or of the ending,
@@ -769,17 +770,21 @@ transaction level mode program =
   tryA (scope (begin level mode) leaving body)
     >>> now queryOutcome
   where
-    body = second (snd . snd) ^>> with (program >>> tap (done >>> finishing))
+    body = programInput ^>> with (program >>> tap (done >>> finishing))
+    -- A pattern takes the fields out; second (snd . snd) would leave a thunk in the pair.
+    programInput (tx, (_, (_, input))) = (tx, input)
 
 -- | Takes the connection for the transaction, and the loan that it works in, which is the primary if the request has not
 -- lent it. A connection that is used by another part, or is broken, or one that the body has given up, is a failure,
 -- and the loan goes back.
 begin :: (Runtime arr) => IsolationLevel -> Mode -> arr (Connection, (Loans, x)) Tx
 begin level mode =
-  (fst . snd &&& fst) ^>> first borrow
+  loansFirst ^>> first borrow
     >>> now (\(loan, connection) -> either (\failure -> Left (loan, failure)) Right <$> try (open loan connection))
     >>> ((first release >>> now (\((), failure) -> throwIO (failure :: SomeException))) ||| returnA)
   where
+    -- A pattern takes the fields out; fst . snd &&& fst would leave a thunk for each.
+    loansFirst (connection, (loans, _)) = (loans, connection)
     -- BEGIN is rendered once for the program, when it is built, and not for each transaction.
     !beginOutput = prerendered (statementOutput (beginning level mode) [] [] [])
     open loan connection = do

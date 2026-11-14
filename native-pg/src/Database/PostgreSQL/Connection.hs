@@ -54,12 +54,12 @@ module Database.PostgreSQL.Connection
   )
 where
 
-import Control.Arrow (arr, first, second, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (arr, first, (>>>), (>>^), (^>>), (|||))
 import Control.Exception (throwIO)
 import Control.Monad (unless, when)
 import Data.IORef (readIORef)
 import Data.List (isPrefixOf)
-import Data.Tuple (getSolo)
+import Data.Tuple (Solo (MkSolo))
 import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.ConnectionString.Types (Host (..))
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectFailure (..), UsageError (..))
@@ -93,7 +93,10 @@ connect settings = bounded (connecting settings) >>^ maybe (failing TimedOut) (e
 connecting :: (Runtime arr) => ConnectSettings -> arr Loans (Either ConnectError Connection)
 connecting settings = case encrypting settings of
   Just reason -> arr (const (Left reason))
-  Nothing -> (, ()) ^>> withSetupBuffersOf (getSolo . fst ^>> connected settings)
+  Nothing -> (, ()) ^>> withSetupBuffersOf (theBuffer ^>> connected settings)
+  where
+    -- A pattern takes the fields out; getSolo . fst would leave a thunk.
+    theBuffer (MkSolo buffer, _) = buffer
 
 -- | Why the settings can't be served without TLS, if they can't: as libpq built without TLS fails them. A Unix-domain
 -- socket isn't encrypted, whatever the mode.
@@ -112,12 +115,14 @@ connected settings =
   (connectAddress settings,) ^>> first (connectSocket (connectTcpOptions settings)) >>> withBuffer ^>> (arr Left ||| session)
   where
     withBuffer (reached, buffer) = fmap (,buffer) reached
+    -- A pattern takes the fields out; second snd &&& fst would leave a thunk for each.
+    startupInput (sock, (_, buffer)) = ((sock, buffer), sock)
     -- The socket is closed unless the session was started: also when the part is cancelled while it starts it.
     session =
       scope
         (arr fst)
         (now (\(sock, exit) -> case exit of Done -> pure (); _ -> Socket.close sock))
-        ((second snd &&& fst) ^>> first (startup settings) >>> now (\(started, sock) -> either (\reason -> Left reason <$ Socket.close sock) (fmap Right . made sock) started))
+        (startupInput ^>> first (startup settings) >>> now (\(started, sock) -> either (\reason -> Left reason <$ Socket.close sock) (fmap Right . made sock) started))
     made sock info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) sock
 
 -- | The host that the settings connect to, as a connection string would have named it.
