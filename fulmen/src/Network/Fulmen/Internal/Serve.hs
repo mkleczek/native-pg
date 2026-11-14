@@ -46,7 +46,7 @@ import Network.Streaming.Pool (queueNow, releaseNow)
 
 -- | The server: for each core, the workers, and for the first, the acceptor.
 serve :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
-serve settings handler = whether isFirst ^>> (together (acceptance settings : workers) ||| together workers)
+serve !settings handler = whether isFirst ^>> (together (acceptance settings : workers) ||| together workers)
   where
     workers = replicate (connectionsPerCore settings) (worker settings handler)
     isFirst (Cores core _) = core == 0
