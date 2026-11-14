@@ -2,6 +2,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
@@ -19,7 +20,7 @@
 -- they wait for lands.
 module IntegrationSpec (spec) where
 
-import Control.Arrow (arr, returnA, second, (&&&), (>>>), (>>^))
+import Control.Arrow (arr, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Exception (IOException, bracket, displayException, finally)
 import Control.Monad (forM_, forever, unless, void)
@@ -83,12 +84,12 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "authenticates with a cleartext password" $
       run (session (unix "native_pg_cleartext" (Just "cleartext secret")) currentUser) `shouldReturn` Right ["native_pg_cleartext"]
     it "reports a wrong password" $
-      (rejection <$> run (connectedTo (unix "native_pg_scram" (Just "wrong")) (arr (const ())))) `shouldReturn` Just "28P01"
+      (rejection <$> run (connectedTo (unix "native_pg_scram" (Just "wrong")) done)) `shouldReturn` Just "28P01"
     it "reports a missing password" $ do
-      result <- run (connectedTo (unix "native_pg_scram" Nothing) (arr (const ())))
+      result <- run (connectedTo (unix "native_pg_scram" Nothing) done)
       authenticationFailure result `shouldSatisfy` P.just P.anything
     it "reports a missing database" $
-      (rejection <$> run (connectedTo ((unix "postgres" Nothing) {connectDatabase = Just "missing"}) (arr (const ()))))
+      (rejection <$> run (connectedTo ((unix "postgres" Nothing) {connectDatabase = Just "missing"}) done))
         `shouldReturn` Just "3D000"
     it "uses protocol 3.2 where the server has it, and 3.0 otherwise" $ do
       info <- run (session ((unix "postgres" Nothing) {connectProtocolVersion = protocolVersion3_2}) (arr (PG.serverInfo . fst)))
@@ -167,7 +168,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     let suppliedBinding supplied mode user =
           PGInternal.withEndPointOverride supplied ((encryptedAs user (Just "scram secret")) {connectChannelBinding = mode})
         bindingFailure = Just (Left "unsupported certificate hash")
-        connectedWith settings = run (connectedTo settings (arr (const ())))
+        connectedWith settings = run (connectedTo settings done)
     it "uses the supplied binding bytes in SCRAM-PLUS" $
       (rejection <$> connectedWith (suppliedBinding (Just (Right "wrong binding")) ChannelBindingRequire "native_pg_scram"))
         `shouldReturn` Just "28000"
@@ -218,13 +219,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     -- connect fails with the same shape for one host as for many: a list with an entry for each host it tried.
     it "reports the one host that failed as a list of one" $ do
       settings <- settingsOf (local "user=native_pg_scram password=wrong")
-      result <- run (connectedTo settings (arr (const ())))
+      result <- run (connectedTo settings done)
       case result of
         Left (ConnectFailure [(host, ConnectionRejected _)]) -> hostName host `shouldBe` directory
         _ -> failTest "expected the rejection of the one host, in a list of one"
     needs "host selection" $ it "reports the hosts that failed, in order" $ do
       settings <- settingsOf "host=/missing-native-pg-first,/missing-native-pg-second dbname=postgres"
-      result <- run (connectedTo settings (arr (const ())))
+      result <- run (connectedTo settings done)
       case result of
         Left (ConnectFailure failures) ->
           map (hostName . fst) failures `shouldBe` ["/missing-native-pg-first", "/missing-native-pg-second"]
@@ -237,14 +238,14 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       withString (local "fallback_application_name=fallback application_name=app") applicationName `shouldReturn` Right ["app"]
     needs "target_session_attrs" $ it "connects only to a server with the session attributes asked for" $ do
       let readOnly = "options='-c default_transaction_read_only=on' "
-      withString (local (readOnly <> "target_session_attrs=read-only")) (arr (const ())) `shouldReturn` ()
+      withString (local (readOnly <> "target_session_attrs=read-only")) done `shouldReturn` ()
       connectFailure (local (readOnly <> "target_session_attrs=read-write"))
         `shouldReturn` ("connection to server on socket \"" <> socketPath <> "\" failed: session is read-only")
-      withString (local "target_session_attrs=primary") (arr (const ())) `shouldReturn` ()
+      withString (local "target_session_attrs=primary") done `shouldReturn` ()
       connectFailure (local "target_session_attrs=standby")
         `shouldReturn` ("connection to server on socket \"" <> socketPath <> "\" failed: server is not in hot standby mode")
       -- With no standby to prefer, the primaries are tried again.
-      withString (local "target_session_attrs=prefer-standby") (arr (const ())) `shouldReturn` ()
+      withString (local "target_session_attrs=prefer-standby") done `shouldReturn` ()
     describe "with TLS" $ do
       let encryptedBy string = withString (tcp string) encrypted
       needs "TLS" $ it "encrypts with sslmode=require, without verifying the server" $
@@ -259,7 +260,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show plaintext <> " failed: server does not support SSL, but SSL was required")
       it "fails as libpq without TLS does, without a TLS client" $ do
         settings <- settingsOf (tcp "sslmode=require")
-        result <- run (connectedTo settings {connectTlsClient = Nothing} (arr (const ())))
+        result <- run (connectedTo settings {connectTlsClient = Nothing} done)
         either displayException (const "connected") result
           `shouldBe` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in")
       needs "TLS" $ it "encrypts by default, with sslmode=prefer, as libpq does" $
@@ -301,7 +302,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           run $
             session settings $
               steps
-                [ concurrently (query sleeping) (after (millis 300) (cancelling settings)) >>> arr (serverCode . fst) `yields` Just "57014",
+                [ (concurrently (query sleeping) (after (millis 300) (cancelling settings)) >>^ serverCode . fst) `yields` Just "57014",
                   cancelling refusing
                     `failsAs` \case
                       TlsFailure reason -> reason `shouldBe` "server does not support SSL, but SSL was required"
@@ -328,7 +329,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       needs "TLS" $ it "checks revocation lists, from sslcrl or sslcrldir" $ do
         let verified extra = tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1 " <> extra)
             revoked = "connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: invalid peer certificate: Revoked"
-        withString (verified ("sslcrl=" <> Char8.pack (certificate "empty.crl"))) (arr (const ())) `shouldReturn` ()
+        withString (verified ("sslcrl=" <> Char8.pack (certificate "empty.crl"))) done `shouldReturn` ()
         connectFailure (verified ("sslcrl=" <> Char8.pack (certificate "revoked.crl"))) `shouldReturn` revoked
         temporary <- getTemporaryDirectory
         bracket (mkdtemp (temporary </> "native-pg-crl-")) removeDirectoryRecursive $ \lists -> do
@@ -336,7 +337,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           copyFile (certificate "revoked.crl") (lists </> "0123abcd.r0")
           connectFailure (verified ("sslcrldir=" <> Char8.pack lists)) `shouldReturn` revoked
         -- As libpq, a missing file is no list.
-        withString (verified "sslcrl=/nonexistent/root.crl") (arr (const ())) `shouldReturn` ()
+        withString (verified "sslcrl=/nonexistent/root.crl") done `shouldReturn` ()
       needs "TLS" $ it "authenticates with a client certificate" $ do
         withKeyCopy ownerReadMode $ \key -> do
           let certified = "user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key
@@ -474,8 +475,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       withSession
         ( transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT s::text FROM generate_series(1, 2) s" (Tx.any Tx.field))) $ \result ->
             Tx.single result
-              >>> (returnA &&& (arr (const ()) >>> Tx.nextRow result))
-              >>> arr fst
+              >>> tap (done >>> Tx.nextRow result >>> done)
               >>> (next `failsWith` FieldExpired)
         )
         `shouldReturn` Right ()
@@ -529,7 +529,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "streams a last column after decoding the others" $
       withSession
         ( transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT 200::int4, repeat('x', 1000000)" statusAndBody)) $ \result ->
-            Tx.single result >>> second measure >>^ \(status, (bytes, _)) -> (status, bytes)
+            Tx.single result >>> second measure >>^ second fst
         )
         `shouldReturn` Right (200, 1000000)
 
@@ -574,8 +574,9 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       run
         ( session (unix "postgres" Nothing) $
             steps
-              [ concurrently (timed (query sleeping)) (after (millis 300) (cancelling (unix "postgres" Nothing)))
-                  >>> arr (\((result, elapsed), ()) -> (serverCode result, elapsed < 10 * 1000000000))
+              [ ( concurrently (timed (query sleeping)) (after (millis 300) (cancelling (unix "postgres" Nothing)))
+                    >>^ \((result, elapsed), ()) -> (serverCode result, elapsed < 10 * 1000000000)
+                )
                   `yields` (Just "57014", True),
                 selectOne `yields` Right [1]
               ]
@@ -626,7 +627,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 [ onFirst (conn (Notify.listen ["events"])),
                   onSecond (ddl "NOTIFY events, 'hello'") `yields` Right (),
                   ( onFirst (conn Notify.notification)
-                      &&& arr (\((_, notifier), _) -> PG.serverProcessId (PG.serverInfo notifier))
+                      &&& arr (PG.serverProcessId . PG.serverInfo . snd . fst)
                       >>^ \(delivered, notifierPid) ->
                         (Just (Notify.notificationProcessId delivered) == notifierPid, Notify.notificationChannel delivered, Notify.notificationPayload delivered)
                   )
@@ -744,13 +745,13 @@ brokenConnection = selectOne `failsAs` unusable
 
 -- | Waits as long as the duration, in a reading program.
 sleepFor :: (Runtime arr) => Duration -> With Tx.Tx arr a ()
-sleepFor duration = arr (const ()) >>> sleep duration
+sleepFor duration = done >>> sleep duration
 
 -- | Cancels the statement that runs on the connection, through the key it has, over a connection of its own that is
 -- made to the settings: those of the connection, or others, for the cases of TLS and channel binding on the cancel
 -- connection.
 cancelling :: (Runtime arr) => ConnectSettings -> OnConn arr ()
-cancelling settings = arr (PG.cancelKey . fst) >>> PG.cancel settings
+cancelling settings = PG.cancelKey . fst ^>> PG.cancel settings
 
 -- | With two connections, the second ends the backend of the first. The process id is the text of a parameter.
 terminatingTheFirst :: (Runtime arr) => arr ((Connection, Connection), Loans) (Either QueryError [Bool])
@@ -792,7 +793,7 @@ onString runner string body = settingsOf string >>= \settings -> ordinary runner
 failureOf :: Runner -> ByteString -> IO String
 failureOf runner string = do
   settings <- settingsOf string
-  result <- ordinary runner (connectedTo settings (arr (const ())))
+  result <- ordinary runner (connectedTo settings done)
   either (pure . displayException) (const (fail "connected")) result
 
 -- | A pair of an Int and a text, as a composite.
@@ -830,7 +831,7 @@ slowSource = newSlowChunks (millis 150) (replicate 4 (Char8.replicate 1000 'y'))
 
 -- | The step, given this input with the connection and the loans.
 withInput :: (Runtime arr) => p -> arr (Connection, (Loans, p)) b -> OnConn arr b
-withInput input step = arr (\(connection, loans) -> (connection, (loans, input))) >>> step
+withInput input step = second (,input) ^>> step
 
 -- | A statement run in a transaction of its own that takes its parameter stream as its input.
 query' :: (Runtime arr) => Tx.Statement arr p row -> arr (Connection, (Loans, p)) (Either QueryError [row])
@@ -859,20 +860,50 @@ largeThenLong =
 -- sampling the live heap. The accumulators are strict, so they don't keep the pieces alive.
 consumeSlowly :: (Runtime arr) => With Tx.Tx arr Tx.Field (Int, Bool, Bool)
 consumeSlowly =
-  now (\field -> (\baseline -> (field, (0 :: Int, 0 :: Int, True, True, baseline, baseline))) <$> liveBytes)
+  now (\field -> (\baseline -> (field, consumedFrom baseline)) <$> liveBytes)
     >>> foldPieces step
-    >>> now (\(_, received, small, valid, peak, baseline) -> do
-          peak - baseline `shouldSatisfy` P.lt (8 * 1024 * 1024)
-          pure (received, small, valid))
+    >>> now (\Consumed {consumedBytes, consumedSmall, consumedValid, consumedPeak, consumedBaseline} -> do
+          consumedPeak - consumedBaseline `shouldSatisfy` P.lt (8 * 1024 * 1024)
+          pure (consumedBytes, consumedSmall, consumedValid))
   where
+    consumedFrom baseline =
+      Consumed
+        { consumedPieces = 0,
+          consumedBytes = 0,
+          consumedSmall = True,
+          consumedValid = True,
+          consumedPeak = baseline,
+          consumedBaseline = baseline
+        }
     -- A blocking delay every 256 pieces, on purpose: the consumer is slow without a wait of the arrow, so that only
     -- the socket pushes back on the server. The pieces are views, no larger than the pool's buffers of 1 KiB.
-    step (count, received, small, valid, peak, baseline) piece = do
-      peak' <- if count `mod` 256 == 255 then threadDelay 2000 *> (max peak <$> liveBytes) else pure peak
+    step consumed@Consumed {consumedPieces, consumedBytes, consumedSmall, consumedValid, consumedPeak} piece = do
+      peak' <-
+        if consumedPieces `mod` 256 == 255
+          then threadDelay 2000 *> (max consumedPeak <$> liveBytes)
+          else pure consumedPeak
       -- The piece is looked at now: it is a view, and the bytes it is of are the next piece's once it is received.
-      let !small' = small && BS.length piece <= 1024
-          !valid' = valid && BS.all (== 120) piece
-      pure (count + 1, received + BS.length piece, small', valid', peak', baseline)
+      let !small' = consumedSmall && BS.length piece <= 1024
+          !valid' = consumedValid && BS.all (== 120) piece
+      pure
+        consumed
+          { consumedPieces = consumedPieces + 1,
+            consumedBytes = consumedBytes + BS.length piece,
+            consumedSmall = small',
+            consumedValid = valid',
+            consumedPeak = peak'
+          }
+
+-- | What 'consumeSlowly' has seen of the pieces: how many there were, how many bytes they had, whether all were small
+-- and valid, and the live heap bytes at the start and at the highest sample.
+data Consumed = Consumed
+  { consumedPieces :: Int,
+    consumedBytes :: Int,
+    consumedSmall :: Bool,
+    consumedValid :: Bool,
+    consumedPeak :: Int,
+    consumedBaseline :: Int
+  }
 
 -- | Live heap bytes after a major collection.
 liveBytes :: IO Int
@@ -918,17 +949,11 @@ withPlaintextServer action =
 
 numbersRow :: (Runtime arr) => Rows arr (Int16, Int32, Int64, Bool, Float, Double, Scientific)
 numbersRow =
-  Tx.any
-    ( Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column
-        >>^ \(a, (b, (c, (d, (e, (f, g)))))) -> (a, b, c, d, e, f, g)
-    )
+  Tx.any ((,,,,,,) <$> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column)
 
 textsRow :: (Runtime arr) => Rows arr (Text, ByteString, Char, UUID, Json, Jsonb)
 textsRow =
-  Tx.any
-    ( Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column
-        >>^ \(a, (b, (c, (d, (e, f))))) -> (a, b, c, d, e, f)
-    )
+  Tx.any ((,,,,,) <$> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column)
 
 -- | A column that may be NULL, and one that may not.
 nullableThen :: (Runtime arr, InPlace a, InPlace b) => Rows arr (Maybe a, b)
@@ -940,7 +965,4 @@ statusAndBody = Tx.any (Tx.column &&& Tx.field)
 
 snippetRow :: (Runtime arr) => Rows arr (Int32, Text, Text, Text, Bool)
 snippetRow =
-  Tx.any
-    ( Tx.column &&& Tx.column &&& Tx.column &&& Tx.column &&& Tx.column
-        >>^ \(n, (a, (b, (c, d)))) -> (n, a, b, c, d)
-    )
+  Tx.any ((,,,,) <$> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column <*> Tx.column)

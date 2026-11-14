@@ -83,7 +83,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
         ( session ((unix "postgres" Nothing) {connectParameters = [("application_name", "pooled-setup")]}) $
             alsoOn ((unix "postgres" Nothing) {connectParameters = [("application_name", "overwriting")]}) $
               steps
-                [ arr (\((first', _), _) -> lookup "application_name" (PG.serverParameters (PG.serverInfo first'))) `yields` Just "pooled-setup",
+                [ arr (lookup "application_name" . PG.serverParameters . PG.serverInfo . fst . fst) `yields` Just "pooled-setup",
                   onFirst (field100000 `yields` Right 100000),
                   onFirst (field100000 `yields` Right 100000)
                 ]
@@ -125,7 +125,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       tiny
         ( withinFor (secs 10) $
             steps
-              [ (connectedTo settings (arr (const ())) >>^ failedHosts) `yields` Just missing,
+              [ (connectedTo settings done >>^ failedHosts) `yields` Just missing,
                 connects scram `yields` Right [1]
               ]
         )
@@ -146,7 +146,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
         silentPort <- Socket.socketPort listener
         tiny
           ( steps
-              [ (withinFor (millis 100) (connectedTo (PG.connectSettings (PG.TcpAddress "127.0.0.1" silentPort) "postgres") (arr (const ()))) >>^ isNothing) `yields` True,
+              [ (withinFor (millis 100) (connectedTo (PG.connectSettings (PG.TcpAddress "127.0.0.1" silentPort) "postgres") done) >>^ isNothing) `yields` True,
                 withinFor (secs 10) (connects scram `yields` Right [1]) `yields` Just ()
               ]
           )
@@ -174,15 +174,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       held <- newIORef Nothing
       sharing
         ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $
-            streamingFrom
-              (\loans -> pure (LoanSource loans remaining held))
-              ( transactOn
-                  Tx.ReadCommitted
-                  Tx.Read
-                  Tx.Final
-                  (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Tx.any Tx.field)))
-                  (\result -> Tx.single result >>> copyOut)
-              )
+            streamingFrom (\loans -> pure (LoanSource loans remaining held)) echoed
         )
         `shouldReturn` Right (BS.replicate 16385 120)
       readIORef remaining `shouldReturn` 0
@@ -193,15 +185,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       let pieces = replicate 64 (BS.replicate 256 120) <> [BS.replicate 1 120]
       sharing
         ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $
-            streaming
-              (newSlowChunks (millis 1) pieces)
-              ( transactOn
-                  Tx.ReadCommitted
-                  Tx.Read
-                  Tx.Final
-                  (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Tx.any Tx.field)))
-                  (\result -> Tx.single result >>> copyOut)
-              )
+            streaming (newSlowChunks (millis 1) pieces) echoed
         )
         `shouldReturn` Right (BS.replicate 16385 120)
 
@@ -223,7 +207,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
                         <*> Tx.statement (plain sql (Tx.any shape))
                     )
                     ( \(parent, child, inserted, body) ->
-                        Tx.discard parent >>> Tx.discard child >>> Tx.discard inserted >>> Tx.single body >>> measure >>> now (\_ -> writeIORef delivered True)
+                        Tx.discard parent >>> Tx.discard child >>> Tx.discard inserted >>> Tx.single body >>> measure >>> now (const (writeIORef delivered True))
                     )
                     >>^ failedCommitCode
               )
@@ -274,11 +258,21 @@ field100000 =
 
 -- | The declared length of the field, and the bytes that it gave, after a column.
 lengthsOf :: (Runtime arr) => Tx.Result arr (Int64, Tx.Field) -> With Tx.Tx arr () (Int64, Int, Int)
-lengthsOf result = Tx.single result >>> (arr fst &&& (arr (Tx.fieldLength . snd) &&& (arr snd >>> measure >>^ fst))) >>^ \(a, (b, c)) -> (a, b, c)
+lengthsOf result = Tx.single result >>> ((,,) <$> arr fst <*> arr (Tx.fieldLength . snd) <*> (snd ^>> measure >>^ fst))
 
 -- | A statement that gives a column and a field.
 columnAndBody :: (Runtime arr) => Rows arr (Int64, Tx.Field)
 columnAndBody = Tx.any (Tx.column &&& Tx.field)
+
+-- | A text of 16385 bytes that the source streams as the parameter, and that the server gives back as a field, copied out.
+echoed :: (Runtime arr, Stream arr s) => arr (Connection, (Loans, s)) (Either QueryError ByteString)
+echoed =
+  transactOn
+    Tx.ReadCommitted
+    Tx.Read
+    Tx.Final
+    (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Tx.any Tx.field)))
+    (\result -> Tx.single result >>> copyOut)
 
 -- | The shape of a row that has a field in the end, as a value that any arrow takes.
 data Shape = Shape String ByteString (forall arr. (Runtime arr) => arr Tx.Columns Tx.Field)
@@ -321,8 +315,9 @@ instance (Runtime arr) => Stream arr LoanSource where
       -- The loan of the piece before is given back.
       giveBack =
         now (\source@(LoanSource _ _ held) -> (source,) <$> atomicModifyIORef' held (Nothing,))
-          >>> (\(source, loan) -> maybe (Left source) (\l -> Right (source, l)) loan)
-          ^>> (returnA ||| (second release >>> arr fst))
+          >>> heldLoan
+          ^>> (returnA ||| (second release >>^ fst))
+      heldLoan (source, loan) = maybe (Left source) (Right . (source,)) loan
       remainingOrEnd =
         now (\source@(LoanSource _ left _) -> (\n -> if n == 0 then Left () else Right (source, n)) <$> readIORef left)
       -- A buffer is borrowed, filled as the view that is the piece, and kept until the next pull. A piece is the
