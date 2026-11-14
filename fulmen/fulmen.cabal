@@ -30,7 +30,8 @@ library
 
 -- The HTTP/1.1 conformance cases, which are data of bytes in and bytes out, run against a
 -- server that the suite starts for each case. The cases that need a part of the server that is
--- not there yet are marked as expected failures.
+-- not there yet are marked as expected failures. The suite checks as well how the server shares new connections out between
+-- the cores.
 test-suite fulmen-conformance
   type: exitcode-stdio-1.0
   default-language: GHC2021
@@ -39,6 +40,7 @@ test-suite fulmen-conformance
   other-modules: ConformanceCases
                  ConformanceSpec
                  ConformanceWire
+                 PlacementSpec
   ghc-options: -Wall -threaded -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5
