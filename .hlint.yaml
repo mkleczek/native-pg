@@ -1,0 +1,57 @@
+# HLint checks only the plumbing of arrow programs: pure steps are composed as functions inside one arr, and the
+# shared combinators of Network.Streaming.Combinators and Network.Streaming.Plumbing are used where they fit. HLint's own hints are ignored.
+#
+# Run it with: hlint streaming-io native-pg native-pg-tls directions fulmen slice test
+
+- group: {name: default, enabled: false}
+- ignore: {}
+
+# --cpp-simple drops the lines of CPP directives, which HLint's own preprocessor fails on in some modules.
+- arguments: [--cpp-simple, -XGHC2021, -XArrows, -XLambdaCase, -XMultiWayIf, -XDataKinds, -XTypeFamilies]
+
+# Pure steps in a row are one function.
+- warn: {name: Compose pure steps, lhs: arr f >>> arr g, rhs: arr (g . f)}
+- warn: {name: Compose pure steps, lhs: f ^>> arr g, rhs: arr (g . f)}
+- warn: {name: Compose pure steps, lhs: arr f >>^ g, rhs: arr (g . f)}
+- warn: {name: Compose pure steps, lhs: f ^>> (g ^>> x), rhs: (g . f) ^>> x}
+- warn: {name: Compose pure steps, lhs: (x >>^ f) >>^ g, rhs: x >>^ (g . f)}
+- warn: {name: Compose pure steps, lhs: arr f >>> (g ^>> x), rhs: (g . f) ^>> x}
+- warn: {name: Compose pure steps, lhs: (x >>^ f) >>> arr g, rhs: x >>^ (g . f)}
+
+# A pure step next to an IO action, or two IO actions in a row, are one now.
+- warn: {name: Fuse into now, lhs: f ^>> now g, rhs: now (g . f)}
+- warn: {name: Fuse into now, lhs: f ^>> (now g >>> y), rhs: now (g . f) >>> y}
+- warn: {name: Fuse into now, lhs: now g >>^ f, rhs: now (fmap f . g)}
+- warn: {name: Fuse into now, lhs: now g >>> now h, rhs: now (g >=> h)}
+- warn: {name: Fuse into now, lhs: now g >>> (now h >>> y), rhs: now (g >=> h) >>> y}
+
+# The action between the rounds of a loop is iterateWith's second argument.
+- warn: {name: Use iterateWith, lhs: iterateA (x >>> left y), rhs: iterateWith x y}
+- warn: {name: Use iterateWith, lhs: iterateA (f ^>> left y), rhs: iterateWith (arr f) y}
+- warn: {name: Use iterateWith, lhs: iterateA (x >>^ f >>> left y), rhs: iterateWith (x >>^ f) y}
+- warn: {name: Use iterateWith, lhs: iterateA (x >>> (f ^>> left y)), rhs: iterateWith (x >>^ f) y}
+- warn: {name: Use iterateWith, lhs: iterateA (x >>> (z >>> left y)), rhs: iterateWith (x >>> z) y}
+- warn: {name: Use iterateWith, lhs: iterateA (f ^>> (x >>> left y)), rhs: iterateWith (f ^>> x) y}
+- warn: {name: Use iterateWith, lhs: iterateA (x >>> (z >>> (f ^>> left y))), rhs: iterateWith (x >>> z >>^ f) y}
+
+# A pure step before or after an arrow is a function on its input or output.
+- warn: {name: Use ^>>, lhs: arr f >>> x, rhs: f ^>> x}
+- warn: {name: Use >>^, lhs: x >>> arr f, rhs: x >>^ f}
+
+# Steps that don't depend on each other's results, combined by a function, are applicative.
+- warn: {name: Use <*>, lhs: (x &&& y) >>^ uncurry f, rhs: f <$> x <*> y}
+
+# The shared combinators.
+- warn: {name: Use done, lhs: arr (const ()), rhs: done}
+- warn: {name: Use done, lhs: x >>^ const (), rhs: x >>> done}
+- warn: {name: Use dup, lhs: (id &&& id) ^>> x, rhs: dup ^>> x}
+- warn: {name: Use dup, lhs: arr (id &&& id), rhs: arr dup}
+- warn: {name: Use alongside, lhs: x &&& returnA, rhs: alongside x}
+- warn: {name: Use alongside, lhs: dup ^>> first x, rhs: alongside x}
+- warn: {name: Use keeping, lhs: "((),) ^>> first x", rhs: keeping x}
+- warn: {name: Use tap, lhs: alongside x >>^ snd, rhs: tap (x >>> done)}
+- warn: {name: Use tap, lhs: (returnA &&& x) >>^ fst, rhs: tap (x >>> done)}
+- warn: {name: Use consume, lhs: first x >>> (snd ^>> y), rhs: consume x >>> y}
+- warn: {name: Use consume, lhs: first x >>^ snd, rhs: consume x}
+- warn: {name: Use fst, lhs: consume x >>> done, rhs: fst ^>> x}
+- warn: {name: Use deliver, lhs: second x >>> give >>> done, rhs: deliver x}
