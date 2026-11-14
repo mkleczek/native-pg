@@ -135,7 +135,7 @@ class (forall x. Applicative (arr x)) => ArrowApplicative arr
 
 -- | What a program needs of the arrow it runs in, so that it can be written
 -- once and run by any of them: the capabilities of its classes, and tickets
--- at both reaches.
+-- and inboxes at both reaches.
 type Runtime arr =
   ( ArrowChoice arr,
     ArrowApplicative arr,
@@ -150,6 +150,8 @@ type Runtime arr =
     Annotate arr,
     Exchange arr (Local arr),
     Exchange arr 'Anywhere,
+    Inboxes arr (Local arr),
+    Inboxes arr 'Anywhere,
     Instrumented (ModeOf arr)
   )
 
