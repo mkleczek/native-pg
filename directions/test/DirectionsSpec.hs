@@ -3,7 +3,7 @@
 
 module DirectionsSpec (spec) where
 
-import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>))
+import Control.Arrow (ArrowChoice, (>>>), (^>>))
 import Control.Exception (bracket)
 import Control.Monad (forM_, when)
 import Data.ByteString (ByteString)
@@ -18,6 +18,7 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes hiding (within)
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..), microseconds)
@@ -128,16 +129,16 @@ type Part = forall arr. (ArrowChoice arr, Effect arr, GiveWay arr) => IORef [Int
 -- | Each step is a receive from a link that never waits.
 receiving :: Part
 receiving order ident buffer =
-  withOnly (const 1000 ^>> replicateA (const (roomOf buffer) ^>> With receive >>> now (\_ -> modifyIORef' order (ident :))) >>^ const ())
+  withOnly (const 1000 ^>> replicateA (const (roomOf buffer) ^>> With receive >>> now (const (modifyIORef' order (ident :)))) >>> done)
 
 -- | Each step is an action that never waits.
 effects :: Part
-effects order ident _ = const 1000 ^>> replicateA (now (\() -> modifyIORef' order (ident :))) >>^ const ()
+effects order ident _ = const 1000 ^>> replicateA (now (const (modifyIORef' order (ident :)))) >>> done
 
 -- | Each step is a point to give way at, and then work for a millisecond that
 -- doesn't give way.
 computing :: Part
-computing order ident _ = const 40 ^>> replicateA (giveWay >>> now (\() -> spin 1000000 *> modifyIORef' order (ident :))) >>^ const ()
+computing order ident _ = const 40 ^>> replicateA (giveWay >>> now (const (spin 1000000 *> modifyIORef' order (ident :)))) >>> done
   where
     spin nanoseconds = monotonicNanoseconds >>= \started -> let wait = monotonicNanoseconds >>= \at -> when (at - started < nanoseconds) wait in wait
 

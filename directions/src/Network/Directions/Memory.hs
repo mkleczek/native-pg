@@ -47,7 +47,7 @@ memoryReceive (Memory (BSI.BS wire total) position limit) target room = unsafeWi
 instance (Arrow arr, Effect arr, GiveWay arr) => Link arr Memory where
   receive = giveWay >>> now (\(memory, Room (Buffer target _) offset size) -> unsafeWithForeignPtr target (\pointer -> memoryReceive memory (pointer `plusPtr` offset) size))
   {-# INLINE receive #-}
-  sendAll = now (\_ -> throwIO (userError "a memory link is for reading only"))
-  awaitInput = now (\_ -> pure ())
-  shutdownSend = now (\_ -> pure ())
-  close = now (\_ -> pure ())
+  sendAll = now (const (throwIO (userError "a memory link is for reading only")))
+  awaitInput = now (const (pure ()))
+  shutdownSend = now (const (pure ()))
+  close = now (const (pure ()))

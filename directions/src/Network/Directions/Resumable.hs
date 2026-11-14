@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 
 -- | The other way to write a parser for a direction: a monad that never waits
@@ -17,18 +18,20 @@ module Network.Directions.Resumable
   )
 where
 
-import Control.Arrow (ArrowChoice, first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (ArrowChoice, arr, first, (>>>), (>>^), (^>>), (|||))
 import Control.Monad (ap, liftM)
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
+import Data.Function ((&))
 import Foreign.Marshal.Utils (moveBytes)
 import Foreign.Ptr (castPtr)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes hiding (Exit (..), Stream (..))
+import Network.Streaming.Combinators (pattern Again, pattern Finish, consume, iterateWith)
 import Network.Streaming.With
 
 -- | Where a parser is: done, with the bytes it left in hand, or in need of
@@ -93,21 +96,20 @@ streamBytes n = Parser (go n)
 -- the parser's result and the bytes it left in hand. Its input is the link it
 -- receives from, and the bytes in hand.
 parse :: (ArrowChoice arr, Effect arr, Link arr link) => Buffer -> arr ByteString () -> Parser a -> arr (link, ByteString) (a, ByteString)
-parse buffer consumer (Parser parser) = with ((`parser` Done) ^>> loop)
+parse buffer consumer (Parser parser) = with ((`parser` Done) ^>> iterateWith (arr step) (more ||| chunk))
   where
-    loop = step ^>> ((more ||| chunk) ||| returnA)
-    more = first (With (fill buffer)) >>> (\(received, go) -> go received) ^>> loop
-    chunk = first (lift consumer) >>> snd ^>> loop
+    more = first (With (fill buffer)) >>^ uncurry (&)
+    chunk = consume (lift consumer)
     step = \case
-      Done value rest -> Right (value, rest)
-      More count held go -> Left (Left ((count, held), go))
-      Yield piece next -> Left (Right (piece, next))
+      Done value rest -> Finish (value, rest)
+      More count held go -> Again (Left ((count, held), go))
+      Yield piece next -> Again (Right (piece, next))
 {-# INLINABLE parse #-}
 
 -- | Moves the bytes in hand to the buffer's start, and receives after them
 -- until there are as many as the parser needs.
 fill :: (ArrowChoice arr, Effect arr, Link arr link) => Buffer -> arr (link, (Int, ByteString)) ByteString
-fill buffer = now compact >>> loop
+fill buffer = now compact >>> iterateWith (arr enough) (first receive >>^ added)
   where
     Buffer memory size = buffer
     compact (link, (count, held))
@@ -115,10 +117,9 @@ fill buffer = now compact >>> loop
       | otherwise = do
           unsafeWithForeignPtr memory (\target -> BSU.unsafeUseAsCStringLen held (\(from, n) -> moveBytes target (castPtr from) n))
           pure (link, (count, BS.length held))
-    loop = enough ^>> ((first receive >>> added ^>> loop) ||| returnA)
     enough (link, (count, filled))
-      | filled >= count = Right (BSI.BS memory filled)
-      | otherwise = Left ((link, Room buffer filled (size - filled)), (link, (count, filled)))
+      | filled >= count = Finish (BSI.BS memory filled)
+      | otherwise = Again ((link, Room buffer filled (size - filled)), (link, (count, filled)))
     added (received, (link, (count, filled)))
       | received <= 0 = error "the stream ended inside a value"
       | otherwise = (link, (count, filled + received))

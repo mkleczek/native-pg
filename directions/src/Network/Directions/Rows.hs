@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | PostgreSQL-shaped messages, and parsers for them written as arrows over a
 -- 'Reader': a stream of DataRow messages ended by a CommandComplete, and one
@@ -32,7 +33,7 @@ module Network.Directions.Rows
   )
 where
 
-import Control.Arrow (ArrowChoice, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>), (|||))
 import Control.Monad (replicateM, replicateM_, void)
 import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -47,7 +48,7 @@ import Foreign.Storable (peek, poke)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Directions.Resumable
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (keeping)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, done, iterateA, iterateWith, keeping)
 import Network.Streaming.Reader
 import Network.Streaming.With
 
@@ -119,15 +120,17 @@ message = withOnly readMessage
 readMessage :: (ArrowChoice arr, Effect arr, Link arr link) => With (Reader link) arr () Message
 readMessage = asks word8 >>> tagged ^>> (row ||| (complete ||| unknown))
   where
-    row = asks word32 >>> const () ^>> dataRow >>^ DataRow
+    row = asks word32 >>> done >>> dataRow >>^ DataRow
     complete = asks word32 >>> subtract 4 ^>> With bytes >>^ CommandComplete
     unknown = now (\tag -> ioError (userError ("a message with the tag " <> show tag)))
 {-# INLINABLE readMessage #-}
 
-tagged :: Int -> Either () (Either () Int)
-tagged 68 = Left ()
-tagged 67 = Right (Left ())
-tagged other = Right (Right other)
+-- | Which message a tag starts: a DataRow, after which the stream goes on, or a CommandComplete or another tag, which
+-- end it.
+tagged :: Int -> Step () (Either () Int)
+tagged 68 = Again ()
+tagged 67 = Finish (Left ())
+tagged other = Finish (Right other)
 
 -- | A DataRow's body: how many fields, and each one's length and bytes.
 dataRow :: (ArrowChoice arr, Effect arr, Link arr link) => With (Reader link) arr () [ByteString]
@@ -138,21 +141,19 @@ dataRow = asks word16 >>> replicateA field
 
 -- | Folds the rows of the stream, until its CommandComplete.
 foldRows :: (ArrowChoice arr, Effect arr, Link arr link) => (acc -> [ByteString] -> acc) -> arr (Reader link, acc) acc
-foldRows add = with loop
+foldRows add = with (iterateA (keeping readMessage >>^ step))
   where
-    loop = keeping readMessage >>> step ^>> (loop ||| returnA)
-    step (DataRow fields, acc) = Left $! add acc fields
-    step (CommandComplete _, acc) = Right acc
+    step (DataRow fields, acc) = Again $! add acc fields
+    step (CommandComplete _, acc) = Finish acc
 {-# INLINABLE foldRows #-}
 
 -- | The stream's messages, until its CommandComplete, with the bytes of every
 -- field given to the consumer as pieces that arrive.
 streamMessages :: (ArrowChoice arr, Effect arr, Link arr link) => arr ByteString () -> arr (Reader link) ()
-streamMessages consumer = withOnly loop
+streamMessages consumer = withOnly (iterateWith (asks word8 >>^ tagged) row >>> (complete ||| unknown))
   where
-    loop = asks word8 >>> tagged ^>> ((row >>> loop) ||| (complete ||| unknown))
-    row = asks word32 >>> asks word16 >>> replicateA (asks word32 >>> With (stream consumer)) >>^ const ()
-    complete = asks word32 >>> subtract 4 ^>> With bytes >>^ const ()
+    row = asks word32 >>> asks word16 >>> replicateA (asks word32 >>> With (stream consumer)) >>> done
+    complete = asks word32 >>> subtract 4 ^>> With bytes >>> done
     unknown = now (\tag -> ioError (userError ("a message with the tag " <> show tag)))
 {-# INLINABLE streamMessages #-}
 
@@ -198,13 +199,18 @@ newCounter = do
 
 -- | Counts the bytes of the pieces it is given.
 counting :: (Effect arr) => Counter -> arr ByteString ()
-counting (Counter total) = now (\piece -> unsafeWithForeignPtr total (\pointer -> peek pointer >>= \sofar -> poke pointer $! sofar + BS.length piece))
+counting (Counter total) = now (addTo total . BS.length)
 {-# INLINABLE counting #-}
 
 -- | Adds the numbers it is given.
 adding :: (Effect arr) => Counter -> arr Int ()
-adding (Counter total) = now (\number -> unsafeWithForeignPtr total (\pointer -> peek pointer >>= \sofar -> poke pointer $! sofar + number))
+adding (Counter total) = now (addTo total)
 {-# INLINABLE adding #-}
 
 counted :: Counter -> IO Int
 counted (Counter total) = unsafeWithForeignPtr total peek
+
+-- | Adds the number to the count, in place.
+addTo :: ForeignPtr Int -> Int -> IO ()
+addTo total number = unsafeWithForeignPtr total (\pointer -> peek pointer >>= \sofar -> poke pointer $! sofar + number)
+{-# INLINE addTo #-}
