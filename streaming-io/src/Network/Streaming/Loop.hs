@@ -40,6 +40,7 @@ import Data.List (partition, sort)
 import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
@@ -76,7 +77,7 @@ instance ArrowChoice Loop where
 
 instance Concurrent Loop where
   together = \case
-    [] -> arr (const ())
+    [] -> done
     [one] -> one
     parts -> Together parts
 

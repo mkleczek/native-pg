@@ -30,6 +30,7 @@ import Control.Exception (SomeException, mask_, throwIO, toException)
 import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Network.Streaming.Classes hiding (Stream (..))
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets
@@ -187,7 +188,7 @@ instance Scope (CompiledM m) where
 -- dropped.
 instance Concurrent (CompiledM m) where
   together = \case
-    [] -> arr (const ())
+    [] -> done
     [one] -> one
     parts -> Compiled $ \(Context run part outer) value next -> do
       let size = length parts

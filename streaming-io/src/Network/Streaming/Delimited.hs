@@ -56,6 +56,7 @@ import Data.List (sortOn)
 import GHC.Exts (PromptTag#, control0#, newPromptTag#, prompt#)
 import GHC.IO (IO (..))
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Scheduler
 import Network.Streaming.Internal.Tickets
@@ -212,7 +213,7 @@ instance Scope (DelimitedM m s) where
 -- failure. A later failure is dropped.
 instance Concurrent (DelimitedM m s) where
   together = \case
-    [] -> arr (const ())
+    [] -> done
     [one] -> one
     parts -> Delimited $ \(Context run tag part) value ->
       control0 tag $ \resume -> do

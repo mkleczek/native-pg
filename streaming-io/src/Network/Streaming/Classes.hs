@@ -2,6 +2,7 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -12,6 +13,24 @@
 -- thread for each concurrent part, and "Network.Streaming.Loop", every part on
 -- one thread; a link's instance is written once for any arrow that does, over
 -- the link's own calls that never wait.
+--
+-- == Build time and run time
+--
+-- A program is built once and then runs many times. Every expression whose type is an arrow, @arr a b@, is evaluated
+-- when the program is built: the arguments of the functions that make arrows, the @if@ and @case@ expressions and
+-- lists that decide which arrows exist, and where-bound arrows such as a list of workers. Only the functions passed
+-- into an arrow run at run time: those given to @arr@, @^>>@, @>>^@ and 'now', and the decisions they return.
+--
+-- So there are two kinds of choice:
+--
+-- * which arrows exist is chosen at build time, with ordinary Haskell: @if@, @case@, and building lists and functions;
+--
+-- * which of the existing arrows runs is chosen at run time, by a value: @|||@, @boolA@, @left@, and the @Again@ or
+--   @Finish@ that a step of @iterateA@ or @iterateWith@ returns.
+--
+-- A run-time value can't build an arrow or pick one that doesn't exist: the arrows have no @app@ and are not monads,
+-- so the types keep the two apart. What is known when the program is built is a function's parameter; what differs
+-- from run to run is the arrow's input.
 module Network.Streaming.Classes
   ( Link (..),
     Stream (..),
@@ -51,7 +70,7 @@ module Network.Streaming.Classes
   )
 where
 
-import Control.Arrow (ArrowChoice, first, returnA, second, (>>>), (^>>), (|||))
+import Control.Arrow (ArrowChoice, second, (>>>), (^>>))
 import Control.Exception (Exception, SomeException, fromException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -65,6 +84,7 @@ import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)
+import Network.Streaming.Plumbing (pattern Again, pattern Finish, consume, iterateWith)
 import Network.Streaming.Internal.Tickets (Giver, Reach (..))
 import Network.Streaming.Watch (Watch)
 import System.Posix.Types (Fd (..))
@@ -310,13 +330,12 @@ writable sock = Writable . Fd <$> Socket.unsafeFdSocket sock
 -- are ready. The part gives way before it tries, so that one whose link always
 -- has bytes ready still does, once for each receive.
 receiveWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => (link -> Ptr Word8 -> Int -> IO (Maybe Int)) -> (link -> IO Event) -> arr (link, Room) Int
-receiveWith try readyToReceive = giveWay >>> loop
+receiveWith try readyToReceive = giveWay >>> iterateWith (now attempt) (consume block)
   where
-    loop = now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
     attempt (link, room@(Room (Buffer memory _) offset size)) =
       withForeignPtr memory (\pointer -> try link (pointer `plusPtr` offset) size) >>= \case
-        Just count -> pure (Right count)
-        Nothing -> (\event -> Left (event, (link, room))) <$> readyToReceive link
+        Just count -> pure (Finish count)
+        Nothing -> (\event -> Again (event, (link, room))) <$> readyToReceive link
 {-# INLINE receiveWith #-}
 
 -- | A send over a link's tries, which an instance supplies: a point to give
@@ -326,17 +345,16 @@ receiveWith try readyToReceive = giveWay >>> loop
 -- the flush writes what it took and hasn't written yet, without waiting, and
 -- says whether nothing is left.
 sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr) => (link -> [ByteString] -> IO Int) -> (link -> IO Bool) -> (link -> IO Event) -> arr (link, [ByteString]) ()
-sendAllWith send flush readyToSend = giveWay >>> loop
+sendAllWith send flush readyToSend = giveWay >>> second (filter (not . BS.null)) ^>> iterateWith (now attempt) (consume block)
   where
-    loop = second (filter (not . BS.null)) ^>> now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
     attempt (link, pieces) = case pieces of
-      [] -> flush link >>= \flushed -> if flushed then pure (Right ()) else blocked link []
+      [] -> flush link >>= \flushed -> if flushed then pure (Finish ()) else blocked link []
       _ -> do
         sent <- send link (take 16 pieces)
         case dropSent sent pieces of
           [] -> attempt (link, [])
           rest -> blocked link rest
-    blocked link rest = (\event -> Left (event, (link, rest))) <$> readyToSend link
+    blocked link rest = (\event -> Again (event, (link, rest))) <$> readyToSend link
 {-# INLINE sendAllWith #-}
 
 -- | Memory to receive into: a view of a buffer, from an offset and up to a

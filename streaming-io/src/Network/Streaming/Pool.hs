@@ -42,7 +42,9 @@ import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Sequence (Seq, ViewL (..), viewl, (|>))
 import qualified Data.Sequence as Seq
+import Data.Tuple (swap)
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (boolA, done, keeping)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Tickets (giveNow)
 
@@ -93,9 +95,12 @@ withLoanWithin limit pool = loaned pool (checkoutWithin limit pool)
 loaned :: (Runtime arr) => Pool c -> arr () (Maybe c) -> arr (c, a) b -> arr a (Either PoolError b)
 loaned pool checkingOut body = scope acquire giveBack run
   where
-    acquire = now (\_ -> (\closed -> if closed then Left () else Right ()) <$> isClosed pool) >>> (arr (const (Left PoolClosed)) ||| (checkingOut >>^ maybe (Left CheckoutTimedOut) Right))
-    giveBack = fst ^>> (arr (const ()) ||| release pool)
-    run = (\(acquired, input) -> fmap (,input) acquired) ^>> (arr Left ||| (body >>^ Right))
+    acquire =
+      now (const (isClosed pool))
+        >>> boolA (checkingOut >>^ maybe (Left CheckoutTimedOut) Right) (arr (const (Left PoolClosed)))
+    giveBack = fst ^>> (done ||| release pool)
+    run = withInput ^>> (arr Left ||| (body >>^ Right))
+    withInput (acquired, input) = fmap (,input) acquired
 
 -- | The body, as a holder of what the pool lent goes: the pool serves those
 -- that hold something first, so that they can give it back. For now it is the
@@ -196,7 +201,7 @@ reserved ::
   (State conn -> (State conn, Either () taken)) ->
   (Giver 'Anywhere taken -> Int -> Waiter conn) ->
   arr () (Either (Waiting arr 'Anywhere taken) taken)
-reserved ref need claim handout = giveWay >>> now (\() -> update ref claim) >>> (queue ||| arr Right)
+reserved ref need claim handout = giveWay >>> now (const (update ref claim)) >>> (queue ||| arr Right)
   where
     queue = ticket >>> now (\(awaiting, giver) -> update ref (queueOrClaim awaiting giver))
     queueOrClaim awaiting giver state = case claim state of
@@ -221,9 +226,14 @@ reserveMany need many (Pool ref _) = reserved ref (max many need) (claimMany man
 -- | The item or the items once the part's ticket is given them, which the part waits at, and gives up its place at when it is
 -- cancelled, so that what was given to it meanwhile goes back through the arrow.
 waited :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr taken () -> arr (Waiting arr 'Anywhere taken) taken
-waited giveBack = scope returnA giveUp (arr fst >>> await)
+waited giveBack = scope returnA giveUp (fst ^>> await)
   where
-    giveUp = (\(awaiting, exit) -> case exit of Done -> Left (); _ -> Right awaiting) ^>> (returnA ||| (abandon >>> (maybe (Left ()) Right ^>> (returnA ||| giveBack))))
+    giveUp = unlessDone ^>> (returnA ||| (abandon >>> (maybe (Left ()) Right ^>> (returnA ||| giveBack))))
+
+-- | The input of a release, which it has to give up, unless the body of the scope completed: then there is nothing to give up,
+-- and it is 'Left'.
+unlessDone :: (a, Exit) -> Either () a
+unlessDone (input, exit) = case exit of Done -> Left (); _ -> Right input
 
 -- | A connection, once one is free: the first part to ask has the first that
 -- is released. A part that is cancelled while it waits gives up its place, and
@@ -247,12 +257,17 @@ checkoutManyOf :: (ArrowChoice arr, Effect arr, GiveWay arr, Exchange arr 'Anywh
 checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
   where
     claim pool@(Pool ref _) = either (const (Left pool)) (Right . (pool,)) <$> update ref (claimMany many need)
-    queue = ((),) ^>> first ticket >>> now (\((awaiting, giver), pool@(Pool ref _)) -> either (\waiting -> Left (pool, waiting)) (Right . (pool,)) <$> update ref (queueOrClaim awaiting giver)) >>> (waitedIn ||| returnA)
+    queue =
+      keeping ticket
+        >>> now (\((awaiting, giver), pool@(Pool ref _)) -> either (\waiting -> Left (pool, waiting)) (Right . (pool,)) <$> update ref (queueOrClaim awaiting giver))
+        >>> (waitedIn ||| returnA)
     queueOrClaim awaiting giver state = case claimMany many need state of
       (claimed, Right taken) -> (claimed, Right taken)
       (_, Left ()) -> (queued (max many need) (Many many giver) state, Left awaiting)
-    waitedIn = scope returnA giveUp ((\((pool, waiting), _) -> (waiting, pool)) ^>> first await >>^ \(items, pool) -> (pool, items))
-    giveUp = (\((pool, waiting), exit) -> case exit of Done -> Left (); _ -> Right (pool, waiting)) ^>> (returnA ||| ((\(pool, waiting) -> (waiting, pool)) ^>> first abandon >>> now (\(given, pool) -> maybe (pure ()) (releaseNow pool) given)))
+    waitedIn = scope returnA giveUp (swap . fst ^>> first await >>^ swap)
+    giveUp =
+      unlessDone
+        ^>> (returnA ||| (swap ^>> first abandon >>> now (\(given, pool) -> maybe (pure ()) (releaseNow pool) given)))
 
 -- | A connection, if one is free within the time, as 'checkout' waits for it: 'Nothing' if it isn't, once the
 -- place in the queue is given up.
