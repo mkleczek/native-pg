@@ -204,7 +204,7 @@ stillWaits step = within (millis 20) step >>> now (\outcome -> isNothing outcome
 proceeds :: (Runtime arr) => arr x b -> arr x b
 proceeds step = within (secs 5) step >>> now (maybe (failTest "the step did not end in five seconds") pure)
 
--- * Waiting for each other
+-- * Future for each other
 
 -- | What the parts of a script wait for each other with: a signal that one raises and another waits for.
 newtype Signal = Signal (IORef Bool)
@@ -255,4 +255,4 @@ choose (one : others) = countDown ^>> (one ||| choose others)
 
 -- | A step that ends only when it is cancelled.
 blockForever :: forall arr x. (Runtime arr) => arr x ()
-blockForever = done >>> ticket @arr @'Anywhere >>> fst ^>> (await :: arr (Waiting arr 'Anywhere ()) ())
+blockForever = done >>> ticket @arr @'Anywhere >>> fst ^>> (await :: arr (Future arr 'Anywhere ()) ())

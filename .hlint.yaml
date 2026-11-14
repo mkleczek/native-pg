@@ -54,7 +54,7 @@
 - warn: {name: Use consume, lhs: first x >>> (snd ^>> y), rhs: consume x >>> y}
 - warn: {name: Use consume, lhs: first x >>^ snd, rhs: consume x}
 - warn: {name: Use fst, lhs: consume x >>> done, rhs: fst ^>> x}
-- warn: {name: Use deliver, lhs: second x >>> give >>> done, rhs: deliver x}
+- warn: {name: Use deliver, lhs: second x >>> fulfil >>> done, rhs: deliver x}
 
 # An effect that returns its own input, or a part of it, makes the value flow through the IO step instead of around it:
 # the effect should get only what it reads, and the rest go by tap, alongside, consume, first, second or <*>. The rules

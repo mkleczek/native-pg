@@ -81,13 +81,13 @@ data Tree
 data Shape
   = -- | An action that never waits.
     Action
-  | -- | A wait for a ticket to be given its value.
+  | -- | A wait for the promise of a ticket to be fulfilled.
     Wait
   | -- | A block until an event fires.
     Blocking
   | -- | A point where the part gives way to the others.
     Yielding
-  | -- | A value given to another part.
+  | -- | A promise fulfilled with a value for another part.
     Handover
   | -- | A step that is none of those.
     Round

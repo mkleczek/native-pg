@@ -81,7 +81,7 @@ asking :: (Annotate arr) => String -> arr a b -> arr a b
 asking = exchange Asking
 {-# INLINE asking #-}
 
--- | The arrow as the answering end of an exchange of the named value in diagrams: the end that gives the value.
+-- | The arrow as the answering end of an exchange of the named value in diagrams: the end that fulfils the promise.
 answering :: (Annotate arr) => String -> arr a b -> arr a b
 answering = exchange Answering
 {-# INLINE answering #-}

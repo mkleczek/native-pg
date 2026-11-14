@@ -111,8 +111,8 @@ receiveBytes buffer total = withOnly (const BS.empty ^>> iterateA ((roomOf buffe
 -- answer side gives it, and sends the ending that was decided; the answer side
 -- reads the batch's answer, decides from it, and keeps what follows. The
 -- decision is a ticket of the arrow's own core that the transaction makes when
--- it runs, and the request side is given the end to wait at and the answer side
--- the end to give at.
+-- it runs, and the request side is given the future to await and the answer side
+-- the promise to fulfil.
 transaction :: forall arr end. (ArrowChoice arr, Annotate arr, Concurrent arr, Effect arr, Exchange arr (Local arr), Link arr end) => Buffer -> ByteString -> (ByteString -> Bool) -> IORef [ByteString] -> arr end ()
 transaction buffer batch commits kept = withOnly (localTicket >>> together [fst ^>> requests, snd ^>> answers])
   where

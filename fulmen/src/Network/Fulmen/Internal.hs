@@ -20,7 +20,7 @@ import Network.Fulmen.Internal.Date (Date)
 import Network.Fulmen.Internal.Response (Exchange)
 import Network.Socket (Socket)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings)
-import Network.Streaming.Classes (Duration, Giver, Reach (..))
+import Network.Streaming.Classes (Duration, Promise, Reach (..))
 import Network.Streaming.Loans (Loans)
 import Network.Streaming.Pool (Pool)
 
@@ -66,8 +66,8 @@ data Shared = Shared
     sharedBuffers :: !BufferPool
   }
 
--- | A free worker: the core that it is on, and the giver of the ticket that it waits at for a connection.
+-- | A free worker: the core that it is on, and the promise of the ticket that it awaits a connection at.
 data Free = Free
   { freeCore :: !Int,
-    freeGiver :: !(Giver 'Anywhere Socket)
+    freePromise :: !(Promise 'Anywhere Socket)
   }

@@ -29,17 +29,17 @@ import System.Timeout (timeout)
 spec :: Spec
 spec = describe "the runtime" $ do
   describe "tickets" $ do
-    it "show, in a simulation, a part that waits for a ticket nothing gives a value" $ do
+    it "show, in a simulation, a part that waits for a ticket nothing fulfils" $ do
       (simulatedOutcome <$> runSimulation 1 limit (localTicket >>> fst ^>> await :: Loop () ()) ()) `shouldReturn` Deadlocked [0]
 
-    it "make the giver evaluate the value, so a value that is an error call fails the giver even when no part waits for the ticket yet" $ do
-      failsAtTheGive (runThreads givingErrorLocal ())
-      failsAtTheGive (runLoop givingErrorLocal ())
-      failsAtTheGive (runCompiled givingErrorLocal ())
-      failsAtTheGive (runDelimited givingErrorLocal ())
-      failsAtTheGive (runDelimited (givingError @'Anywhere) ())
-      failsAtTheGive (runCompiled (givingError @'Anywhere) ())
-      failsAtTheGive (runSimulation 1 limit givingErrorLocal ())
+    it "make the promise evaluate the value, so a value that is an error call fails the promise even when no part waits for the ticket yet" $ do
+      failsAtTheFulfil (runThreads fulfilWithErrorLocal ())
+      failsAtTheFulfil (runLoop fulfilWithErrorLocal ())
+      failsAtTheFulfil (runCompiled fulfilWithErrorLocal ())
+      failsAtTheFulfil (runDelimited fulfilWithErrorLocal ())
+      failsAtTheFulfil (runDelimited (fulfilWithError @'Anywhere) ())
+      failsAtTheFulfil (runCompiled (fulfilWithError @'Anywhere) ())
+      failsAtTheFulfil (runSimulation 1 limit fulfilWithErrorLocal ())
 
   describe "giving way, with every part on one thread" $ do
     it "goes on first with the parts that I/O woke, before those that yielded" $ do
@@ -146,20 +146,20 @@ wokenFirst run = withPair $ \waiting sending -> do
         ]
   reverse <$> readIORef notes
 
--- | The error call that the value a giver gives is.
+-- | The error call that the value a promise is fulfilled with is.
 valueError :: ErrorCall
-valueError = ErrorCall "the value given was an error call"
+valueError = ErrorCall "the value fulfilled was an error call"
 
--- | A ticket that no part waits for, whose giver gives a value that is an error call.
-givingError :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
-givingError = ticket @arr @r >>> (,throw valueError :: Int) . snd ^>> give
+-- | A ticket that no part waits for, whose promise is fulfilled with a value that is an error call.
+fulfilWithError :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
+fulfilWithError = ticket @arr @r >>> (,throw valueError :: Int) . snd ^>> fulfil
 
-givingErrorLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () Bool
-givingErrorLocal = givingError @(Local arr)
+fulfilWithErrorLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () Bool
+fulfilWithErrorLocal = fulfilWithError @(Local arr)
 
--- | The run fails with the error call, which the giver evaluates when it gives.
-failsAtTheGive :: IO a -> IO ()
-failsAtTheGive run = try (void run) `shouldReturn` (Left valueError :: Either ErrorCall ())
+-- | The run fails with the error call, which the promise evaluates when it is fulfilled.
+failsAtTheFulfil :: IO a -> IO ()
+failsAtTheFulfil run = try (void run) `shouldReturn` (Left valueError :: Either ErrorCall ())
 
 -- | A program made in IO, which each arrow runs: what the tests run.
 type Built = forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr), GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => IO (arr () ())

@@ -29,15 +29,15 @@ spec = describe "an arrow with an environment" $ do
     results <- inEach (const timed) 7 ()
     results `shouldBe` replicate 4 ((Just 7, Left 7), [])
 
--- | In a scope that notes what it does, a ticket whose giver gives the input doubled from one half of a pair while
+-- | In a scope that notes what it does, a ticket whose promise is fulfilled with the input doubled by one half of a pair while
 -- the other half waits for it; then the environment is added to it.
 exchanging :: (Rich arr) => IORef [String] -> With Int arr Int Int
 exchanging noted = scope (now (const (note "acquired"))) (now (\(_, exit) -> note ("released " <> show exit))) (snd ^>> doubled) >>> alongside ask >>^ uncurry (+)
   where
     note what = modifyIORef' noted (what :)
     doubled = keeping localTicket >>> concurrently handing waiting >>^ snd
-    handing = twice ^>> give >>> done
-    twice ((_, giver), number) = (giver, 2 * number)
+    handing = twice ^>> fulfil >>> done
+    twice ((_, promise), number) = (promise, 2 * number)
     waiting = fst . fst ^>> await
 
 -- | A deadline that doesn't pass, and a race that the part that doesn't wait wins.

@@ -4,7 +4,7 @@
 -- can't: the structure across function boundaries, after helpers such as @withTicket@ and @receive@ have expanded, and
 -- where the runtime can cancel a part. It suggests changes and never rewrites anything.
 --
--- A part is cancelled at its waits only: the leaves @block@, @await@ and @giveWay@, and @give@, which yields in the
+-- A part is cancelled at its waits only: the leaves @block@, @await@ and @giveWay@, and @fulfil@, which yields in the
 -- arrows that run every part on one thread. An action that never waits, @now@, is never interrupted. A part of the tree
 -- can wait if a wait is reachable inside it, through the boxes, wires, exchanges, scopes, parts that run together, races
 -- and deadlines.

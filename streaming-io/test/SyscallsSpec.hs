@@ -264,11 +264,11 @@ handoverDriver (_, theirs) = do
 rounds :: Int
 rounds = 100000
 
--- | The ends of the ping-pong's two sides: a request that carries the giver of its answer, and an answer that carries the giver
+-- | The ends of the ping-pong's two sides: a request that carries the promise of its answer, and an answer that carries the promise
 -- of the next request.
-newtype Ping r = Ping {answer :: Giver r (Pong r)}
+newtype Ping r = Ping {answer :: Promise r (Pong r)}
 
-newtype Pong r = Pong {following :: Giver r (Ping r)}
+newtype Pong r = Pong {following :: Promise r (Ping r)}
 
 -- | Two parts of one core that give each other a ticket and wait for the answer, this many times: each round is short, and a part
 -- that waits for a ticket never yields.

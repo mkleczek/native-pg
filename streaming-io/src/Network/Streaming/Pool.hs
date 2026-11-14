@@ -2,9 +2,9 @@
 {-# LANGUAGE LambdaCase #-}
 
 -- | A pool of connections, or of anything else that is loaned, as library code on the primitives of the classes
--- alone: one atomically updated reference to the items that are free and to the 'Giver's of the parts that wait
+-- alone: one atomically updated reference to the items that are free and to the 'Promise's of the parts that wait
 -- for some, and an arrow's tickets of reach 'Anywhere for the waiting: the pool is shared by the parts of every
--- core, so the givers it keeps can't belong to one. It is written once, for any arrow that has them: parts on the
+-- core, so the promises it keeps can't belong to one. It is written once, for any arrow that has them: parts on the
 -- cores of "Network.Streaming.Delimited" share it, and so do the threads of "Network.Streaming.Threads".
 --
 -- A waiter wants one item or several at once, and says how many must be free before it is served, which can be
@@ -47,7 +47,7 @@ import Data.Tuple (swap)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (boolA, decide, done, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
-import Network.Streaming.Internal.Tickets (giveNow)
+import Network.Streaming.Internal.Tickets (fulfilNow)
 
 -- | The items that are free, and how many, the number that the next waiter to queue gets, which says which of two
 -- waiters came first, and the waiters in their lanes, by how many items must be free to serve the first of the lane.
@@ -57,16 +57,16 @@ data State conn = State !Int ![conn] !Int !(IntMap (Seq (Waiter conn)))
 -- | The items and the waiters, and whether the pool has been closed.
 data Pool conn = Pool !(IORef (State conn)) !(IORef Bool)
 
--- | A waiter, by what gives it its items, a ticket's giver for one item or for a number of them at once, and by when it
+-- | A waiter, by the ticket's promise that is fulfilled with its items, for one item or for a number of them at once, and by when it
 -- came: the number that the pool counts arrivals with.
 data Waiter conn
-  = One !(Giver 'Anywhere conn) !Int
-  | Many !Int !(Giver 'Anywhere [conn]) !Int
+  = One !(Promise 'Anywhere conn) !Int
+  | Many !Int !(Promise 'Anywhere [conn]) !Int
 
--- | The items that were taken from the free ones for a waiter, to give it.
+-- | The items that were taken from the free ones for a waiter, for its promise to be fulfilled with.
 data Handoff conn
-  = OneTo !(Giver 'Anywhere conn) conn
-  | ManyTo !(Giver 'Anywhere [conn]) [conn]
+  = OneTo !(Promise 'Anywhere conn) conn
+  | ManyTo !(Promise 'Anywhere [conn]) [conn]
 
 -- | Why a pool gave nothing to use.
 data PoolError
@@ -153,8 +153,8 @@ settle state@(State _ _ _ lanes)
             go (State count' conns' arrival (if Seq.null others then IntMap.delete need lanes' else IntMap.insert need others lanes')) (handoff : handed)
       _ -> (st, reverse handed)
     serve count conns = \case
-      One giver _ | conn : others <- conns -> Just (count - 1, others, OneTo giver conn)
-      Many many giver _ | many <= count -> let (taken, others) = splitAt many conns in Just (count - many, others, ManyTo giver taken)
+      One promise _ | conn : others <- conns -> Just (count - 1, others, OneTo promise conn)
+      Many many promise _ | many <= count -> let (taken, others) = splitAt many conns in Just (count - many, others, ManyTo promise taken)
       _ -> Nothing
 
 -- | The first waiter of the lane whose first waiter is the oldest, among the lanes that need no more items than are free.
@@ -174,8 +174,8 @@ putBack [conn] (State count conns arrival lanes)
   -- No lane needs as few items as were free, so one item that is back can only serve the lane that needs one more: its
   -- first waiter if it takes one item, which then has the very item, and the free items are as they were.
   | Just lane <- IntMap.lookup (count + 1) lanes,
-    One giver _ :< others <- viewl lane =
-      (State count conns arrival (if Seq.null others then IntMap.delete (count + 1) lanes else IntMap.insert (count + 1) others lanes), [OneTo giver conn])
+    One promise _ :< others <- viewl lane =
+      (State count conns arrival (if Seq.null others then IntMap.delete (count + 1) lanes else IntMap.insert (count + 1) others lanes), [OneTo promise conn])
 putBack returned (State count conns arrival lanes) = settle (State (count + length returned) (returned ++ conns) arrival lanes)
 
 -- | One item, if at least this many are free. It passes no waiter that could be served: none can be, or it would have been, so
@@ -199,7 +199,7 @@ claimMany many need state@(State count conns arrival lanes)
   | count >= max many need = let (taken, others) = splitAt many conns in (State (count - many) others arrival lanes, Right taken)
   | otherwise = (state, Left ())
 
--- | What the item or the items are, if the claim finds them, and else the end to wait at, once the part's giver is queued. A ticket is
+-- | What the item or the items are, if the claim finds them, and else the future to await, once the part's promise is queued. A ticket is
 -- made only then, and the claim is made again with it: what is released between the look and the queueing is there for this
 -- part to take. Asking is a point to give way at, as a link's receive is: a part that does nothing else than check
 -- connections out and release them doesn't keep the others of its core from running.
@@ -208,40 +208,40 @@ reserved ::
   IORef (State conn) ->
   Int ->
   (State conn -> (State conn, Either () taken)) ->
-  (Giver 'Anywhere taken -> Int -> Waiter conn) ->
-  arr () (Either (Waiting arr 'Anywhere taken) taken)
+  (Promise 'Anywhere taken -> Int -> Waiter conn) ->
+  arr () (Either (Future arr 'Anywhere taken) taken)
 reserved ref need claim handout =
-  named (Label "reserved" "Takes what is free if enough is, and else queues the giver and gives the end to wait at.") $
+  named (Label "reserved" "Takes what is free if enough is, and else queues the promise and returns the future to await.") $
     giveWay
       >>> giving "item free?" (step "claim from free items" (const (update ref claim)))
       >>> (taking "no" queue ||| taking "yes" (arr Right))
   where
-    queue = ticket >>> step "queue giver" (\(awaiting, giver) -> update ref (queueOrClaim awaiting giver))
-    queueOrClaim awaiting giver state = case claim state of
+    queue = ticket >>> step "queue promise" (\(awaiting, promise) -> update ref (queueOrClaim awaiting promise))
+    queueOrClaim awaiting promise state = case claim state of
       (claimed, Right taken) -> (claimed, Right taken)
-      (_, Left ()) -> (queued need (handout giver) state, Left awaiting)
+      (_, Left ()) -> (queued need (handout promise) state, Left awaiting)
 
--- | A connection if one is free, or else the end to wait at for the one that
--- is released to this part: it queues the part's giver. The waiter can
+-- | A connection if one is free, or else the future to await for the one that
+-- is released to this part: it queues the part's promise. The waiter can
 -- 'abandon' it instead, which gives back a connection that came meanwhile.
-reserve :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Either (Waiting arr 'Anywhere conn) conn)
+reserve :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Either (Future arr 'Anywhere conn) conn)
 reserve = reserveAt 1
 
 -- | One item if at least this many are free: a waiter for an item that leaves a number free for others, as a reserve is.
-reserveAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Int -> Pool conn -> arr () (Either (Waiting arr 'Anywhere conn) conn)
+reserveAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Int -> Pool conn -> arr () (Either (Future arr 'Anywhere conn) conn)
 reserveAt need (Pool ref _) = reserved ref need (claimOne need) One
 
 -- | This many items at once, if at least the number needed are free: the waiter queues in the lane of what serves it, which
 -- is never fewer than it takes.
-reserveMany :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Int -> Int -> Pool conn -> arr () (Either (Waiting arr 'Anywhere [conn]) [conn])
+reserveMany :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Int -> Int -> Pool conn -> arr () (Either (Future arr 'Anywhere [conn]) [conn])
 reserveMany need many (Pool ref _) = reserved ref (max many need) (claimMany many need) (Many many)
 
--- | The item or the items once the part's ticket is given them, which the part waits at, and gives up its place at when it is
--- cancelled, so that what was given to it meanwhile goes back through the arrow. The pool that they are of is in the
--- input, with the ticket's end, and the arrow that gives back takes it with them.
-waited :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr (Pool conn, taken) () -> arr (Pool conn, Waiting arr 'Anywhere taken) taken
+-- | The item or the items once the part's promise is fulfilled with them, which the part awaits, and gives up its place when it is
+-- cancelled, so that what was fulfilled meanwhile goes back through the arrow. The pool that they are of is in the
+-- input, with the future, and the arrow that gives back takes it with them.
+waited :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr (Pool conn, taken) () -> arr (Pool conn, Future arr 'Anywhere taken) taken
 waited giveBack =
-  named (Label "waited" "Waits for the item to be given, and gives up the place in the queue if cancelled meanwhile.") $
+  named (Label "waited" "Waits for the promise of the item to be fulfilled, and gives up the place in the queue if cancelled meanwhile.") $
     scope returnA giveUp (fst ^>> second await >>^ snd)
   where
     giveUp =
@@ -251,7 +251,7 @@ waited giveBack =
                   "no"
                   ( swap
                       ^>> first abandon
-                      >>> decide "given meanwhile?" (\(given, pool) -> maybe (Left ()) (Right . (pool,)) given)
+                      >>> decide "fulfilled meanwhile?" (\(fulfilled, pool) -> maybe (Left ()) (Right . (pool,)) fulfilled)
                       >>> (taking "no" returnA ||| taking "yes" giveBack)
                   )
             )
@@ -281,15 +281,15 @@ checkoutAt =
     claim input@(need, Pool ref _) = either (const (Left input)) Right <$> update ref (claimOne need)
     queue =
       keeping ticket
-        >>> giving "item free?" (step "queue giver" queueing)
+        >>> giving "item free?" (step "queue promise" queueing)
         >>> ( taking "no" (waited (step "return item" (\(pool, item) -> releaseNow pool [item])))
                 ||| taking "yes" returnA
             )
-    queueing ((awaiting, giver), (need, pool@(Pool ref _))) =
-      either (Left . (pool,)) Right <$> update ref (queueOrClaim need awaiting giver)
-    queueOrClaim need awaiting giver state = case claimOne need state of
+    queueing ((awaiting, promise), (need, pool@(Pool ref _))) =
+      either (Left . (pool,)) Right <$> update ref (queueOrClaim need awaiting promise)
+    queueOrClaim need awaiting promise state = case claimOne need state of
       (claimed, Right taken) -> (claimed, Right taken)
-      (_, Left ()) -> (queued need (One giver) state, Left awaiting)
+      (_, Left ()) -> (queued need (One promise) state, Left awaiting)
 
 -- | The same for this many items at once, when at least the number needed are free.
 checkoutMany :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Int -> Int -> Pool conn -> arr () [conn]
@@ -304,15 +304,15 @@ checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
     claim pool@(Pool ref _) = either (const (Left pool)) (Right . (pool,)) <$> update ref (claimMany many need)
     queue =
       keeping ticket
-        >>> now (\((awaiting, giver), pool@(Pool ref _)) -> either (\waiting -> Left (pool, waiting)) (Right . (pool,)) <$> update ref (queueOrClaim awaiting giver))
+        >>> now (\((awaiting, promise), pool@(Pool ref _)) -> either (\future -> Left (pool, future)) (Right . (pool,)) <$> update ref (queueOrClaim awaiting promise))
         >>> (waitedIn ||| returnA)
-    queueOrClaim awaiting giver state = case claimMany many need state of
+    queueOrClaim awaiting promise state = case claimMany many need state of
       (claimed, Right taken) -> (claimed, Right taken)
-      (_, Left ()) -> (queued (max many need) (Many many giver) state, Left awaiting)
+      (_, Left ()) -> (queued (max many need) (Many many promise) state, Left awaiting)
     waitedIn = scope returnA giveUp (swap . fst ^>> first await >>^ swap)
     giveUp =
       unlessDone
-        ^>> (returnA ||| (swap ^>> first abandon >>> now (\(given, pool) -> maybe (pure ()) (releaseNow pool) given)))
+        ^>> (returnA ||| (swap ^>> first abandon >>> now (\(fulfilled, pool) -> maybe (pure ()) (releaseNow pool) fulfilled)))
 
 -- | A connection, if one is free within the time, as 'checkout' waits for it: 'Nothing' if it isn't, once the
 -- place in the queue is given up.
@@ -340,15 +340,15 @@ release pool = step "return item" (releaseNow pool . pure)
 
 -- | Gives the items back to the pool: the oldest waiters that can have them are given them, and the rest are free. It
 -- is one action that never waits, so a part that is cancelled can't lose an item between a waiter that has gone and the
--- next: it hands them over as the arrow's 'give' does it, but without its point to give way at.
+-- next: it hands them over as the arrow's 'fulfil' does it, but without its point to give way at.
 releaseNow :: Pool conn -> [conn] -> IO ()
 releaseNow (Pool ref _) conns = update ref (putBack conns) >>= handOver ref
 
--- | Queues the giver, in the lane of the waiters that need this many items free, for one item, which it is given at
--- once if it is the oldest of the waiters that can have an item. The giver says whether it took the item, so a giver can be
+-- | Queues the promise, in the lane of the waiters that need this many items free, for one item. It is fulfilled at
+-- once if it is the oldest of the waiters that can have an item. The promise says whether it took the item, so a promise can be
 -- made of another, for a part that waits for the item or for something else.
-queueNow :: Pool conn -> Int -> Giver 'Anywhere conn -> IO ()
-queueNow (Pool ref _) need giver = update ref (settle . queued need (One giver)) >>= handOver ref
+queueNow :: Pool conn -> Int -> Promise 'Anywhere conn -> IO ()
+queueNow (Pool ref _) need promise = update ref (settle . queued need (One promise)) >>= handOver ref
 
 -- | Gives the items to the waiters they were taken for. A waiter that has gone doesn't take them, and they are put back, to
 -- go to the next that can have them.
@@ -361,5 +361,5 @@ handOver ref (handoff : others) =
   where
     -- Gives them, and says what the waiter didn't take.
     offer = \case
-      OneTo giver conn -> (\taken -> [conn | not taken]) <$> giveNow giver conn
-      ManyTo giver conns -> (\taken -> if taken then [] else conns) <$> giveNow giver conns
+      OneTo promise conn -> (\taken -> [conn | not taken]) <$> fulfilNow promise conn
+      ManyTo promise conns -> (\taken -> if taken then [] else conns) <$> fulfilNow promise conns

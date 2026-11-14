@@ -108,17 +108,17 @@ outermost = fmap snd . listToMaybe . reverse . getCallStack
 -- | The tickets of a diagram are never made: there are two instances, for the two reaches, so that a program that
 -- uses either is built.
 instance Exchange Diagram ('Here DiagramCore) where
-  data Waiting Diagram ('Here DiagramCore) a
+  data Future Diagram ('Here DiagramCore) a
   ticket = leaf "ticket" Round
   await = leaf "await" Wait
-  give = leaf "give" Handover
+  fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
 
 instance Exchange Diagram 'Anywhere where
-  data Waiting Diagram 'Anywhere a
+  data Future Diagram 'Anywhere a
   ticket = leaf "ticket" Round
   await = leaf "await" Wait
-  give = leaf "give" Handover
+  fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
 
 type instance Local Diagram = 'Here DiagramCore

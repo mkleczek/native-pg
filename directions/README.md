@@ -16,8 +16,8 @@ tests and benchmark use its parsers.
   values that are known only when the program runs: a reader, a cursor, a
   ticket; and what an arrow can do: `Effect` (`now`, an action that never
   waits), `Block` (wait until a watch fires), `Concurrent` (two arrows at
-  once) and `Exchange arr r` (a ticket that one direction gives a value and
-  another waits for; made as the program runs, `ticket :: arr () (Waiting arr r a, Giver r a)`,
+  once) and `Exchange arr r` (a ticket that one direction fulfils with a value and
+  another awaits; made as the program runs, `ticket :: arr () (Future arr r a, Promise r a)`,
   and its ends passed through arrows like any value; the ticket's reach `r` is
   in its type, below). None has a superclass: instances and users add what they
   need.
@@ -38,9 +38,9 @@ tests and benchmark use its parsers.
     parts on one thread; a part that blocks is the rest of its program, as
     data. A ticket is a slot on that thread: a part that waits for it is
     parked there, with no watch, and the scheduler takes it back when the
-    ticket is given its value. `runSimulation` runs the same program in an
+    ticket's promise is fulfilled. `runSimulation` runs the same program in an
     order a seed chooses, never waits, and reports parts that wait for each
-    other or for tickets that nothing will give a value.
+    other or for tickets that nothing will fulfil.
 - **The proxy** (`Network.Directions.Proxy`): `pump`, written once with
   `ArrowChoice` and `Link`; the proxy, a pump each way; an echo server; a
   client in two directions, and the same client in one, which deadlocks once
@@ -54,26 +54,26 @@ tests and benchmark use its parsers.
   `Delimited s a b`, run by `runDelimited :: (forall s. Delimited s a b) -> ...`
   or by `runCores`. One ticket API, `Exchange arr r`, with the ticket's reach in
   its type: `data Reach = Here Type | Anywhere`. A ticket of reach `'Here s`
-  (`Local (Delimited s)`) belongs to the one scheduler: its `Giver ('Here s) a`
-  mentions `s`, so it and its `Waiting` end can't be given a value, or waited
-  for, by the program of another core (`RegionSpec` shows the compiler refusing,
+  (`Local (Delimited s)`) belongs to the one scheduler: its `Promise ('Here s) a`
+  mentions `s`, so it can't be fulfilled, nor its `Future` awaited,
+  by the program of another core (`RegionSpec` shows the compiler refusing,
   with `-fdefer-type-errors`), and the arrow keeps it as a plain slot, with no
-  atomic operation. A ticket of reach `'Anywhere` has a `Giver 'Anywhere a`,
+  atomic operation. A ticket of reach `'Anywhere` has a `Promise 'Anywhere a`,
   which has no core in its type and can be kept in shared structures, and a
-  `Waiting` end on the core that made it. A `give` to a parked waiter puts its
+  `Future` end on the core that made it. A `fulfil` of a parked waiter's promise puts its
   continuation in the waiter's core's mailbox and wakes that core's poller
   (`EVFILT_USER` on kqueue, an eventfd on epoll) if it sleeps in it; the
   scheduler takes its mailbox each round and before it sleeps. `Pool` is a
   connection pool written once for any arrow with `Exchange arr 'Anywhere`, with
-  one reference to the free connections and the givers of the waiters.
+  one reference to the free connections and the promises of the waiters.
   `Threads` has the one reach, `'Anywhere`, `Compiled` has both on its one
-  core (a giver on any thread puts the waiter in its mailbox), and `Loop` only
+  core (a promise on any thread puts the waiter in its mailbox), and `Loop` only
   `Local`'s.
 - **Helpers** (`Network.Streaming.Combinators`): what programs need so that a
   value is made where it is used and not carried through the arrows between:
   `timesWith` (a step this many times, on a state), `untilJust` (a retry that
   gives way), `keeping` (an arrow's result next to the input), and `expect` and
-  `call` for a request that carries the giver its answer is given at, for a
+  `call` for a request that carries the promise of its answer, for a
   ticket of any reach.
 - **An environment** (`Network.Streaming.With`): `With r arr a b` is an arrow of
   `arr` that is given an `r` besides its input, which `ask` gives back, so that

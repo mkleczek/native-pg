@@ -924,7 +924,7 @@ awaiting ctx tree exchanged body = do
   where
     title = envelope ++ "awaits " ++ exchanged
     label = Label ("awaits " ++ exchanged) comment
-    comment = "Hands out a ticket for " ++ exchanged ++ ", waits for it to be given, and abandons it otherwise."
+    comment = "Hands out a ticket for " ++ exchanged ++ ", waits for its promise to be fulfilled, and abandons it otherwise."
     detail = maybe "" ("\n" ++) (steps body)
 
 -- | The sign of an exchange, which is an envelope (U+2709), and a space.

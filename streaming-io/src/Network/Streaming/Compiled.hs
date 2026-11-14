@@ -241,7 +241,7 @@ data Core
 
 -- | A ticket is a slot on this thread: a part that waits for it is parked in
 -- it, as a closure that puts its continuation back among those that can go on,
--- and goes back when the ticket is given its value. Giving and waiting count a
+-- and goes back when the ticket's promise is fulfilled. Fulfilling and awaiting count a
 -- step, and can give way: a ticket is where parts coordinate, and none is on a
 -- parser's path.
 type instance Local (CompiledM m) = 'Here Core
@@ -249,30 +249,30 @@ type instance Local (CompiledM m) = 'Here Core
 type instance ModeOf (CompiledM m) = m
 
 instance Exchange (CompiledM m) ('Here Core) where
-  newtype Waiting (CompiledM m) ('Here Core) a = CompiledWaiting (IORef (Slot a))
-  ticket = Compiled (\_ () next -> newIORef Empty >>= \slot -> next (CompiledWaiting slot, HereGiver slot))
-  await = Compiled $ \context@(Context run part _) (CompiledWaiting slot) next ->
+  newtype Future (CompiledM m) ('Here Core) a = CompiledFuture (IORef (Slot a))
+  ticket = Compiled (\_ () next -> newIORef Empty >>= \slot -> next (CompiledFuture slot, HerePromise slot))
+  await = Compiled $ \context@(Context run part _) (CompiledFuture slot) next ->
     readIORef slot >>= \case
-      Given value -> checkpoint part *> steppedIn context (next value)
+      Fulfilled value -> checkpoint part *> steppedIn context (next value)
       Empty -> registering part (OnTicket slot) *> (Parked <$ writeIORef slot (Waiter (\action -> wakeTicket run (resumed context (action >>= next)))))
       Waiter _ -> ioError (userError "two parts wait for one ticket")
       Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
-  give = Compiled (\context (HereGiver slot, value) next -> giveHere slot value >>= \taken -> steppedIn context (next taken))
-  abandon = Compiled (\_ (CompiledWaiting slot) next -> abandonHere slot >>= next)
+  fulfil = Compiled (\context (HerePromise slot, value) next -> fulfilHere slot value >>= \taken -> steppedIn context (next taken))
+  abandon = Compiled (\_ (CompiledFuture slot) next -> abandonHere slot >>= next)
 
--- | The waiter of a ticket that any thread can give is parked in the slot as a local ticket's is, but the
--- giver, on another thread, doesn't run it: it puts it in the mailbox of this scheduler, which goes on with it in
+-- | The waiter of a ticket that any thread can fulfil is parked in the slot as a local ticket's is, but the
+-- promise, on another thread, doesn't run it: it puts it in the mailbox of this scheduler, which goes on with it in
 -- its next round, and wakes the scheduler if it sleeps in its poller. There is one core: a program of this arrow
--- makes the ticket and waits at it on this thread, and what it gives its value from is any thread, or the same.
+-- makes the ticket and waits at it on this thread, and what fulfils its promise is any thread, or the same.
 instance Exchange (CompiledM m) 'Anywhere where
-  newtype Waiting (CompiledM m) 'Anywhere a = CompiledRemoteWaiting (IORef (RemoteSlot a))
+  newtype Future (CompiledM m) 'Anywhere a = CompiledRemoteFuture (IORef (RemoteSlot a))
   ticket = Compiled $ \(Context run _ _) () next -> do
     slot <- newIORef RemoteEmpty
-    next (CompiledRemoteWaiting slot, AnywhereGiver (giveRemote (runMailbox run) slot))
-  await = Compiled $ \context@(Context run part _) (CompiledRemoteWaiting slot) next ->
+    next (CompiledRemoteFuture slot, AnywherePromise (fulfilRemote (runMailbox run) slot))
+  await = Compiled $ \context@(Context run part _) (CompiledRemoteFuture slot) next ->
     awaitRemote run part slot (steppedIn context . next) (\park -> park (\action -> resumed context (action >>= next)))
-  give = Compiled $ \context (AnywhereGiver giver, value) next -> giver value >>= \taken -> steppedIn context (next taken)
-  abandon = Compiled $ \_ (CompiledRemoteWaiting slot) next -> abandonRemote slot >>= next
+  fulfil = Compiled $ \context (AnywherePromise promise, value) next -> promise value >>= \taken -> steppedIn context (next taken)
+  abandon = Compiled $ \_ (CompiledRemoteFuture slot) next -> abandonRemote slot >>= next
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
 -- that can go on in turn, until it has run for a turn and reaches a point to

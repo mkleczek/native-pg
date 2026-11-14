@@ -7,8 +7,8 @@
 -- thousands of them, which is a fraction of a second: a server starts a part for each connection that it may have, and
 -- they all wait for the first.
 --
--- The parts wait for tickets that nothing gives; one more part waits until all of them do, takes the live heap and the
--- time, and gives the tickets, so that the run ends. The heap of 64 parts is taken from that of 4,096, which leaves what
+-- The parts wait for tickets that nothing fulfils; one more part waits until all of them do, takes the live heap and the
+-- time, and fulfils the tickets, so that the run ends. The heap of 64 parts is taken from that of 4,096, which leaves what
 -- the program, the run and the arrow cost out of it. The suite runs with @-T@ ("-with-rtsopts" in its cabal stanza, as the
 -- cursors' does) for the heap to be counted.
 module GroupCostSpec (spec) where
@@ -22,7 +22,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (uncons)
 import Data.Word (Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
-import Network.Streaming.Classes (Block, Concurrent (..), Effect (..), Exchange (..), GiveWay, Giver, Local, Time, millis, monotonicNanoseconds)
+import Network.Streaming.Classes (Block, Concurrent (..), Effect (..), Exchange (..), GiveWay, Promise, Local, Time, millis, monotonicNanoseconds)
 import Network.Streaming.Combinators (consume, done, keeping, localTicket, sleep)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
@@ -69,28 +69,28 @@ spec = describe "the parts of a group" $ forM_ runners $ \(Runner name run) -> d
       then pure ()
       else failTest ("starting 4,096 parts took " <> show (least `div` 1000000) <> " ms")
 
--- | The program: this many parts that wait for a ticket nothing gives, and the one that looks at them all waiting.
+-- | The program: this many parts that wait for a ticket nothing fulfils, and the one that looks at them all waiting.
 idleGroup :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Time arr, Concurrent arr, Exchange arr (Local arr)) => IORef (Maybe Probe) -> Int -> arr () ()
 idleGroup out count = now (const (newIORef [])) >>> together (watcher : replicate count waiter)
   where
-    -- A part gives the giver of its ticket to the registry, which parts on several threads add to, and waits for the ticket.
+    -- A part adds the promise of its ticket to the registry, which parts on several threads add to, and waits for the ticket.
     waiter :: arr (Registry arr) ()
-    waiter = keeping localTicket >>> now (\((waiting, giver), registry) -> waiting <$ atomicModifyIORef' registry (\givers -> (giver : givers, ()))) >>> await
-    -- The watcher looks every millisecond whether all have registered, and then takes the heap and the time, and gives
+    waiter = keeping localTicket >>> now (\((future, promise), registry) -> future <$ atomicModifyIORef' registry (\promises -> (promise : promises, ()))) >>> await
+    -- The watcher looks every millisecond whether all have registered, and then takes the heap and the time, and fulfils
     -- the tickets.
     watcher :: arr (Registry arr) ()
     watcher = looking
     looking :: arr (Registry arr) ()
-    looking = now (\registry -> (\givers -> if length givers >= count then Right givers else Left registry) <$> readIORef registry) >>> ((patient >>> looking) ||| (probing >>> giving))
+    looking = now (\registry -> (\promises -> if length promises >= count then Right promises else Left registry) <$> readIORef registry) >>> ((patient >>> looking) ||| (probing >>> fulfilling))
     patient :: arr (Registry arr) (Registry arr)
     patient = keeping (sleep (millis 1)) >>^ snd
-    probing :: arr [Giver (Local arr) ()] [Giver (Local arr) ()]
-    probing = now (\givers -> performMajorGC *> (Probe . gcdetails_live_bytes . gc <$> getRTSStats) <*> monotonicNanoseconds >>= \probe -> givers <$ writeIORef out (Just probe))
-    giving :: arr [Giver (Local arr) ()] ()
-    giving = maybe (Left ()) Right . uncons ^>> (returnA ||| (consume ((, ()) ^>> give >>> done) >>> giving))
+    probing :: arr [Promise (Local arr) ()] [Promise (Local arr) ()]
+    probing = now (\promises -> performMajorGC *> (Probe . gcdetails_live_bytes . gc <$> getRTSStats) <*> monotonicNanoseconds >>= \probe -> promises <$ writeIORef out (Just probe))
+    fulfilling :: arr [Promise (Local arr) ()] ()
+    fulfilling = maybe (Left ()) Right . uncons ^>> (returnA ||| (consume ((, ()) ^>> fulfil >>> done) >>> fulfilling))
 
--- | What the parts of a group register: the givers of their tickets.
-type Registry arr = IORef [Giver (Local arr) ()]
+-- | What the parts of a group register: the promises of their tickets.
+type Registry arr = IORef [Promise (Local arr) ()]
 
 -- | The live heap, in bytes, when this many parts wait.
 liveWith :: (Program -> IO ()) -> Int -> IO Word64

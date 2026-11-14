@@ -160,18 +160,18 @@ type instance Local (With r arr) = Local arr
 -- | An arrow with an environment is built in the mode of its inner arrow.
 type instance ModeOf (With r arr) = ModeOf arr
 
--- | The end of the inner arrow's ticket, from the input that has it beside the environment.
-innerWaiting :: (r, Waiting (With r arr) reach a) -> Waiting arr reach a
-innerWaiting (_, WithWaiting waiting) = waiting
-{-# INLINE innerWaiting #-}
+-- | The future of the inner arrow's ticket, from the input that has it beside the environment.
+innerFuture :: (r, Future (With r arr) reach a) -> Future arr reach a
+innerFuture (_, WithFuture future) = future
+{-# INLINE innerFuture #-}
 
 instance (Arrow arr, Exchange arr reach) => Exchange (With r arr) reach where
-  newtype Waiting (With r arr) reach a = WithWaiting (Waiting arr reach a)
-  ticket = With (done >>> ticket >>^ first WithWaiting)
+  newtype Future (With r arr) reach a = WithFuture (Future arr reach a)
+  ticket = With (done >>> ticket >>^ first WithFuture)
   {-# INLINE ticket #-}
-  await = With (innerWaiting ^>> await)
+  await = With (innerFuture ^>> await)
   {-# INLINE await #-}
-  give = With (snd ^>> give)
-  {-# INLINE give #-}
-  abandon = With (innerWaiting ^>> abandon)
+  fulfil = With (snd ^>> fulfil)
+  {-# INLINE fulfil #-}
+  abandon = With (innerFuture ^>> abandon)
   {-# INLINE abandon #-}

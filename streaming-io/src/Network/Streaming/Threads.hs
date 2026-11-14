@@ -376,29 +376,29 @@ inScope part@(Part _ _ frames _ flag) scope' action = do
   readIORef frames >>= writeIORef frames . drop 1
   pure outcome
 
--- | The threads have no cores: every ticket can be given by every thread, so there is one reach.
+-- | The threads have no cores: every ticket can be fulfilled by every thread, so there is one reach.
 type instance Local (ThreadsM m) = 'Anywhere
 
 type instance ModeOf (ThreadsM m) = m
 
--- | A ticket is a 'TMVar', which blocks the thread that waits for it, and whether the waiter has gone. The two
--- ends are the same 'TMVar'. Every thread can reach both: there is no core to belong to.
+-- | A ticket is a 'TMVar', which blocks the thread that waits for it, and whether the waiter has gone. The future
+-- and the promise are the same 'TMVar'. Every thread can reach both: there is no core to belong to.
 instance Exchange (ThreadsM m) 'Anywhere where
-  data Waiting (ThreadsM m) 'Anywhere a = ThreadWaiting (TMVar a) (TVar Bool)
+  data Future (ThreadsM m) 'Anywhere a = ThreadFuture (TMVar a) (TVar Bool)
   ticket = Threads $ \_ () -> do
     var <- newEmptyTMVarIO
     abandoned <- newTVarIO False
-    pure (ThreadWaiting var abandoned, AnywhereGiver (giveThread var abandoned))
-  await = Threads (\part (ThreadWaiting var _) -> waiting part (atomically (readTMVar var)))
-  give = Threads (\_ (AnywhereGiver giver, value) -> giver value)
-  abandon = Threads $ \_ (ThreadWaiting var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
+    pure (ThreadFuture var abandoned, AnywherePromise (fulfilThread var abandoned))
+  await = Threads (\part (ThreadFuture var _) -> waiting part (atomically (readTMVar var)))
+  fulfil = Threads (\_ (AnywherePromise promise, value) -> promise value)
+  abandon = Threads $ \_ (ThreadFuture var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
 
--- | The giver evaluates the value, before the transaction, as the other arrows' givers do.
-giveThread :: TMVar a -> TVar Bool -> a -> IO Bool
-giveThread var abandoned !value = atomically $ do
+-- | The promise evaluates the value, before the transaction, as the other arrows' promises do.
+fulfilThread :: TMVar a -> TVar Bool -> a -> IO Bool
+fulfilThread var abandoned !value = atomically $ do
   gone <- readTVar abandoned
   if gone
     then pure False
     else do
-      given <- tryPutTMVar var value
-      if given then pure True else throwSTM (userError "a ticket was given a value twice")
+      fulfilled <- tryPutTMVar var value
+      if fulfilled then pure True else throwSTM (userError "a promise was fulfilled twice")

@@ -134,17 +134,17 @@ type instance ModeOf Loop = 'Release
 data Core
 
 -- | A ticket is a slot on this thread. A part that waits for it is parked in
--- it, with no watch, and goes back among those that can go on when the ticket
--- is given its value. Giving a value and abandoning the ticket never wait, so
+-- it, with no watch, and goes back among those that can go on when the ticket's
+-- promise is fulfilled. Fulfilling a promise and abandoning the ticket never wait, so
 -- they are actions.
 type instance Local Loop = 'Here Core
 
 instance Exchange Loop ('Here Core) where
-  newtype Waiting Loop ('Here Core) a = LoopWaiting (IORef (Slot a))
-  ticket = Now (\() -> newIORef Empty >>= \slot -> pure (LoopWaiting slot, HereGiver slot))
-  await = Seq (Arr (\(LoopWaiting slot) -> slot)) Await
-  give = Now (\(HereGiver slot, value) -> giveHere slot value)
-  abandon = Now (\(LoopWaiting slot) -> abandonHere slot)
+  newtype Future Loop ('Here Core) a = LoopFuture (IORef (Slot a))
+  ticket = Now (\() -> newIORef Empty >>= \slot -> pure (LoopFuture slot, HerePromise slot))
+  await = Seq (Arr (\(LoopFuture slot) -> slot)) Await
+  fulfil = Now (\(HerePromise slot, value) -> fulfilHere slot value)
+  abandon = Now (\(LoopFuture slot) -> abandonHere slot)
 
 -- | A part of a running program: a program with its input, or a value for
 -- what follows, and what follows; or a failure, which unwinds what follows,
@@ -275,7 +275,7 @@ raceHalf (Contest scope' ref) rest outcome =
 
 -- | Runs a part until it waits, forks, ends, or has taken this many steps of
 -- its primitives: what it came to, and how many steps it took. A part it parks
--- on a ticket goes back with the given action when the ticket has its value.
+-- on a ticket goes back with the given action when its promise is fulfilled.
 advance :: forall r. Env -> IO Instant -> Int -> (Process r -> IO ()) -> Process r -> IO (Int, Advanced r)
 advance env time fuel wake = go 0
   where
@@ -307,7 +307,7 @@ advance env time fuel wake = go 0
                 Nothing -> pure (steps + 1, Waits input (Check frames))
             Await ->
               readIORef input >>= \case
-                Given value -> go (steps + 1) (Give value frames)
+                Fulfilled value -> go (steps + 1) (Give value frames)
                 Empty -> (steps + 1, Parked) <$ writeIORef input (Waiter (\action -> action >>= \value -> wake (Give value frames)))
                 Waiter _ -> ioError (userError "two parts wait for one ticket")
                 Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
@@ -365,7 +365,7 @@ watchOf = \case
 -- a simulation a step is any primitive that a part ran. In a run of
 -- "Network.Streaming.Compiled" or "Network.Streaming.Delimited" it is only
 -- a point to give way at, which is a link's receive or send, a wait, or a
--- ticket given or waited for.
+-- ticket fulfilled or awaited.
 data Report = Report {reportSteps :: !Int, reportWaits :: !Int}
   deriving (Eq, Show)
 
@@ -395,7 +395,7 @@ runLoop program input = do
           Forked parts -> go report' parked (others <> parts) waiting
           Waits event process' -> go report' parked others ((watchFor env event process', process') : waiting)
       []
-        | null waiting && parked > (0 :: Int) -> ioError (userError "runLoop: parts wait for tickets that nothing will give a value")
+        | null waiting && parked > (0 :: Int) -> ioError (userError "runLoop: parts wait for tickets that nothing will fulfil")
         | null waiting -> ioError (userError "runLoop: the program ended without a result")
         | otherwise -> do
             fired <- awaitFired (zip (map fst waiting) [0 :: Int ..])
@@ -407,7 +407,7 @@ runLoop program input = do
 data Outcome b
   = Completed b
   | -- | These parts wait for each other: none of their watches can fire, and
-    -- no ticket they wait for will be given a value.
+    -- no ticket they wait for will be fulfilled.
     Deadlocked [Int]
   | -- | It took the most steps it was allowed.
     GaveUp
@@ -427,7 +427,7 @@ data Simulated b = Simulated
 -- none has, but a part waits for an instant, the virtual clock jumps to the
 -- earliest, so that time costs nothing and a run is the same every time; if
 -- none does, the parts wait for each other, or for tickets that nothing will
--- give a value, which it reports. The clock starts at 0. Its links must be
+-- fulfil, which it reports. The clock starts at 0. Its links must be
 -- simulated ones, whose watches depend only on what the parts did, so that a
 -- seed always gives the same run.
 runSimulation :: Word64 -> Int -> Loop a b -> a -> IO (Simulated b)

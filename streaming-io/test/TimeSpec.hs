@@ -287,12 +287,12 @@ describeExit = \case
   Cancelled' -> "cancelled"
 
 -- | A wait that nothing ends.
--- | A wait for a ticket of the arrow's own core that nothing gives a value, and for one of any core.
+-- | A wait for a ticket of the arrow's own core that nothing fulfils, and for one of any core.
 waitsForTicket :: (Rich arr) => arr a ()
 waitsForTicket = done >>> localTicket >>> fst ^>> await
 
 waitsForAnywhereTicket :: forall arr a. (Rich arr, Exchange arr 'Anywhere) => arr a ()
-waitsForAnywhereTicket = done >>> ticket @arr @'Anywhere >>> fst ^>> (await :: arr (Waiting arr 'Anywhere ()) ())
+waitsForAnywhereTicket = done >>> ticket @arr @'Anywhere >>> fst ^>> (await :: arr (Future arr 'Anywhere ()) ())
 
 waitsForEver :: (Rich arr) => arr a ()
 waitsForEver = now (const readableNever) >>> block

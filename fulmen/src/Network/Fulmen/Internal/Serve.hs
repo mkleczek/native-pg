@@ -8,7 +8,7 @@
 
 -- | The server as a static network of parts. Each core has its workers from the start, and the first core has the
 -- acceptor besides, which opens the listener when the server starts and closes it when it ends. A worker offers itself
--- as free, in the pool that the cores share, and waits at a ticket for the connection that the acceptor gives it; then
+-- as free, in the pool that the cores share, and waits at a ticket for the connection that the acceptor fulfils it with; then
 -- it serves the connection, request after request, until it ends, and offers itself again. The acceptor takes a free
 -- worker of the core that has the most free workers, so that the connections are shared out between the cores, and
 -- waits for one when there is none, so that past the cap on connections they wait in the listen backlog.
@@ -90,29 +90,29 @@ acceptance Listen {openListener, closeListener} =
   where
     place =
       ( (,)
-          <$> giving "worker's giver" (snd ^>> checkout)
+          <$> giving "worker's promise" (snd ^>> checkout)
           <*> giving "accepted socket" (fst ^>> accept)
       )
-        >>> alongside (answering "connection" give)
+        >>> alongside (answering "connection" fulfil)
         >>> decide "worker took it?" untaken
         >>> (taking "no" close ||| taking "yes" returnA)
     accept =
       named (Label "accept" "Accepts the next connection of the listening socket, and blocks while none is waiting.") acceptor
     untaken (taken, (_, socket)) = if taken then Right () else Left socket
 
--- | The giver of a free worker of the core that has the most free workers, which is taken from the pool at once. When no
--- worker is free, the part queues the giver of a ticket of its own in the pool, which gives it the worker that is released
--- first, on any core, and waits at the ticket. A worker that is given after the wait has ended is put back in the pool.
-checkout :: (Runtime arr) => arr Cores (Giver 'Anywhere Socket)
+-- | The promise of a free worker of the core that has the most free workers, which is taken from the pool at once. When no
+-- worker is free, the part queues the promise of a ticket of its own in the pool, which fulfils it with the worker that is released
+-- first, on any core, and waits at the ticket. A worker that comes after the wait has ended is put back in the pool.
+checkout :: (Runtime arr) => arr Cores (Promise 'Anywhere Socket)
 checkout =
   named (Label "checkout" "Takes a free worker of the core that has the most free workers at once, and else waits for the worker that is freed first, on any core, and puts back one that comes too late.") $
     alongside (step "take a free worker" (\(Cores _ shared) -> takeNowWith freest (sharedWorkers shared)))
       >>> decide "worker free now?" (\(taken, cores) -> maybe (Left cores) Right taken)
       >>> (taking "no" queued ||| taking "yes" returnA)
-      >>^ freeGiver
+      >>^ freePromise
   where
-    queued = asking "worker's giver" (withTicket (step "queue for a worker" queue) (step "put the worker back" putBack)) >>^ snd
-    queue (giver, Cores _ shared) = queueNow (sharedWorkers shared) 1 giver
+    queued = asking "worker's promise" (withTicket (step "queue for a worker" queue) (step "put the worker back" putBack)) >>^ snd
+    queue (promise, Cores _ shared) = queueNow (sharedWorkers shared) 1 promise
     putBack (free, Cores _ shared) = releaseNow (sharedWorkers shared) [free]
 
 -- | The position of the first free worker, in the order that the pool takes them in, of the core that has the most of
@@ -134,15 +134,15 @@ worker settings handler =
   named (Label "worker" "Offers itself as free, waits for a connection, and serves it, for ever.") $
     foreverA (tap (giving "accepted socket" offered >>> connection settings handler))
 
--- | The worker is free: the giver of a new ticket is in the pool, and the connection that is given it comes. A
--- connection that is given after the wait has ended is closed.
+-- | The worker is free: the promise of a new ticket is in the pool, and the connection that fulfils it comes. A
+-- connection that comes after the wait has ended is closed.
 offered :: (Runtime arr) => arr Cores (Shared, Socket)
 offered =
-  named (Label "offered" "Offers the worker as free in the pool, and waits at a ticket for the connection it is given, and closes one that comes too late.") $
-    (,) <$> arr sharedOf <*> (asking "connection" (withTicket (answering "worker's giver" (step "offer as free" offer)) (box "close late socket" (fst ^>> close))) >>^ snd)
+  named (Label "offered" "Offers the worker as free in the pool, and waits at a ticket for the connection that fulfils its promise, and closes one that comes too late.") $
+    (,) <$> arr sharedOf <*> (asking "connection" (withTicket (answering "worker's promise" (step "offer as free" offer)) (box "close late socket" (fst ^>> close))) >>^ snd)
   where
     sharedOf (Cores _ shared) = shared
-    offer (giver, Cores core shared) = releaseNow (sharedWorkers shared) [Free core giver]
+    offer (promise, Cores core shared) = releaseNow (sharedWorkers shared) [Free core promise]
 
 -- | What a connection is: its socket, the bytes of the next request that came early, which a request copies out of
 -- its buffer, and what the cores share.

@@ -26,67 +26,67 @@ import System.Timeout (timeout)
 spec :: Spec
 spec = describe "cores" $ do
   describe "tickets of any core" $ do
-    it "give a value to a part that waits on the same core, which goes on in a later round" $ do
+    it "fulfil the promise of a part that waits on the same core, which goes on in a later round" $ do
       fst <$> runDelimited (sameCore @'Anywhere) () `shouldReturn` (42, True)
       fst <$> runCompiled (sameCore @'Anywhere) () `shouldReturn` (42, True)
       runThreads (sameCore @'Anywhere) () `shouldReturn` (42, True)
 
-    it "give a value to a part on another core, whose scheduler waits in its poller" $ do
+    it "fulfil the promise of a part on another core, whose scheduler waits in its poller" $ do
       ensureCores
       shelf <- newIORef Nothing
       results <-
         within $ runCores 2 (pure shelf) $ \box core ->
           if core == 0
             then ticket @_ @'Anywhere >>> second (now (atomicWriteIORef box . Just)) >>> fst ^>> await
-            else untilJust (readIORef box) >>> now (\giver -> (giver, 7) <$ threadDelay 20000) >>> give >>^ bool 0 1
+            else untilJust (readIORef box) >>> now (\promise -> (promise, 7) <$ threadDelay 20000) >>> fulfil >>^ bool 0 1
       results `shouldBe` Just [7, 1 :: Int]
 
-    it "give a value from another thread to a part on a scheduler that waits in its poller, and to one that finds it given before it waits" $ do
-      fst <$> runDelimited givenAfterTheWait () `shouldReturn` (7, True)
-      fst <$> runCompiled givenAfterTheWait () `shouldReturn` (7, True)
-      runThreads givenAfterTheWait () `shouldReturn` (7, True)
-      fst <$> runDelimited givenBeforeTheWait () `shouldReturn` (7, True)
-      fst <$> runCompiled givenBeforeTheWait () `shouldReturn` (7, True)
-      runThreads givenBeforeTheWait () `shouldReturn` (7, True)
+    it "fulfil a promise from another thread for a part on a scheduler that waits in its poller, and for one that finds it fulfilled before it waits" $ do
+      fst <$> runDelimited fulfilledAfterTheWait () `shouldReturn` (7, True)
+      fst <$> runCompiled fulfilledAfterTheWait () `shouldReturn` (7, True)
+      runThreads fulfilledAfterTheWait () `shouldReturn` (7, True)
+      fst <$> runDelimited fulfilledBeforeTheWait () `shouldReturn` (7, True)
+      fst <$> runCompiled fulfilledBeforeTheWait () `shouldReturn` (7, True)
+      runThreads fulfilledBeforeTheWait () `shouldReturn` (7, True)
 
-    it "give every value that another thread gives the moment it finds the ticket, whenever that is in the part's wait" $ do
+    it "fulfil every promise that another thread fulfils the moment it finds the ticket, whenever that is in the part's wait" $ do
       ensureCores
-      withGiverThread $ \shelf -> do
+      withPromiseThread $ \shelf -> do
         fst <$> runDelimited (racing shelf 100000) () `shouldReturn` 100000
         fst <$> runCompiled (racing shelf 100000) () `shouldReturn` 100000
         runThreads (racing shelf 100000) () `shouldReturn` 100000
 
   describe "tickets of the arrow's own core" $ do
-    it "give a value to a part that waits on the same core, which goes on in a later round, with every arrow that has them" $ do
+    it "fulfil the promise of a part that waits on the same core, which goes on in a later round, with every arrow that has them" $ do
       fst <$> runDelimited sameCoreLocal () `shouldReturn` (42, True)
       fst <$> runCompiled sameCoreLocal () `shouldReturn` (42, True)
       fst <$> runLoop sameCoreLocal () `shouldReturn` (42, True)
 
   describe "the arrows that have what Runtime bundles" $
-    it "give a program tickets of both reaches" $ do
+    it "let a program fulfil tickets of both reaches" $ do
       runThreads ticketsOfBothReaches () `shouldReturn` ((42, True), (42, True))
       fst <$> runDelimited ticketsOfBothReaches () `shouldReturn` ((42, True), (42, True))
       fst <$> runCompiled ticketsOfBothReaches () `shouldReturn` ((42, True), (42, True))
 
   describe "a ticket of either reach" $ do
-    it "fails when a value is given twice" $ do
-      forM_ [void (runDelimited givenTwiceLocal ()), void (runCompiled givenTwiceLocal ()), void (runLoop givenTwiceLocal ()), void (runDelimited (givenTwice @'Anywhere) ()), void (runCompiled (givenTwice @'Anywhere) ()), void (runThreads (givenTwice @'Anywhere) ())] $ \run -> do
+    it "fails when a promise is fulfilled twice" $ do
+      forM_ [void (runDelimited fulfilledTwiceLocal ()), void (runCompiled fulfilledTwiceLocal ()), void (runLoop fulfilledTwiceLocal ()), void (runDelimited (fulfilledTwice @'Anywhere) ()), void (runCompiled (fulfilledTwice @'Anywhere) ()), void (runThreads (fulfilledTwice @'Anywhere) ())] $ \run -> do
         outcome <- try run
         either (\failure -> "twice" `isInfixOf` show (failure :: IOException)) (const False) outcome `shouldBe` True
 
-    it "tells the giver that the waiter has gone, and gives the waiter a value that came before it went" $ do
+    it "tells the promise that the waiter has gone, and returns to the waiter a value that came before it went" $ do
       fst <$> runDelimited goneLocal () `shouldReturn` (Nothing, False)
       fst <$> runCompiled goneLocal () `shouldReturn` (Nothing, False)
       fst <$> runLoop goneLocal () `shouldReturn` (Nothing, False)
       fst <$> runDelimited (gone @'Anywhere) () `shouldReturn` (Nothing, False)
       fst <$> runCompiled (gone @'Anywhere) () `shouldReturn` (Nothing, False)
       runThreads (gone @'Anywhere) () `shouldReturn` (Nothing, False)
-      fst <$> runDelimited givenFirstLocal () `shouldReturn` (True, Just (5 :: Int))
-      fst <$> runCompiled givenFirstLocal () `shouldReturn` (True, Just 5)
-      fst <$> runLoop givenFirstLocal () `shouldReturn` (True, Just 5)
-      fst <$> runDelimited (givenFirst @'Anywhere) () `shouldReturn` (True, Just 5)
-      fst <$> runCompiled (givenFirst @'Anywhere) () `shouldReturn` (True, Just 5)
-      runThreads (givenFirst @'Anywhere) () `shouldReturn` (True, Just 5)
+      fst <$> runDelimited fulfilledFirstLocal () `shouldReturn` (True, Just (5 :: Int))
+      fst <$> runCompiled fulfilledFirstLocal () `shouldReturn` (True, Just 5)
+      fst <$> runLoop fulfilledFirstLocal () `shouldReturn` (True, Just 5)
+      fst <$> runDelimited (fulfilledFirst @'Anywhere) () `shouldReturn` (True, Just 5)
+      fst <$> runCompiled (fulfilledFirst @'Anywhere) () `shouldReturn` (True, Just 5)
+      runThreads (fulfilledFirst @'Anywhere) () `shouldReturn` (True, Just 5)
 
   describe "the pool of connections" $ do
     it "loses and duplicates no connection, and no part waits for ever, with parts on 2 and 4 cores" $ do
@@ -118,9 +118,9 @@ spec = describe "cores" $ do
 
     it "gives a waiter that abandons its place a connection that came before it did, to release" $ do
       pool <- newPool [7 :: Int]
-      fst <$> runDelimited (givenBeforeAbandoned pool) () `shouldReturn` (Just 7, [7])
+      fst <$> runDelimited (fulfilledBeforeAbandoned pool) () `shouldReturn` (Just 7, [7])
       pool' <- newPool [7 :: Int]
-      runThreads (givenBeforeAbandoned pool') () `shouldReturn` (Just 7, [7])
+      runThreads (fulfilledBeforeAbandoned pool') () `shouldReturn` (Just 7, [7])
 
     it "hands a connection to the next waiter on another core when the first has abandoned its place" $ do
       ensureCores
@@ -161,55 +161,55 @@ afterwards effect = keeping effect >>^ snd
 waitsForEver :: (Arrow arr, Exchange arr 'Anywhere) => arr () Int
 waitsForEver = ticket @_ @'Anywhere >>> fst ^>> await
 
--- | A ticket given a value by the other half of a pair on its core, in a part that waits for it.
+-- | A ticket whose promise the other half of a pair on its core fulfils, in a part that waits for it.
 sameCore :: forall r arr. (ArrowChoice arr, Concurrent arr, Exchange arr r, Exchange arr (Local arr)) => arr () (Int, Bool)
-sameCore = ticket @arr @r >>> concurrently (fst ^>> await) ((,42) . snd ^>> give)
+sameCore = ticket @arr @r >>> concurrently (fst ^>> await) ((,42) . snd ^>> fulfil)
 
-givenTwice :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
-givenTwice = ticket @arr @r >>> ((,1 :: Int) &&& id) . snd ^>> first give >>> (,2) . snd ^>> give
+fulfilledTwice :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
+fulfilledTwice = ticket @arr @r >>> ((,1 :: Int) &&& id) . snd ^>> first fulfil >>> (,2) . snd ^>> fulfil
 
--- | The waiter abandons before anything is given: nothing for it, and the giver is told.
+-- | The waiter abandons before the promise is fulfilled: nothing for it, and the promise is told.
 gone :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Maybe Int, Bool)
-gone = ticket @arr @r >>> first abandon >>> second (,5) ^>> second give
+gone = ticket @arr @r >>> first abandon >>> second (,5) ^>> second fulfil
 
--- | The value is given before the waiter abandons: the waiter has it.
-givenFirst :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Bool, Maybe Int)
-givenFirst = ticket @arr @r >>> second (,5) ^>> second give >>> swap ^>> second abandon
+-- | The promise is fulfilled before the waiter abandons: the waiter has the value.
+fulfilledFirst :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Bool, Maybe Int)
+fulfilledFirst = ticket @arr @r >>> second (,5) ^>> second fulfil >>> swap ^>> second abandon
 
--- | A ticket of any core that a thread of its own gives a value after a while, which the part waits for: the
--- scheduler of an arrow that runs every part on one thread waits in its poller by then, and the give wakes it.
-givenAfterTheWait :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => arr () (Int, Bool)
-givenAfterTheWait =
+-- | A ticket of any core whose promise a thread of its own fulfils after a while, which the part waits for: the
+-- scheduler of an arrow that runs every part on one thread waits in its poller by then, and the fulfil wakes it.
+fulfilledAfterTheWait :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => arr () (Int, Bool)
+fulfilledAfterTheWait =
   ticket @_ @'Anywhere
-    >>> now (\(awaiting, giver) -> newEmptyMVar >>= \taken -> (awaiting, taken) <$ forkIO (threadDelay 20000 *> runThreads give (giver, 7) >>= putMVar taken))
+    >>> now (\(awaiting, promise) -> newEmptyMVar >>= \taken -> (awaiting, taken) <$ forkIO (threadDelay 20000 *> runThreads fulfil (promise, 7) >>= putMVar taken))
     >>> first await
     >>> now (\(value, taken) -> (,) value <$> takeMVar taken)
 
--- | The same, with the value given by a thread before the part waits: it finds the value at its look.
-givenBeforeTheWait :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => arr () (Int, Bool)
-givenBeforeTheWait =
+-- | The same, with the promise fulfilled by a thread before the part waits: it finds the value at its look.
+fulfilledBeforeTheWait :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => arr () (Int, Bool)
+fulfilledBeforeTheWait =
   ticket @_ @'Anywhere
-    >>> now (\(awaiting, giver) -> newEmptyMVar >>= \taken -> (awaiting,) <$> (forkIO (runThreads give (giver, 7) >>= putMVar taken) *> takeMVar taken))
+    >>> now (\(awaiting, promise) -> newEmptyMVar >>= \taken -> (awaiting,) <$> (forkIO (runThreads fulfil (promise, 7) >>= putMVar taken) *> takeMVar taken))
     >>> first await
 
--- | Runs the action with a thread that gives a value to every giver that is left on the shelf, as soon as it is
+-- | Runs the action with a thread that fulfils every promise that is left on the shelf, as soon as it is
 -- there, and stops the thread afterwards: with a flag, since a thread that spins like this one may never reach a
 -- point where an exception could stop it.
-withGiverThread :: (IORef (Maybe (Giver 'Anywhere Int)) -> IO a) -> IO a
-withGiverThread action = do
+withPromiseThread :: (IORef (Maybe (Promise 'Anywhere Int)) -> IO a) -> IO a
+withPromiseThread action = do
   shelf <- newIORef Nothing
   stopped <- newIORef False
-  let spin = readIORef stopped >>= \done -> unless done (atomicModifyIORef' shelf (Nothing,) >>= maybe yield (\giver -> void (runThreads give (giver, 1))) >> spin)
+  let spin = readIORef stopped >>= \done -> unless done (atomicModifyIORef' shelf (Nothing,) >>= maybe yield (\promise -> void (runThreads fulfil (promise, 1))) >> spin)
   _ <- forkIO spin
   action shelf `finally` atomicWriteIORef stopped True
 
--- | Makes a ticket of any core this many times, leaves its giver on the shelf, and waits for it at once, while a
--- thread gives it a value the moment it sees the giver: the give comes before the part looks at the ticket, between
+-- | Makes a ticket of any core this many times, leaves its promise on the shelf, and waits for it at once, while a
+-- thread fulfils it the moment it sees the promise: the fulfil comes before the part looks at the ticket, between
 -- its look and its wait, or after, and the part gets every value.
-racing :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere, Annotate arr) => IORef (Maybe (Giver 'Anywhere Int)) -> Int -> arr () Int
+racing :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere, Annotate arr) => IORef (Maybe (Promise 'Anywhere Int)) -> Int -> arr () Int
 racing shelf count = const 0 ^>> timesWith count (keeping ticketOnShelf >>^ uncurry (+))
   where
-    -- Makes a ticket, leaves its giver on the shelf, and waits for the ticket.
+    -- Makes a ticket, leaves its promise on the shelf, and waits for the ticket.
     ticketOnShelf = ticket @_ @'Anywhere >>> second (now (atomicWriteIORef shelf . Just)) >>> fst ^>> await
 
 -- | The programs of the two reaches at once, for any arrow that has what 'Runtime' bundles.
@@ -220,17 +220,17 @@ ticketsOfBothReaches = sameCoreLocal &&& sameCore @'Anywhere
 sameCoreLocal :: forall arr. (ArrowChoice arr, Concurrent arr, Exchange arr (Local arr)) => arr () (Int, Bool)
 sameCoreLocal = sameCore @(Local arr)
 
-givenTwiceLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () Bool
-givenTwiceLocal = givenTwice @(Local arr)
+fulfilledTwiceLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () Bool
+fulfilledTwiceLocal = fulfilledTwice @(Local arr)
 
 goneLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () (Maybe Int, Bool)
 goneLocal = gone @(Local arr)
 
-givenFirstLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () (Bool, Maybe Int)
-givenFirstLocal = givenFirst @(Local arr)
+fulfilledFirstLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () (Bool, Maybe Int)
+fulfilledFirstLocal = fulfilledFirst @(Local arr)
 
 -- | A part's place in the pool's queue, and no connection: for tests that ask for one when none is free.
-queued :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Waiting arr 'Anywhere conn)
+queued :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Future arr 'Anywhere conn)
 queued pool = reserve pool >>^ fromLeft (error "a connection was free")
 
 -- | One part that holds a connection, queues two others behind it, one of which abandons its place, and releases.
@@ -254,8 +254,8 @@ toFreeList pool =
     >>> second (release pool)
     >>> now (\(abandoned, ()) -> (,) abandoned <$> free pool)
 
-givenBeforeAbandoned :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, [Int])
-givenBeforeAbandoned pool =
+fulfilledBeforeAbandoned :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => Pool Int -> arr () (Maybe Int, [Int])
+fulfilledBeforeAbandoned pool =
   checkout pool
     >>> keeping (queued pool)
     >>> second (release pool)

@@ -21,8 +21,8 @@
 -- has run longer than that, it lets the others go on before it.
 --
 -- Each scheduler also has a mailbox that other threads, the schedulers of other
--- cores, put parts in: a part that waited for a ticket that another core gives
--- is put there by the giver, which wakes the poller if the scheduler waits in
+-- cores, put parts in: a part that waited for a ticket that another core fulfils
+-- is put there by the promise, which wakes the poller if the scheduler waits in
 -- it. The scheduler takes the parts from its mailbox every round, and before
 -- it waits.
 --
@@ -52,7 +52,7 @@ module Network.Streaming.Internal.Scheduler
     wakeTicket,
     RemoteSlot (..),
     awaitRemote,
-    giveRemote,
+    fulfilRemote,
     abandonRemote,
     Mailbox,
     runMailbox,
@@ -124,8 +124,8 @@ data Step
     Forked [IO Step]
   | -- | It waits for a ticket, whose slot holds it.
     Parked
-  | -- | It waits for a ticket that another core gives, whose slot holds it; the
-    -- giver puts it in the mailbox.
+  | -- | It waits for a ticket that another core fulfils, whose slot holds it; the
+    -- promise puts it in the mailbox.
     ParkedRemote
   | -- | It ran for its turn, and can go on.
     Yielded (IO Step)
@@ -184,14 +184,14 @@ data Run = Run
   { -- | Parts that tickets woke.
     runTickets :: !(IORef [IO Step]),
     -- | When the running part's turn began, on the clock, the steps taken, the
-    -- waits, the parts that wait for tickets that other cores give and are not
+    -- waits, the parts that wait for tickets that other cores fulfil and are not
     -- yet back from the mailbox, the parts that wait on descriptors, those that
     -- wait for tickets, the number of the next wait, the rounds, the time that
     -- the round began at, or 0 before it is read, the parts that are in a
     -- scope, the armings that no poll has taken yet, the run's own number, and the time of the last poll: unboxed, so that
     -- counting allocates nothing. A step is a point to
     -- give way at, which a link's receive or send is, or a wait, or a ticket
-    -- given or waited for.
+    -- fulfilled or awaited.
     runCounters :: !(ForeignPtr Int),
     -- | How long a turn is.
     runTurn :: !Int,
@@ -387,14 +387,14 @@ counted run step = step <$ (counter run 1 >>= setCounter run 1 . (+ 1))
 wakeTicket :: Run -> IO Step -> IO ()
 wakeTicket run part = modifyIORef' (runTickets run) (part :) *> adjust run 5 (-1)
 
--- | What the slot of a ticket of reach @'Anywhere@ holds, and what a thread that gives it a value finds: nothing
+-- | What the slot of a ticket of reach @'Anywhere@ holds, and what a thread that fulfils it finds: nothing
 -- yet, the value, the part that waits for it, or that the waiter has gone. Several threads read and change it,
 -- atomically. The value is evaluated, as a local slot's is. The waiter is what puts the part back among those that
 -- can go on, with the action that runs where it waited: the value, or a cancellation to raise.
-data RemoteSlot a = RemoteEmpty | RemoteGiven !a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
+data RemoteSlot a = RemoteEmpty | RemoteFulfilled !a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
 
--- | What a give did to the slot.
-data Giving a = Stored | Resume (IO a -> IO Step) | Gone | Twice
+-- | What a fulfil did to the slot.
+data Fulfilment a = Stored | Resume (IO a -> IO Step) | Gone | Twice
 
 -- | What a waiter's parking did to the slot.
 data Parking a = Parking | Ready a | Misused
@@ -404,30 +404,30 @@ data Parking a = Parking | Ready a | Misused
 -- cancellation takes it off the slot, and the arrow captures what follows the wait, which it hands to the slot
 -- as the waiter. It is the arrow's own to say how it goes on and how it captures.
 awaitRemote :: Run -> Part -> IORef (RemoteSlot a) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
-awaitRemote run part slot given capture =
+awaitRemote run part slot fulfilled capture =
   readIORef slot >>= \case
-    RemoteGiven value -> checkpoint part *> given value
+    RemoteFulfilled value -> checkpoint part *> fulfilled value
     RemoteEmpty -> do
       registering part (Other (stopRemote run slot))
       capture (parkRemote slot)
     _ -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
 {-# INLINE awaitRemote #-}
 
--- | Parks the captured part in the slot, which was empty at the look: unless a value was given since, and then
+-- | Parks the captured part in the slot, which was empty at the look: unless it was fulfilled since, and then
 -- the part goes on in its turn.
 parkRemote :: IORef (RemoteSlot a) -> (IO a -> IO Step) -> IO Step
 parkRemote slot resume = do
   parking <- update slot $ \case
     RemoteEmpty -> (RemoteWaiter resume, Parking)
-    RemoteGiven value -> (RemoteGiven value, Ready value)
+    RemoteFulfilled value -> (RemoteFulfilled value, Ready value)
     other -> (other, Misused)
   case parking of
     Parking -> pure ParkedRemote
-    -- Given since the look: goes on in its turn.
+    -- Fulfilled since the look: goes on in its turn.
     Ready value -> pure (Yielded (resume (pure value)))
     Misused -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
 
--- | Takes the part off the slot, if it still waits there: not if a value was given since, which has put the
+-- | Takes the part off the slot, if it still waits there: not if it was fulfilled since, which has put the
 -- part in the mailbox, and which the part finds at its next wait.
 stopRemote :: Run -> IORef (RemoteSlot a) -> Cancelled -> IO (Maybe (IO Step))
 stopRemote run slot cancelled =
@@ -435,28 +435,28 @@ stopRemote run slot cancelled =
     Nothing -> pure Nothing
     Just resume -> Just (resume (throwIO cancelled)) <$ adjust run 3 (-1)
 
--- | Gives the slot its value, and if a part waits for it, puts the part in the
+-- | Fulfils the slot with its value, and if a part waits for it, puts the part in the
 -- mailbox of the scheduler that owns it. It says whether the waiter takes it. The value is evaluated before
 -- the compare-and-swap, not between its read and its swap.
-giveRemote :: Mailbox -> IORef (RemoteSlot a) -> a -> IO Bool
-giveRemote mailbox slot !value = do
-  giving <- update slot $ \case
-    RemoteEmpty -> (RemoteGiven value, Stored)
-    RemoteWaiter resume -> (RemoteGiven value, Resume resume)
+fulfilRemote :: Mailbox -> IORef (RemoteSlot a) -> a -> IO Bool
+fulfilRemote mailbox slot !value = do
+  fulfilment <- update slot $ \case
+    RemoteEmpty -> (RemoteFulfilled value, Stored)
+    RemoteWaiter resume -> (RemoteFulfilled value, Resume resume)
     RemoteAbandoned -> (RemoteAbandoned, Gone)
-    given -> (given, Twice)
-  case giving of
+    fulfilled -> (fulfilled, Twice)
+  case fulfilment of
     Stored -> pure True
     Resume resume -> post mailbox (resume (pure value))
     Gone -> pure False
-    Twice -> ioError (userError "a ticket was given a value twice")
+    Twice -> ioError (userError "a promise was fulfilled twice")
 
--- | The waiter stops wanting the value, before it waits for it: a later give says it isn't taken. A value given
--- already is the waiter's, and this gives it back.
+-- | The waiter stops wanting the value, before it waits for it: a later fulfil says it isn't taken. A value fulfilled
+-- already is the waiter's, and this returns it.
 abandonRemote :: IORef (RemoteSlot a) -> IO (Maybe a)
 abandonRemote slot =
   update slot $ \case
-    RemoteGiven value -> (RemoteAbandoned, Just value)
+    RemoteFulfilled value -> (RemoteAbandoned, Just value)
     _ -> (RemoteAbandoned, Nothing)
 
 -- | The first part of a run, in no scope: the run's root scope begins with it.
@@ -565,7 +565,7 @@ cancelScope run scope' = do
 stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))
 stopWait run cancelled = \case
   NotWaiting -> pure Nothing
-  -- The waiter in the slot puts the part back among those that can go on itself, as a give does, with the
+  -- The waiter in the slot puts the part back among those that can go on itself, as a fulfil does, with the
   -- cancellation to raise where it waits.
   OnTicket slot ->
     readIORef slot >>= \case
@@ -754,7 +754,7 @@ schedule run enterPart result start = (go [start] [] `catch` failed) `finally` c
           | null watching && descriptors == 0 && remote == 0 && timers == 0 ->
               ioError . userError $
                 if parked > (0 :: Int)
-                  then "the parts wait for tickets that nothing will give a value"
+                  then "the parts wait for tickets that nothing will fulfil"
                   else "the program ended without a result"
           | null watching -> do
               -- Unless a part was given since the round began: the next to give

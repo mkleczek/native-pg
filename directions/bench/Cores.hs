@@ -21,7 +21,7 @@
 --   byte to each other ROUNDS times each way: in ns and bytes per round trip. A round trip waits twice, once in each
 --   part, so the cost of a wait on a descriptor is in it. KIND is @delimited@, @compiled@ or @threads@.
 -- * @wake KIND SAMPLES@: how long a part waiting for a ticket on a core whose scheduler waits in its poller takes
---   to go on after another core gives it a value. KIND is @delimited@ or @threads@.
+--   to go on after another core fulfils its promise. KIND is @delimited@ or @threads@.
 -- * @scope KIND VARIANT ROUNDS [PARTS]@: what a scope costs, entered and left, in ns and bytes, above the loop it is
 --   in. KIND is @threads@, @delimited@ or @compiled@; VARIANT is @bare@ (in the first part, which is in no cancel
 --   scope), @half@ (in a half of a concurrent pair, which is in one) or @pair@ (what a concurrent pair costs, made

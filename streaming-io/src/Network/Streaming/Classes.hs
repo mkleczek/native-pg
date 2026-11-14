@@ -67,7 +67,7 @@ module Network.Streaming.Classes
     Block (..),
     Event (..),
     Reach (..),
-    Giver,
+    Promise,
     Exchange (..),
     Local,
     receiveWith,
@@ -94,7 +94,7 @@ import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Plumbing (pattern Again, pattern Finish, consume, iterateWith)
-import Network.Streaming.Internal.Tickets (Giver, Reach (..))
+import Network.Streaming.Internal.Tickets (Promise, Reach (..))
 import Network.Streaming.Watch (Watch)
 import System.Posix.Types (Fd (..))
 
@@ -149,40 +149,40 @@ type Runtime arr =
     Instrumented (ModeOf arr)
   )
 
--- | Values that one direction gives another, once each: the way directions
--- exchange what they know. A ticket has two ends, a 'Waiting' end that the
--- part which needs the value waits at, on the core that made the ticket, and
--- a 'Giver' that gives it, which the part that has the value keeps. A ticket
+-- | Values that one direction hands another, once each: the way directions
+-- exchange what they know. A ticket has two ends, a 'Future' that the part
+-- which needs the value awaits, on the core that made the ticket, and a
+-- 'Promise' that fulfils it, which the part that has the value keeps. A ticket
 -- is made when the program runs, and its ends are passed through arrows like
 -- any value, so a part can make one for each thing it waits for.
 --
--- The ticket's reach @r@ says in its type where the giver can be used. A giver
+-- The ticket's reach @r@ says in its type where the promise can be used. A promise
 -- of reach @'Here s@ belongs to the core of the arrow @s@ that made the ticket,
--- as the arrow's own region does: only the parts of that core can give it a
--- value, and the arrow can keep its slot as plain memory, with no atomic
--- operation, and its parts on its own run list. A giver of reach @'Anywhere@
+-- as the arrow's own region does: only the parts of that core can fulfil it,
+-- and the arrow can keep its slot as plain memory, with no atomic
+-- operation, and its parts on its own run list. A promise of reach @'Anywhere@
 -- belongs to no core, so that shared structures can hold it, and the parts of
--- any core can give it a value: it costs what a value that crosses cores costs.
+-- any core can fulfil it: it costs what a value that crosses cores costs.
 -- An arrow has the instances for the reaches it can keep.
 class Exchange arr (r :: Reach) where
-  data Waiting arr r a
+  data Future arr r a
 
   -- | The ends of a new ticket, made on this core.
-  ticket :: arr () (Waiting arr r a, Giver r a)
+  ticket :: arr () (Future arr r a, Promise r a)
 
-  -- | Waits until the ticket is given its value, and gives it. Only on the
+  -- | Waits until the promise of the ticket is fulfilled, and returns its value. Only on the
   -- core that made it, which the arrow's type says.
-  await :: arr (Waiting arr r a) a
+  await :: arr (Future arr r a) a
 
-  -- | Gives the value to the part that waits at the other end, and says whether
-  -- it did: it didn't if the waiter has gone, and the value is the giver's
-  -- again. A ticket is given one value once.
-  give :: arr (Giver r a, a) Bool
+  -- | Fulfils the promise with the value, and says whether the part that
+  -- awaits the future took it: it didn't if the waiter has gone, and the value is the promise's
+  -- again. A promise is fulfilled once.
+  fulfil :: arr (Promise r a, a) Bool
 
   -- | The waiter stops wanting the value, before it waits for it: a later
-  -- 'give' says it didn't. If the value was given already, it is the waiter's,
-  -- and this gives it back.
-  abandon :: arr (Waiting arr r a) (Maybe a)
+  -- 'fulfil' says it didn't. If the promise was fulfilled already, the value is the waiter's,
+  -- and this returns it.
+  abandon :: arr (Future arr r a) (Maybe a)
 
 -- | The cheapest reach that an arrow has: that of the tickets whose parts all
 -- run on one core, which is @'Here s@ for an arrow with a region @s@, and

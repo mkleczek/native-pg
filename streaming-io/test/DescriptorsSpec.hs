@@ -201,9 +201,9 @@ cancelledThenArrived = now (const newPair) >>> alongside timesOut >>> second (se
 
 -- * Two cores
 
--- | What two cores share: where the second leaves the giver of the ticket that it waits for the socket at, and a flag
+-- | What two cores share: where the second leaves the promise of the ticket that it waits for the socket at, and a flag
 -- that it raises once it has closed the socket.
-data Shared = Shared (IORef (Maybe (Giver 'Anywhere Socket))) (IORef Bool)
+data Shared = Shared (IORef (Maybe (Promise 'Anywhere Socket))) (IORef Bool)
 
 newShared :: IO Shared
 newShared = Shared <$> newIORef Nothing <*> newIORef False
@@ -227,7 +227,7 @@ handedOver (Shared shelf closed) core
         >>> second (now (\socket -> Socket.close socket *> atomicWriteIORef closed True))
         >>^ (True,) . fst
   where
-    -- Waits for the second core's ticket, and gives it the first socket.
-    handOver = keeping (untilJust (readIORef shelf)) >>> tap (second fst ^>> give >>> done) >>^ snd
+    -- Waits for the second core's ticket, and fulfils its promise with the first socket.
+    handOver = keeping (untilJust (readIORef shelf)) >>> tap (second fst ^>> fulfil >>> done) >>^ snd
     closedByTheOther = keeping (untilJust (fmap (\raised -> if raised then Just () else Nothing) (readIORef closed))) >>^ snd
     closeOther = now (\pair@(_, other) -> pair <$ Socket.close other)

@@ -41,7 +41,7 @@ spec = describe "cores" $ do
       together' `shouldBe` Just ((), ())
 
   describe "a core that waits in its poller" $ do
-    it "is woken by a give from another core within a few milliseconds, every time" $ do
+    it "is woken by a fulfil from another core within a few milliseconds, every time" $ do
       ensureCores
       wake <- newWake
       let samplesWanted = 40

@@ -17,7 +17,7 @@
 -- @ST@'s: a program is @'Delimited' s a b@ for any @s@ that its run chooses, and
 -- what it makes with a ticket of reach @'Here s@ belongs to that @s@, so that
 -- it can't leave the run it was made in, or be used by the program of another
--- core. What crosses cores is a 'Giver' of reach @'Anywhere@, which has no @s@.
+-- core. What crosses cores is a 'Promise' of reach @'Anywhere@, which has no @s@.
 --
 -- A scope is plain IO code in the part: the continuation that a wait captures
 -- holds the part's handlers, so a release runs once, after the resume, however
@@ -261,38 +261,38 @@ instance Race (DelimitedM m s) where
 -- | The tickets that belong to this core: a slot, which the parts of this core read
 -- and write as plain memory. A part that waits for the ticket is parked in the
 -- slot, as a closure that puts its captured continuation back among those that
--- can go on, and goes back when the ticket is given its value. Giving and
--- waiting count a step, and can give way: a ticket is where parts coordinate,
+-- can go on, and goes back when the ticket's promise is fulfilled. Fulfilling and
+-- awaiting count a step, and can give way: a ticket is where parts coordinate,
 -- and none is on a parser's path.
 type instance Local (DelimitedM m s) = 'Here s
 
 type instance ModeOf (DelimitedM m s) = m
 
 instance Exchange (DelimitedM m s) ('Here s) where
-  newtype Waiting (DelimitedM m s) ('Here s) a = HereWaiting (IORef (Slot a))
-  ticket = Delimited (\_ () -> newIORef Empty >>= \slot -> pure (HereWaiting slot, HereGiver slot))
-  await = Delimited $ \context@(Context run tag part) (HereWaiting slot) ->
+  newtype Future (DelimitedM m s) ('Here s) a = HereFuture (IORef (Slot a))
+  ticket = Delimited (\_ () -> newIORef Empty >>= \slot -> pure (HereFuture slot, HerePromise slot))
+  await = Delimited $ \context@(Context run tag part) (HereFuture slot) ->
     readIORef slot >>= \case
-      Given value -> checkpoint part *> (value <$ step context)
+      Fulfilled value -> checkpoint part *> (value <$ step context)
       Empty -> registering part (OnTicket slot) *> control0 tag (\resume -> Parked <$ writeIORef slot (Waiter (wakeTicket run . resume)))
       Waiter _ -> ioError (userError "two parts wait for one ticket")
       Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
-  give = Delimited (\context (HereGiver slot, value) -> giveHere slot value <* step context)
-  abandon = Delimited (\_ (HereWaiting slot) -> abandonHere slot)
+  fulfil = Delimited (\context (HerePromise slot, value) -> fulfilHere slot value <* step context)
+  abandon = Delimited (\_ (HereFuture slot) -> abandonHere slot)
 
--- | The waiter of a ticket that any core can give is parked in the slot as a local ticket's is, but the
--- giver, on another core, doesn't run it: it puts it in the mailbox of the
+-- | The waiter of a ticket that any core can fulfil is parked in the slot as a local ticket's is, but the
+-- promise, on another core, doesn't run it: it puts it in the mailbox of the
 -- scheduler of the waiter's core, which goes on with it in its next round, and
 -- wakes that scheduler if it sleeps in its poller.
 instance Exchange (DelimitedM m s) 'Anywhere where
-  newtype Waiting (DelimitedM m s) 'Anywhere a = AnywhereWaiting (IORef (RemoteSlot a))
+  newtype Future (DelimitedM m s) 'Anywhere a = AnywhereFuture (IORef (RemoteSlot a))
   ticket = Delimited $ \(Context run _ _) () -> do
     slot <- newIORef RemoteEmpty
-    pure (AnywhereWaiting slot, AnywhereGiver (giveRemote (runMailbox run) slot))
-  await = Delimited $ \context@(Context run tag part) (AnywhereWaiting slot) ->
+    pure (AnywhereFuture slot, AnywherePromise (fulfilRemote (runMailbox run) slot))
+  await = Delimited $ \context@(Context run tag part) (AnywhereFuture slot) ->
     awaitRemote run part slot (\value -> value <$ step context) (control0 tag)
-  give = Delimited $ \context (AnywhereGiver giver, value) -> giver value <* step context
-  abandon = Delimited $ \_ (AnywhereWaiting slot) -> abandonRemote slot
+  fulfil = Delimited $ \context (AnywherePromise promise, value) -> promise value <* step context
+  abandon = Delimited $ \_ (AnywhereFuture slot) -> abandonRemote slot
 
 -- | Counts a step, and once the part has run for its turn, yields: captures what
 -- follows and gives it back to the scheduler. When the part goes on, it
@@ -305,7 +305,7 @@ step (Context run tag part) = spent run >>= \yields -> when yields (control0 tag
 -- that can go on in turn, under the prompt, until it has run for a turn and
 -- reaches a point to give way at (a link's receives and sends), and when none
 -- can, a wait until a descriptor wakes one, or a watch fires. The program is
--- for any core: the tickets it makes can't be given to the program of another
+-- for any core: the tickets it makes can't be fulfilled by the program of another
 -- run.
 runDelimited :: (forall s. Delimited s a b) -> a -> IO (b, Report)
 runDelimited = runDelimitedTurn defaultTurn
@@ -354,7 +354,7 @@ runIn run (Delimited program) input = do
 -- core for each) with a scheduler of its own: its own poller, prompt and
 -- mailbox. The setup makes what the cores share; each program is given it, and
 -- its own core's number. What the programs have in common are what the shared
--- structure holds, and the 'Giver's they make and put in it: the tickets of one
+-- structure holds, and the 'Promise's they make and put in it: the tickets of one
 -- core don't have the type of another's. It gives what each program gave, in
 -- the order of the cores, once all have ended. If any core fails, the others
 -- are stopped, even if they wait, and its exception is rethrown.

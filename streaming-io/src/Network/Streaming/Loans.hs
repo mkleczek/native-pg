@@ -35,7 +35,7 @@ import Network.Streaming.Combinators (alongside, decide, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
-import Network.Streaming.Internal.Tickets (Giver (..), giveNow)
+import Network.Streaming.Internal.Tickets (Promise (..), fulfilNow)
 import Network.Streaming.Pool (checkoutAt, checkoutMany, checkoutManyOf, queueNow, releaseNow, takeNow)
 
 -- | What a request borrows buffers with: the pool, its primary buffer, and what is lent of them.
@@ -54,9 +54,9 @@ data State = Ended | Open !Lent !Extra !Int
 -- | The number of the loan that the primary is lent as.
 data Lent = NotLent | Lent !Int
 
--- | The extra place is free, holds the extra loan of this number, or holds a borrow that waits for one, with its giver:
+-- | The extra place is free, holds the extra loan of this number, or holds a borrow that waits for one, with its promise:
 -- it is given the extra loan, or the primary if that is given back first, or, when the request ends, nothing.
-data Extra = NoExtra | Held !Int !Buffer | Asked !Int !(Giver 'Anywhere (Maybe Loan))
+data Extra = NoExtra | Held !Int !Buffer | Asked !Int !(Promise 'Anywhere (Maybe Loan))
 
 closed, twoLoans :: IOError
 closed = userError "request buffer access is closed"
@@ -92,10 +92,10 @@ ended =
   step "return buffers" $ \(Loans pool primary ref) -> do
     (buffers, asking) <- update ref (\case Ended -> (Ended, ([], Nothing)); Open _ extra _ -> (Ended, (primary : heldBy extra, askedBy extra)))
     releaseNow (requestBuffers pool) buffers
-    mapM_ (`giveNow` Nothing) asking
+    mapM_ (`fulfilNow` Nothing) asking
   where
     heldBy = \case Held _ buffer -> [buffer]; _ -> []
-    askedBy = \case Asked _ giver -> Just giver; _ -> Nothing
+    askedBy = \case Asked _ promise -> Just promise; _ -> Nothing
 
 -- | An extra loan: the primary if it isn't lent, and else a buffer of the pool, which may be of its reserve, waiting
 -- while none is free. It fails at once if the request has two loans, or has ended.
@@ -127,16 +127,16 @@ immediately loans@(Loans pool primary ref) = update ref transition >>= either th
       Open lent@(Lent _) NoExtra issued -> (Open lent (Held issued buffer) (issued + 1), Just (Loan loans Extra issued buffer))
       state -> (state, Nothing)
 
--- | What a borrow has when it holds the extra place: the primary, which was given back as it came, or the end it waits at.
-data Registration arr = Got !Loan | Queued !Loans !Int !(Waiting arr 'Anywhere (Maybe Loan))
+-- | What a borrow has when it holds the extra place: the primary, which was given back as it came, or the future it awaits.
+data Registration arr = Got !Loan | Queued !Loans !Int !(Future arr 'Anywhere (Maybe Loan))
 
--- | A borrow that waits for an extra loan: its loans and its number, the giver that the pool queues for it, and the end
--- it waits at.
+-- | A borrow that waits for an extra loan: its loans and its number, the promise that the pool queues for it, and the future
+-- it awaits.
 data Asking arr = Asking
   { askLoans :: !Loans,
     askNumber :: !Int,
-    askGiver :: !(Giver 'Anywhere (Maybe Loan)),
-    askWaiting :: !(Waiting arr 'Anywhere (Maybe Loan))
+    askPromise :: !(Promise 'Anywhere (Maybe Loan)),
+    askFuture :: !(Future arr 'Anywhere (Maybe Loan))
   }
 
 -- | A borrow that waits for an extra loan. It holds the extra place, and waits in the pool's queue for a buffer, and
@@ -147,36 +147,36 @@ wait =
     keeping ticket >>> scope (step "take extra place" register) giveUp body
   where
     body = decide "primary given back?" registered >>> (taking "no" queueAndAwait ||| taking "yes" returnA)
-    registered (registration, ((_, giver), _)) = case registration of
+    registered (registration, ((_, promise), _)) = case registration of
       Got loan -> Right loan
-      Queued loans number waiting -> Left (Asking loans number giver waiting)
+      Queued loans number future -> Left (Asking loans number promise future)
     queueAndAwait = step "queue for a buffer" queueing >>> await >>> step "take lent loan" (maybe (throwIO closed) pure)
-    -- The pool queues a giver of a buffer, which lends the buffer to this borrow if it is still there to take it.
-    queueing Asking {askLoans = loans@(Loans pool _ _), askNumber, askGiver, askWaiting} =
-      askWaiting <$ queueNow (requestBuffers pool) 1 (forwarding loans askNumber askGiver)
+    -- The pool queues a promise of a buffer, which lends the buffer to this borrow if it is still there to take it.
+    queueing Asking {askLoans = loans@(Loans pool _ _), askNumber, askPromise, askFuture} =
+      askFuture <$ queueNow (requestBuffers pool) 1 (forwarding loans askNumber askPromise)
     giveUp = decide "give up place?" stillQueued >>> (taking "no" returnA ||| taking "yes" abandoned)
     stillQueued (registration, exit) = case registration of
-      Queued loans number waiting | not (isDone exit) -> Right (waiting, (loans, number))
+      Queued loans number future | not (isDone exit) -> Right (future, (loans, number))
       _ -> Left ()
     isDone = \case Done -> True; _ -> False
-    -- A loan that was given before the borrow gave up its place is the borrow's, and goes back.
+    -- A loan that the promise was fulfilled with before the borrow gave up its place is the borrow's, and goes back.
     abandoned =
       first abandon
-        >>> decide "loan already given?" givenLoan
+        >>> decide "loan already fulfilled?" fulfilledLoan
         >>> (taking "no" (step "free extra place" (uncurry withdraw)) ||| taking "yes" release)
-    givenLoan (given, (loans, number)) = case given of
+    fulfilledLoan (fulfilled, (loans, number)) = case fulfilled of
       Just (Just loan) -> Right loan
       _ -> Left (loans, number)
 
 -- | Takes the extra place, or the primary if it was given back meanwhile.
-register :: ((Waiting arr 'Anywhere (Maybe Loan), Giver 'Anywhere (Maybe Loan)), Loans) -> IO (Registration arr)
-register ((waiting, giver), loans@(Loans _ primary ref)) = update ref transition >>= either throwIO pure
+register :: ((Future arr 'Anywhere (Maybe Loan), Promise 'Anywhere (Maybe Loan)), Loans) -> IO (Registration arr)
+register ((future, promise), loans@(Loans _ primary ref)) = update ref transition >>= either throwIO pure
   where
     transition Ended = (Ended, Left closed)
     transition state@(Open lent extra issued) = case lent of
       NotLent -> (Open (Lent issued) extra (issued + 1), Right (Got (Loan loans Primary issued primary)))
       Lent _ -> case extra of
-        NoExtra -> (Open lent (Asked issued giver) (issued + 1), Right (Queued loans issued waiting))
+        NoExtra -> (Open lent (Asked issued promise) (issued + 1), Right (Queued loans issued future))
         _ -> (state, Left twoLoans)
 
 -- | Frees the extra place of a borrow that gives up, if it still holds it.
@@ -185,16 +185,16 @@ withdraw (Loans _ _ ref) number = update ref $ \case
   Open lent (Asked asked _) issued | asked == number -> (Open lent NoExtra issued, ())
   state -> (state, ())
 
--- | The giver that the pool keeps for a borrow that waits. Given a buffer, it lends it to the borrow, as the extra loan, if the
--- borrow still holds the extra place; and it says that it didn't take it if the borrow was given the primary, or has gone,
+-- | The promise that the pool keeps for a borrow that waits. Fulfilled with a buffer, it lends it to the borrow, as the extra loan, if the
+-- borrow still holds the extra place; and it says that it didn't take it if the borrow got the primary, or has gone,
 -- so that the buffer is the pool's again. A request that has ended meanwhile has returned the buffer itself, which the
 -- pool must not do again, so then it says that it took it.
-forwarding :: Loans -> Int -> Giver 'Anywhere (Maybe Loan) -> Giver 'Anywhere Buffer
-forwarding loans@(Loans _ _ ref) number (AnywhereGiver giver) = AnywhereGiver $ \buffer ->
+forwarding :: Loans -> Int -> Promise 'Anywhere (Maybe Loan) -> Promise 'Anywhere Buffer
+forwarding loans@(Loans _ _ ref) number (AnywherePromise promise) = AnywherePromise $ \buffer ->
   update ref (claim buffer) >>= \case
     Nothing -> pure False
     Just loan@(Loan _ _ lent _) -> do
-      taken <- giver (Just loan)
+      taken <- promise (Just loan)
       if taken then pure True else not <$> update ref (unclaim lent)
   where
     claim buffer = \case
@@ -206,7 +206,7 @@ forwarding loans@(Loans _ _ ref) number (AnywhereGiver giver) = AnywhereGiver $ 
 
 -- | What giving a loan back leaves to do: nothing, which is so for a loan that has ended or is stale; the primary to
 -- hand to the borrow that waits, which is the request's own loan again; or a buffer to return to the pool.
-data Returned = Settled | Deliver !(Giver 'Anywhere (Maybe Loan)) !Loan | Back !Loans !Buffer
+data Returned = Settled | Deliver !(Promise 'Anywhere (Maybe Loan)) !Loan | Back !Loans !Buffer
 
 -- | Gives the loan back. A loan that has ended, or is already back, is ignored. The primary goes to the borrow that waits
 -- for an extra loan, if there is one, and an extra loan goes back to the pool, and on to the oldest waiter that can have it.
@@ -217,7 +217,7 @@ release =
     returned >=> \case
       Settled -> pure ()
       -- The primary is lent as a new loan, which is undone if the borrow that waited for it has gone.
-      Deliver giver loan -> giveNow giver (Just loan) >>= \taken -> unless taken (undeliver loan)
+      Deliver promise loan -> fulfilNow promise (Just loan) >>= \taken -> unless taken (undeliver loan)
       Back (Loans pool _ _) buffer -> releaseNow (requestBuffers pool) [buffer]
 
 returned :: Loan -> IO Returned
@@ -228,7 +228,7 @@ returned (Loan loans@(Loans _ primary ref) kind number buffer) = update ref tran
         | Primary <- kind,
           lent == number ->
             case extra of
-              Asked _ giver -> (Open (Lent issued) NoExtra (issued + 1), Deliver giver (Loan loans Primary issued primary))
+              Asked _ promise -> (Open (Lent issued) NoExtra (issued + 1), Deliver promise (Loan loans Primary issued primary))
               _ -> (Open NotLent extra issued, Settled)
       Open lent (Held held _) issued | Extra <- kind, held == number -> (Open lent NoExtra issued, Back loans buffer)
       state -> (state, Settled)
