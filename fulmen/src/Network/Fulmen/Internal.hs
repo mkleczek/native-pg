@@ -10,6 +10,7 @@ module Network.Fulmen.Internal
     Answering (..),
     Cores (..),
     Shared (..),
+    Free (..),
   )
 where
 
@@ -62,6 +63,12 @@ data Cores = Cores !Int !Shared
 -- | What the cores share: the free workers, which the acceptor hands connections to, and the date that responses
 -- carry.
 data Shared = Shared
-  { sharedWorkers :: !(Pool (Giver 'Anywhere Socket)),
+  { sharedWorkers :: !(Pool Free),
     sharedDate :: !(IORef Date)
+  }
+
+-- | A free worker: the core that it is on, and the giver of the ticket that it waits at for a connection.
+data Free = Free
+  { freeCore :: !Int,
+    freeGiver :: !(Giver 'Anywhere Socket)
   }

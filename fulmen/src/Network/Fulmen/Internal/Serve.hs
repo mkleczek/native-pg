@@ -9,8 +9,9 @@
 -- | The server as a static network of parts. Each core has its workers from the start, and the first core has the
 -- acceptor besides. A worker offers itself as free, in the pool that the cores share, and waits at a ticket for the
 -- connection that the acceptor gives it; then it serves the connection, request after request, until it ends, and
--- offers itself again. The acceptor takes the worker that has been free the longest, and waits for one when there is
--- none, so that past the cap on connections they wait in the listen backlog.
+-- offers itself again. The acceptor takes a free worker of the core that has the most free workers, so that the
+-- connections are shared out between the cores, and waits for one when there is none, so that past the cap on
+-- connections they wait in the listen backlog.
 --
 -- A request is read into the primary buffer that it was admitted with. The bytes that follow it in the buffer, which
 -- belong to the next request on the connection, are copied out before the buffer is used for anything else, and
@@ -27,7 +28,9 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BU
+import qualified Data.IntMap.Strict as IntMap
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.List (findIndex)
 import Foreign.ForeignPtr (plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
@@ -42,7 +45,7 @@ import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, foreverA, iterateA, iterateWith, keeping, Step, tap, whether)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Pool (queueNow, releaseNow)
+import Network.Streaming.Pool (queueNow, releaseNow, takeNowWith)
 
 -- | The server: for each core, the workers, and for the first, the acceptor.
 serve :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
@@ -53,8 +56,8 @@ serve !settings handler = whether isFirst ^>> (together (acceptance settings : w
 
 -- * The acceptor
 
--- | Takes the worker that has been free the longest, accepts a connection, and gives it to the worker. A connection
--- that the worker is no longer there to take is closed.
+-- | Takes a free worker of the core that has the most free workers, accepts a connection, and gives it to the worker. A
+-- connection that the worker is no longer there to take is closed.
 acceptance :: (Runtime arr) => Settings -> arr Cores ()
 acceptance settings = now (\cores -> cores <$ listening (listener settings)) >>> foreverA (tap place)
   where
@@ -65,14 +68,31 @@ acceptance settings = now (\cores -> cores <$ listening (listener settings)) >>>
         ^>> (close ||| returnA)
     untaken (taken, (_, socket)) = if taken then Right () else Left socket
 
--- | The giver of the worker that has been free the longest. The part queues the giver of a ticket of its own in the
--- pool, which gives it the giver of a free worker at once if one is free, and else when one is released, and waits at
--- the ticket.
+-- | The giver of a free worker of the core that has the most free workers, which is taken from the pool at once. When no
+-- worker is free, the part queues the giver of a ticket of its own in the pool, which gives it the worker that is released
+-- first, on any core, and waits at the ticket.
 checkout :: (Runtime arr) => arr Cores (Giver 'Anywhere Socket)
 checkout =
-  keeping ticket
-    >>> now (\((waiting, giver), Cores _ shared) -> waiting <$ queueNow (sharedWorkers shared) 1 giver)
-    >>> await
+  alongside (now (\(Cores _ shared) -> takeNowWith freest (sharedWorkers shared)))
+    >>> (\(taken, cores) -> maybe (Left cores) Right taken)
+    ^>> (queued ||| returnA)
+    >>^ freeGiver
+  where
+    queued =
+      keeping ticket
+        >>> now (\((waiting, giver), Cores _ shared) -> waiting <$ queueNow (sharedWorkers shared) 1 giver)
+        >>> await
+
+-- | The position of the first free worker, in the order that the pool takes them in, of the core that has the most of
+-- them, which is the first core of those that tie.
+freest :: [Free] -> Maybe Int
+freest workers = busiest >>= \core -> findIndex ((== core) . freeCore) workers
+  where
+    busiest = fst <$> IntMap.foldlWithKey' mostFree Nothing tally
+    mostFree best core count = case best of
+      Just (_, most) | count <= most -> best
+      _ -> Just (core, count)
+    tally = foldl' (\counts (Free core _) -> IntMap.insertWith (+) core (1 :: Int) counts) IntMap.empty workers
 
 -- * The workers
 
@@ -84,7 +104,7 @@ worker settings handler = foreverA (tap (offered >>> connection settings handler
 offered :: (Runtime arr) => arr Cores (Shared, Socket)
 offered =
   keeping ticket
-    >>> now (\((waiting, giver), Cores _ shared) -> (shared, waiting) <$ releaseNow (sharedWorkers shared) [giver])
+    >>> now (\((waiting, giver), Cores core shared) -> (shared, waiting) <$ releaseNow (sharedWorkers shared) [Free core giver])
     >>> second await
 
 -- | What a connection is: its socket, the bytes of the next request that came early, which a request copies out of

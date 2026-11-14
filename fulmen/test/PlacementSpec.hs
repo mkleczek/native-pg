@@ -30,32 +30,31 @@ import System.Timeout (timeout)
 
 spec :: Spec
 spec = describe "placement" $
-  xfail "a new connection goes to the first free worker of the pool, whichever core it is on" $
-    it "gives new connections that are kept open to the cores in turn, when the workers that are free are all of one core" $ do
-      -- Each core runs on the capability of its number.
-      getNumCapabilities >>= \capabilities -> when (capabilities < 2) (setNumCapabilities 2)
-      pool <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
-      bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
-        Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
-        Socket.listen accepting 128
-        port <- Socket.socketPort accepting
-        cores <- Fulmen.newCores 2
-        let settings = (Fulmen.defaultSettings accepting pool) {Fulmen.connectionsPerCore = 4}
-        stopped <- newEmptyMVar
-        bracket (forkFinally (void (runCores 2 (pure cores) (\shared core -> const (Fulmen.onCore shared core) ^>> Fulmen.serve settings answerWithCore))) (putMVar stopped)) killThread $ \_ -> do
-          -- The workers of both cores offer themselves at the start, and the connections come when they all have.
-          threadDelay 200000
-          placed <- timeout 20000000 $
-            -- Every worker serves a connection, so the acceptor waits for a worker, and has the first that is freed: one
-            -- of core 0. Then the workers of core 1 are freed, and last the others of core 0: they are the free workers that
-            -- the pool gives first, the one that was freed last first.
-            bracket (replicateM 8 (opened port)) (mapM_ (Socket.close . fst)) $ \held -> do
-              let (firstFreed, lastFreed) = splitAt 1 (on 0 held)
-              forM_ [firstFreed, on 1 held, lastFreed] $ \group -> do
-                mapM_ (Socket.close . fst) group
-                threadDelay 100000
-              bracket (replicateM 4 (opened port)) (mapM_ (Socket.close . fst)) (pure . sort . map snd)
-          placed `shouldBe` Just [0, 0, 1, 1 :: Int]
+  it "gives new connections that are kept open to the cores in turn, when the workers that are free are all of one core" $ do
+    -- Each core runs on the capability of its number.
+    getNumCapabilities >>= \capabilities -> when (capabilities < 2) (setNumCapabilities 2)
+    pool <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
+    bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+      Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+      Socket.listen accepting 128
+      port <- Socket.socketPort accepting
+      cores <- Fulmen.newCores 2
+      let settings = (Fulmen.defaultSettings accepting pool) {Fulmen.connectionsPerCore = 4}
+      stopped <- newEmptyMVar
+      bracket (forkFinally (void (runCores 2 (pure cores) (\shared core -> const (Fulmen.onCore shared core) ^>> Fulmen.serve settings answerWithCore))) (putMVar stopped)) killThread $ \_ -> do
+        -- The workers of both cores offer themselves at the start, and the connections come when they all have.
+        threadDelay 200000
+        placed <- timeout 20000000 $
+          -- Every worker serves a connection, so the acceptor waits for a worker, and has the first that is freed: one
+          -- of core 0. Then the workers of core 1 are freed, and last the others of core 0: they are the free workers that
+          -- the pool gives first, the one that was freed last first.
+          bracket (replicateM 8 (opened port)) (mapM_ (Socket.close . fst)) $ \held -> do
+            let (firstFreed, lastFreed) = splitAt 1 (on 0 held)
+            forM_ [firstFreed, on 1 held, lastFreed] $ \group -> do
+              mapM_ (Socket.close . fst) group
+              threadDelay 100000
+            bracket (replicateM 4 (opened port)) (mapM_ (Socket.close . fst)) (pure . sort . map snd)
+        placed `shouldBe` Just [0, 0, 1, 1 :: Int]
 
 -- | Answers with the number of the core that runs the handler, as a digit: a core's thread is pinned to the capability
 -- of its number.
