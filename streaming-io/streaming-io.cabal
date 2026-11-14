@@ -114,6 +114,7 @@ test-suite streaming-io-spec
                  RegionSpec
                  RuntimeSpec
                  ScopesSpec
+                 ScopeCostSpec
                  StepCostSpec
                  TimeSpec
                  WithSpec
