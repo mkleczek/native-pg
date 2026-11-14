@@ -16,7 +16,7 @@
 -- blocks on its socket. The server builds its program where its arrow is known, in 'server', so that GHC specialises it to the arrow.
 module Main (main) where
 
-import Control.Arrow (arr, first, (>>>), (^>>))
+import Control.Arrow (first, (&&&), (>>>), (^>>))
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (finally)
@@ -35,6 +35,7 @@ import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (Effect (..), Runtime)
+import Network.Streaming.Combinators (consume)
 import Network.Streaming.Delimited (runCores)
 import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Threads (runThreads)
@@ -78,7 +79,7 @@ server kind cores connections = do
   shared <- Fulmen.newCores cores
   putStrLn ("port " <> show port)
   case kind of
-    "delimited" -> void (runCores cores (pure shared) (\cores' core -> arr (const (Fulmen.onCore cores' core)) >>> Fulmen.serve settings (handler counters)))
+    "delimited" -> void (runCores cores (pure shared) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings (handler counters)))
     "threads" -> runThreads (Fulmen.serve settings (handler counters)) shared
     _ -> die "the server is delimited or threads"
 
@@ -119,12 +120,14 @@ react counters (call, request) = case Fulmen.target request of
 -- | The head with the length, the pieces, and the end.
 answer :: (Runtime arr) => arr (Fulmen.Call, ([ByteString], Int)) ()
 answer =
-  (\(call, (pieces, size)) -> ((call, (Fulmen.Status 200, [("Content-Type", "application/octet-stream")], Fulmen.Known size)), pieces))
+  withHead
     ^>> first Fulmen.respond
-    >>> (\(answering, pieces) -> ((answering, pieces), answering))
-    ^>> first Fulmen.send
-    >>> arr snd
+    >>> (id &&& fst)
+    ^>> consume Fulmen.send
     >>> Fulmen.finish
+  where
+    withHead (call, (pieces, size)) =
+      ((call, (Fulmen.Status 200, [("Content-Type", "application/octet-stream")], Fulmen.Known size)), pieces)
 
 -- * The client
 

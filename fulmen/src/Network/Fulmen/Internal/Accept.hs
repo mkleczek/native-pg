@@ -3,6 +3,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 -- | Accepting without waiting: the listening socket's own calls, which never wait. The acceptor blocks on the
 -- socket's event while they find no connection, as a link's receive does, so that the wait is the arrow's and not
@@ -13,7 +14,7 @@ module Network.Fulmen.Internal.Accept
   )
 where
 
-import Control.Arrow (ArrowChoice, first, returnA, (>>>), (^>>), (|||))
+import Control.Arrow (ArrowChoice, (>>>))
 import Control.Exception (SomeException, try)
 #if !defined(linux_HOST_OS)
 import Control.Monad (when)
@@ -30,6 +31,7 @@ import Foreign.Ptr (Ptr, nullPtr)
 import Network.Socket (Socket, SocketOption (NoDelay), mkSocket, setSocketOption, withFdSocket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Classes (Block (..), Effect (..), Event (..), GiveWay (..))
+import Network.Streaming.Combinators (pattern Again, pattern Finish, consume, iterateWith)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Descriptors (fresh)
 import Network.Streaming.Mode (Instrumented (bump), ModeOf)
@@ -110,10 +112,9 @@ foreign import ccall unsafe "accept"
 -- readable and tries again. The part gives way before it tries, as a receive does, so that a listener that always has
 -- a connection doesn't keep the others of its core from running.
 acceptor :: forall arr. (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr Socket Socket
-acceptor = giveWay >>> loop
+acceptor = giveWay >>> iterateWith (now attempt) (consume block)
   where
-    loop = now attempt >>> ((first block >>> snd ^>> loop) ||| returnA)
     attempt listener =
       tryAccept @(ModeOf arr) listener >>= \case
-        Just accepted -> pure (Right accepted)
-        Nothing -> (\fd -> Left (Readable (Fd fd), listener)) <$> Socket.unsafeFdSocket listener
+        Just accepted -> pure (Finish accepted)
+        Nothing -> (\fd -> Again (Readable (Fd fd), listener)) <$> Socket.unsafeFdSocket listener
