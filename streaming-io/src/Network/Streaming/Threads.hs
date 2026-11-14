@@ -28,7 +28,7 @@ import Control.Applicative ((<|>))
 import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
 import Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forM_, when)
@@ -48,8 +48,8 @@ import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
+import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, closeShelf, collectedWrongly, hasValue, lookOrWait, newShelf, postNow, postOrQueue, stopWaiting, takeWoken, withdraw)
 import Network.Streaming.Internal.Tickets
-import Network.Streaming.NotImplemented (notImplemented)
 import Network.Streaming.Watch (awaitWatch)
 import System.IO.Unsafe (unsafePerformIO)
 import Prelude hiding (id, (.))
@@ -404,10 +404,42 @@ fulfilThread var abandoned !value = atomically $ do
       fulfilled <- tryPutTMVar var value
       if fulfilled then pure True else throwSTM (userError "a promise was fulfilled twice")
 
--- | An inbox of any core: a stub, which fails as not implemented until the code is there.
+-- | An inbox is a shelf that every thread changes atomically, and a part that waits at it blocks its thread on an 'MVar' that
+-- the post, the collect or the closing that it waits for fills. The threads have no cores, so there is one reach.
 instance Inboxes (ThreadsM m) 'Anywhere where
-  data Inbox (ThreadsM m) name 'Anywhere a
-  inbox = notImplemented "inbox"
-  collect = notImplemented "collect"
-  post = notImplemented "post"
-  closeInbox = notImplemented "closeInbox"
+  newtype Inbox (ThreadsM m) name 'Anywhere a = ThreadsInbox (IORef (Shelf a))
+  inbox = Threads (\_ () -> newShelf >>= \shelf -> pure (ThreadsInbox shelf, AnywhereAddress shelf))
+  collect = Threads (\part (ThreadsInbox shelf) -> waiting part (valueThere shelf) *> takeWoken update shelf)
+  post = Threads (\part (AnywhereAddress shelf, value) -> postThread part shelf value)
+  closeInbox = Threads (\_ (ThreadsInbox shelf) -> closeShelf update shelf)
+
+-- | Blocks until the inbox has a value, and leaves it there: the collect takes it after the wait, so that a cancellation that
+-- reaches the part first leaves it for the next collect.
+valueThere :: IORef (Shelf a) -> IO ()
+valueThere shelf =
+  hasValue shelf >>= \there ->
+    if there
+      then pure ()
+      else do
+        gate <- newEmptyMVar
+        lookOrWait update shelf (() <$ tryPutMVar gate ()) >>= \case
+          Registered -> takeMVar gate `onException` stopWaiting update shelf
+          Found -> pure ()
+          Unusable -> collectedWrongly
+
+-- | A post from a thread: if the inbox is full, the thread waits on an 'MVar' that a collect, which lets its value in, or the
+-- closing fills with whether it went in. A cancellation takes the post out of the queue; if the value went in already, the
+-- post is done, and the cancellation reaches the part at its next wait.
+postThread :: Part -> IORef (Shelf a) -> a -> IO Bool
+postThread part shelf value =
+  postNow update shelf value >>= \case
+    Just taken -> pure taken
+    Nothing -> do
+      token <- newIORef ()
+      outcome <- newEmptyMVar
+      postOrQueue update shelf token value (putMVar outcome) >>= \case
+        Just taken -> pure taken
+        Nothing ->
+          try (waiting part (readMVar outcome)) >>= \case
+            Right taken -> pure taken
+            Left failure -> withdraw update shelf token >>= \withdrawn -> if withdrawn || isNothing (cancelledBy failure) then throwIO failure else readMVar outcome

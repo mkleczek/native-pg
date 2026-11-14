@@ -32,12 +32,12 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Cancel
+import Network.Streaming.Internal.Inboxes (Address (..), Shelf, closeShelf, newShelf)
 import Network.Streaming.Internal.Scheduler hiding (post)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (notImplemented)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -275,21 +275,28 @@ instance Exchange (CompiledM m) 'Anywhere where
   fulfil = Compiled $ \context (AnywherePromise promise, value) next -> promise value >>= \taken -> steppedIn context (next taken)
   abandon = Compiled $ \_ (CompiledRemoteFuture slot) next -> abandonRemote slot >>= next
 
--- | An inbox of this core: a stub, which fails as not implemented until the code is there.
+-- | An inbox of this core is a shelf of plain memory, and a part that waits at it is parked there, as at a ticket, until a post
+-- or a collect lets it go on. Posting and collecting count a step and can give way, as a ticket does, before they act: a
+-- cancellation that the yield raises leaves them undone.
 instance Inboxes (CompiledM m) ('Here Core) where
-  data Inbox (CompiledM m) name ('Here Core) a
-  inbox = notImplemented "inbox"
-  collect = notImplemented "collect"
-  post = notImplemented "post"
-  closeInbox = notImplemented "closeInbox"
+  newtype Inbox (CompiledM m) name ('Here Core) a = CompiledInbox (IORef (Shelf a))
+  inbox = Compiled (\_ () next -> newShelf >>= \shelf -> next (CompiledInbox shelf, HereAddress shelf))
+  collect = Compiled $ \context@(Context run part _) (CompiledInbox shelf) next ->
+    steppedIn context (collectFrom hereSeat run part shelf next (\park -> park (\action -> resumed context (action >>= next))))
+  post = Compiled $ \context@(Context run part _) (HereAddress shelf, value) next ->
+    steppedIn context (postTo hereSeat run part shelf value next (\park -> park (\action -> resumed context (action >>= next))))
+  closeInbox = Compiled (\_ (CompiledInbox shelf) next -> closeShelf (seatChange hereSeat) shelf >>= next)
 
--- | An inbox of any core: a stub as well.
+-- | The shelf of an inbox of any core is changed by compare-and-swap, and the part that lets a part that waits at it go on puts
+-- it in the mailbox of its scheduler, as at a ticket of any core.
 instance Inboxes (CompiledM m) 'Anywhere where
-  data Inbox (CompiledM m) name 'Anywhere a
-  inbox = notImplemented "inbox"
-  collect = notImplemented "collect"
-  post = notImplemented "post"
-  closeInbox = notImplemented "closeInbox"
+  newtype Inbox (CompiledM m) name 'Anywhere a = CompiledRemoteInbox (IORef (Shelf a))
+  inbox = Compiled (\_ () next -> newShelf >>= \shelf -> next (CompiledRemoteInbox shelf, AnywhereAddress shelf))
+  collect = Compiled $ \context@(Context run part _) (CompiledRemoteInbox shelf) next ->
+    steppedIn context (collectFrom anywhereSeat run part shelf next (\park -> park (\action -> resumed context (action >>= next))))
+  post = Compiled $ \context@(Context run part _) (AnywhereAddress shelf, value) next ->
+    steppedIn context (postTo anywhereSeat run part shelf value next (\park -> park (\action -> resumed context (action >>= next))))
+  closeInbox = Compiled (\_ (CompiledRemoteInbox shelf) next -> closeShelf (seatChange anywhereSeat) shelf >>= next)
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
 -- that can go on in turn, until it has run for a turn and reaches a point to

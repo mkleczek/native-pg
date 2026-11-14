@@ -54,6 +54,11 @@ module Network.Streaming.Internal.Scheduler
     awaitRemote,
     fulfilRemote,
     abandonRemote,
+    Seat (..),
+    hereSeat,
+    anywhereSeat,
+    collectFrom,
+    postTo,
     Mailbox,
     runMailbox,
     post,
@@ -105,6 +110,7 @@ import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Descriptors (armedBy, newRunNumber)
+import Network.Streaming.Internal.Inboxes (Change, Looked (..), Shelf, changeHere, collectedWrongly, lookOrWait, postNow, postOrQueue, stopWaiting, takeNow, takeWoken, withdraw)
 import Network.Streaming.Internal.Tickets (Slot (..))
 import Network.Streaming.Internal.Timers
 import Network.Streaming.Loop (Report (..))
@@ -458,6 +464,63 @@ abandonRemote slot =
   update slot $ \case
     RemoteFulfilled value -> (RemoteAbandoned, Just value)
     _ -> (RemoteAbandoned, Nothing)
+
+-- | How the parts of a run wait at an inbox, and are woken: how the shelf is changed, how a part is put back among those that
+-- can go on, what a part that waits comes to, and the counter of the parts that wait that way.
+data Seat = Seat
+  { seatChange :: Change,
+    seatWake :: Run -> IO Step -> IO (),
+    seatParked :: Step,
+    seatCounter :: Int
+  }
+
+-- | The seat of an inbox of this core: plain memory, and the parts that tickets woke.
+hereSeat :: Seat
+hereSeat = Seat changeHere wakeTicket Parked 5
+
+-- | The seat of an inbox of any core: compare-and-swap, and the mailbox of the part's scheduler.
+anywhereSeat :: Seat
+anywhereSeat = Seat update (\run part -> () <$ post (runMailbox run) part) ParkedRemote 3
+
+-- | What a part does that collects from an inbox, for the two arrows that run every part on one thread: the arrow goes on with the
+-- value, or, if there is none, captures what follows, and the part waits on the shelf until a post wakes it and it takes the value.
+-- A cancellation that reaches the part first is raised before it takes one, and leaves the value in the inbox.
+collectFrom :: Seat -> Run -> Part -> IORef (Shelf a) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
+collectFrom seat run part shelf taken capture = do
+  checkpoint part
+  takeNow (seatChange seat) shelf >>= \case
+    Just value -> taken value
+    Nothing -> capture $ \resume -> do
+      let again = checkpoint part *> takeWoken (seatChange seat) shelf
+      lookOrWait (seatChange seat) shelf (seatWake seat run (resume again)) >>= \case
+        Registered -> do
+          -- A cancellation takes the part off the shelf, unless a post has woken it already.
+          let stop cancelled = stopWaiting (seatChange seat) shelf >>= \stopped -> if stopped then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+          writeIORef (partWait part) (Other stop)
+          pure (seatParked seat)
+        -- A value came since the look, from another thread.
+        Found -> pure (Yielded (resume again))
+        Unusable -> collectedWrongly
+
+-- | What a part does that posts to an inbox, for the two arrows that run every part on one thread: the arrow goes on with whether
+-- the inbox took the value, or, if the inbox is full, captures what follows, and the part waits in the queue of the shelf until a
+-- collect lets its value in or the inbox closes. A cancellation that reaches the part first is raised before the post, and a
+-- cancellation takes the part out of the queue, unless its value went in.
+postTo :: Seat -> Run -> Part -> IORef (Shelf a) -> a -> (Bool -> IO r) -> (((IO Bool -> IO Step) -> IO Step) -> IO r) -> IO r
+postTo seat run part shelf value posted capture = do
+  checkpoint part
+  postNow (seatChange seat) shelf value >>= \case
+    Just taken -> posted taken
+    Nothing -> do
+      token <- newIORef ()
+      capture $ \resume ->
+        postOrQueue (seatChange seat) shelf token value (\outcome -> seatWake seat run (resume (pure outcome))) >>= \case
+          Nothing -> do
+            let stop cancelled = withdraw (seatChange seat) shelf token >>= \withdrawn -> if withdrawn then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+            writeIORef (partWait part) (Other stop)
+            pure (seatParked seat)
+          -- The inbox took the value, or closed, since the look, on another thread.
+          Just taken -> pure (Yielded (resume (pure taken)))
 
 -- | The first part of a run, in no scope: the run's root scope begins with it.
 newPart :: Run -> IO Part

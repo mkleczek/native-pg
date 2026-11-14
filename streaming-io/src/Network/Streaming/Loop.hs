@@ -41,9 +41,9 @@ import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, changeHere, closeShelf, collectedWrongly, lookOrWait, newShelf, postNow, postOrQueue, takeNow)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (notImplemented)
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
@@ -60,6 +60,8 @@ data Loop a b where
   Clock :: Loop () Instant
   Block :: Loop Event ()
   Await :: Loop (IORef (Slot a)) a
+  Collect :: Loop (IORef (Shelf a)) a
+  Post :: Loop (IORef (Shelf a), a) Bool
   Scope' :: Loop a r -> Loop (r, Exit) () -> Loop (r, a) b -> Loop a b
   Try :: Loop a b -> Loop a (Either SomeException b)
   Shield' :: Loop a b -> Loop a b
@@ -147,13 +149,15 @@ instance Exchange Loop ('Here Core) where
   fulfil = Now (\(HerePromise slot, value) -> fulfilHere slot value)
   abandon = Now (\(LoopFuture slot) -> abandonHere slot)
 
--- | An inbox of this core: a stub, which fails as not implemented until the code is there.
+-- | An inbox is a shelf on this thread, and a part that waits at it is parked there, with no watch, as at a ticket, until a post
+-- or a collect lets it go on. Closing never waits, so it is an action; the collect and the post are primitives, which raise a
+-- cancellation that has reached the part before they act.
 instance Inboxes Loop ('Here Core) where
-  data Inbox Loop name ('Here Core) a
-  inbox = notImplemented "inbox"
-  collect = notImplemented "collect"
-  post = notImplemented "post"
-  closeInbox = notImplemented "closeInbox"
+  newtype Inbox Loop name ('Here Core) a = LoopInbox (IORef (Shelf a))
+  inbox = Now (\() -> newShelf >>= \shelf -> pure (LoopInbox shelf, HereAddress shelf))
+  collect = Seq (Arr (\(LoopInbox shelf) -> shelf)) Collect
+  post = Seq (Arr (\(HereAddress shelf, value) -> (shelf, value))) Post
+  closeInbox = Now (\(LoopInbox shelf) -> closeShelf changeHere shelf)
 
 -- | A part of a running program: a program with its input, or a value for
 -- what follows, and what follows; or a failure, which unwinds what follows,
@@ -320,6 +324,29 @@ advance env time fuel wake = go 0
                 Empty -> (steps + 1, Parked) <$ writeIORef input (Waiter (\action -> action >>= \value -> wake (Give value frames)))
                 Waiter _ -> ioError (userError "two parts wait for one ticket")
                 Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
+            Collect ->
+              cancelledNow env frames >>= \case
+                Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
+                Nothing ->
+                  takeNow changeHere input >>= \case
+                    Just value -> go (steps + 1) (Give value frames)
+                    -- The part parks, and goes on by collecting again when a post wakes it.
+                    Nothing ->
+                      lookOrWait changeHere input (wake (Run Collect input frames)) >>= \case
+                        Registered -> pure (steps + 1, Parked)
+                        Found -> go steps process
+                        Unusable -> collectedWrongly
+            Post -> case input of
+              (shelf, value) ->
+                cancelledNow env frames >>= \case
+                  Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
+                  Nothing ->
+                    postNow changeHere shelf value >>= \case
+                      Just taken -> go (steps + 1) (Give taken frames)
+                      Nothing -> do
+                        token <- newIORef ()
+                        _ <- postOrQueue changeHere shelf token value (\outcome -> wake (Give outcome frames))
+                        pure (steps + 1, Parked)
             Scope' acquire release body -> go steps (Run acquire input (Acquired release body input frames))
             Try inner -> go steps (Run inner input (Trying frames))
             Shield' inner -> go steps (Run inner input (Shielding frames))

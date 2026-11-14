@@ -58,12 +58,12 @@ import GHC.IO (IO (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Cancel
+import Network.Streaming.Internal.Inboxes (Address (..), Shelf, closeShelf, newShelf)
 import Network.Streaming.Internal.Scheduler hiding (post)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (notImplemented)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -295,21 +295,24 @@ instance Exchange (DelimitedM m s) 'Anywhere where
   fulfil = Delimited $ \context (AnywherePromise promise, value) -> promise value <* step context
   abandon = Delimited $ \_ (AnywhereFuture slot) -> abandonRemote slot
 
--- | An inbox of this core: a stub, which fails as not implemented until the code is there.
+-- | An inbox of this core is a shelf of plain memory, and a part that waits at it is parked there, as at a ticket, until a post
+-- or a collect lets it go on. Posting and collecting count a step and can give way, as a ticket does, before they act: a
+-- cancellation that the yield raises leaves them undone.
 instance Inboxes (DelimitedM m s) ('Here s) where
-  data Inbox (DelimitedM m s) name ('Here s) a
-  inbox = notImplemented "inbox"
-  collect = notImplemented "collect"
-  post = notImplemented "post"
-  closeInbox = notImplemented "closeInbox"
+  newtype Inbox (DelimitedM m s) name ('Here s) a = HereInbox (IORef (Shelf a))
+  inbox = Delimited (\_ () -> newShelf >>= \shelf -> pure (HereInbox shelf, HereAddress shelf))
+  collect = Delimited $ \context@(Context run tag part) (HereInbox shelf) -> step context *> collectFrom hereSeat run part shelf pure (control0 tag)
+  post = Delimited $ \context@(Context run tag part) (HereAddress shelf, value) -> step context *> postTo hereSeat run part shelf value pure (control0 tag)
+  closeInbox = Delimited (\_ (HereInbox shelf) -> closeShelf (seatChange hereSeat) shelf)
 
--- | An inbox of any core: a stub as well.
+-- | The shelf of an inbox of any core is changed by compare-and-swap, and the part that lets a part that waits at it go on puts
+-- it in the mailbox of its scheduler, as at a ticket of any core.
 instance Inboxes (DelimitedM m s) 'Anywhere where
-  data Inbox (DelimitedM m s) name 'Anywhere a
-  inbox = notImplemented "inbox"
-  collect = notImplemented "collect"
-  post = notImplemented "post"
-  closeInbox = notImplemented "closeInbox"
+  newtype Inbox (DelimitedM m s) name 'Anywhere a = AnywhereInbox (IORef (Shelf a))
+  inbox = Delimited (\_ () -> newShelf >>= \shelf -> pure (AnywhereInbox shelf, AnywhereAddress shelf))
+  collect = Delimited $ \context@(Context run tag part) (AnywhereInbox shelf) -> step context *> collectFrom anywhereSeat run part shelf pure (control0 tag)
+  post = Delimited $ \context@(Context run tag part) (AnywhereAddress shelf, value) -> step context *> postTo anywhereSeat run part shelf value pure (control0 tag)
+  closeInbox = Delimited (\_ (AnywhereInbox shelf) -> closeShelf (seatChange anywhereSeat) shelf)
 
 -- | Counts a step, and once the part has run for its turn, yields: captures what
 -- follows and gives it back to the scheduler. When the part goes on, it

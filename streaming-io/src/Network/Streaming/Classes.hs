@@ -193,13 +193,13 @@ class Exchange arr (r :: Reach) where
 -- @'Anywhere@ for one that has no cores to belong to.
 type family Local (arr :: Type -> Type -> Type) :: Reach
 
--- | Values that one part hands another over and over, to the part that collects them: where a ticket is for one value,
--- an inbox lasts as long as the part that owns it, and a value that comes late is good for its next collect. An inbox
--- holds one value. The part that owns it collects from its 'Inbox', on the core that made it, and closes it as its scope
--- ends; the parts that post to it hold its 'Address', which is passed through arrows like any value. The inbox's reach
--- @r@ is that of a ticket: an address of reach @'Here s@ belongs to the core of the arrow @s@ that made the inbox, and an
--- address of reach @'Anywhere@ belongs to no core, so that the parts of any core can post to it. An inbox has a name, a
--- type-level string that no runtime looks at: diagrams draw it, and the lint pairs the posts and collects by it.
+-- | Values that one part hands another over and over: where a ticket is for one value, an inbox lasts as long as the part
+-- that owns it, and a value that comes late is good for its next collect. An inbox holds one value. The part that owns it
+-- collects from its 'Inbox', on the core that made it, and closes it as its scope ends; the parts that post to it hold its
+-- 'Address', which passes through arrows like any value. The reach @r@ is a ticket's: an address of reach @'Here s@
+-- belongs to the core of the arrow @s@ that made the inbox, and one of reach @'Anywhere@ belongs to no core, so that the
+-- parts of any core can post to it. An inbox has a name, a type-level string that no runtime looks at: diagrams draw it,
+-- and the lint pairs the posts and collects by it.
 class Inboxes arr (r :: Reach) where
   data Inbox arr (name :: Symbol) r a
 

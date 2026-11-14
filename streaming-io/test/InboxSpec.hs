@@ -49,76 +49,70 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | Marks a case that is expected to fail while the inboxes of the runtimes are stubs. The mark comes off as the code
--- lands, and a case that then passes unexpectedly fails the suite.
-stub :: Spec -> Spec
-stub = xfail "inbox: the runtimes have stubs of it, which fail as not implemented"
-
 spec :: Spec
 spec = describe "inboxes" $ forM_ runners $ \(Runner name run) -> describe name $ do
   forM_ (reachings name run) $ \(Reaching reach runAt) -> describe reach $ do
-    stub $ it "gives the value that is posted, and leaves none for the disposal" $ do
+    it "gives the value that is posted, and leaves none for the disposal" $ do
       noted <- newLog
       promptly (runAt (Reached (postedThenCollected noted))) `shouldReturn` Just (True, 7)
       readLog noted `shouldReturn` []
 
-    stub $ it "makes a collect wait until a value is posted" $ do
+    it "makes a collect wait until a value is posted" $ do
       noted <- newLog
       promptly (runAt (Reached (collectWaitsForPost noted))) `shouldReturn` Just (7, True)
       readLog noted `shouldReturn` ["posting", "collected"]
 
-    stub $ it "makes a post wait while the inbox is full, until the value in it is collected" $ do
+    it "makes a post wait while the inbox is full, until the value in it is collected" $ do
       noted <- newLog
       promptly (runAt (Reached (postWaitsWhileFull noted))) `shouldReturn` Just (True, ((1, 2), True))
       readLog noted `shouldReturn` ["collecting", "posted 2"]
 
-    stub $ it "serves the posters that wait in the order they came" $ do
+    it "serves the posters that wait in the order they came" $ do
       noted <- newLog
       promptly (runAt (Reached (postersInOrder noted))) `shouldReturn` Just ([0, 1, 2, 3], [True, True, True, True])
       readLog noted `shouldReturn` []
 
     -- A part of a Loop that waits at an inbox is held by it and is not cancelled there, as at a ticket.
     when (name /= "loop") $ do
-      stub $ it "leaves the value that is posted after a collect that waited was cancelled for the next collect" $ do
+      it "leaves the value that is posted after a collect that waited was cancelled for the next collect" $ do
         noted <- newLog
         promptly (runAt (Reached (cancelledCollect noted))) `shouldReturn` Just ("second", True, 7)
         readLog noted `shouldReturn` []
 
-      stub $ it "passes over a post that is cancelled while it waits, and serves the posters after it" $
+      it "passes over a post that is cancelled while it waits, and serves the posters after it" $
         promptly (runAt (Reached cancelledPost)) `shouldReturn` Just (True, (True, ("second", (1, 3, Nothing))))
 
-    stub $ it "leaves the value in the inbox when a collect is cancelled before it takes it" $ do
+    it "leaves the value in the inbox when a collect is cancelled before it takes it" $ do
       noted <- newLog
       promptly (runAt (Reached (cancelledBeforeTaking noted))) `shouldReturn` Just (True, "second", 5)
       readLog noted `shouldReturn` []
 
-    stub $ it "gives the value left in it to the disposal, with the input, when its scope ends" $ do
+    it "gives the value left in it to the disposal, with the input, when its scope ends" $ do
       noted <- newLog
       promptly (runAt (Reached (leftAtTheEnd noted))) `shouldReturn` Just True
       readLog noted `shouldReturn` ["disposed 7 of request"]
 
-    stub $ it "gives the value left in it to the disposal, with the input, when the body fails too" $ do
+    it "gives the value left in it to the disposal, with the input, when the body fails too" $ do
       noted <- newLog
       promptly (runAt (Reached (leftAtAFailure noted))) `shouldReturn` Just "Left user error (body failed)"
       readLog noted `shouldReturn` ["disposed 7 of request"]
 
-    stub $ it "gives back the value left in it when it is closed, and nothing the second time" $
+    it "gives back the value left in it when it is closed, and nothing the second time" $
       promptly (runAt (Reached closedWithLeftover)) `shouldReturn` Just (True, Just 7, Nothing)
 
-    stub $ it "releases a post that waits with False when it is closed, and says False to a post after that" $
+    it "releases a post that waits with False when it is closed, and says False to a post after that" $
       promptly (runAt (Reached closedUnderPoster)) `shouldReturn` Just (True, (False, Just 1), False)
 
-    stub $ it "says False to a post to the address of an inbox whose scope has ended" $ do
+    it "says False to a post to the address of an inbox whose scope has ended" $ do
       noted <- newLog
       promptly (runAt (Reached (afterTheScope noted))) `shouldReturn` Just False
       readLog noted `shouldReturn` []
 
   when (name == "delimited") $
-    stub $
-      it "wakes the owner that waits on one core for a post from another, and the poster that waits on another core for a collect" $ do
-        ensureCores
-        shelf <- newEmptyMVar
-        promptly (runCores 2 (pure shelf) acrossCores) `shouldReturn` Just [[1, 2, 3], [1, 1, 1]]
+    it "wakes the owner that waits on one core for a post from another, and the poster that waits on another core for a collect" $ do
+      ensureCores
+      shelf <- newEmptyMVar
+      promptly (runCores 2 (pure shelf) acrossCores) `shouldReturn` Just [[1, 2, 3], [1, 1, 1]]
 
 -- | The reaches that a runtime has inboxes of, as the scoped-ticket tests have them: its own core's, and, if it has cores,
 -- any core's.
