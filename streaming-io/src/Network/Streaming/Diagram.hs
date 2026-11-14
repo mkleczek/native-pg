@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -22,7 +23,9 @@ where
 import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
 import Data.Maybe (listToMaybe)
+import Data.Proxy (Proxy (..))
 import GHC.Stack (CallStack, SrcLoc, callStack, getCallStack)
+import GHC.TypeLits (KnownSymbol, symbolVal)
 import Network.Streaming.Annotate (Annotate (..))
 import Network.Streaming.Classes
 import Network.Streaming.Mode (Mode (..), ModeOf)
@@ -120,6 +123,39 @@ instance Exchange Diagram 'Anywhere where
   await = leaf "await" Wait
   fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
+
+-- | The inboxes of a diagram are never made either, and have the two reaches for the same reason. Each step is a leaf that
+-- has the inbox's name in its text and in its shape: a post is a handover, and a collect is a wait.
+instance Inboxes Diagram ('Here DiagramCore) where
+  data Inbox Diagram name ('Here DiagramCore) a
+  inbox :: forall name a. (KnownSymbol name) => Diagram () (Inbox Diagram name ('Here DiagramCore) a, Address name ('Here DiagramCore) a)
+  inbox = atInbox @name "open inbox " OpenInbox Nothing
+  collect :: forall name a. (KnownSymbol name) => Diagram (Inbox Diagram name ('Here DiagramCore) a) a
+  collect = atInbox @name "collect " CollectFrom (Just envelope)
+  post :: forall name a. (KnownSymbol name) => Diagram (Address name ('Here DiagramCore) a, a) Bool
+  post = atInbox @name "post " PostTo (Just envelope)
+  closeInbox :: forall name a. (KnownSymbol name) => Diagram (Inbox Diagram name ('Here DiagramCore) a) (Maybe a)
+  closeInbox = atInbox @name "close inbox " CloseInbox Nothing
+
+instance Inboxes Diagram 'Anywhere where
+  data Inbox Diagram name 'Anywhere a
+  inbox :: forall name a. (KnownSymbol name) => Diagram () (Inbox Diagram name 'Anywhere a, Address name 'Anywhere a)
+  inbox = atInbox @name "open inbox " OpenInbox Nothing
+  collect :: forall name a. (KnownSymbol name) => Diagram (Inbox Diagram name 'Anywhere a) a
+  collect = atInbox @name "collect " CollectFrom (Just envelope)
+  post :: forall name a. (KnownSymbol name) => Diagram (Address name 'Anywhere a, a) Bool
+  post = atInbox @name "post " PostTo (Just envelope)
+  closeInbox :: forall name a. (KnownSymbol name) => Diagram (Inbox Diagram name 'Anywhere a) (Maybe a)
+  closeInbox = atInbox @name "close inbox " CloseInbox Nothing
+
+-- | A leaf for a step at the inbox of the name: its text is the step, then the sign of a message if it has one, then the
+-- name, and its shape says which step and which inbox.
+atInbox :: forall name a b. (KnownSymbol name) => String -> (String -> Shape) -> Maybe String -> Diagram a b
+atInbox step shape sign = leaf (step ++ concat sign ++ symbolVal (Proxy @name)) (shape (symbolVal (Proxy @name)))
+
+-- | The sign of a message, which is an envelope (U+2709), and a space.
+envelope :: String
+envelope = "\x2709 "
 
 type instance Local Diagram = 'Here DiagramCore
 

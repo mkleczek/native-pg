@@ -30,6 +30,7 @@ module Network.Streaming.Combinators
     deliver,
     withTicket,
     tryTicket,
+    withInbox,
     expect,
     call,
     sleep,
@@ -123,6 +124,21 @@ withTicket handOut dispose =
       Done -> Left ()
       _ -> Right (future, b)
 {-# INLINE withTicket #-}
+
+-- | Opens an inbox for the body, and closes it when the body ends however it ends: a value left in it goes to the
+-- disposal, with the input.
+withInbox :: forall name r arr a b c. (ArrowChoice arr, Annotate arr, Scope arr, Inboxes arr r, KnownSymbol name) => arr (a, b) () -> arr ((Inbox arr name r a, Address name r a), b) c -> arr b c
+withInbox dispose body = scope (keeping (inbox @arr @r @name)) (closing @name @r dispose) (fst ^>> body)
+{-# INLINE withInbox #-}
+
+-- | The release of an inbox's scope: it closes the inbox, and gives the value that was left in it to the disposal, with
+-- the input.
+closing :: forall name r arr a b. (ArrowChoice arr, Annotate arr, Inboxes arr r, KnownSymbol name) => arr (a, b) () -> arr (((Inbox arr name r a, Address name r a), b), Exit) ()
+closing dispose =
+  (\(((opened, _), b), _) -> (opened, b)) ^>> first (closeInbox @arr @r @name) >>> decide "value left?" left >>> (taking "no" returnA ||| taking "yes" dispose)
+  where
+    left (leftover, b) = maybe (Left ()) (Right . (,b)) leftover
+{-# INLINE closing #-}
 
 -- | Makes a ticket and tries to hand out its promise. Left: the promise wasn't handed out, so the ticket is abandoned at
 -- once, a value fulfilled before that goes to the disposal, with the input, and the result is Left. Right: it waits for the

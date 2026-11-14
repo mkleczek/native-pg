@@ -140,8 +140,12 @@ isWait = \case
     Blocking -> True
     Yielding -> True
     Handover -> True
+    PostTo _ -> True
+    CollectFrom _ -> True
     Action -> False
     Round -> False
+    OpenInbox _ -> False
+    CloseInbox _ -> False
   _ -> False
 
 -- | The wait at the end of a way to it, and the nearest box that it is in.

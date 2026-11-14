@@ -49,6 +49,7 @@ import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
 import Network.Streaming.Internal.Tickets
+import Network.Streaming.NotImplemented (notImplemented)
 import Network.Streaming.Watch (awaitWatch)
 import System.IO.Unsafe (unsafePerformIO)
 import Prelude hiding (id, (.))
@@ -402,3 +403,11 @@ fulfilThread var abandoned !value = atomically $ do
     else do
       fulfilled <- tryPutTMVar var value
       if fulfilled then pure True else throwSTM (userError "a promise was fulfilled twice")
+
+-- | An inbox of any core: a stub, which fails as not implemented until the code is there.
+instance Inboxes (ThreadsM m) 'Anywhere where
+  data Inbox (ThreadsM m) name 'Anywhere a
+  inbox = notImplemented "inbox"
+  collect = notImplemented "collect"
+  post = notImplemented "post"
+  closeInbox = notImplemented "closeInbox"

@@ -52,6 +52,7 @@ reject_module Network.Streaming.BufferPool.Internal
 reject_module Network.Streaming.Internal.ListPrefix
 reject_module Network.Streaming.Internal.Socket
 reject_module Network.Streaming.Internal.Tickets
+reject_module Network.Streaming.Internal.Inboxes
 
 for private_module in \
   Authentication Buffer Connection.Internal Internal.Diagnostics \

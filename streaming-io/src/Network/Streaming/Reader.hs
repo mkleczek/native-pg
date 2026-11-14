@@ -253,9 +253,9 @@ stream consumer = with (With (now begin) >>> iterateWith (asks (now next)) (more
 -- | The action, as many times as the input says, and what it gave each time,
 -- in order.
 replicateA :: (ArrowChoice arr, Annotate arr) => arr () b -> arr Int [b]
-replicateA action = (,[]) ^>> iterateWith (arr leftToDo) (startOne ^>> first action >>^ collect) >>^ reverse
+replicateA action = (,[]) ^>> iterateWith (arr leftToDo) (startOne ^>> first action >>^ gather) >>^ reverse
   where
     leftToDo (count, values) = if count <= 0 then Finish values else Again (count, values)
     startOne (count, values) = ((), (count - 1, values))
-    collect (value, (count, values)) = (count, value : values)
+    gather (value, (count, values)) = (count, value : values)
 {-# INLINABLE replicateA #-}

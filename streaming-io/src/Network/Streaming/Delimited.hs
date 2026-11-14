@@ -58,11 +58,12 @@ import GHC.IO (IO (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Cancel
-import Network.Streaming.Internal.Scheduler
+import Network.Streaming.Internal.Scheduler hiding (post)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplemented)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -294,6 +295,22 @@ instance Exchange (DelimitedM m s) 'Anywhere where
   fulfil = Delimited $ \context (AnywherePromise promise, value) -> promise value <* step context
   abandon = Delimited $ \_ (AnywhereFuture slot) -> abandonRemote slot
 
+-- | An inbox of this core: a stub, which fails as not implemented until the code is there.
+instance Inboxes (DelimitedM m s) ('Here s) where
+  data Inbox (DelimitedM m s) name ('Here s) a
+  inbox = notImplemented "inbox"
+  collect = notImplemented "collect"
+  post = notImplemented "post"
+  closeInbox = notImplemented "closeInbox"
+
+-- | An inbox of any core: a stub as well.
+instance Inboxes (DelimitedM m s) 'Anywhere where
+  data Inbox (DelimitedM m s) name 'Anywhere a
+  inbox = notImplemented "inbox"
+  collect = notImplemented "collect"
+  post = notImplemented "post"
+  closeInbox = notImplemented "closeInbox"
+
 -- | Counts a step, and once the part has run for its turn, yields: captures what
 -- follows and gives it back to the scheduler. When the part goes on, it
 -- raises the cancellation that came meanwhile, if it is in a scope.
@@ -400,19 +417,19 @@ runCoresReportTurnM turn cores setup program = do
         traverse
           (\(core, run) -> forkOnWithUnmask core (\unmask -> try (unmask (runIn run (program shared core) ())) >>= writeChan outcomes . (,) core))
           (zip [0 ..] runs)
-      let collect results
+      let gather results
             | length results == cores = pure (map snd (sortOn fst results))
             | otherwise = do
                 (core, outcome) <- readChan outcomes
                 modifyIORef' pending (subtract 1)
                 case outcome of
                   Left failure -> throwIO (failure :: SomeException)
-                  Right result -> collect ((core :: Int, result) : results)
+                  Right result -> gather ((core :: Int, result) : results)
           -- Stops the cores that still run, and waits until each has released what its parts hold.
           stopAll = do
             mapM_ killThread threads
             readIORef pending >>= \remaining -> replicateM_ remaining (readChan outcomes)
-      restore (collect []) `onException` stopAll
+      restore (gather []) `onException` stopAll
 {-# INLINE runCoresReportTurnM #-}
 
 -- | The runs of that many cores, all freed once the action ends: after the

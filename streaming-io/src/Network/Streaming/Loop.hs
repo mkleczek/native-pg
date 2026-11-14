@@ -43,6 +43,7 @@ import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplemented)
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
@@ -145,6 +146,14 @@ instance Exchange Loop ('Here Core) where
   await = Seq (Arr (\(LoopFuture slot) -> slot)) Await
   fulfil = Now (\(HerePromise slot, value) -> fulfilHere slot value)
   abandon = Now (\(LoopFuture slot) -> abandonHere slot)
+
+-- | An inbox of this core: a stub, which fails as not implemented until the code is there.
+instance Inboxes Loop ('Here Core) where
+  data Inbox Loop name ('Here Core) a
+  inbox = notImplemented "inbox"
+  collect = notImplemented "collect"
+  post = notImplemented "post"
+  closeInbox = notImplemented "closeInbox"
 
 -- | A part of a running program: a program with its input, or a value for
 -- what follows, and what follows; or a failure, which unwinds what follows,

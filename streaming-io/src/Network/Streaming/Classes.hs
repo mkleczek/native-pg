@@ -69,6 +69,8 @@ module Network.Streaming.Classes
     Reach (..),
     Promise,
     Exchange (..),
+    Address,
+    Inboxes (..),
     Local,
     receiveWith,
     sendAllWith,
@@ -87,10 +89,12 @@ import Data.Kind (Type)
 import Data.Word (Word64, Word8)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Ptr (Ptr, plusPtr)
+import GHC.TypeLits (KnownSymbol, Symbol)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Annotate (Annotate (..), Check (..), Label (..), box, giving, taking)
 import Network.Streaming.Buffer (Buffer (..))
+import Network.Streaming.Internal.Inboxes (Address)
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Plumbing (pattern Again, pattern Finish, consume, iterateWith)
@@ -188,6 +192,31 @@ class Exchange arr (r :: Reach) where
 -- run on one core, which is @'Here s@ for an arrow with a region @s@, and
 -- @'Anywhere@ for one that has no cores to belong to.
 type family Local (arr :: Type -> Type -> Type) :: Reach
+
+-- | Values that one part hands another over and over, to the part that collects them: where a ticket is for one value,
+-- an inbox lasts as long as the part that owns it, and a value that comes late is good for its next collect. An inbox
+-- holds one value. The part that owns it collects from its 'Inbox', on the core that made it, and closes it as its scope
+-- ends; the parts that post to it hold its 'Address', which is passed through arrows like any value. The inbox's reach
+-- @r@ is that of a ticket: an address of reach @'Here s@ belongs to the core of the arrow @s@ that made the inbox, and an
+-- address of reach @'Anywhere@ belongs to no core, so that the parts of any core can post to it. An inbox has a name, a
+-- type-level string that no runtime looks at: diagrams draw it, and the lint pairs the posts and collects by it.
+class Inboxes arr (r :: Reach) where
+  data Inbox arr (name :: Symbol) r a
+
+  -- | A new inbox, made on this core, and its address.
+  inbox :: (KnownSymbol name) => arr () (Inbox arr name r a, Address name r a)
+
+  -- | Waits until the inbox has a value, and takes it. A collect that is cancelled before it has taken the value leaves
+  -- it in the inbox.
+  collect :: (KnownSymbol name) => arr (Inbox arr name r a) a
+
+  -- | Posts the value, and waits while the inbox is full; posters that wait are served in the order they came. It
+  -- returns 'False' if the inbox has closed, before the post or while it waited, and the value is the poster's still.
+  post :: (KnownSymbol name) => arr (Address name r a, a) Bool
+
+  -- | Closes the inbox, which the part that owns it does as its scope ends: it returns the value left in it, and every
+  -- post that waits, or comes later, returns 'False'.
+  closeInbox :: (KnownSymbol name) => arr (Inbox arr name r a) (Maybe a)
 
 -- | Arrows that run at once on the same input, as '&&&' runs two of them one after the other.
 class Concurrent arr where

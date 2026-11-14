@@ -47,6 +47,7 @@ library
                    Network.Streaming.Internal.Atomic
                    Network.Streaming.Internal.Descriptors
   other-modules: Network.Streaming.Internal.BufferPool
+                 Network.Streaming.Internal.Inboxes
                  Network.Streaming.Internal.ListPrefix
                  Network.Streaming.Internal.Socket
                  Network.Streaming.Internal.Tickets
@@ -99,9 +100,11 @@ test-suite streaming-io-spec
                  Network.Streaming.Internal.Atomic
                  Network.Streaming.Internal.BufferPool
                  Network.Streaming.Internal.Descriptors
+                 Network.Streaming.Internal.Inboxes
                  Network.Streaming.Internal.Socket
                  Network.Streaming.Internal.Tickets
                  EmptyPoolSpec
+                 InboxSpec
                  PositiveIntSpec
                  ResourcesSpec
                  WatchSpec

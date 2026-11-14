@@ -89,6 +89,14 @@ data Shape
     Yielding
   | -- | A promise fulfilled with a value for another part.
     Handover
+  | -- | A post to the inbox of the name: a handover, which waits while the inbox is full.
+    PostTo String
+  | -- | A collect from the inbox of the name: a wait.
+    CollectFrom String
+  | -- | The opening of the inbox of the name.
+    OpenInbox String
+  | -- | The closing of the inbox of the name.
+    CloseInbox String
   | -- | A step that is none of those.
     Round
 

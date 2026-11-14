@@ -95,9 +95,9 @@ sendThenReceive buffer request kept =
 -- | Receives this many bytes, or what comes before the end of the stream, and
 -- gives them.
 receiveBytes :: (ArrowChoice arr, Annotate arr, Link arr end) => Buffer -> Int -> arr end ByteString
-receiveBytes buffer total = withOnly (const BS.empty ^>> iterateA ((roomOf buffer,) ^>> first (With receive) >>^ collect))
+receiveBytes buffer total = withOnly (const BS.empty ^>> iterateA ((roomOf buffer,) ^>> first (With receive) >>^ gather))
   where
-    collect (count, got)
+    gather (count, got)
       | count == 0 || BS.length next >= total = Finish next
       | otherwise = Again next
       where

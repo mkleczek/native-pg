@@ -175,3 +175,19 @@ instance (Arrow arr, Exchange arr reach) => Exchange (With r arr) reach where
   {-# INLINE fulfil #-}
   abandon = With (innerFuture ^>> abandon)
   {-# INLINE abandon #-}
+
+-- | The inbox of the inner arrow, from the input that has it beside the environment.
+innerInbox :: (r, Inbox (With r arr) name reach a) -> Inbox arr name reach a
+innerInbox (_, WithInbox box) = box
+{-# INLINE innerInbox #-}
+
+instance (Arrow arr, Inboxes arr reach) => Inboxes (With r arr) reach where
+  newtype Inbox (With r arr) name reach a = WithInbox (Inbox arr name reach a)
+  inbox = With (done >>> inbox >>^ first WithInbox)
+  {-# INLINE inbox #-}
+  collect = With (innerInbox ^>> collect)
+  {-# INLINE collect #-}
+  post = With (snd ^>> post)
+  {-# INLINE post #-}
+  closeInbox = With (innerInbox ^>> closeInbox)
+  {-# INLINE closeInbox #-}

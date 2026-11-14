@@ -32,11 +32,12 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Cancel
-import Network.Streaming.Internal.Scheduler
+import Network.Streaming.Internal.Scheduler hiding (post)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplemented)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -273,6 +274,22 @@ instance Exchange (CompiledM m) 'Anywhere where
     awaitRemote run part slot (steppedIn context . next) (\park -> park (\action -> resumed context (action >>= next)))
   fulfil = Compiled $ \context (AnywherePromise promise, value) next -> promise value >>= \taken -> steppedIn context (next taken)
   abandon = Compiled $ \_ (CompiledRemoteFuture slot) next -> abandonRemote slot >>= next
+
+-- | An inbox of this core: a stub, which fails as not implemented until the code is there.
+instance Inboxes (CompiledM m) ('Here Core) where
+  data Inbox (CompiledM m) name ('Here Core) a
+  inbox = notImplemented "inbox"
+  collect = notImplemented "collect"
+  post = notImplemented "post"
+  closeInbox = notImplemented "closeInbox"
+
+-- | An inbox of any core: a stub as well.
+instance Inboxes (CompiledM m) 'Anywhere where
+  data Inbox (CompiledM m) name 'Anywhere a
+  inbox = notImplemented "inbox"
+  collect = notImplemented "collect"
+  post = notImplemented "post"
+  closeInbox = notImplemented "closeInbox"
 
 -- | Runs the program and all of its concurrent parts on this thread: each part
 -- that can go on in turn, until it has run for a turn and reaches a point to

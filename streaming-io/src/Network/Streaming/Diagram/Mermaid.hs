@@ -452,6 +452,11 @@ leafText shape text node = case shape of
   Yielding -> node ++ "@{ shape: flip-tri, label: " ++ labelOf text ++ " }"
   Handover -> node ++ "@{ shape: lean-r, label: " ++ labelOf text ++ " }"
   Round -> node ++ "(" ++ labelOf text ++ ")"
+  -- A step at an inbox is drawn as the step it is: a post hands over, a collect waits.
+  PostTo _ -> leafText Handover text node
+  CollectFrom _ -> leafText Wait text node
+  OpenInbox _ -> leafText Round text node
+  CloseInbox _ -> leafText Round text node
 
 -- | A label as Mermaid reads it: in quotes, with the characters that it takes for markup escaped. The first line is a
 -- title, and the rest a comment, which is drawn on a line of its own, smaller.

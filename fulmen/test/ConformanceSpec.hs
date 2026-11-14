@@ -239,7 +239,7 @@ reply =
 echo :: (Runtime arr) => arr (Call, Request) ()
 echo =
   fst
-    ^>> alongside (Fulmen.body >>> collect)
+    ^>> alongside (Fulmen.body >>> gather)
     >>> second (Fulmen.Status 200, [],) . swap
     ^>> reply
 
@@ -274,8 +274,8 @@ echoStreaming =
       maybe (Finish answering) (\view' -> Again ((answering, [view']), (requestBody, answering))) piece
 
 -- | The pieces of the stream, copied out of the views and put together.
-collect :: (Runtime arr, Stream arr s) => arr s ByteString
-collect =
+gather :: (Runtime arr, Stream arr s) => arr s ByteString
+gather =
   (,[])
     ^>> iterateA
       ( alongside (fst ^>> next)
