@@ -101,11 +101,11 @@ main = do
 -- | A statement that gives one number, and ones that give one JSON value, of the tables' rows, as a field.
 build :: (Runtime arr) => Workload -> BufferPool -> ConnectionPool -> arr () ()
 build workload buffers pool = case workload of
-  SelectOne -> request buffers pool (Tx.Statement "SELECT 1" (const []) (Tx.one (Tx.column @_ @Int32))) (\result -> Tx.single result >>> done)
+  SelectOne -> request buffers pool (Tx.Statement "SELECT 1" (const []) Nothing (Tx.one (Tx.column @_ @Int32))) (\result -> Tx.single result >>> done)
   Field16 -> field "SELECT json_agg(small) FROM small"
   Field1M -> field "SELECT json_agg(large) FROM large"
   where
-    field sql = request buffers pool (Tx.Statement sql (const []) (Tx.one Tx.field)) (\result -> Tx.single result >>> drained >>> done)
+    field sql = request buffers pool (Tx.Statement sql (const []) Nothing (Tx.one Tx.field)) (\result -> Tx.single result >>> drained >>> done)
 {-# INLINABLE build #-}
 
 -- | One request: a transaction on a pooled connection, in loans of its own, whose pipeline carries the COMMIT, and the

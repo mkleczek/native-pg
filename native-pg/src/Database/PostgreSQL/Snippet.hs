@@ -63,7 +63,7 @@ render (Snippet chunks) = finish (foldl' step (1 :: Int, mempty, id) (chunks [])
 -- | The statement that sends the snippet's SQL and its parameters, whatever the
 -- input of the program is.
 fromSnippet :: Snippet -> Rows arr row -> Statement arr p row
-fromSnippet snippet = Transaction.Statement query (const (map parameter parameters))
+fromSnippet snippet = Transaction.Statement query (const (map parameter parameters)) Nothing
   where
     (query, parameters) = render snippet
     parameter (Param oid format value) =

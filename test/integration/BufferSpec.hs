@@ -302,7 +302,7 @@ echoed =
     Tx.ReadCommitted
     Tx.Read
     Tx.Final
-    (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Tx.any Tx.field)))
+    (Tx.statement (Tx.streamFrom id (Tx.Statement "SELECT $1::text" (const [streamedText 16385]) Nothing (Tx.any Tx.field))))
     (\result -> Tx.single result >>> copyOut)
 
 -- | The shape of a row that has a field in the end, as a value that any arrow takes.

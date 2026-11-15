@@ -473,7 +473,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       withSession
         ( withInput
             (("40", "2"), "unused" :: ByteString)
-            (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from fst (Tx.statement (Tx.Statement "SELECT $1::int + $2::int" (\(a, b) -> [textual (Just a), textual (Just b)]) (single @_ @Int32)))) readAll)
+            (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from fst (Tx.statement (Tx.Statement "SELECT $1::int + $2::int" (\(a, b) -> [textual (Just a), textual (Just b)]) Nothing (single @_ @Int32)))) readAll)
         )
         `shouldReturn` Right [42]
     it "passes NULL parameters and returns NULL columns" $
@@ -507,21 +507,21 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       withSession
         ( streaming
             (newChunks (replicate chunks payload))
-            (query' (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (\source -> [streamedText (chunks * BS.length payload) source]) (single @_ @Bool)))
+            (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [streamedText (chunks * BS.length payload)]) Nothing (single @_ @Bool))))
         )
         `shouldReturn` Right [True]
     needs "streamed parameters" $ it "streams an empty parameter, and one in a statement that follows a streamed one" $
       withSession
         ( steps
-            [ streaming (newChunks []) (query' (lengthWith (\source -> [streamedText 0 source]))) `yields` Right [0],
-              streaming (newChunks ["ab", "", "c"]) (query' (Tx.Statement "SELECT length($1::text), length($2::text)" (\source -> [streamedText 3 source, textual (Just "four")]) pair)) `yields` Right [(3 :: Int32, 4 :: Int32)]
+            [ streaming (newChunks []) (query' (Tx.streamFrom id (lengthWith (const [streamedText 0])))) `yields` Right [0],
+              streaming (newChunks ["ab", "", "c"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT length($1::text), length($2::text)" (const [streamedText 3, textual (Just "four")]) Nothing pair))) `yields` Right [(3 :: Int32, 4 :: Int32)]
             ]
         )
         `shouldReturn` ()
     it "sends a parameter in pieces, short and long, larger than the socket's buffers" $ do
       let payload = BS.concat (replicate 4096 "0123456789abcdef")
           pieces = concatMap (\piece -> [BS.take 100 piece, BS.drop 100 piece]) (replicate 128 payload)
-      withSession (query (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [piecesText pieces]) (single @_ @Bool)))
+      withSession (query (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [piecesText pieces]) Nothing (single @_ @Bool)))
         `shouldReturn` Right [True]
     needs "streamed parameters" $ it "streams a parameter to a prepared statement, whether it returns rows or not" $
       withSession
@@ -529,8 +529,8 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             [ ddl "CREATE TEMPORARY TABLE streamed (value text)" `yields` Right (),
               preparing "insert_streamed" (insertStreamed (const [])) `yields` Right (),
               preparing "length_of" (lengthWith (const [])) `yields` Right (),
-              streaming (newChunks ["abc", "def"]) (preparedStreamed "insert_streamed" (insertStreamed (\source -> [streamedText 6 source]))) `yields` Right [],
-              streaming (newChunks ["abc", "def"]) (preparedStreamed "length_of" (lengthWith (\source -> [streamedText 6 source]))) `yields` Right [6]
+              streaming (newChunks ["abc", "def"]) (preparedStreamed "insert_streamed" (Tx.streamFrom id (insertStreamed (const [streamedText 6])))) `yields` Right [],
+              streaming (newChunks ["abc", "def"]) (preparedStreamed "length_of" (Tx.streamFrom id (lengthWith (const [streamedText 6])))) `yields` Right [6]
             ]
         )
         `shouldReturn` ()
@@ -539,8 +539,8 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         ( steps
             [ ddl "SET statement_timeout = '200ms'" `yields` Right (),
               preparing "slow_length" (lengthWith (const [])) `yields` Right (),
-              (streaming slowSource (query' (lengthWith (\source -> [streamedText 4000 source]))) >>^ serverCode) `yields` Just "57014",
-              (streaming slowSource (preparedStreamed "slow_length" (lengthWith (\source -> [streamedText 4000 source]))) >>^ serverCode) `yields` Just "57014",
+              (streaming slowSource (query' (Tx.streamFrom id (lengthWith (const [streamedText 4000])))) >>^ serverCode) `yields` Just "57014",
+              (streaming slowSource (preparedStreamed "slow_length" (Tx.streamFrom id (lengthWith (const [streamedText 4000])))) >>^ serverCode) `yields` Just "57014",
               selectOne `yields` Right [1]
             ]
         )
@@ -906,7 +906,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "breaks the connection when a parameter stream is shorter than declared" $
       withSession
         ( steps
-            [ streaming (newChunks ["short"]) (query' (Tx.Statement "SELECT $1::text" (\source -> [streamedText 10 source]) (single @_ @Text)))
+            [ streaming (newChunks ["short"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text" (const [streamedText 10]) Nothing (single @_ @Text))))
                 `failsAs` \case
                   StreamLengthError {} -> pure ()
                   other -> failTest ("expected StreamLengthError, got " <> show other),
@@ -917,7 +917,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "breaks the connection when a parameter stream is longer than declared" $
       withSession
         ( steps
-            [ streaming (newChunks ["more than", " declared"]) (query' (Tx.Statement "SELECT $1::text" (\source -> [streamedText 5 source]) (single @_ @Text)))
+            [ streaming (newChunks ["more than", " declared"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text" (const [streamedText 5]) Nothing (single @_ @Text))))
                 `failsAs` \case
                   StreamLengthError {} -> pure ()
                   other -> failTest ("expected StreamLengthError, got " <> show other),
@@ -929,7 +929,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "breaks the connection when the wait for a slow parameter stream is cancelled" $
       withSession
         ( steps
-            [ withinFor (millis 300) (streaming slowSource (query' (lengthWith (\source -> [streamedText 4000 source])))) `yields` Nothing,
+            [ withinFor (millis 300) (streaming slowSource (query' (Tx.streamFrom id (lengthWith (const [streamedText 4000]))))) `yields` Nothing,
               brokenConnection
             ]
         )
@@ -937,7 +937,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "throws a parameter stream's failure, and breaks the connection" $
       withSession
         ( steps
-            [ streaming (newFailingChunks [Char8.replicate 1000000 'y']) (query' (Tx.Statement "SELECT length($1::text)" (\source -> [streamedText 2000000 source]) (single @_ @Int32)))
+            [ streaming (newFailingChunks [Char8.replicate 1000000 'y']) (query' (Tx.streamFrom id (Tx.Statement "SELECT length($1::text)" (const [streamedText 2000000]) Nothing (single @_ @Int32))))
                 `failsAs` \(_ :: IOException) -> pure (),
               brokenConnection
             ]
@@ -998,7 +998,7 @@ terminatingTheFirst =
         Nothing -> failTest "the server sent no process id"
         Just pid -> pure (administrator, (loans, Char8.pack (show pid)))
     )
-    >>> query' (Tx.Statement "SELECT pg_terminate_backend($1::int)" (\pid -> [textual (Just pid)]) single)
+    >>> query' (Tx.Statement "SELECT pg_terminate_backend($1::int)" (\pid -> [textual (Just pid)]) Nothing single)
 
 -- | Notifies the channel with the payload, from a function of the server, so that the payload is a parameter.
 notifying :: (Runtime arr) => ByteString -> OnConn arr (Either QueryError [Bool])
@@ -1063,12 +1063,12 @@ preparedAnswer name value =
   committed Tx.Write (Tx.executePrepared name ((addOneWith value) {Tx.sql = error "SQL forced"})) Tx.single
 
 -- | The statement that inserts its parameter, which the function makes of the input.
-insertStreamed :: (Runtime arr) => (p -> [Tx.Param arr]) -> Tx.Statement arr p ()
-insertStreamed parameters = Tx.Statement "INSERT INTO streamed VALUES ($1)" parameters Tx.none
+insertStreamed :: (Runtime arr) => (p -> [Tx.Param]) -> Tx.Statement arr p ()
+insertStreamed parameters = Tx.Statement "INSERT INTO streamed VALUES ($1)" parameters Nothing Tx.none
 
 -- | The statement that takes the length of its parameter, which the function makes of the input.
-lengthWith :: (Runtime arr) => (p -> [Tx.Param arr]) -> Tx.Statement arr p Int32
-lengthWith parameters = Tx.Statement "SELECT length($1::text)" parameters single
+lengthWith :: (Runtime arr) => (p -> [Tx.Param]) -> Tx.Statement arr p Int32
+lengthWith parameters = Tx.Statement "SELECT length($1::text)" parameters Nothing single
 
 -- | A source of four slow pieces of a thousand bytes.
 slowSource :: IO SlowChunks

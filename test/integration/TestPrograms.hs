@@ -371,22 +371,23 @@ triple = Tx.any ((,,) <$> Tx.column <*> Tx.column <*> Tx.column)
 
 -- | A statement without parameters.
 plain :: ByteString -> Rows arr row -> Tx.Statement arr () row
-plain sql = Tx.Statement sql (const [])
+plain sql = Tx.Statement sql (const []) Nothing
 
 -- | A statement whose parameters are these values, as text, and NULL for 'Nothing'.
 valued :: ByteString -> [Maybe ByteString] -> Rows arr row -> Tx.Statement arr () row
-valued sql values = Tx.Statement sql (const (map textual values))
+valued sql values = Tx.Statement sql (const (map textual values)) Nothing
 
 -- | A parameter that is text of a type that the server infers, or NULL.
-textual :: Maybe ByteString -> Tx.Param arr
+textual :: Maybe ByteString -> Tx.Param
 textual value = Tx.Param Nothing TextFormat (maybe Tx.Null Tx.Bytes value)
 
--- | A parameter that is text of a type that the server infers, which the stream gives, and declares this long.
-streamedText :: (Stream arr s) => Int -> s -> Tx.Param arr
-streamedText declared source = Tx.Param Nothing TextFormat (Tx.Streamed declared source)
+-- | A parameter that is text of a type that the server infers, of this many bytes, which are the next of the stream of
+-- its statement.
+streamedText :: Int -> Tx.Param
+streamedText declared = Tx.Param Nothing TextFormat (Tx.FromStream declared)
 
 -- | A parameter that is text of a type that the server infers, which is sent as these pieces.
-piecesText :: [ByteString] -> Tx.Param arr
+piecesText :: [ByteString] -> Tx.Param
 piecesText pieces = Tx.Param Nothing TextFormat (Tx.Pieces pieces)
 
 -- * Streams

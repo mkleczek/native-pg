@@ -22,7 +22,9 @@
 -- expected is the statements of the pipeline that was sent, which the server
 -- answers in order, and the reading program takes the results from it in the
 -- order of their statements. Streamed parameters are to come: they fail with
--- 'Network.Streaming.NotImplemented.NotImplemented'.
+-- 'Network.Streaming.NotImplemented.NotImplemented'. A statement declares the one
+-- stream that its 'FromStream' parameters take their bytes from, when the program is
+-- built, with 'streamFrom'; the stream's state is taken from the input of the program.
 --
 -- A prepared statement is named by the program, which keeps the names of the
 -- connection: 'prepare' sends the Parse of a name, 'executePrepared' sends only the
@@ -31,6 +33,8 @@
 module Database.PostgreSQL.Transaction
   ( -- * Statements
     Statement (..),
+    StreamSource (..),
+    streamFrom,
     Param (..),
     Value (..),
 
@@ -135,31 +139,40 @@ import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
 
 -- | A statement: its SQL, the parameters that it takes from the input of the
--- program, and how its rows are read. The SQL is evaluated only when it is sent,
--- and a prepared statement the connection already has sends only its
--- parameters.
+-- program, the stream that its 'FromStream' parameters read, and how its rows are
+-- read. The SQL is evaluated only when it is sent, and a prepared statement the
+-- connection already has sends only its parameters.
 data Statement arr p row = Statement
   { sql :: ByteString,
-    params :: p -> [Param arr],
+    params :: p -> [Param],
+    stream :: Maybe (StreamSource arr p),
     rows :: Rows arr row
   }
 
+-- | The stream of a statement, as its type is fixed when the statement is built, and so is its 'next': only the state
+-- of the stream is taken from the input of the program, when it runs.
+data StreamSource arr p = forall s. (Stream arr s) => StreamSource (p -> s)
+
+-- | The statement, with the stream that its 'FromStream' parameters take their bytes from: each takes the next bytes
+-- of the stream, as many as it declares.
+streamFrom :: (Stream arr s) => (p -> s) -> Statement arr p row -> Statement arr p row
+streamFrom source given = given {stream = Just (StreamSource source)}
+
 -- | A parameter: its type, which the server infers if there is none, its format,
 -- and its value.
-data Param arr = Param
+data Param = Param
   { paramType :: Maybe Oid,
     paramFormat :: FormatCode,
-    paramValue :: Value arr
+    paramValue :: Value
   }
 
-data Value arr
+data Value
   = Null
   | Bytes ByteString
   | -- | Sent one after another, without a copy.
     Pieces [ByteString]
-  | -- | The declared length, and the stream that is pulled while the value is
-    -- sent.
-    forall s. (Stream arr s) => Streamed Int s
+  | -- | This many bytes, which are the next of the statement's stream.
+    FromStream Int
 
 -- | What is sent, in order. A pipeline's value holds the positions of its
 -- results in the queue of answers that are expected, relative to the start of the
@@ -205,7 +218,7 @@ statement given = Pipeline 1 [Execute given] (\base -> Result base (readingOf (r
 -- | Parses the statement under the name. Parse sends no parameters, so what the
 -- pipeline takes as its input doesn't matter.
 prepare :: ByteString -> Statement arr p row -> Pipeline arr q Preparation
-prepare name given = Pipeline 1 [Prepare name (given {params = const []})] Preparation
+prepare name given = Pipeline 1 [Prepare name (given {params = const [], stream = Nothing})] Preparation
 
 -- | Binds and executes the statement that the connection has under the name.
 executePrepared :: ByteString -> Statement arr p row -> Pipeline arr p (Result arr row)
@@ -226,11 +239,12 @@ from :: (q -> p) -> Pipeline arr p a -> Pipeline arr q a
 from function (Pipeline count' sent value) = Pipeline count' (map sentFrom sent) value
   where
     sentFrom item = case item of
-      Execute given -> Execute (given {params = params given . function})
-      Prepare name given -> Prepare name (given {params = params given . function})
-      ExecutePrepared name given -> ExecutePrepared name (given {params = params given . function})
+      Execute given -> Execute (taken given)
+      Prepare name given -> Prepare name (taken given)
+      ExecutePrepared name given -> ExecutePrepared name (taken given)
       Close name -> Close name
       Command given -> Command given
+    taken given = given {params = params given . function, stream = (\(StreamSource source) -> StreamSource (source . function)) <$> stream given}
 
 data IsolationLevel = ReadCommitted | RepeatableRead | Serializable
   deriving (Eq, Ord, Show)
@@ -775,14 +789,14 @@ boundOutput name formats values =
     <> Wire.serialize (Wire.Execute "" 0 :: Wire.Execute ByteString)
 
 -- | The types, the formats and the values of the parameters as the protocol has them.
-parametersOf :: [Param arr] -> IO ([Maybe Oid], [FormatCode], [Maybe Parameter])
+parametersOf :: [Param] -> IO ([Maybe Oid], [FormatCode], [Maybe Parameter])
 parametersOf given = (map paramType given,map paramFormat given,) <$> traverse (valueOf . paramValue) given
   where
     valueOf = \case
       Null -> pure Nothing
       Bytes bytes -> pure (Just (ParameterBytes bytes))
       Pieces pieces -> pure (Just (ParameterChunks pieces))
-      Streamed _ _ -> notImplementedIO "streamed parameters"
+      FromStream _ -> notImplementedIO "streamed parameters"
 
 -- | Sends what was laid out, in the loan of the transaction, whose buffer the replies are read into when it is sent.
 transmit :: (Runtime arr) => With Tx arr Output ()

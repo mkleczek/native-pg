@@ -95,7 +95,7 @@ rows pool sql =
   where
     unlessSucceeded (Right (Right (Right ())), _) = Right ()
     unlessSucceeded (_, call) = Left call
-    query = Tx.Statement sql (const []) (Tx.one Tx.field)
+    query = Tx.Statement sql (const []) Nothing (Tx.one Tx.field)
     failed = (,(500, "internal error\n")) ^>> plain
 
 -- | Takes the field of the result, says how long it is with the head, sends its pieces as they arrive, and ends the

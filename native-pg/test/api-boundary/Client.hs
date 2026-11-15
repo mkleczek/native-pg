@@ -54,7 +54,7 @@ countRequest pool =
     ^>> withConnection pool (transaction ReadCommitted Read (pipeline Final (statement count) single))
   where
     count :: Runtime arr => Statement arr () Int64
-    count = Statement "SELECT count(*) FROM t" (const []) (one column)
+    count = Statement "SELECT count(*) FROM t" (const []) Nothing (one column)
 
 -- | The statement that a snippet makes, and a fold of its rows.
 foldRequest :: Runtime arr => ConnectionPool -> arr Loans (Either PoolError (Either QueryError Int))
