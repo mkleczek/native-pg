@@ -512,6 +512,14 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             (query' (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (\source -> [streamedText (chunks * BS.length payload) source]) (single @_ @Bool)))
         )
         `shouldReturn` Right [True]
+    needs "streamed parameters" $ it "streams an empty parameter, and one in a statement that follows a streamed one" $
+      withSession
+        ( steps
+            [ streaming (newChunks []) (query' (lengthWith (\source -> [streamedText 0 source]))) `yields` Right [0],
+              streaming (newChunks ["ab", "", "c"]) (query' (Tx.Statement "SELECT length($1::text), length($2::text)" (\source -> [streamedText 3 source, textual (Just "four")]) pair)) `yields` Right [(3 :: Int32, 4 :: Int32)]
+            ]
+        )
+        `shouldReturn` ()
     it "sends a parameter in pieces, short and long, larger than the socket's buffers" $ do
       let payload = BS.concat (replicate 4096 "0123456789abcdef")
           pieces = concatMap (\piece -> [BS.take 100 piece, BS.drop 100 piece]) (replicate 128 payload)
@@ -841,6 +849,26 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 `failsAs` \case
                   StreamLengthError {} -> pure ()
                   other -> failTest ("expected StreamLengthError, got " <> show other),
+              brokenConnection
+            ]
+        )
+        `shouldReturn` ()
+    it "breaks the connection when a parameter stream is longer than declared" $
+      withSession
+        ( steps
+            [ streaming (newChunks ["more than", " declared"]) (query' (Tx.Statement "SELECT $1::text" (\source -> [streamedText 5 source]) (single @_ @Text)))
+                `failsAs` \case
+                  StreamLengthError {} -> pure ()
+                  other -> failTest ("expected StreamLengthError, got " <> show other),
+              brokenConnection
+            ]
+        )
+        `shouldReturn` ()
+    -- The cancellation rule: a message that is half sent owes the server its rest, wherever the sender waits.
+    it "breaks the connection when the wait for a slow parameter stream is cancelled" $
+      withSession
+        ( steps
+            [ withinFor (millis 300) (streaming slowSource (query' (lengthWith (\source -> [streamedText 4000 source])))) `yields` Nothing,
               brokenConnection
             ]
         )
