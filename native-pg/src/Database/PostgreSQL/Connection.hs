@@ -33,7 +33,8 @@ module Database.PostgreSQL.Connection
         connectResolver,
         connectFallbacks,
         connectTargetSessionAttrs,
-        connectTimeout
+        connectTimeout,
+        connectStatementCache
       ),
     connectSettings,
     Address (..),

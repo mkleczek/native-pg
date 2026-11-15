@@ -77,6 +77,10 @@ data ConnectSettings = ConnectSettings
     -- authenticate and qualify.
     connectTargetSessionAttrs :: TargetSessionAttrs,
     connectTimeout :: Maybe Int,
+    -- | How many statements a connection keeps prepared for the programs that cache them
+    -- ('Database.PostgreSQL.Transaction.cached'), the least recently used of which goes when it has more. None caches nothing:
+    -- the statements are sent as unnamed ones.
+    connectStatementCache :: Int,
     -- | For tests: what SCRAM's channel binding takes as the TLS end-point
     -- data in place of the server's certificate's: the bytes, or why there are
     -- none, or none. Set through "Database.PostgreSQL.Connection.Internal".
@@ -153,6 +157,7 @@ connectSettings address user =
       connectFallbacks = [],
       connectTargetSessionAttrs = AnySession,
       connectTimeout = Nothing,
+      connectStatementCache = 256,
       connectEndPointOverride = Nothing
     }
 

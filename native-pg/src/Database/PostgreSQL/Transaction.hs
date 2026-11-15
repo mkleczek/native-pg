@@ -52,6 +52,7 @@ module Database.PostgreSQL.Transaction
     statement,
     prepare,
     executePrepared,
+    cached,
     closeStatement,
     command,
     from,
@@ -100,6 +101,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Foldable (traverse_)
+import Data.Hashable (Hashable)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.Kind (Type)
@@ -107,6 +109,7 @@ import qualified Data.List as List
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import Data.Tuple (Solo (MkSolo))
+import Data.Typeable (Typeable)
 import Data.Word (Word8)
 import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..), InPlace)
@@ -145,6 +148,7 @@ import Network.Streaming.Buffer (Buffer (bufferCapacity))
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, _1, _2, alongside, boolA, concurrently, consume, done, iterateA, iterateWith, keeping, on, tap, through, undoing)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, loanIsPrimary, loansOf, release, withSetupBuffersOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity, readerMemory)
 import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
@@ -212,6 +216,7 @@ data Sent arr p
   = forall row. Execute (Statement arr p row)
   | forall row. Prepare ByteString (Statement arr p row)
   | forall row. ExecutePrepared ByteString (Statement arr p row)
+  | forall k row. (Typeable k, Hashable k) => Cached (p -> k) (p -> ByteString) (Statement arr p row)
   | Close ByteString
   | Command ByteString
 
@@ -252,6 +257,15 @@ prepare name given = Pipeline 1 [Prepare name given] Preparation
 executePrepared :: ByteString -> Statement arr p row -> Pipeline arr p (Result arr row)
 executePrepared name given = Pipeline 1 [ExecutePrepared name given] (\base -> Result base (readingOf (rows given)))
 
+-- | The statement, prepared on the connection under a name that the connection chooses and keeps for the key that the input gives,
+-- so that a run whose key the connection has executes the prepared statement, and does not evaluate the SQL. The SQL is a function
+-- of the input of its own, evaluated only when the connection has no statement for the key, which is prepared before it is
+-- executed, in the same pipeline: the pipeline, and the position of its result, are the same whether the connection has it
+-- or not. The parameters, and the stream, are the statement's, made for the input on every run; its own SQL is not used. The
+-- connection keeps as many statements as 'connectStatementCache' says, and forgets the least recently used.
+cached :: (Typeable k, Hashable k) => (p -> k) -> (p -> ByteString) -> Statement arr p row -> Pipeline arr p (Result arr row)
+cached key makeSql given = Pipeline 1 [Cached key makeSql given] (\base -> Result base (readingOf (rows given)))
+
 -- | Closes the statement that the connection has under the name.
 closeStatement :: ByteString -> Pipeline arr p (Result arr ())
 closeStatement name = Pipeline 1 [Close name] (`Result` Silent)
@@ -270,6 +284,7 @@ from function (Pipeline count' sent value) = Pipeline count' (map sentFrom sent)
       Execute given -> Execute (taken given)
       Prepare name given -> Prepare name (taken given)
       ExecutePrepared name given -> ExecutePrepared name (taken given)
+      Cached key makeSql given -> Cached (key . function) (makeSql . function) (taken given)
       Close name -> Close name
       Command given -> Command given
     taken = \case
@@ -805,6 +820,7 @@ streamOf :: Sent arr p -> Maybe (StreamSource arr p)
 streamOf = \case
   Execute given -> stream given
   ExecutePrepared _ given -> stream given
+  Cached _ _ given -> stream given
   _ -> Nothing
 
 -- | The statements, each with the number of its stream, among the streams of the pipeline's statements in order, if it has one.
@@ -870,6 +886,7 @@ layout finality streams sent tx (input, rest) = do
           -- The server starts statement_timeout at a Describe, and reads a Bind whole before it runs it, so it is described first
           -- for the time that the stream takes to count.
           pure (Entry (sql given) Wanted, Wire.serialize (Wire.Describe Wire.PreparedStatement name) <> boundStreamed name formats values)
+      Cached {} -> notImplementedIO "cached"
       Close name -> pure (Entry ("DEALLOCATE " <> name) Closing, Wire.serialize (Wire.Close Wire.PreparedStatement name))
 
 -- | The statement as it is for the input: one that has its SQL is as it is, and one that is made from the input is the
