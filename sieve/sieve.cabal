@@ -23,7 +23,7 @@ library
   other-modules: Data.Sieve.Ghosts
                  Data.Sieve.Memory
                  Data.Sieve.Table
-  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, containers >=0.6 && <0.8, streaming-io, text >=2.0 && <2.2
+  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, containers >=0.6 && <0.8, hashable >=1.4 && <1.6, streaming-io, text >=2.0 && <2.2
 
 test-suite sieve-spec
   type: exitcode-stdio-1.0

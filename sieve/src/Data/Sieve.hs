@@ -42,10 +42,12 @@ where
 
 import Control.Arrow (arr, returnA, (>>>), (^>>), (|||))
 import Control.Concurrent (yield)
-import Control.Exception (evaluate, onException, throw)
+import Control.Exception (evaluate, onException)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Control.Monad (when)
 import Data.Foldable (for_, traverse_)
+import Data.Hashable (hash)
 import Data.IORef (IORef, atomicWriteIORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
@@ -54,10 +56,10 @@ import Data.Sieve.Ghosts (Ghosts, addGhost, noGhosts, takeGhost)
 import Data.Sieve.Memory (Ints, casInt, newInts, readInt, writeInt, writeIntAtomic)
 import Data.Sieve.Table
 import Data.Text (Text)
+import qualified Data.Text as T
 import GHC.TypeLits (ErrorMessage (..), TypeError)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (Step, alongside, done, iterateA, keeping, step, tryTicket, pattern Again, pattern Finish)
-import Network.Streaming.NotImplemented (NotImplemented (..))
 
 -- | Which cores use a cache.
 data Sharing
@@ -101,13 +103,19 @@ class (Eq k) => Key k where
 instance Key Int where
   hashKey = id
 
--- | Not yet.
+-- | The hash of all the bytes, which hashable's code computes without a copy, and which the cache spreads as it spreads any
+-- other, so that the hashes that are close, or that share their low bits, don't cluster. A fold over the bytes in Haskell would
+-- cost about a nanosecond for each, which is a hundred times what the rest of a hit costs for the bytes of a JWT. A key that is
+-- a slice of a request's buffer is stored as a copy of its bytes, so that the cache doesn't keep the buffer alive.
 instance Key ByteString where
-  hashKey _ = throw (NotImplemented "hashKey of a strict ByteString")
+  hashKey = hash
+  storedKey = BS.copy
 
--- | Not yet.
+-- | The hash of the characters, by hashable, as for a byte string; the stored key is a copy of the array of the text that it is
+-- a slice of.
 instance Key Text where
-  hashKey _ = throw (NotImplemented "hashKey of a Text")
+  hashKey = hash
+  storedKey = T.copy
 
 -- | How a cache is made: its capacity, what it does with a key that it stores, and what it tells.
 data Config k v = Config
