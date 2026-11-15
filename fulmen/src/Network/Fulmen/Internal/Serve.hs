@@ -96,11 +96,11 @@ acceptance Listen {openListener, closeListener} =
           <*> (fst ^>> accept) `giving` "accepted socket"
       )
         >>> alongside post
-        >>> decide "worker took it?" untaken
-        >>> (taking "no" close ||| taking "yes" returnA)
+        >>> decide "worker rejected?" rejected
+        >>> (taking "yes" close ||| taking "no" returnA)
     accept =
       named (Label "accept" "Accepts the next connection of the listening socket, and blocks while none is waiting.") acceptor
-    untaken (taken, (_, socket)) = if taken then Right () else Left socket
+    rejected (taken, (_, socket)) = if taken then Right () else Left socket
 
 -- | The address of the inbox of a free worker of the core that has the most free workers, which is taken from the pool at once. When no
 -- worker is free, the part queues the promise of a ticket of its own in the pool, which fulfils it with the worker that is released
