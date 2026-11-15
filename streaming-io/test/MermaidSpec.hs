@@ -37,10 +37,6 @@ beside (posting, collecting) = fst ^>> ((snd ^>> posting) &&& (fst ^>> collectin
 together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhere ()), ()) ()
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 
--- | The stubs of adding, at and field fail until they are written, and the marks come off with them.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Named has stubs: adding, at and field are not written yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -77,15 +73,15 @@ spec = describe "the chart" $ do
     let labelled = [name | name <- ["name", "size"], any (("|\"" ++ name ++ "\"|") `isInfixOf`) (stripped chart)]
     labelled `shouldBe` ["name", "size"]
 
-  stubbed $ it "has the name of the field that adding puts in front of a record, on the wire out of its step" $ do
+  it "has the name of the field that adding puts in front of a record, on the wire out of its step" $ do
     chart <- chartOf (adding "size" quick >>> quick :: Diagram () ())
     wiresNamed "size" chart `shouldBe` 1
 
-  stubbed $ it "has the name of the field that at runs its arrow on, on the wire into its step and out of it" $ do
+  it "has the name of the field that at runs its arrow on, on the wire into its step and out of it" $ do
     chart <- chartOf (at "size" quick >>> quick :: Diagram ("size" := Int, "kept" := Bool) ())
     wiresNamed "size" chart `shouldBe` 2
 
-  stubbed $ it "has the name of the field that field reads, on the wire out of it" $ do
+  it "has the name of the field that field reads, on the wire out of it" $ do
     chart <- chartOf (field "size" >>> quick :: Diagram ("size" := Int, "kept" := Bool) ())
     wiresNamed "size" chart `shouldBe` 1
 

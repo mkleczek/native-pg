@@ -34,14 +34,9 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The stubs of newRecord, adding, at and field fail with 'NotImplemented': every case that needs one is expected to
--- fail, and the mark comes off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Named has stubs: newRecord, adding, at and field are not written yet"
-
 spec :: Spec
 spec = describe "fields named in their type" $ do
-  stubbed $ it "makes a record from the values of a plain function, by the names in the order that they are given" $ do
+  it "makes a record from the values of a plain function, by the names in the order that they are given" $ do
     let r = newRecord ["name", "size", "kept"] "pipe" (3 :: Int) True
     (r.name, r.size, r.kept) `shouldBe` ("pipe", 3, True)
 
@@ -52,7 +47,7 @@ spec = describe "fields named in their type" $ do
     it "reads the only field of a record of one" $
       run (is "only" (arr (const 'x')) >>^ \r -> r.only) `shouldReturn` 'x'
 
-    stubbed $ it "reads a field by field \"size\", whose output is that field" $ do
+    it "reads a field by field \"size\", whose output is that field" $ do
       run (record >>> field "size") `shouldReturn` 3
       run (record >>> field "name") `shouldReturn` "pipe"
       run (record >>> field "count") `shouldReturn` 4
@@ -76,13 +71,13 @@ spec = describe "fields named in their type" $ do
       total `shouldBe` 6
       readLog noted `shouldReturn` ["first", "second", "third"]
 
-    stubbed $ it "makes a record of three arrows with newRecord, <$> and <*>, and reads each field back" $
+    it "makes a record of three arrows with newRecord, <$> and <*>, and reads each field back" $
       run (three >>^ \r -> (r.name, r.size, r.kept)) `shouldReturn` ("pipe", 3, True)
 
-    stubbed $ it "makes a record of four arrows with newRecord, <$> and <*>, and reads each field back" $
+    it "makes a record of four arrows with newRecord, <$> and <*>, and reads each field back" $
       run (four >>^ \r -> (r.name, r.size, r.kept, r.count)) `shouldReturn` ("pipe", 3, True, 4)
 
-    stubbed $ it "runs the arrows that newRecord is applied to once each, from the first to the last" $ do
+    it "runs the arrows that newRecord is applied to once each, from the first to the last" $ do
       noted <- newLog
       total <-
         run
@@ -95,39 +90,39 @@ spec = describe "fields named in their type" $ do
       total `shouldBe` 6
       readLog noted `shouldReturn` ["first", "second", "third"]
 
-    stubbed $ it "puts a field in front of a record, and keeps the rest of it" $
+    it "puts a field in front of a record, and keeps the rest of it" $
       run
         ( record >>> adding "extra" (arr (const 'e')) >>^ \(Is extra, rest) ->
             (extra, rest.name, rest.size, rest.kept, rest.count)
         )
         `shouldReturn` ('e', "pipe", 3, True, 4)
 
-    stubbed $ it "gives a field that it adds the arrow's result, which reads the record" $
+    it "gives a field that it adds the arrow's result, which reads the record" $
       run (record >>> adding "total" (now (\r -> pure (r.size + r.count))) >>^ \r -> (r.total, r.size))
         `shouldReturn` (7, 3)
 
-    stubbed $ it "reads the newer of two fields of a name, which shadows the older, of whatever type" $
+    it "reads the newer of two fields of a name, which shadows the older, of whatever type" $
       run (record >>> adding "size" (field "name") >>^ \r -> (r.size, r.count)) `shouldReturn` ("pipe", 4)
 
-    stubbed $ it "runs an arrow on the first field and puts the result in its place, of another type" $
+    it "runs an arrow on the first field and puts the result in its place, of another type" $
       run (record >>> at "name" (arr length) >>^ \r -> (r.name, r.size, r.kept, r.count)) `shouldReturn` (4, 3, True, 4)
 
-    stubbed $ it "runs an arrow on a middle field and puts the result in its place, of another type" $
+    it "runs an arrow on a middle field and puts the result in its place, of another type" $
       run (record >>> at "size" (arr show) >>^ \r -> (r.name, r.size, r.kept, r.count))
         `shouldReturn` ("pipe", "3", True, 4)
 
-    stubbed $ it "runs an arrow on the last field and puts the result in its place, of another type" $
+    it "runs an arrow on the last field and puts the result in its place, of another type" $
       run (record >>> at "count" (arr even) >>^ \r -> (r.name, r.size, r.kept, r.count))
         `shouldReturn` ("pipe", 3, True, True)
 
-    stubbed $ it "runs an arrow on the only field of a record of one" $
+    it "runs an arrow on the only field of a record of one" $
       run (is "only" (arr (const 'x')) >>> at "only" (arr fromEnum) >>^ \r -> r.only) `shouldReturn` 120
 
-    stubbed $ it "runs an arrow on a field of a record that is a field, with at \"outer\" . at \"inner\"" $
+    it "runs an arrow on a field of a record that is a field, with at \"outer\" . at \"inner\"" $
       run (nested >>> (at "outer" . at "inner") (arr show) >>^ \r -> (r.label, r.outer.inner, r.outer.kept))
         `shouldReturn` ("pipe", "3", True)
 
-    stubbed $ it "runs a step that asks for two fields on records of different shapes" $ do
+    it "runs a step that asks for two fields on records of different shapes" $ do
       run (record >>> sized) `shouldReturn` "pipe3"
       run (four >>> sized) `shouldReturn` "pipe3"
       run (record >>> adding "size" (arr (const 5)) >>> sized) `shouldReturn` "pipe5"

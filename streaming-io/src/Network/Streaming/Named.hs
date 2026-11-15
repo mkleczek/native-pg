@@ -36,14 +36,13 @@ module Network.Streaming.Named
   )
 where
 
-import Control.Arrow (Arrow, (>>^))
-import Control.Exception (throw)
+import Control.Arrow (Arrow, arr, first, (&&&), (>>^), (^>>))
 import Data.Kind (Constraint)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
 import GHC.TypeLits (ErrorMessage (..), KnownSymbol, Symbol, TypeError, symbolVal)
-import Network.Streaming.Annotate (Annotate, giving)
-import Network.Streaming.NotImplemented (NotImplemented (..))
+import Network.Streaming.Annotate (Annotate, giving, inout)
+import Network.Streaming.Plumbing (alongside)
 
 -- | A value with its name in its type: one field of an anonymous record.
 newtype (name :: Symbol) := a = Is a
@@ -83,7 +82,8 @@ type Twice name = 'Text "The record has more than one field named " ':<>: 'ShowT
 
 -- | The field of a record, whose output wire is named after the field in diagrams.
 field :: forall name -> forall r a arr. (HasField name r a, KnownSymbol name, Arrow arr, Annotate arr) => arr r a
-field name = unwritten ("field " <> symbolVal (Proxy @name))
+field name = arr (getField @name) `giving` symbolVal (Proxy @name)
+{-# INLINE field #-}
 
 -- * Making
 
@@ -92,13 +92,15 @@ class Build (names :: [Symbol]) record k f | names record k -> f, names f -> rec
   build :: (record -> k) -> f
 
 instance (f ~ (a -> k), record ~ (name := a)) => Build '[name] record k f where
-  build _ = unwritten "newRecord"
+  build done = done . Is
+  {-# INLINE build #-}
 
 instance
   (f ~ (a -> g), record ~ (name := a, rest), Build (next ': names) rest k g) =>
   Build (name ': next ': names) record k f
   where
-  build _ = unwritten "newRecord"
+  build done a = build @(next ': names) (\rest -> done (Is a, rest))
+  {-# INLINE build #-}
 
 -- | The names are all different.
 type family Distinct (names :: [Symbol]) :: Constraint where
@@ -131,15 +133,18 @@ class SetField (name :: Symbol) r b r' | name r b -> r' where
 
 -- | The last field, which has the name.
 instance (r' ~ (name := b)) => SetField name (name := a) b r' where
-  setField _ = unwritten "at"
+  setField b _ = Is b
+  {-# INLINE setField #-}
 
 -- | The first field, which has the name: the newer one, as 'getField' reads it.
 instance {-# OVERLAPPING #-} (r' ~ (name := b, rest)) => SetField name (name := a, rest) b r' where
-  setField _ = unwritten "at"
+  setField b (_, rest) = (Is b, rest)
+  {-# INLINE setField #-}
 
 -- | A later field, found in the rest.
 instance (SetField name rest b rest', r' ~ (other := a, rest')) => SetField name (other := a, rest) b r' where
-  setField _ = unwritten "at"
+  setField b (a, rest) = (,) a $! setField @name b rest
+  {-# INLINE setField #-}
 
 -- | Runs the arrow on a field of the record, and puts its result in the field's place, with the rest of the record as
 -- it was. Both wires of the arrow are named after the field in diagrams.
@@ -149,13 +154,13 @@ at ::
   (Arrow arr, Annotate arr, KnownSymbol name, HasField name r a, SetField name r b r') =>
   arr a b ->
   arr r r'
-at name _ = unwritten ("at " <> symbolVal (Proxy @name))
+at name p = (getField @name &&& id) ^>> first (inout label p label) >>^ uncurry (setField @name)
+  where
+    label = symbolVal (Proxy @name)
+{-# INLINE at #-}
 
 -- | The arrow's result, as a field of the name in front of the input, which is the rest of the record. The wire out of
 -- the arrow is called the name in diagrams.
 adding :: forall name -> forall arr r b. (Arrow arr, Annotate arr, KnownSymbol name) => arr r b -> arr r (name := b, r)
-adding name _ = unwritten ("adding " <> symbolVal (Proxy @name))
-
--- | What the stubs fail with, until they are written.
-unwritten :: String -> a
-unwritten = throw . NotImplemented . ("Network.Streaming.Named: " <>)
+adding name p = alongside (is name p)
+{-# INLINE adding #-}
