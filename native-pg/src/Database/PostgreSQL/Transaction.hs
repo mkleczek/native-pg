@@ -7,6 +7,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- | Statements, pipelines and transactions, and the cursors that read their rows.
 --
@@ -37,7 +38,8 @@
 -- 'closeStatement' sends the Close. The library keeps no record of the names.
 module Database.PostgreSQL.Transaction
   ( -- * Statements
-    Statement (..),
+    Statement (Statement, sql, params, stream, rows),
+    statementFrom,
     StreamSource (..),
     streamFrom,
     Param (..),
@@ -150,12 +152,29 @@ import Prelude hiding (any)
 -- program, the stream that its 'FromStream' parameters read, and how its rows are
 -- read. The SQL is evaluated only when it is sent, and a prepared statement the
 -- connection already has sends only its parameters.
-data Statement arr p row = Statement
-  { sql :: ByteString,
-    params :: p -> [Param],
-    stream :: Maybe (StreamSource arr p),
-    rows :: Rows arr row
-  }
+data Statement arr p row
+  = Statement
+      { sql :: ByteString,
+        params :: p -> [Param],
+        stream :: Maybe (StreamSource arr p),
+        rows :: Rows arr row
+      }
+  | -- | A statement whose SQL and parameters are made from the input when it is sent, as 'statementFrom' makes it. Its own
+    -- @sql@ and @params@ are empty.
+    Made
+      { sql :: ByteString,
+        params :: p -> [Param],
+        stream :: Maybe (StreamSource arr p),
+        rows :: Rows arr row,
+        made :: p -> (ByteString, [Param])
+      }
+
+-- | A statement whose SQL and parameters are made from the input of the program when it is sent: the one place where the
+-- text of a statement is a run-time value, for a program that is built once and sends a different statement each time.
+-- The rows are read as the statement says, whatever its SQL is, and the statement takes 'streamFrom', 'prepare' and
+-- 'executePrepared', and 'from' like any other. The SQL is evaluated when it is sent, and not by 'executePrepared'.
+statementFrom :: (p -> (ByteString, [Param])) -> Rows arr row -> Statement arr p row
+statementFrom make reading = Made {sql = BS.empty, params = const [], stream = Nothing, rows = reading, made = make}
 
 -- | The stream of a statement, as its type is fixed when the statement is built, and so is its 'next': only the state
 -- of the stream is taken from the input of the program, when it runs.
@@ -223,10 +242,10 @@ readingOf (Rows cardinality cursor) = Reading cardinality cursor
 statement :: Statement arr p row -> Pipeline arr p (Result arr row)
 statement given = Pipeline 1 [Execute given] (\base -> Result base (readingOf (rows given)))
 
--- | Parses the statement under the name. Parse sends no parameters, so what the
--- pipeline takes as its input doesn't matter.
-prepare :: ByteString -> Statement arr p row -> Pipeline arr q Preparation
-prepare name given = Pipeline 1 [Prepare name (given {params = const [], stream = Nothing})] Preparation
+-- | Parses the statement under the name. Parse sends no parameters, so the input of the pipeline matters only to a
+-- statement made from it.
+prepare :: ByteString -> Statement arr p row -> Pipeline arr p Preparation
+prepare name given = Pipeline 1 [Prepare name given] Preparation
 
 -- | Binds and executes the statement that the connection has under the name.
 executePrepared :: ByteString -> Statement arr p row -> Pipeline arr p (Result arr row)
@@ -252,7 +271,9 @@ from function (Pipeline count' sent value) = Pipeline count' (map sentFrom sent)
       ExecutePrepared name given -> ExecutePrepared name (taken given)
       Close name -> Close name
       Command given -> Command given
-    taken given = given {params = params given . function, stream = (\(StreamSource source) -> StreamSource (source . function)) <$> stream given}
+    taken = \case
+      Statement {sql, params, stream, rows} -> Statement {sql, params = params . function, stream = (\(StreamSource source) -> StreamSource (source . function)) <$> stream, rows}
+      Made {sql, params, stream, rows, made} -> Made {sql, params = params . function, stream = (\(StreamSource source) -> StreamSource (source . function)) <$> stream, rows, made = made . function}
 
 data IsolationLevel = ReadCommitted | RepeatableRead | Serializable
   deriving (Eq, Ord, Show)
@@ -804,7 +825,7 @@ layout finality streams sent tx (input, rest) = do
   where
     plain text = statementOutput text [] [] []
     rendered parameters (source, item) = case item of
-      Execute given -> case source of
+      Execute (resolved parameters -> given) -> case source of
         Nothing -> do
           (types, formats, values) <- parametersOf (params given parameters)
           pure (Entry (sql given) Wanted, statementOutput (sql given) types formats values)
@@ -812,8 +833,8 @@ layout finality streams sent tx (input, rest) = do
           (types, formats, values) <- argumentsOf number (params given parameters)
           pure (Entry (sql given) Wanted, streamedStatementOutput (sql given) types formats values)
       Command text -> pure (Entry text Wanted, plain text)
-      Prepare name given -> pure (Entry (sql given) Parsing, parseOutput name (sql given))
-      ExecutePrepared name given -> case source of
+      Prepare name (resolved parameters -> given) -> pure (Entry (sql given) Parsing, parseOutput name (sql given))
+      ExecutePrepared name (resolved parameters -> given) -> case source of
         Nothing -> do
           (_, formats, values) <- parametersOf (params given parameters)
           pure (Entry (sql given) Wanted, boundOutput name formats values)
@@ -823,6 +844,12 @@ layout finality streams sent tx (input, rest) = do
           -- for the time that the stream takes to count.
           pure (Entry (sql given) Wanted, Wire.serialize (Wire.Describe Wire.PreparedStatement name) <> boundStreamed name formats values)
       Close name -> pure (Entry ("DEALLOCATE " <> name) Closing, Wire.serialize (Wire.Close Wire.PreparedStatement name))
+
+-- | The statement as it is for the input: one that has its SQL is as it is, and one that is made from the input is not sent yet.
+resolved :: p -> Statement arr p row -> Statement arr p row
+resolved _ = \case
+  Made {} -> error "a statement made from the input is not sent yet"
+  given -> given
 
 -- | The statement that ends a transaction: ROLLBACK if it is condemned, else COMMIT, as its SQL, which the errors name, and
 -- the messages that carry it.
