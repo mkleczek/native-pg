@@ -19,6 +19,11 @@ module Database.PostgreSQL.Pool
     ConnectionPool,
     withConnectionPool,
     withConnection,
+    Maintenance,
+    newMaintenance,
+    newConnectionPool,
+    closeConnectionPool,
+    maintain,
     PoolStats (..),
     connectionPoolStats,
     Observation (..),
@@ -54,6 +59,7 @@ import Network.Streaming.Classes (Block (..), Duration (..), Effect (..), Event 
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, iterateA, keeping, step, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
+import Network.Streaming.NotImplemented (notImplemented, notImplementedIO)
 import Network.Streaming.Pool (Pool, PoolError (..), closePoolWith, free, isClosed, newPool, queueAt, releaseNow, takeNow, urgently)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 
@@ -161,6 +167,28 @@ withConnectionPool settings use = do
     slotOf self beyond = Slot self beyond <$> newIORef Nothing <*> newIORef UUID.nil <*> newIORef 0 <*> newIORef 0
     positive :: Int -> PositiveInt
     positive number = fromMaybe (positiveInt @1) (mkPositiveInt (toInteger number))
+
+-- | The pools whose connections have a lifetime or an idle time, which one arrow, 'maintain', looks after.
+data Maintenance = Maintenance
+
+-- | A maintenance with no pool.
+newMaintenance :: IO Maintenance
+newMaintenance = pure Maintenance
+
+-- | A pool, made without waiting: its slots are empty until a request first has them, and it is registered with the
+-- maintenance if it has a lifetime or an idle time.
+newConnectionPool :: Maintenance -> ConnectionPoolSettings -> IO ConnectionPool
+newConnectionPool _ _ = notImplementedIO "newConnectionPool"
+
+-- | Closes the pool, without waiting: a checkout after it is 'PoolClosed', the connections that are free close now, and each of
+-- the others as the request that has it gives it back. It is taken out of its maintenance.
+closeConnectionPool :: ConnectionPool -> IO ()
+closeConnectionPool _ = notImplementedIO "closeConnectionPool"
+
+-- | Looks after the pools of the maintenance for ever: it sleeps, and then closes the connections that are free and past their
+-- lifetime or idle time. A part that the server runs beside its others.
+maintain :: (Runtime arr) => arr Maintenance ()
+maintain = notImplemented "maintain"
 
 -- | Closes the connection that the slot holds, if it has one, for the reason, which is then told to the observer. The slot is
 -- empty.

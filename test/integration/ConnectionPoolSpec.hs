@@ -26,7 +26,7 @@ import Data.UUID (UUID)
 import Data.Word (Word64)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), connectSettings)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), PoolStats (..), connectionPoolSettings, connectionPoolStats, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), PoolStats (..), closeConnectionPool, connectionPoolSettings, connectionPoolStats, maintain, newConnectionPool, newMaintenance, withConnection, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats)
@@ -40,6 +40,7 @@ import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.Mem (performMinorGC)
 import System.Timeout (timeout)
+import TestPools
 import TestPrograms
 import TestServers
 
@@ -118,6 +119,75 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       withConnectionPool (applicationPool "two") $ \open ->
         runOn runner buffers (across applicationOf [shut, open, shut])
           `shouldReturn` [Left PoolClosed, Right (Right ["two"]), Left PoolClosed]
+
+  -- Pools are values that are made and closed without waiting, and their maintenance is an arrow that a program runs: the cases
+  -- that follow are those of closing and ageing, for pools made as values, with 'maintain' run as a part.
+  needs "pools as values" $ describe "a pool that is a value" $ do
+    let buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+        lasting change = withPool' (change (connectionPoolSettings 1 settings))
+        withPool' settings' use = buffersOf >>= \buffers -> withPool runner buffers settings' (\pool -> use (Env runner buffers pool))
+    it "makes no connection when it is made, and gives PoolClosed once it is closed, as often as it is closed" $ do
+      buffers <- buffersOf
+      maintenance <- newMaintenance
+      pool <- newConnectionPool maintenance (connectionPoolSettings 2 settings)
+      connectionPoolStats pool `shouldReturn` PoolStats 0 0 0
+      void (pidOf (Env runner buffers pool))
+      connectionPoolStats pool `shouldReturn` PoolStats 1 0 0
+      closeConnectionPool pool
+      closeConnectionPool pool
+      runOn runner buffers (viaPool pool done) `shouldReturn` Left PoolClosed
+
+    it "closes the connections that are free as it is closed, and the one that a request has as it gives it back, without waiting" $ do
+      buffers <- buffersOf
+      maintenance <- newMaintenance
+      pool <- newConnectionPool maintenance (connectionPoolSettings 2 settings)
+      let env = Env runner buffers pool
+      held <- startHolding env
+      freePid <- pidOf env
+      started <- getMonotonicTime
+      closeConnectionPool pool
+      took <- subtract started <$> getMonotonicTime
+      (took < 0.1) `shouldBe` True
+      eventually 5 (gone freePid) `shouldReturn` True
+      stateOf (holderBackend held) `shouldReturn` Right ["idle"]
+      finishHolding held
+      eventually 5 (gone (holderBackend held)) `shouldReturn` True
+
+    it "closes a connection that is older than the pool's lifetime, and makes another for the next request" $
+      lasting (\s -> s {poolLifetime = Just (millis 600)}) $ \env -> do
+        pid <- pidOf env
+        pidOf env `shouldReturn` pid
+        eventually 6 (gone pid) `shouldReturn` True
+        pid' <- pidOf env
+        (pid' /= pid) `shouldBe` True
+
+    it "closes a connection that nobody has used for the pool's idle time, and not one that is used" $
+      lasting (\s -> s {poolIdleTime = Just (millis 600)}) $ \env -> do
+        pid <- pidOf env
+        forM_ [1 .. 8 :: Int] $ \_ -> threadDelay 150000 *> (pidOf env `shouldReturn` pid)
+        eventually 6 (gone pid) `shouldReturn` True
+
+    it "looks after every pool that is registered with the maintenance, with one part" $ do
+      buffers <- buffersOf
+      maintenance <- newMaintenance
+      aging <- newConnectionPool maintenance ((connectionPoolSettings 1 settings) {poolLifetime = Just (millis 500)})
+      idling <- newConnectionPool maintenance ((connectionPoolSettings 1 settings) {poolIdleTime = Just (millis 500)})
+      _ <- forkIO (void (try @SomeException (runOn runner buffers (const maintenance ^>> maintain))))
+      agingPid <- pidOf (Env runner buffers aging)
+      idlingPid <- pidOf (Env runner buffers idling)
+      eventually 6 ((&&) <$> gone agingPid <*> gone idlingPid) `shouldReturn` True
+      closeConnectionPool aging
+      closeConnectionPool idling
+
+    it "ends where it sleeps when it is cancelled, whatever pools are registered" $ do
+      buffers <- buffersOf
+      maintenance <- newMaintenance
+      pool <- newConnectionPool maintenance ((connectionPoolSettings 1 settings) {poolIdleTime = Just (secs 60)})
+      started <- getMonotonicTime
+      runOn runner buffers (race (const maintenance ^>> maintain) (done >>> sleep (millis 100))) `shouldReturn` Right ()
+      ended <- getMonotonicTime
+      (ended - started < 5) `shouldBe` True
+      closeConnectionPool pool
 
   -- What the pool does past its size, as v1's overflow policy did: a request that finds every connection in use waits for one
   -- to come back, and after the overflow delay opens one more, up to the overflow. That connection is closed as its request ends.
