@@ -100,6 +100,47 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       PG.serverProtocolVersion info
         `shouldBe` (if maybe False (>= 18) major then protocolVersion3_2 else protocolVersion3_0)
 
+  -- What the client can't do in the authentication is worded as libpq words it, in the failure of the host. The cluster
+  -- has no server that asks for what the client doesn't have, so a scripted server asks.
+  needs "authentication wording" $ describe "authentication wording" $ do
+    let failureAt settings = either displayException (const "connected") <$> run (connectedTo settings done)
+        onSocket reason = "connection to server on socket \"" <> socketPath <> "\" failed: " <> reason
+        startupThen reply client = receiveStartup client *> SocketBytes.sendAll client reply *> drain client
+        -- The reason that the one host gave, which the scripts make.
+        reasonOf :: [Socket.Socket -> IO ()] -> IO String
+        reasonOf scripts = withScripted scripts $ \scriptedPort -> do
+          settings <- settingsOf ("host=127.0.0.1 user=postgres password=secret sslmode=disable port=" <> Char8.pack (show scriptedPort))
+          failure <- failureAt settings
+          pure (drop (length ("connection to server at \"127.0.0.1\", port " <> show scriptedPort <> " failed: ")) failure)
+        scripted reply = reasonOf [startupThen reply]
+    forM_ [("SCRAM-SHA-256", "native_pg_scram"), ("MD5", "native_pg_md5"), ("a cleartext password", "native_pg_cleartext")] $ \(method, user) ->
+      it ("says that no password was supplied, when the server asks for one for " <> method) $
+        failureAt (unix user Nothing) `shouldReturn` onSocket "fe_sendauth: no password supplied"
+    it "says that GSSAPI isn't supported" $ scripted (frame 'R' (int32 7)) `shouldReturn` "GSSAPI authentication not supported"
+    it "says that SSPI isn't supported" $ scripted (frame 'R' (int32 9)) `shouldReturn` "SSPI authentication not supported"
+    it "says that an authentication method that no client has isn't supported" $ do
+      scripted (frame 'R' (int32 2)) `shouldReturn` "authentication method 2 not supported"
+      scripted (frame 'R' (int32 99)) `shouldReturn` "authentication method 99 not supported"
+    it "says that none of the SASL mechanisms is supported" $
+      scripted (frame 'R' (int32 10 <> "SCRAM-SHA-512\0\0")) `shouldReturn` "none of the server's SASL authentication mechanisms are supported"
+    -- The server's side of SCRAM, up to a message that the client doesn't accept.
+    let scramThen serverFirst final = \client -> do
+          _ <- receiveStartup client
+          SocketBytes.sendAll client (frame 'R' (int32 10 <> "SCRAM-SHA-256\0\0"))
+          (_, clientFirst) <- receiveMessage client
+          let nonce = BS.drop 2 (snd (BS.breakSubstring "r=" clientFirst))
+          SocketBytes.sendAll client (frame 'R' (int32 11 <> serverFirst nonce))
+          maybe (pure ()) (\finalMessage -> receiveMessage client *> SocketBytes.sendAll client (frame 'R' (int32 12 <> finalMessage))) final
+          drain client
+        scramFailure serverFirst final = reasonOf [scramThen serverFirst final]
+        agreeing nonce = "r=" <> nonce <> "server,s=c2FsdA==,i=4096"
+    it "says that the server's nonce isn't the client's" $
+      scramFailure (const "r=anothernonce,s=c2FsdA==,i=4096") Nothing `shouldReturn` "invalid SCRAM response (nonce mismatch)"
+    it "says that the server's signature is incorrect" $
+      scramFailure agreeing (Just ("v=" <> BS.replicate 43 65 <> "=")) `shouldReturn` "incorrect server signature"
+    it "says what the server reports of its failing the proof" $
+      scramFailure agreeing (Just "e=invalid-proof") `shouldReturn` "error received from server in SCRAM exchange: invalid-proof"
+
   -- A connection is closed when its scope ends. Closing it earlier is allowed, and so is closing it again.
   describe "close" $
     forM_ [("without TLS", unix "postgres" Nothing), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
@@ -1059,6 +1100,14 @@ receiveStartup :: Socket.Socket -> IO ByteString
 receiveStartup client = do
   size <- BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0 <$> SocketBytes.recv client 4
   SocketBytes.recv client (size - 4)
+
+-- | Takes a message of the client, which has a tag: the tag, and the payload after the length.
+receiveMessage :: Socket.Socket -> IO (Char, ByteString)
+receiveMessage client = do
+  tag <- receiving client 1
+  size <- BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0 <$> receiving client 4
+  payload <- receiving client (size - 4)
+  pure (Char8.head tag, payload)
 
 -- | Takes this many bytes from the client.
 receiving :: Socket.Socket -> Int -> IO ByteString
