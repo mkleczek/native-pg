@@ -10,7 +10,7 @@ module Network.Streaming.Internal.Tickets
     Slot (..),
     fulfilHere,
     abandonHere,
-    fulfilNow,
+    Fulfilling (..),
   )
 where
 
@@ -37,12 +37,22 @@ newtype instance Promise 'Anywhere a = AnywherePromise (a -> IO Bool)
 -- alive as long as the slot.
 data Slot a = Empty | Fulfilled !a | Waiter (IO a -> IO ()) | Abandoned
 
--- | Fulfils the promise of a ticket of any core with the value, as the arrow's own 'fulfil' does, but as an action that
--- never waits, so that it is a step of an arrow without a point to give way at: for what hands a value over together
--- with what must not be left half done if a cancellation came between.
-fulfilNow :: Promise 'Anywhere a -> a -> IO Bool
-fulfilNow (AnywherePromise fulfilling) = fulfilling
-{-# INLINE fulfilNow #-}
+-- | Promises that an action fulfils, as the arrow's own 'Network.Streaming.Classes.fulfil' does but without its point to give
+-- way at, so that it is a step of an arrow that can't wait: for what hands a value over together with what must not be left
+-- half done if a cancellation came between, and for an action of a structure that parts share, which has no arrow to fulfil in.
+-- It says whether the part that awaits the future took the value. A promise of reach @'Here s@ is fulfilled by an action that
+-- runs on the core of its arrow, as the part that awaits it is put back among those that can go on there.
+class Fulfilling (r :: Reach) where
+  fulfilNow :: Promise r a -> a -> IO Bool
+
+-- | A promise of any core is fulfilled by the function that the arrow of its ticket made it with.
+instance Fulfilling 'Anywhere where
+  fulfilNow (AnywherePromise fulfilling) = fulfilling
+  {-# INLINE fulfilNow #-}
+
+-- | Not yet.
+instance Fulfilling ('Here s) where
+  fulfilNow _ _ = ioError (userError "fulfilNow of a promise of the arrow's own core is not implemented yet")
 
 -- | Fulfils the slot with its value, and puts the part that waits for it back among those that can go on. It says
 -- whether the waiter takes it: it doesn't if the waiter has gone. The value is evaluated, whether it is

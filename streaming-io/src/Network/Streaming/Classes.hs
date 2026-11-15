@@ -70,6 +70,7 @@ module Network.Streaming.Classes
     Event (..),
     Reach (..),
     Promise,
+    Fulfilling (..),
     Exchange (..),
     Address,
     Inboxes (..),
@@ -104,7 +105,7 @@ import Network.Streaming.Internal.Inboxes (Address)
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Plumbing (pattern Again, pattern Finish, consume, iterateWith)
-import Network.Streaming.Internal.Tickets (Promise, Reach (..))
+import Network.Streaming.Internal.Tickets (Fulfilling (..), Promise, Reach (..))
 import Network.Streaming.Watch (Watch)
 import System.Posix.Types (Fd (..))
 
@@ -183,7 +184,7 @@ type Runtime arr =
 -- belongs to no core, so that shared structures can hold it, and the parts of
 -- any core can fulfil it: it costs what a value that crosses cores costs.
 -- An arrow has the instances for the reaches it can keep.
-class Exchange arr (r :: Reach) where
+class (Fulfilling r) => Exchange arr (r :: Reach) where
   data Future arr r a
 
   -- | The ends of a new ticket, made on this core.

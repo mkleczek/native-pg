@@ -36,7 +36,7 @@ import Network.Streaming.Combinators (alongside, decide, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
-import Network.Streaming.Internal.Tickets (Promise (..), fulfilNow)
+import Network.Streaming.Internal.Tickets (Promise (..))
 import Network.Streaming.Pool (checkoutAt, checkoutMany, checkoutManyOf, queueNow, releaseNow, takeNow)
 
 -- | What a request borrows buffers with: the pool, its primary buffer, and what is lent of them.

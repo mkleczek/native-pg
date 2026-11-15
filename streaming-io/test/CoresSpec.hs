@@ -88,6 +88,24 @@ spec = describe "cores" $ do
       fst <$> runCompiled (fulfilledFirst @'Anywhere) () `shouldReturn` (True, Just 5)
       runThreads (fulfilledFirst @'Anywhere) () `shouldReturn` (True, Just 5)
 
+  describe "a promise fulfilled by an action that never waits" $ do
+    it "fulfils the promise of a part that waits, and tells the promise that the waiter has gone, for a ticket of any core" $ do
+      fst <$> runDelimited (fulfilledNowTo @'Anywhere) () `shouldReturn` (42, True)
+      fst <$> runCompiled (fulfilledNowTo @'Anywhere) () `shouldReturn` (42, True)
+      runThreads (fulfilledNowTo @'Anywhere) () `shouldReturn` (42, True)
+      fst <$> runDelimited (goneNow @'Anywhere) () `shouldReturn` (Nothing, False)
+      fst <$> runCompiled (goneNow @'Anywhere) () `shouldReturn` (Nothing, False)
+      runThreads (goneNow @'Anywhere) () `shouldReturn` (Nothing, False)
+
+    xfail "fulfilNow of a promise of the arrow's own core is not there yet" $
+      it "does the same for a ticket of the arrow's own core" $ do
+        fst <$> runDelimited fulfilledNowToLocal () `shouldReturn` (42, True)
+        fst <$> runCompiled fulfilledNowToLocal () `shouldReturn` (42, True)
+        fst <$> runLoop fulfilledNowToLocal () `shouldReturn` (42, True)
+        fst <$> runDelimited goneNowLocal () `shouldReturn` (Nothing, False)
+        fst <$> runCompiled goneNowLocal () `shouldReturn` (Nothing, False)
+        fst <$> runLoop goneNowLocal () `shouldReturn` (Nothing, False)
+
   describe "the pool of connections" $ do
     it "loses and duplicates no connection, and no part waits for ever, with parts on 2 and 4 cores" $ do
       ensureCores
@@ -228,6 +246,22 @@ goneLocal = gone @(Local arr)
 
 fulfilledFirstLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () (Bool, Maybe Int)
 fulfilledFirstLocal = fulfilledFirst @(Local arr)
+
+-- | A part waits at the ticket while another fulfils its promise with an action that never waits: the value is the
+-- waiter's.
+fulfilledNowTo :: forall r arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr r, Exchange arr (Local arr)) => arr () (Int, Bool)
+fulfilledNowTo = ticket @arr @r >>> concurrently (fst ^>> await) (now (\(_, promise) -> fulfilNow promise 42))
+
+-- | The waiter abandons before the promise is fulfilled by an action: nothing for it, and the action is told.
+goneNow :: forall r arr. (ArrowChoice arr, Effect arr, Exchange arr r) => arr () (Maybe Int, Bool)
+goneNow = ticket @arr @r >>> first abandon >>> second (now (\promise -> fulfilNow promise 5))
+
+-- | Those two at the reach of the arrow's own core.
+fulfilledNowToLocal :: forall arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr (Local arr)) => arr () (Int, Bool)
+fulfilledNowToLocal = fulfilledNowTo @(Local arr)
+
+goneNowLocal :: forall arr. (ArrowChoice arr, Effect arr, Exchange arr (Local arr)) => arr () (Maybe Int, Bool)
+goneNowLocal = goneNow @(Local arr)
 
 -- | A part's place in the pool's queue, and no connection: for tests that ask for one when none is free.
 queued :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere) => Pool conn -> arr () (Future arr 'Anywhere conn)

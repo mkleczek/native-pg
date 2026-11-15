@@ -54,7 +54,6 @@ import Data.Tuple (swap)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (alongside, boolA, decide, done, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
-import Network.Streaming.Internal.Tickets (fulfilNow)
 
 -- | The items that are free, and how many, the number that the next waiter to queue gets, which says which of two
 -- waiters came first, and the waiters in their lanes, by how many items must be free to serve the first of the lane.
