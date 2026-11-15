@@ -3,12 +3,12 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
 
--- | What a scope costs each iteration of a loop that runs inside it, which is nothing: a part enters a scope once, as an
--- inbox's or a listener's is, and runs a loop in it for its life, and the loop's iterations cost what they do outside it.
--- Each case runs the same loop bare and inside an empty scope, and compares the bytes that an iteration allocates, which
--- are the difference between a long run and a short one. A loop that gives way at each step is one case, and a loop that
--- waits at an inbox for a part that posts to it is the other. The suite runs with @-T@ ("-with-rtsopts" in its cabal
--- stanza) so that allocation is counted.
+-- | What encloses a loop costs each iteration of it: a part enters a scope, a shield, a deadline, tryA or a group once, as an
+-- inbox's or a listener's is, and runs a loop in it for its life, and the loop's iterations cost what they do outside. Each
+-- case runs the same loop bare and enclosed, and compares the bytes that an iteration allocates, which are the difference
+-- between a long run and a short one. A loop that gives way at each step is one case, and a loop that waits at an inbox for a
+-- part that posts to it is the other. The suite runs with @-T@ ("-with-rtsopts" in its cabal stanza) so that allocation is
+-- counted. With @SCOPE_COST_REPORT@ set, each case says what it measured, on stderr.
 --
 -- The schedulers that run every part on one thread take a turn of no length, so that every step is a point where the part
 -- gives way.
@@ -28,56 +28,122 @@ import Network.Streaming.Internal.Scheduler (Turn (..))
 import Network.Streaming.Loop (runLoop)
 import Network.Streaming.Threads
 import Skeletest
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
 import System.Mem (performMinorGC)
 
 -- | What the cases' programs need of an arrow.
-type Program = forall arr. (ArrowChoice arr, Annotate arr, Concurrent arr, GiveWay arr, Scope arr, Inboxes arr (Local arr)) => Int -> arr () ()
+type Program = forall arr. (ArrowChoice arr, Annotate arr, Concurrent arr, GiveWay arr, Scope arr, Within arr, Inboxes arr (Local arr)) => Int -> arr () ()
 
--- | An arrow, whether a scope costs its loop anything in it, which is a known failure, and how it runs a program for the
--- unit, with the number of iterations that it is given.
-data Runner = Runner String Bool (Program -> Int -> IO ())
+-- | An arrow, how it runs a program for the unit, with the number of iterations that it is given, what a scope may add to
+-- what a part's wait copies, and the most that a bare loop may allocate each iteration.
+data Runner = Runner
+  { runnerName :: String,
+    runnerRun :: Program -> Int -> IO (),
+    -- | What the frames of one scope add to each wait, in bytes: the one pointer that the return frame of a scope holds, in
+    -- the arrow whose parts capture their stack when they wait, and nothing in the others.
+    runnerFrame :: Double,
+    runnerCeilings :: Ceilings
+  }
+
+-- | The most that a bare loop allocates each iteration, in bytes, that gives way at each step and that waits at an inbox: what
+-- the arrow allocated when the ceiling was set, and a tolerance. A change that makes a bare loop dearer says so here, as a
+-- change that makes it cheaper takes the ceiling down.
+data Ceilings = Ceilings {yieldingCeiling :: Double, exchangingCeiling :: Double}
 
 runners :: [Runner]
 runners =
-  [ Runner "threads" False (\program count -> void (runThreads (program count) ())),
-    Runner "delimited" True (\program count -> void (runDelimitedTurn (Turn 0) (program count) ())),
-    Runner "compiled" False (\program count -> void (runCompiledTurn (Turn 0) (program count) ())),
-    Runner "loop" False (\program count -> void (runLoop (program count) ()))
+  [ Runner "threads" (\program count -> void (runThreads (program count) ())) 0 (Ceilings 304 1488),
+    Runner "delimited" (\program count -> void (runDelimitedTurn (Turn 0) (program count) ())) 16 (Ceilings 512 1904),
+    Runner "compiled" (\program count -> void (runCompiledTurn (Turn 0) (program count) ())) 0 (Ceilings 488 1856),
+    Runner "loop" (\program count -> void (runLoop (program count) ())) 0 (Ceilings 1584 5976)
   ]
 
--- | The most that an iteration in a scope may allocate more than one outside, in bytes: a few words, for the noise of the
+-- | The most that an iteration enclosed may allocate more than one outside, in bytes: a few words, for the noise of the
 -- count, which is none in practice.
 tolerance :: Double
 tolerance = 24
 
--- | Marks a case of an arrow whose parts capture their stack when they wait, which holds the frames of their scopes: the
--- catch frame of the scope, and what follows its body, 12 words in all, are copied each time a part waits in the scope.
--- The mark comes off when a scope's frames are not copied, and a case that then passes unexpectedly fails the suite.
-copied :: Bool -> Spec -> Spec
-copied known = if known then xfail "delimited: a part that waits captures the frames of its scopes, which a scope adds to each wait" else id
+-- | Marks a case of an arrow whose parts capture their stack when they wait, which copies what the loop is enclosed in: the
+-- frames of its scopes, which a scope adds to each wait, the catch of a shield, a deadline or tryA, and what follows a part's
+-- body in its group. The mark comes off when what encloses a loop is not copied, and a case that then passes unexpectedly
+-- fails the suite.
+copied :: String -> String -> Spec -> Spec
+copied name reason = if name == "delimited" then xfail ("delimited: " <> reason) else id
 
 spec :: Spec
-spec = describe "a scope" $ forM_ runners $ \(Runner name costly run) -> describe name $ do
-  copied costly $
-    it "costs a loop that gives way at each step no allocation in it" $ do
-      outside <- perIteration (run yielding)
-      inside <- perIteration (run (\count -> scoped (yielding count)))
-      atMostMore outside inside
+spec = do
+  describe "a scope" $ forM_ runners $ \runner -> describe (runnerName runner) $ do
+    let name = runnerName runner
+    copied name "a part that waits captures the frames of its scopes, which a scope adds to each wait" $
+      it "costs a loop that gives way at each step no allocation in it" $
+        costsAtMost runner "scope, gives way" tolerance yielding (\count -> scoped (yielding count))
 
-  copied costly $
-    it "costs a loop that waits at an inbox no allocation in it" $ do
-      outside <- perIteration (run exchanging)
-      inside <- perIteration (run (\count -> exchangingIn scoped count))
-      atMostMore outside inside
+    copied name "a part that waits captures the frames of its scopes, which a scope adds to each wait" $
+      it "costs a loop that waits at an inbox no allocation in it" $
+        costsAtMost runner "scope, inbox" tolerance exchanging (exchangingIn scoped)
 
-  when (name == "delimited") $
-    copied costly $
-      it "costs a loop that waits at an inbox that a part on another core posts to no allocation in it" $ do
-        cores <- getNumCapabilities
-        when (cores < 2) (setNumCapabilities 2)
-        outside <- perIteration (void . acrossCores id)
-        inside <- perIteration (void . acrossCores scoped)
-        atMostMore outside inside
+    when (name == "delimited") $
+      copied name "a part that waits captures the frames of its scopes, which a scope adds to each wait" $
+        it "costs a loop that waits at an inbox that a part on another core posts to no allocation in it" $ do
+          cores <- getNumCapabilities
+          when (cores < 2) (setNumCapabilities 2)
+          outside <- perIteration (void . acrossCores id)
+          inside <- perIteration (void . acrossCores scoped)
+          reported name "scope, another core" outside inside
+          atMostMore tolerance outside inside
+
+    -- Each scope adds the frame of one pointer to a wait, and nothing else: a frame that grows shows here, eight times over.
+    copied name "a part that waits captures the frames of its scopes, which a scope adds to each wait" $
+      it "costs a loop in eight nested scopes no more than a frame for each" $
+        costsAtMost runner "eight scopes" (tolerance + runnerFrame runner * 8) yielding (\count -> iterate scoped (yielding count) !! 8)
+
+  describe "what else encloses a loop" $ forM_ runners $ \runner -> describe (runnerName runner) $ do
+    let name = runnerName runner
+    copied name "a part that waits captures the catch of a shield, which a shield adds to each wait" $
+      it "costs a loop in a shield no allocation in it" $
+        costsAtMost runner "shield" tolerance yielding (shield . yielding)
+
+    copied name "a part that waits captures the catch of a deadline, which a deadline adds to each wait, until stage C of the frame-free scopes" $
+      it "costs a loop in a deadline no allocation in it" $
+        costsAtMost runner "deadline" tolerance yielding (\count -> within (secs 3600) (yielding count) >>> done)
+
+    copied name "a part that waits captures the catch of tryA, which tryA adds to each wait, until stage C of the frame-free scopes" $
+      it "costs a loop in tryA no allocation in it" $
+        costsAtMost runner "tryA" tolerance yielding (\count -> tryA (yielding count) >>> done)
+
+    copied name "a part that waits captures the catch and what follows the body of the part of a group, which a part adds to each wait, until stage B of the frame-free scopes" $
+      it "costs a loop in a part of a group no allocation in it" $
+        costsAtMost runner "group" tolerance yielding (\count -> together [yielding count, done])
+
+  describe "a bare loop" $ forM_ runners $ \runner -> describe (runnerName runner) $ do
+    it "that gives way at each step allocates no more than it did" $
+      allocatesAtMost runner "bare, gives way" (yieldingCeiling (runnerCeilings runner)) yielding
+
+    it "that waits at an inbox allocates no more than it did" $
+      allocatesAtMost runner "bare, inbox" (exchangingCeiling (runnerCeilings runner)) exchanging
+
+-- | The enclosed loop allocates no more each iteration than the bare one, but for the allowance.
+costsAtMost :: Runner -> String -> Double -> Program -> Program -> IO ()
+costsAtMost runner label allowance bare enclosed = do
+  outside <- perIteration (runnerRun runner bare)
+  inside <- perIteration (runnerRun runner enclosed)
+  reported (runnerName runner) label outside inside
+  atMostMore allowance outside inside
+
+-- | The bare loop allocates no more each iteration than the ceiling.
+allocatesAtMost :: Runner -> String -> Double -> Program -> IO ()
+allocatesAtMost runner label ceiling' bare = do
+  bytes <- perIteration (runnerRun runner bare)
+  reported (runnerName runner) label bytes bytes
+  when (bytes > ceiling' + tolerance) $
+    failTest ("an iteration allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round ceiling' :: Int))
+
+-- | Says what the case measured, if the run asks for it.
+reported :: String -> String -> Double -> Double -> IO ()
+reported name label outside inside =
+  lookupEnv "SCOPE_COST_REPORT" >>= \asked ->
+    when (asked /= Nothing) (hPutStrLn stderr ("scope-cost " <> name <> " | " <> label <> " | outside " <> show (round outside :: Int) <> " | inside " <> show (round inside :: Int)))
 
 -- | The arrow in a scope that acquires nothing and releases nothing.
 scoped :: (Arrow arr, Scope arr) => arr a () -> arr a ()
@@ -132,9 +198,10 @@ allocatedBy action = do
   after <- allocated_bytes <$> getRTSStats
   pure (after - before)
 
--- | The iteration inside the scope allocates no more than the one outside it, but for the tolerance.
-atMostMore :: Double -> Double -> IO ()
-atMostMore outside inside =
-  if inside - outside <= tolerance
+-- | The iteration inside allocates no more than the one outside it, but for the allowance: the difference is of whole words,
+-- whatever the count of a long run says of it.
+atMostMore :: Double -> Double -> Double -> IO ()
+atMostMore allowance outside inside =
+  if fromIntegral (round ((inside - outside) / 8) * 8 :: Int) <= allowance
     then pure ()
-    else failTest ("an iteration allocates " <> show (round inside :: Int) <> " bytes in a scope, where it allocates " <> show (round outside :: Int) <> " outside one")
+    else failTest ("an iteration allocates " <> show (round inside :: Int) <> " bytes enclosed, where it allocates " <> show (round outside :: Int) <> " bare")
