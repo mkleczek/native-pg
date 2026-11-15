@@ -28,7 +28,7 @@ import Data.Int (Int64)
 import Data.Text (Text)
 import Database.PostgreSQL.Connection (ConnectSettings)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), connectionPoolSettings, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import Network.Socket (PortNumber)
@@ -314,14 +314,14 @@ spec socketPath port = describe "operations and transactions in a request" $ for
       withConnectionPool ((connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) {poolCheckoutTimeout = Just (millis 50)}) $ \pool -> do
         let env = Env runner buffers pool
         -- The only connection is held by the outer request, so the inner one waits for it.
-        onEnv env (withConnection pool (snd ^>> withConnection pool done))
+        onEnv env (viaPool pool (snd ^>> viaPool pool done))
           `shouldReturn` Right (Left CheckoutTimedOut)
         pidOf env >>= \pid -> (pid > 0) `shouldBe` True
 
     it "gives PoolClosed to a checkout after the pool has ended" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
       pool <- withConnectionPool (connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) pure
-      runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
+      runOn runner buffers (viaPool pool done) `shouldReturn` Left PoolClosed
 
 -- * The pool of the cases
 
@@ -346,7 +346,7 @@ withEnv runner settings size use = do
 -- program's failure.
 request :: (Runtime arr) => Env -> OnConn arr b -> arr Loans b
 request env body =
-  withConnection (envPool env) body
+  viaPool (envPool env) body
     >>> now (either (\failure -> failTest ("no connection: " <> show failure)) pure)
 
 selectOne :: (Runtime arr) => OnConn arr (Either QueryError [Int64])

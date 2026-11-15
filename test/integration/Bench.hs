@@ -16,7 +16,7 @@
 -- Usage: @native-pg-bench [scale]@, which multiplies the number of requests of each workload (1 by default).
 module Main (main) where
 
-import Control.Arrow (returnA, second, (>>>), (>>^), (^>>))
+import Control.Arrow (returnA, (>>>), (>>^), (^>>))
 import Control.Monad (forM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -119,7 +119,7 @@ request ::
   arr () ()
 request buffers pool given reading =
   (buffers,)
-    ^>> withRequestBuffers (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement given) reading)))
+    ^>> withRequestBuffers ((\(loans, _) -> (pool, (loans, ((), ())))) ^>> withConnection (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement given) reading)))
     >>> now (\case Right (Right ()) -> pure (); other -> die ("a request failed: " <> show other))
 
 -- | The pieces of the field, one after the other, dropped: how many bytes they had.
@@ -132,7 +132,7 @@ drained = (,0) ^>> iterateA (alongside (fst ^>> next) >>^ counted)
 commands :: (Runtime arr) => BufferPool -> ConnectionPool -> [ByteString] -> arr () ()
 commands buffers pool texts =
   (buffers,)
-    ^>> withRequestBuffers (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Write (Tx.pipeline Tx.Final (traverse Tx.command texts) (foldr ((>>>) . Tx.discard) returnA))))
+    ^>> withRequestBuffers ((\(loans, _) -> (pool, (loans, ((), ())))) ^>> withConnection (Tx.transaction Tx.ReadCommitted Tx.Write (Tx.pipeline Tx.Final (traverse Tx.command texts) (foldr ((>>>) . Tx.discard) returnA))))
     >>> now (\case Right (Right ()) -> pure (); other -> die ("the setup failed: " <> show other))
 
 -- | The workload under the arrow: transactions per second, and the bytes that each allocated. The first requests make

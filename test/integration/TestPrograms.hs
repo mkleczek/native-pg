@@ -32,6 +32,7 @@ module TestPrograms
     -- * A connection in a program
     OnConn,
     across,
+    viaPool,
     session,
     connectedTo,
     alsoOn,
@@ -99,6 +100,7 @@ import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), Conne
 import qualified Database.PostgreSQL.Connection as PG
 import Database.PostgreSQL.Decoding (InPlace)
 import Database.PostgreSQL.Errors (ConnectFailure, Diagnostics, QueryError (..), ServerError (..), StatementError (..), diagnosticCode)
+import Database.PostgreSQL.Pool (ConnectionPool, PoolError, withConnection)
 import Database.PostgreSQL.Tls (tlsClient)
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
@@ -205,6 +207,10 @@ type OnConn arr b = arr (Connection, Loans) b
 -- can't be made is the program's failure.
 session :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans b
 session settings body = connectedTo settings body >>> orFail
+
+-- | The body on a connection of the pool: 'withConnection' for a pool that the program has, as a test has.
+viaPool :: (Runtime arr) => ConnectionPool -> arr (Connection, a) b -> arr a (Either PoolError b)
+viaPool pool body = (pool,) ^>> withConnection body
 
 -- | The step on each of the inputs in turn, whichever their number: one arrow, built once, which takes what differs from run
 -- to run, the settings of a connection or a pool, from its input.

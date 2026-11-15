@@ -18,7 +18,6 @@ module Database.PostgreSQL.Pool
     ConnectionPool,
     withConnectionPool,
     withConnection,
-    withConnectionIn,
     Observation (..),
     ConnectionStatus (..),
     ConnectionReadyForUseReason (..),
@@ -27,14 +26,15 @@ module Database.PostgreSQL.Pool
   )
 where
 
-import Control.Arrow (arr, second, (***), (>>>), (^>>), (|||))
+import Control.Arrow (arr, (***), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, threadDelay)
 import Control.Exception (ErrorCall (..), SomeException, bracket, finally, mask_, throwIO, toException, try)
-import Control.Monad (forever, replicateM, void)
+import Control.Monad (forever, replicateM, void, when)
+import System.IO (fixIO)
 import Data.Tuple (swap)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import qualified Data.Text as Text
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
@@ -46,12 +46,11 @@ import Database.PostgreSQL.Internal.Carrier (isQuiet)
 import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Data.Word (Word64)
-import Network.Streaming.Classes (Duration (..), Effect (..), Exit (..), Runtime, Scope (..), monotonicNanoseconds)
-import Network.Streaming.Combinators (keeping, tap)
+import Network.Streaming.Classes (Duration (..), Effect (..), Exit (..), GiveWay (..), Runtime, Scope (..), Within (..), giving, monotonicNanoseconds, taking)
+import Network.Streaming.Combinators (alongside, done, step, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
-import Network.Streaming.NotImplemented (notImplemented)
-import Network.Streaming.Pool (Pool, PoolError (..), closePoolWith, newPool, releaseNow, takeNow, urgently, withLoan, withLoanWithin)
+import Network.Streaming.Pool (Pool, PoolError (..), closePoolWith, isClosed, newPool, queueAt, releaseNow, takeNow, urgently)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 
 data ConnectionPoolSettings = ConnectionPoolSettings
@@ -87,9 +86,10 @@ data ConnectionPool = ConnectionPool
   }
 
 -- | A place for a connection, which is empty until it is made, and empty again once it is broken, and the identifier that the
--- observer knows the connection by.
+-- observer knows the connection by. It knows its pool, so that a request that has it needs nothing else of the pool.
 data Slot = Slot
-  { slotConnection :: !(IORef (Maybe Connection)),
+  { slotOwner :: ConnectionPool,
+    slotConnection :: !(IORef (Maybe Connection)),
     slotIdentifier :: !(IORef UUID),
     -- | When the connection was made, on the monotonic clock, in nanoseconds.
     slotOpened :: !(IORef Word64),
@@ -121,10 +121,12 @@ withConnectionPool settings use = do
           reserveBufferCount = positive 1,
           setupBufferCount = positive size
         }
-  slots <- replicateM size (Slot <$> newIORef Nothing <*> newIORef UUID.nil <*> newIORef 0 <*> newIORef 0)
-  pool <- newPool slots
-  epoch <- newIORef 0
-  let connectionPool = ConnectionPool pool buffers settings epoch
+  -- The slots know the pool that they are of, so the pool is made by the knot: nothing looks at it until it is made.
+  connectionPool <-
+    fixIO $ \self -> do
+      slots <- replicateM size (Slot self <$> newIORef Nothing <*> newIORef UUID.nil <*> newIORef 0 <*> newIORef 0)
+      ConnectionPool <$> newPool slots <*> pure buffers <*> pure settings <*> newIORef 0
+  let pool = poolSlots connectionPool
   bracket
     (maintaining connectionPool)
     (\maintenance -> traverse_ killThread maintenance *> closePoolWith (closeSlot settings ReleaseConnectionTerminationReason "the pool is closed") pool)
@@ -190,41 +192,57 @@ look pool = do
     -- How many looks make the idle time, rounded up.
     idleEpochs idle = maybe 0 (\period -> fromIntegral ((nanoseconds idle + period * 1000 - 1) `div` (period * 1000))) (fromIntegral <$> maintenancePeriod settings)
 
--- | The body, with a connection of the pool for as long as it runs, as 'withLoan'
--- does, and as a holder that is served first ('urgently'). The checkout waits
--- inside the deadline of the arrow's 'Network.Streaming.Classes.within', and
--- the pool's own checkout timeout, if it has one. A slot that is empty is
--- filled by making a connection, which fails with
+-- | The body, with a connection of the pool that is the arrow's input, for as long as it runs, and with the input of the
+-- body after the pool: one program, built once, serves the pool of each run, as a tenant's pool is. The connection is lent as
+-- a pool lends its items, and the request is a holder that is served first ('urgently'). The checkout waits inside the
+-- deadline of the arrow's 'Network.Streaming.Classes.within', and the pool's own checkout timeout, if it has one. A slot that
+-- is empty is filled by making a connection, with the pool's own connect settings, which fails with
 -- 'Database.PostgreSQL.Errors.ConnectFailure' if it can't be made. The connection
 -- is the body's alone: used after the body ended, it fails with
 -- 'Database.PostgreSQL.Errors.ConnectionReleased'. One that the body broke, as a
 -- cancelled statement does, is closed as the body ends, and its slot is empty.
-withConnection :: (Runtime arr) => ConnectionPool -> arr (Connection, a) b -> arr a (Either PoolError b)
-withConnection pool body = checkingOut (poolSlots pool) (urgently (using pool body))
-  where
-    checkingOut = maybe withLoan withLoanWithin (poolCheckoutTimeout (poolSettings pool))
+withConnection :: (Runtime arr) => arr (Connection, a) b -> arr (ConnectionPool, a) (Either PoolError b)
+withConnection body = loaned (urgently (using body))
 
--- | 'withConnection' for a pool that is the arrow's input, with the input of the body after it: one program, built once,
--- serves the pool of each run, as a tenant's.
-withConnectionIn :: (Runtime arr) => arr (Connection, a) b -> arr (ConnectionPool, a) (Either PoolError b)
-withConnectionIn _ = notImplemented "withConnection with the pool as input"
+-- | The scope around the checkout of a slot, which is the arrow that gives the slot or says why not, and the release of what it
+-- gave: it goes back to the pool that it came from. A slot that is free is taken at once, and the pool's being closed is
+-- looked at only if there is none: a closed pool keeps none free.
+loaned :: (Runtime arr) => arr (Slot, a) b -> arr (ConnectionPool, a) (Either PoolError b)
+loaned body = scope acquire returning run
+  where
+    acquire =
+      giveWay
+        >>> step "claim from free items" (\(pool, _) -> maybe (Left pool) Right <$> takeNow (poolSlots pool) 1) `giving` "item free?"
+        >>> (taking "no" waiting ||| taking "yes" (arr Right))
+    returning = fst ^>> (done ||| step "return item" (\slot -> releaseNow (poolSlots (slotOwner slot)) [slot]))
+    run = withInput ^>> (arr Left ||| (body >>^ Right))
+    withInput (acquired, (_, input)) = fmap (,input) acquired
+
+-- | The request has to wait for a slot: until the pool's checkout timeout, if it has one, with its place given up if the wait
+-- ends any other way. A pool that is closed has none to give.
+waiting :: (Runtime arr) => arr ConnectionPool (Either PoolError Slot)
+waiting = now (\pool -> (\closed -> if closed then Left PoolClosed else Right pool) <$> isClosed (poolSlots pool)) >>> (arr Left ||| queueing)
+  where
+    queueing = limited ^>> ((queueAt >>^ Right) ||| (withinIn queueAt >>^ maybe (Left CheckoutTimedOut) Right))
+    limited pool = case poolCheckoutTimeout (poolSettings pool) of
+      Nothing -> Left (1, poolSlots pool)
+      Just limit -> Right (limit, (1, poolSlots pool))
 
 -- | The body on the connection of the slot: the one that the slot holds if it is as it was left, and else one that is
 -- made. What the body leaves of the connection stays in the slot, unless the body broke it. The observer is told that the
 -- connection is in use, and what became of it, if the pool has one.
-using :: forall arr a b. (Runtime arr) => ConnectionPool -> arr (Connection, a) b -> arr (Slot, a) b
-using pool body = scope acquire release run
+using :: forall arr a b. (Runtime arr) => arr (Connection, a) b -> arr (Slot, a) b
+using body = scope acquire release run
   where
-    settings = poolSettings pool
     acquire =
-      now (\(slot, _) -> either (const (Left slot)) (Right . (slot,)) <$> existing @(ModeOf arr) settings slot)
+      now (\(slot, _) -> either (const (Left slot)) (Right . (slot,)) <$> existing @(ModeOf arr) (poolSettings (slotOwner slot)) slot)
         >>> (making ||| arr id)
-        >>> lending
-    -- A connection is made under the arrow of the request, and the observer is told that it is being made, and that it
-    -- is ready, or that it could not be made.
+        >>> now lending
+    -- A connection is made under the arrow of the request, with the settings and the buffers of the pool, and the observer is
+    -- told that it is being made, and that it is ready, or that it could not be made.
     making =
       tap (now (\slot -> UUID.nextRandom >>= \identifier -> writeIORef (slotIdentifier slot) identifier *> observeNow slot ConnectingConnectionStatus))
-        >>> keeping ((\() -> (poolBuffers pool, poolConnect settings)) ^>> withRequestBuffers (swap ^>> connect))
+        >>> alongside ((\slot -> (poolBuffers (slotOwner slot), poolConnect (poolSettings (slotOwner slot)))) ^>> withRequestBuffers (swap ^>> connect))
         >>> now (uncurry made)
     made :: Either ConnectFailure Connection -> Slot -> IO (Slot, Connection)
     made result slot = case result of
@@ -232,20 +250,29 @@ using pool body = scope acquire release run
       Right connection -> do
         writeIORef (slotConnection slot) (Just connection)
         monotonicNanoseconds >>= writeIORef (slotOpened slot)
-        readIORef (poolEpoch pool) >>= writeIORef (slotUsed slot)
+        readIORef (poolEpoch (slotOwner slot)) >>= writeIORef (slotUsed slot)
         observeNow slot (ReadyForUseConnectionStatus EstablishedConnectionReadyForUseReason)
         pure (slot, connection)
-    lending = case poolObserver settings of
-      Nothing -> second (now leased)
-      Just _ -> now (\(slot, connection) -> leased connection >>= \lent -> (slot, lent) <$ observeNow slot InUseConnectionStatus)
-    release = maybe id (const (tap stamp >>>)) (poolIdleTime settings) $ case poolObserver settings of
-      Nothing -> now (\((slot, connection), _) -> void (giveBack slot connection))
-      Just _ -> now (\((slot, connection), exit) -> giveBack slot connection >>= \ended -> observeNow slot (afterUse exit ended))
-    -- A connection that is given back is stamped with the epoch of the pool, if the pool has an idle time to tell it by.
-    stamp :: arr ((Slot, Connection), Exit) ()
-    stamp = now (\((slot, _), _) -> readIORef (poolEpoch pool) >>= writeIORef (slotUsed slot))
+    lending (slot, connection) = do
+      lent <- leased connection
+      observeNow slot InUseConnectionStatus
+      pure (slot, lent)
+    -- A connection that is given back is stamped with the epoch of the pool, if the pool has an idle time to tell it by, and
+    -- the observer is told what became of it, if the pool has one.
+    release = now $ \((slot, connection), exit) -> do
+      let pool = slotOwner slot
+      when (isJust (poolIdleTime (poolSettings pool))) (readIORef (poolEpoch pool) >>= writeIORef (slotUsed slot))
+      ended <- giveBack slot connection
+      case poolObserver (poolSettings pool) of
+        Nothing -> pure ()
+        Just _ -> observeNow slot (afterUse exit ended)
     run = (snd *** snd) ^>> body
-    observeNow slot status = readIORef (slotIdentifier slot) >>= \identifier -> observe settings (ConnectionObservation identifier status)
+
+-- | Tells the observer of the event of the slot's connection, if the pool has one: the event is not built if it has none.
+observeNow :: Slot -> ConnectionStatus -> IO ()
+observeNow slot status = case poolObserver (poolSettings (slotOwner slot)) of
+  Nothing -> pure ()
+  Just tell -> readIORef (slotIdentifier slot) >>= \identifier -> tell (ConnectionObservation identifier status)
 
 -- | What became of a connection when its request ended: it is idle in its slot again, or it was closed, and why.
 data Ended = Kept | Closed String

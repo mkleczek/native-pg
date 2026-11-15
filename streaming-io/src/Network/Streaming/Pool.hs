@@ -31,6 +31,8 @@ module Network.Streaming.Pool
     offer,
     free,
     checkoutAt,
+    queueAt,
+    isClosed,
     checkoutMany,
     checkoutManyOf,
     takeNow,

@@ -89,7 +89,7 @@ routed = foldr step missing
 -- which fulmen does when a handler gives the head twice.
 rows :: (Runtime arr) => ConnectionPool -> ByteString -> arr Call ()
 rows pool sql =
-  alongside (tryA (Fulmen.loans &&& arr ((),) >>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement query) reading))))
+  alongside (tryA ((Fulmen.loans &&& arr ((),) >>^ (pool,)) >>> withConnection (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement query) reading))))
     >>> unlessSucceeded
     ^>> (failed ||| returnA)
   where

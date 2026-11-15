@@ -26,7 +26,7 @@ import Data.UUID (UUID)
 import Data.Word (Word64)
 import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Connection (ConnectSettings (..))
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), connectionPoolSettings, withConnection, withConnectionIn, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), connectionPoolSettings, withConnection, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats)
@@ -60,7 +60,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       pooled (\s -> s {poolCheckoutTimeout = Just (millis 100)}) $ \env -> do
         -- The only connection is held by the outer request, so the inner one waits for it.
         started <- getMonotonicTime
-        onEnv env (withConnection (envPool env) (snd ^>> withConnection (envPool env) done)) `shouldReturn` Right (Left CheckoutTimedOut)
+        onEnv env (viaPool (envPool env) (snd ^>> viaPool (envPool env) done)) `shouldReturn` Right (Left CheckoutTimedOut)
         ended <- getMonotonicTime
         (ended - started >= 0.1) `shouldBe` True
         (ended - started < 5) `shouldBe` True
@@ -68,7 +68,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
     it "gives up its place when the deadline of an enclosing 'within' cancels it, and keeps the connection for the next" $
       pooled id $ \env -> do
         pid <- pidOf env
-        onEnv env (withConnection (envPool env) (snd ^>> withinFor (millis 50) (withConnection (envPool env) done)))
+        onEnv env (viaPool (envPool env) (snd ^>> withinFor (millis 50) (viaPool (envPool env) done)))
           `shouldReturn` Right Nothing
         pidOf env `shouldReturn` pid
 
@@ -76,8 +76,8 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       pooled (\s -> s {poolCheckoutTimeout = Just (millis 100)}) $ \env -> do
         pid <- pidOf env
         let waiting :: (Runtime arr) => arr Loans (Either PoolError ())
-            waiting = withConnection (envPool env) done
-        onEnv env (withConnection (envPool env) (snd ^>> steps [waiting `yields` Left CheckoutTimedOut, waiting `yields` Left CheckoutTimedOut]))
+            waiting = viaPool (envPool env) done
+        onEnv env (viaPool (envPool env) (snd ^>> steps [waiting `yields` Left CheckoutTimedOut, waiting `yields` Left CheckoutTimedOut]))
           `shouldReturn` Right ()
         pidOf env `shouldReturn` pid
 
@@ -85,18 +85,18 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
       (pool, holder) <- withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> (pool,) <$> startHolding (Env runner buffers pool)
       -- The pool's bracket has ended while the request holds the only connection, so the checkout doesn't wait for it.
-      runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
+      runOn runner buffers (viaPool pool done) `shouldReturn` Left PoolClosed
       finishHolding holder
 
   -- The pool is the input of withConnection: one program, built once, serves the pool of each run, with that pool's own
   -- connections and checkout timeout.
-  needs "the pool as input" $ describe "a pool that is the arrow's input" $ do
+  describe "a pool that is the arrow's input" $ do
     let applicationPool application = connectionPoolSettings 1 settings {connectParameters = [("application_name", application)]}
         applicationOf :: (Runtime arr) => arr (ConnectionPool, Loans) (Either PoolError (Either QueryError [Text]))
-        applicationOf = withConnectionIn (query (plain "SELECT current_setting('application_name')" single))
+        applicationOf = withConnection (query (plain "SELECT current_setting('application_name')" single))
         -- The pool's only connection is held by the outer request, so the inner one waits for it, for the pool's timeout.
         holdingThenAsking :: (Runtime arr) => arr (ConnectionPool, Loans) (Either PoolError (Maybe (Either PoolError ())))
-        holdingThenAsking = (\(pool, loans) -> (pool, (pool, loans))) ^>> withConnectionIn (snd ^>> withinFor (millis 400) (withConnectionIn done))
+        holdingThenAsking = (\(pool, loans) -> (pool, (pool, loans))) ^>> withConnection (snd ^>> withinFor (millis 400) (withConnection done))
         buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
     it "lends each pool of a run its own connections, in one program" $ do
       buffers <- buffersOf
@@ -129,19 +129,19 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
             failTest ("a request allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round ceiling' :: Int))
     it "allocates no more than it did" $
       costs "withConnection" id $ case name of
-        "threads" -> 2560
-        "delimited" -> 2100
-        _ -> 3405
+        "threads" -> 2376
+        "delimited" -> 1965
+        _ -> 3140
     it "allocates no more than it did when the pool has a checkout timeout" $
       costs "withConnection, with a timeout" (\s -> s {poolCheckoutTimeout = Just (secs 3600)}) $ case name of
-        "threads" -> 2576
-        "delimited" -> 2100
-        _ -> 3375
+        "threads" -> 2376
+        "delimited" -> 1980
+        _ -> 3140
     it "allocates no more than it did when the pool has an observer" $
       costs "withConnection, observed" (\s -> s {poolObserver = Just (const (pure ()))}) $ case name of
-        "threads" -> 2648
-        "delimited" -> 2180
-        _ -> 3440
+        "threads" -> 2464
+        "delimited" -> 2070
+        _ -> 3225
 
   -- What the pool does with its connections as it closes: those that are free close at once, and one that a request still
   -- has closes as the request gives it back.
@@ -158,7 +158,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       finishHolding holder
       eventually 5 (gone (holderBackend holder)) `shouldReturn` True
       -- The pool is used last: while it is reachable, its connection is not closed by the collection of its socket.
-      runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
+      runOn runner buffers (viaPool pool done) `shouldReturn` Left PoolClosed
 
   -- What the pool does with its connections as they age: it closes a connection when it is older than the pool's lifetime, and
   -- when nobody has used it for the pool's idle time, and never one that a request has.
@@ -217,7 +217,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
     it "tells of a use that failed without breaking its connection" $ do
       (events, change) <- observed id
       pooled change $ \env -> do
-        onEnv env (withConnection (envPool env) (now (const (throwIO (userError "the use failed")))) `failsAs` \failure -> failure `shouldBe` userError "the use failed")
+        onEnv env (viaPool (envPool env) (now (const (throwIO (userError "the use failed")))) `failsAs` \failure -> failure `shouldBe` userError "the use failed")
           `shouldReturn` ()
         void (pidOf env)
       said events
@@ -226,7 +226,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
     it "tells of a connection that a use broke, and of the one that replaces it" $ do
       (events, change) <- observed id
       pooled change $ \env -> do
-        onEnv env (withinFor (millis 100) (withConnection (envPool env) (committed Tx.Read (Tx.statement sleeping) Tx.single))) `shouldReturn` Nothing
+        onEnv env (withinFor (millis 100) (viaPool (envPool env) (committed Tx.Read (Tx.statement sleeping) Tx.single))) `shouldReturn` Nothing
         void (pidOf env)
       said events
         `shouldReturn` ["connecting", "ready: established", "in use", "terminated: network error", "connecting", "ready: established", "in use", "ready: succeeded", "terminated: release"]
@@ -245,7 +245,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       (events, change) <- observed id
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
       withConnectionPool (change (connectionPoolSettings 1 (unixSettings (socketPath <> "-missing") "postgres" Nothing))) $ \pool ->
-        runOn runner buffers (withConnection pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
+        runOn runner buffers (viaPool pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
       said events `shouldReturn` ["connecting", "terminated: network error"]
 
     it "tells of a connection that reached its lifetime, and of one that nobody used for the idle time" $ do
@@ -275,7 +275,7 @@ onEnv env = runOn (envRunner env) (envBuffers env)
 
 -- | The backend of the connection that a request runs on.
 pidOf :: Env -> IO Int64
-pidOf env = onEnv env (withConnection (envPool env) backend) >>= either (\failure -> failTest ("no connection: " <> show failure)) (either (\failure -> failTest ("no backend: " <> show failure)) pure)
+pidOf env = onEnv env (viaPool (envPool env) backend) >>= either (\failure -> failTest ("no connection: " <> show failure)) (either (\failure -> failTest ("no backend: " <> show failure)) pure)
 
 -- | The backend of the connection that a request runs on, as a step on it.
 backend :: (Runtime arr) => OnConn arr (Either QueryError Int64)
@@ -299,7 +299,7 @@ startHolding env = do
   ended <- newEmptyMVar
   let holdIt :: (Runtime arr) => OnConn arr ()
       holdIt = backend >>> now (either (throwIO . userError . show) (\pid -> putMVar held pid *> takeMVar goOn))
-  _ <- forkIO (try (onEnv env (withConnection (envPool env) holdIt >>> now (either throwIO pure))) >>= putMVar ended)
+  _ <- forkIO (try (onEnv env (viaPool (envPool env) holdIt >>> now (either throwIO pure))) >>= putMVar ended)
   pid <- takeMVar held
   pure (Holder pid goOn ended)
 
@@ -350,7 +350,7 @@ perRequest env = do
   pure ((fromIntegral many - fromIntegral few) / 20000)
   where
     run :: Int -> IO ()
-    run count = onEnv env (timesWith count (tap (withConnection (envPool env) done >>> done)) >>> done)
+    run count = onEnv env (timesWith count (tap (viaPool (envPool env) done >>> done)) >>> done)
 
 -- | The bytes that the action allocated: the runtime counts a nursery when it is collected, so a collection is made on both
 -- sides.
