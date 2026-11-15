@@ -35,7 +35,8 @@
 -- A prepared statement is named by the program, which keeps the names of the
 -- connection: 'prepare' sends the Parse of a name, 'executePrepared' sends only the
 -- Bind and Execute of a name that the connection has, without its SQL, and
--- 'closeStatement' sends the Close. The library keeps no record of the names.
+-- 'closeStatement' sends the Close. The library keeps no record of those names. A statement that the
+-- program caches by a key, with 'cached', is named by the library, which keeps the connection's cache of them.
 module Database.PostgreSQL.Transaction
   ( -- * Statements
     Statement (Statement, sql, params, stream, rows),
