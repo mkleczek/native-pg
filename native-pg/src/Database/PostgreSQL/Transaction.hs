@@ -737,12 +737,14 @@ foldRows step start result = const start ^>> iterateA (keeping (nextRow result) 
 -- streams nothing is sent in turn with the reading program: it is sent in the buffer of the transaction, and is read after it.
 -- A larger one, or one whose statements declare a stream, is sent while it is read, in two parts of a group: the request side,
 -- which renders into a buffer that it borrows and pulls the streams, and the reading program. The failure of either part
--- cancels the other where it waits.
+-- cancels the other where it waits. A request that has no buffer to lend, since a stream holds its primary, sends in turn from
+-- the buffer of the transaction the pipeline whose one result is the statement that streams, and refuses any other pipeline that
+-- is sent while it is read with 'NoBufferToSend', before anything is sent.
 pipeline :: (Runtime arr) => Ending -> Pipeline arr p a -> (a -> With Tx arr x y) -> With Tx arr (p, x) y
 pipeline finality (Pipeline _ sent value) reading =
   tap (done >>> moved >>> readyToSend)
-    >>> withTx (layout finality streams streamsAlone numbered)
-    >>> ((program ||| (atOnce ||| onBuffer)) ||| inTurn)
+    >>> withTx (layout finality streams numbered)
+    >>> ((program ||| apart) ||| inTurn)
   where
     streams = List.any (isJust . streamOf) sent
     -- Whether the one statement of the pipeline that gives a result is the one that streams.
@@ -751,6 +753,10 @@ pipeline finality (Pipeline _ sent value) reading =
     numbered = numberStreams sent
     program = reading (value 0)
     inTurn = consume transmit >>> program
+    -- At once with the reading when the request can lend a buffer to send from. Else, in turn from the transaction's own buffer, if
+    -- the one statement of the pipeline that gives a result is the one that streams, and else it is refused, and what was laid out is
+    -- undone, since nothing was sent.
+    apart = withTx (\tx sending -> if loanIsPrimary (txLoan tx) then pure (Left sending) else if streamsAlone then pure (Right sending) else refused tx) >>> (atOnce ||| onBuffer)
     -- What the reader holds and what the connection kept are put together before the parts start, as a send in turn does it
     -- around its rendering, and nothing is rendered into the buffer of the reader after.
     atOnce =
@@ -816,14 +822,10 @@ readyToSend = inTx check >>> drain True
       when (stFinal s || stEnded s) (throwIO AfterFinal)
 
 -- | The output of a pipeline of the program, and how it is sent: not at all if there is nothing to send, in turn with the
--- reading if it is no larger than one buffer and no statement of it streams, and else at once with it, which takes a second
--- buffer, borrowed from the request. A request that has none to lend, since its primary is held by what the program streams from,
--- sends a pipeline of which one statement gives a result, and it is the one that streams, in turn with the reading, from the
--- buffer of the transaction: nothing is answered before what it sends is all in the socket but what follows the stream, which is
--- a few bytes. Else the pipeline is refused, before anything is sent. What the server is to answer is put in the queue of the
--- transaction, once all of it is rendered.
-layout :: Ending -> Bool -> Bool -> [(Maybe Int, Sent arr p)] -> Tx -> (p, x) -> IO (Either (Either x (Either (Output, p, x) (Output, p, x))) (Output, x))
-layout finality streams streamsAlone sent tx (input, rest) = do
+-- reading if it is no larger than one buffer and no statement of it streams, and else at once with it, or apart. What the server is
+-- to answer is put in the queue of the transaction, once all of it is rendered.
+layout :: Ending -> Bool -> [(Maybe Int, Sent arr p)] -> Tx -> (p, x) -> IO (Either (Either x (Output, p, x)) (Output, x))
+layout finality streams sent tx (input, rest) = do
   s <- inspect tx
   user <- traverse (rendered input) sent
   let starting = [(Entry (txBegin tx) Passed, txBeginOutput tx) | not (stBegun s), not (null sent) || finality == Final]
@@ -832,13 +834,11 @@ layout finality streams streamsAlone sent tx (input, rest) = do
     [] -> pure (Left (Left rest))
     queued -> do
       output <- evaluate (foldMap snd queued <> sync)
-      let !together = streams || outputLength output > bufferCapacity (loanBuffer (txLoan tx))
-      when (together && not (loanIsPrimary (txLoan tx)) && not streamsAlone) (throwIO NoBufferToSend)
       modify tx (const s {stBegun = True, stFinal = stFinal s || finality == Final, stPending = map fst queued, stIndex = 0, stBase = length starting, stRows = 0, stTags = [], stOwed = True})
       writeIORef (txSending tx) True
       pure $
-        if together
-          then Left (Right (if loanIsPrimary (txLoan tx) then Left (output, input, rest) else Right (output, input, rest)))
+        if streams || outputLength output > bufferCapacity (loanBuffer (txLoan tx))
+          then Left (Right (output, input, rest))
           else Right (output, rest)
   where
     plain text = statementOutput text [] [] []
@@ -869,6 +869,15 @@ resolved :: p -> Statement arr p row -> Statement arr p row
 resolved parameters = \case
   Made {stream, rows, made} -> case made parameters of (text, given) -> Statement {sql = text, params = const given, stream, rows}
   given -> given
+
+-- | The pipeline that was laid out is refused: it is undone, as nothing was sent, so that the transaction ends as if the pipeline had
+-- not been tried, and its failure is 'NoBufferToSend'. BEGIN was laid out with it if the transaction had not begun, which is when
+-- the pipeline's statements start at the first place.
+refused :: Tx -> IO a
+refused tx = do
+  modify tx (\s -> s {stBegun = stBase s == 0, stFinal = False, stPending = [], stOwed = False})
+  writeIORef (txSending tx) False
+  throwIO NoBufferToSend
 
 -- | The statement that ends a transaction: ROLLBACK if it is condemned, else COMMIT, as its SQL, which the errors name, and
 -- the messages that carry it.
