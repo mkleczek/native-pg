@@ -284,7 +284,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
 
   -- What a program keeps for a connection, as a program that prepares statements keeps the names that its connection has, lives as
   -- long as the connection does: through every use of it by a pool, and not beyond.
-  needs "connectionSlot" $ describe "the slot of a connection" $ do
+  describe "the slot of a connection" $ do
     let terminated pid = ordinary runner (session settings (query (plain ("SELECT pg_terminate_backend(" <> BC.pack (show pid) <> ")") single))) `shouldReturn` Right [True]
     it "starts with the value that it is given on a new connection, and is the connection's own" $
       ordinary

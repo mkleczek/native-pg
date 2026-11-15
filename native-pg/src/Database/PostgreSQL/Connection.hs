@@ -65,9 +65,10 @@ import Control.Arrow (Arrow, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
 import Control.Exception (IOException, fromException, throwIO)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, readIORef)
+import Data.Dynamic (fromDynamic, toDyn)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (isPrefixOf)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Tuple (Solo (MkSolo))
 import Data.Typeable (Typeable)
 import Database.PostgreSQL.Connection.Internal
@@ -88,7 +89,6 @@ import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes (Effect (..), Exit (..), Link (receive), Room, Runtime, Scope (..), Within (..), roomOf, secs)
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, iterateA)
 import Network.Streaming.Loans (Loans, withSetupBuffersOf)
-import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.PositiveInt (positiveInt)
 
 -- | Connects to the first of the settings' hosts that qualifies: the settings' own, then the settings of its fallbacks,
@@ -315,7 +315,13 @@ close =
 -- connection has none of that type. It lives as long as the connection does, through every use of it by a pool, and is gone with
 -- it: a connection that replaces another has none.
 connectionSlot :: (Typeable a) => Connection -> a -> IO (IORef a)
-connectionSlot _ _ = notImplementedIO "connectionSlot"
+connectionSlot connection initial = do
+  live <- readIORef (connectionLease connection)
+  unless live (throwIO ConnectionReleased)
+  fresh <- newIORef initial
+  atomicModifyIORef' (sessionSlots (connectionSession connection)) $ \slots -> case mapMaybe fromDynamic slots of
+    cell : _ -> (slots, cell)
+    [] -> (toDyn fresh : slots, fresh)
 
 -- | What the server said of itself at startup.
 serverInfo :: Connection -> ServerInfo

@@ -7,7 +7,8 @@
 -- A connection is a socket and what the server said of itself, and whether it is
 -- idle, used by one part, or broken, and what it keeps between its uses: the bytes
 -- that a use read past its last message, the notifications that came while nobody
--- waited for them, and the buffer that listening reads in. It holds nothing that
+-- waited for them, and the buffer that listening reads in; and the cells that a
+-- program keeps for it, which nothing in it reads. It holds nothing that
 -- belongs to the arrow it was made under, so that a connection made under one runtime
 -- works under another.
 module Database.PostgreSQL.Connection.Internal
@@ -42,6 +43,7 @@ import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.Dynamic (Dynamic)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Database.PostgreSQL.ConnectionString.Types (Host)
 import Database.PostgreSQL.Errors (ConnectionError (..), UsageError (..))
@@ -70,7 +72,9 @@ data Session = Session
   { sessionCarrier :: !Carrier,
     sessionStatus :: !(IORef Status),
     -- | What the session keeps between uses, which only the part that uses it changes.
-    sessionKept :: !(IORef Kept)
+    sessionKept :: !(IORef Kept),
+    -- | The cells that a program keeps for the connection, one for each type of value. No use of the connection reads them.
+    sessionSlots :: !(IORef [Dynamic])
   }
 
 -- | What a session keeps between its uses: the bytes that the server sent after the last message that a use read, which
@@ -100,7 +104,8 @@ newConnection :: ServerInfo -> Host -> CancelKey -> Carrier -> IO Connection
 newConnection info host key carrier = do
   status <- newIORef Idle
   kept <- newIORef (Kept BS.empty (Backlog [] []) Nothing)
-  Connection info host key (Session carrier status kept) <$> newIORef True
+  slots <- newIORef []
+  Connection info host key (Session carrier status kept slots) <$> newIORef True
 
 -- | The connection through a new handle, which is live until it is given up.
 leased :: Connection -> IO Connection
