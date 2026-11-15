@@ -1,3 +1,6 @@
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
+
 -- At -O2, liberate-case copies the receive loop once for each place it calls
 -- itself, and one loop is enough. At -O1 the flag does nothing.
 {-# OPTIONS_GHC -fno-liberate-case #-}
@@ -11,6 +14,9 @@ module Database.PostgreSQL.Transport
     TlsLink (..),
     Handshake (..),
     shake,
+    linkReadable,
+    linkWritable,
+    linkWatchInput,
     TlsSettings (..),
     ServerVerification (..),
     RootCertificates (..),
@@ -20,6 +26,7 @@ module Database.PostgreSQL.Transport
   )
 where
 
+import Control.Arrow (ArrowChoice, (>>>))
 import Control.Exception (Exception (..))
 import Crypto.Hash (HashAlgorithm, SHA224 (..), SHA256 (..), SHA384 (..), SHA512 (..), hashWith)
 import Data.Bits (shiftL, testBit, (.&.), (.|.))
@@ -28,9 +35,10 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr)
-import Network.Socket (HostName, PortNumber, Socket)
-import Network.Streaming.Classes (Effect, Link (..))
-import Network.Streaming.NotImplemented (notImplemented)
+import Network.Socket (HostName, PortNumber, Socket, unsafeFdSocket)
+import Network.Streaming.Classes (Annotate, Block (..), Effect (..), Event (..), GiveWay, Instant (..), Label (..), Link (..), named, receiveWith, sendAllWith)
+import Network.Streaming.Combinators (box, consume, iterateWith, pattern Again, pattern Finish)
+import System.Posix.Types (Fd (..))
 
 data Address
   = -- | A host name or IP address, and a port.
@@ -103,18 +111,49 @@ data Handshake
     NeedsRoom
   | Complete (Maybe (Either String ByteString))
 
--- | A stub, until the code is there: the handshake of the link, which waits for the
--- socket as the handshake needs, and gives the data for channel binding.
-shake :: (Effect arr) => arr TlsLink (Maybe (Either String ByteString))
-shake = notImplemented "the TLS handshake"
+-- | The handshake of the link, to its end: it blocks on the socket while the handshake needs bytes or room, and gives the
+-- data that SCRAM's channel binding takes, or none. A failure of the handshake is thrown.
+shake :: (ArrowChoice arr, Effect arr, Block arr, Annotate arr) => arr TlsLink (Maybe (Either String ByteString))
+shake =
+  named (Label "handshake" "Does the steps of the TLS handshake, and blocks on the socket while it needs bytes or room.") $
+    iterateWith (now stepping) (consume block)
+  where
+    stepping link =
+      linkHandshake link >>= \case
+        NeedsInput -> (\event -> Again (event, link)) <$> linkReadable link
+        NeedsRoom -> (\event -> Again (event, link)) <$> linkWritable link
+        Complete binding -> pure (Finish binding)
+{-# INLINE shake #-}
 
--- | A stub, until the code is there.
-instance (Effect arr) => Link arr TlsLink where
-  receive = notImplemented "a receive over TLS"
-  sendAll = notImplemented "a send over TLS"
-  awaitInput = notImplemented "a wait for input over TLS"
-  shutdownSend = notImplemented "the end of output over TLS"
-  close = notImplemented "closing a TLS link"
+-- | A socket that is a TLS link, in any arrow that can run its calls, block and give way: the calls are the link's own,
+-- which never wait, and while one finds nothing ready, the part blocks until the socket is readable or writable.
+instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => Link arr TlsLink where
+  receive =
+    named (Label "receive" "Receives decrypted bytes into the room, and blocks while the TLS session and the socket have none.") $
+      receiveWith linkTryReceive linkReadable
+  {-# INLINE receive #-}
+  sendAll =
+    named (Label "send" "Sends all of the pieces, and blocks while the TLS session's records can't be written.") $
+      sendAllWith linkTrySend linkFlush linkWritable
+  {-# INLINE sendAll #-}
+  awaitInput =
+    named (Label "await input" "Blocks until decrypted bytes or the end of the stream are in hand, or the socket has bytes, and takes none of the decrypted ones.") $
+      box "watch for input" (now linkWatchInput) >>> block
+  {-# INLINE awaitInput #-}
+  shutdownSend = box "shut down output" (now linkShutdownSend)
+  {-# INLINE shutdownSend #-}
+  close = box "close TLS link" (now linkEnd)
+  {-# INLINE close #-}
+
+-- | The events of the link's socket being readable, and being writable.
+linkReadable, linkWritable :: TlsLink -> IO Event
+linkReadable link = Readable . Fd <$> unsafeFdSocket (linkSocket link)
+linkWritable link = Writable . Fd <$> unsafeFdSocket (linkSocket link)
+
+-- | The event that a wait for input is for: one that has passed, which returns at once, if input is in hand, and the
+-- socket's being readable if not.
+linkWatchInput :: TlsLink -> IO Event
+linkWatchInput link = linkHasInput link >>= \ready -> if ready then pure (Until (Instant 0)) else linkReadable link
 
 -- | How a TLS link is configured.
 data TlsSettings = TlsSettings
