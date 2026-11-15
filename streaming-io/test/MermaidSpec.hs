@@ -4,7 +4,7 @@
 -- they should.
 module MermaidSpec (spec) where
 
-import Control.Arrow ((&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow ((&&&), (>>>), (>>^), (^>>), (|||), returnA)
 import Data.Char (isAlphaNum)
 import Data.List (isInfixOf, isPrefixOf, nub)
 import Network.Streaming.Classes
@@ -36,6 +36,15 @@ beside (posting, collecting) = fst ^>> ((snd ^>> posting) &&& (fst ^>> collectin
 -- | The posts and the collects as parts that run together, which are lanes.
 together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhere ()), ()) ()
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
+
+-- | What is drawn in front of the label of a step that never waits: a gear (U+2699) as a plain glyph, not a coloured
+-- emoji (U+FE0E), and a space.
+gear :: String
+gear = "\x2699\xFE0E "
+
+-- | The renderer doesn't draw the gear yet, so the cases that say it does fail, and the marks come off when it does.
+gearless :: Spec -> Spec
+gearless = xfail "Network.Streaming.Diagram.Mermaid doesn't draw a gear in front of a step that never waits yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -133,6 +142,24 @@ spec = describe "the chart" $ do
   it "has the name of the field that field reads, on the wire out of it" $ do
     chart <- chartOf (field "size" >>> quick :: Diagram ("size" := Int, "kept" := Bool) ())
     wiresNamed "size" chart `shouldBe` 1
+
+  gearless $ it "has a gear in front of the label of a step that never waits and has no name" $ do
+    chart <- chartOf (quick :: Diagram () ())
+    length (nodesDeclared (gear ++ "IO") chart) `shouldBe` 1
+
+  gearless $ it "has a gear in front of the name of a step that never waits and has one" $ do
+    chart <- chartOf (working >>> quick)
+    length (nodesDeclared (gear ++ "working") chart) `shouldBe` 1
+
+  it "has no gear in front of a block, a wait, a box or a decision" $ do
+    blocked <- chartOf (block :: Diagram Event ())
+    waited <- chartOf (await :: Diagram (Future Diagram 'Anywhere ()) ())
+    boxed <- chartOf (block >>> box "outer" (quick >>> quick) :: Diagram Event ())
+    decided <- chartOf (decide "which?" (\n -> if n > (0 :: Int) then Left () else Right ()) >>> (returnA ||| returnA))
+    let drawnAs shape chart = length [line | line <- stripped chart, shape `isInfixOf` line]
+    [drawnAs "hourglass" blocked, drawnAs "delay" waited, drawnAs "[[\"outer\"]]" boxed, drawnAs "{\"which?\"}" decided]
+      `shouldBe` [1, 1, 1, 1]
+    any (gear `isInfixOf`) (concat [blocked, waited, boxed, decided]) `shouldBe` False
 
 -- | The chart of the top page of the program, as lines.
 chartOf :: Diagram a b -> IO [String]
