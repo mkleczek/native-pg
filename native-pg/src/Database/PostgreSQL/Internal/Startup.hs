@@ -204,6 +204,7 @@ react settings (tag, body) phase = case (tag, phase) of
       _ | required -> throwIO (AuthenticationError "channel binding required but not supported by server's authentication request")
       3 -> requirePassword >>= \password -> answering (serialize (PasswordMessage password)) (Authenticated version)
       5 -> requirePassword >>= \password -> answering (serialize (PasswordMessage (md5Password (connectUser settings) password (BS.take 4 rest)))) (Authenticated version)
+      2 -> throwIO (UnsupportedAuthentication "Kerberos 5 authentication not supported")
       7 -> throwIO (UnsupportedAuthentication "GSSAPI authentication not supported")
       9 -> throwIO (UnsupportedAuthentication "SSPI authentication not supported")
       other -> throwIO (UnsupportedAuthentication ("authentication method " <> show other <> " not supported"))

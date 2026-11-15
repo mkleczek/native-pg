@@ -119,7 +119,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "says that GSSAPI isn't supported" $ scripted (frame 'R' (int32 7)) `shouldReturn` "GSSAPI authentication not supported"
     it "says that SSPI isn't supported" $ scripted (frame 'R' (int32 9)) `shouldReturn` "SSPI authentication not supported"
     -- Checked against libpq's own words, from a psql on the same scripted server.
-    needs "authentication wording" $ it "says that Kerberos 5 isn't supported" $
+    it "says that Kerberos 5 isn't supported" $
       scripted (frame 'R' (int32 2)) `shouldReturn` "Kerberos 5 authentication not supported"
     it "says that an authentication method that no client has isn't supported" $
       scripted (frame 'R' (int32 99)) `shouldReturn` "authentication method 99 not supported"

@@ -60,7 +60,7 @@ data ConnectError
   | -- | The server's messages don't follow the protocol.
     ProtocolError String
   | -- | The server asked for an authentication method this client doesn't
-    -- implement, in the words of libpq's: GSSAPI, SSPI, a method that no
+    -- implement, in the words of libpq's: Kerberos 5, GSSAPI, SSPI, a method that no
     -- client has, or SASL mechanisms that are all unknown.
     UnsupportedAuthentication String
   | -- | Authentication failed on the client's side: a password is needed but
