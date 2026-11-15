@@ -42,10 +42,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The renderer doesn't draw the gear yet, so the cases that say it does fail, and the marks come off when it does.
-gearless :: Spec -> Spec
-gearless = xfail "Network.Streaming.Diagram.Mermaid doesn't draw a gear in front of a step that never waits yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -90,13 +86,13 @@ spec = describe "the chart" $ do
     chart <- chartOf (each working :: Diagram [Int] [()])
     (wiresNamed "each" chart, wiresNamed "again" chart, wiresNamed "finish" chart) `shouldBe` (1, 1, 1)
     any (("{\"another focus?\"}" `isInfixOf`)) chart `shouldBe` True
-    let worked = nodesDeclared "working" chart
+    let worked = nodesDeclared (gear ++ "working") chart
     length worked `shouldBe` 1
     [from | (from, _) <- edgesOf chart, from `elem` worked, reaches chart from from] `shouldBe` worked
 
   it "has the branches of a prism: the arrow is on the branch of the focus, and the other case goes past it" $ do
     chart <- chartOf (_Just working >>> afterwards :: Diagram (Maybe Int) ())
-    case (nodesDeclared "working" chart, nodesDeclared "afterwards" chart) of
+    case (nodesDeclared (gear ++ "working") chart, nodesDeclared (gear ++ "afterwards") chart) of
       ([inside], [after]) -> do
         targetsOf "Right" chart `shouldBe` [inside]
         targetsOf "Left" chart `shouldBe` [after]
@@ -143,11 +139,11 @@ spec = describe "the chart" $ do
     chart <- chartOf (field "size" >>> quick :: Diagram ("size" := Int, "kept" := Bool) ())
     wiresNamed "size" chart `shouldBe` 1
 
-  gearless $ it "has a gear in front of the label of a step that never waits and has no name" $ do
+  it "has a gear in front of the label of a step that never waits and has no name" $ do
     chart <- chartOf (quick :: Diagram () ())
     length (nodesDeclared (gear ++ "IO") chart) `shouldBe` 1
 
-  gearless $ it "has a gear in front of the name of a step that never waits and has one" $ do
+  it "has a gear in front of the name of a step that never waits and has one" $ do
     chart <- chartOf (working >>> quick)
     length (nodesDeclared (gear ++ "working") chart) `shouldBe` 1
 

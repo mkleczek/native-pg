@@ -450,7 +450,7 @@ bar title node = node ++ "@{ shape: fork, label: " ++ labelOf title ++ " }"
 -- | The text of a node that is a leaf.
 leafText :: Shape -> String -> Node -> String
 leafText shape text node = case shape of
-  Action -> node ++ "[" ++ labelOf text ++ "]"
+  Action -> node ++ "[" ++ labelOf (gear ++ text) ++ "]"
   Wait -> node ++ "@{ shape: delay, label: " ++ labelOf text ++ " }"
   Blocking -> node ++ "@{ shape: hourglass }"
   Yielding -> node ++ "@{ shape: flip-tri, label: " ++ labelOf text ++ " }"
@@ -461,6 +461,10 @@ leafText shape text node = case shape of
   CollectFrom _ -> leafText Wait text node
   OpenInbox _ -> leafText Round text node
   CloseInbox _ -> leafText Round text node
+
+-- | The sign of a step that never waits, which is a gear (U+2699) kept a plain glyph by U+FE0E, and a space.
+gear :: String
+gear = "\x2699\xFE0E "
 
 -- | A label as Mermaid reads it: in quotes, with the characters that it takes for markup escaped. The first line is a
 -- title, and the rest a comment, which is drawn on a line of its own, smaller.
