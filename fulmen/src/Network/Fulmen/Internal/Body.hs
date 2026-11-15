@@ -1,6 +1,8 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -50,6 +52,7 @@ import Network.Streaming.Classes
     Stream (..),
     giving,
     taking,
+    trySend,
   )
 import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, iterateWith, step, tap)
 import Network.Streaming.Loans (Loan, release)
@@ -63,6 +66,9 @@ data Body
     Sized !BodyState
   | -- | A body in chunks.
     ChunkedBody !ChunkState
+  | -- | A body that its client waits to send until it is told to, by the @100 Continue@ that the first read of the body sends, once:
+    -- whether it is still owed. The body is what it is told of.
+    Awaited !(IORef Bool) !Body
 
 -- | What reading a body works with: the connection's socket, the buffer that the bytes are in and the loan of it
 -- that the body gives back when it ends, where the bytes that follow the body are kept, and where the reading is.
@@ -126,7 +132,7 @@ type Reading = Step ((Socket, Room), Body) (Either BodyState (Maybe ByteString))
 instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => Stream arr Body where
   next =
     named (Label "next" "Gives the next piece of the request body, from the bytes in hand or else from the socket.") $
-      iterateWith (step "look at bytes in hand" advance `giving` "bytes in hand?") (taking "no" receiving)
+      iterateWith (step "look at bytes in hand" (advance @(ModeOf arr)) `giving` "bytes in hand?") (taking "no" receiving)
         `giving` "body ended?"
         >>> (taking "yes" (ending Nothing) ||| taking "no" returnA)
     where
@@ -135,9 +141,15 @@ instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Ins
 
 -- | The next piece of the body, from the bytes in hand if there are any, and else the socket and the room to receive
 -- them into.
-advance :: Body -> IO Reading
+advance :: forall m. (Instrumented m) => Body -> IO Reading
 advance body = case body of
   NoBody -> pure (Finish (Right Nothing))
+  Awaited owed inner -> do
+    -- The first read tells the client to go on, in a send that doesn't wait: a client whose socket is full of what it has not
+    -- read yet goes on after its own wait.
+    due <- readIORef owed
+    when due $ writeIORef owed False *> (() <$ trySend @m (socketOf inner) ["HTTP/1.1 100 Continue\r\n\r\n"])
+    advance @m inner
   ChunkedBody chunks -> decode body chunks
   Sized state -> do
     marks@Marks {markStart, markEnd, markRemaining} <- readIORef (bodyMarks state)
@@ -149,6 +161,14 @@ advance body = case body of
           pure (Finish (Right (Just (BSI.BS (bufferMemory (bodyBuffer state) `plusForeignPtr` markStart) size))))
       | otherwise -> pure (Again ((bodySocket state, receiveRoom state markRemaining), body))
 
+-- | The socket that the body is read from.
+socketOf :: Body -> Socket
+socketOf = \case
+  NoBody -> error "a request that has no body has none to read from a socket"
+  Sized state -> bodySocket state
+  ChunkedBody ChunkState {chunkBody} -> bodySocket chunkBody
+  Awaited _ inner -> socketOf inner
+
 -- | The room that the rest of the body is received into: the buffer, or if the rest is less than that, as much as it.
 receiveRoom :: BodyState -> Int -> Room
 receiveRoom state remaining = Room (bodyBuffer state) 0 (min (bufferCapacity (bodyBuffer state)) remaining)
@@ -157,6 +177,7 @@ receiveRoom state remaining = Room (bodyBuffer state) 0 (min (bufferCapacity (bo
 arrived :: (Int, Body) -> IO Body
 arrived (count, body) = case body of
   NoBody -> pure body
+  Awaited _ inner -> arrived (count, inner)
   Sized state -> do
     when (count <= 0) (throwIO ConnectionLost)
     marks <- readIORef (bodyMarks state)
@@ -295,6 +316,7 @@ type Dropped = Step ((Socket, Room), (Body, Int)) (Either BodyState Bool)
 dropInHand :: Body -> Int -> IO Dropped
 dropInHand body total = case body of
   NoBody -> pure (Finish (Right True))
+  Awaited _ inner -> dropInHand inner total
   ChunkedBody chunks -> dropChunks body chunks total
   Sized state -> do
     marks@Marks {markStart, markEnd, markRemaining} <- readIORef (bodyMarks state)

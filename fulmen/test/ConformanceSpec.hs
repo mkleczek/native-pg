@@ -321,7 +321,6 @@ marked c = maybe id xfail (expectedFailure c)
 expectedFailure :: Case -> Maybe String
 expectedFailure c
   | caseName c `elem` served = Nothing
-  | caseArea c == AExpect = Just "Expect: 100-continue is not there yet (step 3)"
   | caseArea c == ATimeouts = Just "the client timeout is not there yet (step 3)"
   | otherwise = Nothing
 

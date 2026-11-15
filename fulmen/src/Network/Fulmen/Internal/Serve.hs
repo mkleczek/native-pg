@@ -41,6 +41,7 @@ import Foreign.Storable (poke)
 import Network.Fulmen.Internal
 import Network.Fulmen.Internal.Accept (acceptor, listening)
 import Network.Fulmen.Internal.Body (BodyRefused (..), BodyState (..), ChunkState (..), ConnectionLost (..), Decoding (..), Marks (..), drain)
+import Network.Fulmen.Internal.Bytes (equalsLower)
 import Network.Fulmen.Internal.Date (beginDraining)
 import Network.Fulmen.Internal.Head (Framing (..), Parsed (..), Scan (..), Spill (..), joined, notYet, parseHead, scanHead, startScan)
 import Network.Fulmen.Internal.Response (Exchange (..), Phase (..), newExchange, refusal)
@@ -374,16 +375,27 @@ prepare settings Headed {headedReq = Req {reqConn = Conn {..}, ..}, headedParsed
   case framing of
     Length size -> do
       marks <- newIORef Marks {markStart = consumed, markEnd = end, markRemaining = size}
-      pure (Prepared (Call reqLoans (Sized (BodyState connSocket buffer reqLoan connCarry marks)) exchange) request' Nothing)
+      requestBody <- awaited request' (end == consumed) (Sized (BodyState connSocket buffer reqLoan connCarry marks))
+      pure (Prepared (Call reqLoans requestBody exchange) request' Nothing)
     Chunked -> do
       marks <- newIORef Marks {markStart = consumed, markEnd = end, markRemaining = 0}
       decoding <- newIORef (AtSize 0)
       let state = BodyState connSocket buffer reqLoan connCarry marks
-      pure (Prepared (Call reqLoans (ChunkedBody (ChunkState state decoding (lineLimit settings) (bodyLimit settings) (headLimit settings))) exchange) request' Nothing)
+      requestBody <- awaited request' (end == consumed) (ChunkedBody (ChunkState state decoding (lineLimit settings) (bodyLimit settings) (headLimit settings)))
+      pure (Prepared (Call reqLoans requestBody exchange) request' Nothing)
     NoContent -> do
       -- Copied now, while the bytes are there: a lazy copy would be made after the buffer was used for something else.
       when (end > consumed) $ writeIORef connCarry $! B.copy (BSI.BS (bufferMemory buffer `plusForeignPtr` consumed) (end - consumed))
       pure (Prepared (Call reqLoans NoBody exchange) request' (Just reqLoan))
+
+-- | The body, or the body that is told to go on when it is first read, if the request expects @100-continue@ in HTTP/1.1 and
+-- none of the body came with the head, so that the client waits (RFC 9110 10.1.1; HTTP/1.0 ignores the expectation).
+awaited :: Request -> Bool -> Body -> IO Body
+awaited request' nothingYet requestBody
+  | nothingYet && version request' == Http11 && any expecting (headers request') = (`Awaited` requestBody) <$> newIORef True
+  | otherwise = pure requestBody
+  where
+    expecting (name, value) = equalsLower "expect" name && equalsLower "100-continue" value
 
 -- | What the handler left: a connection that the client has gone from, or a response that is not there or not
 -- complete, ends the connection, with a 500 if the handler had not answered; and one that is complete is kept if the
