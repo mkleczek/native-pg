@@ -1,3 +1,5 @@
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RankNTypes #-}
 
@@ -8,9 +10,16 @@ module ModelSpec (spec) where
 
 import Control.Monad (forM_, unless, when)
 import Data.Bits (shiftR, xor)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as B8
+import Data.ByteString (ByteString)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Sieve
+import qualified Data.Text as T
+import qualified Data.Text.Array as TA
+import Data.Text.Internal (Text (..))
 import Data.Word (Word64)
+import GHC.Exts (Int (..), sizeofByteArray#)
 import Model
 import Skeletest
 import Support
@@ -103,6 +112,42 @@ spec = describe "the table" $ do
         forM_ [1, 2, 3, 5, 8, 16, 32] $ \cap -> forM_ [1 .. 40] $ \seed -> do
           agrees make Two (\(Two k) -> k) cap (operations 300 (cap * 3) (fromIntegral (seed * 104729 + cap)))
           agrees make Five (\(Five k) -> k) cap (operations 300 (cap * 3) (fromIntegral (seed * 1299709 + cap)))
+
+  itNeeds [Table, Shared, Strings] "does the same for keys that are slices of byte strings, with the hash of their bytes" $
+    sharings $ \make ->
+      forM_ [1, 2, 3, 5, 8, 16, 32] $ \cap -> forM_ [1 .. 40] $ \seed ->
+        agrees make bytesKey unBytesKey cap (operations 300 (cap * 3) (fromIntegral (seed * 15485863 + cap)))
+
+  itNeeds [Table, Shared, Strings] "does the same for keys that are slices of text" $
+    sharings $ \make ->
+      forM_ [1, 2, 3, 5, 8, 16, 32] $ \cap -> forM_ [1 .. 40] $ \seed ->
+        agrees make textKey unTextKey cap (operations 300 (cap * 3) (fromIntegral (seed * 32452843 + cap)))
+
+  describe "keys that are views" $ do
+    itNeeds [Table, Strings] "are stored as copies: a byte string that is a slice of a buffer is not kept as the slice" $ do
+      let buffer = "xxxxjwt.7.sigyyyy" :: ByteString
+          view = BS.take 9 (BS.drop 4 buffer)
+      cache <- newCache (config 4)
+      store cache view (1 :: Int) `shouldReturn` True
+      stored <- map fst <$> entries cache
+      stored `shouldBe` [view]
+      mapM (viewOf buffer) stored `shouldReturn` [False]
+
+    itNeeds [Table, Strings] "are stored as copies: a text that is a slice is not kept as the slice" $ do
+      let wide = "xxxxtenant-7yyyy" :: Text
+          view = T.take 8 (T.drop 4 wide)
+      cache <- newCache (config 4)
+      store cache view (1 :: Int) `shouldReturn` True
+      stored <- map fst <$> entries cache
+      stored `shouldBe` [view]
+      -- Its own array, which holds its characters and no more.
+      [(offset, size') | Text array offset _ <- stored, let size' = case array of TA.ByteArray bytes -> I# (sizeofByteArray# bytes)] `shouldBe` [(0, 8)]
+
+    itNeeds [Table, Strings] "equal slices of different buffers are one key" $ do
+      cache <- newCache (config 4)
+      store cache (bytesKey 7) (1 :: Int) `shouldReturn` True
+      store cache (BS.copy (bytesKey 7)) 2 `shouldReturn` False
+      peek cache (B8.pack "jwt.7.sig") `shouldReturn` Just 1
 
   describe "one by one" $ do
     itNeeds [Table] "finds only what was stored, and keeps the value that is there" $ do

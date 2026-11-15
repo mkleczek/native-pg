@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RankNTypes #-}
 
@@ -7,6 +8,8 @@ module CachedSpec (spec) where
 
 import Control.Arrow ((^>>))
 import Control.Exception (throwIO)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Control.Monad (forM_)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Sieve
@@ -146,6 +149,20 @@ spec = describe "cached" $ forM_ setups $ \setup@(Setup name _ make _ _ run) -> 
       -- 1 and 2 were evicted, and both are among the last three.
       (_ :: [Int]) <- run (valuesOf (tenTimes loads) cache [1, 2])
       readIORef thrashes `shouldReturn` 2
+
+  describe "keys that are views" $
+    itCase setup [Table, Cached, Strings] "are stored as copies by a load too, and a copy of the slice is the same key" $ do
+      let buffer = "xxxxjwt.7.sigyyyy" :: ByteString
+          view = BS.take 9 (BS.drop 4 buffer)
+      loads <- counter
+      cache <- make (config 4)
+      let loader = BS.length ^>> tap (now (const (() <$ bump loads)))
+          call k = const (cache, k) ^>> cached loader accept
+      run ((,) <$> call view <*> call (BS.copy view)) `shouldReturn` (9, 9)
+      readIORef loads `shouldReturn` 1
+      stored <- map fst <$> entries cache
+      stored `shouldBe` [view]
+      mapM (viewOf buffer) stored `shouldReturn` [False]
 
   describe "keys that are prepared for storage" $ do
     itCase setup [Table, Cached] "are stored prepared, and found by an unprepared one" $ do

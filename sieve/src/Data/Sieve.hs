@@ -42,7 +42,8 @@ where
 
 import Control.Arrow (arr, returnA, (>>>), (^>>), (|||))
 import Control.Concurrent (yield)
-import Control.Exception (evaluate, onException)
+import Control.Exception (evaluate, onException, throw)
+import Data.ByteString (ByteString)
 import Control.Monad (when)
 import Data.Foldable (for_, traverse_)
 import Data.IORef (IORef, atomicWriteIORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -52,9 +53,11 @@ import Data.Kind (Type)
 import Data.Sieve.Ghosts (Ghosts, addGhost, noGhosts, takeGhost)
 import Data.Sieve.Memory (Ints, casInt, newInts, readInt, writeInt, writeIntAtomic)
 import Data.Sieve.Table
+import Data.Text (Text)
 import GHC.TypeLits (ErrorMessage (..), TypeError)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (Step, alongside, done, iterateA, keeping, step, tryTicket, pattern Again, pattern Finish)
+import Network.Streaming.NotImplemented (NotImplemented (..))
 
 -- | Which cores use a cache.
 data Sharing
@@ -86,19 +89,32 @@ instance
 -- | What an arrow needs to run the programs of a cache of the sharing: the tickets of its reach, and parts that suit it.
 type Reaching c arr = (Exchange arr (ReachOf c arr), Cooperating c (Local arr))
 
--- | A key: equality, and a hash that equal keys share.
+-- | A key: equality, a hash that equal keys share, and the form in which the cache stores it.
 class (Eq k) => Key k where
   hashKey :: k -> Int
 
+  -- | The key as the cache stores it: a copy, if the key is a view of memory that is used again, as a slice of a request's buffer
+  -- is. It is equal to the key and hashes the same, and it is evaluated when the key is stored.
+  storedKey :: k -> k
+  storedKey = id
+
 instance Key Int where
   hashKey = id
+
+-- | Not yet.
+instance Key ByteString where
+  hashKey _ = throw (NotImplemented "hashKey of a strict ByteString")
+
+-- | Not yet.
+instance Key Text where
+  hashKey _ = throw (NotImplemented "hashKey of a Text")
 
 -- | How a cache is made: its capacity, what it does with a key that it stores, and what it tells.
 data Config k v = Config
   { -- | How many entries it holds, at least one.
     capacity :: Int,
-    -- | Prepares a key for storage, for example by copying a view of a buffer. Equal keys stay equal, and hash the same. It is
-    -- evaluated when a key is stored.
+    -- | Prepares a key for storage, for example by copying a view of a buffer: 'config' has 'storedKey'. Equal keys stay equal, and
+    -- hash the same. It is evaluated when a key is stored.
     prepareKey :: k -> k,
     -- | Told of each lookup of 'cached': whether it found the key. It never waits.
     requested :: Bool -> IO (),
@@ -108,9 +124,9 @@ data Config k v = Config
     thrashed :: Maybe (IO ())
   }
 
--- | A config of this capacity that prepares no key and tells nothing.
-config :: Int -> Config k v
-config capacity = Config {capacity, prepareKey = id, requested = const (pure ()), evicted = \_ _ -> pure (), thrashed = Nothing}
+-- | A config of this capacity that stores keys as 'storedKey' says and tells nothing.
+config :: (Key k) => Int -> Config k v
+config capacity = Config {capacity, prepareKey = storedKey, requested = const (pure ()), evicted = \_ _ -> pure (), thrashed = Nothing}
 
 -- | A cache of the sharing, of keys and values.
 data Cache (c :: Sharing) (k :: Type) (v :: Type) = Cache

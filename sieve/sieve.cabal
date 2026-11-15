@@ -23,7 +23,7 @@ library
   other-modules: Data.Sieve.Ghosts
                  Data.Sieve.Memory
                  Data.Sieve.Table
-  build-depends: base >=4.18 && <5, containers >=0.6 && <0.8, streaming-io
+  build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, containers >=0.6 && <0.8, streaming-io, text >=2.0 && <2.2
 
 test-suite sieve-spec
   type: exitcode-stdio-1.0
@@ -43,4 +43,4 @@ test-suite sieve-spec
   -- -T counts the allocation that AllocationSpec reads.
   ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-T" -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, containers, sieve, streaming-io, skeletest >=0.4.2 && <0.5
+  build-depends: base, bytestring, containers, sieve, streaming-io, skeletest >=0.4.2 && <0.5, text

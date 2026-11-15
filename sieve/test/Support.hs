@@ -1,4 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE RankNTypes #-}
@@ -30,6 +31,15 @@ module Support
     spinUntil,
     pause,
     later,
+    viewOf,
+    Keys (..),
+    intKeys,
+    bytesKeys,
+    textKeys,
+    bytesKey,
+    unBytesKey,
+    textKey,
+    unTextKey,
   )
 where
 
@@ -38,6 +48,10 @@ import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Monad (when)
 import Data.Kind (Type)
 import Data.Bool (bool)
+import Data.Char (isDigit)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Sieve
 import Data.Sieve.Lease (Lease, newLease, newSharedLease)
@@ -47,6 +61,10 @@ import Network.Streaming.Combinators (done, sleep, tap, untilJust)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited (runDelimited)
 import Network.Streaming.Threads (runThreads)
+import qualified Data.ByteString.Char8 as B8
+import qualified Data.Text as T
+import Data.Text (Text)
+import Foreign.Ptr (minusPtr)
 import Skeletest
 import System.Timeout (timeout)
 
@@ -60,6 +78,8 @@ data Part
     SingleFlight
   | -- | The cache that all cores share.
     Shared
+  | -- | The keys that are strict byte strings and text.
+    Strings
   | -- | The lease.
     Lease
   | -- | The graveyard and the teardown part.
@@ -69,7 +89,7 @@ data Part
 -- | The parts that the code doesn't have yet. A change that adds one takes it off the list, and with it the marks of the cases
 -- that wait for it.
 notThere :: [Part]
-notThere = []
+notThere = [Strings]
 
 -- | Marks every case of the spec as an expected failure while a part that it needs is missing. A case that then passes
 -- unexpectedly fails the suite.
@@ -172,3 +192,40 @@ pause duration = tap (done >>> sleep duration)
 -- | The arrow, after a pause.
 later :: (Runtime arr) => Duration -> arr a b -> arr a b
 later duration body = pause duration >>> body
+
+-- | Whether the second byte string is a view of the memory of the first, and not a copy.
+viewOf :: ByteString -> ByteString -> IO Bool
+viewOf buffer candidate =
+  BSU.unsafeUseAsCString buffer $ \start ->
+    BSU.unsafeUseAsCString candidate $ \at ->
+      let offset = at `minusPtr` start in pure (offset >= 0 && offset < BS.length buffer)
+
+-- | The key of a number as a slice of a wider byte string, as the key of a request is a slice of its buffer: the bytes of a JWT.
+bytesKey :: Int -> ByteString
+bytesKey k = BS.take (BS.length bytes) (BS.drop 4 ("xxxx" <> bytes <> "yyyy"))
+  where
+    bytes = B8.pack ("jwt." <> show k <> ".sig")
+
+unBytesKey :: ByteString -> Int
+unBytesKey = read . takeWhile isDigit . drop 4 . B8.unpack
+
+-- | The key of a number as a slice of a wider text, as a tenant's name is read from a header.
+textKey :: Int -> Text
+textKey k = T.take (T.length name) (T.drop 4 ("xxxx" <> name <> "yyyy"))
+  where
+    name = T.pack ("tenant-" <> show k)
+
+unTextKey :: Text -> Int
+unTextKey = read . drop 7 . T.unpack
+
+-- | How a number is a key, and which number a key is: for the specs that run with each kind of key.
+data Keys k = Keys {keyOfNumber :: Int -> k, numberOfKey :: k -> Int}
+
+intKeys :: Keys Int
+intKeys = Keys id id
+
+bytesKeys :: Keys ByteString
+bytesKeys = Keys bytesKey unBytesKey
+
+textKeys :: Keys Text
+textKeys = Keys textKey unTextKey
