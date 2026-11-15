@@ -26,6 +26,7 @@ library
                    Network.Fulmen.Listen
                    Network.Fulmen.Request
                    Network.Fulmen.Response
+                   Network.Fulmen.Shutdown
   other-modules: Network.Fulmen.Internal
                  Network.Fulmen.Internal.Accept
                  Network.Fulmen.Internal.Body
@@ -53,7 +54,7 @@ test-suite fulmen-conformance
   if flag(threaded)
     ghc-options: -threaded
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, bytestring, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5
+  build-depends: base, bytestring, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5, unix
 
 -- A quick measurement: a client of C keep-alive connections and a server that answers with a static body, run as two
 -- processes of this one program. Its numbers are for looking at, and nothing checks them.

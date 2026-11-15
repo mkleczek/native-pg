@@ -20,7 +20,7 @@ import Network.Fulmen.Internal.Date (Date)
 import Network.Fulmen.Internal.Response (Exchange)
 import Network.Socket (Socket)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings)
-import Network.Streaming.Classes (Address, Duration, Reach (..))
+import Network.Streaming.Classes (Address, Duration, Event, Reach (..))
 import Network.Streaming.Loans (Loans)
 import Network.Streaming.Pool (Pool)
 
@@ -45,7 +45,11 @@ data Settings = Settings
     bodyLimit :: Maybe Int,
     -- | How long a client may be silent in the middle of a head or a body before
     -- the server closes the connection.
-    clientTimeout :: Maybe Duration
+    clientTimeout :: Maybe Duration,
+    -- | The event that starts a graceful shutdown, if the server has one: when it fires, the listener closes, a connection
+    -- that waits for its next request closes, a request in flight finishes and says that its connection ends, and the
+    -- server returns when none is left.
+    shutdown :: Maybe Event
   }
 
 -- | One request in flight: its loans, its body and its answer.

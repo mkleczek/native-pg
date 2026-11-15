@@ -16,7 +16,7 @@
 -- off when the part lands.
 module ConformanceSpec (spec) where
 
-import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>))
+import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Exception (IOException, SomeException, bracket, displayException, fromException, throwIO, try)
@@ -27,7 +27,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Char (toLower)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Tuple (swap)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -45,11 +46,13 @@ import Network.Streaming.Mode (Mode (..))
 import Network.Streaming.Threads (runThreads, runThreadsM)
 import Skeletest
 import System.Info (os)
+import System.Posix.Signals (raiseSignal, sigTERM)
+import System.Posix.Types (Fd (..))
 import System.IO.Error (ioeGetErrorString, isAlreadyInUseError)
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure *> peerAddress
+spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -132,6 +135,125 @@ peerOf (Runner _ runServer) =
     -- Answers with the address of the peer, as the network package shows it.
     peerHandler :: (Runtime arr) => arr (Call, Request) ()
     peerHandler = (\(call, request) -> (call, (Fulmen.Status 200, [], C.pack (show (Fulmen.peer request))))) ^>> reply
+
+-- | A graceful shutdown: it starts when the event of the server's settings fires, which a byte on a socket does here. The
+-- listener is closed, a connection that waits for its next request is closed, a request in flight finishes and says that
+-- the connection ends, and the server ends when none is left.
+shutdownSpec :: Spec
+shutdownSpec = describe "a graceful shutdown" $ forM_ (runners ++ [coresRunner]) $ \runner@(Runner runnerName _) ->
+  describe runnerName $ xfail "a graceful shutdown is not there yet (step 3)" $ do
+    it "ends the server and closes its listener, with no connection open" $
+      withStoppable runner (handling (Fixed 200 [] "ok")) $ \shutting -> do
+        stopServer shutting
+        ended <- timeout 3000000 (readMVar (serverStopped shutting))
+        fmap (either (const False) (const True)) ended `shouldBe` Just True
+        readIORef (listenerClosed shutting) >>= (`shouldBe` True)
+    it "closes a connection that waits for its next request" $
+      withStoppable runner (handling (Fixed 200 [] "ok")) $ \shutting ->
+        withClient (serverPort shutting) $ \client -> do
+          SocketBytes.sendAll (socket client) "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          awaitBytes client "ok"
+          stopServer shutting
+          closed <- timeout 3000000 (waitUntil (readIORef (ended client)))
+          closed `shouldBe` Just ()
+          ended' <- timeout 3000000 (readMVar (serverStopped shutting))
+          fmap (either (const False) (const True)) ended' `shouldBe` Just True
+    it "lets a request in flight finish, and says that the connection ends" $
+      withStoppable runner quickOrSlow $ \shutting ->
+        withClient (serverPort shutting) $ \client -> do
+          SocketBytes.sendAll (socket client) "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          threadDelay 150000
+          stopServer shutting
+          closed <- timeout 5000000 (waitUntil (readIORef (ended client)))
+          closed `shouldBe` Just ()
+          bytes <- readIORef (received client)
+          case parsedResponses (parseResponses [False] True bytes) of
+            [response] -> do
+              responseStatus response `shouldBe` 200
+              responseBody response `shouldBe` "onetwo"
+              [value | (name, value) <- responseFields response, C.map toLower name == "connection"] `shouldBe` ["close"]
+            others -> failTest ("expected one response, got " <> show (length others))
+          ended' <- timeout 3000000 (readMVar (serverStopped shutting))
+          fmap (either (const False) (const True)) ended' `shouldBe` Just True
+    it "closes the idle connection at once while another request is in flight, which then finishes" $
+      withStoppable runner quickOrSlow $ \shutting ->
+        withClient (serverPort shutting) $ \busy -> withClient (serverPort shutting) $ \idle -> do
+          -- The connection that is idle has served a request, and waits for the next.
+          SocketBytes.sendAll (socket idle) "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          awaitBytes idle "ok"
+          SocketBytes.sendAll (socket busy) "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          threadDelay 200000
+          stopServer shutting
+          idleClosed <- timeout 1000000 (waitUntil (readIORef (ended idle)))
+          idleClosed `shouldBe` Just ()
+          busyClosed <- readIORef (ended busy)
+          busyClosed `shouldBe` False
+          finished <- timeout 6000000 (waitUntil (readIORef (ended busy)))
+          finished `shouldBe` Just ()
+          bytes <- readIORef (received busy)
+          fmap responseBody (parsedResponses (parseResponses [False] True bytes)) `shouldBe` ["onetwo"]
+    it "starts when the process is sent SIGTERM, with the event of terminating" $ do
+      event <- Fulmen.terminating
+      withStoppableOn event runner (handling (Fixed 200 [] "ok")) $ \shutting -> do
+        raiseSignal sigTERM
+        ended <- timeout 3000000 (readMVar (serverStopped shutting))
+        fmap (either (const False) (const True)) ended `shouldBe` Just True
+
+-- | A server that is running, and what a test needs to stop it and to see how it ended.
+data Stoppable = Stoppable
+  { serverPort :: Socket.PortNumber,
+    stopServer :: IO (),
+    serverStopped :: MVar (Either SomeException ()),
+    listenerClosed :: IORef Bool
+  }
+
+-- | A server whose shutdown starts when a byte is written to a socket, as the event of its settings says.
+withStoppable :: Runner -> Handling -> (Stoppable -> IO a) -> IO a
+withStoppable runner handler use =
+  bracket (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) (\(reader, writer) -> Socket.close reader *> Socket.close writer) $ \(reader, writer) -> do
+    fd <- Socket.unsafeFdSocket reader
+    withStoppableOn (Readable (Fd fd)) runner handler (\shutting -> use shutting {stopServer = void (try @IOException (SocketBytes.sendAll writer "x"))})
+
+-- | A server whose shutdown starts when the event fires. It listens on a socket that it closes as it ends, so that the
+-- test sees that it did.
+withStoppableOn :: Event -> Runner -> Handling -> (Stoppable -> IO a) -> IO a
+withStoppableOn event (Runner _ runServer) handler use =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+    Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen accepting 128
+    port <- Socket.socketPort accepting
+    closed <- newIORef False
+    -- Several workers, so that a connection that is idle and one that is busy are both served.
+    let settings = Fulmen.defaultSettings {Fulmen.shutdown = Just event, Fulmen.connectionsPerCore = 4}
+        listener =
+          Listening
+            Fulmen.Listen
+              { Fulmen.openListener = now (const (pure accepting)),
+                Fulmen.closeListener = now (\sock -> writeIORef closed True *> Socket.close sock)
+              }
+    cores <- Fulmen.newCores settings 1
+    stopped <- newEmptyMVar
+    bracket (forkFinally (runServer settings listener handler cores) (putMVar stopped)) killThread $ \_ ->
+      use (Stoppable port (pure ()) stopped closed)
+
+-- | Waits, a little at a time, until the check holds.
+waitUntil :: IO Bool -> IO ()
+waitUntil check = check >>= \holds -> if holds then pure () else threadDelay 5000 *> waitUntil check
+
+-- | Waits until what the client has received has the bytes.
+awaitBytes :: Client -> ByteString -> IO ()
+awaitBytes client needle = do
+  arrived <- timeout 3000000 (waitUntil ((needle `B.isInfixOf`) <$> readIORef (received client)))
+  when (isNothing arrived) (failTest ("waited for " <> show needle <> ", which did not arrive"))
+
+-- | A handler that answers /slow in two chunks, a second before each, and anything else at once.
+quickOrSlow :: Handling
+quickOrSlow = Handling program
+  where
+    program :: (Runtime arr) => arr (Call, Request) ()
+    program =
+      (\input@(_, request) -> if target request == "/slow" then Left input else Right input)
+        ^>> (streamedWith [pause 1000 >>> writing "one", pause 1000 >>> writing "two"] ||| ((, (Fulmen.Status 200, [], "ok")) . fst ^>> reply))
 
 -- | How the server ended, if it did in time: the runner runs it with a handler that answers 200, on one core made for it.
 endedWith :: Runner -> Listening -> IO (Maybe (Either SomeException ()))

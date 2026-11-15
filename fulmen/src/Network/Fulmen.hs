@@ -32,6 +32,7 @@ module Network.Fulmen
     module Network.Fulmen.Listen,
     module Network.Fulmen.Request,
     module Network.Fulmen.Response,
+    module Network.Fulmen.Shutdown,
   )
 where
 
@@ -42,6 +43,7 @@ import Network.Fulmen.Internal.Serve (serve)
 import Network.Fulmen.Listen
 import Network.Fulmen.Request
 import Network.Fulmen.Response
+import Network.Fulmen.Shutdown
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (secs)
 import Network.Streaming.Loans (Loans)
@@ -60,6 +62,7 @@ defaultSettings =
     51200
     Nothing
     (Just (secs 30))
+    Nothing
 
 -- | The cores that a server runs on, from its settings and how many there are: what they share, the pool of request
 -- buffers that the settings size included, and the first core's own value.
