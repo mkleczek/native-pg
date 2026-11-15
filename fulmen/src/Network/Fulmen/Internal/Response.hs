@@ -201,8 +201,10 @@ headOutput exchange date (Status code) headers len keep =
     given name = any (equalsLower name . fst) headers
     unlessGiven name = ifNot (given name)
     ifNot condition out = if condition then mempty else out
+    -- A response to HEAD has the framing fields that the handler gave and no others: a length that the server stated might
+    -- not be the length of the body of a GET.
     framing
-      | bodyless code = mempty
+      | bodyless code || exHead exchange = mempty
       | otherwise = case len of
           Known size -> unlessGiven "content-length" (bytes "Content-Length: " <> bytes (C.pack (show size)) <> bytes "\r\n")
           Unknown | exHttp11 exchange -> unlessGiven "transfer-encoding" (bytes "Transfer-Encoding: chunked\r\n")
