@@ -37,10 +37,6 @@ beside (posting, collecting) = fst ^>> ((snd ^>> posting) &&& (fst ^>> collectin
 together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhere ()), ()) ()
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 
--- | The stubs of each and the prisms draw as one pure step, until they are written, and the marks come off with them.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Plumbing has stubs: the prisms and each are not written yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -81,7 +77,7 @@ spec = describe "the chart" $ do
     let labelled = [name | name <- ["name", "size"], any (("|\"" ++ name ++ "\"|") `isInfixOf`) (stripped chart)]
     labelled `shouldBe` ["name", "size"]
 
-  stubbed $ it "has the loop of each: the step goes round, the decision asks for another focus, and the loop is named" $ do
+  it "has the loop of each: the step goes round, the decision asks for another focus, and the loop is named" $ do
     chart <- chartOf (each working :: Diagram [Int] [()])
     (wiresNamed "each" chart, wiresNamed "again" chart, wiresNamed "finish" chart) `shouldBe` (1, 1, 1)
     any (("{\"another focus?\"}" `isInfixOf`)) chart `shouldBe` True
@@ -89,7 +85,7 @@ spec = describe "the chart" $ do
     length worked `shouldBe` 1
     [from | (from, _) <- edgesOf chart, from `elem` worked, reaches chart from from] `shouldBe` worked
 
-  stubbed $ it "has the branches of a prism: the arrow is on the branch of the focus, and the other case goes past it" $ do
+  it "has the branches of a prism: the arrow is on the branch of the focus, and the other case goes past it" $ do
     chart <- chartOf (_Just working >>> afterwards :: Diagram (Maybe Int) ())
     case (nodesDeclared "working" chart, nodesDeclared "afterwards" chart) of
       ([inside], [after]) -> do

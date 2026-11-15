@@ -35,15 +35,10 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The stubs of the optics fail when they run: every case that needs one is expected to fail, and the mark comes off when
--- the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Plumbing has stubs: the prisms, each, traversal and folding are not written yet"
-
 spec :: Spec
 spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $ do
   describe "prisms" $ do
-    stubbed $ it "_Left runs the arrow on a Left, and passes a Right through without running it" $ do
+    it "_Left runs the arrow on a Left, and passes a Right through without running it" $ do
       noted <- newLog
       run (const (Left 3 :: Either Int Bool) ^>> _Left (seeing noted)) `shouldReturn` Left 30
       readLog noted `shouldReturn` ["saw 3"]
@@ -51,7 +46,7 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const (Right True :: Either Int Bool) ^>> _Left (seeing passed)) `shouldReturn` Right True
       readLog passed `shouldReturn` []
 
-    stubbed $ it "_Right runs the arrow on a Right, and passes a Left through without running it" $ do
+    it "_Right runs the arrow on a Right, and passes a Left through without running it" $ do
       noted <- newLog
       run (const (Right 3 :: Either Bool Int) ^>> _Right (seeing noted)) `shouldReturn` Right 30
       readLog noted `shouldReturn` ["saw 3"]
@@ -59,7 +54,7 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const (Left True :: Either Bool Int) ^>> _Right (seeing passed)) `shouldReturn` Left True
       readLog passed `shouldReturn` []
 
-    stubbed $ it "_Just runs the arrow on the value of a Just, and passes Nothing through without running it" $ do
+    it "_Just runs the arrow on the value of a Just, and passes Nothing through without running it" $ do
       noted <- newLog
       run (const (Just 3 :: Maybe Int) ^>> _Just (seeing noted)) `shouldReturn` Just 30
       readLog noted `shouldReturn` ["saw 3"]
@@ -67,7 +62,7 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const (Nothing :: Maybe Int) ^>> _Just (seeing passed)) `shouldReturn` Nothing
       readLog passed `shouldReturn` []
 
-    stubbed $ it "a prism that the test makes runs the arrow on the case that matches, and passes the others through" $ do
+    it "a prism that the test makes runs the arrow on the case that matches, and passes the others through" $ do
       noted <- newLog
       run (const 4 ^>> halved (seeing noted)) `shouldReturn` "even, then 40"
       readLog noted `shouldReturn` ["saw 4"]
@@ -75,7 +70,7 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const 3 ^>> halved (seeing passed)) `shouldReturn` "odd 3"
       readLog passed `shouldReturn` []
 
-    stubbed $ it "composes with the lens _1: _1 . _Left runs the arrow on the Left of the first of a pair" $ do
+    it "composes with the lens _1: _1 . _Left runs the arrow on the Left of the first of a pair" $ do
       noted <- newLog
       run (const (Left 3 :: Either Int Bool, "kept") ^>> (_1 . _Left) (seeing noted)) `shouldReturn` (Left 30, "kept")
       readLog noted `shouldReturn` ["saw 3"]
@@ -83,7 +78,7 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const (Right True :: Either Int Bool, "kept") ^>> (_1 . _Left) (seeing passed)) `shouldReturn` (Right True, "kept")
       readLog passed `shouldReturn` []
 
-    stubbed $ it "composes with at: at \"x\" . _Just runs the arrow on the value of a field that is a Just" $ do
+    it "composes with at: at \"x\" . _Just runs the arrow on the value of a field that is a Just" $ do
       noted <- newLog
       run (maybeField (Just 3) >>> (at "x" . _Just) (seeing noted) >>^ \r -> (r.x, r.kept)) `shouldReturn` (Just 30, True)
       readLog noted `shouldReturn` ["saw 3"]
@@ -91,7 +86,7 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (maybeField Nothing >>> (at "x" . _Just) (seeing passed) >>^ \r -> (r.x, r.kept)) `shouldReturn` (Nothing, True)
       readLog passed `shouldReturn` []
 
-    stubbed $ it "composes with the lens _2: _Just . _2 runs the arrow on the second of a pair that is in a Just" $ do
+    it "composes with the lens _2: _Just . _2 runs the arrow on the second of a pair that is in a Just" $ do
       noted <- newLog
       run (const (Just (1 :: Int, 2)) ^>> (_Just . _2) (seeing noted)) `shouldReturn` Just (1, 20)
       readLog noted `shouldReturn` ["saw 2"]
@@ -100,28 +95,28 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       readLog passed `shouldReturn` []
 
   describe "each" $ do
-    stubbed $ it "gives an empty list for an empty list, and doesn't run the arrow" $ do
+    it "gives an empty list for an empty list, and doesn't run the arrow" $ do
       noted <- newLog
       run (const ([] :: [Int]) ^>> each (seeing noted)) `shouldReturn` []
       readLog noted `shouldReturn` []
 
-    stubbed $ it "runs the arrow on the one element of a list of one" $ do
+    it "runs the arrow on the one element of a list of one" $ do
       noted <- newLog
       run (const [7] ^>> each (seeing noted)) `shouldReturn` [70]
       readLog noted `shouldReturn` ["saw 7"]
 
-    stubbed $ it "gives the results in the order of the elements, and runs the arrow on them in that order" $ do
+    it "gives the results in the order of the elements, and runs the arrow on them in that order" $ do
       noted <- newLog
       run (const [1, 2, 3, 4, 5] ^>> each (seeing noted)) `shouldReturn` [10, 20, 30, 40, 50]
       readLog noted `shouldReturn` ["saw 1", "saw 2", "saw 3", "saw 4", "saw 5"]
 
-    stubbed $ it "runs the arrow on 10,000 elements, once each" $ do
+    it "runs the arrow on 10,000 elements, once each" $ do
       counted <- newCount
       run (const [1 .. 10000] ^>> each (counting counted)) `shouldReturn` [2 .. 10001]
       readIORef counted `shouldReturn` 10000
 
   describe "traversal" $ do
-    stubbed $ it "with traverse runs the arrow on the value of a Maybe, and puts the result in its place" $ do
+    it "with traverse runs the arrow on the value of a Maybe, and puts the result in its place" $ do
       noted <- newLog
       run (const (Just 4 :: Maybe Int) ^>> traversal traverse (seeing noted)) `shouldReturn` Just 40
       readLog noted `shouldReturn` ["saw 4"]
@@ -129,7 +124,7 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const (Nothing :: Maybe Int) ^>> traversal traverse (seeing passed)) `shouldReturn` Nothing
       readLog passed `shouldReturn` []
 
-    stubbed $ it "with traverse runs the arrow on each element of a list, in order, and puts the results in their places" $ do
+    it "with traverse runs the arrow on each element of a list, in order, and puts the results in their places" $ do
       noted <- newLog
       run (const [1, 2, 3] ^>> traversal traverse (seeing noted)) `shouldReturn` [10, 20, 30]
       readLog noted `shouldReturn` ["saw 1", "saw 2", "saw 3"]
@@ -137,22 +132,22 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const [] ^>> traversal traverse (seeing empty)) `shouldReturn` []
       readLog empty `shouldReturn` []
 
-    stubbed $ it "runs the arrow on both parts of a pair, with a traversal that the test writes" $ do
+    it "runs the arrow on both parts of a pair, with a traversal that the test writes" $ do
       noted <- newLog
       run (const (5, 6) ^>> traversal both (seeing noted)) `shouldReturn` (50, 60)
       readLog noted `shouldReturn` ["saw 5", "saw 6"]
 
-    stubbed $ it "runs the arrow on the foci of a traversal that is made of two, in the order that it visits them" $ do
+    it "runs the arrow on the foci of a traversal that is made of two, in the order that it visits them" $ do
       noted <- newLog
       run (const [(7, 8), (9, 10)] ^>> traversal (traverse . both) (seeing noted)) `shouldReturn` [(70, 80), (90, 100)]
       readLog noted `shouldReturn` ["saw 7", "saw 8", "saw 9", "saw 10"]
 
-    stubbed $ it "composes with at: at \"rows\" . traversal traverse runs the arrow on each element of a field" $ do
+    it "composes with at: at \"rows\" . traversal traverse runs the arrow on each element of a field" $ do
       noted <- newLog
       run (rows >>> (at "rows" . traversal traverse) (seeing noted) >>^ \r -> (r.rows, r.name)) `shouldReturn` ([10, 20, 30], "pipe")
       readLog noted `shouldReturn` ["saw 1", "saw 2", "saw 3"]
 
-    stubbed $ it "runs the arrow on 10,000 foci of a list, and on 10,000 foci of 5,000 pairs, once each" $ do
+    it "runs the arrow on 10,000 foci of a list, and on 10,000 foci of 5,000 pairs, once each" $ do
       counted <- newCount
       run (const [1 .. 10000] ^>> traversal traverse (counting counted)) `shouldReturn` [2 .. 10001]
       readIORef counted `shouldReturn` 10000
@@ -163,20 +158,20 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       readIORef paired `shouldReturn` 10000
 
   describe "folding" $ do
-    stubbed $ it "runs the arrow on each part, in order, and combines the results with the monoid" $ do
+    it "runs the arrow on each part, in order, and combines the results with the monoid" $ do
       noted <- newLog
       run (const [1, 2, 3] ^>> folding id (seeing noted >>^ Sum)) `shouldReturn` Sum 60
       readLog noted `shouldReturn` ["saw 1", "saw 2", "saw 3"]
       shown <- newLog
       run (const [1, 2, 3] ^>> folding id (seeing shown >>^ show)) `shouldReturn` "102030"
 
-    stubbed $ it "gives the empty monoid for a structure that has no part, and doesn't run the arrow" $ do
+    it "gives the empty monoid for a structure that has no part, and doesn't run the arrow" $ do
       noted <- newLog
       run (const ([] :: [Int]) ^>> folding id (seeing noted >>^ Sum)) `shouldReturn` Sum 0
       run (const (Nothing :: Maybe Int) ^>> folding id (seeing noted >>^ show)) `shouldReturn` ""
       readLog noted `shouldReturn` []
 
-    stubbed $ it "folds the parts that a function gives, and 10,000 of them" $ do
+    it "folds the parts that a function gives, and 10,000 of them" $ do
       noted <- newLog
       run (const (1, 2) ^>> folding (\(a, b) -> [a, b]) (seeing noted >>^ Sum)) `shouldReturn` Sum 30
       readLog noted `shouldReturn` ["saw 1", "saw 2"]
@@ -185,19 +180,19 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       readIORef counted `shouldReturn` 10000
 
   describe "a failure of the arrow" $ do
-    stubbed $ it "on the third element reaches the caller from each, and the fourth element doesn't run it" $ do
+    it "on the third element reaches the caller from each, and the fourth element doesn't run it" $ do
       noted <- newLog
       result <- run (tryA (const [1 .. 5] ^>> each (failingOn 3 noted)))
       failureOf result `shouldBe` Just (Boom 3)
       readLog noted `shouldReturn` ["saw 1", "saw 2", "saw 3"]
 
-    stubbed $ it "on the third focus reaches the caller from traversal, and the fourth focus doesn't run it" $ do
+    it "on the third focus reaches the caller from traversal, and the fourth focus doesn't run it" $ do
       noted <- newLog
       result <- run (tryA (const [1 .. 5] ^>> traversal traverse (failingOn 3 noted)))
       failureOf result `shouldBe` Just (Boom 3)
       readLog noted `shouldReturn` ["saw 1", "saw 2", "saw 3"]
 
-    stubbed $ it "on the third part reaches the caller from folding, and the fourth part doesn't run it" $ do
+    it "on the third part reaches the caller from folding, and the fourth part doesn't run it" $ do
       noted <- newLog
       result <- run (tryA (const [1 .. 5] ^>> folding id (failingOn 3 noted >>^ Sum)))
       failureOf result `shouldBe` Just (Boom 3)

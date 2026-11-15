@@ -33,8 +33,10 @@ module Network.Streaming.Plumbing
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, left, returnA, right, second, (>>>), (>>^), (^>>), (|||))
 import Data.Bool (bool)
+import Data.Foldable (toList)
+import Data.Functor.Const (Const (..))
 import Network.Streaming.Annotate (Annotate, giving, taking)
 
 -- | What a step of a loop gives: 'Again' with the state to go round with, or 'Finish' with the result. It is 'Either',
@@ -129,52 +131,71 @@ _2 :: (Arrow arr) => arr a b -> arr (c, a) (c, b)
 _2 = second
 {-# INLINE _2 #-}
 
--- | The left of an 'Either', as a prism: runs the arrow on a 'Left' and passes a 'Right' through. A stub: it fails when it
--- runs, until it is written.
+-- | The left of an 'Either', as a prism: runs the arrow on a 'Left' and passes a 'Right' through.
 _Left :: (ArrowChoice arr) => arr a b -> arr (Either a c) (Either b c)
-_Left _ = unwritten "_Left"
+_Left = left
 {-# INLINE _Left #-}
 
--- | The right of an 'Either', as a prism: runs the arrow on a 'Right' and passes a 'Left' through. A stub: it fails when it
--- runs, until it is written.
+-- | The right of an 'Either', as a prism: runs the arrow on a 'Right' and passes a 'Left' through.
 _Right :: (ArrowChoice arr) => arr a b -> arr (Either c a) (Either c b)
-_Right _ = unwritten "_Right"
+_Right = right
 {-# INLINE _Right #-}
 
--- | The 'Just' of a 'Maybe', as a prism: runs the arrow on the value and passes 'Nothing' through. A stub: it fails when it
--- runs, until it is written.
+-- | The 'Just' of a 'Maybe', as a prism: runs the arrow on the value and passes 'Nothing' through.
 _Just :: (ArrowChoice arr) => arr a b -> arr (Maybe a) (Maybe b)
-_Just _ = unwritten "_Just"
+_Just = prism Just (maybe (Left Nothing) Right)
 {-# INLINE _Just #-}
 
 -- | A prism from how a case is built and how it is matched: the arrow runs on the focus of a 'Right', and a 'Left' is
--- the whole result already and passes through without running it. A stub: it fails when it runs, until it is written.
+-- the whole result already and passes through without running it.
 prism :: (ArrowChoice arr) => (b -> t) -> (s -> Either t a) -> arr a b -> arr s t
-prism _ _ _ = unwritten "prism"
+prism build match p = match ^>> (returnA ||| (p >>^ build))
 {-# INLINE prism #-}
 
 -- | Runs the arrow on each element of a list in order, and gives the results in the same order. In diagrams the loop
--- is named "each", and it asks "another focus?". A stub: it fails when it runs, until it is written.
+-- is named "each", and it asks "another focus?".
 each :: (ArrowChoice arr, Annotate arr) => arr a b -> arr [a] [b]
-each _ = unwritten "each"
+each p = taking "each" ((\as -> (as, [])) ^>> iterateWith (arr pick `giving` "another focus?") (first p >>^ push))
+  where
+    pick ([], bs) = Finish (reverse bs)
+    pick (a : rest, bs) = Again (a, (rest, bs))
+    push (b, (rest, bs)) = (rest, b : bs)
 {-# INLINE each #-}
 
 -- | Runs the arrow on each focus of a traversal, in the order that the traversal visits them, and puts the results in
--- the places of the foci. The traversal is in the form of the van Laarhoven lenses, as 'traverse' is. A stub: it fails
--- when it runs, until it is written.
+-- the places of the foci. The traversal is in the form of the van Laarhoven lenses, as 'traverse' is.
 traversal :: (ArrowChoice arr, Annotate arr) => (forall f. (Applicative f) => (a -> f b) -> s -> f t) -> arr a b -> arr s t
-traversal _ _ = unwritten "traversal"
+traversal trav p = alongside (focuses ^>> each p) >>^ \(bs, s) -> refill (trav (const pop) s) bs
+  where
+    focuses = getConst . trav (\a -> Const [a])
 {-# INLINE traversal #-}
 
--- | Runs the arrow on each part that the function gives, in order, and combines the results. A stub: it fails when it
--- runs, until it is written.
+-- | Runs the arrow on each part that the function gives, in order, and combines the results.
 folding :: (ArrowChoice arr, Annotate arr, Foldable f, Monoid m) => (s -> f a) -> arr a m -> arr s m
-folding _ _ = unwritten "folding"
+folding parts p = (toList . parts) ^>> each p >>^ mconcat
 {-# INLINE folding #-}
 
--- | What the stubs are until they are written: an arrow that fails when it runs.
-unwritten :: (Arrow arr) => String -> arr a b
-unwritten operation = arr (const (error (operation <> " is not implemented yet")))
+-- | Takes the results of a traversal from the front of a list, in the order that it asks, in continuation-passing style,
+-- so that a traversal of any length is put back in a stack of constant size.
+newtype Refill b a = Refill (forall r. [b] -> (a -> [b] -> r) -> r)
+
+instance Functor (Refill b) where
+  fmap f (Refill put) = Refill (\bs k -> put bs (\a bs' -> k (f a) bs'))
+
+instance Applicative (Refill b) where
+  pure a = Refill (\bs k -> k a bs)
+  Refill f <*> Refill x = Refill (\bs k -> f bs (\g bs' -> x bs' (\a bs'' -> k (g a) bs'')))
+  liftA2 f (Refill x) (Refill y) = Refill (\bs k -> x bs (\a bs' -> y bs' (\b bs'' -> k (f a b) bs'')))
+
+-- | The next result.
+pop :: Refill b b
+pop = Refill $ \bs k -> case bs of
+  b : rest -> k b rest
+  [] -> error "Network.Streaming.Plumbing.traversal: the traversal has more foci than results"
+
+-- | The traversal's result, with its foci replaced by the results from the front of the list.
+refill :: Refill b t -> [b] -> t
+refill (Refill put) bs = put bs const
 
 -- | Runs the arrow on the part that the lens picks, and ignores the rest.
 on :: (Arrow arr) => (arr a () -> arr s t) -> arr a () -> arr s ()
