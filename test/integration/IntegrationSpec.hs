@@ -1216,6 +1216,22 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` Right [(42, "a,zażółć", "1", "[1, 2]", True)]
 
+  -- A snippet marks the parameter that its statement streams, so that SQL that is generated can have a streamed parameter: the
+  -- statement from the snippet takes its bytes from the stream that the statement declares, as 'Tx.FromStream' does.
+  describe "snippets that stream a parameter" $ do
+    let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
+        withSession body = run (session (unix "postgres" Nothing) body)
+    needs "ParameterStream in a snippet" $ do
+      it "takes the parameter that the snippet marks from the stream of its statement" $
+        withSession (streaming (newChunks ["abc", "def"]) (query' (Tx.streamFrom id (Snippet.fromSnippet (lengthOfStreamed 6) single))))
+          `shouldReturn` Right [6 :: Int32]
+      it "takes it among parameters that are bytes, in the order that the snippet has them" $
+        withSession (streaming (newChunks ["ab", "cd"]) (query' (Tx.streamFrom id (Snippet.fromSnippet (afterBytes 4) single))))
+          `shouldReturn` Right ["xyabcd" :: Text]
+      it "takes it from the stream of a statement made from the input, whose snippet the input makes" $ do
+        inputs <- traverse (\(size, pieces) -> (size,) <$> newChunks pieces) [(5, ["ab", "cde"]), (3, ["xyz"]), (0, [])]
+        withSession (overInputs (query' madeFromSnippet) inputs) `shouldReturn` [Right [5], Right [3], Right [0]]
+
   -- A parameter stream that breaks its promise leaves the protocol in a state nobody can continue from.
   describe "execute (failures)" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
@@ -1424,6 +1440,23 @@ failureOf runner string = do
   settings <- settingsOf string
   result <- ordinary runner (connectedTo settings done)
   either (pure . displayException) (const (fail "connected")) result
+
+-- | The snippet whose parameter is this many bytes of the stream of its statement, as text.
+lengthOfStreamed :: Int -> Snippet.Snippet
+lengthOfStreamed size = "SELECT length(" <> streamedParam size <> "::text)"
+
+-- | The snippet whose parameters are two bytes and then this many bytes of the stream, concatenated.
+afterBytes :: Int -> Snippet.Snippet
+afterBytes size = "SELECT " <> Snippet.encoderAndParam (Encoders.nonNullable Encoders.unknown) "xy" <> "::text || " <> streamedParam size <> "::text"
+
+-- | The parameter that is this many bytes of the stream of the statement, of a type that the server infers.
+streamedParam :: Int -> Snippet.Snippet
+streamedParam size = Snippet.param (Encoders.rawParam Encoders.rawUnknown (Just (Encoders.ParameterStream size)))
+
+-- | The statement that a snippet makes of the input, which is the size of the stream, and the stream: its SQL and parameters
+-- are those of 'Snippet.fromSnippet'.
+madeFromSnippet :: forall arr. (Runtime arr) => Tx.Statement arr (Int, Chunks) Int32
+madeFromSnippet = Tx.streamFrom snd (Tx.statementFrom (\(size, _) -> let given = Snippet.fromSnippet (lengthOfStreamed size) (Tx.none :: Rows arr ()) in (Tx.sql given, Tx.params given ())) single)
 
 -- | A pair of an Int and a text, as a composite.
 data Pair = Pair Int32 Text
