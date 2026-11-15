@@ -54,6 +54,8 @@ module Network.Streaming.Combinators
     taking,
     giving,
     inout,
+    (-|),
+    (|-),
     typed,
   )
 where

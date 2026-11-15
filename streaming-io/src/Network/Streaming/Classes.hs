@@ -64,6 +64,8 @@ module Network.Streaming.Classes
     taking,
     giving,
     inout,
+    (-|),
+    (|-),
     Effect (..),
     GiveWay (..),
     Block (..),
@@ -99,7 +101,7 @@ import Foreign.Ptr (Ptr, plusPtr)
 import GHC.TypeLits (KnownSymbol, Symbol)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
-import Network.Streaming.Annotate (Annotate (..), Check (..), Label (..), box, giving, inout, taking)
+import Network.Streaming.Annotate (Annotate (..), Check (..), Label (..), box, giving, inout, taking, (-|), (|-))
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Internal.Inboxes (Address)
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)

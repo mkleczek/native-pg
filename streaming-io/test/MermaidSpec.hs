@@ -4,7 +4,7 @@
 -- they should.
 module MermaidSpec (spec) where
 
-import Control.Arrow ((&&&), (>>>), (^>>), (|||))
+import Control.Arrow ((&&&), (>>>), (>>^), (^>>), (|||))
 import Data.Char (isAlphaNum)
 import Data.List (isInfixOf, isPrefixOf, nub)
 import Network.Streaming.Classes
@@ -36,6 +36,10 @@ beside (posting, collecting) = fst ^>> ((snd ^>> posting) &&& (fst ^>> collectin
 -- | The posts and the collects as parts that run together, which are lanes.
 together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhere ()), ()) ()
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
+
+-- | The stubs of the operators fail when the program is built, until they are written, and the marks come off with them.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Annotate has stubs: -| and |- are not written yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -99,6 +103,28 @@ spec = describe "the chart" $ do
     [wiresNamed name chart | name <- ["stream ended", "refused", "good"]] `shouldBe` [1, 1, 1]
     any ("{\"how did the head end?\"}" `isInfixOf`) chart `shouldBe` True
     length (nub (concat [sourcesOf name chart | name <- ["stream ended", "refused", "good"]])) `shouldBe` 1
+
+  stubbed $ it "has the names of both wires of an arrow that |- names before it and -| after it" $ do
+    chart <- chartOf ("in" |- working -| "out" >>> quick :: Diagram Int ())
+    (wiresNamed "in" chart, wiresNamed "out" chart) `shouldBe` (1, 1)
+
+  stubbed $ it "has the name that -| gives a wire at a junction, where the next arrow names it too: a wire is labelled once" $ do
+    chart <- chartOf (working -| "a" >>> "b" |- quick :: Diagram Int ())
+    (wiresNamed "a" chart, wiresNamed "b" chart) `shouldBe` (1, 0)
+
+  stubbed $ it "has the names that |- gives to the branches of a choice, with no parentheses around the branches" $ do
+    chart <- chartOf (("yes" |- working ||| "no" |- working) :: Diagram (Either Int Int) ())
+    (wiresNamed "yes" chart, wiresNamed "no" chart) `shouldBe` (1, 1)
+
+  stubbed $ it "has the name that |- gives to the arrow that a function applied to arguments makes, with no parentheses" $ do
+    chart <- chartOf ("x" |- step "working" (const (pure ())) >>> quick :: Diagram Int ())
+    wiresNamed "x" chart `shouldBe` 1
+
+  stubbed $ it "has the names of the wires in a pipeline that mixes the operators with ^>> and >>^" $ do
+    chart <- chartOf ((+ 1) ^>> "in" |- working -| "out" >>> quick :: Diagram Int ())
+    (wiresNamed "in" chart, wiresNamed "out" chart) `shouldBe` (1, 1)
+    ended <- chartOf ("in" |- working -| "out" >>^ const (Just ()) :: Diagram Int (Maybe ()))
+    (wiresNamed "in" ended, wiresNamed "out" ended) `shouldBe` (1, 1)
 
   it "has the name of the field that adding puts in front of a record, on the wire out of its step" $ do
     chart <- chartOf (adding "size" quick >>> quick :: Diagram () ())

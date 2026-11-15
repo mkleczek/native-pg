@@ -12,6 +12,8 @@ module Network.Streaming.Annotate
     taking,
     giving,
     inout,
+    (-|),
+    (|-),
     asking,
     answering,
   )
@@ -89,6 +91,25 @@ giving step output = wires Nothing (Just output) step
 inout :: (Annotate arr) => String -> arr a b -> String -> arr a b
 inout input step output = wires (Just input) (Just output) step
 {-# INLINE inout #-}
+
+-- '-|' binds tighter than the operators of arrows, as 'giving' does, and '|-' tighter still, so that
+-- @"in" |- p -| "out"@ names both wires of @p@, and @a -| "x" >>> "y" |- b@ and @("yes" |- p ||| "no" |- q)@ need no
+-- parentheses.
+infixl 5 -|
+
+infixr 6 |-
+
+-- | The arrow, with a name for its output wire in diagrams, written after it: @parse -| "request"@. It is 'giving'. A stub:
+-- it fails when the program is built, until it is written.
+(-|) :: (Annotate arr) => arr a b -> String -> arr a b
+(-|) _ _ = error "-| is not implemented yet"
+{-# INLINE (-|) #-}
+
+-- | The arrow, with a name for its input wire in diagrams, written before it: @"request" |- handler@. It is 'taking'. A
+-- stub: it fails when the program is built, until it is written.
+(|-) :: (Annotate arr) => String -> arr a b -> arr a b
+(|-) _ _ = error "|- is not implemented yet"
+{-# INLINE (|-) #-}
 
 -- | The arrow as the asking end of an exchange of the named value in diagrams: the end that makes a ticket and waits.
 asking :: (Annotate arr) => String -> arr a b -> arr a b
