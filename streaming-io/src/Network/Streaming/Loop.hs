@@ -29,7 +29,7 @@ where
 
 import Control.Arrow (Arrow (..), ArrowChoice (..), returnA)
 import Control.Category (Category (..))
-import Control.Concurrent.STM (STM, TVar, atomically, check, newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, check, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (SomeException, bracket, mask, onException, throwIO, toException, try, uninterruptibleMask_)
 import Control.Monad (filterM)
 import Data.Bits (shiftR, xor)
@@ -44,7 +44,7 @@ import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, changeHere, closeShelf, collectedWrongly, lookOrWait, newShelf, postNow, postOrQueue, takeNow)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
-import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
+import Network.Streaming.Watch (Watch (..), delayWatch, fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
 -- | A program as data: functions, sequences, choices and concurrent pairs, and
@@ -399,8 +399,7 @@ watchOf = \case
   Watched register -> register
   Until (Instant at) -> do
     current <- monotonicNanoseconds
-    elapsed <- registerDelay (fromIntegral (if at > current then (at - current) `div` 1000 else 0))
-    pure (Watch (readTVar elapsed >>= check) (pure ()))
+    delayWatch (fromIntegral (if at > current then (at - current) `div` 1000 else 0))
 
 -- | What a run did: how many steps, and how many waits. In a run of 'Loop' or
 -- a simulation a step is any primitive that a part ran. In a run of

@@ -363,17 +363,17 @@ instance Within (ThreadsM m) where
 deadlined :: Word64 -> Part -> IO a -> IO (Maybe a)
 deadlined limit part action = do
   scope' <- newScope
-  let micros = fromIntegral (limit `div` 1000)
+  let wait = fromIntegral (limit `div` 1000)
   outcome <-
     if rtsSupportsBoundThreads
       then do
         manager <- getSystemTimerManager
-        key <- registerTimeout manager micros (cancelScope scope')
+        key <- registerTimeout manager wait (cancelScope scope')
         result <- inScope part scope' action
         result <$ unregisterTimeout manager key
       else do
         -- The non-threaded run time has no timer manager: a thread of its own sleeps, and is stopped with the deadline.
-        timer <- mask_ (forkIO (threadDelay micros *> cancelScope scope'))
+        timer <- mask_ (forkIO (threadDelay wait *> cancelScope scope'))
         result <- inScope part scope' action
         result <$ uninterruptibleMask_ (killThread timer)
   case outcome of

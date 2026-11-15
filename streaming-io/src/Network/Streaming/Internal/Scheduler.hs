@@ -95,9 +95,9 @@ module Network.Streaming.Internal.Scheduler
 where
 
 import Control.Concurrent (rtsSupportsBoundThreads, yield)
-import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDelay, retry)
+import Control.Concurrent.STM (atomically, orElse, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, toException, try)
-import Control.Monad (foldM, replicateM, when, (>=>))
+import Control.Monad (foldM, replicateM, when)
 import Data.Bits ((.&.), (.|.))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
@@ -120,7 +120,7 @@ import Network.Streaming.Internal.Tickets (Slot (..))
 import Network.Streaming.Internal.Timers
 import Network.Streaming.Loop (Report (..))
 import Network.Streaming.Mode (Instrumented (bump, bumpBy, debugging))
-import Network.Streaming.Watch (Watch (..))
+import Network.Streaming.Watch (Watch (..), delayWatch)
 import System.Posix.Types (Fd (..))
 
 -- | What a part comes to.
@@ -888,8 +888,9 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
                     (True, Nothing) -> Just 1000
                     (False, Just nanos) -> Just (fromIntegral (nanos `div` 1000))
                     (False, Nothing) -> Nothing
-              delay <- maybe (pure Nothing) (fmap Just . registerDelay) micros
-              interruptedBy . atomically $ maybe retry (readTVar >=> check) delay `orElse` foldr (orElse . (\(Watching _ watch _) -> watchReady watch)) retry watching
+              delay <- maybe (pure Nothing) (fmap Just . delayWatch) micros
+              interruptedBy . atomically $ maybe retry watchReady delay `orElse` foldr (orElse . (\(Watching _ watch _) -> watchReady watch)) retry watching
+              mapM_ watchCancel delay
               watched <- readIORef (runWatching run)
               checked <- traverse (\entry@(Watching _ watch _) -> (,) entry <$> hasFired watch) watched
               let (fired, still) = partition snd checked

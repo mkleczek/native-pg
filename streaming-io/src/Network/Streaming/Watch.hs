@@ -9,13 +9,15 @@ module Network.Streaming.Watch
     readyNow,
     fdReadable,
     fdWritable,
+    delayWatch,
     awaitFirst,
     awaitWatch,
     anyWatch,
   )
 where
 
-import Control.Concurrent (threadWaitReadSTM, threadWaitWriteSTM)
+import Control.Concurrent (forkIO, killThread, rtsSupportsBoundThreads, threadDelay, threadWaitReadSTM, threadWaitWriteSTM)
+import Control.Concurrent.STM (check, newTVarIO, readTVar, registerDelay, writeTVar)
 import Control.Exception (mask, mask_, onException, uninterruptibleMask_)
 import Control.Monad (unless)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
@@ -40,6 +42,16 @@ fdReadable = fdWatch threadWaitReadSTM
 -- 'threadWaitWriteSTM' does.
 fdWritable :: Fd -> IO Watch
 fdWritable = fdWatch threadWaitWriteSTM
+
+-- | Fires when this many microseconds have passed. GHC's timer manager makes it where the run time has one; where it
+-- hasn't, which the non-threaded run time doesn't, a thread sleeps, and releasing the watch stops it.
+delayWatch :: Int -> IO Watch
+delayWatch micros
+  | rtsSupportsBoundThreads = (\elapsed -> Watch (readTVar elapsed >>= check) (pure ())) <$> registerDelay micros
+  | otherwise = do
+      elapsed <- newTVarIO False
+      timer <- mask_ (forkIO (threadDelay micros *> atomically (writeTVar elapsed True)))
+      pure (Watch (readTVar elapsed >>= check) (uninterruptibleMask_ (killThread timer)))
 
 fdWatch :: (Fd -> IO (STM (), IO ())) -> Fd -> IO Watch
 fdWatch register fd = do
