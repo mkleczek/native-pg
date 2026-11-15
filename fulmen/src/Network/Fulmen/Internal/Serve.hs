@@ -23,7 +23,7 @@ module Network.Fulmen.Internal.Serve
 where
 
 import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
-import Control.Exception (SomeException, fromException)
+import Control.Exception (SomeException, fromException, try)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -44,7 +44,7 @@ import Network.Fulmen.Internal.Head (Framing (..), Parsed (..), Scan (..), Spill
 import Network.Fulmen.Internal.Response (Exchange (..), Phase (..), newExchange, refusal)
 import Network.Fulmen.Listen (Listen (..))
 import Network.Fulmen.Request (Method (..), Request (..), Version (..))
-import Network.Socket (Socket)
+import Network.Socket (SockAddr (..), Socket, getPeerName)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators
@@ -153,11 +153,12 @@ offered =
     free ((_, address), Cores core shared) = (sharedWorkers shared, Free core address)
 
 -- | What a connection is: its socket, the bytes of the next request that came early, which a request copies out of
--- its buffer, and what the cores share.
+-- its buffer, what the cores share, and the address that it came from.
 data Conn = Conn
   { connSocket :: !Socket,
     connCarry :: !(IORef ByteString),
-    connShared :: !Shared
+    connShared :: !Shared,
+    connPeer :: !SockAddr
   }
 
 -- | The connection until it ends, which closes its socket however it ends. What goes wrong on a connection is that
@@ -168,10 +169,15 @@ connection settings handler =
     scope (arr snd) (fst ^>> close) (snd ^>> serving)
   where
     serving =
-      step "make connection state" (\(shared, socket) -> (\carry -> Conn socket carry shared) <$> newIORef B.empty)
+      step "make connection state" (\(shared, socket) -> Conn socket <$> newIORef B.empty <*> pure shared <*> peerOf socket)
         `giving` "Conn"
         >>> tryA (requests settings handler)
         >>> done
+
+-- | The address that the socket's peer has, or a Unix address with no name if the peer has gone already, as a client of
+-- a Unix socket has no other.
+peerOf :: Socket -> IO SockAddr
+peerOf socket = either (\(_ :: SomeException) -> SockAddrUnix "") id <$> try (getPeerName socket)
 
 -- | Request after request, while the connection is kept.
 requests :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Conn ()
@@ -290,7 +296,7 @@ readHead settings =
 
 -- | Looks at the bytes that arrived: what the head came to, or the socket and the room to receive more into.
 advance :: Settings -> Req -> IO (Step ((Socket, Room), Req) (Req, Head))
-advance settings req@Req {reqConn = Conn {connSocket}, reqLoan, reqProgress} = do
+advance settings req@Req {reqConn = Conn {connSocket, connPeer}, reqLoan, reqProgress} = do
   progress@Progress {progressEnd, progressScan, progressEnded} <- readIORef reqProgress
   let buffer = loanBuffer reqLoan
       bytes = view buffer progressEnd
@@ -299,7 +305,7 @@ advance settings req@Req {reqConn = Conn {connSocket}, reqLoan, reqProgress} = d
     Complete start stop spill -> do
       -- The head is copied and parsed while the bytes are there, and the request owns them.
       let !owned = joined spill (B.copy (B.take (stop - max 0 start) (B.drop (max 0 start) bytes)))
-      pure . Finish $ case parseHead (bodyLimit settings) owned of
+      pure . Finish $ case parseHead (bodyLimit settings) connPeer owned of
         Left status -> (req, HeadRefused status)
         Right parsed -> (req, HeadGood parsed stop)
     Full lineStart requestStart spill -> do

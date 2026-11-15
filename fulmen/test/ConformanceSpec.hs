@@ -101,8 +101,7 @@ listenerFailure =
 peerAddress :: Spec
 peerAddress = describe "the peer address" $ forM_ runners $ \runner@(Runner runnerName _) ->
   describe runnerName $
-    xfail "the peer address is not there yet (step 3)" $
-      it "of a request is the address that its client connected from" (peerOf runner)
+    it "of a request is the address that its client connected from" (peerOf runner)
 
 peerOf :: Runner -> IO ()
 peerOf (Runner _ runServer) =

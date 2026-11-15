@@ -20,13 +20,12 @@ module Network.Fulmen.Internal.Head
   )
 where
 
-import Control.Exception (throw)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as BU
 import Network.Fulmen.Internal.Bytes (commaList, equalsLower, isToken, lowerCase, trim)
 import Network.Fulmen.Request (Method (..), Request (..), Version (..))
-import Network.Streaming.NotImplemented (NotImplemented (..))
+import Network.Socket (SockAddr)
 
 -- | The bytes of a head that have been taken out of the buffer, so that the buffer can be received into again: how many,
 -- and the pieces, the latest first. A head that is more than the buffer is read in several of its fills.
@@ -106,9 +105,10 @@ data Framing
 data Parsed = Parsed !Request !Framing !Bool
 
 -- | What a head says: the bytes are the head, from the request line to the empty line, which are all the head has,
--- and the request owns them. @bodyLimit@ is the most that a body may have.
-parseHead :: Maybe Int -> ByteString -> Either Int Parsed
-parseHead bodyLimit owned = do
+-- and the request owns them. @bodyLimit@ is the most that a body may have, and the peer is where the connection
+-- came from.
+parseHead :: Maybe Int -> SockAddr -> ByteString -> Either Int Parsed
+parseHead bodyLimit peer owned = do
   (requestLine, fieldLines) <- case splitLines owned of
     line : others -> Right (line, others)
     [] -> Left 400
@@ -126,7 +126,7 @@ parseHead bodyLimit owned = do
       keepsAlive = case version of
         Http11 -> not closes
         Http10 -> "keep-alive" `elem` options && not closes
-  Right (Parsed (Request method target version fields (throw (NotImplemented "the peer address of a request"))) framing keepsAlive)
+  Right (Parsed (Request method target version fields peer) framing keepsAlive)
 
 -- | The lines of a head, without their ends, up to the empty line.
 splitLines :: ByteString -> [ByteString]
