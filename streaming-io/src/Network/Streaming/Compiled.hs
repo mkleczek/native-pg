@@ -39,6 +39,7 @@ import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -204,6 +205,8 @@ instance Scope (CompiledM m) where
         failed failure = leaves *> outer failure
     writeIORef (runFailure run) failed
     inner (Context run part failed) value (\result -> leaves *> next result)
+
+  grace _ _ = Compiled (\_ _ _ -> notImplementedIO "grace")
 
 -- | Annotations are for diagrams: the arrow is run as it is.
 instance Annotate (CompiledM m)

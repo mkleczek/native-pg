@@ -51,6 +51,7 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, closeShelf, collectedWrongly, hasValue, lookOrWait, newShelf, postNow, postOrQueue, stopWaiting, takeWoken, withdraw)
@@ -262,6 +263,8 @@ instance Scope (ThreadsM m) where
       other -> pure other
 
   shield (Threads inner) = Threads (\part value -> shielded part (inner part value))
+
+  grace _ _ = Threads (\_ _ -> notImplementedIO "grace")
 
 -- | A part that runs in the scope as well as in those of the part that made it, on a thread of its own, and what
 -- it came to once it ended: the scopes are left before the pair's policy is told.

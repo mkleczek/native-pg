@@ -68,6 +68,7 @@ import Network.Streaming.Internal.Timers (Timer, addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Counters (Counter (Captures))
 import Network.Streaming.Mode (Instrumented (bump), Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -290,6 +291,8 @@ instance Scope (DelimitedM m s) where
   shield (Delimited inner) = Delimited $ \context value -> do
     shielding context
     inner context value >>= unshielded context
+
+  grace _ _ = Delimited (\_ _ -> notImplementedIO "grace")
 
 -- | Annotations are for diagrams: the arrow is run as it is.
 instance Annotate (DelimitedM m s)

@@ -67,6 +67,10 @@ spec = describe "the chart of an inbox" $ do
     chart <- chartOf (timeoutA (quick >>> quick) :: Diagram (Duration, ()) (Maybe ()))
     any ("within the duration of the input" `isInfixOf`) chart `shouldBe` True
 
+  xfail "grace is not implemented yet" $ it "has a group for a grace, which says its period" $ do
+    chart <- chartOf (grace (secs 30) (quick >>> quick) :: Diagram () ())
+    any ("grace 30 s" `isInfixOf`) chart `shouldBe` True
+
   it "has no store, and no edge of a message, for a program with no inbox" $ do
     chart <- chartOf (quick >>> quick :: Diagram () ())
     (storeIn chart, any ("-.->" `isInfixOf`) (stripped chart)) `shouldBe` (Nothing, False)

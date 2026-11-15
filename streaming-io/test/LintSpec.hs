@@ -45,6 +45,7 @@ spec = do
   loops
   deadlines
   shields
+  graces
   allowances
   inboxes
   findings
@@ -177,6 +178,21 @@ shields = describe "a shield" $ do
   it "around steps that never wait is not" $ do
     report <- lint (shield (quick >>> quick) :: Diagram () ())
     summary report `shouldBe` ([], [])
+
+-- | Graces, whose period bounds how long they hold a cancellation off.
+graces :: Spec
+graces = describe "a grace" $ xfail "grace is not implemented yet" $ do
+  it "around a wait is not found, as its period bounds how long it holds a cancellation off" $ do
+    report <- lint (grace (secs 5) (giveWay >>> quick) :: Diagram () ())
+    summary report `shouldBe` ([], [])
+
+  it "around a wait that a shield holds is found, as the shield holds it for as long as the wait lasts" $ do
+    report <- lint (grace (secs 5) (shield (giveWay >>> quick)) :: Diagram () ())
+    summary report `shouldBe` ([ShieldAroundWait], [])
+
+  it "has a loop through it that never waits found, as through any other step" $ do
+    report <- lint (iterateWith countDown (grace (secs 5) (arr id)))
+    summary report `shouldBe` ([LoopWithoutWait], [])
 
 -- | A scope that opens the inbox of the name, for a body that is given the inbox and its address.
 owning :: forall name. (KnownSymbol name) => Diagram ((Inbox Diagram name 'Anywhere (), Address name 'Anywhere ()), ()) () -> Diagram () ()

@@ -79,6 +79,7 @@ test-suite streaming-io-spec
                  SpecialisedSpec
                  SyscallsSpec
                  LintSpec
+                 GraceSpec
                  Network.Streaming.Internal.ListPrefix
                  Network.Streaming.Output
                  Network.Streaming.PositiveInt

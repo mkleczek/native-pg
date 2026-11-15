@@ -279,7 +279,7 @@ exitOf = either (\failure -> maybe (Failed failure) (const Cancelled') (cancelle
 -- A part is cancelled at its waits only ('block', 'await', and 'giveWay'): a part that waits gets it
 -- at once, and one that runs, at its next wait, so that no 'now' is ever interrupted. A cancellation is of a
 -- scope, and is delivered to the parts inside it, unless a 'shield' lies between: then it is kept until the part
--- has left the shield.
+-- has left the shield, and one that a 'grace' lies between is kept until the part has left it or its period has passed.
 class Scope arr where
   -- | Acquires, runs the body with what it acquired, and releases it on every exit, however the body ended: the
   -- release is shielded, so no cancellation reaches it, and it may wait. A failure of the release is reported
@@ -292,6 +292,13 @@ class Scope arr where
   -- | Runs the arrow with the cancellations of scopes outside it kept until it ends. A deadline inside it still
   -- fires.
   shield :: arr a b -> arr a b
+
+  -- | Runs the arrow with the cancellations of scopes outside it kept, as 'shield' keeps them, but for at most the duration,
+  -- counted from when the cancellation arrives: then it is delivered to the parts inside, at their next wait, and not
+  -- during an action that never waits. A body that ends first leaves with the cancellation still pending, so the scope that
+  -- was cancelled finds it at its next wait; one that arrives after the body has ended is not kept at all. The period of each of
+  -- nested regions is its own, a deadline inside still fires, and a 'shield' inside keeps the cancellation until the part has left it.
+  grace :: Duration -> arr a b -> arr a b
 
 -- | Two arrows that run at once, until the first ends.
 class Race arr where

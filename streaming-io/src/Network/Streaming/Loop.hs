@@ -44,6 +44,7 @@ import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, changeHere, closeShelf, collectedWrongly, lookOrWait, newShelf, postNow, postOrQueue, takeNow)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Watch (Watch (..), delayWatch, fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
@@ -107,6 +108,7 @@ instance Scope Loop where
   scope = Scope'
   tryA = Try
   shield = Shield'
+  grace _ _ = Now (\_ -> notImplementedIO "grace")
 
 instance Race Loop where
   race = Race'

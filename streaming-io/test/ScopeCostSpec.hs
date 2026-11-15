@@ -104,6 +104,16 @@ spec = do
     it "costs a loop in a shield no allocation in it" $
       costsAtMost runner "shield" tolerance yielding (shield . yielding)
 
+    -- A region that keeps a cancellation for its period costs a loop in it nothing, and costs each entry what a shield does:
+    -- a frame on the part's stack, and nothing of its own until a cancellation arrives (the interpreter of 'Loop' makes a race
+    -- of the region, and is not held to that).
+    when (name /= "loop") $ xfail "grace is not implemented yet" $ do
+      it "costs a loop in a grace no allocation in it" $
+        costsAtMost runner "grace" tolerance yielding (grace (secs 3600) . yielding)
+
+      it "costs each entry of a grace no more allocation than each entry of a shield" $
+        costsAtMost runner "grace entry" 0 (\count -> timesWith count (shield giveWay)) (\count -> timesWith count (grace (secs 3600) giveWay))
+
     copied name "a part that waits captures the catch of a deadline, which a deadline adds to each wait, until stage C of the frame-free scopes" $
       it "costs a loop in a deadline no allocation in it" $
         costsAtMost runner "deadline" tolerance yielding (\count -> within (secs 3600) (yielding count) >>> done)

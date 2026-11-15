@@ -134,6 +134,8 @@ instance (Arrow arr, Scope arr) => Scope (With r arr) where
   {-# INLINE tryA #-}
   shield (With inner) = With (shield inner)
   {-# INLINE shield #-}
+  grace duration (With inner) = With (grace duration inner)
+  {-# INLINE grace #-}
 
 -- | Every part is given the environment.
 instance (Concurrent arr) => Concurrent (With r arr) where
