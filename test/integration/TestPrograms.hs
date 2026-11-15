@@ -32,6 +32,7 @@ module TestPrograms
     -- * A connection in a program
     OnConn,
     across,
+    overInputs,
     viaPool,
     session,
     connectedTo,
@@ -225,6 +226,17 @@ across step inputs = (\loans -> (inputs, loans, [])) ^>> iterateA following
       [] -> Left (Finish (reverse results))
       input : others -> Right ((input, loans), (others, loans, results))
     tried = first step >>^ \(result, (others, loans, results)) -> Again (others, loans, result : results)
+
+-- | The step on each of the inputs in turn, on the connection, and its results in order: one arrow, built once, that takes what
+-- differs from run to run as its input.
+overInputs :: (Runtime arr) => arr (Connection, (Loans, p)) b -> [p] -> OnConn arr [b]
+overInputs step inputs = (\(connection, loans) -> (inputs, connection, loans, [])) ^>> iterateA following
+  where
+    following = untried ^>> (returnA ||| tried)
+    untried (remaining, connection, loans, results) = case remaining of
+      [] -> Left (Finish (reverse results))
+      input : others -> Right ((connection, (loans, input)), (others, connection, loans, results))
+    tried = first step >>^ \(result, (others, connection, loans, results)) -> Again (others, connection, loans, result : results)
 
 -- | The same, with the failure to connect as a value, and the body not run.
 connectedTo :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans (Either ConnectFailure b)

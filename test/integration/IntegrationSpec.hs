@@ -869,6 +869,50 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
 
+  -- A program is built once, and a statement made from its input has the SQL, and the parameters, of each run.
+  needs "statementFrom" $ describe "a statement made from the input" $ do
+    let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
+        withSession body = run (session (unix "postgres" Nothing) body)
+    it "sends the SQL and the parameters that the input makes, for each run of one program" $
+      withSession (overInputs (query' offsetBy) [(1, "41"), (10, "41"), (100, "41")])
+        `shouldReturn` [Right [42], Right [51], Right [141]]
+    it "names the SQL that it was sent with in the failure of its statement, and the connection goes on" $
+      withSession (overInputs (query' dividing >>^ failedSql) [2, 0, 5])
+        `shouldReturn` [Right [5], Left "SELECT 10 / 0", Right [2]]
+    it "takes the parameter from its stream, with the SQL that the input makes" $ do
+      inputs <- traverse (\(offset, size, pieces) -> (offset,size,) <$> newChunks pieces) [(0, 5, ["ab", "cde"]), (100, 5, ["fghij"]), (1000, 7, ["", "k", "lmnopq"])]
+      withSession (overInputs (query' lengthPlus) inputs) `shouldReturn` [Right [5], Right [105], Right [1007]]
+    it "has the parameters that the input makes, a stream and one more or not" $ do
+      inputs <- traverse (\extra -> (extra,) <$> newChunks ["abc"]) [False, True, False]
+      withSession (overInputs (query' lengthOrBoth) inputs) `shouldReturn` [Right [3], Right [7], Right [3]]
+    it "is prepared, executed and closed under one name in one pipeline, for SQL that differs from run to run" $
+      withSession ((,) <$> overInputs (preparedOnce "made" offsetBy) [(1, "41"), (10, "41")] <*> query (plain "SELECT name FROM pg_prepared_statements" (single @_ @Text)))
+        `shouldReturn` ([Right 42, Right 51], Right [])
+    it "takes the parameter from its stream when it is prepared, executed and closed under one name" $ do
+      inputs <- traverse (\(offset, size, pieces) -> (offset,size,) <$> newChunks pieces) [(0, 5, ["ab", "cde"]), (100, 5, ["fghij"])]
+      withSession (overInputs (preparedOnce "made_streamed" lengthPlus) inputs) `shouldReturn` [Right 5, Right 105]
+    it "executes a statement that the connection has prepared without evaluating the SQL that the input makes" $
+      withSession
+        ( steps
+            [ preparing "made_earlier" (addOneWith "0") `yields` Right (),
+              overInputs (transactOn Tx.ReadCommitted Tx.Write Tx.Open (Tx.executePrepared "made_earlier" withoutSql) Tx.single) ["1", "41"] `yields` [Right 2, Right 42]
+            ]
+        )
+        `shouldReturn` ()
+    it "is one statement of a pipeline among others, whose results are where they were built" $
+      withSession
+        ( overInputs
+            ( transactOn
+                Tx.ReadCommitted
+                Tx.Write
+                Tx.Final
+                ((,,) <$> Tx.from fst (Tx.statement offsetBy) <*> Tx.from (const ()) (Tx.statement (plain "SELECT 7::int" (single @_ @Int32))) <*> Tx.from snd (Tx.statement offsetBy))
+                (\(left, middle, right) -> Tx.single left &&& Tx.single middle &&& Tx.single right)
+            )
+            [((1, "41"), (10, "41")), ((100, "1"), (1000, "1"))]
+        )
+        `shouldReturn` [Right (42, (7, 51)), Right (101, (7, 1001))]
+
   describe "decoding" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
@@ -1401,6 +1445,47 @@ preparing name statement = committed Tx.Write (Tx.prepare name statement) Tx.pre
 preparedAnswer :: (Runtime arr) => ByteString -> ByteString -> OnConn arr (Either QueryError Int32)
 preparedAnswer name value =
   committed Tx.Write (Tx.executePrepared name ((addOneWith value) {Tx.sql = error "SQL forced"})) Tx.single
+
+-- | The statement whose SQL adds a number to its parameter: the number and the parameter come from the input.
+offsetBy :: (Runtime arr) => Tx.Statement arr (Int, ByteString) Int32
+offsetBy = Tx.statementFrom (\(offset, value) -> ("SELECT $1::int + " <> Char8.pack (show offset), [textual (Just value)])) single
+
+-- | The statement whose SQL divides ten by the number that is its input.
+dividing :: (Runtime arr) => Tx.Statement arr Int Int32
+dividing = Tx.statementFrom (\divisor -> ("SELECT 10 / " <> Char8.pack (show divisor), [])) single
+
+-- | The statement that adds a number to the length of the parameter that the stream gives: the number, the length and the stream
+-- are the input.
+lengthPlus :: (Runtime arr) => Tx.Statement arr (Int, Int, Chunks) Int32
+lengthPlus =
+  Tx.streamFrom (\(_, _, chunks) -> chunks) (Tx.statementFrom (\(offset, size, _) -> ("SELECT length($1::text) + " <> Char8.pack (show offset), [streamedText size])) single)
+
+-- | The statement whose parameters are the stream, of three bytes, and one more if the input says so, which its SQL then uses.
+lengthOrBoth :: (Runtime arr) => Tx.Statement arr (Bool, Chunks) Int32
+lengthOrBoth = Tx.streamFrom snd (Tx.statementFrom made single)
+  where
+    made (True, _) = ("SELECT length($1::text) + length($2::text)", [streamedText 3, textual (Just "four")])
+    made (False, _) = ("SELECT length($1::text)", [streamedText 3])
+
+-- | A statement that the connection has prepared under a name, whose SQL the input doesn't make: it has none.
+withoutSql :: (Runtime arr) => Tx.Statement arr ByteString Int32
+withoutSql = Tx.statementFrom (\value -> (error "SQL forced", [textual (Just value)])) single
+
+-- | The statement prepared, executed and closed under the name, in one pipeline that commits, and its one row.
+preparedOnce :: (Runtime arr) => ByteString -> Tx.Statement arr p Int32 -> arr (Connection, (Loans, p)) (Either QueryError Int32)
+preparedOnce name statement =
+  transactOn
+    Tx.ReadCommitted
+    Tx.Write
+    Tx.Final
+    ((,,) <$> Tx.prepare name statement <*> Tx.executePrepared name statement <*> Tx.closeStatement name)
+    (\(preparation, result, deallocation) -> Tx.prepared preparation >>> Tx.single result >>> tap (done >>> Tx.discard deallocation))
+
+-- | What failed a statement, if it was the server: the SQL that it was sent with.
+failedSql :: Either QueryError a -> Either ByteString a
+failedSql = \case
+  Left (QueryError text _) -> Left text
+  Right value -> Right value
 
 -- | The statement that inserts its parameter, which the function makes of the input.
 insertStreamed :: (Runtime arr) => (p -> [Tx.Param]) -> Tx.Statement arr p ()
