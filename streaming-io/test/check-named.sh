@@ -12,8 +12,11 @@ check() {
     -i"$package_dir/src" "$package_dir/test/compile/$1.hs"
 }
 
-# A successful control proves failures come from the names, not the environment.
+# A successful control proves failures come from the names, not the environment. A name that a record has twice is no
+# error where it is read: the newer field, which is the first, shadows the older.
 check NamedFields
+check NamedRepeated
+check NamedPolymorphic
 while read -r fixture message; do
   if check "$fixture" >"$output_dir/$fixture.log" 2>&1; then
     echo "Expected $fixture to fail compilation" >&2
@@ -25,6 +28,6 @@ while read -r fixture message; do
   fi
 done <<EOF2
 NamedMisspelt The record has no field "count"
-NamedRepeated The record has more than one field named "size"
+NamedTwice The record has more than one field named "size"
 EOF2
-echo "Named: fields are read by name; a name that the record doesn't have, or has twice, is rejected with a message that says so"
+echo "Named: a record is read by name from any step that names its fields; a name that it lacks, or that newRecord has twice, is rejected"

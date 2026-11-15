@@ -65,7 +65,7 @@ import System.Posix.Files (groupReadMode, otherReadMode, ownerReadMode, setFileM
 import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (FileMode)
 import TestCluster (certificate)
-import TestPrograms hiding (field)
+import TestPrograms
 
 spec :: FilePath -> Socket.PortNumber -> Spec
 spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner name _) -> describe name $ do

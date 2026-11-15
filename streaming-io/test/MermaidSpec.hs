@@ -11,7 +11,7 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (box, done, withInbox)
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
-import Network.Streaming.Named (is)
+import Network.Streaming.Named (adding, at, field, is, (:=))
 import Skeletest
 
 -- | A step that never waits.
@@ -36,6 +36,10 @@ beside (posting, collecting) = fst ^>> ((snd ^>> posting) &&& (fst ^>> collectin
 -- | The posts and the collects as parts that run together, which are lanes.
 together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhere ()), ()) ()
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
+
+-- | The stubs of adding, at and field fail until they are written, and the marks come off with them.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Named has stubs: adding, at and field are not written yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -73,6 +77,18 @@ spec = describe "the chart" $ do
     let labelled = [name | name <- ["name", "size"], any (("|\"" ++ name ++ "\"|") `isInfixOf`) (stripped chart)]
     labelled `shouldBe` ["name", "size"]
 
+  stubbed $ it "has the name of the field that adding puts in front of a record, on the wire out of its step" $ do
+    chart <- chartOf (adding "size" quick >>> quick :: Diagram () ())
+    wiresNamed "size" chart `shouldBe` 1
+
+  stubbed $ it "has the name of the field that at runs its arrow on, on the wire into its step and out of it" $ do
+    chart <- chartOf (at "size" quick >>> quick :: Diagram ("size" := Int, "kept" := Bool) ())
+    wiresNamed "size" chart `shouldBe` 2
+
+  stubbed $ it "has the name of the field that field reads, on the wire out of it" $ do
+    chart <- chartOf (field "size" >>> quick :: Diagram ("size" := Int, "kept" := Bool) ())
+    wiresNamed "size" chart `shouldBe` 1
+
 -- | The chart of the top page of the program, as lines.
 chartOf :: Diagram a b -> IO [String]
 chartOf program = do
@@ -80,6 +96,10 @@ chartOf program = do
   pure $ case found of
     page : _ -> lines (pageMermaid page)
     [] -> []
+
+-- | How many wires of the chart are labelled with the name.
+wiresNamed :: String -> [String] -> Int
+wiresNamed name = length . filter (("|\"" ++ name ++ "\"|") `isInfixOf`) . stripped
 
 -- | The lines without their indent.
 stripped :: [String] -> [String]

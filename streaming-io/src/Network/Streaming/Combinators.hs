@@ -48,7 +48,6 @@ module Network.Streaming.Combinators
     giving,
     inout,
     typed,
-    field,
   )
 where
 
@@ -56,9 +55,8 @@ import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (*
 import Control.Exception (throwIO)
 import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable, typeRep)
-import GHC.Records (HasField (..))
 import GHC.Stack (HasCallStack)
-import GHC.TypeLits (KnownSymbol, symbolVal)
+import GHC.TypeLits (KnownSymbol)
 import Network.Streaming.Annotate (answering, asking, box)
 import Network.Streaming.Classes
 import Network.Streaming.Plumbing
@@ -237,8 +235,3 @@ typed = wires (typeName (Proxy @a)) (typeName (Proxy @b))
       "()" -> Nothing
       name -> Just name
 {-# INLINE typed #-}
-
--- | The field of a record, whose output wire is named after the field in diagrams.
-field :: forall name r a arr. (HasField name r a, KnownSymbol name, Arrow arr, Annotate arr) => arr r a
-field = arr (getField @name) `giving` symbolVal (Proxy @name)
-{-# INLINE field #-}
