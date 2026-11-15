@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -67,6 +68,7 @@ import Network.Streaming.Combinators
     withTicket,
   )
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
+import Network.Streaming.Named (is, (:=))
 import Network.Streaming.Pool (offer, queueNow, takeNowWith)
 
 -- | The server: for each core, the workers, and for the first, the acceptor, which opens the listener.
@@ -241,8 +243,7 @@ data Prepared = Prepared
 request :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr (Loans, Conn) Bool
 request settings handler =
   named (Label "request" "Reads the head of a request, runs the handler, and says whether the connection is kept.") $
-    (fst &&& id)
-      ^>> first borrow
+    (is "loan" (fst ^>> borrow) &&& is "loans" (arr fst) &&& is "conn" (arr snd))
       >>> step "copy carry-over" begin' `giving` "Req"
       >>> readHead settings
       >>> decide "how did the head end?" byHead
@@ -262,13 +263,14 @@ request settings handler =
         >>> sendAll
         >>> quit
     -- The request has the connection's first bytes, which came with the one before.
-    begin' (loan, (loans, conn@Conn {connCarry})) = do
-      carried <- readIORef connCarry
+    begin' :: ("loan" := Loan, ("loans" := Loans, "conn" := Conn)) -> IO Req
+    begin' r = do
+      carried <- readIORef r.conn.connCarry
       unless (B.null carried) $ do
-        writeIORef connCarry B.empty
+        writeIORef r.conn.connCarry B.empty
         BU.unsafeUseAsCStringLen carried $ \(source, size) ->
-          withForeignPtr (bufferMemory (loanBuffer loan)) (\target -> copyBytes target (castPtr source) size)
-      Req conn loans loan <$> newIORef Progress {progressEnd = B.length carried, progressScan = startScan, progressEnded = False}
+          withForeignPtr (bufferMemory (loanBuffer r.loan)) (\target -> copyBytes target (castPtr source) size)
+      Req r.conn r.loans r.loan <$> newIORef Progress {progressEnd = B.length carried, progressScan = startScan, progressEnded = False}
 
 -- | Receives until the head is there, or is refused, or the stream has ended.
 readHead :: (Runtime arr) => Settings -> arr Req (Req, Head)
@@ -314,7 +316,7 @@ answered handler =
     ( typed @Headed @Prepared (step "prepare call" prepare)
         >>> decide "give back loan?" heldLoan
         >>> (taking "yes" (consume release) ||| taking "no" returnA)
-        >>> alongside (tryA handler)
+        >>> (is "outcome" (tryA handler) &&& is "call" (arr fst))
         >>> aftermath
     )
       `giving` "keep alive"
@@ -343,17 +345,17 @@ prepare Headed {headedReq = Req {reqConn = Conn {..}, ..}, headedParsed = Parsed
 -- | What the handler left: a connection that the client has gone from, or a response that is not there or not
 -- complete, ends the connection, with a 500 if the handler had not answered; and one that is complete is kept if the
 -- body of the request was read, or could be, and the response didn't end the connection.
-aftermath :: (Runtime arr) => arr (Either SomeException (), (Call, Request)) Bool
+aftermath :: (Runtime arr) => arr ("outcome" := Either SomeException (), "call" := Call) Bool
 aftermath =
   named (Label "aftermath" "Decides whether the connection is kept, and answers 500 if nothing was answered.") $
     decide "how did the handler end?" byOutcome
       >>> ((taking "connection lost" quit ||| taking "failed" failed) ||| taking "returned" finished)
   where
-    byOutcome (outcome, (call, _)) = case outcome of
+    byOutcome r = case r.outcome of
       Left failure
         | Just ConnectionLost <- fromException failure -> Left (Left ())
-        | otherwise -> Left (Right call)
-      Right () -> Right call
+        | otherwise -> Left (Right r.call)
+      Right () -> Right r.call
     quit = arr (const False) `giving` "keep alive"
     failed = step "check if answered" (\(Call _ _ exchange) -> unanswered exchange) >>> internalError
     finished =
