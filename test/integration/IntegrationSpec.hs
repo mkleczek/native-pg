@@ -803,6 +803,69 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
               ]
         )
         `shouldReturn` ()
+    -- The server sends a notification to a session that is idle, as soon as it has it. It is read by the statement that
+    -- runs next, among that statement's replies, and kept.
+    it "keeps a notification that arrived while the connection was idle, when a statement runs before it is taken" $
+      run
+        ( session (unix "postgres" Nothing) $
+            alsoOn (unix "postgres" Nothing) $
+              steps
+                [ onFirst (conn (Notify.listen ["events"])),
+                  onSecond (ddl "NOTIFY events, 'idle'") `yields` Right (),
+                  onFirst selectOne `yields` Right [1],
+                  onFirst selectOne `yields` Right [1],
+                  (onFirst (conn Notify.notification) >>^ Notify.notificationPayload) `yields` "idle",
+                  withinFor (millis 100) (onFirst (conn Notify.notification)) `yields` Nothing
+                ]
+        )
+        `shouldReturn` ()
+    it "delivers each notification once, in the order they were sent, whether a statement or a wait reads them" $
+      run
+        ( session (unix "postgres" Nothing) $
+            alsoOn (unix "postgres" Nothing) $
+              steps
+                [ onFirst (conn (Notify.listen ["events", "more"])),
+                  onSecond (ddl "NOTIFY events, 'one'") `yields` Right (),
+                  onFirst selectOne `yields` Right [1],
+                  onSecond (ddl "NOTIFY more, 'two'") `yields` Right (),
+                  onSecond (ddl "NOTIFY events, 'three'") `yields` Right (),
+                  (onFirst (conn Notify.notification) >>^ payloadAndChannel) `yields` ("one", "events"),
+                  (onFirst (conn Notify.notification) >>^ payloadAndChannel) `yields` ("two", "more"),
+                  onFirst selectOne `yields` Right [1],
+                  (onFirst (conn Notify.notification) >>^ payloadAndChannel) `yields` ("three", "events"),
+                  withinFor (millis 100) (onFirst (conn Notify.notification)) `yields` Nothing
+                ]
+        )
+        `shouldReturn` ()
+    -- The buffers of the case are 1 KiB: a payload of 7000 bytes is read by pieces, wherever it arrives.
+    it "delivers a payload larger than the buffer, whether a statement or a wait reads it" $ do
+      let payload = Char8.replicate 7000 'p'
+      run
+        ( session (unix "postgres" Nothing) $
+            alsoOn (unix "postgres" Nothing) $
+              steps
+                [ onFirst (conn (Notify.listen ["events"])),
+                  onSecond (notifying payload) `yields` Right [True],
+                  onFirst selectOne `yields` Right [1],
+                  (onFirst (conn Notify.notification) >>^ Notify.notificationPayload) `yields` payload,
+                  onSecond (notifying payload) `yields` Right [True],
+                  (onFirst (conn Notify.notification) >>^ Notify.notificationPayload) `yields` payload
+                ]
+        )
+        `shouldReturn` ()
+    it "reports a channel the server rejects, and stays usable" $
+      run
+        ( session (unix "postgres" Nothing) $
+            steps
+              [ conn (Notify.listen [""])
+                  `failsAs` \case
+                    QueryError _ (ServerFailed (ServerError diagnostics)) -> diagnosticCode diagnostics `shouldBe` "42601"
+                    other -> failTest ("expected a QueryError, got " <> show other),
+                selectOne `yields` Right [1],
+                conn (Notify.listen []) `yields` ()
+              ]
+        )
+        `shouldReturn` ()
     it "fails when a listening connection is terminated" $
       run
         ( session (unix "postgres" Nothing) $
@@ -938,6 +1001,14 @@ terminatingTheFirst =
         Just pid -> pure (administrator, (loans, Char8.pack (show pid)))
     )
     >>> query' (Tx.Statement "SELECT pg_terminate_backend($1::int)" (\pid -> [textual (Just pid)]) single)
+
+-- | Notifies the channel with the payload, from a function of the server, so that the payload is a parameter.
+notifying :: (Runtime arr) => ByteString -> OnConn arr (Either QueryError [Bool])
+notifying payload = query (valued "SELECT pg_notify('events', $1::text) IS NOT NULL" [Just payload] single)
+
+-- | What a notification says: its payload and its channel.
+payloadAndChannel :: Notify.Notification -> (ByteString, ByteString)
+payloadAndChannel delivered = (Notify.notificationPayload delivered, Notify.notificationChannel delivered)
 
 -- | The SQLSTATE of the rejection that the one host tried gave.
 rejection :: Either ConnectFailure a -> Maybe ByteString
