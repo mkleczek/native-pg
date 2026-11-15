@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | A quick measurement of the server: it serves a static body of 16 KiB or of 1 MiB (in 64 pieces of 16 KiB) to
@@ -6,13 +7,15 @@
 --
 -- It has two modes, which are run as two processes:
 --
--- > fulmen-bench server delimited|threads CORES CONNECTIONS +RTS -T -N2
--- > fulmen-bench client PORT CONNECTIONS SECONDS /16k|/1m
+-- > fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS +RTS -T -N2
+-- > fulmen-bench client PORT CONNECTIONS SECONDS /16k|/1m [fresh]
 --
 -- The server prints the port it listens on, and serves until it is killed. The client asks the server to note its
 -- allocation (@GET /reset@), runs its connections for the time with the path, and asks for the difference
 -- (@GET /report@), over a connection of its own that it keeps all the while: the server needs a worker for it besides
--- the ones for the connections that the client runs. The server is the arrow runtime's, the client is plain IO: a GHC thread for each connection, which
+-- the ones for the connections that the client runs. @delimited-debug@ is the server in the debug mode of its arrow, which
+-- counts the captures of the stacks of its parts, and the report says how many. A client that is told @fresh@ makes a
+-- connection for each request, and closes it after. The server is the arrow runtime's, the client is plain IO: a GHC thread for each connection, which
 -- blocks on its socket. The server builds its program where its arrow is known, in 'server', so that GHC specialises it to the arrow.
 module Main (main) where
 
@@ -36,7 +39,9 @@ import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.Classes (Effect (..), Runtime)
 import Network.Streaming.Combinators (consume)
-import Network.Streaming.Delimited (runCores)
+import Network.Streaming.Counters (Counter (Captures), Counts, countOf, since, snapshot)
+import Network.Streaming.Delimited (runCores, runCoresM)
+import Network.Streaming.Mode (Mode (Debug))
 import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Threads (runThreads)
 import System.Environment (getArgs)
@@ -48,16 +53,18 @@ main = do
   args <- getArgs
   case args of
     ["server", kind, cores, connections] -> server kind (read cores) (read connections)
-    ["client", port, connections, seconds, path] -> client (read port) (read connections) (read seconds) (C.pack path)
-    _ -> die "usage: fulmen-bench server delimited|threads CORES CONNECTIONS | client PORT CONNECTIONS SECONDS /16k|/1m"
+    ["client", port, connections, seconds, path] -> client False (read port) (read connections) (read seconds) (C.pack path)
+    ["client", port, connections, seconds, path, "fresh"] -> client True (read port) (read connections) (read seconds) (C.pack path)
+    _ -> die "usage: fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS | client PORT CONNECTIONS SECONDS /16k|/1m [fresh]"
 
 -- * The server
 
 -- | What the server counts for the report: the requests, and the allocation and request count when it was asked to
--- note them.
+-- note them, and what the runtime had counted then.
 data Counters = Counters
   { requests :: !(IORef Int),
-    marked :: !(IORef (Word64, Int))
+    marked :: !(IORef (Word64, Int)),
+    countsMarked :: !(IORef Counts)
   }
 
 server :: String -> Int -> Int -> IO ()
@@ -73,7 +80,7 @@ server kind cores connections = do
   ordinary <- positive (fromIntegral connections + 2)
   reserve <- positive 2
   setup <- positive 1
-  counters <- Counters <$> newIORef 0 <*> newIORef (0, 0)
+  counters <- Counters <$> newIORef 0 <*> newIORef (0, 0) <*> (snapshot >>= newIORef)
   let settings =
         Fulmen.defaultSettings
           { Fulmen.bufferPool = BufferPoolSettings size ordinary reserve setup,
@@ -84,8 +91,9 @@ server kind cores connections = do
   putStrLn ("port " <> show port)
   case kind of
     "delimited" -> void (runCores cores (pure shared) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings (Fulmen.borrowed listening) (handler counters)))
+    "delimited-debug" -> void (runCoresM @'Debug cores (pure shared) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings (Fulmen.borrowed listening) (handler counters)))
     "threads" -> runThreads (Fulmen.serve settings (Fulmen.borrowed listening) (handler counters)) shared
-    _ -> die "the server is delimited or threads"
+    _ -> die "the server is delimited, delimited-debug or threads"
 
 -- | The 16 KiB body, and the 1 MiB body as 64 pieces of 16 KiB, which are made once.
 small :: ByteString
@@ -110,12 +118,14 @@ react counters (call, request) = case Fulmen.target request of
     stats <- getRTSStats
     served <- readIORef (requests counters)
     atomicWriteIORef (marked counters) (allocated_bytes stats, served)
+    snapshot >>= atomicWriteIORef (countsMarked counters)
     pure (call, (["ok"], 2))
   "/report" -> do
     stats <- getRTSStats
     served <- readIORef (requests counters)
     (allocated, before) <- readIORef (marked counters)
-    let text = C.pack ("requests=" <> show (served - before) <> " allocated=" <> show (allocated_bytes stats - allocated))
+    counted <- since <$> snapshot <*> readIORef (countsMarked counters)
+    let text = C.pack ("requests=" <> show (served - before) <> " allocated=" <> show (allocated_bytes stats - allocated) <> " captures=" <> show (countOf Captures counted))
     pure (call, ([text], B.length text))
   _ -> pure (call, (["?"], 1))
   where
@@ -135,8 +145,8 @@ answer =
 
 -- * The client
 
-client :: Int -> Int -> Double -> ByteString -> IO ()
-client port connections seconds path = do
+client :: Bool -> Int -> Int -> Double -> ByteString -> IO ()
+client fresh port connections seconds path = do
   control <- connectTo port
   _ <- roundTrip control "/reset"
   served <- newIORef (0 :: Int)
@@ -144,8 +154,7 @@ client port connections seconds path = do
   started <- getMonotonicTimeNSec
   let deadline = started + round (seconds * 1e9)
       connection = do
-        socket <- connectTo port
-        let go = do
+        let go socket = do
               now' <- getMonotonicTimeNSec
               if now' >= deadline
                 then Socket.close socket
@@ -153,8 +162,8 @@ client port connections seconds path = do
                   (size, _) <- roundTrip socket path
                   atomicModifyIORef' served (\n -> (n + 1, ()))
                   atomicModifyIORef' received (\n -> (n + size, ()))
-                  go
-        go
+                  if fresh then Socket.close socket *> connectTo port >>= go else go socket
+        connectTo port >>= go
   finished' <- replicateM connections newEmptyMVar
   mapM_ (\done -> forkIO (connection `finally` putMVar done ())) finished'
   mapM_ takeMVar finished'

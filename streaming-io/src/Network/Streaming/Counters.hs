@@ -52,6 +52,9 @@ data Counter
     Fcntls
   | -- | @recv@ calls with @MSG_PEEK@ that a pool made at a checkout.
     Probes
+  | -- | Captures of a part's stack by "Network.Streaming.Delimited", each of which copies the frames between the part's wait and the
+    -- scheduler's prompt to the heap: a wait, a yield, and the fork of a group or a race.
+    Captures
   deriving (Eq, Show, Enum, Bounded)
 
 -- | The counter's name in a metric: lower case, with underscores.
@@ -71,6 +74,7 @@ counterName counter = case counter of
   AcceptsEmpty -> "accepts_empty"
   Fcntls -> "fcntls"
   Probes -> "probes"
+  Captures -> "captures"
 
 -- | The cells of one capability: the counters, and room to the next cache line.
 cellsPerStripe :: Int

@@ -159,6 +159,11 @@ spec = describe "system calls" $ do
       (countOf PollsImmediate counts >= 10) `shouldBe` True
       (countOf PollsImmediate counts <= 100) `shouldBe` True
 
+  describe "delimited" $
+    it "counts a capture of the stack for each yield and each fork of a group, and none for a part that ends" $ do
+      counts <- counting (runDelimitedTurnM @'Debug (microseconds 0) (timesWith 10 giveWay >>> together [done, done]) ())
+      countOf Captures counts `shouldBe` 11
+
   describe "on two cores" $ do
     it "count an arming of a descriptor that another core armed last as a move" $ do
       ensureCores

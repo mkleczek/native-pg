@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
@@ -64,7 +65,8 @@ import Network.Streaming.Internal.Scheduler hiding (post)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (Timer, addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
-import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
+import Network.Streaming.Counters (Counter (Captures))
+import Network.Streaming.Mode (Instrumented (bump), Mode (..), ModeOf)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -433,7 +435,13 @@ runIn run (Delimited program) input = do
   result <- newIORef Nothing
   root <- newPart run
   let rooted = Rooted run root result
-  mask_ $ schedule @m run (prompt tag) result (catch (program (Context run tag root) input >>= finished rooted) (failed rooted))
+  mask_ $ schedule @m run (\part -> prompt tag part >>= capturesCounted @m) result (catch (program (Context run tag root) input >>= finished rooted) (failed rooted))
+
+-- | Counts a capture, where a build observes: each step that a part gives the scheduler, but its end, is one.
+capturesCounted :: forall m. (Instrumented m) => Step -> IO Step
+capturesCounted = \case
+  Ended -> pure Ended
+  suspended -> suspended <$ bump @m Captures
 
 -- | The first part of a run, and where its result goes, which is all that the frame that follows the program holds, the one pointer.
 data Rooted b = Rooted !Run !Part !(IORef (Maybe b))
