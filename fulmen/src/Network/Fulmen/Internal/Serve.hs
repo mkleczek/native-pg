@@ -99,8 +99,8 @@ serve !settings listen handler =
 beginning :: (Runtime arr) => Event -> arr Cores ()
 beginning event =
   named (Label "shutdown" "Waits for the event that starts the shutdown, and marks the server as shutting down.") $
-    alongside (const event ^>> block)
-      >>> step "begin the shutdown" (\(_, Cores _ shared) -> beginDraining (sharedPulse shared))
+    tap (const event ^>> block)
+      >>> step "begin the shutdown" (\(Cores _ shared) -> beginDraining (sharedPulse shared))
 
 -- * The acceptor
 
@@ -114,16 +114,16 @@ acceptance Listen {openListener, closeListener} =
       tap (step "make listener non-blocking" (listening . fst)) >>> foreverA (tap place)
   where
     place =
-      ( (,)
+      ( newRecord ["address", "socket"]
           <$> (snd ^>> checkout) -| "worker's address"
           <*> (fst ^>> accept) -| "accepted socket"
       )
-        >>> alongside post
+        >>> adding "taken" ((field "address" &&& field "socket") >>> post)
         >>> decide "worker rejected?" rejected
         >>> ("yes" |- close ||| "no" |- returnA)
     accept =
       named (Label "accept" "Accepts the next connection of the listening socket, and blocks while none is waiting.") acceptor
-    rejected (taken, (_, socket)) = if taken then Right () else Left socket
+    rejected r = if r.taken then Right () else Left r.socket
 
 -- | The address of the inbox of a free worker of the core that has the most free workers, which is taken from the pool at once. When no
 -- worker is free, the part queues the promise of a ticket of its own in the pool, which fulfils it with the worker that is released
@@ -165,10 +165,14 @@ closeLateSocket :: (Runtime arr) => arr (Socket, Cores) ()
 closeLateSocket = box "close late socket" (fst ^>> close)
 
 -- | The worker is free: its address is in the pool, and the connection that is posted to its inbox comes.
-offered :: (Runtime arr) => arr ((Inbox arr "connections" 'Anywhere Socket, Address "connections" 'Anywhere Socket), Cores) (Shared, Socket)
+offered ::
+  (Runtime arr) =>
+  arr
+    ((Inbox arr "connections" 'Anywhere Socket, Address "connections" 'Anywhere Socket), Cores)
+    ("shared" := Shared, "socket" := Socket)
 offered =
   named (Label "offered" "Offers the worker as free in the pool, and collects the connection that is posted to its inbox.") $
-    tap (answering "free worker" (free ^>> offer)) >>> ((,) <$> arr sharedOf <*> (fst . fst ^>> collect))
+    tap (answering "free worker" (free ^>> offer)) >>> (is "shared" (arr sharedOf) &&& is "socket" (fst . fst ^>> collect))
   where
     sharedOf (_, Cores _ shared) = shared
     free ((_, address), Cores core shared) = (sharedWorkers shared, Free core address)
@@ -184,13 +188,17 @@ data Conn = Conn
 
 -- | The connection until it ends, which closes its socket however it ends. What goes wrong on a connection is that
 -- connection's: the worker goes on to the next.
-connection :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr (Shared, Socket) ()
+connection ::
+  (Runtime arr, HasField "shared" r Shared, HasField "socket" r Socket) =>
+  Settings ->
+  arr (Call, Request) () ->
+  arr r ()
 connection settings handler =
   named (Label "connection" "Serves the connection until it ends, and closes its socket however it ends.") $
-    scope (arr snd) (fst ^>> close) (snd ^>> serving)
+    scope (field "socket") (fst ^>> close) (snd ^>> serving)
   where
     serving =
-      step "make connection state" (\(shared, socket) -> Conn socket <$> newIORef B.empty <*> pure shared <*> peerOf socket)
+      step "make connection state" (\r -> Conn r.socket <$> newIORef B.empty <*> pure r.shared <*> peerOf r.socket)
         -| "Conn"
         >>> tryA (requests settings handler)
         >>> done
