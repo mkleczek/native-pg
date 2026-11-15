@@ -31,13 +31,17 @@ import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, rtsSupports
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, unless, when)
+import Data.Bits ((.&.))
 import Data.Foldable (traverse_)
 import Data.Functor (($>))
 import Data.IORef (atomicWriteIORef, newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe (isNothing)
 import Data.Word (Word64)
+import Foreign.Marshal.Alloc (malloc)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek, poke)
 import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
 import GHC.Exts (casMutVar#)
 import GHC.IO (IO (..))
@@ -74,6 +78,12 @@ type Members = IntMap.IntMap Part
 counter :: IORef Int
 counter = unsafePerformIO (newIORef 0)
 {-# NOINLINE counter #-}
+
+-- | How many points to give way at the threads have passed, on the non-threaded run time, whose one OS thread runs them one at a
+-- time: not exact. Unboxed, so that counting allocates nothing.
+gaveWay :: Ptr Int
+gaveWay = unsafePerformIO (malloc >>= \cell -> cell <$ poke cell 0)
+{-# NOINLINE gaveWay #-}
 
 -- | A number that no other part or scope has, from any thread.
 nextIdent :: IO Int
@@ -154,7 +164,13 @@ instance GiveWay (ThreadsM m) where
 -- | The point itself, which what the part has in hand doesn't go through: the call is not given it, so that a caller
 -- doesn't have to build it, as a link's input is a pair of the link and where it receives, for the call to give it back.
 givingWay :: Part -> IO ()
-givingWay (Part _ _ frames _ flag) =
+givingWay (Part _ _ frames _ flag) = do
+  -- The non-threaded run time has one capability, and a thread that doesn't allocate is not preempted: a part that polls
+  -- for what another thread does has to let it run. One point in 64 yields, since a yield costs what the stack is deep.
+  unless rtsSupportsBoundThreads $ do
+    passed <- peek gaveWay
+    poke gaveWay (passed + 1)
+    when (passed .&. 63 == 0) yield
   readIORef flag >>= \flagged ->
     if flagged
       then readIORef frames >>= reachedBy flag >>= maybe allowInterrupt (throwIO . Cancelled)
