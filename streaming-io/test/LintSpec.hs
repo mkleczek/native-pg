@@ -149,7 +149,7 @@ deadlines = describe "a deadline or a race" $ do
     summary report `shouldBe` ([], [])
 
   -- A deadline whose duration is an input is a deadline too: the finding says so.
-  xfail "withinIn is not there yet" $ it "whose duration is an input, over a body that can't wait, is found" $ do
+  it "whose duration is an input, over a body that can't wait, is found" $ do
     report <- lint (withinIn quick :: Diagram (Duration, ()) (Maybe ()))
     (summary report, findingWhat <$> reportFindings report) `shouldBe` (([DeadlineWithoutWait], []), ["within the duration of its input"])
 

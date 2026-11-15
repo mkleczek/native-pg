@@ -37,6 +37,7 @@ import Data.Functor (($>))
 import Data.IORef (atomicWriteIORef, newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe (isNothing)
+import Data.Word (Word64)
 import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
 import GHC.Exts (casMutVar#)
 import GHC.IO (IO (..))
@@ -46,7 +47,6 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, closeShelf, collectedWrongly, hasValue, lookOrWait, newShelf, postNow, postOrQueue, stopWaiting, takeWoken, withdraw)
@@ -354,18 +354,25 @@ instance Time (ThreadsM m) where
 -- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another
 -- passes through.
 instance Within (ThreadsM m) where
-  within (Duration limit) (Threads body) = Threads $ \part value -> do
-    scope' <- newScope
-    manager <- getSystemTimerManager
-    key <- registerTimeout manager (fromIntegral (limit `div` 1000)) (cancelScope scope')
-    outcome <- inScope part scope' (body part value)
-    unregisterTimeout manager key
-    case outcome of
-      Right result -> pure (Just result)
-      Left failure
-        | cancelledBy failure == Just (scopeIdent scope') -> pure Nothing
-        | otherwise -> throwIO failure
-  withinIn _ = Threads (\_ _ -> notImplementedIO "withinIn")
+  within (Duration limit) (Threads body) = Threads (\part value -> deadlined limit part (body part value))
+  {-# INLINE within #-}
+  withinIn (Threads body) = Threads (\part (Duration limit, value) -> deadlined limit part (body part value))
+  {-# INLINE withinIn #-}
+
+-- | The action with a deadline of this many nanoseconds: nothing if the deadline passed first.
+deadlined :: Word64 -> Part -> IO a -> IO (Maybe a)
+deadlined limit part action = do
+  scope' <- newScope
+  manager <- getSystemTimerManager
+  key <- registerTimeout manager (fromIntegral (limit `div` 1000)) (cancelScope scope')
+  outcome <- inScope part scope' action
+  unregisterTimeout manager key
+  case outcome of
+    Right result -> pure (Just result)
+    Left failure
+      | cancelledBy failure == Just (scopeIdent scope') -> pure Nothing
+      | otherwise -> throwIO failure
+{-# INLINE deadlined #-}
 
 -- | Runs the action as a part that is in the cancel scope, and how it ended.
 inScope :: Part -> CancelScope Members -> IO a -> IO (Either SomeException a)

@@ -566,6 +566,7 @@ drawStep ctx path = \case
   Try inner -> grouped ctx "try" (render ctx path inner)
   Shield inner -> grouped ctx "shield" (render ctx path inner)
   Within duration inner -> grouped ctx ("within " ++ readable duration) (render ctx path inner)
+  WithinIn inner -> grouped ctx "within the duration of the input" (render ctx path inner)
   Wires input output inner -> wired input output <$> render ctx path inner
   Allowing _ _ inner -> render ctx path inner
   tree@(Named label location body) -> named ctx path tree label location body

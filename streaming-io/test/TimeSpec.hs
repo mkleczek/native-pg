@@ -147,7 +147,7 @@ spec = describe "time" $ do
 
     -- The deadline is the first of the input, in front of what the body takes: one program, built once, has the deadline
     -- of each run.
-    xfail "withinIn is not there yet" $ describe "a deadline that the input gives" $ do
+    describe "a deadline that the input gives" $ do
       it "gives Nothing when the deadline passes first, and releases what the body held" $ do
         noted <- newLog
         started <- monotonicNanoseconds
@@ -251,7 +251,7 @@ spec = describe "time" $ do
         inner <- runSimulation seed 100000 (within (secs 10) (within (secs 3) (sleep (secs 100)))) ()
         simulatedOutcome inner `shouldBe` Completed (Just Nothing)
 
-    xfail "withinIn is not there yet" $ describe "a deadline that the input gives" $ do
+    describe "a deadline that the input gives" $ do
       it "gives Nothing at its instant, for every seed, and releases what the body held" $
         forM_ [1 .. 20] $ \seed -> do
           noted <- newLog
