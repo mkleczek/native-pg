@@ -83,7 +83,7 @@ module Database.PostgreSQL.Transaction
 where
 
 import Control.Arrow (Arrow, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
-import Control.Exception (IOException, SomeAsyncException, SomeException, displayException, evaluate, fromException, throwIO, toException, try)
+import Control.Exception (IOException, SomeAsyncException, SomeException, displayException, evaluate, fromException, throwIO, toException)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -127,7 +127,7 @@ import Database.PostgreSQL.Types (FormatCode (..), Oid, Parameter (..))
 import Foreign.Storable (peekByteOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, boolA, consume, done, iterateA, iterateWith, keeping, tap)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, _1, _2, alongside, boolA, consume, done, iterateA, iterateWith, keeping, on, tap, through, undoing)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
 import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity, readerMemory)
@@ -871,14 +871,12 @@ transaction level mode program =
 -- and the loan goes back.
 begin :: (Runtime arr) => IsolationLevel -> Mode -> arr (Connection, (Loans, x)) Tx
 begin level mode =
-  loansFirst ^>> first borrow
-    >>> now (\(loan, connection) -> either (\failure -> Left (loan, failure)) Right <$> try (open loan connection))
-    >>> ((first release >>> now (\((), failure) -> throwIO (failure :: SomeException))) ||| returnA)
+  through (_2 . _1) borrow
+    >>> undoing (now opening) (on (_2 . _1) release)
   where
-    -- A pattern takes the fields out; fst . snd &&& fst would leave a thunk for each.
-    loansFirst (connection, (loans, _)) = (loans, connection)
     -- BEGIN is rendered once for the program, when it is built, and not for each transaction.
     !beginOutput = prerendered (statementOutput (beginning level mode) [] [] [])
+    opening (connection, (loan, _)) = open loan connection
     open loan connection = do
       reader <- newReader (sessionCarrier (connectionSession connection)) (loanBuffer loan)
       state <-
