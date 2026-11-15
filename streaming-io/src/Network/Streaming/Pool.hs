@@ -43,16 +43,15 @@ module Network.Streaming.Pool
   )
 where
 
-import Control.Arrow (ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (ArrowChoice, arr, returnA, second, (>>>), (>>^), (^>>), (|||))
 import Control.Exception (Exception, IOException, catch)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Sequence (Seq, ViewL (..), ViewR (..), viewl, viewr, (<|), (|>))
 import qualified Data.Sequence as Seq
-import Data.Tuple (swap)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (alongside, boolA, decide, done, keeping, step)
+import Network.Streaming.Combinators (_2, alongside, boolA, decide, done, keeping, step, through)
 import Network.Streaming.Internal.Atomic (update)
 
 -- | The items that are free, and how many, the number that the next waiter to queue gets, which says which of two
@@ -321,9 +320,8 @@ waited giveBack =
       decide "got its item?" unlessDone
         >>> ( "yes" |- returnA
                 ||| "no"
-                  |- ( swap
-                         ^>> first abandon
-                         >>> decide "fulfilled meanwhile?" (\(fulfilled, pool) -> maybe (Left ()) (Right . (pool,)) fulfilled)
+                  |- ( through _2 abandon
+                         >>> decide "fulfilled meanwhile?" (\(pool, fulfilled) -> maybe (Left ()) (Right . (pool,)) fulfilled)
                          >>> ("no" |- returnA ||| "yes" |- giveBack)
                      )
             )
@@ -406,10 +404,10 @@ checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
     queueOrClaim awaiting promise state = case claimMany many need state of
       (claimed, Right taken) -> (claimed, Right taken)
       (_, Left ()) -> (queued (max many need) (Many many promise) state, Left awaiting)
-    waitedIn = scope returnA giveUp (swap . fst ^>> first await >>^ swap)
+    waitedIn = scope returnA giveUp (fst ^>> through _2 await)
     giveUp =
       unlessDone
-        ^>> (returnA ||| (swap ^>> first abandon >>> now (\(fulfilled, pool) -> maybe (pure ()) (releaseNow pool) fulfilled)))
+        ^>> (returnA ||| (through _2 abandon >>> now (\(pool, fulfilled) -> maybe (pure ()) (releaseNow pool) fulfilled)))
 
 -- | An item of the pool that is the arrow's input, once one is free, as 'checkout' waits for it.
 checkoutIn :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => arr (Pool conn) conn
