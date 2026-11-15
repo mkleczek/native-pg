@@ -75,6 +75,7 @@ test-suite streaming-io-spec
                  PoolSpec
                  PoolCostSpec
                  SetupBuffersSpec
+                 SignalsSpec
                  SpecialisedSpec
                  SyscallsSpec
                  LintSpec
@@ -134,4 +135,4 @@ test-suite streaming-io-spec
   if flag(threaded)
     ghc-options: -threaded
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, bytestring, containers, network, stm, streaming-io, skeletest >=0.4.2 && <0.5
+  build-depends: base, bytestring, containers, network, stm, streaming-io, unix, skeletest >=0.4.2 && <0.5
