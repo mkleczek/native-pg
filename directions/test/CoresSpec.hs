@@ -4,7 +4,7 @@
 module CoresSpec (spec) where
 
 import Control.Arrow ((>>>))
-import Control.Concurrent (getNumCapabilities, setNumCapabilities)
+import Control.Concurrent (getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities)
 import Control.Monad (when)
 import Data.List (sort)
 import Network.Directions.PingPong
@@ -41,7 +41,7 @@ spec = describe "cores" $ do
       together' `shouldBe` Just ((), ())
 
   describe "a core that waits in its poller" $ do
-    it "is woken by a fulfil from another core within a few milliseconds, every time" $ do
+    parallelCores "the cores take turns on one OS thread, and the other core runs only once this one's wait has ended: the wake-up takes as long as that" $ it "is woken by a fulfil from another core within a few milliseconds, every time" $ do
       ensureCores
       wake <- newWake
       let samplesWanted = 40
@@ -56,6 +56,10 @@ spec = describe "cores" $ do
       -- The median is far below a millisecond; the slowest tenth, on a busy host, still well under 10 ms.
       (latencies !! (samplesWanted `div` 2) < 1000000) `shouldBe` True
       (latencies !! (samplesWanted * 9 `div` 10) < 10000000) `shouldBe` True
+
+-- | Skips the case on the non-threaded run time, which has one capability: the cores of a run take turns.
+parallelCores :: String -> Spec -> Spec
+parallelCores reason = if rtsSupportsBoundThreads then id else skip reason
 
 -- | A test's cores need capabilities: it runs with @+RTS -N4@, and sets that if the run was started without.
 ensureCores :: IO ()
