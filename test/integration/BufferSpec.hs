@@ -137,12 +137,37 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
         `shouldReturn` Just ()
 
     needs "target_session_attrs" $ it "asks a server that doesn't report its attributes at startup, with setup buffers" $
-      withOlderServer $ \scriptedPort -> do
+      withOlderServer (showing "off") $ \scriptedPort -> do
         settings <-
           settingsOf ("host=127.0.0.1 user=postgres dbname=postgres sslmode=disable target_session_attrs=read-write port=" <> Char8.pack (show scriptedPort))
         -- The scripted server answers the startup and the one query, so the case doesn't run a statement on the connection.
         tiny (session settings (arr (PG.serverParameters . PG.serverInfo . fst)))
           `shouldReturn` []
+
+    -- The answer of a server that doesn't report its attributes decides whether it qualifies, and a question that the
+    -- server fails is a failure of the host, not of the connection.
+    needs "target_session_attrs" $ it "doesn't qualify a server that says its session is read-only, and returns the setup buffers" $
+      withOlderServer (showing "on") $ \scriptedPort -> do
+        settings <- olderServerSettings scriptedPort
+        tiny
+          ( withinFor (secs 10) $
+              steps
+                [ (connectedTo settings done >>^ unsuitable) `yields` Just "session is read-only",
+                  connects scram `yields` Right [1]
+                ]
+          )
+          `shouldReturn` Just ()
+    needs "target_session_attrs" $ it "reports a host whose question the server fails as a failed check, and returns the setup buffers" $
+      withOlderServer failing $ \scriptedPort -> do
+        settings <- olderServerSettings scriptedPort
+        tiny
+          ( withinFor (secs 10) $
+              steps
+                [ (connectedTo settings done >>^ checkFailure) `yields` Just "42501",
+                  connects scram `yields` Right [1]
+                ]
+          )
+          `shouldReturn` Just ()
 
     -- v1: a thread timed out in the startup. A deadline of the program does the same, and it reaches the wait of the setup.
     it "returns the setup buffers when a silent startup is cancelled" $
@@ -289,6 +314,43 @@ rejection = \case
   _ -> Nothing
 
 -- | The names of the hosts that failed, in order.
+-- | A message of the server: its tag, its length and its payload.
+frame :: Char -> ByteString -> ByteString
+frame kind payload = Char8.singleton kind <> built (Builder.word32BE (fromIntegral (BS.length payload + 4))) <> payload
+
+-- | The bytes of a builder.
+built :: Builder.Builder -> ByteString
+built = Lazy.toStrict . Builder.toLazyByteString
+
+-- | The answer to a SHOW of one value: the extended protocol's replies up to ReadyForQuery.
+showing :: ByteString -> ByteString
+showing value =
+  frame '1' "" <> frame '2' ""
+    <> frame 'D' (built (Builder.word16BE 1 <> Builder.word32BE (fromIntegral (BS.length value)) <> Builder.byteString value))
+    <> frame 'C' "SHOW\0"
+    <> frame 'Z' "I"
+
+-- | The answer of a server that refuses the question: an error for a role that may not ask, then ReadyForQuery.
+failing :: ByteString
+failing = frame 'E' "SERROR\0VERROR\0C42501\0Mpermission denied\0\0" <> frame 'Z' "I"
+
+-- | The settings of the scripted older server, which a read-write session is asked of.
+olderServerSettings :: Socket.PortNumber -> IO ConnectSettings
+olderServerSettings scriptedPort =
+  settingsOf ("host=127.0.0.1 user=postgres dbname=postgres sslmode=disable target_session_attrs=read-write port=" <> Char8.pack (show scriptedPort))
+
+-- | Why the one host tried didn't qualify.
+unsuitable :: Either ConnectFailure a -> Maybe String
+unsuitable = \case
+  Left (ConnectFailure [(_, Unsuitable reason)]) -> Just reason
+  _ -> Nothing
+
+-- | The SQLSTATE of the failure of the check that the one host tried was asked.
+checkFailure :: Either ConnectFailure a -> Maybe ByteString
+checkFailure = \case
+  Left (ConnectFailure [(_, CheckFailed (ServerError diagnostics))]) -> Just (diagnosticCode diagnostics)
+  _ -> Nothing
+
 failedHosts :: Either ConnectFailure a -> Maybe [String]
 failedHosts = \case
   Left (ConnectFailure failures) -> Just (map (hostName . fst) failures)
@@ -352,9 +414,10 @@ filled =
     )
 
 -- | A scripted server of before PostgreSQL 14: its startup omits the attributes that target_session_attrs asks
--- about, and it answers the SHOW query that follows. It serves one connection, and the case's action runs with its port.
-withOlderServer :: (Socket.PortNumber -> IO a) -> IO a
-withOlderServer action =
+-- about, and it gives the answer to the query that follows (see 'showing' and 'failing'). It serves one connection, and
+-- the case's action runs with its port.
+withOlderServer :: ByteString -> (Socket.PortNumber -> IO a) -> IO a
+withOlderServer answer action =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
     Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
     Socket.listen listener 1
@@ -374,12 +437,9 @@ withOlderServer action =
     serve listener = bracket (fst <$> Socket.accept listener) Socket.close $ \socket -> do
       size <- messageSize <$> receiveExactly socket 4
       _ <- receiveExactly socket (size - 4)
-      SocketBytes.sendAll socket (frame 'R' (bytes (Builder.word32BE 0)) <> frame 'Z' "I")
+      SocketBytes.sendAll socket (frame 'R' (built (Builder.word32BE 0)) <> frame 'Z' "I")
       frontendUntil socket 'S'
-      let row = bytes $ Builder.word16BE 1 <> Builder.word32BE 3 <> Builder.byteString "off"
-      SocketBytes.sendAll socket $
-        frame '1' "" <> frame '2' ""
-          <> frame 'D' row <> frame 'C' "SHOW\0" <> frame 'Z' "I"
+      SocketBytes.sendAll socket answer
       drain socket
     -- The connection is closed by the client, which needn't say so first.
     drain socket = SocketBytes.recv socket 4096 >>= \received -> unless (BS.null received) (drain socket)
@@ -388,8 +448,6 @@ withOlderServer action =
       size <- messageSize <$> receiveExactly socket 4
       _ <- receiveExactly socket (size - 4)
       if kind == Char8.singleton wanted then pure () else frontendUntil socket wanted
-    frame kind payload = Char8.singleton kind <> bytes (Builder.word32BE (fromIntegral (BS.length payload + 4))) <> payload
-    bytes = Lazy.toStrict . Builder.toLazyByteString
     messageSize = BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0
 
 receiveExactly :: Socket.Socket -> Int -> IO ByteString
