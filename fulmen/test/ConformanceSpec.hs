@@ -199,25 +199,24 @@ shutdownSpec = describe "a graceful shutdown" $ forM_ (runners ++ [coresRunner])
           fmap responseBody (parsedResponses (parseResponses [False] True bytes)) `shouldBe` ["onetwo"]
     -- A request whose handler never returns: with a drain deadline the server ends when it has passed, and the handler is cancelled
     -- where it waits, so that the scope that it holds is released.
-    xfail "the drain deadline is not there yet" $
-      it "ends within the drain deadline when a request in flight never returns, and releases what its handler held" $ do
-        noted <- newIORef []
-        withStoppableWith (\settings -> settings {Fulmen.drainTimeout = Just (millis 300)}) runner (hanging noted) $ \shutting ->
-          withClient (serverPort shutting) $ \client -> do
-            SocketBytes.sendAll (socket client) "GET /hang HTTP/1.1\r\nHost: localhost\r\n\r\n"
-            began <- timeout 3000000 (waitUntil ((== ["began"]) <$> readIORef noted))
-            began `shouldBe` Just ()
-            begun <- getMonotonicTimeNSec
-            stopServer shutting
-            ended' <- timeout 5000000 (readMVar (serverStopped shutting))
-            finished <- getMonotonicTimeNSec
-            fmap (either (const False) (const True)) ended' `shouldBe` Just True
-            -- It waited for the deadline, and not for ever.
-            (finished - begun >= 300000000) `shouldBe` True
-            (finished - begun < 3000000000) `shouldBe` True
-            readIORef noted `shouldReturn` ["left: cancelled", "began"]
-            closed <- timeout 3000000 (waitUntil (readIORef (ended client)))
-            closed `shouldBe` Just ()
+    it "ends within the drain deadline when a request in flight never returns, and releases what its handler held" $ do
+      noted <- newIORef []
+      withStoppableWith (\settings -> settings {Fulmen.drainTimeout = Just (millis 300)}) runner (hanging noted) $ \shutting ->
+        withClient (serverPort shutting) $ \client -> do
+          SocketBytes.sendAll (socket client) "GET /hang HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          began <- timeout 3000000 (waitUntil ((== ["began"]) <$> readIORef noted))
+          began `shouldBe` Just ()
+          begun <- getMonotonicTimeNSec
+          stopServer shutting
+          ended' <- timeout 5000000 (readMVar (serverStopped shutting))
+          finished <- getMonotonicTimeNSec
+          fmap (either (const False) (const True)) ended' `shouldBe` Just True
+          -- It waited for the deadline, and not for ever.
+          (finished - begun >= 300000000) `shouldBe` True
+          (finished - begun < 3000000000) `shouldBe` True
+          readIORef noted `shouldReturn` ["left: cancelled", "began"]
+          closed <- timeout 3000000 (waitUntil (readIORef (ended client)))
+          closed `shouldBe` Just ()
     it "starts when the process is sent SIGTERM, with the event of terminating" $ do
       event <- Fulmen.terminating
       withStoppableOn id event runner (handling (Fixed 200 [] "ok")) $ \shutting -> do

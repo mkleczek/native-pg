@@ -85,8 +85,9 @@ serve !settings listen handler =
     isFirst (Cores core _) = core == 0
     -- A server that has an event to shut down on runs its parts in a race with the wait for the event. When it fires, the server
     -- is marked as shutting down and the parts are cancelled where they wait: the acceptor, whose listener closes, the
-    -- workers that wait for a connection, and the connections that wait for a request. A request in flight is behind a shield
-    -- (see 'answered'), so it finishes, and the race ends when no part is left.
+    -- workers that wait for a connection, and the connections that wait for a request. A request in flight is behind a grace
+    -- (see 'answered'), so it finishes, or is cancelled where it waits when the drain's deadline has passed, and the race ends
+    -- when no part is left.
     shutting parts = case shutdown settings of
       Nothing -> together parts
       Just event -> race (beginning event) (together parts) >>> done
@@ -358,9 +359,10 @@ answered settings handler =
     )
       `giving` "keep alive"
   where
-    -- With a shutdown event, a handler runs behind a shield: a cancellation of the server waits until it has returned.
+    -- With a shutdown event, a handler runs behind a grace of the drain's deadline: a cancellation of the server waits until it has
+    -- returned, or until the deadline has passed since the shutdown began, if there is one, and then reaches it at its next wait.
     protected :: (Runtime arr) => arr a b -> arr a b
-    protected = if isJust (shutdown settings) then shield else id
+    protected = if isJust (shutdown settings) then maybe shield grace (drainTimeout settings) else id
     heldLoan Prepared {preparedCall, preparedRequest, preparedLoan} =
       maybe (Right (preparedCall, preparedRequest)) (\loan -> Left (loan, (preparedCall, preparedRequest))) preparedLoan
 
