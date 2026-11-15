@@ -10,6 +10,10 @@
 -- part that posts to it is the other. The suite runs with @-T@ ("-with-rtsopts" in its cabal stanza) so that allocation is
 -- counted. With @SCOPE_COST_REPORT@ set, each case says what it measured, on stderr.
 --
+-- A part of "Network.Streaming.Delimited" that waits captures its stack, up to the scheduler's prompt, so that each scope around
+-- its loop adds the frame that runs the scope's release to every wait: one pointer, 16 bytes, which is under the tolerance. A
+-- shield, a deadline, tryA and a part of a group add what they keep on the stack.
+--
 -- The schedulers that run every part on one thread take a turn of no length, so that every step is a point where the part
 -- gives way.
 module ScopeCostSpec (spec) where
@@ -48,13 +52,14 @@ data Runner = Runner
 
 -- | The most that a bare loop allocates each iteration, in bytes, that gives way at each step and that waits at an inbox: what
 -- the arrow allocated when the ceiling was set, and a tolerance. A change that makes a bare loop dearer says so here, as a
--- change that makes it cheaper takes the ceiling down.
+-- change that makes it cheaper takes the ceiling down. The ceilings of Delimited hold the catch at the base of the program, which
+-- runs the releases that a failure of the first part finds, a frame of 16 bytes that the first part's waits capture.
 data Ceilings = Ceilings {yieldingCeiling :: Double, exchangingCeiling :: Double}
 
 runners :: [Runner]
 runners =
   [ Runner "threads" (\program count -> void (runThreads (program count) ())) 0 (Ceilings 304 1488),
-    Runner "delimited" (\program count -> void (runDelimitedTurn (Turn 0) (program count) ())) 16 (Ceilings 512 1904),
+    Runner "delimited" (\program count -> void (runDelimitedTurn (Turn 0) (program count) ())) 16 (Ceilings 528 1920),
     Runner "compiled" (\program count -> void (runCompiledTurn (Turn 0) (program count) ())) 0 (Ceilings 488 1856),
     Runner "loop" (\program count -> void (runLoop (program count) ())) 0 (Ceilings 1584 5976)
   ]
@@ -64,10 +69,9 @@ runners =
 tolerance :: Double
 tolerance = 24
 
--- | Marks a case of an arrow whose parts capture their stack when they wait, which copies what the loop is enclosed in: the
--- frames of its scopes, which a scope adds to each wait, the catch of a shield, a deadline or tryA, and what follows a part's
--- body in its group. The mark comes off when what encloses a loop is not copied, and a case that then passes unexpectedly
--- fails the suite.
+-- | Marks a case of an arrow whose parts capture their stack when they wait, which copies what the loop is enclosed in: the catch
+-- of a deadline or of tryA, and what follows a part's body in its group. The mark comes off when what encloses a loop is not
+-- copied, and a case that then passes unexpectedly fails the suite.
 copied :: String -> String -> Spec -> Spec
 copied name reason = if name == "delimited" then xfail ("delimited: " <> reason) else id
 
@@ -75,34 +79,29 @@ spec :: Spec
 spec = do
   describe "a scope" $ forM_ runners $ \runner -> describe (runnerName runner) $ do
     let name = runnerName runner
-    copied name "a part that waits captures the frames of its scopes, which a scope adds to each wait" $
-      it "costs a loop that gives way at each step no allocation in it" $
-        costsAtMost runner "scope, gives way" tolerance yielding (\count -> scoped (yielding count))
+    it "costs a loop that gives way at each step no allocation in it" $
+      costsAtMost runner "scope, gives way" tolerance yielding (\count -> scoped (yielding count))
 
-    copied name "a part that waits captures the frames of its scopes, which a scope adds to each wait" $
-      it "costs a loop that waits at an inbox no allocation in it" $
-        costsAtMost runner "scope, inbox" tolerance exchanging (exchangingIn scoped)
+    it "costs a loop that waits at an inbox no allocation in it" $
+      costsAtMost runner "scope, inbox" tolerance exchanging (exchangingIn scoped)
 
     when (name == "delimited") $
-      copied name "a part that waits captures the frames of its scopes, which a scope adds to each wait" $
-        it "costs a loop that waits at an inbox that a part on another core posts to no allocation in it" $ do
-          cores <- getNumCapabilities
-          when (cores < 2) (setNumCapabilities 2)
-          outside <- perIteration (void . acrossCores id)
-          inside <- perIteration (void . acrossCores scoped)
-          reported name "scope, another core" outside inside
-          atMostMore tolerance outside inside
+      it "costs a loop that waits at an inbox that a part on another core posts to no allocation in it" $ do
+        cores <- getNumCapabilities
+        when (cores < 2) (setNumCapabilities 2)
+        outside <- perIteration (void . acrossCores id)
+        inside <- perIteration (void . acrossCores scoped)
+        reported name "scope, another core" outside inside
+        atMostMore tolerance outside inside
 
     -- Each scope adds the frame of one pointer to a wait, and nothing else: a frame that grows shows here, eight times over.
-    copied name "a part that waits captures the frames of its scopes, which a scope adds to each wait" $
-      it "costs a loop in eight nested scopes no more than a frame for each" $
-        costsAtMost runner "eight scopes" (tolerance + runnerFrame runner * 8) yielding (\count -> iterate scoped (yielding count) !! 8)
+    it "costs a loop in eight nested scopes no more than a frame for each" $
+      costsAtMost runner "eight scopes" (tolerance + runnerFrame runner * 8) yielding (\count -> iterate scoped (yielding count) !! 8)
 
   describe "what else encloses a loop" $ forM_ runners $ \runner -> describe (runnerName runner) $ do
     let name = runnerName runner
-    copied name "a part that waits captures the catch of a shield, which a shield adds to each wait" $
-      it "costs a loop in a shield no allocation in it" $
-        costsAtMost runner "shield" tolerance yielding (shield . yielding)
+    it "costs a loop in a shield no allocation in it" $
+      costsAtMost runner "shield" tolerance yielding (shield . yielding)
 
     copied name "a part that waits captures the catch of a deadline, which a deadline adds to each wait, until stage C of the frame-free scopes" $
       it "costs a loop in a deadline no allocation in it" $

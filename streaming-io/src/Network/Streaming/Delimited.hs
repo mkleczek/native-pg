@@ -19,12 +19,13 @@
 -- it can't leave the run it was made in, or be used by the program of another
 -- core. What crosses cores is a 'Promise' of reach @'Anywhere@, which has no @s@.
 --
--- A scope is plain IO code in the part: the continuation that a wait captures
--- holds the part's handlers, so a release runs once, after the resume, however
--- the part ended. A part is cancelled by resuming it, where it waits, with the
--- cancellation to raise there. The scheduler runs and resumes every part
--- masked, so that the part sees one masking state everywhere, as if it never
--- suspended.
+-- A scope is plain IO code in the part, and keeps nothing of its own on the stack that a wait captures but
+-- one frame, which runs its release when its body ends. What it owes for a failure is a record in the part's
+-- frames, and the catcher that the failure comes to runs it: 'tryA', a deadline, the base of a part of a group or a race,
+-- and the base of the program, each of which has a handler on the stack and a mark in the frames, down to which it runs the
+-- releases that are due, so that a release runs once, after the resume, however the part ended. A part is cancelled by
+-- resuming it, where it waits, with the cancellation to raise there. The scheduler runs and resumes every part
+-- masked, so that the part sees one masking state everywhere, as if it never suspended.
 module Network.Streaming.Delimited
   ( Delimited,
     DelimitedM,
@@ -48,8 +49,8 @@ import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
 import Control.Concurrent (forkOnWithUnmask, killThread)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
-import Control.Exception (SomeException, mask, mask_, onException, throwIO, try)
-import Control.Monad (replicateM_, when)
+import Control.Exception (SomeException, catch, mask, mask_, onException, throwIO, try)
+import Control.Monad (replicateM_, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Kind (Type)
 import Data.List (sortOn)
@@ -61,7 +62,7 @@ import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Inboxes (Address (..), Shelf, closeShelf, newShelf)
 import Network.Streaming.Internal.Scheduler hiding (post)
 import Network.Streaming.Internal.Tickets
-import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
+import Network.Streaming.Internal.Timers (Timer, addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
 import System.Posix.Types (Fd (..))
@@ -171,54 +172,113 @@ instance Time (DelimitedM m s) where
   clock = Delimited (\(Context run _ _) () -> Instant <$> roundNow run)
 
 -- | The deadline is a timer of the scheduler's wheel, which cancels the scope when it fires, and a cancel scope
--- that the part is in while the body runs. The scope is the body's own: the cancellation that ends it is
--- recognised by it, and another passes through.
+-- that the part is in while the body runs, with a mark above it for the failure of the body. The scope is the body's own: the
+-- cancellation that ends it is recognised by it, and another passes through.
 instance Within (DelimitedM m s) where
   within (Duration limit) (Delimited body) = Delimited $ \context@(Context run _ part) value -> do
     scope' <- newScope run
     started <- roundNow run
     timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
     pushFrame run part (Inside scope')
-    outcome <- try (body context value)
-    popFrame run part
-    _ <- cancelTimer (runWheel run) timer
-    case outcome of
-      Right result -> pure (Just result)
-      Left failure
-        | cancelledBy failure == Just (scopeIdent scope') -> pure Nothing
-        | otherwise -> throwIO failure
+    marking context
+    let deadline = Deadline context scope' timer
+    catch (body context value >>= deadlineDone deadline) (deadlineFailed deadline)
 
--- | Runs the action behind a shield.
-shielded :: Context -> IO a -> IO a
-shielded (Context run _ part) action = do
-  pushFrame run part Shielded
-  outcome <- try action
+-- | A deadline that the part is in: the part, its scope and its timer, which is all that the frame that the deadline leaves on
+-- the stack holds, the one pointer.
+data Deadline = Deadline !Context !PartScope !Timer
+
+-- | The part leaves the deadline, and its timer is cancelled.
+leavesDeadline :: Deadline -> IO ()
+leavesDeadline (Deadline (Context run _ part) _ timer) = popFrame run part *> popFrame run part *> void (cancelTimer (runWheel run) timer)
+
+-- | The body of a deadline ended with its result before the deadline passed.
+deadlineDone :: Deadline -> a -> IO (Maybe a)
+deadlineDone deadline result = Just result <$ leavesDeadline deadline
+{-# OPAQUE deadlineDone #-}
+
+-- | The body of a deadline failed: the releases that its failure finds are run, and the part leaves the deadline. The body gave
+-- nothing if the deadline passed, and any other failure is the part's.
+deadlineFailed :: Deadline -> SomeException -> IO (Maybe a)
+deadlineFailed deadline@(Deadline (Context run _ part) scope' _) failure = do
+  unwound <- unwindFrames run part AtMark failure
+  leavesDeadline deadline
+  if cancelledBy unwound == Just (scopeIdent scope') then pure Nothing else throwIO unwound
+{-# OPAQUE deadlineFailed #-}
+
+-- | The failure of the body of a part of a group or a race, for the part that pushed a mark at its base: the releases that are
+-- due above the mark are run, and what is left of the failure is the part's.
+unwinding :: Run -> Part -> SomeException -> IO (Either SomeException a)
+unwinding run part failure = Left <$> unwindFrames run part AtMark failure
+
+-- | A scope that was entered: the part, and the release that is due, which is all that the frame that the scope leaves on the
+-- stack holds, the one pointer.
+data Entered = Entered !Context !(Exit -> IO ())
+
+-- | The part enters the scope: the release is due from now on. Not inlined, so that the frame that follows the body holds
+-- only what 'leaving' is given.
+entering :: Context -> (Exit -> IO ()) -> IO Entered
+entering context@(Context run _ part) owed = Entered context owed <$ pushFrame run part (Owes owed)
+{-# OPAQUE entering #-}
+
+-- | The body of the scope ended with the result: its release runs behind a shield, and the scope is left. A part that is in no
+-- other scope was in the root scope while it held what it acquired, so that a shutdown reaches it, and its release runs.
+leaving :: Entered -> b -> IO b
+leaving (Entered (Context run _ part) owed) result = do
+  shieldTop part
+  released <- try (owed Done)
   popFrame run part
-  either (\failure -> throwIO (failure :: SomeException)) pure outcome
+  case released of
+    Left failure -> throwIO (ReleaseFailed Done failure)
+    Right () -> pure result
+{-# OPAQUE leaving #-}
+
+-- | The part goes behind a shield. Not inlined, so that the frame that follows the body holds only the context.
+shielding :: Context -> IO ()
+shielding (Context run _ part) = pushFrame run part Shielded
+{-# OPAQUE shielding #-}
+
+-- | The shield ended with the result: the part leaves it. Not inlined, so that the frame that follows the arrow holds only the
+-- context.
+unshielded :: Context -> b -> IO b
+unshielded (Context run _ part) result = result <$ popFrame run part
+{-# OPAQUE unshielded #-}
+
+-- | The part pushes the mark of a catcher, above which a failure runs the releases that are due. Not inlined, so that the frame
+-- that follows the body holds only what the catcher's helpers are given.
+marking :: Context -> IO ()
+marking (Context run _ part) = pushFrame run part Marked
+{-# OPAQUE marking #-}
+
+-- | The body of 'tryA' ended with its result: the part leaves the catcher.
+unmarked :: Context -> b -> IO (Either SomeException b)
+unmarked (Context run _ part) result = Right result <$ popFrame run part
+{-# OPAQUE unmarked #-}
+
+-- | The body of 'tryA' failed: the releases that its failure finds are run, the part leaves the catcher, and a failure that is
+-- not a cancellation is the result.
+caught :: Context -> SomeException -> IO (Either SomeException b)
+caught (Context run _ part) failure = do
+  unwound <- unwindFrames run part AtMark failure
+  popFrame run part
+  case cancelledBy unwound of
+    Just _ -> throwIO unwound
+    Nothing -> pure (Left unwound)
+{-# OPAQUE caught #-}
 
 instance Scope (DelimitedM m s) where
-  scope (Delimited acquire) (Delimited release) (Delimited body) = Delimited $ \context@(Context run _ part) value -> do
+  scope (Delimited acquire) (Delimited release) (Delimited body) = Delimited $ \context value -> do
     acquired <- acquire context value
-    -- A part that is in no scope is in the root scope while it holds what it acquired, so that a shutdown
-    -- reaches it, and its release runs.
-    held <- readIORef (partFrames part) >>= \case [] -> True <$ pushFrame run part Held; _ -> pure False
-    outcome <- try (body context (acquired, value))
-    let exit = exitOf outcome
-    -- The release runs behind a shield.
-    pushFrame run part Shielded
-    released <- try (release context (acquired, exit))
-    popFrame run part
-    when held (popFrame run part)
-    case released of
-      Left failure -> throwIO (ReleaseFailed exit failure)
-      Right () -> either (\failure -> throwIO (failure :: SomeException)) pure outcome
+    entered <- entering context (\exit -> release context (acquired, exit))
+    body context (acquired, value) >>= leaving entered
 
-  tryA (Delimited inner) = Delimited $ \context value ->
-    try (inner context value) >>= \case
-      Left failure | Just _ <- cancelledBy failure -> throwIO failure
-      other -> pure other
+  tryA (Delimited inner) = Delimited $ \context value -> do
+    marking context
+    catch (inner context value >>= unmarked context) (caught context)
 
-  shield (Delimited inner) = Delimited (\context value -> shielded context (inner context value))
+  shield (Delimited inner) = Delimited $ \context value -> do
+    shielding context
+    inner context value >>= unshielded context
 
 -- | Annotations are for diagrams: the arrow is run as it is.
 instance Annotate (DelimitedM m s)
@@ -239,7 +299,9 @@ instance Concurrent (DelimitedM m s) where
         joined <- newIORef (Joined Nothing 0)
         pure $
           Forked
-            [ try (body (Context run tag child) value) >>= groupEnded run scope' size joined (resume . throwIO) (resume . pure) child
+            [ pushFrame run child Marked
+                *> catch (Right <$> body (Context run tag child) value) (unwinding run child)
+                >>= groupEnded run scope' size joined (resume . throwIO) (resume . pure) child
               | (Delimited body, child) <- zip parts children
             ]
 
@@ -255,8 +317,12 @@ instance Race (DelimitedM m s) where
       winner <- newIORef Nothing
       pure $
         Forked
-          [ try (Left <$> one (Context run tag first') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) first',
-            try (Right <$> two (Context run tag second') value) >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) second'
+          [ pushFrame run first' Marked
+              *> catch (Right . Left <$> one (Context run tag first') value) (unwinding run first')
+              >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) first',
+            pushFrame run second' Marked
+              *> catch (Right . Right <$> two (Context run tag second') value) (unwinding run second')
+              >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) second'
           ]
 
 -- | The tickets that belong to this core: a slot, which the parts of this core read
@@ -366,7 +432,22 @@ runIn run (Delimited program) input = do
   tag <- newPromptTag
   result <- newIORef Nothing
   root <- newPart run
-  mask_ $ schedule @m run (prompt tag) result (program (Context run tag root) input >>= \value -> Ended <$ writeIORef result (Just value))
+  let rooted = Rooted run root result
+  mask_ $ schedule @m run (prompt tag) result (catch (program (Context run tag root) input >>= finished rooted) (failed rooted))
+
+-- | The first part of a run, and where its result goes, which is all that the frame that follows the program holds, the one pointer.
+data Rooted b = Rooted !Run !Part !(IORef (Maybe b))
+
+-- | The program ended with its result.
+finished :: Rooted b -> b -> IO Step
+finished (Rooted _ _ result) value = Ended <$ writeIORef result (Just value)
+{-# OPAQUE finished #-}
+
+-- | The program failed: the releases that are due in the frames of the first part are run, all of them, since it has no mark,
+-- and the run fails.
+failed :: Rooted b -> SomeException -> IO Step
+failed (Rooted run root _) failure = unwindFrames run root AtBottom failure >>= throwIO
+{-# OPAQUE failed #-}
 
 -- | Runs the program of each of the cores, each on a thread of its own, pinned
 -- to a capability (@forkOn@: core @n@ to capability @n@, modulo their number,

@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- | Scopes, failures and cancellation, for every arrow that has them: the same programs, written once for any
 -- arrow that has what they need, are run by each.
@@ -44,6 +45,7 @@ import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Internal.Scheduler (Turn (..))
 import Network.Streaming.Loop (runLoop)
+import Network.Streaming.Mode (Mode (..))
 import Network.Streaming.Pool
 import Network.Streaming.Threads
 import Skeletest
@@ -480,12 +482,14 @@ differentialSpec = describe "scopes, whichever arrow runs them," $
     forM_ [1 .. 400 :: Word64] $ \seed -> do
       shape <- generate seed
       expected <- observe loopRunner shape
-      forM_ [runner | runner@(Runner name _) <- runners, name /= "loop"] $ \runner@(Runner name _) -> do
+      forM_ ([runner | runner@(Runner name _) <- runners, name /= "loop"] <> [observing]) $ \runner@(Runner name _) -> do
         observed <- observe runner shape
         when (observed /= expected) $
           failTest ("seed " <> show seed <> ", on " <> name <> ": " <> show shape <> "\nexpected " <> show expected <> "\nobserved " <> show observed)
   where
     loopRunner = Runner "loop" (\program -> fst <$> runLoop program ())
+    -- Delimited in a build that observes, which finds that a part's failure unwound frames that its mark should have kept.
+    observing = Runner "delimited that observes" (\program -> fst <$> runDelimitedM @'Debug program ())
 
 -- | What a scope's release does after it notes how the body ended.
 data Releases = Quietly | Slowly | Badly

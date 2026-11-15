@@ -20,7 +20,7 @@ spec = describe "the unwinding of a failure" $ do
       part <- newPart run
       noted <- newIORef []
       mapM_ (pushFrame run part) [Owes (notes noted "outer"), Marked, Owes (notes noted "second"), Shielded, Owes (notes noted "first")]
-      left <- unwindFrames @'Release run part AtMark (userFailure "x")
+      left <- unwindFrames run part AtMark (userFailure "x")
       show left `shouldBe` "user error (x)"
       reverse <$> readIORef noted `shouldReturn` ["first: Failed user error (x)", "second: Failed user error (x)"]
       frames part `shouldReturn` ["marked", "owes", "inside"]
@@ -30,7 +30,7 @@ spec = describe "the unwinding of a failure" $ do
       part <- newPart run
       noted <- newIORef []
       mapM_ (pushFrame run part) [Marked, Owes (notes noted "second"), Owes (\exit -> notes noted "first" exit *> ioError (userError "release failed"))]
-      left <- unwindFrames @'Release run part AtMark (userFailure "body failed")
+      left <- unwindFrames run part AtMark (userFailure "body failed")
       case fromException left of
         Just (ReleaseFailed _ released) -> show released `shouldBe` "user error (release failed)"
         Nothing -> failTest ("unwound to " <> show left)
@@ -44,11 +44,11 @@ spec = describe "the unwinding of a failure" $ do
       part <- newPart run
       noted <- newIORef []
       mapM_ (pushFrame run part) [Owes (notes noted "outer"), Shielded, Owes (notes noted "inner")]
-      _ <- unwindFrames @'Release run part AtBottom (userFailure "x")
+      _ <- unwindFrames run part AtBottom (userFailure "x")
       reverse <$> readIORef noted `shouldReturn` ["inner: Failed user error (x)", "outer: Failed user error (x)"]
       frames part `shouldReturn` []
 
-  it "finds in a build that observes that the base of a part that is not the first has no mark" $
+  it "finds, in a run that observes, that the base of a part that is not the first has no mark" $
     withRun defaultTurn $ \run -> do
       parent <- newPart run
       noted <- newIORef []
@@ -56,13 +56,18 @@ spec = describe "the unwinding of a failure" $ do
       scope' <- newScope run
       child <- childPart run parent scope'
       -- The child's frames are its parent's, and it has no mark of its own.
-      missing <- try (unwindFrames @'Debug run child AtMark (userFailure "x"))
+      observing @'Debug run
+      missing <- try (unwindFrames run child AtMark (userFailure "x"))
       either (\failure -> show (failure :: SomeException)) (const "no failure") missing `shouldBe` "user error (a failure unwound the frames of a part to the bottom, and found no mark at its base)"
-      -- Where nothing observes, it unwinds what it finds.
-      other <- newPart run
-      pushFrame run other (Owes (notes noted "other"))
-      left <- unwindFrames @'Release run other AtMark (userFailure "x")
+  it "unwinds what it finds, where nothing observes, whether it finds the mark or not" $
+    withRun defaultTurn $ \run -> do
+      part <- newPart run
+      noted <- newIORef []
+      observing @'Release run
+      pushFrame run part (Owes (notes noted "owed"))
+      left <- unwindFrames run part AtMark (userFailure "x")
       show left `shouldBe` "user error (x)"
+      reverse <$> readIORef noted `shouldReturn` ["owed: Failed user error (x)"]
 
 -- | A release that notes how the body ended.
 notes :: IORef [String] -> String -> Exit -> IO ()

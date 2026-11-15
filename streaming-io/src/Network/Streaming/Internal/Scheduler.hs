@@ -76,6 +76,7 @@ module Network.Streaming.Internal.Scheduler
     shieldTop,
     Floor (..),
     unwindFrames,
+    observing,
     checkpoint,
     cancelScope,
     registering,
@@ -223,7 +224,9 @@ data Run = Run
     -- parts have no handlers of their own on a stack that can be captured: the part sets it when it goes on.
     runFailure :: !(IORef (SomeException -> IO Step)),
     -- | The timers of the parts: deadlines, and those that sleep.
-    runWheel :: !Wheel
+    runWheel :: !Wheel,
+    -- | Whether the run is in a build that observes, and asserts what it can (see 'observing').
+    runObserved :: !(IORef Bool)
   }
 
 -- | The parts that wait on a descriptor, as the 'Suspended' steps they gave the scheduler.
@@ -273,7 +276,7 @@ newRun (Turn turn) = do
   unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
-  Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel)
+  Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
@@ -608,12 +611,17 @@ shieldTop part =
 -- is not a child, which has no catcher of its own to push one.
 data Floor = AtMark | AtBottom
 
+-- | The run is in a build that observes: the arrows that run it assert what they can, which a build that observes nothing leaves
+-- to the code that it was built from.
+observing :: forall m. (Instrumented m) => Run -> IO ()
+observing run = debugging @m (writeIORef (runObserved run) True)
+
 -- | The failure leaves the frames of the part, down to the floor, innermost first: a release that is due is run behind a shield,
 -- with how the body ended, and its failure replaces the failure, with how the body ended, for the releases that follow; the
--- other frames are dropped. It gives the failure that is left. A release may wait, and runs on the part's own stack. In a build
--- that observes, a part whose frames run out before its mark is found has no mark at its base, and the releases of the parts
--- that its frames are shared with have been run.
-unwindFrames :: forall m. (Instrumented m) => Run -> Part -> Floor -> SomeException -> IO SomeException
+-- other frames are dropped. It gives the failure that is left. A release may wait, and runs on the part's own stack. In a run that
+-- observes, a part whose frames run out before its mark is found has no mark at its base, and the releases of the parts that its
+-- frames are shared with have been run.
+unwindFrames :: Run -> Part -> Floor -> SomeException -> IO SomeException
 unwindFrames run part floor' failure =
   readIORef (partFrames part) >>= \case
     Owes owed : _ -> do
@@ -621,14 +629,14 @@ unwindFrames run part floor' failure =
       shieldTop part
       released <- try (owed exit)
       popFrame run part
-      unwindFrames @m run part floor' (either (toException . ReleaseFailed exit) (const failure) released)
+      unwindFrames run part floor' (either (toException . ReleaseFailed exit) (const failure) released)
     Marked : _ | AtMark <- floor' -> pure failure
     [] -> do
       case floor' of
-        AtMark -> debugging @m (ioError (userError "a failure unwound the frames of a part to the bottom, and found no mark at its base"))
+        AtMark -> readIORef (runObserved run) >>= \observed -> when observed (ioError (userError "a failure unwound the frames of a part to the bottom, and found no mark at its base"))
         AtBottom -> pure ()
       pure failure
-    _ : _ -> popFrame run part *> unwindFrames @m run part floor' failure
+    _ : _ -> popFrame run part *> unwindFrames run part floor' failure
 
 -- | Raises the cancellation that reaches the part, if there is one: it looks at the part's scopes only if its flag says
 -- that one may have.
@@ -783,7 +791,7 @@ takeEntry ident = go []
 -- fails with the exception. The exception of a part that no scope holds fails
 -- the run at once.
 schedule :: forall m b. (Instrumented m) => Run -> (IO Step -> IO Step) -> IORef (Maybe b) -> IO Step -> IO (b, Report)
-schedule run enterPart result start = (go [start] [] `catch` failed) `finally` closeInbox run
+schedule run enterPart result start = (observing @m run *> go [start] [] `catch` failed) `finally` closeInbox run
   where
     -- A shutdown fails the run with its exception, whatever the parts failed with, which is their cancellation.
     failed :: SomeException -> IO a
