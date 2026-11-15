@@ -147,8 +147,8 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
   describe "close" $
     forM_ [("without TLS", unix "postgres" Nothing), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
       (if label == "with TLS" then needs "TLS" else id) $ describe label $ do
-        -- What listens needs the notifications, and over TLS everything needs TLS.
-        let listening = if label == "with TLS" then id else needs "notifications"
+        -- What listens needs the notifications, and over TLS it needs TLS too.
+        let listening = needs (if label == "with TLS" then "TLS and notifications" else "notifications")
         listening $ it "rejects every operation after closing" $
           run $
             session connecting $
@@ -233,7 +233,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "rejects required binding when the TLS link supplies none" $
       (authenticationFailure <$> connectedWith (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram"))
         `shouldReturn` Just "channel binding is required, but server did not offer an authentication method that supports channel binding"
-    it "ignores binding errors on a cancellation connection" $
+    needs "TLS and cancel" $ it "ignores binding errors on a cancellation connection" $
       run $
         session (unix "postgres" Nothing) $
           cancelling (suppliedBinding bindingFailure ChannelBindingRequire "postgres")
@@ -352,7 +352,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       let encryptedBy string = withString (tcp string) encrypted
       needs "TLS" $ it "encrypts with sslmode=require, without verifying the server" $
         encryptedBy "sslmode=require" `shouldReturn` Right [True]
-      needs "TLS" $ it "sends a large batch while reading its responses over TLS" $
+      needs "TLS and a connection that sends and reads at once" $ it "sends a large batch while reading its responses over TLS" $
         withString (tcp "sslmode=require") batchWhileReading `shouldReturn` Just (Right (1000000, 2000000))
       it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $
         withString (local "sslmode=require") encrypted `shouldReturn` Right [False]
@@ -397,7 +397,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                          )
       needs "TLS" $ it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $
         encryptedBy "sslnegotiation=direct sslmode=require" `shouldReturn` Right [True]
-      needs "TLS" $ it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
+      needs "TLS and cancel" $ it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
         settings <- settingsOf (tcp "sslmode=require")
         withPlaintextServer $ \plaintext -> do
           refusing <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
