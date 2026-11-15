@@ -18,6 +18,7 @@ module Database.PostgreSQL.Pool
     ConnectionPool,
     withConnectionPool,
     withConnection,
+    withConnectionIn,
     Observation (..),
     ConnectionStatus (..),
     ConnectionReadyForUseReason (..),
@@ -49,6 +50,7 @@ import Network.Streaming.Classes (Duration (..), Effect (..), Exit (..), Runtime
 import Network.Streaming.Combinators (keeping, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
+import Network.Streaming.NotImplemented (notImplemented)
 import Network.Streaming.Pool (Pool, PoolError (..), closePoolWith, newPool, releaseNow, takeNow, urgently, withLoan, withLoanWithin)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 
@@ -201,6 +203,11 @@ withConnection :: (Runtime arr) => ConnectionPool -> arr (Connection, a) b -> ar
 withConnection pool body = checkingOut (poolSlots pool) (urgently (using pool body))
   where
     checkingOut = maybe withLoan withLoanWithin (poolCheckoutTimeout (poolSettings pool))
+
+-- | 'withConnection' for a pool that is the arrow's input, with the input of the body after it: one program, built once,
+-- serves the pool of each run, as a tenant's.
+withConnectionIn :: (Runtime arr) => arr (Connection, a) b -> arr (ConnectionPool, a) (Either PoolError b)
+withConnectionIn _ = notImplemented "withConnection with the pool as input"
 
 -- | The body on the connection of the slot: the one that the slot holds if it is as it was left, and else one that is
 -- made. What the body leaves of the connection stays in the slot, unless the body broke it. The observer is told that the

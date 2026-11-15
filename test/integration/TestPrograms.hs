@@ -31,6 +31,7 @@ module TestPrograms
     tlsSettings,
     -- * A connection in a program
     OnConn,
+    across,
     session,
     connectedTo,
     alsoOn,
@@ -204,6 +205,17 @@ type OnConn arr b = arr (Connection, Loans) b
 -- can't be made is the program's failure.
 session :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans b
 session settings body = connectedTo settings body >>> orFail
+
+-- | The step on each of the inputs in turn, whichever their number: one arrow, built once, which takes what differs from run
+-- to run, the settings of a connection or a pool, from its input.
+across :: (Runtime arr) => arr (x, Loans) b -> [x] -> arr Loans [b]
+across step inputs = (\loans -> (inputs, loans, [])) ^>> iterateA following
+  where
+    following = untried ^>> (returnA ||| tried)
+    untried (remaining, loans, results) = case remaining of
+      [] -> Left (Finish (reverse results))
+      input : others -> Right ((input, loans), (others, loans, results))
+    tried = first step >>^ \(result, (others, loans, results)) -> Again (others, loans, result : results)
 
 -- | The same, with the failure to connect as a value, and the body not run.
 connectedTo :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans (Either ConnectFailure b)

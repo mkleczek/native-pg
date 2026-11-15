@@ -25,7 +25,8 @@ import Data.Text (Text)
 import Data.UUID (UUID)
 import Data.Word (Word64)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Connection (ConnectSettings (..))
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), connectionPoolSettings, withConnection, withConnectionIn, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats)
@@ -86,6 +87,33 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       -- The pool's bracket has ended while the request holds the only connection, so the checkout doesn't wait for it.
       runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
       finishHolding holder
+
+  -- The pool is the input of withConnection: one program, built once, serves the pool of each run, with that pool's own
+  -- connections and checkout timeout.
+  needs "the pool as input" $ describe "a pool that is the arrow's input" $ do
+    let applicationPool application = connectionPoolSettings 1 settings {connectParameters = [("application_name", application)]}
+        applicationOf :: (Runtime arr) => arr (ConnectionPool, Loans) (Either PoolError (Either QueryError [Text]))
+        applicationOf = withConnectionIn (query (plain "SELECT current_setting('application_name')" single))
+        -- The pool's only connection is held by the outer request, so the inner one waits for it, for the pool's timeout.
+        holdingThenAsking :: (Runtime arr) => arr (ConnectionPool, Loans) (Either PoolError (Maybe (Either PoolError ())))
+        holdingThenAsking = (\(pool, loans) -> (pool, (pool, loans))) ^>> withConnectionIn (snd ^>> withinFor (millis 400) (withConnectionIn done))
+        buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+    it "lends each pool of a run its own connections, in one program" $ do
+      buffers <- buffersOf
+      withConnectionPool (applicationPool "one") $ \one -> withConnectionPool (applicationPool "two") $ \two ->
+        runOn runner buffers (across applicationOf [one, two, one])
+          `shouldReturn` [Right (Right ["one"]), Right (Right ["two"]), Right (Right ["one"])]
+    it "takes the checkout timeout from the pool of each run" $ do
+      buffers <- buffersOf
+      withConnectionPool ((applicationPool "one") {poolCheckoutTimeout = Just (millis 100)}) $ \limited -> withConnectionPool (applicationPool "two") $ \unlimited ->
+        runOn runner buffers (across holdingThenAsking [limited, unlimited])
+          `shouldReturn` [Right (Just (Left CheckoutTimedOut)), Right Nothing]
+    it "gives PoolClosed for a pool that is closed, and serves the pool that isn't, in the same program" $ do
+      buffers <- buffersOf
+      shut <- withConnectionPool (applicationPool "one") pure
+      withConnectionPool (applicationPool "two") $ \open ->
+        runOn runner buffers (across applicationOf [shut, open, shut])
+          `shouldReturn` [Left PoolClosed, Right (Right ["two"]), Left PoolClosed]
 
   -- What a request pays the pool when its connection is free: the bytes that a request allocates for the checkout, the
   -- use of the connection and the release, with a body that does nothing. The ceiling is what each arrow allocated when it

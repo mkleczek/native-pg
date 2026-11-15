@@ -20,7 +20,7 @@
 -- they wait for lands.
 module IntegrationSpec (spec) where
 
-import Control.Arrow (arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (arr, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (IOException, SomeException, bracket, catch, displayException, finally)
@@ -349,7 +349,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     -- connect and cancel take their settings as input: one arrow, built once, serves the settings of each run.
     describe "settings as input" $ do
       let connectingWith :: [ConnectSettings] -> (forall arr. (Runtime arr) => OnConn arr b) -> IO [Either ConnectFailure b]
-          connectingWith settingsList body = run (acrossSettings (onSettings body) settingsList)
+          connectingWith settingsList body = run (across (onSettings body) settingsList)
           reasons :: [Either ConnectFailure b] -> [Either String b]
           reasons = map (either (Left . displayException) Right)
       it "connects with the settings of each run, one after the other, and a failure of one doesn't disturb the next" $ do
@@ -1117,17 +1117,6 @@ cancelWith = (\(settings, connection) -> (settings, PG.cancelKey connection)) ^>
 -- ends: the connection that 'session' makes, for settings that come at run time. A failure to connect is a value.
 onSettings :: (Runtime arr) => OnConn arr b -> arr (ConnectSettings, Loans) (Either ConnectFailure b)
 onSettings body = scope PG.connect (fst ^>> (done ||| PG.close)) ((\(connected, (_, loans)) -> fmap (,loans) connected) ^>> (arr Left ||| (body >>^ Right)))
-
--- | The step on each of the settings in turn, whichever its number: one arrow, which takes the settings that it connects
--- with from its input.
-acrossSettings :: (Runtime arr) => arr (ConnectSettings, Loans) b -> [ConnectSettings] -> arr Loans [b]
-acrossSettings step settingsList = (\loans -> (settingsList, loans, [])) ^>> iterateA following
-  where
-    following = untried ^>> (returnA ||| tried)
-    untried (remaining, loans, results) = case remaining of
-      [] -> Left (Finish (reverse results))
-      settings : others -> Right ((settings, loans), (others, loans, results))
-    tried = first step >>^ \(result, (others, loans, results)) -> Again (others, loans, result : results)
 
 -- | With two connections, the second ends the backend of the first. The process id is the text of a parameter.
 terminatingTheFirst :: (Runtime arr) => arr ((Connection, Connection), Loans) (Either QueryError [Bool])
