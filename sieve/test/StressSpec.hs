@@ -69,6 +69,8 @@ checkWorld :: World -> IO ()
 checkWorld world = do
   readIORef (worldWrong world) `shouldReturn` 0
   looked <- readIORef (worldLookups world)
+  made <- readIORef (worldSerial world)
+  putStrLn ("the readers looked " <> show looked <> " keys up, and the loads and the writer's turns were " <> show made)
   (looked > 1000) `shouldBe` True
   found <- entries (worldCache world)
   nub (map fst found) `shouldBe` map fst found
@@ -95,6 +97,11 @@ data Tenants = Tenants
 
 keysOfTenants :: Int
 keysOfTenants = 30
+
+-- | How many turns the writer takes, and how many requests each of three parts makes.
+writerTurns, requestTurns :: Int
+writerTurns = 600000
+requestTurns = 150000
 
 newTenants :: IO Tenants
 newTenants = do
@@ -138,8 +145,10 @@ teardownAfter tenants requesters = race part ending >>> done
 checkTenants :: Tenants -> IO ()
 checkTenants tenants = do
   readIORef (tenantsViolations tenants) `shouldReturn` 0
-  readIORef (tenantsUsed tenants) >>= \used -> (used > 1000) `shouldBe` True
+  used <- readIORef (tenantsUsed tenants)
   created <- readIORef (tenantsCreated tenants)
+  putStrLn ("the requests used tenants " <> show used <> " times, of " <> show (length created) <> " that were made, and each was torn down")
+  (used > 1000) `shouldBe` True
   forM_ created $ \tenant -> do
     readIORef (tenantDown tenant) `shouldReturn` True
     inFlight (tenantLease tenant) `shouldReturn` 0
@@ -157,7 +166,7 @@ spec = describe "stress" $ do
           ( runCores 3 (pure world) $ \shared core -> case core of
               0 -> readerOf shared (const 0)
               1 -> readerOf shared (`mod` 16)
-              _ -> writerOf shared 150000
+              _ -> writerOf shared writerTurns
           )
       results `shouldBe` Just [(), (), ()]
       checkWorld world
@@ -165,7 +174,7 @@ spec = describe "stress" $ do
     itNeeds [Table, Cached] "give no reader a value of another key, with the parts as threads" $ do
       ensureCores
       world <- newWorld
-      results <- promptly (runThreads (together [readerOf world (const 0), readerOf world (`mod` 16), readerOf world (`mod` 5), writerOf world 150000]) ())
+      results <- promptly (runThreads (together [readerOf world (const 0), readerOf world (`mod` 16), readerOf world (`mod` 5), writerOf world writerTurns]) ())
       results `shouldBe` Just ()
       checkWorld world
 
@@ -177,9 +186,9 @@ spec = describe "stress" $ do
       results <-
         promptly
           ( runCores 4 (pure tenants) $ \shared core -> case core of
-              0 -> requests shared (`mod` 10) 40000 (positions !! 0)
-              1 -> requests shared (\n -> (n * 3) `mod` 10) 40000 (positions !! 1)
-              2 -> requests shared (\n -> (n * 7) `mod` keysOfTenants) 40000 (positions !! 2)
+              0 -> requests shared (`mod` 10) requestTurns (positions !! 0)
+              1 -> requests shared (\n -> (n * 3) `mod` 10) requestTurns (positions !! 1)
+              2 -> requests shared (\n -> (n * 7) `mod` keysOfTenants) requestTurns (positions !! 2)
               _ -> teardownAfter shared 3
           )
       results `shouldBe` Just [(), (), (), ()]
@@ -193,9 +202,9 @@ spec = describe "stress" $ do
         promptly
           ( runThreads
               ( together
-                  [ requests tenants (`mod` 10) 40000 (positions !! 0),
-                    requests tenants (\n -> (n * 3) `mod` 10) 40000 (positions !! 1),
-                    requests tenants (\n -> (n * 7) `mod` keysOfTenants) 40000 (positions !! 2),
+                  [ requests tenants (`mod` 10) requestTurns (positions !! 0),
+                    requests tenants (\n -> (n * 3) `mod` 10) requestTurns (positions !! 1),
+                    requests tenants (\n -> (n * 7) `mod` keysOfTenants) requestTurns (positions !! 2),
                     teardownAfter tenants 3
                   ]
               )
