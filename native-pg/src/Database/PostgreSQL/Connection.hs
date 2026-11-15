@@ -146,7 +146,7 @@ attempt = bounded connecting >>^ fromMaybe (Left TimedOut)
 
 -- | The step, with the settings' @connect_timeout@ as its deadline, if they have one: nothing if the deadline passed first.
 bounded :: (Runtime arr) => arr (ConnectSettings, a) b -> arr (ConnectSettings, a) (Maybe b)
-bounded body = limited ^>> ((body >>^ Just) ||| withinIn body)
+bounded body = limited ^>> ((body >>^ Just) ||| timeoutA body)
   where
     limited input@(settings, _) = case connectTimeout settings of
       Nothing -> Left input

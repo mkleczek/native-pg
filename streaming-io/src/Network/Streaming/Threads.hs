@@ -356,8 +356,8 @@ instance Time (ThreadsM m) where
 instance Within (ThreadsM m) where
   within (Duration limit) (Threads body) = Threads (\part value -> deadlined limit part (body part value))
   {-# INLINE within #-}
-  withinIn (Threads body) = Threads (\part (Duration limit, value) -> deadlined limit part (body part value))
-  {-# INLINE withinIn #-}
+  timeoutA (Threads body) = Threads (\part (Duration limit, value) -> deadlined limit part (body part value))
+  {-# INLINE timeoutA #-}
 
 -- | The action with a deadline of this many nanoseconds: nothing if the deadline passed first.
 deadlined :: Word64 -> Part -> IO a -> IO (Maybe a)

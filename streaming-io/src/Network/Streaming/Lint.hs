@@ -102,7 +102,7 @@ atNode met@(Met tree _ _) = case tree of
         | Just waiting <- [way]
       ]
   Within duration body -> deadline ("within " ++ readable duration) body
-  WithinIn body -> deadline "within the duration of its input" body
+  TimeoutA body -> deadline "within the duration of its input" body
   Race one two -> do
     stuck <- traverse (fmap isNothing . waitIn) [one, two]
     pure
@@ -272,7 +272,7 @@ combine tree inner = case tree of
   Try {} -> inOrder inner
   Shield {} -> inOrder inner
   Within {} -> inOrder inner
-  WithinIn {} -> inOrder inner
+  TimeoutA {} -> inOrder inner
   Wires {} -> inOrder inner
   End {} -> inOrder inner
   Allowing {} -> inOrder inner

@@ -118,8 +118,8 @@ instance (Arrow arr, Time arr) => Time (With r arr) where
 instance (Arrow arr, Within arr) => Within (With r arr) where
   within duration (With body) = With (within duration body)
   {-# INLINE within #-}
-  withinIn (With body) = With ((\(r, (duration, a)) -> (duration, (r, a))) ^>> withinIn body)
-  {-# INLINE withinIn #-}
+  timeoutA (With body) = With ((\(r, (duration, a)) -> (duration, (r, a))) ^>> timeoutA body)
+  {-# INLINE timeoutA #-}
 
 -- | What the scope acquires is acquired in the environment, and the release and the body are given both.
 instance (Arrow arr, Scope arr) => Scope (With r arr) where

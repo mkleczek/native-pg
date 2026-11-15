@@ -302,7 +302,7 @@ loaned body = scope acquire returning run
 waiting :: (Runtime arr) => arr ConnectionPool (Either PoolError Slot)
 waiting = now (\pool -> (\closed -> if closed then Left PoolClosed else Right pool) <$> isClosed (poolSlots pool)) >>> (arr Left ||| queueing)
   where
-    queueing = limited ^>> ((queue >>^ Right) ||| (withinIn queue >>^ maybe (Left CheckoutTimedOut) Right))
+    queueing = limited ^>> ((queue >>^ Right) ||| (timeoutA queue >>^ maybe (Left CheckoutTimedOut) Right))
     limited pool = case poolCheckoutTimeout (poolSettings pool) of
       Nothing -> Left pool
       Just limit -> Right (limit, pool)

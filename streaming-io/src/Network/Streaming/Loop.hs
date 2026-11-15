@@ -119,7 +119,7 @@ instance Within Loop where
       `Seq` First Clock
       `Seq` Race' (Arr snd `Seq` body) (Arr (\(Instant at, _) -> Until (Instant (at + limit))) `Seq` Block)
       `Seq` Arr (either Just (const Nothing))
-  withinIn body =
+  timeoutA body =
     Arr ((),)
       `Seq` First Clock
       `Seq` Race' (Arr (snd . snd) `Seq` body) (Arr (\(Instant at, (Duration limit, _)) -> Until (Instant (at + limit))) `Seq` Block)

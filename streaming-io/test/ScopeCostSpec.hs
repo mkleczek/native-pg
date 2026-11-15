@@ -110,7 +110,7 @@ spec = do
     -- The same cost as a deadline that the program fixes.
     copied name "a part that waits captures the catch of a deadline, which a deadline adds to each wait, until stage C of the frame-free scopes" $
       it "costs a loop in a deadline that the input gives no allocation in it" $
-        costsAtMost runner "deadline, input" tolerance yielding (\count -> (secs 3600,) ^>> withinIn (yielding count) >>> done)
+        costsAtMost runner "deadline, input" tolerance yielding (\count -> (secs 3600,) ^>> timeoutA (yielding count) >>> done)
 
     copied name "a part that waits captures the catch of tryA, which tryA adds to each wait, until stage C of the frame-free scopes" $
       it "costs a loop in tryA no allocation in it" $

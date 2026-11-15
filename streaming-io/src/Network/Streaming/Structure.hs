@@ -71,7 +71,7 @@ data Tree
   | -- | A body with a deadline.
     Within Duration Tree
   | -- | A body with a deadline that its input gives.
-    WithinIn Tree
+    TimeoutA Tree
   | -- | A box of its own: its label, the place in the code that named it, and its body.
     Named Label (Maybe SrcLoc) Tree
   | -- | A body with names for its input and output wires.
@@ -153,7 +153,7 @@ children = \case
   Shield inner -> [inner]
   Race one two -> [one, two]
   Within _ inner -> [inner]
-  WithinIn inner -> [inner]
+  TimeoutA inner -> [inner]
   Named _ _ inner -> [inner]
   Wires _ _ inner -> [inner]
   End _ _ inner -> [inner]

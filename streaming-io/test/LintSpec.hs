@@ -150,11 +150,11 @@ deadlines = describe "a deadline or a race" $ do
 
   -- A deadline whose duration is an input is a deadline too: the finding says so.
   it "whose duration is an input, over a body that can't wait, is found" $ do
-    report <- lint (withinIn quick :: Diagram (Duration, ()) (Maybe ()))
+    report <- lint (timeoutA quick :: Diagram (Duration, ()) (Maybe ()))
     (summary report, findingWhat <$> reportFindings report) `shouldBe` (([DeadlineWithoutWait], []), ["within the duration of its input"])
 
   it "whose duration is an input, over a body that waits, is not" $ do
-    report <- lint (withinIn (giveWay >>> quick) :: Diagram (Duration, ()) (Maybe ()))
+    report <- lint (timeoutA (giveWay >>> quick) :: Diagram (Duration, ()) (Maybe ()))
     summary report `shouldBe` ([], [])
 
   it "that has a side that can't wait is found, and one that has both sides wait is not" $ do

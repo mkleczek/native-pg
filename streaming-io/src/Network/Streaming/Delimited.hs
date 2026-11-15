@@ -180,8 +180,8 @@ instance Time (DelimitedM m s) where
 instance Within (DelimitedM m s) where
   within (Duration limit) (Delimited body) = Delimited (deadlined limit body)
   {-# INLINE within #-}
-  withinIn (Delimited body) = Delimited (\context (Duration limit, value) -> deadlined limit body context value)
-  {-# INLINE withinIn #-}
+  timeoutA (Delimited body) = Delimited (\context (Duration limit, value) -> deadlined limit body context value)
+  {-# INLINE timeoutA #-}
 
 -- | The body with a deadline of this many nanoseconds: nothing if the deadline passed first.
 deadlined :: Word64 -> (Context -> a -> IO b) -> Context -> a -> IO (Maybe b)

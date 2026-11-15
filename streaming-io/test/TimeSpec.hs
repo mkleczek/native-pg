@@ -335,13 +335,13 @@ spec = describe "time" $ do
 
 -- | The body with a deadline that its input gives.
 given :: (Rich arr) => Duration -> arr () b -> arr () (Maybe b)
-given duration body = const (duration, ()) ^>> withinIn body
+given duration body = const (duration, ()) ^>> timeoutA body
 
 -- | One body, whose deadline is the input's, which a short deadline cuts short and a long one doesn't, in one program.
 bothDeadlines :: (Rich arr) => arr () (Maybe Char, Maybe Char)
 bothDeadlines = (const (millis 10, ()) ^>> once) &&& (const (secs 10, ()) ^>> once)
   where
-    once = withinIn (sleep (millis 100) >>^ const 'x')
+    once = timeoutA (sleep (millis 100) >>^ const 'x')
 
 type Log = IORef [String]
 

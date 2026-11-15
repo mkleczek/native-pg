@@ -149,8 +149,8 @@ instance Time (CompiledM m) where
 instance Within (CompiledM m) where
   within (Duration limit) (Compiled body) = Compiled (deadlined limit body)
   {-# INLINE within #-}
-  withinIn (Compiled body) = Compiled (\context (Duration limit, value) next -> deadlined limit body context value next)
-  {-# INLINE withinIn #-}
+  timeoutA (Compiled body) = Compiled (\context (Duration limit, value) next -> deadlined limit body context value next)
+  {-# INLINE timeoutA #-}
 
 -- | The body with a deadline of this many nanoseconds, which goes on with nothing if the deadline passed first.
 deadlined :: Word64 -> (Context -> a -> (b -> IO Step) -> IO Step) -> Context -> a -> (Maybe b -> IO Step) -> IO Step
