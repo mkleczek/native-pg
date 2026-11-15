@@ -27,7 +27,7 @@ where
 import Control.Applicative ((<|>))
 import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
-import Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, rtsSupportsBoundThreads, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
@@ -350,9 +350,9 @@ waited = bump @m DescriptorWaits *> bump @m Armings
 instance Time (ThreadsM m) where
   clock = Threads (\_ () -> Instant <$> monotonicNanoseconds)
 
--- | The deadline is a timeout of GHC's timer manager, which cancels the scope when it fires, and a cancel scope
--- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another
--- passes through.
+-- | The deadline is a timeout of GHC's timer manager, or a thread that sleeps where the run time has none, which cancels
+-- the scope when it fires, and a cancel scope that the part is in while the body runs: the cancellation that ends it is
+-- recognised by it, and another passes through.
 instance Within (ThreadsM m) where
   within (Duration limit) (Threads body) = Threads (\part value -> deadlined limit part (body part value))
   {-# INLINE within #-}
@@ -363,10 +363,19 @@ instance Within (ThreadsM m) where
 deadlined :: Word64 -> Part -> IO a -> IO (Maybe a)
 deadlined limit part action = do
   scope' <- newScope
-  manager <- getSystemTimerManager
-  key <- registerTimeout manager (fromIntegral (limit `div` 1000)) (cancelScope scope')
-  outcome <- inScope part scope' action
-  unregisterTimeout manager key
+  let micros = fromIntegral (limit `div` 1000)
+  outcome <-
+    if rtsSupportsBoundThreads
+      then do
+        manager <- getSystemTimerManager
+        key <- registerTimeout manager micros (cancelScope scope')
+        result <- inScope part scope' action
+        result <$ unregisterTimeout manager key
+      else do
+        -- The non-threaded run time has no timer manager: a thread of its own sleeps, and is stopped with the deadline.
+        timer <- mask_ (forkIO (threadDelay micros *> cancelScope scope'))
+        result <- inScope part scope' action
+        result <$ uninterruptibleMask_ (killThread timer)
   case outcome of
     Right result -> pure (Just result)
     Left failure
