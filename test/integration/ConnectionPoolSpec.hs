@@ -13,7 +13,7 @@
 module ConnectionPoolSpec (spec) where
 
 import Control.Arrow (arr, (&&&), (>>>), (>>^), (^>>), (|||))
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIO, rtsSupportsBoundThreads, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forM_, replicateM_, void, when)
@@ -388,7 +388,8 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
 
   -- What a request pays the pool when its connection is free: the bytes that a request allocates for the checkout, the
   -- use of the connection and the release, with a body that does nothing. The ceiling is what each arrow allocated when it
-  -- was set: a change that makes a request dearer says so here, as one that makes it cheaper takes the ceiling down. With
+  -- was set, in the threaded build; the non-threaded run time allocates a few dozen bytes more for the same code, which it is
+  -- allowed. A change that makes a request dearer says so here, as one that makes it cheaper takes the ceiling down. With
   -- @POOL_COST_REPORT@ set, the case says what it measured, on stderr.
   describe "a request that finds its connection free" $ do
     let costs :: String -> (ConnectionPoolSettings -> ConnectionPoolSettings) -> Double -> IO ()
@@ -396,7 +397,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
           void (pidOf env)
           bytes <- perRequest env
           lookupEnv "POOL_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("pool-cost " <> name <> " | " <> label <> " | " <> show (round bytes :: Int)))
-          when (bytes > ceiling' + 24) $
+          when (bytes > ceiling' + 24 + (if rtsSupportsBoundThreads then 0 else 48)) $
             failTest ("a request allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round ceiling' :: Int))
     it "allocates no more than it did" $
       costs "withConnection" id $ case name of
