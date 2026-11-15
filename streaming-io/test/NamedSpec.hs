@@ -37,11 +37,6 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The stubs of inj, cases, ?> and _Case fail when they run: every case that needs one is expected to fail, and the mark
--- comes off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Named has stubs: inj, cases, ?> and _Case are not written yet"
-
 spec :: Spec
 spec = describe "fields named in their type" $ do
   it "makes a record from the values of a plain function, by the names in the order that they are given" $ do
@@ -137,25 +132,25 @@ spec = describe "fields named in their type" $ do
       run (is "size" (arr (const 8)) &&& is "name" (arr (const "tube")) >>> sized) `shouldReturn` "tube8"
       run (newRecord ["size", "name"] <$> arr (const 6) <*> arr (const "bar") >>> sized) `shouldReturn` "bar6"
 
-    stubbed $ it "hands each case of a choice of three to its branch, with its value, the rest of the record and a record" $ do
+    it "hands each case of a choice of three to its branch, with its value, the rest of the record and a record" $ do
       forM_ [(0, "ended GET /", "stream ended"), (404, "GET / refused 404", "refused"), (1000, "GET / good head 1000", "good")] $ \(number, expected, taken) -> do
         noted <- newLog
         run (const number ^>> heads noted) `shouldReturn` expected
         readLog noted `shouldReturn` [taken]
 
-    stubbed $ it "hands each case of a choice of four to its branch, with its value and the rest of the record" $ do
+    it "hands each case of a choice of four to its branch, with its value and the rest of the record" $ do
       forM_ [(5, "GET / tiny 5", "tiny"), (50, "GET / small 50", "small"), (500, "GET / medium 500", "medium"), (5000, "GET / large 5000", "large")] $ \(number, expected, taken) -> do
         noted <- newLog
         run (const number ^>> sizes noted) `shouldReturn` expected
         readLog noted `shouldReturn` [taken]
 
-    stubbed $ it "hands each case of a classification of a field to its branch, with casesBy" $ do
+    it "hands each case of a classification of a field to its branch, with casesBy" $ do
       forM_ [(200, "GET / ok 200", "ok"), (404, "GET / missing 404", "missing"), (503, "GET / broken 503", "broken")] $ \(status, expected, taken) -> do
         noted <- newLog
         run (const status ^>> classified noted) `shouldReturn` expected
         readLog noted `shouldReturn` [taken]
 
-    stubbed $ it "runs the arrow on the case of the name of a plain sum, with another type, and passes the other cases through" $ do
+    it "runs the arrow on the case of the name of a plain sum, with another type, and passes the other cases through" $ do
       noted <- newLog
       run (const (inj "failed" "boom" :: Outcome) ^>> _Case "failed" (tap (noting' noted "failed") >>^ length) >>^ showOutcome)
         `shouldReturn` "failed 4"
@@ -165,11 +160,11 @@ spec = describe "fields named in their type" $ do
         `shouldReturn` "done 7"
       readLog passed `shouldReturn` []
 
-    stubbed $ it "runs the arrow on the first case of a plain sum, and on the last, with _Case" $ do
+    it "runs the arrow on the first case of a plain sum, and on the last, with _Case" $ do
       run (const (inj "done" 7 :: Outcome) ^>> _Case "done" (arr show) >>^ showOutcome) `shouldReturn` "done \"7\""
       run (const (inj "failed" "boom" :: Outcome) ^>> _Case "failed" (arr (const True)) >>^ showOutcome) `shouldReturn` "failed True"
 
-    stubbed $ it "composes with at: at \"outcome\" . _Case \"failed\" runs the arrow on the case of a field that is a sum" $ do
+    it "composes with at: at \"outcome\" . _Case \"failed\" runs the arrow on the case of a field that is a sum" $ do
       noted <- newLog
       run (withOutcome (inj "failed" "boom") >>> (at "outcome" . _Case "failed") (tap (noting' noted "failed") >>^ length) >>^ \r -> (showOutcome r.outcome, r.kept))
         `shouldReturn` ("failed 4", True)

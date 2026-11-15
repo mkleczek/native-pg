@@ -54,14 +54,12 @@ module Network.Streaming.Named
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, (&&&), (>>^), (^>>))
-import Control.Exception (throw)
+import Control.Arrow (Arrow, ArrowChoice, arr, first, left, right, (&&&), (>>^), (^>>))
 import Data.Kind (Constraint)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
 import GHC.TypeLits (ErrorMessage (..), KnownSymbol, Symbol, TypeError, symbolVal)
 import Network.Streaming.Annotate (Annotate, giving, inout, taking)
-import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 
 -- | A value with its name in its type: one field of an anonymous record.
@@ -196,17 +194,17 @@ class Inj (name :: Symbol) a s where
 
 -- | The last case, which has the name.
 instance (a ~ b) => Inj name a (name := b) where
-  injWith _ = unwritten "inj"
+  injWith = Is
   {-# INLINE injWith #-}
 
 -- | The first case, when it has the name.
 instance {-# OVERLAPPING #-} (a ~ b) => Inj name a (Either (name := b) rest) where
-  injWith _ = unwritten "inj"
+  injWith = Left . Is
   {-# INLINE injWith #-}
 
 -- | A later case, found in the rest.
 instance (Inj name a rest) => Inj name a (Either other rest) where
-  injWith _ = unwritten "inj"
+  injWith = Right . injWith @name
   {-# INLINE injWith #-}
 
 -- | The last case, when it has another name: the choice has no case of the name.
@@ -228,12 +226,13 @@ class Distribute s r d | s r -> d, d r -> s where
 
 -- | The last case: its value, in front of the record.
 instance (r' ~ r) => Distribute (name := x) r (name := (name := x, r')) where
-  distribute _ _ = unwritten "cases"
+  distribute (Is x) r = Is (Is x, r)
   {-# INLINE distribute #-}
 
 -- | The first case, and the rest of them.
 instance (r' ~ r, Distribute rest r drest) => Distribute (Either (name := x) rest) r (Either (name := (name := x, r')) drest) where
-  distribute _ _ = unwritten "cases"
+  distribute (Left (Is x)) r = Left (Is (Is x, r))
+  distribute (Right rest) r = Right (distribute rest r)
   {-# INLINE distribute #-}
 
 -- | The sum that is the field of the name, with each case's value in front of the record, for the branches of a chain of
@@ -256,7 +255,7 @@ infixr 6 ?>
 -- the wire into it is called the name in diagrams. A chain of them, @"a" ?> p ||| "b" ?> q ||| "c" ?> r@, takes apart what
 -- 'cases' gives.
 (?>) :: forall name -> forall arr x r b. (Arrow arr, Annotate arr, KnownSymbol name) => arr (name := x, r) b -> arr (name := (name := x, r)) b
-(?>) name _ = unwritten ("?> " <> symbolVal (Proxy @name))
+(?>) name p = taking (symbolVal (Proxy @name)) ((\(Is a) -> a) ^>> p)
 {-# INLINE (?>) #-}
 
 -- | Runs an arrow on the case of the name of a choice, with a change of its type if the arrow has one.
@@ -265,17 +264,17 @@ class Case (name :: Symbol) s a b t | name s -> a, name s b -> t where
 
 -- | The last case, which has the name.
 instance (a ~ x, t ~ (name := b)) => Case name (name := x) a b t where
-  caseOf _ = unwritten "_Case"
+  caseOf p = (\(Is a) -> a) ^>> p >>^ Is
   {-# INLINE caseOf #-}
 
 -- | The first case, when it has the name: the rest passes through.
 instance {-# OVERLAPPING #-} (a ~ x, t ~ Either (name := b) rest) => Case name (Either (name := x) rest) a b t where
-  caseOf _ = unwritten "_Case"
+  caseOf p = left ((\(Is a) -> a) ^>> p >>^ Is)
   {-# INLINE caseOf #-}
 
 -- | A later case, found in the rest: the first case passes through.
 instance (Case name rest a b rest', t ~ Either other rest') => Case name (Either other rest) a b t where
-  caseOf _ = unwritten "_Case"
+  caseOf = right . caseOf @name
   {-# INLINE caseOf #-}
 
 -- | The last case, when it has another name: the choice has no case of the name.
@@ -287,7 +286,3 @@ instance {-# OVERLAPPABLE #-} (a ~ TypeError (NoCase name), t ~ TypeError (NoCas
 _Case :: forall name -> forall arr s t a b. (ArrowChoice arr, Annotate arr, KnownSymbol name, Case name s a b t) => arr a b -> arr s t
 _Case name p = caseOf @name (taking (symbolVal (Proxy @name)) p)
 {-# INLINE _Case #-}
-
--- | What the stubs fail with, until they are written.
-unwritten :: String -> a
-unwritten = throw . NotImplemented . ("Network.Streaming.Named: " <>)

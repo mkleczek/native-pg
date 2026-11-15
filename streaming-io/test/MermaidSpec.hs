@@ -37,10 +37,6 @@ beside (posting, collecting) = fst ^>> ((snd ^>> posting) &&& (fst ^>> collectin
 together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhere ()), ()) ()
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 
--- | The stub of ?> fails when the program is built, until it is written, and the mark comes off with it.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Named has stubs: ?> is not written yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -98,7 +94,7 @@ spec = describe "the chart" $ do
         ((inside, after) `elem` edgesOf chart) `shouldBe` True
       found -> failTest ("the chart has the steps " <> show found)
 
-  stubbed $ it "has the question of the decision and the names of the cases on the branches of a chain of ?>" $ do
+  it "has the question of the decision and the names of the cases on the branches of a chain of ?>" $ do
     chart <- chartOf (decide "how did the head end?" (cases "head") >>> ("stream ended" ?> quick ||| "refused" ?> quick ||| "good" ?> quick) :: Diagram ("head" := Either ("stream ended" := ()) (Either ("refused" := Int) ("good" := Bool))) ())
     [wiresNamed name chart | name <- ["stream ended", "refused", "good"]] `shouldBe` [1, 1, 1]
     any ("{\"how did the head end?\"}" `isInfixOf`) chart `shouldBe` True
