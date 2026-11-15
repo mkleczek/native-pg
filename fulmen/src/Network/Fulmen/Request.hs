@@ -12,6 +12,7 @@ where
 import Control.Arrow (Arrow, arr)
 import Data.ByteString (ByteString)
 import Network.Fulmen.Internal (Body (..), Call (..))
+import Network.Socket (SockAddr)
 
 -- | The head of a request, parsed whole into owned metadata.
 data Request = Request
@@ -19,7 +20,10 @@ data Request = Request
     -- | The request target exactly as it was received.
     target :: ByteString,
     version :: Version,
-    headers :: Headers
+    headers :: Headers,
+    -- | The address that the connection came from, as the server saw it: that of the proxy in front of the server, if
+    -- there is one.
+    peer :: SockAddr
   }
   deriving (Eq, Show)
 

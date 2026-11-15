@@ -20,11 +20,13 @@ module Network.Fulmen.Internal.Head
   )
 where
 
+import Control.Exception (throw)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as BU
 import Network.Fulmen.Internal.Bytes (commaList, equalsLower, isToken, lowerCase, trim)
 import Network.Fulmen.Request (Method (..), Request (..), Version (..))
+import Network.Streaming.NotImplemented (NotImplemented (..))
 
 -- | The bytes of a head that have been taken out of the buffer, so that the buffer can be received into again: how many,
 -- and the pieces, the latest first. A head that is more than the buffer is read in several of its fills.
@@ -124,7 +126,7 @@ parseHead bodyLimit owned = do
       keepsAlive = case version of
         Http11 -> not closes
         Http10 -> "keep-alive" `elem` options && not closes
-  Right (Parsed (Request method target version fields) framing keepsAlive)
+  Right (Parsed (Request method target version fields (throw (NotImplemented "the peer address of a request"))) framing keepsAlive)
 
 -- | The lines of a head, without their ends, up to the empty line.
 splitLines :: ByteString -> [ByteString]

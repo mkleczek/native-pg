@@ -25,6 +25,7 @@ import ConformanceCases
 import ConformanceWire
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Tuple (swap)
@@ -48,7 +49,7 @@ import System.IO.Error (ioeGetErrorString, isAlreadyInUseError)
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure
+spec = conformance *> counted *> listenerFailure *> peerAddress
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -95,6 +96,43 @@ listenerFailure =
         { Fulmen.openListener = now (const (ioError (userError "the listener failed"))),
           Fulmen.closeListener = now (const (pure ()))
         }
+
+-- | The request has the address that its connection came from, as the server saw it: the client's own address.
+peerAddress :: Spec
+peerAddress = describe "the peer address" $ forM_ runners $ \runner@(Runner runnerName _) ->
+  describe runnerName $
+    xfail "the peer address is not there yet (step 3)" $
+      it "of a request is the address that its client connected from" (peerOf runner)
+
+peerOf :: Runner -> IO ()
+peerOf (Runner _ runServer) =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+    Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen accepting 128
+    port <- Socket.socketPort accepting
+    cores <- Fulmen.newCores Fulmen.defaultSettings 1
+    stopped <- newEmptyMVar
+    let serving = runServer Fulmen.defaultSettings (Listening (Fulmen.borrowed accepting)) (Handling peerHandler) cores
+    bracket (forkFinally serving (putMVar stopped)) killThread $ \_ ->
+      withClient port $ \client -> do
+        own <- Socket.getSocketName (socket client)
+        let outcome = Outcome [ResponseExpect (Status 200) Nothing [] (BodyIs (C.pack (show own))) False] ConnOpen
+            c =
+              Case
+                { caseName = "the peer address",
+                  caseArea = ARequestLine,
+                  caseOrigin = Spec "the peer address of a request",
+                  caseHandler = Fail,
+                  caseSettings = noSettings,
+                  caseSteps = [Send "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"],
+                  caseExpect = [outcome],
+                  caseNote = ""
+                }
+        exchange c client stopped
+  where
+    -- Answers with the address of the peer, as the network package shows it.
+    peerHandler :: (Runtime arr) => arr (Call, Request) ()
+    peerHandler = (\(call, request) -> (call, (Fulmen.Status 200, [], C.pack (show (Fulmen.peer request))))) ^>> reply
 
 -- | How the server ended, if it did in time: the runner runs it with a handler that answers 200, on one core made for it.
 endedWith :: Runner -> Listening -> IO (Maybe (Either SomeException ()))
