@@ -147,9 +147,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
   describe "close" $
     forM_ [("without TLS", unix "postgres" Nothing), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
       describe label $ do
-        -- What listens needs the notifications.
-        let listening = needs "notifications"
-        listening $ it "rejects every operation after closing" $
+        it "rejects every operation after closing" $
           run $
             session connecting $
               steps
@@ -182,7 +180,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 ]
         -- The cancellation rule: v1 left the session unusable after a cancelled wait for a notification, but the reader
         -- is at a message boundary then and nothing is half sent or expected, so v2 leaves the connection usable.
-        listening $ it "keeps a connection usable when a wait for a notification is cancelled" $
+        it "keeps a connection usable when a wait for a notification is cancelled" $
           run $
             session connecting $
               steps
@@ -752,7 +750,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    needs "notifications" $ it "keeps the connection usable when a wait for a notification is cancelled, and delivers a later one" $
+    it "keeps the connection usable when a wait for a notification is cancelled, and delivers a later one" $
       run
         ( session (unix "postgres" Nothing) $
             alsoOn (unix "postgres" Nothing) $
@@ -774,7 +772,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
 
-  needs "notifications" $ describe "notifications" $ do
+  describe "notifications" $ do
     it "delivers a notification from another connection" $
       run
         ( session (unix "postgres" Nothing) $

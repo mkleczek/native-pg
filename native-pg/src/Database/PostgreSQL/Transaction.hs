@@ -91,7 +91,7 @@ import qualified Data.ByteString.Internal as BSI
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Kind (Type)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import Data.Word (Word8)
 import Database.PostgreSQL.Connection.Internal
@@ -325,7 +325,7 @@ type Replies =
      FramedMessage 'I' ('PayloadStruct '[]),
      FramedMessage 'N' ('PayloadStruct '[]),
      FramedMessage 'S' ('PayloadStruct '[]),
-     FramedMessage 'A' ('PayloadStruct '[]),
+     FramedMessage 'A' 'RemainingBytesAtom,
      FramedMessage '3' ('PayloadStruct '[]),
      FramedMessage 'n' ('PayloadStruct '[]),
      FramedMessage 't' ('PayloadStruct '[]),
@@ -339,8 +339,8 @@ data Event
   | -- | A CommandComplete: its tag, which is a view of the buffer.
     Complete !ByteString
   | EmptyQuery
-  | -- | An ErrorResponse: its body, copied.
-    Rejected !ByteString
+  | -- | An ErrorResponse or a NotificationResponse, as its tag says: its body, copied.
+    Rare !Word8 !ByteString
   | -- | A ReadyForQuery: the byte of its status.
     Ready !Int
   | Other
@@ -357,11 +357,11 @@ events =
                 :> (fixed >>^ Ready)
                 :> other
                 :> other
-                :> (remaining >>^ Rejected)
+                :> rare
                 :> arr (const EmptyQuery)
                 :> other
                 :> other
-                :> other
+                :> rare
                 :> other
                 :> other
                 :> other
@@ -372,6 +372,9 @@ events =
   where
     other :: (Arrow a) => a b Event
     other = arr (const Other)
+    -- Both bodies are copied whole, and the tag, which the copy takes the cursor past, is looked at first. The one arrow
+    -- serves both messages, so that the reply cursor has no arm more than it had.
+    rare = Rare <$> now (\(At reader _) -> lastTag reader) <*> remaining
 
 -- | What the transaction makes of a message: what the reading goes on with.
 data Step
@@ -430,7 +433,7 @@ settleEvent tx = \case
   Row cursor -> Rowed cursor <$ modify tx (\s -> s {stRows = stRows s + 1})
   Complete tag -> answered tx (Just tag)
   EmptyQuery -> answered tx Nothing
-  Rejected body -> rejected tx body
+  Rare tag body -> if tag == notificationResponseTag then notified tx body else rejected tx body
   Ready status -> Synced <$ modify tx (\s -> s {stOwed = False, stStatus = status, stPending = []})
 
 -- | The statement that was being read is answered: it is done, and its tag is kept if the program may ask for it.
@@ -463,10 +466,16 @@ acknowledged tx = do
 awaiting :: Tx -> Word8 -> IO Step
 awaiting tx tag = lastTag (txReader tx) >>= \found -> if found == tag then answered tx Nothing else pure Stepped
 
--- | The tags of ParseComplete and CloseComplete, as numbers.
-parseCompleteTag, closeCompleteTag :: Word8
+-- | The tags of ParseComplete, CloseComplete and NotificationResponse, as numbers.
+parseCompleteTag, closeCompleteTag, notificationResponseTag :: Word8
 parseCompleteTag = 0x31
 closeCompleteTag = 0x33
+notificationResponseTag = 0x41
+
+-- | A notification arrived among the replies: its body is kept, for the next wait of the connection for a notification,
+-- and nothing waits for it here.
+notified :: Tx -> ByteString -> IO Step
+notified tx body = Stepped <$ keepNotification (connectionSession (txConnection tx)) body
 
 -- | The tag of the message that was framed last, which is five bytes before the bytes in hand when nothing of its body
 -- is taken, as is so for the messages that no cursor reads.
@@ -778,9 +787,23 @@ parametersOf given = (map paramType given,map paramFormat given,) <$> traverse (
 -- | Sends what was laid out, in the loan of the transaction, whose buffer the replies are read into when it is sent.
 transmit :: (Runtime arr) => With Tx arr Output ()
 transmit =
-  withTx (\tx output -> pure (sessionCarrier (connectionSession (txConnection tx)), loanBuffer (txLoan tx), output))
+  withTx (\tx output -> setAside tx >> pure (sessionCarrier (connectionSession (txConnection tx)), loanBuffer (txLoan tx), output))
     >>> lift sendOutput
-    >>> modifying (\s -> s {stSending = False})
+    >>> inTx (\tx -> bringBack tx >> modify tx (\s -> s {stSending = False}))
+
+-- | The buffer is rendered into, so what the reader holds of what the server sent after its last message goes to the
+-- connection first: the notification that came after the last reply of a pipeline is not lost to the next pipeline.
+setAside :: Tx -> IO ()
+setAside tx = do
+  held <- pastLastMessage (txReader tx)
+  unless (BS.null held) (leaveCarry (connectionSession (txConnection tx)) held)
+
+-- | The reader starts with what the connection kept: what was set aside, and what the use before left, which the first
+-- send of a transaction finds, since the reader of a new transaction has nothing in hand.
+bringBack :: Tx -> IO ()
+bringBack tx = do
+  kept <- takeCarry (connectionSession (txConnection tx))
+  unless (BS.null kept) (seedReader (txReader tx) kept)
 
 -- | A statement of the transaction's own, as a pipeline of its own: ROLLBACK or COMMIT, read as the pipeline's
 -- statements are.
@@ -912,7 +935,14 @@ leaving =
     planned (tx, Recover) = Right tx
     planned (tx, Keep) = Left (tx, Nothing)
     planned (tx, Break why) = Left (tx, Just why)
-    settled (tx, why) = tx <$ settle (connectionSession (txConnection tx)) why
+    settled (tx, why) = do
+      when (isNothing why) (keepWhatCame tx)
+      settle (connectionSession (txConnection tx)) why
+      pure tx
+    -- A connection that goes on keeps what the server sent after the last message that the transaction read.
+    keepWhatCame tx = do
+      came <- pastLastMessage (txReader tx)
+      unless (BS.null came) (leaveCarry (connectionSession (txConnection tx)) came)
     recovering = alongside (tryA ((, ()) ^>> with cleanup)) >>> now (uncurry recovered)
     recovered rolledBack tx = settled (tx, either (Just . ("the transaction could not be rolled back: " <>) . displayException) (const Nothing) rolledBack)
 
