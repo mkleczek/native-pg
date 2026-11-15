@@ -20,7 +20,7 @@
 -- they wait for lands.
 module IntegrationSpec (spec) where
 
-import Control.Arrow (arr, second, (&&&), (>>>), (>>^), (^>>))
+import Control.Arrow (arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (IOException, SomeException, bracket, catch, displayException, finally)
@@ -346,6 +346,57 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         `shouldReturn` ("connection to server on socket \"" <> socketPath <> "\" failed: server is not in hot standby mode")
       -- With no standby to prefer, the primaries are tried again.
       withString (local "target_session_attrs=prefer-standby") done `shouldReturn` ()
+    -- connect and cancel take their settings as input: one arrow, built once, serves the settings of each run.
+    needs "settings as input" $ describe "settings as input" $ do
+      let connectingWith :: [ConnectSettings] -> (forall arr. (Runtime arr) => OnConn arr b) -> IO [Either ConnectFailure b]
+          connectingWith settingsList body = run (acrossSettings (onSettings body) settingsList)
+          reasons :: [Either ConnectFailure b] -> [Either String b]
+          reasons = map (either (Left . displayException) Right)
+      it "connects with the settings of each run, one after the other, and a failure of one doesn't disturb the next" $ do
+        one <- settingsOf (local "application_name=one")
+        two <- settingsOf (local "application_name=two")
+        wrong <- settingsOf (local "user=native_pg_scram password=wrong")
+        results <- connectingWith [one, two, wrong, one] (arr (lookup "application_name" . PG.serverParameters . PG.serverInfo . fst))
+        map (\result -> (rejection result, either (const Nothing) id result)) results
+          `shouldBe` [(Nothing, Just "one"), (Nothing, Just "two"), (Just "28P01", Nothing), (Nothing, Just "one")]
+      it "takes the TLS mode and the TLS client from the settings of each run" $ do
+        secured <- settingsOf (tcp "sslmode=require")
+        unencrypted <- settingsOf (local "")
+        results <- connectingWith [secured, unencrypted, secured {connectTlsClient = Nothing}, secured] encrypted
+        reasons results
+          `shouldBe` [ Right (Right [True]),
+                       Right (Right [False]),
+                       Left ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in"),
+                       Right (Right [True])
+                     ]
+      it "takes connect_timeout from the settings of each run, and has none for settings that have none" $
+        withSilentServer $ \silent -> do
+          slow <- settingsOf ("host=" <> Char8.pack silent <> " connect_timeout=1")
+          unlimited <- settingsOf (local "")
+          started <- getMonotonicTime
+          results <- connectingWith [slow, unlimited] done
+          elapsed <- subtract started <$> getMonotonicTime
+          reasons results
+            `shouldBe` [Left ("connection to server on socket \"" <> silent <> "/.s.PGSQL.5432\" failed: timeout expired"), Right ()]
+          elapsed `shouldSatisfy` (P.gte 0.9 P.&& P.lt 5)
+      it "takes the hosts from the settings of each run" $ do
+        missing <- settingsOf "host=/nonexistent-1,/nonexistent-2"
+        fallback <- settingsOf ("host=/nonexistent," <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres")
+        results <- connectingWith [missing, fallback, missing] (arr (hostName . PG.connectedHost . fst))
+        map (either (\(ConnectFailure failures) -> Left (length failures)) Right) results `shouldBe` [Left 2, Right directory, Left 2]
+      it "cancels with the settings of each run" $ do
+        settings <- settingsOf (tcp "sslmode=require")
+        withPlaintextServer $ \plaintext -> do
+          refusing <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
+          run $
+            session (unix "postgres" Nothing) $
+              steps
+                [ (concurrently (query sleeping) (after (millis 300) (cancelledWith settings)) >>^ serverCode . fst) `yields` Just "57014",
+                  cancelledWith refusing
+                    `failsAs` \case
+                      TlsFailure reason -> reason `shouldBe` "server does not support SSL, but SSL was required"
+                      other -> failTest ("expected TlsFailure, got " <> show other)
+                ]
     describe "with TLS" $ do
       let encryptedBy string = withString (tcp string) encrypted
       it "encrypts with sslmode=require, without verifying the server" $
@@ -1057,6 +1108,30 @@ sleepFor duration = done >>> sleep duration
 -- connection.
 cancelling :: (Runtime arr) => ConnectSettings -> OnConn arr ()
 cancelling settings = PG.cancelKey . fst ^>> PG.cancel settings
+
+-- | Cancels the statement that runs on the connection, with the settings that the input gives: one arrow for any settings.
+cancelWith :: (Runtime arr) => arr (ConnectSettings, Connection) ()
+cancelWith = (\(settings, connection) -> (settings, PG.cancelKey connection)) ^>> PG.cancelIn
+
+-- | The cancel of the connection of a step, over a connection of its own that is made to the settings.
+cancelledWith :: (Runtime arr) => ConnectSettings -> OnConn arr ()
+cancelledWith settings = (\(connection, _) -> (settings, connection)) ^>> cancelWith
+
+-- | The body on a connection made to the settings that the input gives, with the loans after them, closed when the body
+-- ends: the connection that 'session' makes, for settings that come at run time. A failure to connect is a value.
+onSettings :: (Runtime arr) => OnConn arr b -> arr (ConnectSettings, Loans) (Either ConnectFailure b)
+onSettings body = scope PG.connectIn (fst ^>> (done ||| PG.close)) ((\(connected, (_, loans)) -> fmap (,loans) connected) ^>> (arr Left ||| (body >>^ Right)))
+
+-- | The step on each of the settings in turn, whichever its number: one arrow, which takes the settings that it connects
+-- with from its input.
+acrossSettings :: (Runtime arr) => arr (ConnectSettings, Loans) b -> [ConnectSettings] -> arr Loans [b]
+acrossSettings step settingsList = (\loans -> (settingsList, loans, [])) ^>> iterateA following
+  where
+    following = untried ^>> (returnA ||| tried)
+    untried (remaining, loans, results) = case remaining of
+      [] -> Left (Finish (reverse results))
+      settings : others -> Right ((settings, loans), (others, loans, results))
+    tried = first step >>^ \(result, (others, loans, results)) -> Again (others, loans, result : results)
 
 -- | With two connections, the second ends the backend of the first. The process id is the text of a parameter.
 terminatingTheFirst :: (Runtime arr) => arr ((Connection, Connection), Loans) (Either QueryError [Bool])

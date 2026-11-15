@@ -44,6 +44,7 @@ module Database.PostgreSQL.Connection
     -- * Connections
     Connection,
     connect,
+    connectIn,
     close,
     ServerInfo (..),
     serverProcessId,
@@ -54,6 +55,7 @@ module Database.PostgreSQL.Connection
     CancelKey,
     cancelKey,
     cancel,
+    cancelIn,
   )
 where
 
@@ -82,6 +84,7 @@ import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes (Effect (..), Exit (..), Link (receive), Room, Runtime, Scope (..), Within (..), roomOf, secs)
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, iterateA)
 import Network.Streaming.Loans (Loans, withSetupBuffersOf)
+import Network.Streaming.NotImplemented (notImplemented)
 import Network.Streaming.PositiveInt (positiveInt)
 
 -- | Connects to the first of the settings' hosts that qualifies: the settings' own, then the settings of its fallbacks,
@@ -108,6 +111,11 @@ connect settings = case connectTargetSessionAttrs settings of
     -- The loans go to the second pass if the first found no host.
     retry (result, loans) = either (const (Left loans)) Right result
     outcome = either (Left . ConnectFailure) Right
+
+-- | 'connect' for settings that are the arrow's input, with the loans after them: one program, built once, connects with the
+-- settings of each run.
+connectIn :: (Runtime arr) => arr (ConnectSettings, Loans) (Either ConnectFailure Connection)
+connectIn = notImplemented "connect with its settings as input"
 
 -- | The first of the hosts that connects, or why each of them didn't, in order. The hosts are known when the program is
 -- built, so each one's attempt is an arrow of its own, which the one before it runs if it fails.
@@ -307,6 +315,10 @@ cancel settings =
     ^>> (done ||| (bounded (requesting settings) >>> now (maybe (throwIO TimedOut) (either throwIO pure))))
   where
     bounded = maybe (>>^ Just) (within . secs . fromIntegral) (connectTimeout settings)
+
+-- | 'cancel' for settings that are the arrow's input, with the key after them.
+cancelIn :: (Runtime arr) => arr (ConnectSettings, CancelKey) ()
+cancelIn = notImplemented "cancel with its settings as input"
 
 -- | The request on a connection of its own, with TLS or without as the settings say, which is closed when the step ends,
 -- however it ends.
