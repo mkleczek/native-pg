@@ -35,6 +35,8 @@ jobs:
           gh release download v0.15.4 --repo rustls/rustls-ffi --pattern 'librustls_*_amd64.deb.zip' --dir "$RUNNER_TEMP"
           unzip -d "$RUNNER_TEMP" "$RUNNER_TEMP"/librustls_*_amd64.deb.zip
           sudo apt-get install -y "$RUNNER_TEMP"/librustls_*_amd64.deb
+      - name: Install c-ares
+        run: sudo apt-get install -y libc-ares-dev
       - name: Install PostgreSQL
         # The integration tests start their own cluster with initdb and pg_ctl
         run: |
