@@ -28,13 +28,14 @@ import Data.Int (Int64)
 import Data.Text (Text)
 import Database.PostgreSQL.Connection (ConnectSettings)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), connectionPoolSettings, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), connectionPoolSettings)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import Network.Socket (PortNumber)
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.PositiveInt (positiveInt)
 import Skeletest
+import TestPools
 import TestPrograms
 
 spec :: FilePath -> PortNumber -> Spec
@@ -311,7 +312,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
 
     it "gives CheckoutTimedOut to a checkout that waits longer than the pool's timeout, and doesn't lose the connection" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-      withConnectionPool ((connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) {poolCheckoutTimeout = Just (millis 50)}) $ \pool -> do
+      withPool runner buffers ((connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) {poolCheckoutTimeout = Just (millis 50)}) $ \pool -> do
         let env = Env runner buffers pool
         -- The only connection is held by the outer request, so the inner one waits for it.
         onEnv env (viaPool pool (snd ^>> viaPool pool done))
@@ -320,7 +321,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
 
     it "gives PoolClosed to a checkout after the pool has ended" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-      pool <- withConnectionPool (connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) pure
+      pool <- withPool runner buffers (connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) pure
       runOn runner buffers (viaPool pool done) `shouldReturn` Left PoolClosed
 
 -- * The pool of the cases
@@ -340,7 +341,7 @@ onEnv env = runOn (envRunner env) (envBuffers env)
 withEnv :: Runner -> ConnectSettings -> Int -> (Env -> IO a) -> IO a
 withEnv runner settings size use = do
   buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-  withConnectionPool (connectionPoolSettings size settings) $ \pool -> use (Env runner buffers pool)
+  withPool runner buffers (connectionPoolSettings size settings) $ \pool -> use (Env runner buffers pool)
 
 -- | The body in a request: a connection of the pool, which the body uses and gives back. A pool that has none is the
 -- program's failure.

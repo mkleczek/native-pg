@@ -26,7 +26,7 @@ import Data.UUID (UUID)
 import Data.Word (Word64)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), connectSettings)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), PoolStats (..), closeConnectionPool, connectionPoolSettings, connectionPoolStats, maintain, newConnectionPool, newMaintenance, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), PoolStats (..), closeConnectionPool, connectionPoolSettings, connectionPoolStats, maintain, newConnectionPool, newMaintenance, withConnection)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats)
@@ -51,7 +51,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       pooled :: (ConnectionPoolSettings -> ConnectionPoolSettings) -> (Env -> IO a) -> IO a
       pooled change use = do
         buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-        withConnectionPool (change (connectionPoolSettings 1 settings)) $ \pool -> use (Env runner buffers pool)
+        withPool runner buffers (change (connectionPoolSettings 1 settings)) $ \pool -> use (Env runner buffers pool)
       -- What the server says a backend is doing, asked on a connection of its own: no row once the backend is gone.
       stateOf :: Int64 -> IO (Either QueryError [Text])
       stateOf pid =
@@ -88,7 +88,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
 
     it "gives PoolClosed once the pool is closed, though a request still holds its connection" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-      (pool, holder) <- withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> (pool,) <$> startHolding (Env runner buffers pool)
+      (pool, holder) <- withPool runner buffers (connectionPoolSettings 1 settings) $ \pool -> (pool,) <$> startHolding (Env runner buffers pool)
       -- The pool's bracket has ended while the request holds the only connection, so the checkout doesn't wait for it.
       runOn runner buffers (viaPool pool done) `shouldReturn` Left PoolClosed
       finishHolding holder
@@ -105,24 +105,24 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
     it "lends each pool of a run its own connections, in one program" $ do
       buffers <- buffersOf
-      withConnectionPool (applicationPool "one") $ \one -> withConnectionPool (applicationPool "two") $ \two ->
+      withPool runner buffers (applicationPool "one") $ \one -> withPool runner buffers (applicationPool "two") $ \two ->
         runOn runner buffers (across applicationOf [one, two, one])
           `shouldReturn` [Right (Right ["one"]), Right (Right ["two"]), Right (Right ["one"])]
     it "takes the checkout timeout from the pool of each run" $ do
       buffers <- buffersOf
-      withConnectionPool ((applicationPool "one") {poolCheckoutTimeout = Just (millis 100)}) $ \limited -> withConnectionPool (applicationPool "two") $ \unlimited ->
+      withPool runner buffers ((applicationPool "one") {poolCheckoutTimeout = Just (millis 100)}) $ \limited -> withPool runner buffers (applicationPool "two") $ \unlimited ->
         runOn runner buffers (across holdingThenAsking [limited, unlimited])
           `shouldReturn` [Right (Just (Left CheckoutTimedOut)), Right Nothing]
     it "gives PoolClosed for a pool that is closed, and serves the pool that isn't, in the same program" $ do
       buffers <- buffersOf
-      shut <- withConnectionPool (applicationPool "one") pure
-      withConnectionPool (applicationPool "two") $ \open ->
+      shut <- withPool runner buffers (applicationPool "one") pure
+      withPool runner buffers (applicationPool "two") $ \open ->
         runOn runner buffers (across applicationOf [shut, open, shut])
           `shouldReturn` [Left PoolClosed, Right (Right ["two"]), Left PoolClosed]
 
   -- Pools are values that are made and closed without waiting, and their maintenance is an arrow that a program runs: the cases
   -- that follow are those of closing and ageing, for pools made as values, with 'maintain' run as a part.
-  needs "pools as values" $ describe "a pool that is a value" $ do
+  describe "a pool that is a value" $ do
     let buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
         lasting change = withPool' (change (connectionPoolSettings 1 settings))
         withPool' settings' use = buffersOf >>= \buffers -> withPool runner buffers settings' (\pool -> use (Env runner buffers pool))
@@ -275,7 +275,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
     it "counts the connection that a request is making as opening" $
       withSilentServer $ \silent -> do
         buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-        withConnectionPool (connectionPoolSettings 1 (connectSettings (UnixAddress (silent </> ".s.PGSQL.5432")) "postgres")) $ \pool -> do
+        withPool runner buffers (connectionPoolSettings 1 (connectSettings (UnixAddress (silent </> ".s.PGSQL.5432")) "postgres")) $ \pool -> do
           _ <- forkIO (void (runOn runner buffers (withinFor (secs 2) (viaPool pool done))))
           eventually 3 ((== PoolStats 0 0 1) <$> connectionPoolStats pool) `shouldReturn` True
           -- The request gave up: its slot is empty and free again.
@@ -298,7 +298,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       attempts <- newIORef 0
       buffers <- buffersOf
       withScripted [counting attempts refusal, counting attempts accepting] $ \port ->
-        withConnectionPool (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 150})) $ \pool -> do
+        withPool runner buffers (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 150})) $ \pool -> do
           started <- getMonotonicTime
           runOn runner buffers (viaPool pool done) `shouldReturn` Right ()
           ended <- getMonotonicTime
@@ -309,7 +309,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       attempts <- newIORef 0
       buffers <- buffersOf
       withScripted (repeat (counting attempts refusal)) $ \port ->
-        withConnectionPool (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 60})) $ \pool -> do
+        withPool runner buffers (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 60})) $ \pool -> do
           runOn runner buffers (withinFor (millis 500) (viaPool pool done)) `shouldReturn` Nothing
           tried <- readIORef attempts
           (tried >= 3 && tried < 12) `shouldBe` True
@@ -320,7 +320,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       attempts <- newIORef 0
       buffers <- buffersOf
       withScripted [counting attempts refusal, counting attempts accepting] $ \port ->
-        withConnectionPool (poolTo port id) $ \pool -> do
+        withPool runner buffers (poolTo port id) $ \pool -> do
           runOn runner buffers (viaPool pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
           readIORef attempts `shouldReturn` 1
 
@@ -328,7 +328,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       attempts <- newIORef 0
       buffers <- buffersOf
       withScripted [counting attempts rejected, counting attempts accepting] $ \port ->
-        withConnectionPool (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 50})) $ \pool -> do
+        withPool runner buffers (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 50})) $ \pool -> do
           runOn runner buffers (viaPool pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
           readIORef attempts `shouldReturn` 1
 
@@ -369,7 +369,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
 
     it "closes the connection that a request still has, as the request gives it back" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-      (pool, holder) <- withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> (pool,) <$> startHolding (Env runner buffers pool)
+      (pool, holder) <- withPool runner buffers (connectionPoolSettings 1 settings) $ \pool -> (pool,) <$> startHolding (Env runner buffers pool)
       -- The pool's bracket has ended while the request holds the only connection: it is still open.
       stateOf (holderBackend holder) `shouldReturn` Right ["idle"]
       finishHolding holder
@@ -402,7 +402,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
 
     it "leaves a connection to the request that has it, though it is older than the lifetime, and closes it once it is given back" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-      withConnectionPool ((connectionPoolSettings 1 settings) {poolLifetime = Just (millis 300)}) $ \pool -> do
+      withPool runner buffers ((connectionPoolSettings 1 settings) {poolLifetime = Just (millis 300)}) $ \pool -> do
         holder <- startHolding (Env runner buffers pool)
         threadDelay 900000
         stateOf (holderBackend holder) `shouldReturn` Right ["idle"]
@@ -461,7 +461,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
     it "tells of a connection that can't be made" $ do
       (events, change) <- observed id
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-      withConnectionPool (change (connectionPoolSettings 1 (unixSettings (socketPath <> "-missing") "postgres" Nothing))) $ \pool ->
+      withPool runner buffers (change (connectionPoolSettings 1 (unixSettings (socketPath <> "-missing") "postgres" Nothing))) $ \pool ->
         runOn runner buffers (viaPool pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
       said events `shouldReturn` ["connecting", "terminated: network error"]
 

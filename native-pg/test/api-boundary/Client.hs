@@ -4,6 +4,7 @@
 module Client where
 
 import Control.Arrow ((***), (>>>), (^>>))
+import Control.Exception (bracket)
 import Data.Int (Int64)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings, Connection, cancelKey, connectSettings, connectedHost, serverInfo)
 import Database.PostgreSQL.ConnectionString (ConnectionString, fromConnectionString)
@@ -13,7 +14,7 @@ import Database.PostgreSQL.Diagnostics ()
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectionError (..), PoolError (..), QueryError, UsageError (..))
 import Database.PostgreSQL.Encoders (Parameter (..))
 import Database.PostgreSQL.Notifications (Notification, listen, notification)
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings, connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings, Maintenance, closeConnectionPool, connectionPoolSettings, maintain, newConnectionPool, newMaintenance, withConnection)
 import Database.PostgreSQL.Session.Settings ()
 import Database.PostgreSQL.Snippet (fromSnippet)
 import Database.PostgreSQL.Transaction
@@ -72,8 +73,13 @@ settingsOf = Right (connectSettings (UnixAddress "/tmp") "postgres")
 hostOf :: Connection -> (Bool, Bool)
 hostOf connection = (serverInfo connection `seq` True, connectedHost connection `seq` cancelKey connection `seq` True)
 
+-- | A pool that lasts for the use, as a program that wants a lexical pool makes one.
 poolFor :: ConnectionPoolSettings -> (ConnectionPool -> IO a) -> IO a
-poolFor = withConnectionPool
+poolFor settings use = newMaintenance >>= \maintenance -> bracket (newConnectionPool maintenance settings) closeConnectionPool use
+
+-- | The part that looks after the pools of a maintenance.
+maintained :: Runtime arr => arr Maintenance ()
+maintained = maintain
 
 poolOf :: ConnectSettings -> ConnectionPoolSettings
 poolOf = connectionPoolSettings 4

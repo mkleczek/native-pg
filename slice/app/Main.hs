@@ -27,20 +27,22 @@
 module Main (main) where
 
 import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Exception (bracket)
 import Control.Monad (void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Database.PostgreSQL.Connection (ConnectSettings)
 import Database.PostgreSQL.ConnectionString (Defaults (..), fromConnectionString, readConnectionString)
-import Database.PostgreSQL.Pool (ConnectionPool, connectionPoolSettings, withConnection, withConnectionPool)
+import Data.Maybe (isJust)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), Maintenance, closeConnectionPool, connectionPoolSettings, maintain, newConnectionPool, newMaintenance, withConnection)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
 import Network.Fulmen (Call, Method (..), Request (..))
 import qualified Network.Fulmen as Fulmen
 import qualified Network.Socket as Socket
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
-import Network.Streaming.Classes (Effect (..), Runtime, Scope (..), Stream (..))
+import Network.Streaming.Classes (Concurrent (..), Effect (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateWith, keeping)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Counters (Counts, counterName, toList)
@@ -236,6 +238,11 @@ listening (host, port) info = tcp {Fulmen.openListener = Fulmen.openListener tcp
 connectSettingsOf :: String -> IO ConnectSettings
 connectSettingsOf uri = readConnectionString (Defaults "localhost" Nothing) (C.pack uri) >>= either die (either die pure . fromConnectionString)
 
+-- | The server, and the maintenance of the pools beside it if a pool has a lifetime or an idle time: one more part of the
+-- server's scope, so that its sleep is cancelled with the rest when the server ends.
+maintained :: (Runtime arr) => Bool -> Maintenance -> arr a () -> arr a ()
+maintained limited maintenance server = if limited then together [server, const maintenance ^>> maintain] else server
+
 positive :: Int -> IO PositiveInt
 positive n = maybe (die ("not a positive count: " <> show n)) pure (mkPositiveInt (toInteger n))
 
@@ -268,14 +275,20 @@ main = do
       listener = listening listen info
   shared <- Fulmen.newCores settings runningCores
   -- The arrow is known where the handler is built, so that GHC specialises it to the arrow.
-  withConnectionPool (connectionPoolSettings (optPool options) connect) $ \pool -> case (optMode options, optRuntime options) of
-    (Release, Threads) -> runThreads (Fulmen.serve settings listener (handler (counted @'Release) pool)) shared
-    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings listener (handler (counted @'Release) pool)))
-    (Release, Compiled) -> void (runCompiled (Fulmen.serve settings listener (handler (counted @'Release) pool)) shared)
+  maintenance <- newMaintenance
+  let poolSettings = connectionPoolSettings (optPool options) connect
+      -- The pool is closed when the server ends. Its maintenance, if its connections have limits, runs beside the server, on the
+      -- first core of the runners that have several.
+      limited = isJust (poolLifetime poolSettings) || isJust (poolIdleTime poolSettings)
+      maintainedOn core = if core == (0 :: Int) then maintained limited maintenance else id
+  bracket (newConnectionPool maintenance poolSettings) closeConnectionPool $ \pool -> case (optMode options, optRuntime options) of
+    (Release, Threads) -> runThreads (maintained limited maintenance (Fulmen.serve settings listener (handler (counted @'Release) pool))) shared
+    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> maintainedOn core (Fulmen.serve settings listener (handler (counted @'Release) pool))))
+    (Release, Compiled) -> void (runCompiled (maintained limited maintenance (Fulmen.serve settings listener (handler (counted @'Release) pool))) shared)
 #if defined(DEBUG_MODE)
-    (Debug, Threads) -> runThreadsM @'Debug (Fulmen.serve settings listener (handler (counted @'Debug) pool)) shared
-    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings listener (handler (counted @'Debug) pool)))
-    (Debug, Compiled) -> void (runCompiledM @'Debug (Fulmen.serve settings listener (handler (counted @'Debug) pool)) shared)
+    (Debug, Threads) -> runThreadsM @'Debug (maintained limited maintenance (Fulmen.serve settings listener (handler (counted @'Debug) pool))) shared
+    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> maintainedOn core (Fulmen.serve settings listener (handler (counted @'Debug) pool))))
+    (Debug, Compiled) -> void (runCompiledM @'Debug (maintained limited maintenance (Fulmen.serve settings listener (handler (counted @'Debug) pool))) shared)
 #else
     (Debug, _) -> die "this build has no debug mode: build the slice with -f debug-mode"
 #endif

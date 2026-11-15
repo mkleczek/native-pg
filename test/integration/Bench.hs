@@ -17,12 +17,13 @@
 module Main (main) where
 
 import Control.Arrow (returnA, (>>>), (>>^), (^>>))
+import Control.Exception (bracket)
 import Control.Monad (forM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int32)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), connectSettings)
-import Database.PostgreSQL.Pool (ConnectionPool, connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings, closeConnectionPool, connectionPoolSettings, newConnectionPool, newMaintenance, withConnection)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
@@ -79,7 +80,7 @@ main = do
     let settings = (connectSettings (UnixAddress socketPath) "postgres") {connectDatabase = Just "postgres"}
     buffers <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @4) (positiveInt @2) (positiveInt @2))
     -- The tables that the fields are made of: 352 rows of about 46 bytes in JSON, which is 16 KiB, and 22,500, which is 1 MiB.
-    withConnectionPool (connectionPoolSettings 1 settings) $ \pool ->
+    withPool (connectionPoolSettings 1 settings) $ \pool ->
       runThreads
         ( commands
             buffers
@@ -96,7 +97,12 @@ main = do
     printf "%-10s %-22s %12s %14s\n" ("arrow" :: String) ("workload" :: String) ("tx/s" :: String) ("bytes/tx" :: String)
     forM_ runners $ \(name, run) -> forM_ [minBound .. maxBound] $ \workload ->
       -- A pool for each measurement, so that its connection is made under the arrow that measures it.
-      withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> measure name workload (requestsOf workload * scale) (run workload buffers pool)
+      withPool (connectionPoolSettings 1 settings) $ \pool -> measure name workload (requestsOf workload * scale) (run workload buffers pool)
+
+-- | The use, with a pool of the settings that is closed when it ends: the bench's pools have no lifetime, so no maintenance
+-- is run.
+withPool :: ConnectionPoolSettings -> (ConnectionPool -> IO a) -> IO a
+withPool settings use = newMaintenance >>= \maintenance -> bracket (newConnectionPool maintenance settings) closeConnectionPool use
 
 -- | A statement that gives one number, and ones that give one JSON value, of the tables' rows, as a field.
 build :: (Runtime arr) => Workload -> BufferPool -> ConnectionPool -> arr () ()

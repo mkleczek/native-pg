@@ -9,15 +9,14 @@
 -- request waits for is a slot, in the order that requests came, and its deadline is the pool's checkout timeout or
 -- the arrow's own. What happens to each connection is told to the pool's observer, if it has one.
 --
--- A connection is closed when it is older than the pool's lifetime, and when nobody has used it for the pool's idle time, by
--- a thread of the pool's own, which looks at the connections that are free, a few times in the shortest of the two, and
--- never at one that a request has. It is the one thread that waits in IO, to sleep between its looks: a request waits only
--- through the arrow that runs it.
+-- A pool is a value, made and closed in IO that never waits. A connection is closed when it is older than the pool's lifetime,
+-- and when nobody has used it for the pool's idle time, by 'maintain', which is one arrow for all the pools that are registered
+-- with a 'Maintenance': a part that the server runs beside its others, which sleeps with the arrow's clock, looks at the
+-- connections that are free a few times in the shortest of the limits, and never at one that a request has.
 module Database.PostgreSQL.Pool
   ( ConnectionPoolSettings (..),
     connectionPoolSettings,
     ConnectionPool,
-    withConnectionPool,
     withConnection,
     Maintenance,
     newMaintenance,
@@ -35,9 +34,8 @@ module Database.PostgreSQL.Pool
 where
 
 import Control.Arrow (arr, first, (***), (>>>), (>>^), (^>>), (|||))
-import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, threadDelay)
-import Control.Exception (ErrorCall (..), SomeException, bracket, finally, mask_, throwIO, toException, try)
-import Control.Monad (forever, replicateM, void, when)
+import Control.Exception (ErrorCall (..), SomeException, finally, throwIO, toException, try)
+import Control.Monad (replicateM, void, when)
 import System.IO (fixIO)
 import Data.Tuple (swap)
 import qualified Data.ByteString.Char8 as BC
@@ -55,11 +53,10 @@ import Database.PostgreSQL.Internal.Carrier (isQuiet)
 import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Data.Word (Word64)
-import Network.Streaming.Classes (Block (..), Duration (..), Effect (..), Event (..), Exit (..), GiveWay (..), Race (..), Runtime, Scope (..), Time (..), Within (..), giving, millis, monotonicNanoseconds, plus, taking)
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, iterateA, keeping, step, tap)
+import Network.Streaming.Classes (Block (..), Duration (..), Effect (..), Event (..), Exit (..), GiveWay (..), Instant (..), Race (..), Runtime, Scope (..), Time (..), Within (..), giving, micros, millis, monotonicNanoseconds, plus, taking)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, foreverA, iterateA, keeping, step, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
-import Network.Streaming.NotImplemented (notImplemented, notImplementedIO)
 import Network.Streaming.Pool (Pool, PoolError (..), closePoolWith, free, isClosed, newPool, queueAt, releaseNow, takeNow, urgently)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 
@@ -109,7 +106,11 @@ data ConnectionPool = ConnectionPool
     -- | When the soft limit was last cut, and until when no connection is made after a refusal, on the monotonic clock, in
     -- nanoseconds.
     poolBackedOff :: !(IORef Word64),
-    poolPausedUntil :: !(IORef Word64)
+    poolPausedUntil :: !(IORef Word64),
+    -- | When the maintenance last looked at the pool for its idle time, on the monotonic clock, in nanoseconds.
+    poolLastLook :: !(IORef Word64),
+    -- | The maintenance that the pool is registered with, and its place there, until it is closed.
+    poolRegistration :: !(IORef (Maybe (Maintenance, Int)))
   }
 
 -- | A place for a connection, which is empty until it is made, and empty again once it is broken, and the identifier that the
@@ -130,18 +131,28 @@ data Slot = Slot
 observe :: ConnectionPoolSettings -> Observation -> IO ()
 observe settings event = maybe (pure ()) ($ event) (poolObserver settings)
 
--- | The body, with a pool that keeps its connections. The pool is closed when the body ends, however it ends: the
--- connections that are free close, and each of the others closes as the request that has it gives it back, and a checkout
--- after that is 'PoolClosed'. A request that waits for a connection when the pool closes is served by one that comes
--- back, and its connection closes when it gives it back.
+-- | The pools whose connections have a lifetime or an idle time, which one arrow, 'maintain', looks after: the pools, each with
+-- how often it is to be looked at, and what the next place is.
+data Maintenance = Maintenance !(IORef [Registered]) !(IORef Int)
+
+-- | A pool that is registered: its place, how often it is looked at, in microseconds, and the look at it, which is given the
+-- time.
+data Registered = Registered !Int !Int (Word64 -> IO ())
+
+-- | A maintenance with no pool.
+newMaintenance :: IO Maintenance
+newMaintenance = Maintenance <$> newIORef [] <*> newIORef 0
+
+-- | A pool, made without waiting: its slots are empty until a request first has them, and it is registered with the
+-- maintenance if it has a lifetime or an idle time, until it is closed. The maintenance keeps it until then.
 --
 -- A connection is made under the arrow of the request that first has its slot, and is set up with the buffers of a pool
 -- of the pool's own, which needn't be the request's: for each slot an ordinary buffer, so that every connection can be
 -- made at once, and a setup buffer, and one buffer that is kept in reserve, as a request's pool does. They are the size
 -- of a connection's read buffer, 16 KiB with the usual settings, so a pool of 10 connections has 21 of them, which is
 -- 336 KiB.
-withConnectionPool :: ConnectionPoolSettings -> (ConnectionPool -> IO a) -> IO a
-withConnectionPool settings use = do
+newConnectionPool :: Maintenance -> ConnectionPoolSettings -> IO ConnectionPool
+newConnectionPool maintenance settings = do
   buffers <-
     newBufferPool
       BufferPoolSettings
@@ -151,16 +162,15 @@ withConnectionPool settings use = do
           setupBufferCount = positive (size + overflow)
         }
   -- The slots know the pool that they are of, so the pool is made by the knot: nothing looks at it until it is made.
-  connectionPool <-
+  pool <-
     fixIO $ \self -> do
       slots <- replicateM size (slotOf self False)
       extra <- replicateM overflow (slotOf self True)
-      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0
-  let closing = closePoolWith (closeSlot settings ReleaseConnectionTerminationReason "the pool is closed")
-  bracket
-    (maintaining connectionPool)
-    (\maintenance -> traverse_ killThread maintenance *> closing (poolSlots connectionPool) *> closing (poolOverflow connectionPool))
-    (const (use connectionPool))
+      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing
+  case maintenancePeriod settings of
+    Nothing -> pure ()
+    Just period -> register maintenance period (lookAt pool) >>= \place -> writeIORef (poolRegistration pool) (Just (maintenance, place))
+  pure pool
   where
     size = max 1 (poolSize settings)
     overflow = max 0 (poolMaxOverflow settings)
@@ -168,27 +178,38 @@ withConnectionPool settings use = do
     positive :: Int -> PositiveInt
     positive number = fromMaybe (positiveInt @1) (mkPositiveInt (toInteger number))
 
--- | The pools whose connections have a lifetime or an idle time, which one arrow, 'maintain', looks after.
-data Maintenance = Maintenance
-
--- | A maintenance with no pool.
-newMaintenance :: IO Maintenance
-newMaintenance = pure Maintenance
-
--- | A pool, made without waiting: its slots are empty until a request first has them, and it is registered with the
--- maintenance if it has a lifetime or an idle time.
-newConnectionPool :: Maintenance -> ConnectionPoolSettings -> IO ConnectionPool
-newConnectionPool _ _ = notImplementedIO "newConnectionPool"
-
 -- | Closes the pool, without waiting: a checkout after it is 'PoolClosed', the connections that are free close now, and each of
--- the others as the request that has it gives it back. It is taken out of its maintenance.
+-- the others as the request that has it gives it back, and a request that waits for a connection when the pool closes is served
+-- by one that comes back. It is taken out of its maintenance. Closing it again changes nothing.
 closeConnectionPool :: ConnectionPool -> IO ()
-closeConnectionPool _ = notImplementedIO "closeConnectionPool"
+closeConnectionPool pool = do
+  registration <- atomicModifyIORef' (poolRegistration pool) (\registered -> (Nothing, registered))
+  traverse_ (\(maintenance, place) -> unregister maintenance place) registration
+  closing (poolSlots pool)
+  closing (poolOverflow pool)
+  where
+    closing = closePoolWith (closeSlot (poolSettings pool) ReleaseConnectionTerminationReason "the pool is closed")
 
--- | Looks after the pools of the maintenance for ever: it sleeps, and then closes the connections that are free and past their
--- lifetime or idle time. A part that the server runs beside its others.
+-- | Registers the pool's look, which is made every this many microseconds, and says its place.
+register :: Maintenance -> Int -> (Word64 -> IO ()) -> IO Int
+register (Maintenance pools places) period look = do
+  place <- atomicModifyIORef' places (\next -> (next + 1, next))
+  atomicModifyIORef' pools (\registered -> (Registered place period look : registered, ()))
+  pure place
+
+-- | Takes the pool at the place out of the maintenance.
+unregister :: Maintenance -> Int -> IO ()
+unregister (Maintenance pools _) place = atomicModifyIORef' pools (\registered -> ([one | one@(Registered kept _ _) <- registered, kept /= place], ()))
+
+-- | Looks after the pools of the maintenance for ever, as one part: it sleeps, by the arrow's clock, as long as the shortest
+-- period that a pool asks for (a second if there is none), and then looks at each pool, which closes the connections that are
+-- free and past their lifetime or idle time, without waiting. A cancellation reaches the part where it sleeps, and a look is
+-- not interrupted. A part that the server runs beside its others.
 maintain :: (Runtime arr) => arr Maintenance ()
-maintain = notImplemented "maintain"
+maintain = foreverA (tap (now periodOf >>> sleepIn) >>> tap (keeping clock >>> now (\(Instant at, maintenance) -> lookAtAll at maintenance)))
+  where
+    periodOf (Maintenance pools _) = (\registered -> micros (fromIntegral (minimum (1000000 : [period | Registered _ period _ <- registered])))) <$> readIORef pools
+    lookAtAll at (Maintenance pools _) = readIORef pools >>= traverse_ (\(Registered _ _ look) -> void (try @SomeException (look at)))
 
 -- | Closes the connection that the slot holds, if it has one, for the reason, which is then told to the observer. The slot is
 -- empty.
@@ -203,13 +224,6 @@ closeSlot settings reason because slot =
           observe settings (ConnectionObservation identifier (TerminatedConnectionStatus reason))
       )
 
--- | The thread that closes the connections that are free when they are old or idle, if the pool has a lifetime or an idle time.
--- It sleeps between its looks, and a look is not interrupted: it is masked, so that the slots it took are given back.
-maintaining :: ConnectionPool -> IO (Maybe ThreadId)
-maintaining pool = case maintenancePeriod (poolSettings pool) of
-  Nothing -> pure Nothing
-  Just period -> Just <$> mask_ (forkIOWithUnmask (\unmask -> forever (unmask (threadDelay period) *> (void (try @SomeException (look pool))))))
-
 -- | How often the pool looks at its connections, in microseconds: four times in the shortest of the lifetime and the idle
 -- time, and not more often than every 10 milliseconds, or less often than every second.
 maintenancePeriod :: ConnectionPoolSettings -> Maybe Int
@@ -220,20 +234,25 @@ maintenancePeriod settings = case catMaybes [poolLifetime settings, poolIdleTime
 nanoseconds :: Duration -> Word64
 nanoseconds (Duration count) = count
 
--- | One look at the connections that are free: those that are older than the lifetime, or that were given back more than the
--- idle time ago, are closed. A slot is taken from the pool for the look, and is the looker's alone while it is, so that no
--- request has the connection that is closed; they are given back in the order that they were taken in, so that the pool lends
--- them as it did.
-look :: ConnectionPool -> IO ()
-look pool = do
-  now' <- monotonicNanoseconds
-  epoch <- atomicModifyIORef' (poolEpoch pool) (\count -> (count + 1, count + 1))
-  taken <- takeAll []
-  traverse_ (expire now' epoch) taken `finally` traverse_ (\slot -> releaseNow (poolSlots pool) [slot]) (reverse taken)
+-- | One look at the connections that are free, at the time: those that are older than the lifetime, or that were given back more
+-- than the idle time ago, are closed. A slot is taken from the pool for the look, and is the looker's alone while it is, so
+-- that no request has the connection that is closed; they are given back in the order that they were taken in, so that the
+-- pool lends them as it did. The idle time is told in looks, which the pool counts once for each of its own periods, and not
+-- more often, though the maintenance looks as often as the shortest period of its pools asks.
+lookAt :: ConnectionPool -> Word64 -> IO ()
+lookAt pool now' = do
+  lastLook <- readIORef (poolLastLook pool)
+  let due = now' - lastLook >= period
+  when due (writeIORef (poolLastLook pool) now')
+  when (due || isJust (poolLifetime settings)) $ do
+    epoch <- if due then atomicModifyIORef' (poolEpoch pool) (\count -> (count + 1, count + 1)) else readIORef (poolEpoch pool)
+    taken <- takeAll []
+    traverse_ (expire epoch) taken `finally` traverse_ (\slot -> releaseNow (poolSlots pool) [slot]) (reverse taken)
   where
     settings = poolSettings pool
+    period = maybe 0 ((* 1000) . fromIntegral) (maintenancePeriod settings)
     takeAll taken = takeNow (poolSlots pool) 1 >>= maybe (pure (reverse taken)) (\slot -> takeAll (slot : taken))
-    expire now' epoch slot = do
+    expire epoch slot = do
       opened <- readIORef (slotOpened slot)
       used <- readIORef (slotUsed slot)
       case () of
@@ -244,7 +263,7 @@ look pool = do
               closeSlot settings IdlenessConnectionTerminationReason "the connection was idle for the pool's idle time" slot
           | otherwise -> pure ()
     -- How many looks make the idle time, rounded up.
-    idleEpochs idle = maybe 0 (\period -> fromIntegral ((nanoseconds idle + period * 1000 - 1) `div` (period * 1000))) (fromIntegral <$> maintenancePeriod settings)
+    idleEpochs idle = maybe 0 (\period' -> fromIntegral ((nanoseconds idle + period' * 1000 - 1) `div` (period' * 1000))) (fromIntegral <$> maintenancePeriod settings)
 
 -- | The body, with a connection of the pool that is the arrow's input, for as long as it runs, and with the input of the
 -- body after the pool: one program, built once, serves the pool of each run, as a tenant's pool is. The connection is lent as
