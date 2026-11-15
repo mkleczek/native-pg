@@ -159,9 +159,8 @@ data UsageError
     -- the declared length, and at least as many as were delivered. The message
     -- it belongs to is incomplete, so the connection is broken.
     StreamLengthError Int Int
-  | -- | A pipeline was to be sent while it is read, which takes a second buffer, and the request has none to lend: what the
-    -- program streams from holds its primary buffer, and the transaction works in the one that is left. Only a pipeline whose
-    -- one result is the statement that streams is sent from the transaction's buffer. Nothing was sent.
+  | -- | A pipeline was to be sent while it is read, which takes a second buffer, and the request had none to lend. Nothing raises
+    -- it any more: the sender takes a setup buffer of the pool then. It is kept for the programs that name it.
     NoBufferToSend
   deriving (Eq, Show)
 

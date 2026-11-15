@@ -106,6 +106,7 @@ import Data.Kind (Type)
 import qualified Data.List as List
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
+import Data.Tuple (Solo (MkSolo))
 import Data.Word (Word8)
 import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..), InPlace)
@@ -143,7 +144,7 @@ import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Buffer (Buffer (bufferCapacity))
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, _1, _2, alongside, boolA, concurrently, consume, done, iterateA, iterateWith, keeping, on, tap, through, undoing)
-import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, loanIsPrimary, loansOf, release)
+import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, loanIsPrimary, loansOf, release, withSetupBuffersOf)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity, readerMemory)
 import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
@@ -738,8 +739,8 @@ foldRows step start result = const start ^>> iterateA (keeping (nextRow result) 
 -- A larger one, or one whose statements declare a stream, is sent while it is read, in two parts of a group: the request side,
 -- which renders into a buffer that it borrows and pulls the streams, and the reading program. The failure of either part
 -- cancels the other where it waits. A request that has no buffer to lend, since a stream holds its primary, sends in turn from
--- the buffer of the transaction the pipeline whose one result is the statement that streams, and refuses any other pipeline that
--- is sent while it is read with 'NoBufferToSend', before anything is sent.
+-- the buffer of the transaction the pipeline whose one result is the statement that streams, and sends any other pipeline that
+-- is sent while it is read from a setup buffer of the pool, which the request side takes for as long as it sends.
 pipeline :: (Runtime arr) => Ending -> Pipeline arr p a -> (a -> With Tx arr x y) -> With Tx arr (p, x) y
 pipeline finality (Pipeline _ sent value) reading =
   tap (done >>> moved >>> readyToSend)
@@ -753,10 +754,10 @@ pipeline finality (Pipeline _ sent value) reading =
     numbered = numberStreams sent
     program = reading (value 0)
     inTurn = consume transmit >>> program
-    -- At once with the reading when the request can lend a buffer to send from. Else, in turn from the transaction's own buffer, if
-    -- the one statement of the pipeline that gives a result is the one that streams, and else it is refused, and what was laid out is
-    -- undone, since nothing was sent.
-    apart = withTx (\tx sending -> if loanIsPrimary (txLoan tx) then pure (Left sending) else if streamsAlone then pure (Right sending) else refused tx) >>> (atOnce ||| onBuffer)
+    -- At once with the reading, from a buffer that the request lends, or else, when it has none to lend, from a setup buffer of the
+    -- pool. Except that the pipeline whose one result is the statement that streams is sent in turn from the transaction's own
+    -- buffer, if the request has none to lend, which costs no second buffer.
+    apart = withTx (\tx sending -> pure (if loanIsPrimary (txLoan tx) || not streamsAlone then Left sending else Right sending)) >>> (atOnce ||| onBuffer)
     -- What the reader holds and what the connection kept are put together before the parts start, as a send in turn does it
     -- around its rendering, and nothing is rendered into the buffer of the reader after.
     atOnce =
@@ -764,9 +765,17 @@ pipeline finality (Pipeline _ sent value) reading =
         >>> sharing (regrouped ^>> concurrently (fst ^>> request) (snd ^>> program) >>^ snd)
     regrouped (output, input, rest) = ((input, output), rest)
     request =
-      withTx (\tx (input, output) -> pure (carrierOf tx, Borrowed (loansOf (txLoan tx)), input, output))
-        >>> lift (sendStreamed (selecting (concatMap puller sent)))
+      withTx (\tx (input, output) -> pure (roomFor tx input output))
+        >>> (lift pulling ||| lift (withSetupBuffersOf lent))
         >>> inTx (\tx -> writeIORef (txSending tx) False)
+    pulling = sendStreamed (selecting (concatMap puller sent))
+    -- A request that can lend a buffer has the sender borrow it. One that can't, since a stream holds its primary and the transaction
+    -- has the one loan that is left, has it take a setup buffer of the pool, which no request's loan comes from: it is the last
+    -- that the request waits for, and whoever has one waits for nothing that a request holds, so the wait is over when it ends.
+    roomFor tx input output
+      | loanIsPrimary (txLoan tx) = Left (carrierOf tx, Borrowed (loansOf (txLoan tx)), input, output)
+      | otherwise = Right (loansOf (txLoan tx), (carrierOf tx, input, output))
+    lent = (\(MkSolo buffer, (_, (carrier, input, output))) -> (carrier, Given buffer, input, output)) ^>> pulling
     -- Sent in turn with the reading, as a send in turn is, from the buffer of the transaction: the request had no other to lend.
     onBuffer =
       regrouped
@@ -869,15 +878,6 @@ resolved :: p -> Statement arr p row -> Statement arr p row
 resolved parameters = \case
   Made {stream, rows, made} -> case made parameters of (text, given) -> Statement {sql = text, params = const given, stream, rows}
   given -> given
-
--- | The pipeline that was laid out is refused: it is undone, as nothing was sent, so that the transaction ends as if the pipeline had
--- not been tried, and its failure is 'NoBufferToSend'. BEGIN was laid out with it if the transaction had not begun, which is when
--- the pipeline's statements start at the first place.
-refused :: Tx -> IO a
-refused tx = do
-  modify tx (\s -> s {stBegun = stBase s == 0, stFinal = False, stPending = [], stOwed = False})
-  writeIORef (txSending tx) False
-  throwIO NoBufferToSend
 
 -- | The statement that ends a transaction: ROLLBACK if it is condemned, else COMMIT, as its SQL, which the errors name, and
 -- the messages that carry it.

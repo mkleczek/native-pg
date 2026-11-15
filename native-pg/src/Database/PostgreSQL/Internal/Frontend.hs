@@ -75,8 +75,8 @@ sync = serialize Sync
 
 -- | Where a send that has holes renders what it sends: into a buffer that it borrows from the loans of the request for each part
 -- that it renders, and gives back before it pulls a stream, or into the buffer of a loan that its caller holds, which stays the
--- caller's.
-data Room = Borrowed Loans | Held Loan
+-- caller's, or into a buffer that its caller was given for the whole send, as a setup buffer of the pool is.
+data Room = Borrowed Loans | Held Loan | Given Buffer
 
 -- | What a send that has holes has in hand: the carrier, where the writer's buffer is, what the streams' state is taken from, the
 -- writer, and what the streams have given.
@@ -116,9 +116,9 @@ sendStreamed pull =
   (\(carrier, room, input, output) -> Streamed carrier room input (outputWriter output) BS.empty 0 0)
     ^>> iterateA (burst >>> next')
   where
-    -- A loan that was borrowed is given back, and one that was held is not.
-    burst = scope (streamRoom ^>> roomed) (fst ^>> (done ||| release)) (now (renderStreamed . first (either id id)) >>> shown ^>> consume sendPieces)
-    roomed = (\case Held loan -> Left loan; Borrowed loans -> Right loans) ^>> (arr Left ||| (borrow >>^ Right))
+    -- A loan that was borrowed is given back, and a buffer that was held or given is not.
+    burst = scope (streamRoom ^>> roomed) (fst ^>> (done ||| release)) (now (renderStreamed . first (either id loanBuffer)) >>> shown ^>> consume sendPieces)
+    roomed = (\case Held loan -> Left (loanBuffer loan); Given buffer -> Left buffer; Borrowed loans -> Right loans) ^>> (arr Left ||| (borrow >>^ Right))
     shown (Showing carrier pieces following) = ((carrier, pieces), following)
     sendPieces = somePieces ^>> (returnA ||| sendAll)
     somePieces (carrier, pieces) = if null pieces then Left () else Right (carrier, pieces)
@@ -153,13 +153,12 @@ sendStreamed pull =
     carried (Taking state _ _) = not (BS.null (streamCarry state))
     pulled = alongside ((\(Taking state tag _) -> (tag `shiftR` 1, streamInput state)) ^>> pull) >>^ swap
     fromCarry = arr (\(Taking state tag left) -> (Taking state {streamCarry = BS.empty} tag left, Just (streamCarry state)))
-    renderStreamed :: (Loan, Streamed p) -> IO (Showing p)
-    renderStreamed (loan, state@Streamed {streamCarrier, streamWriter}) =
+    renderStreamed :: (Buffer, Streamed p) -> IO (Showing p)
+    renderStreamed (buffer, state@Streamed {streamCarrier, streamWriter}) =
       withForeignPtr (bufferMemory buffer) (\pointer -> runWriter streamWriter pointer (bufferCapacity buffer) 0) >>= \case
         Finished used -> pure (showing used [] Over)
         NeedSpace used rest -> pure (showing used [] (Resume state {streamWriter = rest}))
         Yield used (UncopiedBytes long) rest -> pure (showing used [long] (Resume state {streamWriter = rest}))
         Hole used tag size rest -> pure (showing used [] (Holed state {streamWriter = rest} tag size))
       where
-        buffer = loanBuffer loan
         showing used following = Showing streamCarrier ([view buffer used | used > 0] <> following)
