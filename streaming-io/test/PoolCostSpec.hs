@@ -49,17 +49,12 @@ spec = describe "a loan of a free item" $ forM_ runners $ \runner -> describe (r
     when (bytes > runnerCeiling runner + tolerance) $
       failTest ("a loan allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round (runnerCeiling runner) :: Int))
 
-  armedOnWaiting $ it "costs no more with a deadline than without one" $ do
+  it "costs no more with a deadline than without one" $ do
     pool <- newPool [7 :: Int]
     without <- perLoan runner (\count -> times count (withLoan pool done >>> done))
     with <- perLoan runner (\count -> times count (withLoanWithin (secs 3600) pool done >>> done))
     reported runner "withLoanWithin" with
     atMostMore tolerance without with
-
--- | Marks a case that waits for the deadline to be armed only when the checkout has to wait: a deadline is armed now for every
--- checkout. The mark comes off when it is, and a case that then passes unexpectedly fails the suite.
-armedOnWaiting :: Spec -> Spec
-armedOnWaiting = xfail "a deadline on a checkout is armed when it has to wait, and not before"
 
 -- | The most that a loan with a deadline may allocate more than one without, in bytes: a few words, for the noise of the
 -- count, which is none in practice.

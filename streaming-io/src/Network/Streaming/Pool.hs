@@ -87,7 +87,8 @@ withLoan :: (Runtime arr) => Pool c -> arr (c, a) b -> arr a (Either PoolError b
 withLoan pool = loaned pool (checkout pool >>^ Just)
 
 -- | The same, but the checkout gives up after the time: 'CheckoutTimedOut',
--- once its place in the queue is given up.
+-- once its place in the queue is given up. The deadline is armed only if the
+-- checkout has to wait: an item that is free is lent as 'withLoan' lends it.
 withLoanWithin :: (Runtime arr) => Duration -> Pool c -> arr (c, a) b -> arr a (Either PoolError b)
 withLoanWithin limit pool = loaned pool (checkoutWithin limit pool)
 
@@ -275,16 +276,33 @@ checkoutAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange 
 checkoutAt =
   named (Label "checkoutAt" "Takes an item of the pool if enough are free, and else queues for one and waits.") $
     giveWay
-      >>> giving "item free?" (step "claim from free items" claim)
-      >>> (taking "no" queue ||| taking "yes" returnA)
+      >>> giving "item free?" (step "claim from free items" claimAtNow)
+      >>> (taking "no" queueAt ||| taking "yes" returnA)
+
+-- | The same, but the checkout gives up after the time, once its place in the queue is given up: 'Nothing'. The deadline
+-- is armed when the checkout has to wait, and an item that is free is taken without it.
+checkoutAtWithin :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Within arr) => Duration -> arr (Int, Pool conn) (Maybe conn)
+checkoutAtWithin limit =
+  named (Label "checkoutAtWithin" "Takes an item of the pool if enough are free, and else queues for one and waits for it until the deadline.") $
+    giveWay
+      >>> giving "item free?" (step "claim from free items" claimAtNow)
+      >>> (taking "no" (within limit queueAt) ||| taking "yes" (arr Just))
+
+-- | The item, if at least this many are free, and else the input again.
+claimAtNow :: (Int, Pool conn) -> IO (Either (Int, Pool conn) conn)
+claimAtNow input@(need, Pool ref _) = either (const (Left input)) Right <$> update ref (claimOne need)
+
+-- | Queues for an item that is only given when at least this many are free, and waits for it: the part that is cancelled
+-- while it waits gives up its place, and an item that was given to it meanwhile goes back to the pool. The item that
+-- was released between the first look and the queueing is taken at once.
+queueAt :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr (Int, Pool conn) conn
+queueAt =
+  keeping ticket
+    >>> giving "item free?" (step "queue promise" queueing)
+    >>> ( taking "no" (waited (step "return item" (\(pool, item) -> releaseNow pool [item])))
+            ||| taking "yes" returnA
+        )
   where
-    claim input@(need, Pool ref _) = either (const (Left input)) Right <$> update ref (claimOne need)
-    queue =
-      keeping ticket
-        >>> giving "item free?" (step "queue promise" queueing)
-        >>> ( taking "no" (waited (step "return item" (\(pool, item) -> releaseNow pool [item])))
-                ||| taking "yes" returnA
-            )
     queueing ((awaiting, promise), (need, pool@(Pool ref _))) =
       either (Left . (pool,)) Right <$> update ref (queueOrClaim need awaiting promise)
     queueOrClaim need awaiting promise state = case claimOne need state of
@@ -315,9 +333,9 @@ checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
         ^>> (returnA ||| (swap ^>> first abandon >>> now (\(fulfilled, pool) -> maybe (pure ()) (releaseNow pool) fulfilled)))
 
 -- | A connection, if one is free within the time, as 'checkout' waits for it: 'Nothing' if it isn't, once the
--- place in the queue is given up.
+-- place in the queue is given up. The deadline is armed only if the checkout has to wait.
 checkoutWithin :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Within arr) => Duration -> Pool conn -> arr () (Maybe conn)
-checkoutWithin limit pool = within limit (checkout pool)
+checkoutWithin limit pool = const (1, pool) ^>> checkoutAtWithin limit
 
 -- | An item if at least this many are free, without waiting: the part that takes it passes no waiter, for none that can be
 -- served is queued.
