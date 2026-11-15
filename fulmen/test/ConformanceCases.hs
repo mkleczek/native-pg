@@ -806,6 +806,48 @@ headLimitCases =
       [Send (getWith (replicate 3 ("X-Big: " <> B.replicate 400 98)))]
       [stays [okHeaders "GET" "/" (hostLocal : replicate 3 ("X-Big", B.replicate 400 98))]]
       & withSettings noSettings {lineLimit = Just 1024, headLimit = Just 2048}
+  , mk AHeadLimits (Spec "the limits are settings, whatever the size of the buffer")
+      "with the default settings a header line of 40000 bytes is served"
+      Headers
+      [Send (getWith ["X-Long: " <> B.replicate 40000 97])]
+      [stays [okHeaders "GET" "/" [hostLocal, ("X-Long", B.replicate 40000 97)]]]
+      & note "PostgREST under Warp took a Cookie of this size (its io suite sends one); Warp's limit is 50 KiB for the whole head."
+  , mk AHeadLimits (Spec "the limits are settings, whatever the size of the buffer")
+      "with the default settings a head of 100 lines of 400 bytes, which is more than the buffer, is served"
+      Headers
+      [Send (getWith (replicate 100 ("X-Big: " <> B.replicate 400 98)))]
+      [stays [okHeaders "GET" "/" (hostLocal : replicate 100 ("X-Big", B.replicate 400 98))]]
+  , mk AHeadLimits (Spec "the limits are settings, whatever the size of the buffer")
+      "a head that is more than the buffer, whose lines are cut at the end of the buffer where a CR and a LF are, is served"
+      Headers
+      [Send (getWith ["X-Pad: " <> B.replicate 16343 97, "X-Next: 1"])]
+      [stays [okHeaders "GET" "/" [hostLocal, ("X-Pad", B.replicate 16343 97), ("X-Next", "1")]]]
+      & note "The first 16384 bytes of the head are the request line, Host and X-Pad's name and value, and the CR of its line end; the LF is the first byte after."
+  , mk AHeadLimits (Spec "the limits are settings, whatever the size of the buffer")
+      "a request with a header line of 40000 bytes and a body is answered with the body"
+      Echo
+      [Send ("POST / HTTP/1.1\r\nHost: localhost\r\nX-Long: " <> B.replicate 40000 97 <> "\r\nContent-Length: 5\r\n\r\nhello")]
+      [stays [ok "hello"]]
+  , mk AHeadLimits (Spec "the head limit counts the whole head, however many buffers it is")
+      "with the default settings a head of 200 lines of 400 bytes is answered 431"
+      Headers
+      [Send (getWith (replicate 200 ("X-Big: " <> B.replicate 400 98)))]
+      (refused 431)
+  , mk AHeadLimits (Spec "the line limit is not the buffer's")
+      "with the default settings a header line of 60000 bytes is answered 431"
+      Headers
+      [Send (getWith ["X-Long: " <> B.replicate 60000 97])]
+      (refused 431)
+  , mk AHeadLimits (Spec "the line limit is not the buffer's")
+      "with the default settings a request line of 60000 bytes is answered 414"
+      Headers
+      [Send (get ("/" <> B.replicate 60000 97))]
+      (refused 414)
+  , mk AHeadLimits (Spec "the bytes after a head that is more than the buffer belong to the next request")
+      "a head that is more than the buffer is followed by the request that came with it"
+      Ignore
+      [Send (getWith ["X-Long: " <> B.replicate 40000 97] <> singleGet)]
+      [stays [ok ignoreBody, ok ignoreBody]]
   , mk AHeadLimits (Spec "after a framing error the connection is closed")
       "a request that follows an oversized head on the connection is not answered"
       Headers
