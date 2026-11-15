@@ -14,9 +14,8 @@ module Network.Fulmen.Internal
   )
 where
 
-import Data.IORef (IORef)
 import Network.Fulmen.Internal.Body (Body (..))
-import Network.Fulmen.Internal.Date (Date)
+import Network.Fulmen.Internal.Date (Pulse)
 import Network.Fulmen.Internal.Response (Exchange)
 import Network.Socket (Socket)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings)
@@ -62,11 +61,11 @@ newtype Answering = Answering Exchange
 -- is the one that runs the acceptor, if it is the first.
 data Cores = Cores !Int !Shared
 
--- | What the cores share: the free workers, which the acceptor hands connections to, the date that responses carry, and
--- the buffers that requests in flight work in.
+-- | What the cores share: the free workers, which the acceptor hands connections to, the date that responses carry and
+-- whether the server is shutting down, and the buffers that requests in flight work in.
 data Shared = Shared
   { sharedWorkers :: !(Pool Free),
-    sharedDate :: !(IORef Date),
+    sharedPulse :: !Pulse,
     sharedBuffers :: !BufferPool
   }
 

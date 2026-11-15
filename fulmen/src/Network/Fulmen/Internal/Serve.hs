@@ -32,6 +32,7 @@ import qualified Data.ByteString.Unsafe as BU
 import qualified Data.IntMap.Strict as IntMap
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (findIndex)
+import Data.Maybe (isJust)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
@@ -40,6 +41,7 @@ import Foreign.Storable (poke)
 import Network.Fulmen.Internal
 import Network.Fulmen.Internal.Accept (acceptor, listening)
 import Network.Fulmen.Internal.Body (BodyRefused (..), BodyState (..), ChunkState (..), ConnectionLost (..), Decoding (..), Marks (..), drain)
+import Network.Fulmen.Internal.Date (beginDraining)
 import Network.Fulmen.Internal.Head (Framing (..), Parsed (..), Scan (..), Spill (..), joined, notYet, parseHead, scanHead, startScan)
 import Network.Fulmen.Internal.Response (Exchange (..), Phase (..), newExchange, refusal)
 import Network.Fulmen.Listen (Listen (..))
@@ -76,10 +78,25 @@ serve :: (Runtime arr) => Settings -> Listen arr -> arr (Call, Request) () -> ar
 serve !settings listen handler =
   named (Label "serve" "Runs the workers of each core, and the acceptor besides on the first core.") $
     decide "first core?" (whether isFirst)
-      >>> (taking "yes" (together (acceptance listen : workers)) ||| taking "no" (together workers))
+      >>> (taking "yes" (shutting (acceptance listen : workers)) ||| taking "no" (shutting workers))
   where
     workers = replicate (connectionsPerCore settings) (worker settings handler)
     isFirst (Cores core _) = core == 0
+    -- A server that has an event to shut down on runs its parts in a race with the wait for the event. When it fires, the server
+    -- is marked as shutting down and the parts are cancelled where they wait: the acceptor, whose listener closes, the
+    -- workers that wait for a connection, and the connections that wait for a request. A request in flight is behind a shield
+    -- (see 'answered'), so it finishes, and the race ends when no part is left.
+    shutting parts = case shutdown settings of
+      Nothing -> together parts
+      Just event -> race (beginning event) (together parts) >>> done
+
+-- | Waits for the event that starts the shutdown, and marks the server as shutting down: a response from then on says that its
+-- connection ends.
+beginning :: (Runtime arr) => Event -> arr Cores ()
+beginning event =
+  named (Label "shutdown" "Waits for the event that starts the shutdown, and marks the server as shutting down.") $
+    alongside (const event ^>> block)
+      >>> step "begin the shutdown" (\(_, Cores _ shared) -> beginDraining (sharedPulse shared))
 
 -- * The acceptor
 
@@ -265,7 +282,7 @@ request settings handler =
       step
         "render refusal"
         ( \(Req {reqConn = Conn {connSocket, connShared}}, status) ->
-            (,) connSocket <$> refusal (sharedDate connShared) status
+            (,) connSocket <$> refusal (sharedPulse connShared) status
         )
         >>> sendAll
         >>> quit
@@ -335,11 +352,14 @@ answered settings handler =
     ( typed @Headed @Prepared (step "prepare call" (prepare settings))
         >>> decide "give back loan?" heldLoan
         >>> (taking "yes" (consume release) ||| taking "no" returnA)
-        >>> alongside (tryA handler)
+        >>> alongside (protected (tryA handler))
         >>> aftermath
     )
       `giving` "keep alive"
   where
+    -- With a shutdown event, a handler runs behind a shield: a cancellation of the server waits until it has returned.
+    protected :: (Runtime arr) => arr a b -> arr a b
+    protected = if isJust (shutdown settings) then shield else id
     heldLoan Prepared {preparedCall, preparedRequest, preparedLoan} =
       maybe (Right (preparedCall, preparedRequest)) (\loan -> Left (loan, (preparedCall, preparedRequest))) preparedLoan
 
@@ -350,7 +370,7 @@ prepare settings Headed {headedReq = Req {reqConn = Conn {..}, ..}, headedParsed
   Progress {progressEnd = end} <- readIORef reqProgress
   let buffer = loanBuffer reqLoan
       Method name = method request'
-  exchange <- newExchange connSocket reqLoans (name == "HEAD") (version request' == Http11) (sharedDate connShared) keep
+  exchange <- newExchange connSocket reqLoans (name == "HEAD") (version request' == Http11) (sharedPulse connShared) keep
   case framing of
     Length size -> do
       marks <- newIORef Marks {markStart = consumed, markEnd = end, markRemaining = size}
@@ -405,7 +425,7 @@ aftermath =
       decide "unanswered?" (\(status, unanswered') -> maybe (Right ()) (Left . (,) status) unanswered')
         >>> ( taking
                 "yes"
-                (step "render the refusal" (\(status, exchange) -> (,) (exSocket exchange) <$> refusal (exDate exchange) status) >>> sendAll)
+                (step "render the refusal" (\(status, exchange) -> (,) (exSocket exchange) <$> refusal (exPulse exchange) status) >>> sendAll)
                 ||| taking "no" returnA
             )
         >>> quit

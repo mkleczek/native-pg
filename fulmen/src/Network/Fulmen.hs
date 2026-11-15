@@ -38,7 +38,7 @@ where
 
 import Control.Arrow (Arrow, arr)
 import Network.Fulmen.Internal (Call (..), Cores (..), Settings (..), Shared (..))
-import Network.Fulmen.Internal.Date (newDate)
+import Network.Fulmen.Internal.Date (newPulse)
 import Network.Fulmen.Internal.Serve (serve)
 import Network.Fulmen.Listen
 import Network.Fulmen.Request
@@ -67,7 +67,7 @@ defaultSettings =
 -- | The cores that a server runs on, from its settings and how many there are: what they share, the pool of request
 -- buffers that the settings size included, and the first core's own value.
 newCores :: Settings -> Int -> IO Cores
-newCores settings _ = Cores 0 <$> (Shared <$> newPool [] <*> newDate <*> newBufferPool (bufferPool settings))
+newCores settings _ = Cores 0 <$> (Shared <$> newPool [] <*> newPulse <*> newBufferPool (bufferPool settings))
 
 -- | The value of the core of this number, for the program that runs on it. The first core runs the acceptor.
 onCore :: Cores -> Int -> Cores

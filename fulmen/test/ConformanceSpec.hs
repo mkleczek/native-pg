@@ -141,7 +141,7 @@ peerOf (Runner _ runServer) =
 -- the connection ends, and the server ends when none is left.
 shutdownSpec :: Spec
 shutdownSpec = describe "a graceful shutdown" $ forM_ (runners ++ [coresRunner]) $ \runner@(Runner runnerName _) ->
-  describe runnerName $ xfail "a graceful shutdown is not there yet (step 3)" $ do
+  describe runnerName $ do
     it "ends the server and closes its listener, with no connection open" $
       withStoppable runner (handling (Fixed 200 [] "ok")) $ \shutting -> do
         stopServer shutting

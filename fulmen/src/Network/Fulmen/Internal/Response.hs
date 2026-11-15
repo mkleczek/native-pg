@@ -26,7 +26,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
 import Network.Fulmen.Internal.Bytes (commaList, equalsLower)
-import Network.Fulmen.Internal.Date (Date, currentDate)
+import Network.Fulmen.Internal.Date (Pulse, currentDate, draining)
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes (Effect (..), Link (..), Runtime)
@@ -55,7 +55,7 @@ data Exchange = Exchange
     -- | The request was a HEAD.
     exHead :: !Bool,
     exHttp11 :: !Bool,
-    exDate :: !(IORef Date),
+    exPulse :: !Pulse,
     exPhase :: !(IORef Phase),
     -- | Whether the connection is kept open after the response: the request may end it, and so may the response.
     exKeep :: !(IORef Bool)
@@ -83,8 +83,8 @@ data Mode
   | -- | As it is, to the end of the connection.
     Unframed
 
-newExchange :: Socket -> Loans -> Bool -> Bool -> IORef Date -> Bool -> IO Exchange
-newExchange socket loans isHead http11 date keep = Exchange socket loans isHead http11 date <$> newIORef Unanswered <*> newIORef keep
+newExchange :: Socket -> Loans -> Bool -> Bool -> Pulse -> Bool -> IO Exchange
+newExchange socket loans isHead http11 pulse keep = Exchange socket loans isHead http11 pulse <$> newIORef Unanswered <*> newIORef keep
 
 -- | The handler says how it answers. The head is sent with the first piece, or when the response ends.
 begin :: Exchange -> (Status, ResponseHeaders, Length) -> IO ()
@@ -116,7 +116,9 @@ plan (exchange, (given, final)) =
       let mode = modeOf exchange status len
       when (isUnframed mode) (writeIORef (exKeep exchange) False)
       when (closesAfter headers) (writeIORef (exKeep exchange) False)
-      date <- currentDate (exDate exchange)
+      date <- currentDate (exPulse exchange)
+      -- A server that is shutting down ends the connection after this response.
+      draining (exPulse exchange) >>= \shuttingDown -> when shuttingDown (writeIORef (exKeep exchange) False)
       keep <- readIORef (exKeep exchange)
       body <- bodyOf exchange mode 0 given final
       pure (outcome (Just (headOutput exchange date status headers len keep)) body)
@@ -218,7 +220,7 @@ clean text = if B.any bad text then B.map (\byte -> if bad byte then 32 else byt
 
 -- | The answer to a request that can't be served, which ends the connection: the pieces of its response, which are
 -- all as they are but the date.
-refusal :: IORef Date -> Int -> IO [ByteString]
+refusal :: Pulse -> Int -> IO [ByteString]
 refusal date code = (\text -> ["HTTP/1.1 ", statusText code, "Date: ", text, "\r\nServer: fulmen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"]) <$> currentDate date
 
 -- | The status code and its reason phrase, with the end of the line.
