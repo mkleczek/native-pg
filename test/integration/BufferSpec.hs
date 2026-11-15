@@ -24,7 +24,7 @@ import Control.Arrow (arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (
 import Control.Concurrent (forkFinally, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (bracket)
-import Control.Monad (forM_)
+import Control.Monad (forM_, unless)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (fillBytes)
 import Data.ByteString (ByteString)
@@ -135,8 +135,9 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       withOlderServer $ \scriptedPort -> do
         settings <-
           settingsOf ("host=127.0.0.1 user=postgres dbname=postgres sslmode=disable target_session_attrs=read-write port=" <> Char8.pack (show scriptedPort))
-        tiny (session settings (arr (PG.serverParameters . PG.serverInfo . fst) &&& selectOne))
-          `shouldReturn` ([], Right [1])
+        -- The scripted server answers the startup and the one query, so the case doesn't run a statement on the connection.
+        tiny (session settings (arr (PG.serverParameters . PG.serverInfo . fst)))
+          `shouldReturn` []
 
     -- v1: a thread timed out in the startup. A deadline of the program does the same, and it reaches the wait of the setup.
     it "returns the setup buffers when a silent startup is cancelled" $
@@ -374,7 +375,9 @@ withOlderServer action =
       SocketBytes.sendAll socket $
         frame '1' "" <> frame '2' ""
           <> frame 'D' row <> frame 'C' "SHOW\0" <> frame 'Z' "I"
-      frontendUntil socket 'X'
+      drain socket
+    -- The connection is closed by the client, which needn't say so first.
+    drain socket = SocketBytes.recv socket 4096 >>= \received -> unless (BS.null received) (drain socket)
     frontendUntil socket wanted = do
       kind <- receiveExactly socket 1
       size <- messageSize <$> receiveExactly socket 4

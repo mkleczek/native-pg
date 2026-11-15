@@ -22,8 +22,9 @@ module IntegrationSpec (spec) where
 
 import Control.Arrow (arr, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (forkIO, killThread, threadDelay)
-import Control.Exception (IOException, bracket, displayException, finally)
+import Control.Exception (IOException, SomeException, bracket, catch, displayException, finally)
 import Control.Monad (forM_, forever, unless, void)
+import Data.Bits (shiftR)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
@@ -196,6 +197,8 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     let directory = takeDirectory socketPath
         local extra = "host=" <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres " <> extra
         tcp extra = "host=127.0.0.1 port=" <> Char8.pack (show port) <> " dbname=postgres " <> extra
+        -- A role that takes plaintext over TCP, at the host and with the extra options.
+        viaPlaintext host extra = "host=" <> host <> " port=" <> Char8.pack (show port) <> " dbname=postgres user=native_pg_plaintext sslmode=disable " <> extra
         withString :: ByteString -> (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withString = onString runner
         connectFailure = failureOf runner
@@ -230,6 +233,59 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         Left (ConnectFailure failures) ->
           map (hostName . fst) failures `shouldBe` ["/missing-native-pg-first", "/missing-native-pg-second"]
         _ -> failTest "the missing hosts connected, or failed otherwise"
+    -- Each host has its own connect_timeout, and the next is tried after one that timed out.
+    needs "host selection" $ it "gives each host its own connect_timeout" $
+      withSilentServer $ \one -> withSilentServer $ \other -> do
+        started <- getMonotonicTime
+        connectFailure ("host=" <> Char8.pack one <> "," <> Char8.pack other <> " connect_timeout=1")
+          `shouldReturn` intercalate
+            "\n"
+            [ "connection to server on socket \"" <> silent <> "/.s.PGSQL.5432\" failed: timeout expired"
+            | silent <- [one, other]
+            ]
+        elapsed <- subtract started <$> getMonotonicTime
+        elapsed `shouldSatisfy` (P.gte 2 P.&& P.lt 6)
+    needs "host selection" $ it "connects to the next host after one that timed out" $
+      withSilentServer $ \silent ->
+        withString
+          ("host=" <> Char8.pack silent <> "," <> Char8.pack directory <> " port=5432," <> Char8.pack (show port) <> " dbname=postgres connect_timeout=1")
+          (arr (hostName . PG.connectedHost . fst) &&& selectOne)
+          `shouldReturn` (directory, Right [1])
+    -- A server that doesn't have the protocol version that min_protocol_version asks for doesn't qualify, as with
+    -- target_session_attrs.
+    needs "target_session_attrs" $ it "doesn't qualify a server below min_protocol_version, as libpq words it" $
+      withScripted (\client -> receiveStartup client *> SocketBytes.sendAll client (frame 'v' (int32 0x00030000 <> int32 0) <> frame 'R' (int32 0) <> frame 'Z' "I") *> drain client) $ \scripted ->
+        connectFailure ("host=127.0.0.1 user=postgres sslmode=disable max_protocol_version=3.2 min_protocol_version=3.2 port=" <> Char8.pack (show scripted))
+          `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show scripted <> " failed: server only supports protocol version 3.0, but min_protocol_version was set to 3.2")
+    it "qualifies a server that has the protocol version that min_protocol_version asks for" $ do
+      settings <- settingsOf (local "min_protocol_version=3.2 max_protocol_version=3.2")
+      result <- run (connectedTo settings (arr (PG.serverProtocolVersion . PG.serverInfo . fst)))
+      info <- run (session (unix "postgres" Nothing) (arr (PG.serverInfo . fst)))
+      let major = fmap fst . Char8.readInt =<< lookup "server_version" (PG.serverParameters info)
+      case result of
+        Right version -> (maybe False (>= 18) major, version) `shouldBe` (True, protocolVersion3_2)
+        Left (ConnectFailure [(_, Unsuitable _)]) -> maybe False (>= 18) major `shouldBe` False
+        Left failure -> failTest ("failed otherwise: " <> displayException failure)
+    -- A name is looked up, and the addresses it resolves to are tried in order. The cluster listens on 127.0.0.1 only, so
+    -- an address of another family that comes first is refused.
+    needs "host names" $ it "connects to a host by its name" $ do
+      settings <- settingsOf (viaPlaintext "localhost" "")
+      run (session settings (arr (hostName . PG.connectedHost . fst) &&& selectOne)) `shouldReturn` ("localhost", Right [1])
+    needs "host names" $ it "words the failure of each address that a host name resolves to as libpq does" $
+      withUnusedPort $ \unused -> do
+        failure <- connectFailure ("host=localhost sslmode=disable port=" <> Char8.pack (show unused))
+        failure
+          `shouldSatisfy` P.hasInfix
+            ("connection to server at \"localhost\" (127.0.0.1), port " <> show unused <> " failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?")
+    needs "host names" $ it "tries the next host after a name that doesn't resolve" $
+      withString
+        ("host=no-such-host.invalid," <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres")
+        (arr (hostName . PG.connectedHost . fst))
+        `shouldReturn` directory
+    -- With hostaddr, the name is only for TLS and for the words of a failure: nothing is looked up.
+    it "connects to the address of hostaddr, without looking up the host name" $ do
+      settings <- settingsOf (viaPlaintext "no-such-host.invalid" "hostaddr=127.0.0.1")
+      run (session settings (arr (hostName . PG.connectedHost . fst) &&& selectOne)) `shouldReturn` ("no-such-host.invalid", Right [1])
     it "words a host name that doesn't resolve as libpq does" $ do
       failure <- connectFailure "host=no-such-host.invalid"
       failure `shouldSatisfy` P.hasPrefix "could not translate host name \"no-such-host.invalid\" to address: "
@@ -920,6 +976,43 @@ withSilentServer action = do
       Socket.bind sock (Socket.SockAddrUnix (directory </> ".s.PGSQL.5432"))
       Socket.listen sock 4
       action directory
+
+-- | Runs the action with a port at 127.0.0.1 that nothing listens on.
+withUnusedPort :: (Socket.PortNumber -> IO a) -> IO a
+withUnusedPort action =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close
+    (\sock -> Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1))) *> Socket.socketPort sock)
+    >>= action
+
+-- | Runs the action with the port at 127.0.0.1 of a server that serves one connection by the script, which is given its
+-- socket. The connection is closed when the script ends, and what goes wrong in it shows in the client.
+withScripted :: (Socket.Socket -> IO ()) -> (Socket.PortNumber -> IO a) -> IO a
+withScripted script action =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
+    Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen listener 4
+    let serve = do
+          (client, _) <- Socket.accept listener
+          script client `finally` Socket.close client
+    bracket (forkIO (serve `catch` \(_ :: SomeException) -> pure ())) killThread $ \_ -> action =<< Socket.socketPort listener
+
+-- | A message of the server: its tag, its length, and its payload.
+frame :: Char -> ByteString -> ByteString
+frame kind payload = Char8.singleton kind <> int32 (BS.length payload + 4) <> payload
+
+-- | The four bytes of a number, the most significant first.
+int32 :: Int -> ByteString
+int32 number = BS.pack [fromIntegral (number `shiftR` shift) | shift <- [24, 16, 8, 0]]
+
+-- | Takes the client's startup message, which has no tag: its length, and the rest.
+receiveStartup :: Socket.Socket -> IO ByteString
+receiveStartup client = do
+  size <- BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0 <$> SocketBytes.recv client 4
+  SocketBytes.recv client (size - 4)
+
+-- | Takes what the client sends until it closes the connection.
+drain :: Socket.Socket -> IO ()
+drain client = SocketBytes.recv client 4096 >>= \received -> unless (BS.null received) (drain client)
 
 -- | Runs the action with a copy of the client certificate's key, with the file mode given.
 withKeyCopy :: FileMode -> (FilePath -> IO a) -> IO a
