@@ -207,12 +207,12 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         ("postgresql:///postgres?host=" <> Char8.pack directory <> "&port=" <> Char8.pack (show port))
         (arr (hostName . PG.connectedHost . fst) &&& selectOne)
         `shouldReturn` (directory, Right [1])
-    needs "host selection" $ it "tries the hosts in order" $
+    it "tries the hosts in order" $
       withString
         ("host=/nonexistent," <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres")
         (arr (hostName . PG.connectedHost . fst))
         `shouldReturn` directory
-    needs "host selection" $ it "words each host's failure as libpq does" $
+    it "words each host's failure as libpq does" $
       connectFailure "host=/nonexistent-1,/nonexistent-2"
         `shouldReturn` intercalate
           "\n"
@@ -226,7 +226,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       case result of
         Left (ConnectFailure [(host, ConnectionRejected _)]) -> hostName host `shouldBe` directory
         _ -> failTest "expected the rejection of the one host, in a list of one"
-    needs "host selection" $ it "reports the hosts that failed, in order" $ do
+    it "reports the hosts that failed, in order" $ do
       settings <- settingsOf "host=/missing-native-pg-first,/missing-native-pg-second dbname=postgres"
       result <- run (connectedTo settings done)
       case result of
@@ -234,7 +234,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           map (hostName . fst) failures `shouldBe` ["/missing-native-pg-first", "/missing-native-pg-second"]
         _ -> failTest "the missing hosts connected, or failed otherwise"
     -- Each host has its own connect_timeout, and the next is tried after one that timed out.
-    needs "host selection" $ it "gives each host its own connect_timeout" $
+    it "gives each host its own connect_timeout" $
       withSilentServer $ \one -> withSilentServer $ \other -> do
         started <- getMonotonicTime
         connectFailure ("host=" <> Char8.pack one <> "," <> Char8.pack other <> " connect_timeout=1")
@@ -245,7 +245,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         elapsed <- subtract started <$> getMonotonicTime
         elapsed `shouldSatisfy` (P.gte 2 P.&& P.lt 6)
-    needs "host selection" $ it "connects to the next host after one that timed out" $
+    it "connects to the next host after one that timed out" $
       withSilentServer $ \silent ->
         withString
           ("host=" <> Char8.pack silent <> "," <> Char8.pack directory <> " port=5432," <> Char8.pack (show port) <> " dbname=postgres connect_timeout=1")
@@ -277,7 +277,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         failure
           `shouldSatisfy` P.hasInfix
             ("connection to server at \"localhost\" (127.0.0.1), port " <> show unused <> " failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?")
-    needs "host names" $ it "tries the next host after a name that doesn't resolve" $
+    it "tries the next host after a name that does not resolve" $
       withString
         ("host=no-such-host.invalid," <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres")
         (arr (hostName . PG.connectedHost . fst))

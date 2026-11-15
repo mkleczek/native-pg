@@ -103,12 +103,17 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
     -- v1 closed a TLS host that was unsuitable because its session was read-only, and tried the next, with the same pair
     -- of setup buffers. v2's connection string has one set of options for all its hosts, so the first host is unsuitable
     -- by another reason: the server rejects its role over TLS (pg_hba.conf), and the Unix-domain socket takes it.
+    --
+    -- Without TLS the first host fails before the server sees it, so the case also says that the first host alone is
+    -- rejected by the server.
     needs "TLS and host selection" $ it "closes a host that rejects the connection and tries the next one with the same setup buffers" $ do
       settings <- settingsOf ("host=127.0.0.1," <> Char8.pack (takeDirectory socketPath) <> " port=" <> Char8.pack (show port) <> " dbname=postgres user=native_pg_plaintext sslmode=require")
+      rejecting <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show port) <> " dbname=postgres user=native_pg_plaintext sslmode=require")
       tiny
         ( withinFor (secs 10) $
             steps
-              [ session settings (arr (hostName . PG.connectedHost . fst)) `yields` takeDirectory socketPath,
+              [ (connectedTo rejecting done >>^ rejection) `yields` Just "28000",
+                session settings (arr (hostName . PG.connectedHost . fst)) `yields` takeDirectory socketPath,
                 connects scram `yields` Right [1]
               ]
         )
@@ -119,7 +124,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       tiny (withinFor (secs 10) (steps [session settings (arr (hostName . PG.connectedHost . fst)) `yields` takeDirectory socketPath, connects scram `yields` Right [1]]))
         `shouldReturn` Just ()
 
-    needs "host selection" $ it "reports failed hosts in order and returns the setup buffers" $ do
+    it "reports failed hosts in order and returns the setup buffers" $ do
       let missing = ["/missing-native-pg-first", "/missing-native-pg-second"]
       settings <- settingsOf ("host=" <> Char8.intercalate "," (map Char8.pack missing) <> " dbname=postgres user=postgres")
       tiny
