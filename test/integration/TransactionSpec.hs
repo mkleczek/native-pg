@@ -19,20 +19,27 @@
 module TransactionSpec (spec) where
 
 import Control.Arrow (arr, (&&&), (>>>), (>>^), (^>>), (|||))
-import Control.Exception (ErrorCall (..), throwIO)
-import Control.Monad (forM_)
+import Control.Exception (ErrorCall (..), evaluate, throwIO)
+import Control.Monad (forM_, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
 import Data.Bifunctor (bimap)
 import Data.Either (isRight)
 import Data.Int (Int32, Int64)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
+import Data.Word (Word64)
+import Database.PostgreSQL.Connection (ConnectSettings (..), Connection)
 import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Types (FormatCode (..), Oid)
+import GHC.Stats (allocated_bytes, getRTSStats)
 import Skeletest
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
+import System.IO.Unsafe (unsafePerformIO)
+import System.Mem (performMinorGC)
 import TestPrograms hiding (named)
 
 spec :: FilePath -> Spec
@@ -485,6 +492,187 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
         )
         `shouldReturn` ()
 
+  -- A statement that the connection keeps prepared for the key that the input gives: the first run of a key prepares it, in the pipeline
+  -- that executes it, and the runs after only execute it, without evaluating the SQL, which is a function of its own that a miss
+  -- calls. One program serves both: its pipeline, and the position of its result, are the same.
+  needs "statements cached by the program's key" $
+    describe "cached statements" $ do
+      let withCache :: Int -> (forall arr. (Runtime arr) => OnConn arr b) -> IO b
+          withCache size body = run (session ((unixSettings socketPath "postgres" Nothing) {connectStatementCache = size}) body)
+          inputs :: [(Int, Int)] -> [(Int, ByteString)]
+          inputs shapes = [(shape, Char8.pack (show value)) | (shape, value) <- shapes]
+      it "prepares a statement on the first run of its key and only executes it on the runs after, which evaluate no SQL" $ do
+        calls <- newIORef 0
+        withCache 256
+          ( steps
+              [ overInputs (runOf (adding calls)) (inputs [(1, 10), (1, 20), (1, 30)]) `yields` [Right 11, Right 21, Right 31],
+                preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 1
+      it "keeps a statement for each key, as the input gives it" $ do
+        calls <- newIORef 0
+        withCache 256
+          ( steps
+              [ overInputs (runOf (adding calls)) (inputs [(1, 10), (2, 10), (1, 1), (2, 2)]) `yields` [Right 11, Right 12, Right 2, Right 4],
+                preparedStatements `yields` Right ["SELECT $1::int4 + 1", "SELECT $1::int4 + 2"]
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 2
+      it "never evaluates the SQL for a key that the connection has, whatever the function of its SQL is" $ do
+        calls <- newIORef 0
+        withCache 256
+          ( steps
+              [ overInputs (runOf (adding calls)) (inputs [(1, 10)]) `yields` [Right 11],
+                overInputs (runOf (Tx.cached fst (\_ -> error "SQL forced") addingStatement)) (inputs [(1, 1), (1, 2)]) `yields` [Right 2, Right 3]
+              ]
+          )
+          `shouldReturn` ()
+      -- At capacity the least recently used goes, and its statement is closed in the pipeline of the miss that evicts it.
+      it "forgets the least recently used statement at capacity, and closes it on the server in the pipeline that evicts it" $ do
+        calls <- newIORef 0
+        withCache 2
+          ( steps
+              [ overInputs (runOf (adding calls)) (inputs [(1, 0), (2, 0), (1, 0), (3, 0)]) `yields` [Right 1, Right 2, Right 1, Right 3],
+                -- 1 was used after 2, so 2 went, and its statement is gone from the server.
+                preparedStatements `yields` Right ["SELECT $1::int4 + 1", "SELECT $1::int4 + 3"],
+                overInputs (runOf (adding calls)) (inputs [(2, 0), (3, 0)]) `yields` [Right 2, Right 3],
+                -- 2 came back and evicted 1, the least recently used then, which 3 was after.
+                preparedStatements `yields` Right ["SELECT $1::int4 + 2", "SELECT $1::int4 + 3"]
+              ]
+          )
+          `shouldReturn` ()
+        -- The misses: 1, 2, 3, and 2 again.
+        readIORef calls `shouldReturn` 4
+      it "keeps no statement when it may keep none, and sends each as an unnamed one" $ do
+        calls <- newIORef 0
+        withCache 0
+          ( steps
+              [ overInputs (runOf (adding calls)) (inputs [(1, 10), (1, 20)]) `yields` [Right 11, Right 21],
+                preparedStatements `yields` Right []
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 2
+      it "records a statement only once the server accepted its Parse: a rejected one is prepared again by the next run of its key" $ do
+        calls <- newIORef 0
+        withCache 256
+          ( steps
+              [ -- The server rejects the Parse of the first, accepts the second, and the third finds the second's statement.
+                (overInputs (runOf (flagged calls)) [(False, "1"), (True, "1"), (False, "1")] >>^ map (either (Left . serverCode . Left) Right))
+                  `yields` [Left (Just "42601"), Right 2, Right 2],
+                preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 2
+      it "keeps a statement that the server accepted when its execution fails, and the next run of its key finds it" $ do
+        calls <- newIORef 0
+        withCache 256
+          ( steps
+              [ (overInputs (runOf (dividing calls)) ["0", "1", "2"] >>^ map (either (Left . serverCode . Left) Right))
+                  `yields` [Left (Just "22012"), Right 1, Right 0],
+                preparedStatements `yields` Right ["SELECT 1 / $1::int4"]
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 1
+      -- The server lost the statement that the connection thinks it has: SQLSTATE 26000, once, and the connection forgets them all.
+      it "forgets its statements when the server says that one does not exist, and prepares the next run again" $ do
+        calls <- newIORef 0
+        withCache 256
+          ( steps
+              [ overInputs (runOf (adding calls)) (inputs [(1, 1)]) `yields` [Right 2],
+                ddl "DEALLOCATE ALL" `yields` Right (),
+                (overInputs (runOf (adding calls)) (inputs [(1, 1)]) >>^ map serverCode) `yields` [Just "26000"],
+                overInputs (runOf (adding calls)) (inputs [(1, 1), (1, 2)]) `yields` [Right 2, Right 3],
+                preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 2
+      -- A statement whose result type the server found changed since it was planned: SQLSTATE 0A000, once, and the connection forgets
+      -- them all, and closes the ones that the server still has.
+      it "forgets its statements when the server says that a cached plan must not change its result type, and prepares the next run again" $ do
+        calls <- newIORef 0
+        let running :: (Runtime arr) => arr (Connection, (Loans, ())) (Either QueryError ())
+            running = transactOn Tx.ReadCommitted Tx.Write Tx.Open (changing calls) Tx.discard
+        withCache 256
+          ( steps
+              [ ddl "CREATE TEMP TABLE cached_changing (a int4)" `yields` Right (),
+                overInputs running [()] `yields` [Right ()],
+                ddl "ALTER TABLE cached_changing ALTER a TYPE int8" `yields` Right (),
+                (overInputs running [()] >>^ map serverCode) `yields` [Just "0A000"],
+                overInputs running [(), ()] `yields` [Right (), Right ()],
+                (preparedStatements >>^ fmap length) `yields` Right 1
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 2
+      it "caches two statements of one pipeline, each by its own key, of different types" $ do
+        calls <- newIORef 0
+        other <- newIORef 0
+        withCache 256
+          ( steps
+              [ ( overInputs
+                    (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,) <$> numbered calls <*> lengthOfText other) (\(left, right) -> Tx.single left &&& Tx.single right))
+                    [(1 :: Int, "a"), (2, "a"), (1, "bcd")]
+                )
+                  `yields` [Right (101, 1), Right (102, 1), Right (101, 3)],
+                (preparedStatements >>^ fmap length) `yields` Right 4
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 2
+        readIORef other `shouldReturn` 3
+      it "finds in a pipeline the statement that an earlier statement of the same pipeline prepares, for the same key" $ do
+        calls <- newIORef 0
+        withCache 256
+          ( steps
+              [ overInputs (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,) <$> adding calls <*> adding calls) (\(left, right) -> Tx.single left &&& Tx.single right)) (inputs [(1, 5), (1, 6)])
+                  `yields` [Right (6, 6), Right (7, 7)],
+                preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 1
+      it "takes a streamed parameter from the stream of the statement, whether it prepares the statement or only executes it" $ do
+        calls <- newIORef 0
+        runs <- traverse (\(shape, pieces) -> (shape :: Int,) <$> newChunks pieces) [(1, ["ab", "cde"]), (1, ["fghij"]), (2, ["", "klmno"])]
+        withCache 256
+          ( steps
+              [ overInputs (runOf (streamedAdding calls)) runs `yields` [Right 6, Right 6, Right 7],
+                (preparedStatements >>^ fmap length) `yields` Right 2
+              ]
+          )
+          `shouldReturn` ()
+        readIORef calls `shouldReturn` 2
+
+  -- What a cached statement allocates for a run, as a hit and as a miss, against the same statement sent unnamed (made from the input
+  -- as well, so that the SQL is generated for each run) and against one that the program prepared itself. It measures only when
+  -- CACHE_COST_REPORT is set, and says what it measured on stderr.
+  describe "what a cached statement costs" $
+    it "reports the bytes that a run allocates, cached as a hit and as a miss, unnamed and prepared by the program" $ do
+      asked <- lookupEnv "CACHE_COST_REPORT"
+      when (asked /= Nothing) $ do
+        let withSessionOf :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
+            withSessionOf body = run (session (unixSettings socketPath "postgres" Nothing) body)
+            hits count = [(1 :: Int, "1" :: ByteString) | _ <- [1 .. count]]
+            misses count = [(shape, "1" :: ByteString) | shape <- [1 .. count]]
+            measured :: String -> (forall arr. (Runtime arr) => Int -> OnConn arr ()) -> IO ()
+            measured label program = do
+              withSessionOf (program 200)
+              few <- allocatedBy (withSessionOf (program 1000))
+              many <- allocatedBy (withSessionOf (program 5000))
+              hPutStrLn stderr ("cache-cost " <> name <> " | " <> label <> " | " <> show (round ((fromIntegral many - fromIntegral few :: Double) / 4000) :: Int))
+        measured "unnamed, hit shape" (\count -> overInputs (runOf (Tx.statement costStatement)) (hits count) >>> done)
+        measured "prepared by the program" (\count -> steps [preparing' costStatement, overInputs (runOf (Tx.executePrepared "cost_prepared" costStatement)) (hits count) >>> done])
+        measured "cached, a hit" (\count -> overInputs (runOf (Tx.cached fst (sqlOf . fst) costStatement)) (hits count) >>> done)
+        measured "unnamed, SQL made for each run" (\count -> overInputs (runOf (Tx.statement (Tx.statementFrom (\input -> (sqlOf (fst input), parametersOf input)) single))) (misses count) >>> done)
+        measured "cached, a miss that evicts" (\count -> overInputs (runOf (Tx.cached fst (sqlOf . fst) costStatement)) (misses count) >>> done)
+
 -- * Statements of the cases
 
 createItems :: (Runtime arr) => OnConn arr (Either QueryError ())
@@ -552,6 +740,79 @@ typedInput (preparation, result, closing) = Tx.prepared preparation >>> Tx.singl
 -- | An unnamed statement, a preparation and its execution, with the parameters that tell them apart.
 wire :: (Runtime arr) => ByteString -> Tx.Pipeline arr () (Tx.Result arr Int32, Tx.Preparation, Tx.Result arr Int32)
 wire name = (,,) <$> Tx.statement (answerFor "1") <*> Tx.prepare name (answerFor "2") <*> Tx.executePrepared name (answerFor "3")
+
+-- | The statement that adds a number, which is the shape of the input, to the text that is its parameter, cached by the shape: the
+-- function of its SQL counts how many times it is evaluated.
+adding :: (Runtime arr) => IORef Int -> Tx.Pipeline arr (Int, ByteString) (Tx.Result arr Int32)
+adding calls = Tx.cached fst (evaluations calls (\(shape, _) -> "SELECT $1::int4 + " <> Char8.pack (show shape))) addingStatement
+
+-- | The parameters, the stream and the rows of the statement that 'adding' caches: its own SQL is not used.
+addingStatement :: (Runtime arr) => Tx.Statement arr (Int, ByteString) Int32
+addingStatement = Tx.Statement "" (\(_, value) -> [textual (Just value)]) Nothing single
+
+-- | The function of the SQL, counting each time that a run evaluates what it gives. The count is of the evaluations of the SQL
+-- that a run makes, which a statement that the connection has doesn't.
+evaluations :: IORef Int -> (p -> ByteString) -> p -> ByteString
+evaluations calls makeSql input = unsafePerformIO (atomicModifyIORef' calls (\n -> (n + 1, ())) *> evaluate (makeSql input))
+{-# NOINLINE evaluations #-}
+
+-- | The statement of the key (), whose SQL is rejected by the server when the input says so: the input is whether it is, and the
+-- text that is the parameter of the SQL that is not.
+flagged :: (Runtime arr) => IORef Int -> Tx.Pipeline arr (Bool, ByteString) (Tx.Result arr Int32)
+flagged calls = Tx.cached (const ()) (evaluations calls (\(ok, _) -> if ok then "SELECT $1::int4 + 1" else "SELEC 1")) (Tx.Statement "" (\(_, value) -> [textual (Just value)]) Nothing single)
+
+-- | The statement of the key () that divides one by its parameter, which is the input.
+dividing :: (Runtime arr) => IORef Int -> Tx.Pipeline arr ByteString (Tx.Result arr Int32)
+dividing calls = Tx.cached (const ()) (evaluations calls (const "SELECT 1 / $1::int4")) (Tx.Statement "" (\value -> [textual (Just value)]) Nothing single)
+
+-- | The statement of the key () that reads a column of a table whose type the cases change.
+changing :: (Runtime arr) => IORef Int -> Tx.Pipeline arr () (Tx.Result arr ())
+changing calls = Tx.cached (const ()) (evaluations calls (const "SELECT a FROM cached_changing")) (Tx.Statement "" (const []) Nothing (Tx.any Tx.skip))
+
+-- | A statement cached by a number, which adds a hundred to it, and one cached by a text, which is the length of the text.
+numbered :: (Runtime arr) => IORef Int -> Tx.Pipeline arr (Int, ByteString) (Tx.Result arr Int32)
+numbered calls = Tx.cached fst (evaluations calls (const "SELECT $1::int4 + 100")) (Tx.Statement "" (\(number, _) -> [textual (Just (Char8.pack (show number)))]) Nothing single)
+
+lengthOfText :: (Runtime arr) => IORef Int -> Tx.Pipeline arr (Int, ByteString) (Tx.Result arr Int32)
+lengthOfText calls = Tx.cached snd (evaluations calls (const "SELECT length($1::text)")) (Tx.Statement "" (\(_, name) -> [textual (Just name)]) Nothing single)
+
+-- | The statement cached by its shape, whose parameter is five bytes of the stream that is the second of its input.
+streamedAdding :: (Runtime arr) => IORef Int -> Tx.Pipeline arr (Int, Chunks) (Tx.Result arr Int32)
+streamedAdding calls =
+  Tx.cached fst (evaluations calls (\(shape, _) -> "SELECT length($1::text) + " <> Char8.pack (show shape))) (Tx.streamFrom snd (Tx.Statement "" (const [streamedText 5]) Nothing single))
+
+-- | The statement that the cases measure: SQL of its own, for the unnamed and the prepared, and the same text of its parameter.
+costStatement :: (Runtime arr) => Tx.Statement arr (Int, ByteString) Int32
+costStatement = Tx.Statement "SELECT $1::int4 + 1" (\(_, value) -> [textual (Just value)]) Nothing single
+
+-- | The SQL of the shape, and the parameters of the input, for the statement that is made from the input.
+sqlOf :: Int -> ByteString
+sqlOf shape = "SELECT $1::int4 + " <> Char8.pack (show shape)
+
+parametersOf :: (Int, ByteString) -> [Tx.Param]
+parametersOf (_, value) = [textual (Just value)]
+
+-- | The statements the server has prepared on the connection, as their SQL.
+preparedStatements :: (Runtime arr) => OnConn arr (Either QueryError [Text])
+preparedStatements = query (plain "SELECT statement FROM pg_prepared_statements ORDER BY statement" single)
+
+-- | A run: a transaction that commits when the reading program ends, and the one row of the pipeline's result.
+runOf :: (Runtime arr) => Tx.Pipeline arr p (Tx.Result arr Int32) -> arr (Connection, (Loans, p)) (Either QueryError Int32)
+runOf pipeline = transactOn Tx.ReadCommitted Tx.Write Tx.Open pipeline Tx.single
+
+-- | Prepares the statement under a name for the measure, once.
+preparing' :: (Runtime arr) => Tx.Statement arr (Int, ByteString) Int32 -> OnConn arr ()
+preparing' statement = overInputs (transactOn Tx.ReadCommitted Tx.Write Tx.Open (Tx.prepare "cost_prepared" statement) Tx.prepared) [(1, "1")] >>> done
+
+-- | The bytes that the action allocated: the runtime counts a nursery when it is collected, so a collection is made on both sides.
+allocatedBy :: IO () -> IO Word64
+allocatedBy action = do
+  performMinorGC
+  before <- allocated_bytes <$> getRTSStats
+  action
+  performMinorGC
+  allocated <- allocated_bytes <$> getRTSStats
+  pure (allocated - before)
 
 -- | The names the server has prepared on the connection.
 preparedNames :: (Runtime arr) => OnConn arr (Either QueryError [Text])
