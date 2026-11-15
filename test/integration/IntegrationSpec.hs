@@ -372,10 +372,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       -- libpq tries again without TLS only after the server's rejection and a failure of TLS. A host that doesn't qualify, and
       -- a failure of the client's own, are reported as they are: the cluster takes these users over TLS only, so a second
       -- attempt in plaintext would report a rejection by pg_hba.conf in their place.
-      needs "the narrow retry of sslmode=prefer" $ it "reports a host that doesn't qualify over TLS with sslmode=prefer, and doesn't try it in plaintext" $
+      it "reports a host that doesn't qualify over TLS with sslmode=prefer, and doesn't try it in plaintext" $
         connectFailure (tcp "options='-c default_transaction_read_only=on' target_session_attrs=read-write")
           `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: session is read-only")
-      needs "the narrow retry of sslmode=prefer" $ it "reports the client's own authentication failure over TLS with sslmode=prefer, and doesn't try plaintext" $
+      it "reports the client's own authentication failure over TLS with sslmode=prefer, and doesn't try plaintext" $
         connectFailure (tcp "user=native_pg_scram")
           `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: fe_sendauth: no password supplied")
       it "tries plaintext after a failure of TLS with sslmode=prefer" $

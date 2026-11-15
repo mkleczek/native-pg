@@ -106,7 +106,7 @@ data SslMode
     -- without verifying the server.
     SslAllow
   | -- | With TLS if the server takes it, without verifying the server, and if
-    -- it then fails or the server rejects the connection, without TLS.
+    -- the server then rejects the connection or TLS fails, without TLS.
     SslPrefer
   | -- | With TLS, without verifying the server.
     SslRequire

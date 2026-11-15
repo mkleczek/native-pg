@@ -161,8 +161,9 @@ type Use arr a = arr (Carrier, Maybe (Either String ByteString), Buffer) (Either
 -- on the same buffer, one after the other:
 --
 -- * @allow@ connects without TLS first, and with TLS if the server rejected the connection;
--- * @prefer@ connects with TLS first, and without if the server didn't take it, which is no failure, or if the connection
---   failed after it did;
+-- * @prefer@ connects with TLS first, and without if the server didn't take it, which is no failure, or if it did and then
+--   rejected the connection or TLS failed, as libpq does: a host that doesn't qualify, and a failure of the client's own,
+--   are reported as they are;
 -- * @require@ and @verify-full@ connect with TLS or fail, and @verify-full@ looks for the root certificate file first.
 --
 -- A Unix-domain socket isn't encrypted, whatever the mode, and without a TLS client @allow@ and @prefer@ connect without.
@@ -177,7 +178,7 @@ attempting settings use = attempts >>^ either (\(NotMade _ reason) -> Left reaso
       _ -> oneTry settings use Nothing
     secure client verification required = oneTry settings use (Just (Securing client verification required))
     rejected (NotMade _ failure) = case failure of ConnectionRejected _ -> True; _ -> False
-    afterTls (NotMade accepted _) = accepted
+    afterTls (NotMade accepted failure) = accepted && case failure of ConnectionRejected _ -> True; TlsFailure _ -> True; _ -> False
 
 -- | The attempt, and the second one on the same buffer if the first failed as the test says.
 retrying ::
