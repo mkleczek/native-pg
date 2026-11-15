@@ -52,6 +52,7 @@ module Network.Streaming.Combinators
 where
 
 import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (***), (>>>), (>>^), (^>>), (|||))
+import Control.Exception (throwIO)
 import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable, typeRep)
 import GHC.Records (HasField (..))
@@ -59,7 +60,6 @@ import GHC.Stack (HasCallStack)
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Network.Streaming.Annotate (answering, asking, box)
 import Network.Streaming.Classes
-import Network.Streaming.NotImplemented (notImplemented)
 import Network.Streaming.Plumbing
 
 -- | The step this many times, each on what the one before gave.
@@ -95,10 +95,13 @@ untilJust action = iterateWith (now (const (maybe (Again ()) Finish <$> action))
 {-# INLINE untilJust #-}
 
 -- | Runs the step; if it fails, runs the cleanup on the same input, and fails the same way. Neither of them can wait, so a
--- cancellation can't stop them half way, and catching the failure is enough. A stub: it fails when it runs, until it is
--- written.
+-- cancellation can't stop them half way, and catching the failure is enough. If the cleanup fails too, its failure goes on
+-- instead.
 undoing :: (Steps arr) => (forall p. (Steps p) => p a b) -> (forall p. (Steps p) => p a ()) -> arr a b
-undoing _ _ = notImplemented "undoing"
+undoing body cleanup =
+  alongside (tryA body)
+    >>> decide "failed?" (\(result, input) -> either (Left . (input,)) Right result)
+    >>> (taking "failed" (consume cleanup >>> now throwIO) ||| taking "done" returnA)
 {-# INLINE undoing #-}
 
 -- | A ticket of the arrow's own reach: one that only parts of this core fulfil and await.

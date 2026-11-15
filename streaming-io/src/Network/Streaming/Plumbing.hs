@@ -122,10 +122,9 @@ _2 :: (Arrow arr) => arr a b -> arr (c, a) (c, b)
 _2 = second
 {-# INLINE _2 #-}
 
--- | Runs the arrow on the part that the lens picks, and ignores the rest. A stub: it fails when it runs, until it is
--- written.
+-- | Runs the arrow on the part that the lens picks, and ignores the rest.
 on :: (Arrow arr) => (arr a () -> arr s t) -> arr a () -> arr s ()
-on _ _ = arr (const (error "on is not implemented yet"))
+on l p = l p >>> done
 {-# INLINE on #-}
 
 -- | Runs the first arrow if the input is 'False', and the second if it is 'True', like 'bool'. In diagrams the two

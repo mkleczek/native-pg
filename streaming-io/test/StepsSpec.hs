@@ -29,33 +29,28 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | Marks a case that is expected to fail while 'undoing' and 'on' are stubs. The mark comes off as the code lands, and a
--- case that then passes unexpectedly fails the suite.
-stub :: Spec -> Spec
-stub = xfail "steps: undoing and on are stubs, which fail as not implemented"
-
 spec :: Spec
 spec = describe "steps" $ forM_ runners $ \(Runner name run) -> describe name $ do
   describe "undoing" $ do
-    stub $ it "gives the result of the step when it succeeds, and doesn't run the cleanup" $ do
+    it "gives the result of the step when it succeeds, and doesn't run the cleanup" $ do
       noted <- newLog
       run (const 7 ^>> undoing (succeeds noted) (cleaning noted)) `shouldReturn` 8
       readLog noted `shouldReturn` ["step 7"]
 
-    stub $ it "runs the cleanup once, on the input of the step, when it fails, and then fails with the same exception" $ do
+    it "runs the cleanup once, on the input of the step, when it fails, and then fails with the same exception" $ do
       noted <- newLog
       result <- run (tryA (const 7 ^>> undoing (fails noted) (cleaning noted)))
       failureOf result `shouldBe` Just (Boom 7)
       readLog noted `shouldReturn` ["step 7", "cleanup 7"]
 
-    stub $ it "fails with the exception of the cleanup, when the cleanup fails too" $ do
+    it "fails with the exception of the cleanup, when the cleanup fails too" $ do
       noted <- newLog
       result <- run (tryA (const 7 ^>> undoing (fails noted) (cleaning noted >>> now (const (throwIO (userError "cleanup failed"))))))
       describeFailure result `shouldBe` "Left user error (cleanup failed)"
       readLog noted `shouldReturn` ["step 7", "cleanup 7"]
 
     -- The inner one is a step of the outer one, which a step that waits could not be.
-    stub $ it "can be the step of another undoing: the cleanups run innermost first, and the exception is the same" $ do
+    it "can be the step of another undoing: the cleanups run innermost first, and the exception is the same" $ do
       noted <- newLog
       failed <- run (tryA (const 7 ^>> undoing (undoing (fails noted) (cleaning noted)) (noting' noted "outer cleanup")))
       failureOf failed `shouldBe` Just (Boom 7)
@@ -72,7 +67,7 @@ spec = describe "steps" $ forM_ runners $ \(Runner name run) -> describe name $ 
       run (const (1 :: Int, (2 :: Int, "rest")) ^>> through _1 (arr (+ 1))) `shouldReturn` (2, (2, "rest"))
 
   describe "on" $
-    stub $ it "runs the arrow on the part that the lens picks, and gives the unit" $ do
+    it "runs the arrow on the part that the lens picks, and gives the unit" $ do
       noted <- newLog
       run (const (1 :: Int, (2 :: Int, "rest")) ^>> on (_2 . _1) (seeing noted >>> done)) `shouldReturn` ()
       readLog noted `shouldReturn` ["saw 2"]
