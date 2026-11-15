@@ -1,0 +1,43 @@
+cabal-version: 3.0
+name: sieve
+version: 0.1.0.0
+synopsis: A SIEVE cache on the arrow runtime of streaming-io
+description: A SIEVE cache as an open-addressed table, whose hits take no lock and write nothing but a visited byte, with
+             loads that are shared between the callers that miss the same key, as tickets of the arrow that runs them, and
+             leases for values that must not be destroyed while a request uses them. It is for one core and for all cores.
+license: AGPL-3.0-or-later
+license-file: LICENSE
+build-type: Simple
+extra-source-files: test/check-reach.sh
+                    test/compile/*.hs
+
+library
+  default-language: GHC2021
+  hs-source-dirs: src
+  -- The unfoldings are exposed and the overloaded functions specialised, so that a program that is built where its arrow
+  -- is known is specialised to the arrow, and a hit to the key's type.
+  ghc-options: -Wall -fexpose-all-unfoldings -fspecialise-aggressively
+  exposed-modules: Data.Sieve
+                   Data.Sieve.Lease
+                   Data.Sieve.Teardown
+  build-depends: base >=4.18 && <5, containers >=0.6 && <0.8, streaming-io
+
+test-suite sieve-spec
+  type: exitcode-stdio-1.0
+  default-language: GHC2021
+  hs-source-dirs: test
+  main-is: Main.hs
+  default-extensions: NoMonomorphismRestriction
+  other-modules: Support
+                 Model
+                 ModelSpec
+                 CachedSpec
+                 SingleFlightSpec
+                 LeaseSpec
+                 TeardownSpec
+                 StressSpec
+                 AllocationSpec
+  -- -T counts the allocation that AllocationSpec reads.
+  ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-T" -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
+  build-depends: base, containers, sieve, streaming-io, skeletest >=0.4.2 && <0.5
