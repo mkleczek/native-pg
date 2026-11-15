@@ -131,9 +131,9 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       buffers <- buffersOf
       maintenance <- newMaintenance
       pool <- newConnectionPool maintenance (connectionPoolSettings 2 settings)
-      connectionPoolStats pool `shouldReturn` PoolStats 0 0 0
+      counts pool `shouldReturn` (0, 0, 0)
       void (pidOf (Env runner buffers pool))
-      connectionPoolStats pool `shouldReturn` PoolStats 1 0 0
+      counts pool `shouldReturn` (1, 0, 0)
       closeConnectionPool pool
       closeConnectionPool pool
       runOn runner buffers (viaPool pool done) `shouldReturn` Left PoolClosed
@@ -229,7 +229,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
           other -> failTest ("no connection: " <> show (other :: Either SomeException (Either PoolError (Either QueryError Int64))))
         (ended - started < 2) `shouldBe` True
         -- The only connection that the pool has is the holder's: none was opened for the delay that ran out meanwhile.
-        connectionPoolStats (envPool env) `shouldReturn` PoolStats 1 0 0
+        counts (envPool env) `shouldReturn` (1, 0, 0)
 
     it "keeps to the size and the overflow: a request past both waits for a connection to come back, and gives up at the pool's timeout" $
       pooled (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 50, poolCheckoutTimeout = Just (millis 600)}) $ \env -> do
@@ -262,25 +262,25 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
   describe "stats" $ do
     it "counts the connections that are idle, that a request has, and that are being made" $
       pooled (\s -> s {poolSize = 2}) $ \env -> do
-        connectionPoolStats (envPool env) `shouldReturn` PoolStats 0 0 0
+        counts (envPool env) `shouldReturn` (0, 0, 0)
         void (pidOf env)
-        connectionPoolStats (envPool env) `shouldReturn` PoolStats 1 0 0
+        counts (envPool env) `shouldReturn` (1, 0, 0)
         first <- startHolding env
-        connectionPoolStats (envPool env) `shouldReturn` PoolStats 0 1 0
+        counts (envPool env) `shouldReturn` (0, 1, 0)
         second <- startHolding env
-        connectionPoolStats (envPool env) `shouldReturn` PoolStats 0 2 0
+        counts (envPool env) `shouldReturn` (0, 2, 0)
         finishHolding first
         finishHolding second
-        connectionPoolStats (envPool env) `shouldReturn` PoolStats 2 0 0
+        counts (envPool env) `shouldReturn` (2, 0, 0)
 
     it "counts the connection that a request is making as opening" $
       withSilentServer $ \silent -> do
         buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
         withPool runner buffers (connectionPoolSettings 1 (connectSettings (UnixAddress (silent </> ".s.PGSQL.5432")) "postgres")) $ \pool -> do
           _ <- forkIO (void (runOn runner buffers (withinFor (secs 2) (viaPool pool done))))
-          eventually 3 ((== PoolStats 0 0 1) <$> connectionPoolStats pool) `shouldReturn` True
+          eventually 3 ((== (0, 0, 1)) <$> counts pool) `shouldReturn` True
           -- The request gave up: its slot is empty and free again.
-          eventually 5 ((== PoolStats 0 0 0) <$> connectionPoolStats pool) `shouldReturn` True
+          eventually 5 ((== (0, 0, 0)) <$> counts pool) `shouldReturn` True
 
   -- What a program keeps for a connection, as a program that prepares statements keeps the names that its connection has, lives as
   -- long as the connection does: through every use of it by a pool, and not beyond.
@@ -367,7 +367,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
           runOn runner buffers (withinFor (millis 500) (viaPool pool done)) `shouldReturn` Nothing
           tried <- readIORef attempts
           (tried >= 3 && tried < 12) `shouldBe` True
-          connectionPoolStats pool `shouldReturn` PoolStats 0 0 0
+          counts pool `shouldReturn` (0, 0, 0)
 
     -- What the pool did before it had overflow, and still does when it has none, or when the failure is another.
     it "is reported by a pool that has no overflow" $ do
@@ -575,6 +575,10 @@ slotted = alongside known >>> (\(has, input) -> if has then Left input else Righ
     remember = now (\(connection, _) -> slot connection >>= \cell -> modifyIORef' cell (\(Prepared names) -> Prepared ("slotted" : names)))
     preparing = committed Tx.Read ((,) <$> Tx.prepare "slotted" statement <*> Tx.executePrepared "slotted" statement) (\(preparation, result) -> Tx.prepared preparation >>> Tx.single result)
     executing = committed Tx.Read (Tx.executePrepared "slotted" statement) Tx.single
+
+-- | How many connections the pool has that are idle, that a request has, and that a request is making.
+counts :: ConnectionPool -> IO (Int, Int, Int)
+counts pool = (\stats -> (statsIdle stats, statsInUse stats, statsOpening stats)) <$> connectionPoolStats pool
 
 -- | The backend of the connection that a request runs on, as a step on it.
 backend :: (Runtime arr) => OnConn arr (Either QueryError Int64)

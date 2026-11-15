@@ -370,8 +370,9 @@ using body = scope acquire release run
     run = (snd *** snd) ^>> body
 
 -- | How many connections the pool has, as they are now: those that are free in their slot, those that a request has, and
--- the slots that a request has to fill, and is filling.
-data PoolStats = PoolStats {statsIdle :: Int, statsInUse :: Int, statsOpening :: Int}
+-- the slots that a request has to fill, and is filling; how many connections it keeps, its soft limit, which is its size until the
+-- server refuses a connection for its connection limit; and how many such refusals the server has made since the pool was made.
+data PoolStats = PoolStats {statsIdle :: Int, statsInUse :: Int, statsOpening :: Int, statsSoftLimit :: Int, statsRefusals :: Int}
   deriving (Eq, Show)
 
 -- | The counts of the pool's connections, read without stopping the pool, so that a request that comes and goes meanwhile may
@@ -382,7 +383,7 @@ connectionPoolStats pool = do
   idle <- connected free'
   have <- connected (poolEvery pool)
   let held = length (poolEvery pool) - length free'
-  pure (PoolStats idle (have - idle) (held - (have - idle)))
+  pure (PoolStats idle (have - idle) (held - (have - idle)) 0 0)
   where
     connected slots = length . filter isJust <$> traverse (readIORef . slotConnection) slots
 
