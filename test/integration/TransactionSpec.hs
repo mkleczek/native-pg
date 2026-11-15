@@ -453,6 +453,18 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
             ]
         )
         `shouldReturn` ()
+    -- The server answers a Close of a name it doesn't have as it does one that it has.
+    it "closes a name that was never prepared without an error, and a name once only" $
+      withSession
+        ( steps
+            [ closed "never_prepared" `yields` Right (),
+              committed Tx.Read (Tx.prepare "once" (answerFor "1")) Tx.prepared `yields` Right (),
+              closed "once" `yields` Right (),
+              closed "once" `yields` Right (),
+              preparedNames `yields` Right []
+            ]
+        )
+        `shouldReturn` ()
 
 -- * Statements of the cases
 
