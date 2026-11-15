@@ -26,6 +26,7 @@ module Database.PostgreSQL.Pool
     newConnectionPool,
     closeConnectionPool,
     maintain,
+    lookAt,
     PoolStats (..),
     connectionPoolStats,
     Observation (..),
@@ -271,7 +272,8 @@ nanoseconds (Duration count) = count
 -- than the idle time ago, are closed. A slot is taken from the pool for the look, and is the looker's alone while it is, so
 -- that no request has the connection that is closed; they are given back in the order that they were taken in, so that the
 -- pool lends them as it did. The idle time is told in looks, which the pool counts once for each of its own periods, and not
--- more often, though the maintenance looks as often as the shortest period of its pools asks.
+-- more often, though the maintenance looks as often as the shortest period of its pools asks. It is what 'maintain' makes at each
+-- of its pools, and is exported so that a test can make one look.
 lookAt :: ConnectionPool -> Word64 -> IO ()
 lookAt pool now' = do
   lastLook <- readIORef (poolLastLook pool)
