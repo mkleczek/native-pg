@@ -352,7 +352,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         encryptedBy "sslmode=require" `shouldReturn` Right [True]
       -- The batch is larger than the buffers that the two ends of a TCP connection can grow to, so that the server stops
       -- writing a result that nobody reads, and stops reading the request, for every platform and every run.
-      needs "a connection that sends and reads at once" $ it "sends a large batch while reading its responses over TLS" $
+      it "sends a large batch while reading its responses over TLS" $
         withString (tcp "sslmode=require") (batchWhileReading 32000000 32000000) `shouldReturn` Just (Right (32000000, 32000000))
       it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $
         withString (local "sslmode=require") encrypted `shouldReturn` Right [False]
@@ -581,9 +581,9 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    needs "a connection that sends and reads at once" $ it "sends a batch while reading its results, as the server answers before reading all of it" $
+    it "sends a batch while reading its results, as the server answers before reading all of it" $
       withSession (batchWhileReading 1000000 2000000) `shouldReturn` Just (Right (1000000, 2000000))
-    needs "a connection that sends and reads at once" $ it "streams a parameter while it reads the large result of a statement before it" $
+    it "streams a parameter while it reads the large result of a statement before it" $
       withSession
         ( withinFor (secs 10) $
             streaming

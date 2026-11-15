@@ -17,10 +17,14 @@
 --
 -- A transaction works in one buffer of the request's loans, its primary: what the
 -- client says is rendered into it and sent, and the replies are read into it by
--- cursors. The two directions take turns in the one part: a pipeline is sent once
--- what the one before it said is answered. The queue of the answers that are
--- expected is the statements of the pipeline that was sent, which the server
--- answers in order, and the reading program takes the results from it in the
+-- cursors. A pipeline is sent once what the one before it said is answered. A
+-- pipeline that is no larger than one buffer, and streams nothing, is sent in turn
+-- with the reading: all of it is sent, and then read. A larger one, or one that
+-- streams, is sent while it is read, as two parts, since the server may stop reading
+-- what it is sent while nobody reads its answers; the sending then renders into a
+-- second buffer, which it borrows. The queue of the answers that are expected is the
+-- statements of the pipeline that was sent, which the server answers in order, and it is
+-- made before either part starts. The reading program takes the results from it in the
 -- order of their statements. A statement declares the one stream that its
 -- 'FromStream' parameters take their bytes from, when the program is built, with
 -- 'streamFrom'; the stream's state is taken from the input of the program, and
@@ -94,7 +98,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Foldable (traverse_)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
 import Data.Kind (Type)
 import qualified Data.List as List
@@ -129,14 +133,15 @@ import Database.PostgreSQL.Internal.Protocol.Codec (Serializable (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output, hole, int32, outputLength, outputWriter, runWriter)
 import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output (WriteResult (..), bytes)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
-import Database.PostgreSQL.Internal.Carrier (Carrier)
+import Database.PostgreSQL.Internal.Carrier (Carrier, share)
 import qualified Database.PostgreSQL.Internal.Protocol.Messages as Wire
 import Database.PostgreSQL.Types (FormatCode (..), Oid, Parameter (..))
 import Foreign.Storable (peekByteOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
+import Network.Streaming.Buffer (Buffer (bufferCapacity))
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
-import Network.Streaming.Combinators (pattern Again, pattern Finish, _1, _2, alongside, boolA, consume, done, iterateA, iterateWith, keeping, on, tap, through, undoing)
-import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, _1, _2, alongside, boolA, concurrently, consume, done, iterateA, iterateWith, keeping, on, tap, through, undoing)
+import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, loansOf, release)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity, readerMemory)
 import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
@@ -309,8 +314,6 @@ data State = State
     stOwed :: !Bool,
     -- | What the last ReadyForQuery said: the byte of @I@, @T@ or @E@.
     stStatus :: !Int,
-    -- | Whether a send is under way, which leaves something half sent if it is cancelled.
-    stSending :: !Bool,
     -- | Whether a field was handed out of the row that is being read.
     stField :: !Bool
   }
@@ -327,7 +330,10 @@ data Tx = Tx
     txLoan :: !Loan,
     txState :: !(IORef State),
     -- | The number that a field is valid for: it changes as the row moves on, and when the transaction ends.
-    txEpoch :: !(IORef Int)
+    txEpoch :: !(IORef Int),
+    -- | Whether a send is under way, which leaves something half sent if it is cancelled. The part that sends changes it and the
+    -- part that reads doesn't, since the two may run at once.
+    txSending :: !(IORef Bool)
   }
 
 -- | The messages of the server that a transaction reads, which are told apart by their tags. The body of those that
@@ -706,19 +712,39 @@ foldRows step start result = const start ^>> iterateA (keeping (nextRow result) 
 -- dropped, as is the field of a row.
 --
 -- What the server is sent is the statements, and a Sync, in as many sends as the buffer needs, once what the pipeline before it
--- was answered with is read. BEGIN comes with the first, and the ending with the last. A pipeline whose statements declare a
--- stream pulls the streams as it sends. All of it is sent before the reading program runs.
+-- was answered with is read. BEGIN comes with the first, and the ending with the last. A pipeline that fits one buffer and
+-- streams nothing is sent in turn with the reading program: it is sent in the buffer of the transaction, and is read after it.
+-- A larger one, or one whose statements declare a stream, is sent while it is read, in two parts of a group: the request side,
+-- which renders into a buffer that it borrows and pulls the streams, and the reading program. The failure of either part
+-- cancels the other where it waits.
 pipeline :: (Runtime arr) => Ending -> Pipeline arr p a -> (a -> With Tx arr x y) -> With Tx arr (p, x) y
 pipeline finality (Pipeline _ sent value) reading =
   tap (done >>> moved >>> readyToSend)
     >>> withTx (layout finality streams numbered)
-    >>> ((program ||| streamed) ||| inTurn)
+    >>> ((program ||| atOnce) ||| inTurn)
   where
     streams = List.any (isJust . streamOf) sent
     numbered = numberStreams sent
     program = reading (value 0)
     inTurn = consume transmit >>> program
-    streamed = (\(output, input, rest) -> ((input, output), rest)) ^>> consume (transmitStreamed (selecting (concatMap puller sent))) >>> program
+    -- What the reader holds and what the connection kept are put together before the parts start, as a send in turn does it
+    -- around its rendering, and nothing is rendered into the buffer of the reader after.
+    atOnce =
+      tap (inTx (\tx -> setAside tx >> bringBack tx))
+        >>> sharing (regrouped ^>> concurrently (fst ^>> request) (snd ^>> program) >>^ snd)
+    regrouped (output, input, rest) = ((input, output), rest)
+    request =
+      withTx (\tx (input, output) -> pure (carrierOf tx, loansOf (txLoan tx), input, output))
+        >>> lift (sendStreamed (selecting (concatMap puller sent)))
+        >>> inTx (\tx -> writeIORef (txSending tx) False)
+
+-- | The connection's carrier of the transaction.
+carrierOf :: Tx -> Carrier
+carrierOf = sessionCarrier . connectionSession . txConnection
+
+-- | The step, with the calls on the connection's TLS session taking their lock while it runs, as its two parts make them at once.
+sharing :: (Runtime arr) => With Tx arr a b -> With Tx arr a b
+sharing body = scope (inTx (\tx -> share (carrierOf tx) True)) (inTx (\tx -> share (carrierOf tx) False)) (snd ^>> body)
 
 -- | The step that pulls the stream that the statement declares, if it declares one, with the input that its state is taken from.
 puller :: (Arrow arr) => Sent arr p -> [arr p (Maybe ByteString)]
@@ -756,9 +782,9 @@ readyToSend = inTx check >>> drain True
       traverse_ throwIO (stFailure s)
       when (stFinal s || stEnded s) (throwIO AfterFinal)
 
--- | The output of a pipeline of the program, and how it is sent: not at all if there is nothing to send, with the pulls of
--- its streams if a statement declares one, and else as it is. What the server is to answer is put in the queue of the
--- transaction, once all of it is rendered.
+-- | The output of a pipeline of the program, and how it is sent: not at all if there is nothing to send, in turn with the
+-- reading if it is no larger than one buffer and no statement of it streams, and else at once with it. What the server is
+-- to answer is put in the queue of the transaction, once all of it is rendered.
 layout :: Ending -> Bool -> [(Maybe Int, Sent arr p)] -> Tx -> (p, x) -> IO (Either (Either x (Output, p, x)) (Output, x))
 layout finality streams sent tx (input, rest) = do
   s <- inspect tx
@@ -769,8 +795,12 @@ layout finality streams sent tx (input, rest) = do
     [] -> pure (Left (Left rest))
     queued -> do
       output <- evaluate (foldMap snd queued <> sync)
-      modify tx (const s {stBegun = True, stFinal = stFinal s || finality == Final, stPending = map fst queued, stIndex = 0, stBase = length starting, stRows = 0, stTags = [], stOwed = True, stSending = True})
-      pure $ if streams then Left (Right (output, input, rest)) else Right (output, rest)
+      modify tx (const s {stBegun = True, stFinal = stFinal s || finality == Final, stPending = map fst queued, stIndex = 0, stBase = length starting, stRows = 0, stTags = [], stOwed = True})
+      writeIORef (txSending tx) True
+      pure $
+        if streams || outputLength output > bufferCapacity (loanBuffer (txLoan tx))
+          then Left (Right (output, input, rest))
+          else Right (output, rest)
   where
     plain text = statementOutput text [] [] []
     rendered parameters (source, item) = case item of
@@ -891,16 +921,7 @@ transmit :: (Runtime arr) => With Tx arr Output ()
 transmit =
   withTx (\tx output -> setAside tx >> pure (sessionCarrier (connectionSession (txConnection tx)), loanBuffer (txLoan tx), output))
     >>> lift sendOutput
-    >>> inTx (\tx -> bringBack tx >> modify tx (\s -> s {stSending = False}))
-
--- | Sends what was laid out as 'transmit' does, with the bytes of its holes taken from the streams that the arrow pulls, with
--- the input that the streams' state comes from. The messages are rendered into the loan of the transaction in turn with the
--- pulls, and a pull that waits leaves them half sent.
-transmitStreamed :: (Runtime arr) => arr (Int, p) (Maybe ByteString) -> With Tx arr (p, Output) ()
-transmitStreamed pulling =
-  withTx (\tx (input, output) -> setAside tx >> pure (sessionCarrier (connectionSession (txConnection tx)), loanBuffer (txLoan tx), input, output))
-    >>> lift (sendStreamed pulling)
-    >>> inTx (\tx -> bringBack tx >> modify tx (\s -> s {stSending = False}))
+    >>> inTx (\tx -> bringBack tx >> writeIORef (txSending tx) False)
 
 -- | The buffer is rendered into, so what the reader holds of what the server sent after its last message goes to the
 -- connection first: the notification that came after the last reply of a pipeline is not lost to the next pipeline.
@@ -924,7 +945,8 @@ alone validating = moved >>> withTx queued >>> transmit >>> drain validating
     queued tx (text, carrier) = do
       s <- inspect tx
       let !output = carrier <> sync
-      modify tx (const s {stPending = [Entry text Passed], stIndex = 0, stBase = 0, stRows = 0, stTags = [], stOwed = True, stSending = True})
+      modify tx (const s {stPending = [Entry text Passed], stIndex = 0, stBase = 0, stRows = 0, stTags = [], stOwed = True})
+      writeIORef (txSending tx) True
       pure output
 
 -- | Ends the transaction as the program didn't: what is owed is read, and what the server may have left open is rolled
@@ -1005,10 +1027,10 @@ begin level mode =
               stFailure = Nothing,
               stOwed = False,
               stStatus = idle,
-              stSending = False,
               stField = False
             }
       epoch <- newIORef 0
+      sending <- newIORef False
       -- The last, since it can't be undone but by the failure of this.
       claim connection
       pure
@@ -1020,7 +1042,8 @@ begin level mode =
             txCursor = messages reader,
             txLoan = loan,
             txState = state,
-            txEpoch = epoch
+            txEpoch = epoch,
+            txSending = sending
           }
 
 -- | BEGIN, with the isolation level and the mode.
@@ -1062,8 +1085,9 @@ data Plan = Keep | Recover | Break String
 plan :: Tx -> Exit -> IO Plan
 plan tx exit = do
   s <- inspect tx
+  sending <- readIORef (txSending tx)
   unread <- fieldUnread tx s
-  let owed = stOwed s || stSending s
+  let owed = stOwed s || sending
       open = stBegun s && not (stEnded s)
   pure $ case exit of
     Done
@@ -1072,7 +1096,7 @@ plan tx exit = do
       | otherwise -> Keep
     Failed failure
       | not (recoverable failure) -> Break (displayException failure)
-      | stSending s -> Break "the transaction failed while it sent"
+      | sending -> Break "the transaction failed while it sent"
       | unread -> Break "a field was left unread in the middle of its stream"
       | otherwise -> Recover
     Cancelled'

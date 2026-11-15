@@ -15,6 +15,7 @@ module Network.Streaming.Loans
   ( Loans,
     Loan,
     loanBuffer,
+    loansOf,
     withRequestBuffers,
     borrow,
     release,
@@ -64,6 +65,10 @@ twoLoans = userError "request already has two buffer loans"
 
 loanBuffer :: Loan -> Buffer
 loanBuffer (Loan _ _ _ buffer) = buffer
+
+-- | The loans of the request that lent the loan, which a part that was given the loan borrows more from.
+loansOf :: Loan -> Loans
+loansOf (Loan loans _ _ _) = loans
 
 -- | The program as one request in flight: it is given its loans besides its input, and has them until it ends,
 -- however it ends. Every loan is returned then, and every alias of a buffer is invalid. A request that has to wait to

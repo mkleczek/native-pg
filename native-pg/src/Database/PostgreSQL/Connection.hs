@@ -219,7 +219,7 @@ started settings =
   where
     startupInput (carrier, binding, buffer) = ((carrier, buffer, binding), carrier)
     made carrier info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) carrier
-    isSecure = \case Secure _ -> True; Plain _ -> False
+    isSecure = \case Secure _ _ -> True; Plain _ -> False
 
 -- | What an attempt that wants no TLS starts on: the socket itself, without channel binding.
 onSocket :: (Arrow arr) => arr (Socket, Buffer) (Either NotMade (Carrier, Maybe (Either String ByteString), Buffer))

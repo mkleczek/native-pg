@@ -26,7 +26,7 @@ import Data.Foldable (toList)
 import Data.List (sort)
 import Data.Maybe (fromMaybe)
 import Database.PostgreSQL.Errors (ConnectError (..))
-import Database.PostgreSQL.Internal.Carrier (Carrier (..))
+import Database.PostgreSQL.Internal.Carrier (Carrier (..), newGuard)
 import Database.PostgreSQL.Internal.Frontend (sendOutput)
 import Database.PostgreSQL.Internal.Protocol.Messages (pattern SSLRequest, serialize)
 import Database.PostgreSQL.Session.Settings (ConnectSettings (..))
@@ -98,7 +98,7 @@ secured settings (Securing client verification _) = now opening >>> (now (pure .
       alongside (tryA shake)
         >>> now
           ( \(shaken, link) -> case shaken of
-              Right binding -> pure (Right (Secure link, fromMaybe binding (connectEndPointOverride settings)))
+              Right binding -> (\guard -> Right (Secure link guard, fromMaybe binding (connectEndPointOverride settings))) <$> newGuard
               Left failure -> Left <$> (linkEnd link *> classified failure)
           )
 

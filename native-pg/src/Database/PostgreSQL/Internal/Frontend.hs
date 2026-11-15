@@ -24,8 +24,9 @@ import Database.PostgreSQL.Internal.Protocol.Messages (pattern Sync, serialize)
 import Database.PostgreSQL.Internal.Carrier (Carrier)
 import Foreign.ForeignPtr (withForeignPtr)
 import Network.Streaming.Buffer (Buffer (..))
-import Network.Streaming.Classes (Effect (..), Link (..), Runtime, view)
+import Network.Streaming.Classes (Effect (..), Link (..), Runtime, Scope (..), view)
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateA, tap)
+import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
 
 -- | What is left to send: the carrier, the buffer that the writer renders into, and the writer.
 data Outgoing = Outgoing {outCarrier :: Carrier, outBuffer :: Buffer, outWriter :: Writer}
@@ -71,11 +72,11 @@ sendOutput =
 sync :: Output
 sync = serialize Sync
 
--- | What a send that has holes has in hand: the carrier, the buffer that the writer renders into, what the streams' state
--- is taken from, the writer, and what the streams have given.
+-- | What a send that has holes has in hand: the carrier, the loans of the request that the writer's buffer is borrowed from, what
+-- the streams' state is taken from, the writer, and what the streams have given.
 data Streamed p = Streamed
   { streamCarrier :: Carrier,
-    streamBuffer :: Buffer,
+    streamLoans :: Loans,
     streamInput :: p,
     streamWriter :: Writer,
     -- | The rest of the piece that a stream gave last, which no hole has taken yet.
@@ -100,11 +101,15 @@ data Taking p = Taking !(Streamed p) !Int !Int
 -- split, and its rest goes to the next hole. A hole whose tag is odd is the last of its statement that takes from the
 -- stream, which then has no more to give, or the send fails with 'StreamLengthError', as it does if a stream ends before
 -- its holes are full. No byte that a stream gave beyond its holes is sent.
-sendStreamed :: (Runtime arr) => arr (Int, p) (Maybe ByteString) -> arr (Carrier, Buffer, p, Output) ()
+--
+-- The writer renders into a buffer that is borrowed from the loans, for each part of the output that is rendered and sent,
+-- and is given back before a stream is pulled, so that a stream may borrow of the loans itself.
+sendStreamed :: (Runtime arr) => arr (Int, p) (Maybe ByteString) -> arr (Carrier, Loans, p, Output) ()
 sendStreamed pull =
-  (\(carrier, buffer, input, output) -> Streamed carrier buffer input (outputWriter output) BS.empty 0 0)
-    ^>> iterateA (now renderStreamed >>> shown ^>> consume sendPieces >>> next')
+  (\(carrier, loans, input, output) -> Streamed carrier loans input (outputWriter output) BS.empty 0 0)
+    ^>> iterateA (burst >>> next')
   where
+    burst = scope (streamLoans ^>> borrow) (fst ^>> release) (now renderStreamed >>> shown ^>> consume sendPieces)
     shown (Showing carrier pieces following) = ((carrier, pieces), following)
     sendPieces = somePieces ^>> (returnA ||| sendAll)
     somePieces (carrier, pieces) = if null pieces then Left () else Right (carrier, pieces)
@@ -139,12 +144,13 @@ sendStreamed pull =
     carried (Taking state _ _) = not (BS.null (streamCarry state))
     pulled = alongside ((\(Taking state tag _) -> (tag `shiftR` 1, streamInput state)) ^>> pull) >>^ swap
     fromCarry = arr (\(Taking state tag left) -> (Taking state {streamCarry = BS.empty} tag left, Just (streamCarry state)))
-    renderStreamed :: Streamed p -> IO (Showing p)
-    renderStreamed state@Streamed {streamCarrier, streamBuffer, streamWriter} =
-      withForeignPtr (bufferMemory streamBuffer) (\pointer -> runWriter streamWriter pointer (bufferCapacity streamBuffer) 0) >>= \case
+    renderStreamed :: (Loan, Streamed p) -> IO (Showing p)
+    renderStreamed (loan, state@Streamed {streamCarrier, streamWriter}) =
+      withForeignPtr (bufferMemory buffer) (\pointer -> runWriter streamWriter pointer (bufferCapacity buffer) 0) >>= \case
         Finished used -> pure (showing used [] Over)
         NeedSpace used rest -> pure (showing used [] (Resume state {streamWriter = rest}))
         Yield used (UncopiedBytes long) rest -> pure (showing used [long] (Resume state {streamWriter = rest}))
         Hole used tag size rest -> pure (showing used [] (Holed state {streamWriter = rest} tag size))
       where
-        showing used following = Showing streamCarrier ([view streamBuffer used | used > 0] <> following)
+        buffer = loanBuffer loan
+        showing used following = Showing streamCarrier ([view buffer used | used > 0] <> following)
