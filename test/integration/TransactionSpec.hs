@@ -31,6 +31,7 @@ import Data.Text (Text)
 import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
+import Database.PostgreSQL.Types (FormatCode (..), Oid)
 import Skeletest
 import TestPrograms hiding (named)
 
@@ -318,6 +319,25 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
             ]
         )
         `shouldReturn` ()
+    -- A parameter that only a typed function takes has no type for the server to infer, as the body of a request that PostgREST
+    -- sends as json does, so Parse has to name the types of the statement's parameters.
+    needs "prepare sending the types of its parameters" $ do
+      it "sends the types of the parameters of a statement that it prepares" $
+        withSession
+          ( steps
+              [ preparedResult "typed" jsonField `yields` Right "x",
+                committed Tx.Read (Tx.executePrepared "typed" (unrendered jsonField)) Tx.single `yields` Right "x"
+              ]
+          )
+          `shouldReturn` ()
+      it "sends the types that the input of the pipeline gives, for each run of one program" $
+        withSession
+          ( overInputs
+              (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,,) <$> Tx.prepare "typed_input" typeOfInput <*> Tx.executePrepared "typed_input" typeOfInput <*> Tx.closeStatement "typed_input") typedInput)
+              [(114, "{}"), (3802, "{}"), (114, "[]")]
+              `yields` [Right "json", Right "jsonb", Right "json"]
+          )
+          `shouldReturn` ()
     it "keeps a name whose preparation was awaited when its execution fails and the transaction rolls back" $ do
       acknowledged <- newIORef False
       withSession
@@ -518,6 +538,18 @@ statusAndBody = Tx.any (Tx.column &&& Tx.field)
 maybeBody :: (Runtime arr) => Rows arr (Int32, Maybe Tx.Field)
 maybeBody = Tx.any (Tx.column &&& Tx.nullableField)
 
+-- | The field of a json parameter, which the server can read only if it knows that the parameter is json.
+jsonField :: (Runtime arr) => Tx.Statement arr () Text
+jsonField = Tx.Statement "SELECT x.a FROM (SELECT $1 AS j) t, json_to_record(t.j) AS x(a text)" (const [Tx.Param (Just 114) BinaryFormat (Tx.Bytes "{\"a\":\"x\"}")]) Nothing single
+
+-- | The type that the server has for the parameter, which is the type of its input.
+typeOfInput :: (Runtime arr) => Tx.Statement arr (Oid, ByteString) Text
+typeOfInput = Tx.Statement "SELECT pg_typeof($1)::text" (\(oid, value) -> [Tx.Param (Just oid) TextFormat (Tx.Bytes value)]) Nothing single
+
+-- | A preparation, its execution and the closing of the name, read in that order: the one row of the execution.
+typedInput :: (Runtime arr) => (Tx.Preparation, Tx.Result arr Text, Tx.Result arr ()) -> With Tx.Tx arr () Text
+typedInput (preparation, result, closing) = Tx.prepared preparation >>> Tx.single result >>> thenDo (Tx.discard closing)
+
 -- | An unnamed statement, a preparation and its execution, with the parameters that tell them apart.
 wire :: (Runtime arr) => ByteString -> Tx.Pipeline arr () (Tx.Result arr Int32, Tx.Preparation, Tx.Result arr Int32)
 wire name = (,,) <$> Tx.statement (answerFor "1") <*> Tx.prepare name (answerFor "2") <*> Tx.executePrepared name (answerFor "3")
@@ -527,7 +559,7 @@ preparedNames :: (Runtime arr) => OnConn arr (Either QueryError [Text])
 preparedNames = query (plain "SELECT name FROM pg_prepared_statements ORDER BY name" single)
 
 -- | Prepares a name and runs it in a pipeline of its own, and takes its one row after the server acknowledged the preparation.
-preparedResult :: (Runtime arr) => ByteString -> Tx.Statement arr () Int32 -> OnConn arr (Either QueryError Int32)
+preparedResult :: (Runtime arr) => ByteString -> Tx.Statement arr () row -> OnConn arr (Either QueryError row)
 preparedResult name statement =
   committed Tx.Read ((,) <$> Tx.prepare name statement <*> Tx.executePrepared name statement) (\(preparation, result) -> Tx.prepared preparation >>> Tx.single result)
 
