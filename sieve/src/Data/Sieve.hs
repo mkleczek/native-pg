@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -35,18 +36,19 @@ module Data.Sieve
   )
 where
 
+import Control.Arrow (returnA, (>>>), (^>>), (|||))
 import Control.Concurrent (yield)
-import Control.Exception (onException)
+import Control.Exception (evaluate, onException)
 import Control.Monad (when)
 import Data.Foldable (for_, traverse_)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef, atomicWriteIORef)
+import Data.IORef (IORef, atomicWriteIORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Kind (Type)
 import Data.Sieve.Ghosts (Ghosts, addGhost, noGhosts, takeGhost)
 import Data.Sieve.Memory (Ints, casInt, newInts, readInt, writeInt, writeIntAtomic)
 import Data.Sieve.Table
 import GHC.TypeLits (ErrorMessage (..), TypeError)
 import Network.Streaming.Classes
-import Network.Streaming.NotImplemented (notImplemented)
+import Network.Streaming.Combinators (Step, alongside, done, iterateA, keeping, step, pattern Again, pattern Finish)
 
 -- | Which cores use a cache.
 data Sharing
@@ -137,11 +139,104 @@ newSharedCache = make True
 -- | What the hook of 'cached' says about a value: the caller's result, or that the value is to be loaded again.
 data Use u = Use u | Reload
 
--- | The result of the hook for the value of a key, loading it if the cache has none. The loader runs as part of the caller's
--- own program, so it may wait, and the callers that miss the same key while it does wait for its value, and don't load it again.
--- If the loader fails or is cancelled, one of them loads it. Not yet.
-cached :: (Runtime arr, Key k, Reaching c arr) => arr k v -> (Instant -> v -> IO (Use u)) -> arr (Cache c k v, k) u
-cached _ _ = notImplemented "cached"
+-- | A caller that missed on its first look: the cache, the key, and whether the caller told 'requested' already, which it does
+-- once.
+data Slow c k v = Slow !(Cache c k v) !k !Bool
+
+-- | The result of the hook for the value of a key, loading it if the cache has none.
+--
+-- * **The look:** it takes no lock. A key that is found is given to the hook, with the time of the arrow's clock, and the hook
+--   says what to return, or that the value is to be loaded again: the entry is then removed, if it is still that entry, and the
+--   look goes on as a miss. A miss that a writer may have caused is looked at again under the writer's lock, where it is a miss
+--   for certain.
+-- * **The load:** the loader is an arrow, fixed when the program is built, that runs as part of the caller's own program, so it
+--   may wait. What it gives is cached, unless the key was cached meanwhile, and then that is what the caller has. The hook runs
+--   once on the value, as it does on one that is found.
+-- * **The listeners:** 'requested' is told once for each call, and the eviction listener of what the load evicts.
+cached ::
+  forall c arr k v u.
+  (Runtime arr, Key k, Reaching c arr) =>
+  arr k v ->
+  (Instant -> v -> IO (Use u)) ->
+  arr (Cache c k v, k) u
+cached loader hook =
+  named (Label "cached" "Looks the key up without a lock, and loads it if the cache has no value that the hook takes.") $
+    keeping clock
+      >>> step "look up" firstLook `giving` "found a value that the hook took?"
+      >>> (taking "no" slow ||| taking "yes" returnA)
+  where
+    -- The lookup that takes no lock, and the hook on what it finds.
+    firstLook (instant, (cache, k)) = do
+      table <- readIORef (cacheTable cache)
+      found <- findEntry table (hashKey k) k
+      case found of
+        Vacant -> pure (Left (Slow cache k False))
+        Entry _ _ _ value -> do
+          requested (cacheConfig cache) True
+          hook instant value >>= \result -> case result of
+            Use taken -> pure (Right taken)
+            Reload -> Left (Slow cache k True) <$ dropSame cache found
+
+    slow :: arr (Slow c k v) u
+    slow = named (Label "claim and load" "Looks the key up where no other writer is, and loads it if it is not cached.") (iterateA claimed)
+
+    claimed :: arr (Slow c k v) (Step (Slow c k v) u)
+    claimed = step "claim" claim `giving` "cached?" >>> (taking "yes" applying ||| taking "no" loading)
+
+    loading :: arr (Slow c k v) (Step (Slow c k v) u)
+    loading = alongside ((\(Slow _ k _) -> k) ^>> loader) >>> step "insert" insertLoaded >>> applying
+
+    -- Runs the hook, on the entry, with the time of the arrow's clock.
+    applying :: arr (Slow c k v, Entry k v) (Step (Slow c k v) u)
+    applying = alongside (done >>> clock) >>> step "hook" (\(instant, (caller, entry)) -> use instant caller entry)
+
+    use instant caller@(Slow cache k _) entry = case entry of
+      Vacant -> pure (Again caller)
+      Entry _ _ _ value -> hook instant value >>= \result -> case result of
+        Use taken -> pure (Finish taken)
+        Reload -> Again (Slow cache k True) <$ dropSame cache entry
+
+    insertLoaded (value, caller@(Slow cache k _)) = do
+      loaded <- evaluate value
+      (entry, _) <- insertUnlessCached cache (hashKey k) (prepareKey (cacheConfig cache) k) loaded
+      pure (caller, entry)
+{-# INLINE cached #-}
+
+-- | The look of a caller that missed, where no other writer is: the entry, if the key is cached after all, or the caller, which
+-- has told 'requested', and 'thrashed' if the key was evicted lately.
+claim :: (Key k) => Slow c k v -> IO (Either (Slow c k v, Entry k v) (Slow c k v))
+claim (Slow cache k recorded) = do
+  (found, notices) <- withWriter cache $ do
+    table <- readIORef (cacheTable cache)
+    entry <- findEntry table h k
+    case entry of
+      Vacant -> (,) entry <$> missed
+      _ -> pure (entry, [requested settings True | not recorded])
+  sequence_ notices
+  pure $ case found of
+    Vacant -> Right (Slow cache k True)
+    _ -> Left (Slow cache k True, found)
+  where
+    h = hashKey k
+    settings = cacheConfig cache
+    missed
+      | recorded = pure []
+      | otherwise = do
+          thrashing <- maybe (pure False) (\ghosts -> readIORef ghosts >>= \before -> let (was, after) = takeGhost h before in was <$ writeIORef ghosts after) (cacheGhosts cache)
+          pure (requested settings False : [tell | Just tell <- [thrashed settings], thrashing])
+
+-- | Removes the entry from the cache if the key still has this entry, and not one that took its place. It is not an eviction:
+-- the listener isn't told, and the key is not remembered as evicted.
+dropSame :: (Key k) => Cache c k v -> Entry k v -> IO ()
+dropSame cache entry = case entry of
+  Vacant -> pure ()
+  Entry h ident k _ -> withWriter cache $ do
+    table <- readIORef (cacheTable cache)
+    at <- locateEntry table h k
+    when (at >= 0) $
+      entryAt table at >>= \current -> case current of
+        Entry _ identNow _ _ | identNow == ident -> () <$ removeEntry table at
+        _ -> pure ()
 
 -- | Runs the action as the only writer: a cache of one core needs no lock, since the steps that never wait are atomic on a core
 -- whose parts switch only at waits, and a shared cache has a flag that a writer takes with a compare-and-swap, and that a writer
@@ -209,21 +304,28 @@ valueOf Vacant = Nothing
 -- | Caches the value of a key, unless it is cached already, and says whether it did. It may evict an entry.
 store :: (Key k) => Cache c k v -> k -> v -> IO Bool
 store cache k value = do
-  let h = hashKey k
-      !prepared = prepareKey (cacheConfig cache) k
-  !_ <- pure value
-  (stored, gone) <- withWriter cache $ do
+  let !prepared = prepareKey (cacheConfig cache) k
+  evaluated <- evaluate value
+  snd <$> insertUnlessCached cache (hashKey k) prepared evaluated
+
+-- | Caches the value of the prepared key, unless the key is cached, and gives the entry that is, and whether it is the new one.
+-- The key is prepared and the value evaluated before the writer is in: a copy of a key is not made while the others wait. It
+-- evicts as an insertion does, and tells the eviction listener once the writer has done.
+insertUnlessCached :: (Key k) => Cache c k v -> Int -> k -> v -> IO (Entry k v, Bool)
+insertUnlessCached cache h key value = do
+  (result, gone) <- withWriter cache $ do
     table <- readIORef (cacheTable cache)
-    present <- locateEntry table h k
+    present <- locateEntry table h key
     if present >= 0
-      then pure (False, [])
+      then (\entry -> ((entry, False), [])) <$> entryAt table present
       else do
         gone <- evictWhile cache (tableCapacity table) table (>= tableCapacity table)
-        newEntry cache h prepared value >>= insertEntry table
+        entry <- newEntry cache h key value
+        insertEntry table entry
         forget cache h
-        pure (True, gone)
+        pure ((entry, True), gone)
   told cache gone
-  pure stored
+  pure result
 
 -- | Removes a key, giving its value if it was cached. 'evicted' is not told: the caller has the value.
 remove :: (Key k) => Cache c k v -> k -> IO (Maybe v)

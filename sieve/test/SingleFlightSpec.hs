@@ -33,7 +33,7 @@ spec = describe "single flight" $ forM_ setups $ \setup@(Setup name _ make _ _ r
     run (valuesOf (tenTimes loads) cache [1]) `shouldReturn` [10]
     readIORef loads `shouldReturn` 1
 
-  itCase setup [Table, Cached, SingleFlight] "loads different keys at once, while the hits of another key go on" $ do
+  itCase setup [Table, Cached] "loads different keys at once, while the hits of another key go on" $ do
     loads <- counter
     started <- (,) <$> newIORef False <*> newIORef False
     cache <- make (ints 4)
@@ -98,7 +98,7 @@ spec = describe "single flight" $ forM_ setups $ \setup@(Setup name _ make _ _ r
     run (valuesOf (tenTimes loads) cache [1]) `shouldReturn` [10]
     readIORef loads `shouldReturn` 1
 
-  itCase setup [Table, Cached, SingleFlight] "gives the callers the value that is cached when the load finishes, if another way put it there" $ do
+  itCase setup [Table, Cached] "gives the callers the value that is cached when the load finishes, if another way put it there" $ do
     results <- newLog
     cache <- make (ints 4)
     let loader = tap (now (\_ -> () <$ store cache 1 99)) >>> pause (millis 60) >>^ const 5

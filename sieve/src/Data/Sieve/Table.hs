@@ -20,6 +20,7 @@ module Data.Sieve.Table
     tableCapacity,
     tableSize,
     findEntry,
+    entryAt,
     locateEntry,
     insertEntry,
     removeEntry,
@@ -134,6 +135,10 @@ findEntry table h k = go (homeOf table h)
             Entry h' _ k' _ | h' == h && k' == k -> found <$ visit table ident
             _ -> go (nextSlot table slot)
 {-# INLINE findEntry #-}
+
+-- | The entry that has the number: it is the writer's to ask, for an entry that is there.
+entryAt :: Table k v -> Int -> IO (Entry k v)
+entryAt table = readPointer (tableEntries table)
 
 -- | Sets the entry's visited byte, unless it is set: a hit that finds it set writes nothing.
 visit :: Table k v -> Int -> IO ()

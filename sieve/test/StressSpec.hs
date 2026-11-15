@@ -149,7 +149,7 @@ checkTenants tenants = do
 spec :: Spec
 spec = describe "stress" $ do
   describe "a writer and readers of one key and of several keys" $ do
-    itNeeds [Table, Cached, SingleFlight, Shared] "give no reader a value of another key, with the parts on three cores" $ do
+    itNeeds [Table, Cached] "give no reader a value of another key, with the parts on three cores" $ do
       ensureCores
       world <- newWorld
       results <-
@@ -162,7 +162,7 @@ spec = describe "stress" $ do
       results `shouldBe` Just [(), (), ()]
       checkWorld world
 
-    itNeeds [Table, Cached, SingleFlight, Shared] "give no reader a value of another key, with the parts as threads" $ do
+    itNeeds [Table, Cached] "give no reader a value of another key, with the parts as threads" $ do
       ensureCores
       world <- newWorld
       results <- promptly (runThreads (together [readerOf world (const 0), readerOf world (`mod` 16), readerOf world (`mod` 5), writerOf world 150000]) ())
