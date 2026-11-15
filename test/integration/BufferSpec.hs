@@ -74,7 +74,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
     it "authenticates with tiny setup buffers while the request's own is busy, and returns them" $
       tiny (thrice scram) `shouldReturn` Just ()
 
-    needs "TLS" $ it "authenticates SCRAM over TLS with required binding and tiny setup buffers" $
+    it "authenticates SCRAM over TLS with required binding and tiny setup buffers" $
       tiny (thrice ((tlsSettings port "native_pg_scram" (Just "scram secret")) {connectChannelBinding = ChannelBindingRequire})) `shouldReturn` Just ()
 
     -- A connection keeps nothing of the setup storage: what it learned there is its own, however the storage is used after.
@@ -185,7 +185,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
 
   -- A request works from one primary buffer, and what it borrows besides. Whatever it sends and receives passes
   -- through them, so the smallest ones are enough.
-  needs "TLS" $ describe "a request's buffers" $ do
+  describe "a request's buffers" $ do
     -- v1 had a workspace of four bytes and "owned metadata" for what did not fit it. A column that v2 decodes in place has
     -- to fit the buffer, and one that does not is read as a field, so the smallest buffer that takes a request is the largest
     -- column that it decodes in place.
@@ -200,7 +200,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       readIORef total `shouldReturn` 256
 
     -- The upload borrows a buffer for each piece it sends, from the loans of the request that also reads the response.
-    needs "TLS and streamed parameters" $ it "shares one primary across a borrowed upload and a streamed TLS response" $ do
+    needs "streamed parameters" $ it "shares one primary across a borrowed upload and a streamed TLS response" $ do
       remaining <- newIORef 16385
       held <- newIORef Nothing
       sharing
@@ -212,7 +212,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       (isNothing <$> readIORef held) `shouldReturn` True
 
     -- A source that is slow makes the request wait for it, and the response is read meanwhile: one wait of the arrow, not two.
-    needs "TLS and streamed parameters" $ it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $ do
+    needs "streamed parameters" $ it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $ do
       let pieces = replicate 64 (BS.replicate 256 120) <> [BS.replicate 1 120]
       sharing
         ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $

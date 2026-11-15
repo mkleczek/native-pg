@@ -217,7 +217,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
 
   -- v1 ran these cases over TLS. The cases above are about the pool and the transactions in it, so they run over a
   -- Unix-domain socket, and this one is what stays to be run over TLS.
-  needs "TLS" $ describe "over TLS" $
+  describe "over TLS" $
     it "commits the transaction, and gives the connection back" $ withEnv runner (tlsSettings port "native_pg_scram" (Just "scram secret")) 1 $ \env -> do
       pid <- pidOf env
       onEnv env (request env (ddl "CREATE TEMP TABLE scope_commit (id int)")) `shouldReturn` Right ()
@@ -229,7 +229,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
   -- the same when it hands the connection out: the request gets another connection, and fails no more than it waits.
   describe "an idle connection" $
     forM_ [("without TLS", unixSettings socketPath "postgres" Nothing), ("with TLS", tlsSettings port "postgres" Nothing)] $ \(label, settings) ->
-      (if label == "with TLS" then needs "TLS" else id) $ it ("is replaced when the server ended it, " <> label) $ withEnv runner settings 1 $ \env -> do
+      it ("is replaced when the server ended it, " <> label) $ withEnv runner settings 1 $ \env -> do
         pid <- pidOf env
         -- with a timeout, it returns once the backend has exited
         administrator (query (valued "SELECT pg_terminate_backend($1::int, 10000)" [Just (BC.pack (show pid))] (single @_ @Bool))) `shouldReturn` Right [True]

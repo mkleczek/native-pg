@@ -14,11 +14,11 @@ module Database.PostgreSQL.Internal.Startup
 where
 
 import Control.Arrow (arr, returnA, (>>>), (>>^), (^>>), (|||))
-import Control.Exception (IOException, SomeException, fromException, throwIO)
+import Control.Exception (Exception (..), IOException, SomeException, fromException, throwIO)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Maybe (maybeToList)
+import Data.Maybe (isJust, maybeToList)
 import Database.PostgreSQL.Errors (ConnectError (..), ServerError (..))
 import Database.PostgreSQL.Internal.Authentication
   ( ChannelBinding (..),
@@ -28,6 +28,7 @@ import Database.PostgreSQL.Internal.Authentication
     scramClientFinal,
     scramClientFirst,
     scramMechanism,
+    scramPlusMechanism,
     scramVerifyServerFinal,
   )
 import Database.PostgreSQL.Internal.Diagnostics (bodyDiagnostics)
@@ -38,6 +39,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Protocol.Messages hiding (FramedMessage)
 import Database.PostgreSQL.Internal.Carrier (Carrier)
 import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), ServerInfo (..), TargetSessionAttrs (..))
+import Database.PostgreSQL.Transport (TlsError (..))
 import GHC.IO.Exception (IOException (..))
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.Classes (Effect (..), Runtime, Scope (..))
@@ -63,8 +65,9 @@ type StartupMessages =
      ]
 
 -- | What the startup works with: the carrier, the buffer that its messages are rendered into and received in, which,
--- one after the other, need no more than one, and the reader of the replies.
-data Setup = Setup !Carrier !Buffer !(Reader Carrier)
+-- one after the other, need no more than one, the reader of the replies, and the data that SCRAM's channel binding takes
+-- from the TLS link: the bytes, or why there are none, or none.
+data Setup = Setup !Carrier !Buffer !(Reader Carrier) !(Maybe (Either String ByteString))
 
 -- | Where the startup is, and what it keeps: the version of the protocol, whichever the server settled on.
 data Phase
@@ -97,16 +100,17 @@ data Verdict = Qualifies | Disqualified String | Asks Question
 -- | Starts the session: it sends the startup message, authenticates and reads the server's report, up to its being
 -- ready for a statement, or says why it couldn't. A server that ends the stream, and one that says what the client
 -- doesn't understand, are ways that it couldn't.
-startup :: (Runtime arr) => ConnectSettings -> arr (Carrier, Buffer) (Either ConnectError ServerInfo)
+startup :: (Runtime arr) => ConnectSettings -> arr (Carrier, Buffer, Maybe (Either String ByteString)) (Either ConnectError ServerInfo)
 startup settings =
-  tryA (now (\(carrier, buffer) -> Setup carrier buffer <$> newReader carrier buffer) >>> withOnly (opening settings))
+  tryA (now (\(carrier, buffer, binding) -> (\reader -> Setup carrier buffer reader binding) <$> newReader carrier buffer) >>> withOnly (opening settings))
     >>> now (either failed (pure . Right))
 
 -- | What a failure of the startup is: the server's rejection and the client's own are as they were thrown, and a
--- stream that ended or broke, and messages that don't follow the protocol, are the connection's.
+-- stream that ended or broke, a TLS record that failed, and messages that don't follow the protocol, are the connection's.
 failed :: SomeException -> IO (Either ConnectError a)
 failed failure
   | Just connecting <- fromException failure = pure (Left connecting)
+  | Just tls <- fromException failure = pure (Left (TlsFailure (displayException (tls :: TlsError))))
   | Just stream <- fromException failure = pure (Left (Broke (brokenBy stream)))
   | Just (CursorError reason) <- fromException failure = pure (Left (ProtocolError reason))
   | otherwise = throwIO failure
@@ -127,18 +131,18 @@ opening settings =
 loop :: (Runtime arr) => ConnectSettings -> With Setup arr Phase ServerInfo
 loop settings =
   iterateWith
-    (keeping received >>> now (uncurry (react settings)))
+    (keeping received >>> With (now (\(Setup _ _ _ binding, (reply, phase)) -> react settings binding reply phase)))
     (answered ^>> (returnA ||| consume send))
   where
     answered (answer, phase) = maybe (Left phase) (Right . (,phase)) answer
 
 -- | Sends the output, rendered into the buffer.
 send :: (Runtime arr) => With Setup arr Output ()
-send = With ((\(Setup carrier buffer _, output) -> (carrier, buffer, output)) ^>> sendOutput)
+send = With ((\(Setup carrier buffer _ _, output) -> (carrier, buffer, output)) ^>> sendOutput)
 
 -- | The next message of the server: its tag, and its body.
 received :: forall arr. (Runtime arr) => With Setup arr () (Char, ByteString)
-received = asks (arr (\(Setup _ _ reader) -> reader)) >>> lift readMessage
+received = asks (arr (\(Setup _ _ reader _) -> reader)) >>> lift readMessage
   where
     readMessage :: arr (Reader Carrier) (Char, ByteString)
     readMessage =
@@ -149,8 +153,8 @@ received = asks (arr (\(Setup _ _ reader) -> reader)) >>> lift readMessage
 
 -- | What the client makes of a message of the server in the phase: the server's report when it is ready, or what to
 -- answer, if anything, and the phase that follows. A rejection and what the client can't accept are thrown.
-react :: ConnectSettings -> (Char, ByteString) -> Phase -> IO (Step (Maybe Output, Phase) ServerInfo)
-react settings (tag, body) phase = case (tag, phase) of
+react :: ConnectSettings -> Maybe (Either String ByteString) -> (Char, ByteString) -> Phase -> IO (Step (Maybe Output, Phase) ServerInfo)
+react settings binding (tag, body) phase = case (tag, phase) of
   ('E', Checking info question _) -> either (throwIO . ProtocolError) (continuing . Checking info question . Left . ServerError) (bodyDiagnostics body)
   ('E', _) -> either (throwIO . ProtocolError) (throwIO . ConnectionRejected . ServerError) (bodyDiagnostics body)
   ('N', _) -> continuing phase
@@ -189,17 +193,28 @@ react settings (tag, body) phase = case (tag, phase) of
       Disqualified why -> throwIO (Unsuitable why)
       Asks question -> answering (questionOutput question) (Checking info question (Right Nothing))
     requirePassword = maybe (throwIO (AuthenticationError "fe_sendauth: no password supplied")) pure (connectPassword settings)
+    bindable = connectChannelBinding settings /= ChannelBindingDisable
+    mechanisms = takeWhile (not . BS.null) (BS.split 0 rest)
+    -- The client's first message of SCRAM, for the mechanism, with its channel binding.
+    clientFirst version mechanism channel = do
+      (first, client) <- scramClientFirst channel "" <$> newScramNonce
+      answering (serialize (SASLInitialResponse mechanism (Just first))) (Challenged version client)
     -- The server's first message: what it asks for.
     requested version = case code of
       0
         | required -> throwIO (AuthenticationError "channel binding required, but server authenticated client without channel binding")
         | otherwise -> continuing (Initializing version [] Nothing)
       10
-        | required -> throwIO (AuthenticationError "channel binding is required, but server did not offer an authentication method that supports channel binding")
-        | scramMechanism `elem` takeWhile (not . BS.null) (BS.split 0 rest) -> do
+        -- The data of the TLS link is bound to if the server offers it and the settings allow it, and an error it carries is
+        -- the client's only then.
+        | Just supplied <- binding, bindable, scramPlusMechanism `elem` mechanisms -> do
             _ <- requirePassword
-            (clientFirst, client) <- scramClientFirst WithoutChannelBinding "" <$> newScramNonce
-            answering (serialize (SASLInitialResponse scramMechanism (Just clientFirst))) (Challenged version client)
+            endPoint <- either (throwIO . AuthenticationError) pure supplied
+            clientFirst version scramPlusMechanism (BoundToServerEndPoint endPoint)
+        | required -> throwIO (AuthenticationError "channel binding is required, but server did not offer an authentication method that supports channel binding")
+        | scramMechanism `elem` mechanisms -> do
+            _ <- requirePassword
+            clientFirst version scramMechanism (if isJust binding && bindable then ChannelBindingUnused else WithoutChannelBinding)
         | otherwise -> throwIO (UnsupportedAuthentication "none of the server's SASL authentication mechanisms are supported")
       _ | required -> throwIO (AuthenticationError "channel binding required but not supported by server's authentication request")
       3 -> requirePassword >>= \password -> answering (serialize (PasswordMessage password)) (Authenticated version)

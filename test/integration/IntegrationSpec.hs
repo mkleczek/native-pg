@@ -146,9 +146,9 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
   -- A connection is closed when its scope ends. Closing it earlier is allowed, and so is closing it again.
   describe "close" $
     forM_ [("without TLS", unix "postgres" Nothing), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
-      (if label == "with TLS" then needs "TLS" else id) $ describe label $ do
-        -- What listens needs the notifications, and over TLS it needs TLS too.
-        let listening = needs (if label == "with TLS" then "TLS and notifications" else "notifications")
+      describe label $ do
+        -- What listens needs the notifications.
+        let listening = needs "notifications"
         listening $ it "rejects every operation after closing" $
           run $
             session connecting $
@@ -210,7 +210,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 ]
 
   -- The binding data that SCRAM-PLUS signs comes from the TLS link. These cases replace it.
-  needs "TLS" $ describe "channel-binding data from TLS setup" $ do
+  describe "channel-binding data from TLS setup" $ do
     let suppliedBinding supplied mode user =
           PGInternal.withEndPointOverride supplied ((encryptedAs user (Just "scram secret")) {connectChannelBinding = mode})
         bindingFailure = Just (Left "unsupported certificate hash")
@@ -233,7 +233,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "rejects required binding when the TLS link supplies none" $
       (authenticationFailure <$> connectedWith (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram"))
         `shouldReturn` Just "channel binding is required, but server did not offer an authentication method that supports channel binding"
-    needs "TLS and cancel" $ it "ignores binding errors on a cancellation connection" $
+    needs "cancel" $ it "ignores binding errors on a cancellation connection" $
       run $
         session (unix "postgres" Nothing) $
           cancelling (suppliedBinding bindingFailure ChannelBindingRequire "postgres")
@@ -350,13 +350,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       withString (local "target_session_attrs=prefer-standby") done `shouldReturn` ()
     describe "with TLS" $ do
       let encryptedBy string = withString (tcp string) encrypted
-      needs "TLS" $ it "encrypts with sslmode=require, without verifying the server" $
+      it "encrypts with sslmode=require, without verifying the server" $
         encryptedBy "sslmode=require" `shouldReturn` Right [True]
-      needs "TLS and a connection that sends and reads at once" $ it "sends a large batch while reading its responses over TLS" $
+      needs "a connection that sends and reads at once" $ it "sends a large batch while reading its responses over TLS" $
         withString (tcp "sslmode=require") batchWhileReading `shouldReturn` Just (Right (1000000, 2000000))
       it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $
         withString (local "sslmode=require") encrypted `shouldReturn` Right [False]
-      needs "TLS" $ it "fails if the server doesn't take TLS" $
+      it "fails if the server doesn't take TLS" $
         withPlaintextServer $ \plaintext ->
           connectFailure ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
             `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show plaintext <> " failed: server does not support SSL, but SSL was required")
@@ -365,39 +365,39 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         result <- run (connectedTo settings {connectTlsClient = Nothing} done)
         either displayException (const "connected") result
           `shouldBe` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in")
-      needs "TLS" $ it "encrypts by default, with sslmode=prefer, as libpq does" $
+      it "encrypts by default, with sslmode=prefer, as libpq does" $
         encryptedBy "" `shouldReturn` Right [True]
       it "falls back to plaintext with sslmode=prefer when the server rejects TLS" $
         encryptedBy "user=native_pg_plaintext" `shouldReturn` Right [False]
-      needs "TLS" $ it "tries plaintext first with sslmode=allow, then TLS" $ do
+      it "tries plaintext first with sslmode=allow, then TLS" $ do
         encryptedBy "sslmode=allow user=native_pg_plaintext" `shouldReturn` Right [False]
         encryptedBy "sslmode=allow" `shouldReturn` Right [True]
       it "connects in plaintext with sslmode=prefer without a TLS client, as libpq without TLS does" $ do
         settings <- settingsOf (tcp "user=native_pg_plaintext")
         run (session settings {connectTlsClient = Nothing} encrypted) `shouldReturn` Right [False]
-      needs "TLS" $ it "verifies the server's certificate and name with sslmode=verify-full" $ do
+      it "verifies the server's certificate and name with sslmode=verify-full" $ do
         encryptedBy ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1")
           `shouldReturn` Right [True]
         encryptedBy ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt")) `shouldReturn` Right [True]
-      needs "TLS" $ it "refuses a server whose certificate no root signed, or that has another name" $ do
+      it "refuses a server whose certificate no root signed, or that has another name" $ do
         let at host = "connection to server at \"" <> host <> "\" (127.0.0.1), port " <> show port <> " failed: "
         connectFailure (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "other-ca.crt") <> " host=localhost hostaddr=127.0.0.1"))
           `shouldReturn` (at "localhost" <> "SSL error: invalid peer certificate: UnknownIssuer")
         connectFailure (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=other.example hostaddr=127.0.0.1"))
           `shouldReturn` (at "other.example" <> "SSL error: invalid peer certificate: NotValidForName")
-      needs "TLS" $ it "verifies against the system's root certificates with sslrootcert=system" $ do
+      it "verifies against the system's root certificates with sslrootcert=system" $ do
         failure <- connectFailure (tcp "sslmode=verify-full sslrootcert=system host=localhost hostaddr=127.0.0.1")
         -- The platforms' verifiers word it differently.
         failure `shouldSatisfy` P.hasPrefix ("connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: ")
-      needs "TLS" $ it "needs the root certificate file, as libpq does" $
+      it "needs the root certificate file, as libpq does" $
         connectFailure (tcp "sslmode=verify-full sslrootcert=/nonexistent/root.crt host=localhost hostaddr=127.0.0.1")
           `shouldReturn` ( "connection to server at \"localhost\" (127.0.0.1), port "
                              <> show port
                              <> " failed: root certificate file \"/nonexistent/root.crt\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification."
                          )
-      needs "TLS" $ it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $
+      it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $
         encryptedBy "sslnegotiation=direct sslmode=require" `shouldReturn` Right [True]
-      needs "TLS and cancel" $ it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
+      needs "cancel" $ it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
         settings <- settingsOf (tcp "sslmode=require")
         withPlaintextServer $ \plaintext -> do
           refusing <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
@@ -410,10 +410,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                       TlsFailure reason -> reason `shouldBe` "server does not support SSL, but SSL was required"
                       other -> failTest ("expected TlsFailure, got " <> show other)
                 ]
-      needs "TLS" $ it "binds SCRAM to TLS with channel_binding=require" $
+      it "binds SCRAM to TLS with channel_binding=require" $
         withString (tcp "user=native_pg_scram password='scram secret' sslmode=require channel_binding=require") currentUser
           `shouldReturn` Right ["native_pg_scram"]
-      needs "TLS" $ it "fails as libpq does with channel_binding=require when the server doesn't bind SCRAM to TLS" $ do
+      it "fails as libpq does with channel_binding=require when the server doesn't bind SCRAM to TLS" $ do
         let failure at reason = "connection to server " <> at <> " failed: " <> reason
             socket = "on socket \"" <> socketPath <> "\""
             tlsAt = "at \"127.0.0.1\", port " <> show port
@@ -423,12 +423,12 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           `shouldReturn` failure socket "channel binding required but not supported by server's authentication request"
         connectFailure (tcp "sslmode=require channel_binding=require")
           `shouldReturn` failure tlsAt "channel binding required, but server authenticated client without channel binding"
-      needs "TLS" $ it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do
+      it "negotiates a version between ssl_min_protocol_version and ssl_max_protocol_version" $ do
         let version extra = withString (tcp ("sslmode=require " <> extra)) tlsVersion
         version "" `shouldReturn` Right ["TLSv1.3"]
         version "ssl_max_protocol_version=TLSv1.2" `shouldReturn` Right ["TLSv1.2"]
         version "ssl_min_protocol_version=TLSv1 ssl_max_protocol_version=TLSv1.2" `shouldReturn` Right ["TLSv1.2"]
-      needs "TLS" $ it "checks revocation lists, from sslcrl or sslcrldir" $ do
+      it "checks revocation lists, from sslcrl or sslcrldir" $ do
         let verified extra = tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt") <> " host=localhost hostaddr=127.0.0.1 " <> extra)
             revoked = "connection to server at \"localhost\" (127.0.0.1), port " <> show port <> " failed: SSL error: invalid peer certificate: Revoked"
         withString (verified ("sslcrl=" <> Char8.pack (certificate "empty.crl"))) done `shouldReturn` ()
@@ -440,13 +440,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           connectFailure (verified ("sslcrldir=" <> Char8.pack lists)) `shouldReturn` revoked
         -- As libpq, a missing file is no list.
         withString (verified "sslcrl=/nonexistent/root.crl") done `shouldReturn` ()
-      needs "TLS" $ it "authenticates with a client certificate" $ do
+      it "authenticates with a client certificate" $ do
         withKeyCopy ownerReadMode $ \key -> do
           let certified = "user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key
           withString (tcp certified) currentUser `shouldReturn` Right ["native_pg_certificate"]
         failure <- connectFailure (tcp "user=native_pg_certificate sslmode=require sslcert=/nonexistent/client.crt sslkey=/nonexistent/client.key")
         failure `shouldSatisfy` P.hasInfix "connection requires a valid client certificate"
-      needs "TLS" $ it "needs a client certificate's key, readable only by its owner, as libpq does" $ do
+      it "needs a client certificate's key, readable only by its owner, as libpq does" $ do
         let certified key = tcp ("user=native_pg_certificate sslmode=require sslcert=" <> Char8.pack (certificate "client.crt") <> " sslkey=" <> Char8.pack key)
             at = "connection to server at \"127.0.0.1\", port " <> show port <> " failed: "
         connectFailure (certified "/nonexistent/client.key")

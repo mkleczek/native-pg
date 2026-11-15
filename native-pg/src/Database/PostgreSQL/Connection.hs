@@ -1,8 +1,8 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 
--- | Connections, one at a time for a part, over a socket. TLS is a stub: a mode that
--- needs it fails until the code is there.
+-- | Connections, one at a time for a part, over a socket, or over TLS on one.
 --
 -- A program that is cancelled leaves its connection usable if and only if nothing
 -- is owed on it in either direction: no reply is still expected, and nothing is
@@ -57,7 +57,7 @@ module Database.PostgreSQL.Connection
   )
 where
 
-import Control.Arrow (arr, first, second, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
 import Control.Exception (IOException, fromException, throwIO)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
@@ -68,13 +68,15 @@ import Data.Tuple (Solo (MkSolo))
 import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.ConnectionString.Types (Host (..))
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectFailure (..), UsageError (..))
+import Database.PostgreSQL.Internal.Carrier (Carrier (..), closeCarrier)
+import Database.PostgreSQL.Internal.Encryption (NotMade (..), Securing (..), checkedRoots, requested, secured)
 import Database.PostgreSQL.Internal.Frontend (sendOutput)
 import Database.PostgreSQL.Internal.Protocol.Messages (BackendKey, pattern CancelRequest, serialize)
 import Database.PostgreSQL.Internal.Socket (connectSocket)
 import Database.PostgreSQL.Internal.Startup (startup)
-import Database.PostgreSQL.Internal.Carrier (Carrier (..))
 import Database.PostgreSQL.Session.Settings
-import Database.PostgreSQL.Transport (Address (..), TlsClient)
+import Database.PostgreSQL.Transport (Address (..), RootCertificates, ServerVerification (..), TlsClient)
+import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes (Effect (..), Exit (..), Link (receive), Room, Runtime, Scope (..), Within (..), roomOf, secs)
@@ -83,12 +85,13 @@ import Network.Streaming.Loans (Loans, withSetupBuffersOf)
 import Network.Streaming.PositiveInt (positiveInt)
 
 -- | Connects to the first of the settings' hosts that qualifies: the settings' own, then the settings of its fallbacks,
--- in order. For each it connects the socket as its address says, the Unix-domain socket or the numeric address, sends
--- the startup message and authenticates as the server asks, with SCRAM-SHA-256, MD5 or a cleartext password, and then
--- checks that the server qualifies: it has the protocol version that @min_protocol_version@ asks for, and the session
--- attributes that @target_session_attrs@ asks for, which @prefer-standby@ asks for in two passes, the hosts that are
--- standbys first and then any. Each host has its own @connect_timeout@, which is a deadline of the arrow. TLS is to
--- come: for now a mode that needs it fails the host. It borrows from the loans only while it sets up a host.
+-- in order. For each it connects the socket as its address says, the Unix-domain socket or the numeric address, TLS as
+-- @sslmode@ and @sslnegotiation@ say, sends the startup message and authenticates as the server asks, with SCRAM-SHA-256
+-- (bound to the TLS link if the server offers it), MD5 or a cleartext password, and then checks that the server
+-- qualifies: it has the protocol version that @min_protocol_version@ asks for, and the session attributes that
+-- @target_session_attrs@ asks for, which @prefer-standby@ asks for in two passes, the hosts that are standbys first and
+-- then any. Each host has its own @connect_timeout@, which is a deadline of the arrow. It borrows from the loans only
+-- while it sets up a host.
 --
 -- It always fails with @ConnectFailure@: an entry for each host it tried, in
 -- order, for one host as for many. Of the two passes of @prefer-standby@ it gives the second's.
@@ -134,32 +137,100 @@ connecting settings = case encrypting settings of
     -- A pattern takes the fields out; getSolo . fst would leave a thunk.
     theBuffer (MkSolo buffer, _) = buffer
 
--- | Why the settings can't be served without TLS, if they can't: as libpq built without TLS fails them. A Unix-domain
--- socket isn't encrypted, whatever the mode.
+-- | Why the settings can't be served without a TLS client, if they can't: as libpq built without TLS fails them. A
+-- Unix-domain socket isn't encrypted, whatever the mode.
 encrypting :: ConnectSettings -> Maybe ConnectError
-encrypting settings = case (connectAddress settings, connectSslMode settings) of
-  (UnixAddress _, _) -> Nothing
-  (_, SslRequire) -> Just (without "require")
-  (_, SslVerifyFull _) -> Just (without "verify-full")
+encrypting settings = case (connectAddress settings, connectSslMode settings, connectTlsClient settings) of
+  (UnixAddress _, _, _) -> Nothing
+  (_, _, Just _) -> Nothing
+  (_, SslRequire, Nothing) -> Just (without "require")
+  (_, SslVerifyFull _, Nothing) -> Just (without "verify-full")
   _ -> Nothing
   where
     without mode = TlsFailure ("sslmode value \"" <> mode <> "\" invalid when SSL support is not compiled in")
 
--- | A socket to the address, which the session is started on.
+-- | A connection to the address, which the session is started on, with TLS or without as @sslmode@ says. Each attempt is
+-- on a new socket and on the same buffer, one after the other:
+--
+-- * @allow@ connects without TLS first, and with TLS if the server rejected the connection;
+-- * @prefer@ connects with TLS first, and without if the server didn't take it, which is no failure, or if the connection
+--   failed after it did;
+-- * @require@ and @verify-full@ connect with TLS or fail, and @verify-full@ looks for the root certificate file first.
+--
+-- A Unix-domain socket isn't encrypted, whatever the mode, and without a TLS client @allow@ and @prefer@ connect without.
 connected :: (Runtime arr) => ConnectSettings -> arr Buffer (Either ConnectError Connection)
-connected settings =
-  (connectAddress settings,) ^>> first (connectSocket (connectTcpOptions settings)) >>> withBuffer ^>> (arr Left ||| session)
+connected settings = attempts >>^ either (\(NotMade _ reason) -> Left reason) Right
+  where
+    attempts = case (connectSslMode settings, connectAddress settings, connectTlsClient settings) of
+      (SslAllow, TcpAddress {}, Just client) -> retrying rejected (oneTry settings Nothing) (secure client NoVerification True)
+      (SslPrefer, TcpAddress {}, Just client) -> retrying afterTls (secure client NoVerification False) (oneTry settings Nothing)
+      (SslRequire, TcpAddress {}, Just client) -> secure client NoVerification True
+      (SslVerifyFull roots, TcpAddress {}, Just client) -> rootsChecked roots >>> (arr Left ||| secure client (VerifyFull roots) True)
+      _ -> oneTry settings Nothing
+    secure client verification required = oneTry settings (Just (Securing client verification required))
+    rejected (NotMade _ failure) = case failure of ConnectionRejected _ -> True; _ -> False
+    afterTls (NotMade accepted _) = accepted
+
+-- | The attempt, and the second one on the same buffer if the first failed as the test says.
+retrying ::
+  (ArrowChoice arr) =>
+  (NotMade -> Bool) ->
+  arr Buffer (Either NotMade Connection) ->
+  arr Buffer (Either NotMade Connection) ->
+  arr Buffer (Either NotMade Connection)
+retrying again firstTry secondTry = (alongside firstTry >>^ chosen) >>> (secondTry ||| returnA)
+  where
+    chosen (result, buffer) = case result of
+      Left failed | again failed -> Left buffer
+      _ -> Right result
+
+-- | The buffer, or the failure of the root certificate file's not being there, which libpq finds out before it connects.
+rootsChecked :: (Runtime arr) => RootCertificates -> arr Buffer (Either NotMade Buffer)
+rootsChecked roots = now (\buffer -> maybe (Right buffer) (Left . NotMade False) <$> checkedRoots roots)
+
+-- | One attempt: a new socket, TLS over it as the securing says, if there is one, and the session started on it.
+oneTry :: (Runtime arr) => ConnectSettings -> Maybe Securing -> arr Buffer (Either NotMade Connection)
+oneTry settings securing =
+  (connectAddress settings,) ^>> first (connectSocket (connectTcpOptions settings)) >>> withBuffer ^>> (arr (Left . NotMade False) ||| session)
   where
     withBuffer (reached, buffer) = fmap (,buffer) reached
-    -- A pattern takes the fields out; second snd &&& fst would leave a thunk for each.
-    startupInput (sock, (_, buffer)) = ((Plain sock, buffer), sock)
     -- The socket is closed unless the session was started: also when the part is cancelled while it starts it.
     session =
       scope
         (arr fst)
         (now (\(sock, exit) -> case exit of Done -> pure (); _ -> Socket.close sock))
-        (startupInput ^>> first (startup settings) >>> now (\(started, sock) -> either (\reason -> Left reason <$ Socket.close sock) (fmap Right . made sock) started))
-    made sock info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) (Plain sock)
+        (snd ^>> alongside (maybe onSocket (encrypted settings) securing) >>> (unready ^>> (now closed ||| started)))
+    -- A pattern takes the fields out; a selector would leave a thunk for each.
+    unready (result, (sock, _)) = either (Left . (,sock)) Right result
+    closed (failed, sock) = Left failed <$ Socket.close sock
+    startupInput (carrier, binding, buffer) = ((carrier, buffer, binding), carrier)
+    started =
+      startupInput ^>> first (startup settings) >>> now (\(info, carrier) -> either (\reason -> Left (NotMade (isSecure carrier) reason) <$ closeCarrier carrier) (fmap Right . made carrier) info)
+    made carrier info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) carrier
+    isSecure = \case Secure _ -> True; Plain _ -> False
+
+-- | What an attempt that wants no TLS starts on: the socket itself, without channel binding.
+onSocket :: (Arrow arr) => arr (Socket, Buffer) (Either NotMade (Carrier, Maybe (Either String ByteString), Buffer))
+onSocket = arr (\(sock, buffer) -> Right (Plain sock, Nothing, buffer))
+
+-- | What an attempt that wants TLS starts on: the server is asked for TLS, unless TLS starts directly, and if it takes it
+-- the handshake is done. A server that doesn't take it fails an attempt that requires TLS, and is otherwise talked to
+-- without, on the same socket.
+encrypted :: (Runtime arr) => ConnectSettings -> Securing -> arr (Socket, Buffer) (Either NotMade (Carrier, Maybe (Either String ByteString), Buffer))
+encrypted settings securing@(Securing _ _ required) = (alongside asking >>^ answered) >>> (arr Left ||| (onSocket ||| shaking))
+  where
+    asking
+      | connectSslDirect settings = arr (const (Right True))
+      | otherwise = requested
+    answered (answer, input) = case answer of
+      Left reason -> Left (NotMade False reason)
+      Right True -> Right (Right input)
+      Right False
+        | required -> Left (NotMade False (TlsFailure "server does not support SSL, but SSL was required"))
+        | otherwise -> Right (Left input)
+    shaking =
+      first (secured settings securing)
+        >>^ \(result, buffer) -> either (Left . NotMade True) (\(carrier, binding) -> Right (carrier, binding, buffer)) result
 
 -- | The host that the settings connect to, as a connection string would have named it.
 hostOf :: ConnectSettings -> Host
