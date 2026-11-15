@@ -40,9 +40,10 @@ module Data.Sieve
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Arrow (arr, returnA, (>>>), (^>>), (|||))
 import Control.Concurrent (yield)
-import Control.Exception (evaluate, onException)
+import Control.Exception (SomeException, evaluate, onException, throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Control.Monad (when)
@@ -126,7 +127,11 @@ data Config k v = Config
     prepareKey :: k -> k,
     -- | Told of each lookup of 'cached': whether it found the key. It never waits.
     requested :: Bool -> IO (),
-    -- | Told of each entry that is evicted, flushed or dropped by a resize, and not of one that is removed. It never waits.
+    -- | Told, once, of each value that the cache has been given, by a loader or by 'store', and doesn't keep: one that is evicted,
+    -- flushed or dropped by a resize; one that a hook's reload removes; and one that was never kept, since the key was cached
+    -- already, which a load that lost the race for its key, and a refused 'store', give. It is not told of a value that 'remove'
+    -- gives back, which the caller has. It is told when the writer has done, in the order that the values left, and every value is
+    -- told even if the listener fails for one: the first failure is then the caller's. It never waits.
     evicted :: k -> v -> IO (),
     -- | Told of a miss of a key that is among the last evicted ones, as many as the capacity. It never waits.
     thrashed :: Maybe (IO ())
@@ -196,8 +201,9 @@ data Slow c k v = Slow !(Cache c k v) !k !Bool
 -- * **The load:** the loader is an arrow, fixed when the program is built, that runs as part of the caller's own program, so it
 --   may wait. What it gives is cached, unless the key was cached meanwhile, and then that is what the caller has. The hook runs
 --   once on the value, as it does on one that is found.
--- * **The listeners:** 'requested' is told once for each call, and the eviction listener of what the load evicts. A value that
---   was loaded and not cached, because the key was cached meanwhile, is not told to the eviction listener.
+-- * **The listeners:** 'requested' is told once for each call. The eviction listener is told of what the load evicts, of the
+--   value that it gave if the key was cached meanwhile, and so the cache kept the value that was there, and of an entry that the
+--   hook's reload removes. A failure of the listener is the caller's, after the waiters of the load have the value.
 -- * **The hook:** it runs once on the value that is found, or that the load gave, and never waits. A hook that asks for a
 --   reload every time makes the call load for ever.
 cached ::
@@ -329,8 +335,8 @@ endLoading cache (Loading h _ waiting) = do
       pure (reverse present)
 
 -- | The load went well: caches what it loaded, unless the key was cached meanwhile, and then that is what everyone has, and ends
--- the load, giving the entry to the callers that wait for it. The eviction listener is told once the writer has done, and then the
--- waiters, which no action of theirs can make wait.
+-- the load, giving the entry to the callers that wait for it. The waiters have the entry before the eviction listener is told, so
+-- that a listener that fails doesn't leave them waiting.
 finishLoading :: (Key k) => Cache c k v -> Loading k v -> v -> IO (Entry k v)
 finishLoading cache marker@(Loading h key _) loaded = do
   (entry, gone, waiters) <- withWriter cache $ do
@@ -338,26 +344,31 @@ finishLoading cache marker@(Loading h key _) loaded = do
     (entry, gone) <- insertLocked cache table h key loaded
     waiters <- endLoading cache marker
     pure (fst entry, gone, waiters)
-  told cache gone
   traverse_ ($ Loaded entry) waiters
+  told cache gone
   pure entry
 
 -- | The load failed or was cancelled: ends it, and the callers that wait for it look the key up again.
 abortLoading :: Cache c k v -> Loading k v -> IO ()
 abortLoading cache marker = withWriter cache (endLoading cache marker) >>= traverse_ ($ Retry)
 
--- | Removes the entry from the cache if the key still has this entry, and not one that took its place. It is not an eviction:
--- the listener isn't told, and the key is not remembered as evicted.
+-- | Removes the entry from the cache if the key still has this entry, and not one that took its place, and tells the eviction
+-- listener of it once the writer has done: nobody else has its value now, and whoever removed or evicted the entry that is not
+-- there has told of it. The key is not remembered as evicted: a reload is not a miss that a larger cache would have saved.
 dropSame :: (Key k) => Cache c k v -> Entry k v -> IO ()
 dropSame cache entry = case entry of
   Vacant -> pure ()
-  Entry h ident k _ -> withWriter cache $ do
-    table <- readIORef (cacheTable cache)
-    at <- locateEntry table h k
-    when (at >= 0) $
-      entryAt table at >>= \current -> case current of
-        Entry _ identNow _ _ | identNow == ident -> () <$ removeEntry table at
-        _ -> pure ()
+  Entry h ident k _ -> do
+    removed <- withWriter cache $ do
+      table <- readIORef (cacheTable cache)
+      at <- locateEntry table h k
+      if at < 0
+        then pure []
+        else
+          entryAt table at >>= \current -> case current of
+            Entry _ identNow _ _ | identNow == ident -> (: []) <$> removeEntry table at
+            _ -> pure []
+    told cache removed
 
 -- | Runs the action as the only writer: a cache of one core needs no lock, since the steps that never wait are atomic on a core
 -- whose parts switch only at waits, and a shared cache has a flag that a writer takes with a compare-and-swap, and that a writer
@@ -391,9 +402,18 @@ evictWhile cache limit table over = go []
           go (gone' : gone)
         else pure (reverse gone)
 
--- | Tells the eviction listener of the entries, in order, once the writer has done.
+-- | Tells the eviction listener of the entries, in order, once the writer has done. Each is told once, whatever the listener does
+-- for the others: a failure is kept until the last has been told, and then it is the caller's, the first of them.
 told :: Cache c k v -> [Entry k v] -> IO ()
-told cache = traverse_ (\gone -> case gone of Entry _ _ key value -> evicted (cacheConfig cache) key value; Vacant -> pure ())
+told cache = go Nothing
+  where
+    go failure [] = traverse_ throwIO failure
+    go failure (gone : others) = do
+      outcome <- try (tell gone)
+      go (failure <|> either (\failed -> Just (failed :: SomeException)) (const Nothing) outcome) others
+    tell gone = case gone of
+      Entry _ _ key value -> evicted (cacheConfig cache) key value
+      Vacant -> pure ()
 
 -- | A key stored is no longer one that was evicted lately.
 forget :: Cache c k v -> Int -> IO ()
@@ -422,7 +442,9 @@ valueOf :: Entry k v -> Maybe v
 valueOf (Entry _ _ _ value) = Just value
 valueOf Vacant = Nothing
 
--- | Caches the value of a key, unless it is cached already, and says whether it did. It may evict an entry.
+-- | Caches the value of a key, unless it is cached already, and says whether it did. It may evict an entry. A value that is
+-- refused, since the key is cached, is told to the eviction listener, as the cache owns every value that it is given, and the
+-- listener is where a value that isn't kept goes.
 store :: (Key k) => Cache c k v -> k -> v -> IO Bool
 store cache k value = do
   let !prepared = prepareKey (cacheConfig cache) k
@@ -438,12 +460,16 @@ insertUnlessCached cache h key value = do
   told cache gone
   pure result
 
--- | The same for the writer, in the table that it has: it gives the entries that were evicted, for the listener to be told.
+-- | The same for the writer, in the table that it has: it gives the entries that were evicted, and the value that was refused if
+-- the key is cached, as an entry that is not in the table, for the listener to be told.
 insertLocked :: (Key k) => Cache c k v -> Table k v -> Int -> k -> v -> IO ((Entry k v, Bool), [Entry k v])
 insertLocked cache table h key value = do
   present <- locateEntry table h key
   if present >= 0
-    then (\entry -> ((entry, False), [])) <$> entryAt table present
+    then do
+      kept <- entryAt table present
+      refused <- newEntry cache h key value
+      pure ((kept, False), [refused])
     else do
       gone <- evictWhile cache (tableCapacity table) table (>= tableCapacity table)
       entry <- newEntry cache h key value
