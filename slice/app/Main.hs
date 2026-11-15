@@ -1,6 +1,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
@@ -35,17 +36,19 @@ import Database.PostgreSQL.Connection (ConnectSettings)
 import Database.PostgreSQL.ConnectionString (Defaults (..), fromConnectionString, readConnectionString)
 import Database.PostgreSQL.Pool (ConnectionPool, connectionPoolSettings, withConnection, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
+import GHC.Records (HasField)
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
 import Network.Fulmen (Call, Method (..), Request (..))
 import qualified Network.Fulmen as Fulmen
 import qualified Network.Socket as Socket
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.Classes (Effect (..), Runtime, Scope (..), Stream (..))
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateWith, keeping)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, iterateWith)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Counters (Counts, counterName, toList)
 import Network.Streaming.Delimited (runCores)
 import Network.Streaming.Mode (Instrumented (counted), Mode (..))
+import Network.Streaming.Named (is)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt)
 import Network.Streaming.Threads (runThreads)
 #if defined(DEBUG_MODE)
@@ -102,18 +105,20 @@ rows pool sql =
 -- response.
 reading :: (Runtime arr) => Tx.Result arr Tx.Field -> With Tx.Tx arr Call ()
 reading result =
-  keeping (Tx.single result)
-    >>> withHead
-    ^>> first Fulmen.respond
+  (is "call" returnA &&& is "source" (done >>> Tx.single result))
+    >>> alongside (is "answering" (withHead ^>> Fulmen.respond))
     >>> pieces
   where
-    withHead (field, call) =
-      ((call, (Fulmen.Status 200, [("Content-Type", "application/json; charset=utf-8")], Fulmen.Known (Tx.fieldLength field))), field)
+    withHead r =
+      (r.call, (Fulmen.Status 200, [("Content-Type", "application/json; charset=utf-8")], Fulmen.Known (Tx.fieldLength r.source)))
 
--- | The pieces of the field, one after the other, each sent before the next is taken: they are views, which are valid
--- until the next step on the field. At its end, the response ends.
-pieces :: (Runtime arr, Stream arr s) => arr (Fulmen.Answering, s) ()
-pieces = iterateWith (withSource ^>> first next >>^ chunked) (consume Fulmen.send) >>> Fulmen.finish
+-- | The pieces of the source, one after the other, each sent before the next is taken: they are views, which are valid
+-- until the next step on the source. At its end, the response ends. The input has the answering and the source by name.
+pieces :: (Runtime arr, Stream arr s, HasField "answering" r Fulmen.Answering, HasField "source" r s) => arr r ()
+pieces =
+  (\r -> (r.answering, r.source))
+    ^>> iterateWith (withSource ^>> first next >>^ chunked) (consume Fulmen.send)
+    >>> Fulmen.finish
   where
     withSource (answering, source) = (source, (answering, source))
     chunked (Nothing, (answering, _)) = Finish answering
