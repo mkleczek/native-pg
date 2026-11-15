@@ -350,8 +350,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       let encryptedBy string = withString (tcp string) encrypted
       it "encrypts with sslmode=require, without verifying the server" $
         encryptedBy "sslmode=require" `shouldReturn` Right [True]
+      -- The batch is larger than the buffers that the two ends of a TCP connection can grow to, so that the server stops
+      -- writing a result that nobody reads, and stops reading the request, for every platform and every run.
       needs "a connection that sends and reads at once" $ it "sends a large batch while reading its responses over TLS" $
-        withString (tcp "sslmode=require") batchWhileReading `shouldReturn` Just (Right (1000000, 2000000))
+        withString (tcp "sslmode=require") (batchWhileReading 32000000 32000000) `shouldReturn` Just (Right (32000000, 32000000))
       it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $
         withString (local "sslmode=require") encrypted `shouldReturn` Right [False]
       it "fails if the server doesn't take TLS" $
@@ -518,6 +520,40 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
+    needs "streamed parameters" $ it "takes the parameters of a statement from consecutive parts of its stream, wherever the pieces end" $
+      withSession
+        ( streaming (newChunks ["ab", "cdefg", "hi"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text, $2::text" (const [streamedText 4, streamedText 5]) Nothing pair)))
+            `yields` Right [("abcd" :: Text, "efghi" :: Text)]
+        )
+        `shouldReturn` ()
+    needs "streamed parameters" $ it "gives each statement of a pipeline the stream that it declares" $
+      withSession
+        ( streaming
+            ((,) <$> newChunks ["ab", "c"] <*> newChunks ["defg", "h"])
+            ( transactOn
+                Tx.ReadCommitted
+                Tx.Write
+                Tx.Final
+                ( (,)
+                    <$> Tx.from fst (Tx.statement (Tx.streamFrom id (lengthWith (const [streamedText 3]))))
+                    <*> Tx.from snd (Tx.statement (Tx.streamFrom id (lengthWith (const [streamedText 5]))))
+                )
+                (\(shorter, longer) -> (,) <$> Tx.single shorter <*> Tx.single longer)
+            )
+            `yields` Right (3 :: Int32, 5 :: Int32)
+        )
+        `shouldReturn` ()
+    needs "streamed parameters" $ it "fails a streamed parameter of a statement that has no stream before anything is sent, and the connection stays usable" $
+      withSession
+        ( steps
+            [ query (Tx.Statement "SELECT length($1::text)" (const [streamedText 3]) Nothing (single @_ @Int32))
+                `failsAs` \case
+                  StreamLengthError 3 0 -> pure ()
+                  other -> failTest ("expected StreamLengthError 3 0, got " <> show other),
+              selectOne `yields` Right [1]
+            ]
+        )
+        `shouldReturn` ()
     it "sends a parameter in pieces, short and long, larger than the socket's buffers" $ do
       let payload = BS.concat (replicate 4096 "0123456789abcdef")
           pieces = concatMap (\piece -> [BS.take 100 piece, BS.drop 100 piece]) (replicate 128 payload)
@@ -546,13 +582,30 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
     needs "a connection that sends and reads at once" $ it "sends a batch while reading its results, as the server answers before reading all of it" $
-      withSession batchWhileReading `shouldReturn` Just (Right (1000000, 2000000))
+      withSession (batchWhileReading 1000000 2000000) `shouldReturn` Just (Right (1000000, 2000000))
+    needs "a connection that sends and reads at once" $ it "streams a parameter while it reads the large result of a statement before it" $
+      withSession
+        ( withinFor (secs 10) $
+            streaming
+              (newChunks (replicate 64 (Char8.replicate 32768 'y')))
+              ( transactOn
+                  Tx.ReadCommitted
+                  Tx.Read
+                  Tx.Final
+                  ( (,)
+                      <$> Tx.from (const ()) (Tx.statement (plain "SELECT repeat('x', 1000000)" (Tx.any Tx.field)))
+                      <*> Tx.statement (Tx.streamFrom id (lengthWith (const [streamedText 2097152])))
+                  )
+                  (\(large, long) -> (Tx.single large >>> measure >>^ fst) &&& Tx.single long)
+              )
+        )
+        `shouldReturn` Just (Right (1000000, 2097152))
     -- The cancellation rule: the reading program is cancelled at its wait while the request side has not finished sending
     -- the 2 MB parameter, so something is half sent, and the connection is broken and closed rather than drained.
     it "closes a connection broken while sending, without waiting for the server to read" $
       withSession
         ( steps
-            [ withinFor (secs 1) (committed Tx.Read largeThenLong (\(large, _) -> Tx.single large >>> sleepFor (secs 60))) `yields` Nothing,
+            [ withinFor (secs 1) (committed Tx.Read (largeThenLong 1000000 2000000) (\(large, _) -> Tx.single large >>> sleepFor (secs 60))) `yields` Nothing,
               selectOne `failsAs` unusable,
               withinFor (secs 5) closing `yields` Just ()
             ]
@@ -1088,18 +1141,18 @@ preparedStreamed name statement = transactOn Tx.ReadCommitted Tx.Write Tx.Open (
 
 -- | Both the first response and the remaining request exceed the socket buffers, so the connection must go on
 -- reading while it sends. The first result is a field of a million bytes.
-batchWhileReading :: (Runtime arr) => OnConn arr (Maybe (Either QueryError (Int, Int32)))
-batchWhileReading =
+batchWhileReading :: (Runtime arr) => Int -> Int -> OnConn arr (Maybe (Either QueryError (Int, Int32)))
+batchWhileReading resultSize parameterSize =
   withinFor (secs 10) $
-    committed Tx.Read largeThenLong $ \(large, long) ->
+    committed Tx.Read (largeThenLong resultSize parameterSize) $ \(large, long) ->
       (Tx.single large >>> measure >>^ fst) &&& Tx.single long
 
--- | A result with a large field, and a statement whose parameter is large.
-largeThenLong :: (Runtime arr) => Tx.Pipeline arr () (Tx.Result arr Tx.Field, Tx.Result arr Int32)
-largeThenLong =
+-- | A result with a field of the first size, and a statement whose parameter is of the second.
+largeThenLong :: (Runtime arr) => Int -> Int -> Tx.Pipeline arr () (Tx.Result arr Tx.Field, Tx.Result arr Int32)
+largeThenLong resultSize parameterSize =
   (,)
-    <$> Tx.statement (plain "SELECT repeat('x', 1000000)" (Tx.any Tx.field))
-    <*> Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')] single)
+    <$> Tx.statement (plain ("SELECT repeat('x', " <> Char8.pack (show resultSize) <> ")") (Tx.any Tx.field))
+    <*> Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate parameterSize 'y')] single)
 
 -- | Streams the single field slowly, checking its bytes and that no piece is larger than the buffer, while
 -- sampling the live heap. The accumulators are strict, so they don't keep the pieces alive.
