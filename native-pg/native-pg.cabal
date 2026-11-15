@@ -50,6 +50,7 @@ common implementation
                       Database.PostgreSQL.Internal.Protocol.Messages.Startup
                       Database.PostgreSQL.Internal.Protocol.Messages.Types
                       Database.PostgreSQL.Internal.Frontend
+                      Database.PostgreSQL.Internal.StatementCache
                       Database.PostgreSQL.Internal.Socket
                       Database.PostgreSQL.Internal.Startup
                       Database.PostgreSQL.Internal.Carrier

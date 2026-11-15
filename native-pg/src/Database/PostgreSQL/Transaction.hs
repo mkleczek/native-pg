@@ -113,7 +113,7 @@ import Data.Typeable (Typeable)
 import Data.Word (Word8)
 import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..), InPlace)
-import Database.PostgreSQL.Errors (ConnectionError (..), QueryError (..), ServerError (..), StatementError (..), UsageError (..), isConnectionFatal)
+import Database.PostgreSQL.Errors (ConnectionError (..), QueryError (..), ServerError (..), StatementError (..), UsageError (..), diagnosticCode, isConnectionFatal)
 import Database.PostgreSQL.Internal.Diagnostics (bodyDiagnostics)
 import Database.PostgreSQL.Internal.Frontend (Room (..), sendOutput, sendStreamed, sync)
 import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
@@ -139,6 +139,7 @@ import Database.PostgreSQL.Internal.Protocol.Codec (Serializable (..))
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output, hole, int32, outputLength, outputWriter, runWriter)
 import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output (WriteResult (..), bytes)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
+import qualified Database.PostgreSQL.Internal.StatementCache as Cache
 import Database.PostgreSQL.Internal.Carrier (Carrier, share)
 import qualified Database.PostgreSQL.Internal.Protocol.Messages as Wire
 import Database.PostgreSQL.Types (FormatCode (..), Oid, Parameter (..))
@@ -148,7 +149,6 @@ import Network.Streaming.Buffer (Buffer (bufferCapacity))
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, _1, _2, alongside, boolA, concurrently, consume, done, iterateA, iterateWith, keeping, on, tap, through, undoing)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, loanIsPrimary, loansOf, release, withSetupBuffersOf)
-import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity, readerMemory)
 import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
@@ -319,11 +319,17 @@ data Role
     Parsing
   | -- | A Close of a name, which a CloseComplete answers, and which a later read passes.
     Closing
-  deriving (Eq)
+  | -- | A statement of the program that gives rows, like 'Wanted', which the connection keeps prepared for a key: the messages
+    -- that precede its own, a CloseComplete of a name that goes and a ParseComplete of the statement, are told to the cache,
+    -- and so is its failing before the ParseComplete.
+    Remembered !Cache.Memory
 
 -- | Whether a later read may pass the entry, as it isn't a result that the program has yet to read.
 entrySkippable :: Entry -> Bool
-entrySkippable entry = entryRole entry /= Wanted
+entrySkippable entry = case entryRole entry of
+  Wanted -> False
+  Remembered _ -> False
+  _ -> True
 
 -- | Where the transaction is, which only the part that runs it changes.
 data State = State
@@ -519,8 +525,15 @@ acknowledged tx = do
     entry : _ -> case entryRole entry of
       Parsing -> awaiting tx parseCompleteTag
       Closing -> awaiting tx closeCompleteTag
+      Remembered memory -> remembering tx memory
       _ -> pure Stepped
     [] -> pure Stepped
+
+-- | A message that no statement's answer is made of, while a statement that the connection keeps prepared is being read: a
+-- ParseComplete or a CloseComplete, as its tag says, is one of the cache's, which it is told, and any other is ignored, as it is for
+-- a statement that is not.
+remembering :: Tx -> Cache.Memory -> IO Step
+remembering tx memory = lastTag (txReader tx) >>= \tag -> Stepped <$ (if tag == parseCompleteTag then Cache.memoryParsed memory else when (tag == closeCompleteTag) (Cache.memoryClosed memory))
 
 -- | The entry that is being read is answered if the message that was framed last has the tag that answers it.
 awaiting :: Tx -> Word8 -> IO Step
@@ -544,6 +557,17 @@ lastTag reader = do
   start <- mark reader markStart
   unsafeWithForeignPtr (readerMemory reader) (\memory -> peekByteOff memory (start - 5))
 
+-- | What the failure of a statement means to the statements that the connection keeps prepared: one that the server doesn't have, or
+-- whose result type it found changed, so that the connection forgets them all.
+staleStatements :: ServerError -> Bool
+staleStatements (ServerError diagnostics) = diagnosticCode diagnostics `elem` ["26000", "0A000"]
+
+-- | What a statement that was not answered tells the cache that it keeps: that the pipeline failed.
+undone :: Entry -> IO ()
+undone entry = case entryRole entry of
+  Remembered memory -> Cache.memoryFailed memory
+  _ -> pure ()
+
 -- | The server failed the statement that was being read, and skipped the ones after it. The first failure is the
 -- transaction's, which every read that follows raises, and the connection is lost if the server ended the session.
 rejected :: Tx -> ByteString -> IO Step
@@ -551,6 +575,9 @@ rejected tx body = do
   s <- inspect tx
   failure <- either (throwIO . unexpected) (pure . ServerError) (bodyDiagnostics body)
   when (isConnectionFatal failure) (throwIO (ConnectionTerminated failure))
+  -- The statements that the server did not parse, since it failed one before them or this, are not the connection's.
+  traverse_ undone (stPending s)
+  when (staleStatements failure) (Cache.forget (sessionStatements (connectionSession (txConnection tx))))
   let query = case stPending s of entry : _ -> entrySql entry; [] -> BS.empty
       exception = toException (QueryError query (ServerFailed failure))
   modify tx (const s {stPending = [], stFailure = Just (fromMaybe exception (stFailure s))})
@@ -886,8 +913,37 @@ layout finality streams sent tx (input, rest) = do
           -- The server starts statement_timeout at a Describe, and reads a Bind whole before it runs it, so it is described first
           -- for the time that the stream takes to count.
           pure (Entry (sql given) Wanted, Wire.serialize (Wire.Describe Wire.PreparedStatement name) <> boundStreamed name formats values)
-      Cached {} -> notImplementedIO "cached"
+      Cached key makeSql given -> case source of
+        Nothing -> do
+          (types, formats, values) <- parametersOf (params given parameters)
+          cachedStatement tx (key parameters) makeSql parameters types False (\name -> boundOutput name formats values) (\text -> statementOutput text types formats values)
+        Just number -> do
+          (types, formats, values) <- argumentsOf number (params given parameters)
+          cachedStatement tx (key parameters) makeSql parameters types True (\name -> boundStreamed name formats values) (\text -> streamedStatementOutput text types formats values)
       Close name -> pure (Entry ("DEALLOCATE " <> name) Closing, Wire.serialize (Wire.Close Wire.PreparedStatement name))
+
+-- | A statement that the connection keeps prepared for the key: the entry that stands for it, and its messages. A statement
+-- that the cache has is executed under its name: a Close of a name that the connection is to close goes before it, and for a
+-- statement that streams a Describe, which starts the server's statement timeout as a Parse does. One that it has not is
+-- prepared first, with the SQL that the function makes, which only a miss evaluates, and a name that goes with it, if the cache was
+-- full, is closed before. Where the cache keeps nothing the statement is an unnamed one. The positions are those of one statement
+-- in every case, since the answers of the messages before its own are ignored, but for the cache's being told of them.
+cachedStatement :: (Typeable k, Hashable k) => Tx -> k -> (p -> ByteString) -> p -> [Maybe Oid] -> Bool -> (ByteString -> Output) -> (ByteString -> Output) -> IO (Entry, Output)
+cachedStatement tx key makeSql parameters types streams bound unnamed = do
+  let statements = sessionStatements (connectionSession (txConnection tx))
+      closing reserved = maybe mempty (Wire.serialize . Wire.Close Wire.PreparedStatement) (Cache.reservedClose reserved)
+      remembered text reserved = Entry text (maybe Wanted Remembered (Cache.reservedMemory reserved))
+  Cache.find statements key >>= \case
+    Cache.Disabled -> (\text -> (Entry text Wanted, unnamed text)) <$> evaluate (makeSql parameters)
+    Cache.Has reserved ->
+      let name = Cache.reservedName reserved
+          describing = if streams then Wire.serialize (Wire.Describe Wire.PreparedStatement name) else mempty
+       in pure (remembered ("EXECUTE " <> name) reserved, closing reserved <> describing <> bound name)
+    Cache.Lacks -> do
+      text <- evaluate (makeSql parameters)
+      reserved <- Cache.insert statements key
+      let name = Cache.reservedName reserved
+      pure (remembered text reserved, closing reserved <> parseOutput name text types <> bound name)
 
 -- | The statement as it is for the input: one that has its SQL is as it is, and one that is made from the input is the
 -- statement that it makes. The pair is made once, and its SQL is left as it is until a message needs it.

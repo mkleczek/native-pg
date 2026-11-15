@@ -253,7 +253,7 @@ started =
   startupInput ^>> first startup >>> now (\(info, (settings, carrier)) -> either (\reason -> Left (NotMade (isSecure carrier) reason) <$ closeCarrier carrier) (fmap Right . made settings carrier) info)
   where
     startupInput (settings, (carrier, binding, buffer)) = ((settings, (carrier, buffer, binding)), (settings, carrier))
-    made settings carrier info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) carrier
+    made settings carrier info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) carrier (connectStatementCache settings)
     isSecure = \case Secure _ _ -> True; Plain _ -> False
 
 -- | What an attempt that wants no TLS starts on: the socket itself, without channel binding.

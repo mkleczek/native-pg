@@ -51,6 +51,7 @@ import Database.PostgreSQL.ConnectionString.Types (Host (..))
 import Database.PostgreSQL.Errors (ConnectionError (..), UsageError (..))
 import Database.PostgreSQL.Internal.Carrier (Carrier, closeCarrier)
 import Database.PostgreSQL.Internal.Protocol.Messages.Types (BackendKey)
+import Database.PostgreSQL.Internal.StatementCache (Statements, newStatements)
 import Database.PostgreSQL.Session.Settings (ConnectSettings (..), ServerInfo)
 import Database.PostgreSQL.Transport (Address (..))
 import Network.Streaming.Buffer (Buffer)
@@ -77,7 +78,9 @@ data Session = Session
     -- | What the session keeps between uses, which only the part that uses it changes.
     sessionKept :: !(IORef Kept),
     -- | The cells that a program keeps for the connection, one for each type of value. No use of the connection reads them.
-    sessionSlots :: !(IORef [Dynamic])
+    sessionSlots :: !(IORef [Dynamic]),
+    -- | The statements that the connection has prepared for the program that caches them, by its key.
+    sessionStatements :: !Statements
   }
 
 -- | What a session keeps between its uses: the bytes that the server sent after the last message that a use read, which
@@ -102,13 +105,14 @@ data Status = Idle | Busy | Broken String
 -- some connection poolers don't.
 newtype CancelKey = CancelKey (Maybe (BackendKey ByteString))
 
--- | A connection on the carrier, which nobody uses yet, and the handle of it.
-newConnection :: ServerInfo -> Host -> CancelKey -> Carrier -> IO Connection
-newConnection info host key carrier = do
+-- | A connection on the carrier, which nobody uses yet, and the handle of it, with a cache of this many prepared statements.
+newConnection :: ServerInfo -> Host -> CancelKey -> Carrier -> Int -> IO Connection
+newConnection info host key carrier cacheSize = do
   status <- newIORef Idle
   kept <- newIORef (Kept BS.empty (Backlog [] []) Nothing)
   slots <- newIORef []
-  Connection info host key (Session carrier status kept slots) <$> newIORef True
+  statements <- newStatements cacheSize
+  Connection info host key (Session carrier status kept slots statements) <$> newIORef True
 
 -- | The connection through a new handle, which is live until it is given up.
 leased :: Connection -> IO Connection

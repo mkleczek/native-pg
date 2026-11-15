@@ -495,160 +495,160 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
   -- A statement that the connection keeps prepared for the key that the input gives: the first run of a key prepares it, in the pipeline
   -- that executes it, and the runs after only execute it, without evaluating the SQL, which is a function of its own that a miss
   -- calls. One program serves both: its pipeline, and the position of its result, are the same.
-  needs "statements cached by the program's key" $
-    describe "cached statements" $ do
-      let withCache :: Int -> (forall arr. (Runtime arr) => OnConn arr b) -> IO b
-          withCache size body = run (session ((unixSettings socketPath "postgres" Nothing) {connectStatementCache = size}) body)
-          inputs :: [(Int, Int)] -> [(Int, ByteString)]
-          inputs shapes = [(shape, Char8.pack (show value)) | (shape, value) <- shapes]
-      it "prepares a statement on the first run of its key and only executes it on the runs after, which evaluate no SQL" $ do
-        calls <- newIORef 0
-        withCache 256
-          ( steps
-              [ overInputs (runOf (adding calls)) (inputs [(1, 10), (1, 20), (1, 30)]) `yields` [Right 11, Right 21, Right 31],
-                preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 1
-      it "keeps a statement for each key, as the input gives it" $ do
-        calls <- newIORef 0
-        withCache 256
-          ( steps
-              [ overInputs (runOf (adding calls)) (inputs [(1, 10), (2, 10), (1, 1), (2, 2)]) `yields` [Right 11, Right 12, Right 2, Right 4],
-                preparedStatements `yields` Right ["SELECT $1::int4 + 1", "SELECT $1::int4 + 2"]
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 2
-      it "never evaluates the SQL for a key that the connection has, whatever the function of its SQL is" $ do
-        calls <- newIORef 0
-        withCache 256
-          ( steps
-              [ overInputs (runOf (adding calls)) (inputs [(1, 10)]) `yields` [Right 11],
-                overInputs (runOf (Tx.cached fst (\_ -> error "SQL forced") addingStatement)) (inputs [(1, 1), (1, 2)]) `yields` [Right 2, Right 3]
-              ]
-          )
-          `shouldReturn` ()
-      -- At capacity the least recently used goes, and its statement is closed in the pipeline of the miss that evicts it.
-      it "forgets the least recently used statement at capacity, and closes it on the server in the pipeline that evicts it" $ do
-        calls <- newIORef 0
-        withCache 2
-          ( steps
-              [ overInputs (runOf (adding calls)) (inputs [(1, 0), (2, 0), (1, 0), (3, 0)]) `yields` [Right 1, Right 2, Right 1, Right 3],
-                -- 1 was used after 2, so 2 went, and its statement is gone from the server.
-                preparedStatements `yields` Right ["SELECT $1::int4 + 1", "SELECT $1::int4 + 3"],
-                overInputs (runOf (adding calls)) (inputs [(2, 0), (3, 0)]) `yields` [Right 2, Right 3],
-                -- 2 came back and evicted 1, the least recently used then, which 3 was after.
-                preparedStatements `yields` Right ["SELECT $1::int4 + 2", "SELECT $1::int4 + 3"]
-              ]
-          )
-          `shouldReturn` ()
-        -- The misses: 1, 2, 3, and 2 again.
-        readIORef calls `shouldReturn` 4
-      it "keeps no statement when it may keep none, and sends each as an unnamed one" $ do
-        calls <- newIORef 0
-        withCache 0
-          ( steps
-              [ overInputs (runOf (adding calls)) (inputs [(1, 10), (1, 20)]) `yields` [Right 11, Right 21],
-                preparedStatements `yields` Right []
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 2
-      it "records a statement only once the server accepted its Parse: a rejected one is prepared again by the next run of its key" $ do
-        calls <- newIORef 0
-        withCache 256
-          ( steps
-              [ -- The server rejects the Parse of the first, accepts the second, and the third finds the second's statement.
-                (overInputs (runOf (flagged calls)) [(False, "1"), (True, "1"), (False, "1")] >>^ map (either (Left . serverCode . Left) Right))
-                  `yields` [Left (Just "42601"), Right 2, Right 2],
-                preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 2
-      it "keeps a statement that the server accepted when its execution fails, and the next run of its key finds it" $ do
-        calls <- newIORef 0
-        withCache 256
-          ( steps
-              [ (overInputs (runOf (dividing calls)) ["0", "1", "2"] >>^ map (either (Left . serverCode . Left) Right))
-                  `yields` [Left (Just "22012"), Right 1, Right 0],
-                preparedStatements `yields` Right ["SELECT 1 / $1::int4"]
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 1
-      -- The server lost the statement that the connection thinks it has: SQLSTATE 26000, once, and the connection forgets them all.
-      it "forgets its statements when the server says that one does not exist, and prepares the next run again" $ do
-        calls <- newIORef 0
-        withCache 256
-          ( steps
-              [ overInputs (runOf (adding calls)) (inputs [(1, 1)]) `yields` [Right 2],
-                ddl "DEALLOCATE ALL" `yields` Right (),
-                (overInputs (runOf (adding calls)) (inputs [(1, 1)]) >>^ map serverCode) `yields` [Just "26000"],
-                overInputs (runOf (adding calls)) (inputs [(1, 1), (1, 2)]) `yields` [Right 2, Right 3],
-                preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 2
-      -- A statement whose result type the server found changed since it was planned: SQLSTATE 0A000, once, and the connection forgets
-      -- them all, and closes the ones that the server still has.
-      it "forgets its statements when the server says that a cached plan must not change its result type, and prepares the next run again" $ do
-        calls <- newIORef 0
-        let running :: (Runtime arr) => arr (Connection, (Loans, ())) (Either QueryError ())
-            running = transactOn Tx.ReadCommitted Tx.Write Tx.Open (changing calls) Tx.discard
-        withCache 256
-          ( steps
-              [ ddl "CREATE TEMP TABLE cached_changing (a int4)" `yields` Right (),
-                overInputs running [()] `yields` [Right ()],
-                ddl "ALTER TABLE cached_changing ALTER a TYPE int8" `yields` Right (),
-                (overInputs running [()] >>^ map serverCode) `yields` [Just "0A000"],
-                overInputs running [(), ()] `yields` [Right (), Right ()],
-                (preparedStatements >>^ fmap length) `yields` Right 1
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 2
-      it "caches two statements of one pipeline, each by its own key, of different types" $ do
-        calls <- newIORef 0
-        other <- newIORef 0
-        withCache 256
-          ( steps
-              [ ( overInputs
-                    (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,) <$> numbered calls <*> lengthOfText other) (\(left, right) -> Tx.single left &&& Tx.single right))
-                    [(1 :: Int, "a"), (2, "a"), (1, "bcd")]
-                )
-                  `yields` [Right (101, 1), Right (102, 1), Right (101, 3)],
-                (preparedStatements >>^ fmap length) `yields` Right 4
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 2
-        readIORef other `shouldReturn` 3
-      it "finds in a pipeline the statement that an earlier statement of the same pipeline prepares, for the same key" $ do
-        calls <- newIORef 0
-        withCache 256
-          ( steps
-              [ overInputs (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,) <$> adding calls <*> adding calls) (\(left, right) -> Tx.single left &&& Tx.single right)) (inputs [(1, 5), (1, 6)])
-                  `yields` [Right (6, 6), Right (7, 7)],
-                preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 1
-      it "takes a streamed parameter from the stream of the statement, whether it prepares the statement or only executes it" $ do
-        calls <- newIORef 0
-        runs <- traverse (\(shape, pieces) -> (shape :: Int,) <$> newChunks pieces) [(1, ["ab", "cde"]), (1, ["fghij"]), (2, ["", "klmno"])]
-        withCache 256
-          ( steps
-              [ overInputs (runOf (streamedAdding calls)) runs `yields` [Right 6, Right 6, Right 7],
-                (preparedStatements >>^ fmap length) `yields` Right 2
-              ]
-          )
-          `shouldReturn` ()
-        readIORef calls `shouldReturn` 2
+  describe "cached statements" $ do
+    let withCache :: Int -> (forall arr. (Runtime arr) => OnConn arr b) -> IO b
+        withCache size body = run (session ((unixSettings socketPath "postgres" Nothing) {connectStatementCache = size}) body)
+        inputs :: [(Int, Int)] -> [(Int, ByteString)]
+        inputs shapes = [(shape, Char8.pack (show value)) | (shape, value) <- shapes]
+    it "prepares a statement on the first run of its key and only executes it on the runs after, which evaluate no SQL" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ overInputs (runOf (adding calls)) (inputs [(1, 10), (1, 20), (1, 30)]) `yields` [Right 11, Right 21, Right 31],
+              preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 1
+    it "keeps a statement for each key, as the input gives it" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ overInputs (runOf (adding calls)) (inputs [(1, 10), (2, 10), (1, 1), (2, 2)]) `yields` [Right 11, Right 12, Right 2, Right 4],
+              preparedStatements `yields` Right ["SELECT $1::int4 + 1", "SELECT $1::int4 + 2"]
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 2
+    it "never evaluates the SQL for a key that the connection has, whatever the function of its SQL is" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ overInputs (runOf (adding calls)) (inputs [(1, 10)]) `yields` [Right 11],
+              overInputs (runOf (Tx.cached fst (\_ -> error "SQL forced") addingStatement)) (inputs [(1, 1), (1, 2)]) `yields` [Right 2, Right 3]
+            ]
+        )
+        `shouldReturn` ()
+    -- At capacity the least recently used goes, and its statement is closed in the pipeline of the miss that evicts it.
+    it "forgets the least recently used statement at capacity, and closes it on the server in the pipeline that evicts it" $ do
+      calls <- newIORef 0
+      withCache 2
+        ( steps
+            [ overInputs (runOf (adding calls)) (inputs [(1, 0), (2, 0), (1, 0), (3, 0)]) `yields` [Right 1, Right 2, Right 1, Right 3],
+              -- 1 was used after 2, so 2 went, and its statement is gone from the server.
+              preparedStatements `yields` Right ["SELECT $1::int4 + 1", "SELECT $1::int4 + 3"],
+              overInputs (runOf (adding calls)) (inputs [(2, 0), (3, 0)]) `yields` [Right 2, Right 3],
+              -- 2 came back and evicted 1, the least recently used then, which 3 was after.
+              preparedStatements `yields` Right ["SELECT $1::int4 + 2", "SELECT $1::int4 + 3"]
+            ]
+        )
+        `shouldReturn` ()
+      -- The misses: 1, 2, 3, and 2 again.
+      readIORef calls `shouldReturn` 4
+    it "keeps no statement when it may keep none, and sends each as an unnamed one" $ do
+      calls <- newIORef 0
+      withCache 0
+        ( steps
+            [ overInputs (runOf (adding calls)) (inputs [(1, 10), (1, 20)]) `yields` [Right 11, Right 21],
+              preparedStatements `yields` Right []
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 2
+    it "records a statement only once the server accepted its Parse: a rejected one is prepared again by the next run of its key" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ -- The server rejects the Parse of the first, accepts the second, and the third finds the second's statement.
+              (overInputs (runOf (flagged calls)) [(False, "1"), (True, "1"), (False, "1")] >>^ map (either (Left . serverCode . Left) Right))
+                `yields` [Left (Just "42601"), Right 2, Right 2],
+              preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 2
+    it "keeps a statement that the server accepted when its execution fails, and the next run of its key finds it" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ (overInputs (runOf (dividing calls)) ["0", "1", "2"] >>^ map (either (Left . serverCode . Left) Right))
+                `yields` [Left (Just "22012"), Right 1, Right 0],
+              preparedStatements `yields` Right ["SELECT 1 / $1::int4"]
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 1
+    -- The server lost the statement that the connection thinks it has: SQLSTATE 26000, once, and the connection forgets them all.
+    it "forgets its statements when the server says that one does not exist, and prepares the next run again" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ overInputs (runOf (adding calls)) (inputs [(1, 1)]) `yields` [Right 2],
+              ddl "DEALLOCATE ALL" `yields` Right (),
+              (overInputs (runOf (adding calls)) (inputs [(1, 1)]) >>^ map serverCode) `yields` [Just "26000"],
+              overInputs (runOf (adding calls)) (inputs [(1, 1), (1, 2)]) `yields` [Right 2, Right 3],
+              preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 2
+    -- A statement whose result type the server found changed since it was planned: SQLSTATE 0A000, once, and the connection forgets
+    -- them all, and closes the ones that the server still has.
+    it "forgets its statements when the server says that a cached plan must not change its result type, and prepares the next run again" $ do
+      calls <- newIORef 0
+      let running :: (Runtime arr) => arr (Connection, (Loans, ())) (Either QueryError ())
+          running = transactOn Tx.ReadCommitted Tx.Write Tx.Open (changing calls) Tx.discard
+      withCache 256
+        ( steps
+            [ ddl "CREATE TEMP TABLE cached_changing (a int4)" `yields` Right (),
+              overInputs running [()] `yields` [Right ()],
+              ddl "ALTER TABLE cached_changing ALTER a TYPE int8" `yields` Right (),
+              (overInputs running [()] >>^ map serverCode) `yields` [Just "0A000"],
+              overInputs running [(), ()] `yields` [Right (), Right ()],
+              (preparedStatements >>^ fmap length) `yields` Right 1
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 2
+    it "caches two statements of one pipeline, each by its own key, of different types" $ do
+      calls <- newIORef 0
+      other <- newIORef 0
+      withCache 256
+        ( steps
+            [ ( overInputs
+                  (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,) <$> numbered calls <*> lengthOfText other) (\(left, right) -> Tx.single left &&& Tx.single right))
+                  [(1 :: Int, "a"), (2, "a"), (1, "bcd")]
+              )
+                `yields` [Right (101, 1), Right (102, 1), Right (101, 3)],
+              (preparedStatements >>^ fmap length) `yields` Right 4
+            ]
+        )
+        `shouldReturn` ()
+      -- Numbers 1 and 2, and the texts "a" and "bcd".
+      readIORef calls `shouldReturn` 2
+      readIORef other `shouldReturn` 2
+    it "finds in a pipeline the statement that an earlier statement of the same pipeline prepares, for the same key" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ overInputs (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,) <$> adding calls <*> adding calls) (\(left, right) -> Tx.single left &&& Tx.single right)) (inputs [(1, 5), (1, 6)])
+                `yields` [Right (6, 6), Right (7, 7)],
+              preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 1
+    it "takes a streamed parameter from the stream of the statement, whether it prepares the statement or only executes it" $ do
+      calls <- newIORef 0
+      runs <- traverse (\(shape, pieces) -> (shape :: Int,) <$> newChunks pieces) [(1, ["ab", "cde"]), (1, ["fghij"]), (2, ["", "klmno"])]
+      withCache 256
+        ( steps
+            [ overInputs (runOf (streamedAdding calls)) runs `yields` [Right 6, Right 6, Right 7],
+              (preparedStatements >>^ fmap length) `yields` Right 2
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 2
 
   -- What a cached statement allocates for a run, as a hit and as a miss, against the same statement sent unnamed (made from the input
   -- as well, so that the SQL is generated for each run) and against one that the program prepared itself. It measures only when
