@@ -72,6 +72,7 @@ import Database.PostgreSQL.Internal.Frontend (sendOutput)
 import Database.PostgreSQL.Internal.Protocol.Messages (BackendKey, pattern CancelRequest, serialize)
 import Database.PostgreSQL.Internal.Socket (connectSocket)
 import Database.PostgreSQL.Internal.Startup (startup)
+import Database.PostgreSQL.Internal.Carrier (Carrier (..))
 import Database.PostgreSQL.Session.Settings
 import Database.PostgreSQL.Transport (Address (..), TlsClient)
 import qualified Network.Socket as Socket
@@ -151,14 +152,14 @@ connected settings =
   where
     withBuffer (reached, buffer) = fmap (,buffer) reached
     -- A pattern takes the fields out; second snd &&& fst would leave a thunk for each.
-    startupInput (sock, (_, buffer)) = ((sock, buffer), sock)
+    startupInput (sock, (_, buffer)) = ((Plain sock, buffer), sock)
     -- The socket is closed unless the session was started: also when the part is cancelled while it starts it.
     session =
       scope
         (arr fst)
         (now (\(sock, exit) -> case exit of Done -> pure (); _ -> Socket.close sock))
         (startupInput ^>> first (startup settings) >>> now (\(started, sock) -> either (\reason -> Left reason <$ Socket.close sock) (fmap Right . made sock) started))
-    made sock info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) sock
+    made sock info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) (Plain sock)
 
 -- | The host that the settings connect to, as a connection string would have named it.
 hostOf :: ConnectSettings -> Host
@@ -235,12 +236,12 @@ requesting settings = case encrypting settings of
   where
     asked :: arr (Socket.Socket, BackendKey ByteString) (Either ConnectError ())
     asked = scope (arr fst) (now (\(sock, _) -> Socket.close sock)) (now rendered >>> alongside sendOutput >>> waiting ^>> orClosed >>^ Right)
-    -- The socket, the room that the reply would be received into, and the request, rendered into the buffer.
-    rendered (_, (sock, key)) = (\buffer -> (sock, buffer, serialize (CancelRequest key))) <$> newBuffer (positiveInt @512)
-    waiting (_, (sock, buffer, _)) = (sock, roomOf buffer)
+    -- The carrier of the socket, the room that the reply would be received into, and the request, rendered into the buffer.
+    rendered (_, (sock, key)) = (\buffer -> (Plain sock, buffer, serialize (CancelRequest key))) <$> newBuffer (positiveInt @512)
+    waiting (_, (carrier, buffer, _)) = (carrier, roomOf buffer)
     -- The server closes the connection once it has handled the request, and ends the stream; a connection that breaks
     -- first is as good.
-    orClosed :: arr (Socket.Socket, Room) ()
+    orClosed :: arr (Carrier, Room) ()
     orClosed = tryA untilClosed >>> now (either (\failure -> maybe (throwIO failure) (\(_ :: IOException) -> pure ()) (fromException failure)) pure)
-    untilClosed :: arr (Socket.Socket, Room) ()
+    untilClosed :: arr (Carrier, Room) ()
     untilClosed = iterateA (alongside receive >>^ \(count, link) -> if count == 0 then Finish () else Again link)

@@ -27,10 +27,9 @@ import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef)
 import Database.PostgreSQL.ConnectionString.Types (Host)
 import Database.PostgreSQL.Errors (ConnectionError (..), UsageError (..))
+import Database.PostgreSQL.Internal.Carrier (Carrier, closeCarrier)
 import Database.PostgreSQL.Internal.Protocol.Messages.Types (BackendKey)
 import Database.PostgreSQL.Session.Settings (ConnectSettings (..), ServerInfo)
-import Network.Socket (Socket)
-import qualified Network.Socket as Socket
 import Network.Streaming.Internal.Atomic (update)
 
 -- | A connection: what it learned of its server and where it is, the key that
@@ -48,7 +47,7 @@ data Connection = Connection
 
 -- | The part of a connection that every handle of it shares.
 data Session = Session
-  { sessionSocket :: !Socket,
+  { sessionCarrier :: !Carrier,
     sessionStatus :: !(IORef Status)
   }
 
@@ -61,9 +60,9 @@ data Status = Idle | Busy | Broken String
 -- some connection poolers don't.
 newtype CancelKey = CancelKey (Maybe (BackendKey ByteString))
 
--- | A connection on the socket, which nobody uses yet, and the handle of it.
-newConnection :: ServerInfo -> Host -> CancelKey -> Socket -> IO Connection
-newConnection info host key sock = (Connection info host key . Session sock <$> newIORef Idle) <*> newIORef True
+-- | A connection on the carrier, which nobody uses yet, and the handle of it.
+newConnection :: ServerInfo -> Host -> CancelKey -> Carrier -> IO Connection
+newConnection info host key carrier = (Connection info host key . Session carrier <$> newIORef Idle) <*> newIORef True
 
 -- | The connection through a new handle, which is live until it is given up.
 leased :: Connection -> IO Connection
@@ -93,7 +92,7 @@ settle session = \case
 breakSession :: Session -> String -> IO ()
 breakSession session reason = do
   first <- update (sessionStatus session) (\status -> case status of Broken _ -> (status, False); _ -> (Broken reason, True))
-  when first (Socket.close (sessionSocket session))
+  when first (closeCarrier (sessionCarrier session))
 
 -- | The settings, with the data that channel binding takes from the TLS link
 -- replaced: by the bytes, or by why there are none, or by none.

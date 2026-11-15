@@ -48,6 +48,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Internal.Frontend
                       Database.PostgreSQL.Internal.Socket
                       Database.PostgreSQL.Internal.Startup
+                      Database.PostgreSQL.Internal.Carrier
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation
@@ -127,6 +128,7 @@ benchmark native-pg-bench
                       Database.PostgreSQL.Internal.Frontend
                       Database.PostgreSQL.Internal.Socket
                       Database.PostgreSQL.Internal.Startup
+                      Database.PostgreSQL.Internal.Carrier
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation

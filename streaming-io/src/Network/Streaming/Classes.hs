@@ -74,6 +74,10 @@ module Network.Streaming.Classes
     Local,
     receiveWith,
     sendAllWith,
+    -- A socket's own calls that never wait, for a link that is a socket among other things.
+    tryReceive,
+    trySend,
+    receiveFirst,
     Room (..),
     roomOf,
     view,

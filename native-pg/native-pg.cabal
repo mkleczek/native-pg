@@ -41,6 +41,7 @@ common implementation
                       Database.PostgreSQL.Internal.Frontend
                       Database.PostgreSQL.Internal.Socket
                       Database.PostgreSQL.Internal.Startup
+                      Database.PostgreSQL.Internal.Carrier
   build-depends:      base              >= 4.19 && < 4.22
                     , base64-bytestring >= 1 && < 1.3
                     , bytestring        >= 0.10.8 && < 0.13

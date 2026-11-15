@@ -116,9 +116,9 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output, outputLength, outputWriter, runWriter)
 import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output (WriteResult (..), bytes)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
+import Database.PostgreSQL.Internal.Carrier (Carrier)
 import qualified Database.PostgreSQL.Internal.Protocol.Messages as Wire
 import Database.PostgreSQL.Types (FormatCode (..), Oid, Parameter (..))
-import Network.Socket (Socket)
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, boolA, consume, done, iterateA, iterateWith, keeping, tap)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
@@ -281,8 +281,8 @@ data Tx = Tx
     txBegin :: !ByteString,
     -- | BEGIN as the messages that carry it, rendered once for the isolation level and the mode.
     txBeginOutput :: !Output,
-    txReader :: !(Reader Socket),
-    txCursor :: !(At ('PayloadChoice Replies) Socket),
+    txReader :: !(Reader Carrier),
+    txCursor :: !(At ('PayloadChoice Replies) Carrier),
     txLoan :: !Loan,
     txState :: !(IORef State),
     -- | The number that a field is valid for: it changes as the row moves on, and when the transaction ends.
@@ -311,7 +311,7 @@ type Replies =
 -- | What a message of the server is, as far as the reading cares.
 data Event
   = -- | A DataRow: the cursor of its columns.
-    Row !(At ('PayloadCounted16 'MaybeBytes32Atom) Socket)
+    Row !(At ('PayloadCounted16 'MaybeBytes32Atom) Carrier)
   | -- | A CommandComplete: its tag, which is a view of the buffer.
     Complete !ByteString
   | EmptyQuery
@@ -322,7 +322,7 @@ data Event
   | Other
 
 -- | The next message of the server, told apart by its tag.
-events :: (Runtime arr) => arr (At ('PayloadChoice Replies) Socket) Event
+events :: (Runtime arr) => arr (At ('PayloadChoice Replies) Carrier) Event
 events =
   withOnly $
     asks message
@@ -354,7 +354,7 @@ data Step
   = -- | A message that no reading is waiting for.
     Stepped
   | -- | A row of the statement that is being read.
-    Rowed !(At ('PayloadCounted16 'MaybeBytes32Atom) Socket)
+    Rowed !(At ('PayloadCounted16 'MaybeBytes32Atom) Carrier)
   | -- | The statement that was being read is answered, with this many rows.
     Completed !Int
   | -- | The server failed the statement that was being read, and so skipped the statements after it.
@@ -541,7 +541,7 @@ nextRow (Result position reading) =
       Synced -> throwIO (unexpected "the pipeline ended before the statement was answered")
 
 -- | The row of the cursor, read by the program's step, which has to take its columns, and no more.
-decodeRow :: (Runtime arr) => arr Columns row -> With Tx arr (At ('PayloadCounted16 'MaybeBytes32Atom) Socket) row
+decodeRow :: (Runtime arr) => arr Columns row -> With Tx arr (At ('PayloadCounted16 'MaybeBytes32Atom) Carrier) row
 decodeRow rowArrow =
   alongside (lift count)
     >>> withTx columnsAt
@@ -709,7 +709,7 @@ parametersOf given = (map paramType given,map paramFormat given,) <$> traverse (
 -- | Sends what was laid out, in the loan of the transaction, whose buffer the replies are read into when it is sent.
 transmit :: (Runtime arr) => With Tx arr Output ()
 transmit =
-  withTx (\tx output -> pure (sessionSocket (connectionSession (txConnection tx)), loanBuffer (txLoan tx), output))
+  withTx (\tx output -> pure (sessionCarrier (connectionSession (txConnection tx)), loanBuffer (txLoan tx), output))
     >>> lift sendOutput
     >>> modifying (\s -> s {stSending = False})
 
@@ -788,7 +788,7 @@ begin level mode =
     -- BEGIN is rendered once for the program, when it is built, and not for each transaction.
     !beginOutput = prerendered (statementOutput (beginning level mode) [] [] [])
     open loan connection = do
-      reader <- newReader (sessionSocket (connectionSession connection)) (loanBuffer loan)
+      reader <- newReader (sessionCarrier (connectionSession connection)) (loanBuffer loan)
       state <-
         newIORef
           State
@@ -906,7 +906,7 @@ condemn = inTx condemned
 -- | A cursor standing at a DataRow: the cursor of its columns, how many there are, and what a failure of a column and
 -- a field need to know.
 data Columns = Columns
-  { colsCursor :: !(At ('PayloadCounted16 'MaybeBytes32Atom) Socket),
+  { colsCursor :: !(At ('PayloadCounted16 'MaybeBytes32Atom) Carrier),
     colsTotal :: !Int,
     colsState :: !(IORef State),
     colsEpoch :: !(IORef Int),
@@ -916,7 +916,7 @@ data Columns = Columns
 -- | A column that was taken from its row: the cursor of its value, which has its length read, the length, which is
 -- negative for NULL, and the columns of the row.
 data Column = Column
-  { columnValue :: At 'MaybeBytes32Atom Socket,
+  { columnValue :: At 'MaybeBytes32Atom Carrier,
     columnSize :: !Int,
     columnRow :: !Columns
   }
@@ -941,7 +941,7 @@ data Rows arr row = Rows Cardinality (arr Columns row)
 -- | A column's value as a stream, of the declared length: the last column of a
 -- row, and the way to read a value that is larger than the buffer. It is valid
 -- until its row moves on, and then fails with 'FieldExpired'.
-data Field = Field !Int !(At 'MaybeBytes32Atom Socket) !(IORef Int) !Int
+data Field = Field !Int !(At 'MaybeBytes32Atom Carrier) !(IORef Int) !Int
 
 instance (Runtime arr) => Stream arr Field where
   next = now (\(Field _ cursor epoch stamp) -> readIORef epoch >>= \current -> if current == stamp then pure cursor else throwIO FieldExpired) >>> piece

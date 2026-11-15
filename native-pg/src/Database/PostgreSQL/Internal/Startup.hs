@@ -36,9 +36,9 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Protocol.Messages hiding (FramedMessage)
+import Database.PostgreSQL.Internal.Carrier (Carrier)
 import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), ServerInfo (..), TargetSessionAttrs (..))
 import GHC.IO.Exception (IOException (..))
-import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.Classes (Effect (..), Runtime, Scope (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, consume, iterateWith, keeping)
@@ -62,9 +62,9 @@ type StartupMessages =
        FramedMessage 'C' 'RemainingBytesAtom
      ]
 
--- | What the startup works with: the socket, the buffer that its messages are rendered into and received in, which,
+-- | What the startup works with: the carrier, the buffer that its messages are rendered into and received in, which,
 -- one after the other, need no more than one, and the reader of the replies.
-data Setup = Setup !Socket !Buffer !(Reader Socket)
+data Setup = Setup !Carrier !Buffer !(Reader Carrier)
 
 -- | Where the startup is, and what it keeps: the version of the protocol, whichever the server settled on.
 data Phase
@@ -97,9 +97,9 @@ data Verdict = Qualifies | Disqualified String | Asks Question
 -- | Starts the session: it sends the startup message, authenticates and reads the server's report, up to its being
 -- ready for a statement, or says why it couldn't. A server that ends the stream, and one that says what the client
 -- doesn't understand, are ways that it couldn't.
-startup :: (Runtime arr) => ConnectSettings -> arr (Socket, Buffer) (Either ConnectError ServerInfo)
+startup :: (Runtime arr) => ConnectSettings -> arr (Carrier, Buffer) (Either ConnectError ServerInfo)
 startup settings =
-  tryA (now (\(sock, buffer) -> Setup sock buffer <$> newReader sock buffer) >>> withOnly (opening settings))
+  tryA (now (\(carrier, buffer) -> Setup carrier buffer <$> newReader carrier buffer) >>> withOnly (opening settings))
     >>> now (either failed (pure . Right))
 
 -- | What a failure of the startup is: the server's rejection and the client's own are as they were thrown, and a
@@ -134,17 +134,17 @@ loop settings =
 
 -- | Sends the output, rendered into the buffer.
 send :: (Runtime arr) => With Setup arr Output ()
-send = With ((\(Setup sock buffer _, output) -> (sock, buffer, output)) ^>> sendOutput)
+send = With ((\(Setup carrier buffer _, output) -> (carrier, buffer, output)) ^>> sendOutput)
 
 -- | The next message of the server: its tag, and its body.
 received :: forall arr. (Runtime arr) => With Setup arr () (Char, ByteString)
 received = asks (arr (\(Setup _ _ reader) -> reader)) >>> lift readMessage
   where
-    readMessage :: arr (Reader Socket) (Char, ByteString)
+    readMessage :: arr (Reader Carrier) (Char, ByteString)
     readMessage =
-      (messages :: Reader Socket -> At StartupMessages Socket)
+      (messages :: Reader Carrier -> At StartupMessages Carrier)
         ^>> withOnly (asks message >>> With (cases (tagged 'R' :> tagged 'E' :> tagged 'N' :> tagged 'S' :> tagged 'K' :> tagged 'Z' :> tagged 'v' :> tagged '1' :> tagged '2' :> tagged 'D' :> tagged 'C' :> NoCases)))
-    tagged :: Char -> arr (At 'RemainingBytesAtom Socket) (Char, ByteString)
+    tagged :: Char -> arr (At 'RemainingBytesAtom Carrier) (Char, ByteString)
     tagged tag = remaining >>^ (tag,)
 
 -- | What the client makes of a message of the server in the phase: the server's report when it is ready, or what to
@@ -265,7 +265,7 @@ startupMessage settings =
             <> connectParameters settings
     )
 
--- | The number of the first four bytes, as the wire has it: the most significant first.
+-- | The number of the first four bytes, as the carrier has it: the most significant first.
 be32 :: ByteString -> Int
 be32 = BS.foldl' (\total byte -> total `shiftL` 8 .|. fromIntegral byte) 0 . BS.take 4
 

@@ -30,7 +30,7 @@ import Data.Maybe (fromMaybe)
 import Data.Tuple (swap)
 import Database.PostgreSQL.Connection (ConnectSettings (connectReadSize), connect)
 import Database.PostgreSQL.Connection.Internal (Connection (..), Session (..), Status (..), breakSession, leased)
-import Database.PostgreSQL.Internal.Socket (isQuiet)
+import Database.PostgreSQL.Internal.Carrier (isQuiet)
 import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (Duration, Effect (..), Runtime, Scope (..))
@@ -143,7 +143,7 @@ existing ref =
     Nothing -> pure (Left ())
     Just connection -> do
       status <- readIORef (sessionStatus (connectionSession connection))
-      quiet <- if status == Idle then isQuiet @m (sessionSocket (connectionSession connection)) else pure False
+      quiet <- if status == Idle then isQuiet @m (sessionCarrier (connectionSession connection)) else pure False
       if quiet
         then pure (Right connection)
         else do
