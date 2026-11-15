@@ -8,6 +8,7 @@
 -- tells its listeners is what the model evicts.
 module ModelSpec (spec) where
 
+import Control.Exception (IOException, throwIO, try)
 import Control.Monad (forM_, unless, when)
 import Data.Bits (shiftR, xor)
 import qualified Data.ByteString as BS
@@ -103,22 +104,22 @@ agrees make toKey fromKey cap ops = do
 
 spec :: Spec
 spec = describe "the table" $ do
-  itNeeds [Table, Shared] "evicts as the reference model of SIEVE does, for sequences of stores, peeks, removals, resizes and flushes" $
+  itNeeds [Table, Shared, Owned] "evicts as the reference model of SIEVE does, for sequences of stores, peeks, removals, resizes and flushes, and hands back the value of a store that is refused" $
       sharings $ \make ->
         forM_ [1, 2, 3, 5, 8, 16] $ \cap -> forM_ [1 .. 40] $ \seed -> agrees make id id cap (operations 300 (cap * 3) (fromIntegral (seed * 7919 + cap)))
 
-  itNeeds [Table, Shared] "does the same for keys that collide, so that the chains of the table are followed and shifted back" $
+  itNeeds [Table, Shared, Owned] "does the same for keys that collide, so that the chains of the table are followed and shifted back" $
       sharings $ \make ->
         forM_ [1, 2, 3, 5, 8, 16, 32] $ \cap -> forM_ [1 .. 40] $ \seed -> do
           agrees make Two (\(Two k) -> k) cap (operations 300 (cap * 3) (fromIntegral (seed * 104729 + cap)))
           agrees make Five (\(Five k) -> k) cap (operations 300 (cap * 3) (fromIntegral (seed * 1299709 + cap)))
 
-  itNeeds [Table, Shared, Strings] "does the same for keys that are slices of byte strings, with the hash of their bytes" $
+  itNeeds [Table, Shared, Strings, Owned] "does the same for keys that are slices of byte strings, with the hash of their bytes" $
     sharings $ \make ->
       forM_ [1, 2, 3, 5, 8, 16, 32] $ \cap -> forM_ [1 .. 40] $ \seed ->
         agrees make bytesKey unBytesKey cap (operations 300 (cap * 3) (fromIntegral (seed * 15485863 + cap)))
 
-  itNeeds [Table, Shared, Strings] "does the same for keys that are slices of text" $
+  itNeeds [Table, Shared, Strings, Owned] "does the same for keys that are slices of text" $
     sharings $ \make ->
       forM_ [1, 2, 3, 5, 8, 16, 32] $ \cap -> forM_ [1 .. 40] $ \seed ->
         agrees make textKey unTextKey cap (operations 300 (cap * 3) (fromIntegral (seed * 32452843 + cap)))
@@ -212,6 +213,34 @@ spec = describe "the table" $ do
         mapM_ (\k -> store cache k (k * 10)) [6, 7]
         resize cache 1
         readLog told `shouldReturn` ["(1,10)", "(3,30)", "(4,40)", "(5,50)", "(6,60)"]
+
+    itNeeds [Table, Owned] "tells the eviction listener of a value that a store is refused, since the key is cached, once" $ do
+      told <- newLog
+      cache <- newCache ((config 4) {evicted = \k v -> noteIn told (show (k :: Int, v :: Int))})
+      store cache 1 10 `shouldReturn` True
+      store cache 1 20 `shouldReturn` False
+      readLog told `shouldReturn` ["(1,20)"]
+      entries cache `shouldReturn` [(1, 10)]
+
+    it "keeps one entry when the capacity is zero, and tells the eviction listener of the entry that the next one evicts" $ do
+      told <- newLog
+      cache <- newCache ((config 0) {evicted = \k v -> noteIn told (show (k :: Int, v :: Int))})
+      store cache 1 10 `shouldReturn` True
+      entries cache `shouldReturn` [(1, 10)]
+      store cache 2 20 `shouldReturn` True
+      entries cache `shouldReturn` [(2, 20)]
+      readLog told `shouldReturn` ["(1,10)"]
+
+    itNeeds [Table, Owned] "tells the eviction listener of every entry that a flush or a resize drops, though a listener fails, and the failure is the caller's" $
+      forM_ [(flush, ["(1,10)", "(2,20)", "(3,30)"]), (\cache -> resize cache 1, ["(1,10)", "(2,20)"])] $ \(dropping, expected) -> do
+        told <- newLog
+        let listener k v = noteIn told (show (k :: Int, v :: Int)) >> when (k == 1) (throwIO (userError "listener failed"))
+        cache <- newCache ((config 4) {evicted = listener})
+        mapM_ (\k -> store cache k (k * 10)) [1, 2, 3 :: Int]
+        outcome <- try (dropping cache)
+        either (\failure -> show (failure :: IOException)) (const "no failure") outcome `shouldBe` "user error (listener failed)"
+        -- The entry whose listener failed was the first, and every one after it was told as well.
+        readLog told `shouldReturn` expected
 
   describe "resizing" $ do
     itNeeds [Table] "keeps every entry of a cache that grows, and has room for more" $ do

@@ -7,11 +7,12 @@ module TeardownSpec (spec) where
 
 import Control.Arrow ((>>>), (^>>))
 import Control.Monad (forM_)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Sieve
 import Data.Sieve.Lease
 import Data.Sieve.Teardown
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (done)
+import Network.Streaming.Combinators (done, tap)
 import Skeletest
 import Support
 
@@ -88,6 +89,52 @@ spec = describe "teardown" $ forM_ setups $ \setup@(Setup name _ make newLease' 
         lookups = traverse (\k -> const (cache, k) ^>> cached loader accept) [1, 2, 3]
     (_ :: Either () ()) <- run (race (const graveyard ^>> teardown snd (secs 10) owner) (lookups >>> done >>> spinUntil (isDown graveyard)))
     readLog logged `shouldReturn` ["torn down tenant 1 Drained", "torn down tenant 2 Drained"]
+
+  describe "values that the cache does not keep" $ do
+    itCase setup [Table, Cached, Lease, Teardown, Owned] "tears down a tenant that lost the race for its key, once, and not the one that won" $ do
+      graveyard <- newGraveyard'
+      logged <- newLog
+      counted <- counter
+      cache <- make ((config 4) {evicted = \_ tenant' -> bury graveyard tenant'})
+      let owner = now (\((label, _), how) -> noteIn logged ("torn down " <> label <> " " <> show how))
+          loader = now (\k -> bump counted >>= \n -> (,) ("tenant " <> show (k :: Int) <> ", loaded " <> show n) <$> newLease') >>> tap (now (\_ -> newLease' >>= \won -> () <$ store cache 1 ("won", won)))
+          call = const (cache, 1) ^>> cached loader (\_ (label, lease) -> pure (Use (label, lease)))
+      run (withPart (const graveyard ^>> teardown snd (secs 10) owner) (call >>> tap (done >>> spinUntil (isDown graveyard)))) `shouldReturn` "the scenario ended"
+      readLog logged `shouldReturn` ["torn down tenant 1, loaded 0 Drained"]
+      map (fst . snd) <$> entries cache `shouldReturn` ["won"]
+      outstanding graveyard `shouldReturn` 0
+
+    itCase setup [Table, Cached, Lease, Teardown, Owned] "tears down a tenant that a reload removes, once" $ do
+      graveyard <- newGraveyard'
+      logged <- newLog
+      counted <- counter
+      asked <- newIORef False
+      cache <- make ((config 4) {evicted = \_ tenant' -> bury graveyard tenant'})
+      let owner = now (\((label, _), how) -> noteIn logged ("torn down " <> label <> " " <> show how))
+          loader = now (\k -> bump counted >>= \n -> (,) ("tenant " <> show (k :: Int) <> ", loaded " <> show n) <$> newLease')
+          hookOnce _ tenant' = readIORef asked >>= \seen -> if seen then pure (Use (fst tenant')) else Reload <$ writeIORef asked True
+          call = const (cache, 1) ^>> cached loader hookOnce
+      run (withPart (const graveyard ^>> teardown snd (secs 10) owner) (call >>> tap (done >>> spinUntil (isDown graveyard)))) `shouldReturn` "the scenario ended"
+      readLog logged `shouldReturn` ["torn down tenant 1, loaded 0 Drained"]
+      map (fst . snd) <$> entries cache `shouldReturn` ["tenant 1, loaded 1"]
+      outstanding graveyard `shouldReturn` 0
+
+    itCase setup [Table, Cached, Lease, Teardown] "tears down a tenant once when its owner buried it already, and a lookup finds it retired and reloads it" $ do
+      graveyard <- newGraveyard'
+      logged <- newLog
+      counted <- counter
+      cache <- make ((config 4) {evicted = \_ tenant' -> bury graveyard tenant'})
+      let owner = now (\((label, _), how) -> noteIn logged ("torn down " <> label <> " " <> show how))
+          loader = now (\k -> bump counted >>= \n -> (,) ("tenant " <> show (k :: Int) <> ", loaded " <> show n) <$> newLease')
+          hook _ (label, lease) = enter lease >>= \entered -> pure (if entered then Use (label, lease) else Reload)
+          call = const (cache, 1) ^>> cached loader hook
+          -- Loads the tenant and is done with it, buries it as its owner does when it kills it, and waits for its teardown, and then
+          -- looks it up again.
+          scenario = call >>> now (\(_, lease) -> leave lease >> peek cache 1 >>= maybe (pure ()) (bury graveyard)) >>> spinUntil (isDown graveyard) >>> call >>> tap (done >>> spinUntil (isDown graveyard))
+      run (withPart (const graveyard ^>> teardown snd (secs 10) owner) scenario) `shouldReturn` "the scenario ended"
+      readLog logged `shouldReturn` ["torn down tenant 1, loaded 0 Drained"]
+      map (fst . snd) <$> entries cache `shouldReturn` ["tenant 1, loaded 1"]
+      outstanding graveyard `shouldReturn` 0
 
 -- | Whether every value that was buried is torn down.
 isDown :: Graveyard c v -> IO Bool

@@ -19,6 +19,7 @@ module Support
     Log,
     newLog,
     noteIn,
+    noteEvicted,
     readLog,
     ensureCores,
     promptly,
@@ -32,6 +33,7 @@ module Support
     pause,
     later,
     viewOf,
+    withPart,
     Keys (..),
     intKeys,
     bytesKeys,
@@ -43,7 +45,7 @@ module Support
   )
 where
 
-import Control.Arrow (ArrowChoice, (>>>), (^>>))
+import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Monad (when)
 import Data.Kind (Type)
@@ -80,6 +82,8 @@ data Part
     Shared
   | -- | The keys that are strict byte strings and text.
     Strings
+  | -- | The eviction listener is told of every value that leaves the cache or is not kept.
+    Owned
   | -- | The lease.
     Lease
   | -- | The graveyard and the teardown part.
@@ -89,7 +93,7 @@ data Part
 -- | The parts that the code doesn't have yet. A change that adds one takes it off the list, and with it the marks of the cases
 -- that wait for it.
 notThere :: [Part]
-notThere = []
+notThere = [Owned]
 
 -- | Marks every case of the spec as an expected failure while a part that it needs is missing. A case that then passes
 -- unexpectedly fails the suite.
@@ -229,3 +233,11 @@ bytesKeys = Keys bytesKey unBytesKey
 
 textKeys :: Keys Text
 textKeys = Keys textKey unTextKey
+
+-- | A part that never ends, beside a scenario: what ends is the scenario, which cancels the part. It says which.
+withPart :: (Runtime arr) => arr () () -> arr () b -> arr () String
+withPart part scenario = race part scenario >>^ either (const "the part ended") (const "the scenario ended")
+
+-- | Notes an eviction of a cache of numbers.
+noteEvicted :: Log -> Int -> Int -> IO ()
+noteEvicted logged k v = noteIn logged (show (k, v))

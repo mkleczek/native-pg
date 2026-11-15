@@ -8,7 +8,7 @@ module SingleFlightSpec (spec) where
 
 import Control.Arrow ((>>>), (>>^), (^>>), (|||))
 import Control.Exception (throwIO)
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (sort)
 import Data.Sieve
@@ -118,3 +118,72 @@ spec = describe "single flight" $ forM_ setups $ \setup@(Setup name _ make _ _ r
     () <- run (together [call accept, later (millis 20) (call hookOnce)])
     readIORef loads `shouldReturn` 2
     sort <$> readLog results `shouldReturn` ["11", "12"]
+
+  describe "values that are not kept" $ do
+    itCase setup [Table, Cached, SingleFlight, Owned] "hands the value of a load that lost the race for its key to the eviction listener, once, and serves the waiters with the value that is cached" $ do
+      told <- newLog
+      results <- newLog
+      cache <- make ((ints 4) {evicted = noteEvicted told})
+      let loader = pause (millis 40) >>> tap (now (\_ -> () <$ store cache 1 99)) >>^ const 5
+          call = const (cache, 1) ^>> cached loader accept >>> now (noteIn results . show)
+      () <- run (together [call, later (millis 10) call, later (millis 20) call])
+      readLog results `shouldReturn` ["99", "99", "99"]
+      readLog told `shouldReturn` ["(1,5)"]
+      entries cache `shouldReturn` [(1, 99)]
+
+    itCase setup [Table, Cached, SingleFlight, Owned] "tells the eviction listener of an entry once when the loader and a waiter both ask for a reload of it" $ do
+      told <- newLog
+      loads <- counter
+      results <- newLog
+      cache <- make ((ints 4) {evicted = noteEvicted told})
+      askedByLoader <- newIORef False
+      askedByWaiter <- newIORef False
+      let loader = now (\k -> (k * 10 +) <$> bump loads) >>> pause (millis 80)
+          hookOnce asked _ v = readIORef asked >>= \seen -> if seen then pure (Use v) else Reload <$ writeIORef asked True
+          call asked = const (cache, 1) ^>> cached loader (hookOnce asked) >>> now (noteIn results . show)
+      () <- run (together [call askedByLoader, later (millis 20) (call askedByWaiter)])
+      readIORef loads `shouldReturn` 2
+      readLog results `shouldReturn` ["11", "11"]
+      readLog told `shouldReturn` ["(1,10)"]
+      entries cache `shouldReturn` [(1, 11)]
+
+    itCase setup [Table, Cached, SingleFlight] "tells the eviction listener of each entry that a resize drops while a load runs, once, and caches the value that is loaded" $ do
+      told <- newLog
+      cache <- make ((ints 4) {evicted = noteEvicted told})
+      mapM_ (\k -> store cache k (k * 10)) [1, 2, 3]
+      let loader = pause (millis 60) >>^ (* 10)
+      () <- run (together [const (cache, 10) ^>> cached loader accept >>> done, later (millis 20) (now (const (resize cache 1)))])
+      sort <$> readLog told `shouldReturn` ["(1,10)", "(2,20)", "(3,30)"]
+      entries cache `shouldReturn` [(10, 100)]
+
+    itCase setup [Table, Cached, SingleFlight] "tells the eviction listener of each entry that a flush drops while a load runs, once, and caches the value that is loaded" $ do
+      told <- newLog
+      cache <- make ((ints 4) {evicted = noteEvicted told})
+      mapM_ (\k -> store cache k (k * 10)) [1, 2]
+      let loader = pause (millis 60) >>^ (* 10)
+      () <- run (together [const (cache, 10) ^>> cached loader accept >>> done, later (millis 20) (now (const (flush cache)))])
+      readLog told `shouldReturn` ["(1,10)", "(2,20)"]
+      entries cache `shouldReturn` [(10, 100)]
+      flush cache
+      readLog told `shouldReturn` ["(1,10)", "(2,20)", "(10,100)"]
+
+    itCase setup [Table, Cached, SingleFlight, Owned] "serves the waiters of a load whose insertion fails in an eviction listener, and the failure is the loader's" $ do
+      results <- newLog
+      cache <- make ((ints 1) {evicted = \k _ -> when (k == 0) (throwIO (userError "listener failed"))})
+      _ <- store cache 0 0
+      let call = const (cache, 1) ^>> cached ((* 10) ^>> pause (millis 80)) accept
+      finished <-
+        promptly
+          ( run
+              ( within
+                  (secs 5)
+                  ( together
+                      [ tryA call >>> now (noteIn results . either show show),
+                        later (millis 20) call >>> now (noteIn results . show)
+                      ]
+                  )
+              )
+          )
+      finished `shouldBe` Just (Just ())
+      sort <$> readLog results `shouldReturn` ["10", "user error (listener failed)"]
+      entries cache `shouldReturn` [(1, 10)]

@@ -6,11 +6,11 @@
 -- same programs, written once for any arrow and any sharing of the cache that suit each other, run under every setup.
 module CachedSpec (spec) where
 
-import Control.Arrow ((^>>))
+import Control.Arrow ((>>^), (^>>))
 import Control.Exception (throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Sieve
 import Network.Streaming.Classes (Effect (..), Scope (..))
@@ -89,9 +89,10 @@ spec = describe "cached" $ forM_ setups $ \setup@(Setup name _ make _ _ run) -> 
       readIORef loads `shouldReturn` 2
       entries cache `shouldReturn` [(1, 20)]
 
-    itCase setup [Table, Cached] "removes the entry that it found, and only if it is still that entry" $ do
+    itCase setup [Table, Cached] "removes the entry that it found, and only if it is still that entry, and tells the eviction listener of no entry that another took the place of" $ do
       loads <- counter
-      cache <- make (ints 4)
+      told <- newLog
+      cache <- make ((ints 4) {evicted = noteEvicted told})
       replaced <- newIORef False
       -- While the hook of the first call decides, another entry takes the place of the one it found: the reload
       -- must not remove it.
@@ -108,6 +109,24 @@ spec = describe "cached" $ forM_ setups $ \setup@(Setup name _ make _ _ run) -> 
       readIORef loads `shouldReturn` 1
       peek cache 1 `shouldReturn` Just 99
       entries cache `shouldReturn` [(1, 99)]
+      -- The first entry was removed by the hook itself, which has its value, and the second is cached.
+      readLog told `shouldReturn` []
+
+    itCase setup [Table, Cached, Owned] "tells the eviction listener of the entry that it removes, once, whether it found the entry or loaded it" $
+      forM_ [False, True] $ \cachedAlready -> do
+        told <- newLog
+        loads <- counter
+        cache <- make ((ints 4) {evicted = noteEvicted told})
+        asked <- newIORef False
+        let loader = now (\k -> (k * 10 +) <$> bump loads)
+            hookOnce _ v = readIORef asked >>= \seen -> if seen then pure (Use v) else Reload <$ writeIORef asked True
+        when cachedAlready $ do
+          (_ :: [Int]) <- run (valuesOf loader cache [1])
+          pure ()
+        run (const (cache, 1) ^>> cached loader hookOnce) `shouldReturn` 11
+        readIORef loads `shouldReturn` 2
+        readLog told `shouldReturn` ["(1,10)"]
+        entries cache `shouldReturn` [(1, 11)]
 
     itCase setup [Table, Cached] "counts the request once, as a hit" $ do
       told <- newLog
@@ -118,6 +137,23 @@ spec = describe "cached" $ forM_ setups $ \setup@(Setup name _ make _ _ run) -> 
       let hook _ v = readIORef replaced >>= \seen -> if seen then pure (Use v) else Reload <$ writeIORef replaced True
       (_ :: Int) <- run (const (cache, 1) ^>> cached (tenTimes loads) hook)
       readLog told `shouldReturn` ["False", "True"]
+
+  describe "values that are not kept" $ do
+    itCase setup [Table, Cached, Owned] "tells the eviction listener of a value that was loaded and not kept, since another way cached the key meanwhile, once" $ do
+      told <- newLog
+      cache <- make ((ints 4) {evicted = noteEvicted told})
+      let loader = tap (now (\_ -> () <$ store cache 1 99)) >>^ const 5
+      run (const (cache, 1) ^>> cached loader accept) `shouldReturn` 99
+      readLog told `shouldReturn` ["(1,5)"]
+      entries cache `shouldReturn` [(1, 99)]
+
+    itCase setup [Table, Cached] "keeps one entry when the capacity is zero, and tells the eviction listener of it once the next evicts it" $ do
+      told <- newLog
+      loads <- counter
+      cache <- make ((ints 0) {evicted = noteEvicted told})
+      run (valuesOf (tenTimes loads) cache [1, 2]) `shouldReturn` [10, 20]
+      readLog told `shouldReturn` ["(1,10)"]
+      entries cache `shouldReturn` [(2, 20)]
 
   describe "thrashing" $ do
     itCase setup [Table, Cached] "tells the listener of a miss of a key among the last evicted ones, once" $ do

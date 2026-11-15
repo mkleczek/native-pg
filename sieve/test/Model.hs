@@ -31,10 +31,10 @@ modelSize :: Model -> Int
 modelSize = length . queue
 
 -- | Stores the value unless the key is there, evicting as SIEVE does if the queue is full: whether it did, and the entries
--- that were evicted, in order.
+-- that were evicted, in order. A value that is not stored, since the key is there, is handed back as if it were evicted.
 modelStore :: Int -> Int -> Model -> (Bool, [(Int, Int)], Model)
 modelStore key value model
-  | any ((== key) . slotKey) (queue model) = (False, [], model)
+  | any ((== key) . slotKey) (queue model) = (False, [(key, value)], model)
   | otherwise = (True, evicted, made {queue = queue made ++ [Slot key value False]})
   where
     (evicted, made) = evictWhile (\m -> length (queue m) >= capacity m) model
