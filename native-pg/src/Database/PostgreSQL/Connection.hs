@@ -149,8 +149,16 @@ encrypting settings = case (connectAddress settings, connectSslMode settings, co
   where
     without mode = TlsFailure ("sslmode value \"" <> mode <> "\" invalid when SSL support is not compiled in")
 
--- | A connection to the address, which the session is started on, with TLS or without as @sslmode@ says. Each attempt is
--- on a new socket and on the same buffer, one after the other:
+-- | A connection to the address, which the session is started on, with TLS or without as @sslmode@ says.
+connected :: (Runtime arr) => ConnectSettings -> arr Buffer (Either ConnectError Connection)
+connected settings = attempting settings (started settings)
+
+-- | What an attempt makes of the carrier that it got, with the data that SCRAM's channel binding takes and the buffer: the
+-- session started on it, or the request that is sent over it.
+type Use arr a = arr (Carrier, Maybe (Either String ByteString), Buffer) (Either NotMade a)
+
+-- | The use, made of a connection to the address, with TLS or without as @sslmode@ says. Each attempt is on a new socket and
+-- on the same buffer, one after the other:
 --
 -- * @allow@ connects without TLS first, and with TLS if the server rejected the connection;
 -- * @prefer@ connects with TLS first, and without if the server didn't take it, which is no failure, or if the connection
@@ -158,16 +166,16 @@ encrypting settings = case (connectAddress settings, connectSslMode settings, co
 -- * @require@ and @verify-full@ connect with TLS or fail, and @verify-full@ looks for the root certificate file first.
 --
 -- A Unix-domain socket isn't encrypted, whatever the mode, and without a TLS client @allow@ and @prefer@ connect without.
-connected :: (Runtime arr) => ConnectSettings -> arr Buffer (Either ConnectError Connection)
-connected settings = attempts >>^ either (\(NotMade _ reason) -> Left reason) Right
+attempting :: (Runtime arr) => ConnectSettings -> Use arr a -> arr Buffer (Either ConnectError a)
+attempting settings use = attempts >>^ either (\(NotMade _ reason) -> Left reason) Right
   where
     attempts = case (connectSslMode settings, connectAddress settings, connectTlsClient settings) of
-      (SslAllow, TcpAddress {}, Just client) -> retrying rejected (oneTry settings Nothing) (secure client NoVerification True)
-      (SslPrefer, TcpAddress {}, Just client) -> retrying afterTls (secure client NoVerification False) (oneTry settings Nothing)
+      (SslAllow, TcpAddress {}, Just client) -> retrying rejected (oneTry settings use Nothing) (secure client NoVerification True)
+      (SslPrefer, TcpAddress {}, Just client) -> retrying afterTls (secure client NoVerification False) (oneTry settings use Nothing)
       (SslRequire, TcpAddress {}, Just client) -> secure client NoVerification True
       (SslVerifyFull roots, TcpAddress {}, Just client) -> rootsChecked roots >>> (arr Left ||| secure client (VerifyFull roots) True)
-      _ -> oneTry settings Nothing
-    secure client verification required = oneTry settings (Just (Securing client verification required))
+      _ -> oneTry settings use Nothing
+    secure client verification required = oneTry settings use (Just (Securing client verification required))
     rejected (NotMade _ failure) = case failure of ConnectionRejected _ -> True; _ -> False
     afterTls (NotMade accepted _) = accepted
 
@@ -175,9 +183,9 @@ connected settings = attempts >>^ either (\(NotMade _ reason) -> Left reason) Ri
 retrying ::
   (ArrowChoice arr) =>
   (NotMade -> Bool) ->
-  arr Buffer (Either NotMade Connection) ->
-  arr Buffer (Either NotMade Connection) ->
-  arr Buffer (Either NotMade Connection)
+  arr Buffer (Either NotMade a) ->
+  arr Buffer (Either NotMade a) ->
+  arr Buffer (Either NotMade a)
 retrying again firstTry secondTry = (alongside firstTry >>^ chosen) >>> (secondTry ||| returnA)
   where
     chosen (result, buffer) = case result of
@@ -188,24 +196,28 @@ retrying again firstTry secondTry = (alongside firstTry >>^ chosen) >>> (secondT
 rootsChecked :: (Runtime arr) => RootCertificates -> arr Buffer (Either NotMade Buffer)
 rootsChecked roots = now (\buffer -> maybe (Right buffer) (Left . NotMade False) <$> checkedRoots roots)
 
--- | One attempt: a new socket, TLS over it as the securing says, if there is one, and the session started on it.
-oneTry :: (Runtime arr) => ConnectSettings -> Maybe Securing -> arr Buffer (Either NotMade Connection)
-oneTry settings securing =
+-- | One attempt: a new socket, TLS over it as the securing says, if there is one, and the use made of it.
+oneTry :: (Runtime arr) => ConnectSettings -> Use arr a -> Maybe Securing -> arr Buffer (Either NotMade a)
+oneTry settings use securing =
   (connectAddress settings,) ^>> first (connectSocket (connectTcpOptions settings)) >>> withBuffer ^>> (arr (Left . NotMade False) ||| session)
   where
     withBuffer (reached, buffer) = fmap (,buffer) reached
-    -- The socket is closed unless the session was started: also when the part is cancelled while it starts it.
+    -- The socket is closed unless the use was made: also when the part is cancelled while it is.
     session =
       scope
         (arr fst)
         (now (\(sock, exit) -> case exit of Done -> pure (); _ -> Socket.close sock))
-        (snd ^>> alongside (maybe onSocket (encrypted settings) securing) >>> (unready ^>> (now closed ||| started)))
+        (snd ^>> alongside (maybe onSocket (encrypted settings) securing) >>> (unready ^>> (now closed ||| use)))
     -- A pattern takes the fields out; a selector would leave a thunk for each.
     unready (result, (sock, _)) = either (Left . (,sock)) Right result
     closed (failed, sock) = Left failed <$ Socket.close sock
+
+-- | The session started on the carrier, which is closed if that fails. The failure says whether the server had taken TLS.
+started :: (Runtime arr) => ConnectSettings -> Use arr Connection
+started settings =
+  startupInput ^>> first (startup settings) >>> now (\(info, carrier) -> either (\reason -> Left (NotMade (isSecure carrier) reason) <$ closeCarrier carrier) (fmap Right . made carrier) info)
+  where
     startupInput (carrier, binding, buffer) = ((carrier, buffer, binding), carrier)
-    started =
-      startupInput ^>> first (startup settings) >>> now (\(info, carrier) -> either (\reason -> Left (NotMade (isSecure carrier) reason) <$ closeCarrier carrier) (fmap Right . made carrier) info)
     made carrier info = newConnection info (hostOf settings) (CancelKey (serverBackendKey info)) carrier
     isSecure = \case Secure _ -> True; Plain _ -> False
 
@@ -295,20 +307,21 @@ cancel settings =
   where
     bounded = maybe (>>^ Just) (within . secs . fromIntegral) (connectTimeout settings)
 
--- | The request on a socket of its own, which is closed when the step ends, however it ends.
+-- | The request on a connection of its own, with TLS or without as the settings say, which is closed when the step ends,
+-- however it ends.
 requesting :: forall arr. (Runtime arr) => ConnectSettings -> arr (BackendKey ByteString) (Either ConnectError ())
 requesting settings = case encrypting settings of
   Just reason -> arr (const (Left reason))
   Nothing ->
-    (\key -> (connectAddress settings, key))
-      ^>> first (connectSocket (connectTcpOptions settings))
+    alongside (now (const (newBuffer (positiveInt @512))))
+      >>> first (attempting settings (arr (\(carrier, _, buffer) -> Right (carrier, buffer))))
       >>> (\(reached, key) -> fmap (,key) reached)
       ^>> (arr Left ||| asked)
   where
-    asked :: arr (Socket.Socket, BackendKey ByteString) (Either ConnectError ())
-    asked = scope (arr fst) (now (\(sock, _) -> Socket.close sock)) (now rendered >>> alongside sendOutput >>> waiting ^>> orClosed >>^ Right)
-    -- The carrier of the socket, the room that the reply would be received into, and the request, rendered into the buffer.
-    rendered (_, (sock, key)) = (\buffer -> (Plain sock, buffer, serialize (CancelRequest key))) <$> newBuffer (positiveInt @512)
+    asked :: arr ((Carrier, Buffer), BackendKey ByteString) (Either ConnectError ())
+    asked = scope (arr (fst . fst)) (now (\(carrier, _) -> closeCarrier carrier)) (rendered ^>> (alongside sendOutput >>> waiting ^>> orClosed >>^ Right))
+    -- The carrier, the buffer that the request is rendered into and the reply would be received into, and the request.
+    rendered (carrier, ((_, buffer), key)) = (carrier, buffer, serialize (CancelRequest key))
     waiting (_, (carrier, buffer, _)) = (carrier, roomOf buffer)
     -- The server closes the connection once it has handled the request, and ends the stream; a connection that breaks
     -- first is as good.

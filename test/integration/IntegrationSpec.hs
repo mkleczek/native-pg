@@ -395,7 +395,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                          )
       it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $
         encryptedBy "sslnegotiation=direct sslmode=require" `shouldReturn` Right [True]
-      needs "cancel over TLS" $ it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
+      it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
         settings <- settingsOf (tcp "sslmode=require")
         withPlaintextServer $ \plaintext -> do
           refusing <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
