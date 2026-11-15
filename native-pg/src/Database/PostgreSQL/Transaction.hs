@@ -845,10 +845,11 @@ layout finality streams sent tx (input, rest) = do
           pure (Entry (sql given) Wanted, Wire.serialize (Wire.Describe Wire.PreparedStatement name) <> boundStreamed name formats values)
       Close name -> pure (Entry ("DEALLOCATE " <> name) Closing, Wire.serialize (Wire.Close Wire.PreparedStatement name))
 
--- | The statement as it is for the input: one that has its SQL is as it is, and one that is made from the input is not sent yet.
+-- | The statement as it is for the input: one that has its SQL is as it is, and one that is made from the input is the
+-- statement that it makes. The pair is made once, and its SQL is left as it is until a message needs it.
 resolved :: p -> Statement arr p row -> Statement arr p row
-resolved _ = \case
-  Made {} -> error "a statement made from the input is not sent yet"
+resolved parameters = \case
+  Made {stream, rows, made} -> case made parameters of (text, given) -> Statement {sql = text, params = const given, stream, rows}
   given -> given
 
 -- | The statement that ends a transaction: ROLLBACK if it is condemned, else COMMIT, as its SQL, which the errors name, and

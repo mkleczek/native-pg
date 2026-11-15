@@ -870,7 +870,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         `shouldReturn` ()
 
   -- A program is built once, and a statement made from its input has the SQL, and the parameters, of each run.
-  needs "statementFrom" $ describe "a statement made from the input" $ do
+  describe "a statement made from the input" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
     it "sends the SQL and the parameters that the input makes, for each run of one program" $
