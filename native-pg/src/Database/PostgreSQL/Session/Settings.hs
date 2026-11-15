@@ -28,6 +28,10 @@ data ConnectSettings = ConnectSettings
     -- | Version 3.2, which PostgreSQL 18 supports, has longer cancel keys, but
     -- some connection poolers reject it.
     connectProtocolVersion :: ProtocolVersion,
+    -- | The lowest version of the protocol that a host may have, as libpq's
+    -- @min_protocol_version@ asks: a server that settles on a lower one
+    -- doesn't qualify.
+    connectMinProtocolVersion :: ProtocolVersion,
     -- | The size of a read buffer.
     connectReadSize :: Int,
     connectTcpOptions :: TcpOptions,
@@ -123,6 +127,7 @@ connectSettings address user =
       connectDatabase = Nothing,
       connectParameters = [],
       connectProtocolVersion = protocolVersion3_0,
+      connectMinProtocolVersion = protocolVersion3_0,
       connectReadSize = 16384,
       connectTcpOptions = defaultTcpOptions,
       connectSslMode = SslDisable,

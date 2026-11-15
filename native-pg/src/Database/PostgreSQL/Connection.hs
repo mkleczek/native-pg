@@ -15,6 +15,7 @@ module Database.PostgreSQL.Connection
         connectDatabase,
         connectParameters,
         connectProtocolVersion,
+        connectMinProtocolVersion,
         connectReadSize,
         connectTcpOptions,
         connectSslMode,
@@ -77,14 +78,27 @@ import Network.Streaming.NotImplemented (notImplemented)
 
 -- | Connects to the first of the settings' hosts that qualifies: the settings' own, then the settings of its fallbacks,
 -- in order. For each it connects the socket as its address says, the Unix-domain socket or the numeric address, sends
--- the startup message and authenticates as the server asks, with SCRAM-SHA-256, MD5 or a cleartext password. Each
--- host has its own @connect_timeout@, which is a deadline of the arrow. TLS and the session attributes are to come:
--- for now a mode that needs TLS fails the host. It borrows from the loans only while it sets up a host.
+-- the startup message and authenticates as the server asks, with SCRAM-SHA-256, MD5 or a cleartext password, and then
+-- checks that the server qualifies: it has the protocol version that @min_protocol_version@ asks for, and the session
+-- attributes that @target_session_attrs@ asks for, which @prefer-standby@ asks for in two passes, the hosts that are
+-- standbys first and then any. Each host has its own @connect_timeout@, which is a deadline of the arrow. TLS is to
+-- come: for now a mode that needs it fails the host. It borrows from the loans only while it sets up a host.
 --
 -- It always fails with @ConnectFailure@: an entry for each host it tried, in
--- order, for one host as for many.
+-- order, for one host as for many. Of the two passes of @prefer-standby@ it gives the second's.
 connect :: (Runtime arr) => ConnectSettings -> arr Loans (Either ConnectFailure Connection)
-connect settings = hostsInOrder (settings : connectFallbacks settings) >>^ either (Left . ConnectFailure) Right
+connect settings = case connectTargetSessionAttrs settings of
+  PreferStandbySession ->
+    alongside (pass StandbySession)
+      >>> retry
+      ^>> (pass AnySession ||| arr Right)
+      >>^ outcome
+  target -> pass target >>^ outcome
+  where
+    pass target = hostsInOrder [host {connectTargetSessionAttrs = target} | host <- settings : connectFallbacks settings]
+    -- The loans go to the second pass if the first found no host.
+    retry (result, loans) = either (const (Left loans)) Right result
+    outcome = either (Left . ConnectFailure) Right
 
 -- | The first of the hosts that connects, or why each of them didn't, in order. The hosts are known when the program is
 -- built, so each one's attempt is an arrow of its own, which the one before it runs if it fails.

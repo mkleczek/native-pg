@@ -136,7 +136,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
         )
         `shouldReturn` Just ()
 
-    needs "target_session_attrs" $ it "asks a server that doesn't report its attributes at startup, with setup buffers" $
+    it "asks a server that doesn't report its attributes at startup, with setup buffers" $
       withOlderServer (showing "off") $ \scriptedPort -> do
         settings <-
           settingsOf ("host=127.0.0.1 user=postgres dbname=postgres sslmode=disable target_session_attrs=read-write port=" <> Char8.pack (show scriptedPort))
@@ -146,7 +146,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
 
     -- The answer of a server that doesn't report its attributes decides whether it qualifies, and a question that the
     -- server fails is a failure of the host, not of the connection.
-    needs "target_session_attrs" $ it "doesn't qualify a server that says its session is read-only, and returns the setup buffers" $
+    it "doesn't qualify a server that says its session is read-only, and returns the setup buffers" $
       withOlderServer (showing "on") $ \scriptedPort -> do
         settings <- olderServerSettings scriptedPort
         tiny
@@ -157,7 +157,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
                 ]
           )
           `shouldReturn` Just ()
-    needs "target_session_attrs" $ it "reports a host whose question the server fails as a failed check, and returns the setup buffers" $
+    it "reports a host whose question the server fails as a failed check, and returns the setup buffers" $
       withOlderServer failing $ \scriptedPort -> do
         settings <- olderServerSettings scriptedPort
         tiny

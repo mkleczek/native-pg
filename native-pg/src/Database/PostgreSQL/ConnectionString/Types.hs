@@ -100,6 +100,7 @@ hostConnectSettings string host =
       connectDatabase = Just (connectionDatabase string),
       connectParameters = connectionParameters string,
       connectProtocolVersion = connectionProtocolVersion string,
+      connectMinProtocolVersion = connectionMinProtocolVersion string,
       connectTcpOptions = connectionTcpOptions string,
       connectSslMode = connectionSslMode string,
       connectSslCertificate = connectionSslCertificate string,

@@ -31,12 +31,12 @@ import Database.PostgreSQL.Internal.Authentication
     scramVerifyServerFinal,
   )
 import Database.PostgreSQL.Internal.Diagnostics (bodyDiagnostics)
-import Database.PostgreSQL.Internal.Frontend (sendOutput)
+import Database.PostgreSQL.Internal.Frontend (sendOutput, sync)
 import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
 import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Protocol.Messages hiding (FramedMessage)
-import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), ServerInfo (..))
+import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), ServerInfo (..), TargetSessionAttrs (..))
 import GHC.IO.Exception (IOException (..))
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer)
@@ -55,7 +55,11 @@ type StartupMessages =
        FramedMessage 'S' 'RemainingBytesAtom,
        FramedMessage 'K' 'RemainingBytesAtom,
        FramedMessage 'Z' 'RemainingBytesAtom,
-       FramedMessage 'v' 'RemainingBytesAtom
+       FramedMessage 'v' 'RemainingBytesAtom,
+       FramedMessage '1' 'RemainingBytesAtom,
+       FramedMessage '2' 'RemainingBytesAtom,
+       FramedMessage 'D' 'RemainingBytesAtom,
+       FramedMessage 'C' 'RemainingBytesAtom
      ]
 
 -- | What the startup works with: the socket, the buffer that its messages are rendered into and received in, which,
@@ -74,6 +78,21 @@ data Phase
     Authenticated ProtocolVersion
   | -- | The parameters that the server reports, last first, and its key for cancelling, until it is ready.
     Initializing ProtocolVersion [(ByteString, ByteString)] (Maybe (BackendKey ByteString))
+  | -- | The answer to the question that the server's report left open, until the server is ready again: the text of the
+    -- first value of the first row if there is one, or the server's failure, which is reported once it is ready.
+    Checking ServerInfo Question (Either ServerError (Maybe ByteString))
+
+-- | What the server's report didn't say about whether it qualifies, which the client asks: the statement, the text that
+-- its first value has when the answer is yes, whether the host has to say yes, and why it isn't suitable if not.
+data Question = Question
+  { askStatement :: ByteString,
+    askYes :: ByteString,
+    askWanted :: Bool,
+    askWhy :: String
+  }
+
+-- | What the server's report says about whether it qualifies.
+data Verdict = Qualifies | Disqualified String | Asks Question
 
 -- | Starts the session: it sends the startup message, authenticates and reads the server's report, up to its being
 -- ready for a statement, or says why it couldn't. A server that ends the stream, and one that says what the client
@@ -124,7 +143,7 @@ received = asks (arr (\(Setup _ _ reader) -> reader)) >>> lift readMessage
     readMessage :: arr (Reader Socket) (Char, ByteString)
     readMessage =
       (messages :: Reader Socket -> At StartupMessages Socket)
-        ^>> withOnly (asks message >>> With (cases (tagged 'R' :> tagged 'E' :> tagged 'N' :> tagged 'S' :> tagged 'K' :> tagged 'Z' :> tagged 'v' :> NoCases)))
+        ^>> withOnly (asks message >>> With (cases (tagged 'R' :> tagged 'E' :> tagged 'N' :> tagged 'S' :> tagged 'K' :> tagged 'Z' :> tagged 'v' :> tagged '1' :> tagged '2' :> tagged 'D' :> tagged 'C' :> NoCases)))
     tagged :: Char -> arr (At 'RemainingBytesAtom Socket) (Char, ByteString)
     tagged tag = remaining >>^ (tag,)
 
@@ -132,6 +151,7 @@ received = asks (arr (\(Setup _ _ reader) -> reader)) >>> lift readMessage
 -- answer, if anything, and the phase that follows. A rejection and what the client can't accept are thrown.
 react :: ConnectSettings -> (Char, ByteString) -> Phase -> IO (Step (Maybe Output, Phase) ServerInfo)
 react settings (tag, body) phase = case (tag, phase) of
+  ('E', Checking info question _) -> either (throwIO . ProtocolError) (continuing . Checking info question . Left . ServerError) (bodyDiagnostics body)
   ('E', _) -> either (throwIO . ProtocolError) (throwIO . ConnectionRejected . ServerError) (bodyDiagnostics body)
   ('N', _) -> continuing phase
   ('v', Negotiating _) -> continuing (Negotiating (versionOf (be32 body)))
@@ -147,7 +167,15 @@ react settings (tag, body) phase = case (tag, phase) of
   ('R', Authenticated version) | code == 0 -> continuing (Initializing version [] Nothing)
   ('S', Initializing version parameters key) -> continuing (Initializing version (parameterOf body : parameters) key)
   ('K', Initializing version parameters _) -> continuing (Initializing version parameters (Just (keyOf body)))
-  ('Z', Initializing version parameters key) -> pure (Finish (ServerInfo version (reverse parameters) key))
+  ('Z', Initializing version parameters key) -> qualifying (ServerInfo version (reverse parameters) key)
+  ('1', Checking {}) -> continuing phase
+  ('2', Checking {}) -> continuing phase
+  ('D', Checking info question (Right _)) -> continuing (Checking info question (Right (Just (firstValue body))))
+  ('C', Checking {}) -> continuing phase
+  ('Z', Checking _ _ (Left failure)) -> throwIO (CheckFailed failure)
+  ('Z', Checking info question (Right answer))
+    | (answer == Just (askYes question)) == askWanted question -> pure (Finish info)
+    | otherwise -> throwIO (Unsuitable (askWhy question))
   _ -> throwIO (ProtocolError ("unexpected message " <> show tag <> " in the startup"))
   where
     code = be32 body
@@ -155,6 +183,11 @@ react settings (tag, body) phase = case (tag, phase) of
     required = connectChannelBinding settings == ChannelBindingRequire
     continuing next = pure (Again (Nothing, next))
     answering output next = pure (Again (Just output, next))
+    -- The end of the startup: the server's report is what the host qualifies by, or is asked what it left out.
+    qualifying info = case verdict settings info of
+      Qualifies -> pure (Finish info)
+      Disqualified why -> throwIO (Unsuitable why)
+      Asks question -> answering (questionOutput question) (Checking info question (Right Nothing))
     requirePassword = maybe (throwIO (AuthenticationError "the server asks for a password, but none is set")) pure (connectPassword settings)
     -- The server's first message: what it asks for.
     requested version = case code of
@@ -177,6 +210,49 @@ react settings (tag, body) phase = case (tag, phase) of
       other -> throwIO (ProtocolError ("unknown authentication request " <> show other))
 -- Not inlined: it is plain IO, the same for every runtime, and inlined it was copied into each runtime's startup.
 {-# NOINLINE react #-}
+
+-- | Whether the server qualifies by its report: it has the protocol version that the settings ask for, and the session
+-- attributes. A server that doesn't report what the attributes are made of, as those before PostgreSQL 14 don't, is asked.
+verdict :: ConnectSettings -> ServerInfo -> Verdict
+verdict settings info
+  | serverProtocolVersion info < connectMinProtocolVersion settings =
+      Disqualified
+        ( "server only supports protocol version "
+            <> version (serverProtocolVersion info)
+            <> ", but min_protocol_version was set to "
+            <> version (connectMinProtocolVersion settings)
+        )
+  | otherwise = case connectTargetSessionAttrs settings of
+      ReadWriteSession -> readOnly False "session is read-only"
+      ReadOnlySession -> readOnly True "session is not read-only"
+      PrimarySession -> standby False "server is in hot standby mode"
+      StandbySession -> standby True "server is not in hot standby mode"
+      -- The two passes of prefer-standby are made by the caller.
+      _ -> Qualifies
+  where
+    reported name = lookup name (serverParameters info)
+    -- A session is read-only in a standby, and if it is by default.
+    readOnly wanted why = case (reported "in_hot_standby", reported "default_transaction_read_only") of
+      (Just inStandby, Just readOnlyDefault) -> decided wanted why (inStandby == "on" || readOnlyDefault == "on")
+      _ -> Asks (Question "SHOW transaction_read_only" "on" wanted why)
+    standby wanted why = case reported "in_hot_standby" of
+      Just inStandby -> decided wanted why (inStandby == "on")
+      Nothing -> Asks (Question "SELECT pg_catalog.pg_is_in_recovery()" "t" wanted why)
+    decided wanted why actual = if actual == wanted then Qualifies else Disqualified why
+    version (ProtocolVersion major minor) = show major <> "." <> show minor
+
+-- | The question as an unnamed statement of the extended protocol, with no parameters, whose value comes as text.
+questionOutput :: Question -> Output
+questionOutput question =
+  serialize (Parse "" (askStatement question) [])
+    <> serialize (Bind (BindBody "" "" [] ([] :: [Maybe Parameter]) []))
+    <> serialize (Execute "" 0 :: Execute ByteString)
+    <> sync
+
+-- | The text of the first value of a DataRow: after the number of its columns, a length and the bytes. A NULL, whose
+-- length is -1, has none.
+firstValue :: ByteString -> ByteString
+firstValue body = BS.take (be32 (BS.drop 2 body)) (BS.drop 6 body)
 
 -- | The startup message: the user, the database if there is one, and the other parameters.
 startupMessage :: ConnectSettings -> Output

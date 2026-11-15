@@ -244,7 +244,8 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             | silent <- [one, other]
             ]
         elapsed <- subtract started <$> getMonotonicTime
-        elapsed `shouldSatisfy` (P.gte 2 P.&& P.lt 6)
+        -- The deadline is read from the runtime's clock, which can differ from this one by a little.
+        elapsed `shouldSatisfy` (P.gte 1.9 P.&& P.lt 6)
     it "connects to the next host after one that timed out" $
       withSilentServer $ \silent ->
         withString
@@ -253,7 +254,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           `shouldReturn` (directory, Right [1])
     -- A server that doesn't have the protocol version that min_protocol_version asks for doesn't qualify, as with
     -- target_session_attrs.
-    needs "target_session_attrs" $ it "doesn't qualify a server below min_protocol_version, as libpq words it" $
+    it "doesn't qualify a server below min_protocol_version, as libpq words it" $
       withScripted (\client -> receiveStartup client *> SocketBytes.sendAll client (frame 'v' (int32 0x00030000 <> int32 0) <> frame 'R' (int32 0) <> frame 'Z' "I") *> drain client) $ \scripted ->
         connectFailure ("host=127.0.0.1 user=postgres sslmode=disable max_protocol_version=3.2 min_protocol_version=3.2 port=" <> Char8.pack (show scripted))
           `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show scripted <> " failed: server only supports protocol version 3.0, but min_protocol_version was set to 3.2")
@@ -292,7 +293,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "names the application, with the fallback name if none is given" $ do
       withString (local "fallback_application_name=fallback") applicationName `shouldReturn` Right ["fallback"]
       withString (local "fallback_application_name=fallback application_name=app") applicationName `shouldReturn` Right ["app"]
-    needs "target_session_attrs" $ it "connects only to a server with the session attributes asked for" $ do
+    it "connects only to a server with the session attributes asked for" $ do
       let readOnly = "options='-c default_transaction_read_only=on' "
       withString (local (readOnly <> "target_session_attrs=read-only")) done `shouldReturn` ()
       connectFailure (local (readOnly <> "target_session_attrs=read-write"))
@@ -415,7 +416,8 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         connectFailure ("host=" <> Char8.pack silent <> " connect_timeout=2")
           `shouldReturn` ("connection to server on socket \"" <> silent <> "/.s.PGSQL.5432\" failed: timeout expired")
         elapsed <- subtract started <$> getMonotonicTime
-        elapsed `shouldSatisfy` (P.gte 2 P.&& P.lt 5)
+        -- As above: the deadline can fire a little before this clock says that it has passed.
+        elapsed `shouldSatisfy` (P.gte 1.9 P.&& P.lt 5)
 
   describe "execute" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
