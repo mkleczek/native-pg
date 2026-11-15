@@ -97,7 +97,7 @@ where
 import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, yield)
 import Control.Concurrent.STM (atomically, orElse, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, toException, try)
-import Control.Monad (foldM, replicateM, when)
+import Control.Monad (foldM, when)
 import Data.Bits ((.&.), (.|.))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
@@ -563,7 +563,8 @@ childParts run parent scope' count = do
   outer <- readIORef (partFrames parent)
   flagged <- if null outer then readIORef (scopeCancelled (runRoot run)) else readIORef (partCancelled parent)
   let frames = Inside scope' : if null outer then [Inside (runRoot run)] else outer
-  children <- replicateM count (Part <$> nextWait run <*> newIORef frames <*> newIORef NotWaiting <*> newIORef flagged)
+  -- Made in a loop that keeps no stack of its own: a group of thousands of parts starts under a small stack limit.
+  children <- reverse <$> foldM (\made _ -> (: made) <$> (Part <$> nextWait run <*> newIORef frames <*> newIORef NotWaiting <*> newIORef flagged)) [] [1 .. count]
   adjust run 9 count
   writeIORef (scopeMembers scope') children
   children <$ writeIORef (partWait parent) (InGroup scope')

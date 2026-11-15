@@ -266,11 +266,7 @@ quickOrSlow = Handling program
 manyWorkers :: Spec
 manyWorkers = describe "a server of thousands of workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
   describe kind $
-    -- Threads stalled at 2,024 workers in some runs of a dev build, which is not what every run does; Delimited at about 1,000 in all.
-    marked' kind $
-      it "serves that many connections that are open at once" (serveMany kind 2500)
-  where
-    marked' kind = if kind == "delimited" then xfail "the startup of thousands of workers is a loop that is not a tail loop (step 3)" else id
+    it "serves that many connections that are open at once" (serveMany kind 2500)
 
 -- | A server of this many workers, and the same many clients that connect at once and ask it for the answer of 200: how
 -- many got it, within the time that they have.

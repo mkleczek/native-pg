@@ -31,7 +31,7 @@ import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, rtsSupports
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (foldM, forM_, unless, when)
 import Data.Bits ((.&.))
 import Data.Foldable (traverse_)
 import Data.Functor (($>))
@@ -298,9 +298,9 @@ awaitBoth scope' one other =
     `onException` (cancelScope scope' *> uninterruptibleMask_ (readMVar one *> readMVar other $> ()))
 
 -- | Waits for all, and if it is interrupted, cancels them and waits for them still: no part outlives the group.
-awaitAll :: CancelScope Members -> [MVar a] -> IO [a]
+awaitAll :: CancelScope Members -> [MVar a] -> IO ()
 awaitAll scope' dones =
-  traverse readMVar dones
+  traverse_ readMVar dones
     `onException` (cancelScope scope' *> uninterruptibleMask_ (traverse_ readMVar dones))
 
 -- | What a group does when one of its parts has ended: the first failure is kept, and cancels the scope.
@@ -324,8 +324,9 @@ instance Concurrent (ThreadsM m) where
     parts -> Threads $ \part input -> do
       scope' <- newScope
       failure <- newIORef Nothing
-      dones <- traverse (\(Threads body) -> spawn part scope' (`body` input) (failing failure scope')) parts
-      _ <- awaitAll scope' dones
+      -- Started and awaited in loops that keep no stack of their own: a group of thousands of parts starts under a small stack limit.
+      dones <- reverse <$> foldM (\started (Threads body) -> (: started) <$> spawn part scope' (`body` input) (failing failure scope')) [] parts
+      awaitAll scope' dones
       readIORef failure >>= maybe (pure ()) throwIO
 
 -- | The first half to end is the result, and the other is cancelled and waited for. The loser's failure is
