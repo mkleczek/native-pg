@@ -35,6 +35,7 @@
 module Network.Streaming.Classes
   ( Link (..),
     Stream (..),
+    Steps,
     Runtime,
     ArrowApplicative,
     Concurrent (..),
@@ -137,26 +138,33 @@ class Stream arr s where
 -- results are combined with '<$>' and '<*>'. The effects run from left to right, as with '&&&'.
 class (forall x. Applicative (arr x)) => ArrowApplicative arr
 
--- | What a program needs of the arrow it runs in, so that it can be written
--- once and run by any of them: the capabilities of its classes, and tickets
--- and inboxes at both reaches.
-type Runtime arr =
+-- | What a step that can't wait needs of the arrow it runs in: the classes of 'Runtime' that have no waiting method. A step
+-- that is polymorphic over them ends by returning or by throwing, so that catching its failure is enough to clean up after
+-- it, and a combinator that only catches takes such a step and refuses one that can wait.
+type Steps arr =
   ( ArrowChoice arr,
     ArrowApplicative arr,
     Effect arr,
+    Scope arr,
+    Time arr,
+    Annotate arr,
+    Instrumented (ModeOf arr)
+  )
+
+-- | What a program needs of the arrow it runs in, so that it can be written
+-- once and run by any of them: the capabilities of its classes, and tickets
+-- and inboxes at both reaches. It is 'Steps' and what can wait.
+type Runtime arr =
+  ( Steps arr,
     Block arr,
     GiveWay arr,
-    Scope arr,
     Race arr,
     Within arr,
-    Time arr,
     Concurrent arr,
-    Annotate arr,
     Exchange arr (Local arr),
     Exchange arr 'Anywhere,
     Inboxes arr (Local arr),
-    Inboxes arr 'Anywhere,
-    Instrumented (ModeOf arr)
+    Inboxes arr 'Anywhere
   )
 
 -- | Values that one direction hands another, once each: the way directions

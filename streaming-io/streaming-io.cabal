@@ -8,6 +8,7 @@ build-type: Simple
 extra-source-files: test/check-positive-int.sh
                     test/check-one-buffer.sh
                     test/check-no-io-waits.sh
+                    test/check-steps.sh
                     test/compile/*.hs
 
 library
@@ -117,6 +118,7 @@ test-suite streaming-io-spec
                  ScopesSpec
                  ScopeCostSpec
                  StepCostSpec
+                 StepsSpec
                  TimeSpec
                  UnwindSpec
                  WithSpec

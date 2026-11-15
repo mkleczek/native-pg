@@ -12,6 +12,10 @@ module Network.Streaming.Plumbing
     keeping,
     tap,
     consume,
+    through,
+    _1,
+    _2,
+    on,
     boolA,
     Step,
     pattern Again,
@@ -22,7 +26,7 @@ module Network.Streaming.Plumbing
   )
 where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
 import Data.Bool (bool)
 import Network.Streaming.Annotate (Annotate, giving, taking)
 
@@ -101,6 +105,28 @@ tap step = alongside step >>^ snd
 consume :: (Arrow arr) => arr a () -> arr (a, c) c
 consume step = first step >>^ snd
 {-# INLINE consume #-}
+
+-- | Runs the arrow on the part that the lens picks. A lens is a function from an arrow on a part to an arrow on the
+-- whole, such as '_1', '_2' or a composition of them like @_2 . _1@.
+through :: (arr a b -> arr s t) -> arr a b -> arr s t
+through l = l
+{-# INLINE through #-}
+
+-- | The first of a pair, as a lens.
+_1 :: (Arrow arr) => arr a b -> arr (a, c) (b, c)
+_1 = first
+{-# INLINE _1 #-}
+
+-- | The second of a pair, as a lens.
+_2 :: (Arrow arr) => arr a b -> arr (c, a) (c, b)
+_2 = second
+{-# INLINE _2 #-}
+
+-- | Runs the arrow on the part that the lens picks, and ignores the rest. A stub: it fails when it runs, until it is
+-- written.
+on :: (Arrow arr) => (arr a () -> arr s t) -> arr a () -> arr s ()
+on _ _ = arr (const (error "on is not implemented yet"))
+{-# INLINE on #-}
 
 -- | Runs the first arrow if the input is 'False', and the second if it is 'True', like 'bool'. In diagrams the two
 -- branches are named "false" and "true".

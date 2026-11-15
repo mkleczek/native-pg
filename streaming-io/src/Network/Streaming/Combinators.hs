@@ -19,6 +19,10 @@ module Network.Streaming.Combinators
     keeping,
     tap,
     consume,
+    through,
+    _1,
+    _2,
+    on,
     boolA,
     Step,
     pattern Again,
@@ -26,6 +30,7 @@ module Network.Streaming.Combinators
     iterateA,
     iterateWith,
     foreverA,
+    undoing,
     localTicket,
     deliver,
     withTicket,
@@ -54,6 +59,7 @@ import GHC.Stack (HasCallStack)
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Network.Streaming.Annotate (answering, asking, box)
 import Network.Streaming.Classes
+import Network.Streaming.NotImplemented (notImplemented)
 import Network.Streaming.Plumbing
 
 -- | The step this many times, each on what the one before gave.
@@ -87,6 +93,13 @@ concurrently one two =
 untilJust :: (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => IO (Maybe a) -> arr () a
 untilJust action = iterateWith (now (const (maybe (Again ()) Finish <$> action))) giveWay
 {-# INLINE untilJust #-}
+
+-- | Runs the step; if it fails, runs the cleanup on the same input, and fails the same way. Neither of them can wait, so a
+-- cancellation can't stop them half way, and catching the failure is enough. A stub: it fails when it runs, until it is
+-- written.
+undoing :: (Steps arr) => (forall p. (Steps p) => p a b) -> (forall p. (Steps p) => p a ()) -> arr a b
+undoing _ _ = notImplemented "undoing"
+{-# INLINE undoing #-}
 
 -- | A ticket of the arrow's own reach: one that only parts of this core fulfil and await.
 localTicket :: (Exchange arr (Local arr)) => arr () (Future arr (Local arr) a, Promise (Local arr) a)
