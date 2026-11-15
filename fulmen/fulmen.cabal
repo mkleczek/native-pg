@@ -54,8 +54,9 @@ test-suite fulmen-conformance
   ghc-options: -Wall -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   if flag(threaded)
     ghc-options: -threaded
-  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, bytestring, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5, unix
+  -- The server of the bench runs in a process of its own, under a small stack, for the case of a server of thousands of workers.
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5, fulmen:fulmen-bench
+  build-depends: base, bytestring, directory, fulmen, network, process, streaming-io, skeletest >=0.4.2 && <0.5, unix
 
 -- A quick measurement: a client of C keep-alive connections and a server that answers with a static body, run as two
 -- processes of this one program. Its numbers are for looking at, and nothing checks them.

@@ -17,10 +17,10 @@
 module ConformanceSpec (spec) where
 
 import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
-import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
+import Control.Concurrent (forkFinally, forkIO, killThread, rtsSupportsBoundThreads, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Exception (IOException, SomeException, bracket, displayException, fromException, throwIO, try)
-import Control.Monad (forM_, void, when)
+import Control.Monad (foldM, forM_, void, when)
 import ConformanceCases
 import ConformanceWire
 import Data.ByteString (ByteString)
@@ -46,13 +46,17 @@ import Network.Streaming.Mode (Mode (..))
 import Network.Streaming.Threads (runThreads, runThreadsM)
 import Skeletest
 import System.Info (os)
+import System.Directory (findExecutable)
+import System.IO (hGetLine)
+import System.Posix.Resource (Resource (..), ResourceLimits (..), getResourceLimit, setResourceLimit)
 import System.Posix.Signals (raiseSignal, sigTERM)
 import System.Posix.Types (Fd (..))
 import System.IO.Error (ioeGetErrorString, isAlreadyInUseError)
+import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, terminateProcess, waitForProcess)
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec
+spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> manyWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -254,6 +258,46 @@ quickOrSlow = Handling program
     program =
       (\input@(_, request) -> if target request == "/slow" then Left input else Right input)
         ^>> (streamedWith [pause 1000 >>> writing "one", pause 1000 >>> writing "two"] ||| ((, (Fulmen.Status 200, [], "ok")) . fst ^>> reply))
+
+-- | A server of thousands of workers starts and serves that many connections at once, under the small stack that a dev
+-- build runs with. Its workers are made at startup, and a loop that is not a tail loop overflows that stack, which the parts
+-- that run masked don't report: the server goes on with the workers that it had made, and spins. It is a process of its
+-- own, so that its spin doesn't hold up the test: it is the server of @fulmen-bench@.
+manyWorkers :: Spec
+manyWorkers = describe "a server of thousands of workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
+  describe kind $
+    -- Threads stalled at 2,024 workers in some runs of a dev build, which is not what every run does; Delimited at about 1,000 in all.
+    marked' kind $
+      it "serves that many connections that are open at once" (serveMany kind 2500)
+  where
+    marked' kind = if kind == "delimited" then xfail "the startup of thousands of workers is a loop that is not a tail loop (step 3)" else id
+
+-- | A server of this many workers, and the same many clients that connect at once and ask it for the answer of 200: how
+-- many got it, within the time that they have.
+serveMany :: String -> Int -> IO ()
+serveMany kind count = do
+  -- Both ends of every connection are descriptors of this process.
+  limit <- getResourceLimit ResourceOpenFiles
+  setResourceLimit ResourceOpenFiles limit {softLimit = hardLimit limit}
+  bench <- findExecutable "fulmen-bench" >>= maybe (failTest "fulmen-bench is not on the path") pure
+  -- The server has ten capabilities where the run time has them: the non-threaded one refuses the flag, and has one.
+  let capabilities = ["-N10" | rtsSupportsBoundThreads]
+  bracket
+    (createProcess (proc bench (["server", kind, "1", show count, "+RTS", "-T"] <> capabilities <> ["-K1K", "-RTS"])) {std_out = CreatePipe})
+    (\(_, _, _, handle) -> terminateProcess handle *> void (waitForProcess handle))
+    $ \(_, out, _, _) -> do
+      port <- maybe (failTest "no output of the server") (fmap (fromIntegral . (read :: String -> Int) . drop 5 . filter (/= '\r') . takeWhile (/= '\n')) . hGetLine) out
+      -- Loops that keep no stack of their own: the stack of the test is small, too, as the stack of a dev build is.
+      answers <- foldM (\collected _ -> (: collected) <$> newEmptyMVar) [] [1 .. count]
+      forM_ answers $ \answer -> forkIO (asking port >>= putMVar answer)
+      answered <- timeout 30000000 (foldM (\total answer -> (\got -> if got then total + 1 else total) <$> readMVar answer) (0 :: Int) answers)
+      answered `shouldBe` Just count
+  where
+    asking port = (either (const False) id <$>) . try @IOException $
+      bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
+        Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1)))
+        SocketBytes.sendAll sock "GET /16k HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        ("HTTP/1.1 200" `B.isPrefixOf`) <$> SocketBytes.recv sock 4096
 
 -- | How the server ended, if it did in time: the runner runs it with a handler that answers 200, on one core made for it.
 endedWith :: Runner -> Listening -> IO (Maybe (Either SomeException ()))
