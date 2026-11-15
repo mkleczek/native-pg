@@ -121,7 +121,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
 
   -- What the pool does past its size, as v1's overflow policy did: a request that finds every connection in use waits for one
   -- to come back, and after the overflow delay opens one more, up to the overflow. That connection is closed as its request ends.
-  needs "pool overflow" $ describe "overflow" $ do
+  describe "overflow" $ do
     let bounded :: Env -> Program a -> IO (Maybe a)
         bounded env program = onEnv env (withinFor (secs 5) program)
         backendOf :: Env -> IO Int64
@@ -188,7 +188,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         finishHolding base
 
   -- What the pool counts: the connections that are idle, in use, and being made.
-  needs "pool stats" $ describe "stats" $ do
+  describe "stats" $ do
     it "counts the connections that are idle, that a request has, and that are being made" $
       pooled (\s -> s {poolSize = 2}) $ \env -> do
         connectionPoolStats (envPool env) `shouldReturn` PoolStats 0 0 0
@@ -224,7 +224,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         counting attempts script client = atomicModifyIORef' attempts (\n -> (n + 1, ())) *> script client
         poolTo port change = change (connectionPoolSettings 1 (connectSettings (TcpAddress "127.0.0.1" port) "postgres"))
         buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-    needs "pool overflow" $ it "is tried again after the overflow delay, and the request gets its connection" $ do
+    it "is tried again after the overflow delay, and the request gets its connection" $ do
       attempts <- newIORef 0
       buffers <- buffersOf
       withScripted [counting attempts refusal, counting attempts accepting] $ \port ->
@@ -235,7 +235,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
           (ended - started >= 0.12) `shouldBe` True
           readIORef attempts `shouldReturn` 2
 
-    needs "pool overflow" $ it "is tried again until the deadline of the arrow that runs the request, and leaves its slot free" $ do
+    it "is tried again until the deadline of the arrow that runs the request, and leaves its slot free" $ do
       attempts <- newIORef 0
       buffers <- buffersOf
       withScripted (repeat (counting attempts refusal)) $ \port ->
