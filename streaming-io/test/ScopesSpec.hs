@@ -10,18 +10,21 @@ module ScopesSpec (spec) where
 
 import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, getNumCapabilities, setNumCapabilities, threadDelay)
-import Control.Exception (SomeException, fromException, throwIO, try)
+import Control.Exception (IOException, SomeException, fromException, throwIO, try)
 import Control.Monad (forM_, unless, void, when)
 import qualified Data.ByteString as BS
 import Data.Functor (($>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
+import Data.Maybe (isJust)
+import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy (..))
 import Data.Tuple (swap)
 import Data.Word (Word64)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as Socket
 import Network.Streaming.Classes hiding (within)
+import qualified Network.Streaming.Classes as Classes (within)
 import Network.Streaming.Combinators
   ( pattern Again,
     pattern Finish,
@@ -30,6 +33,7 @@ import Network.Streaming.Combinators
     consume,
     done,
     iterateWith,
+    sleep,
     tap,
     times,
     tryTicket,
@@ -48,7 +52,7 @@ import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
-type Rich arr = (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Annotate arr)
+type Rich arr = (ArrowChoice arr, ArrowApplicative arr, Effect arr, GiveWay arr, Block arr, Concurrent arr, Exchange arr (Local arr), Scope arr, Race arr, Time arr, Within arr, Annotate arr)
 
 -- | The same, for the pool, which parts of several cores share.
 type Pooled arr = (Rich arr, Exchange arr 'Anywhere)
@@ -71,7 +75,12 @@ runners =
   ]
 
 spec :: Spec
-spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $ do
+spec = do
+  scopesSpec
+  differentialSpec
+
+scopesSpec :: Spec
+scopesSpec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $ do
   it "release once, on Done, on a failure and on a cancellation, also a release that waits" $
     forM_ [False, True] $ \waits -> do
       let work :: Program ()
@@ -105,6 +114,129 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
     returned <- newLog
     (winner <$> run (race (tryA waitsForEver >>> noting returned "tryA returned") giveWayAndEnd)) `shouldReturn` "second"
     readLog returned `shouldReturn` []
+
+  describe "a failure that leaves a body" $ do
+    it "releases innermost first, across tryA and shield, and tells each release how its body ended" $ do
+      caught <- newLog
+      run (bracketed caught "a" returnA (tryA (bracketed caught "b" returnA (shield (bracketed caught "c" returnA (boom "x" :: Program ())))) >>> noting caught "tryA returned" >>> done)) `shouldReturn` ()
+      readLog caught
+        `shouldReturn` [ "acquire a",
+                         "acquire b",
+                         "acquire c",
+                         "release c: failed user error (x)",
+                         "release b: failed user error (x)",
+                         "tryA returned",
+                         "release a: done"
+                       ]
+      failed <- newLog
+      result <- run (tryA (bracketed failed "a" returnA (shield (bracketed failed "b" returnA (bracketed failed "c" returnA (boom "x" :: Program ()))))))
+      describeFailure result `shouldBe` "Left user error (x)"
+      readLog failed
+        `shouldReturn` [ "acquire a",
+                         "acquire b",
+                         "acquire c",
+                         "release c: failed user error (x)",
+                         "release b: failed user error (x)",
+                         "release a: failed user error (x)"
+                       ]
+      -- The cancellation passes through tryA, and waits behind the shield until the shield ends.
+      cancelled <- newLog
+      let held :: Program ()
+          held = bracketed cancelled "b" returnA (shield (slowWait >>> noting cancelled "shielded done") >>> waitsForEver)
+      (winner <$> run (race (bracketed cancelled "a" returnA (tryA held >>> noting cancelled "tryA returned")) giveWayAndEnd)) `shouldReturn` "second"
+      readLog cancelled `shouldReturn` ["acquire a", "acquire b", "shielded done", "release b: cancelled", "release a: cancelled"]
+
+    it "gives the release that follows one that failed, as how its body ended, the failure of the release" $ do
+      noted <- newLog
+      let inner :: Program ()
+          inner = scope (noting noted "acquire inner") (boom "release failed") (snd ^>> boom "body failed")
+      result <- run (tryA (bracketed noted "outer" returnA inner))
+      failure <- either pure (const (failTest "the failure was not reported")) result
+      case fromException failure of
+        Just (ReleaseFailed (Failed body) released) -> (show body, show released) `shouldBe` ("user error (body failed)", "user error (release failed)")
+        _ -> failTest ("reported as " <> show failure)
+      readLog noted `shouldReturn` ["acquire outer", "acquire inner", "release outer: failed " <> show failure]
+      -- A cancellation that the release failed for is reported too, and the race, whose loser it is, fails with it.
+      cancelled <- newLog
+      let loser :: Program ()
+          loser = bracketed cancelled "outer" returnA (scope (noting cancelled "acquire inner") (boom "release failed") (snd ^>> waitsForEver))
+      lost <- run (tryA (race loser giveWayAndEnd))
+      lostFailure <- either pure (const (failTest "the failure of the loser was not reported")) lost
+      case fromException lostFailure of
+        Just (ReleaseFailed Cancelled' released) -> show released `shouldBe` "user error (release failed)"
+        _ -> failTest ("reported as " <> show lostFailure)
+      readLog cancelled `shouldReturn` ["acquire outer", "acquire inner", "release outer: failed " <> show lostFailure]
+
+    it "lets a release that waits, while a failure unwinds, end before the cancellation that came meanwhile is raised" $ do
+      noted <- newLog
+      let unwinding :: Program ()
+          unwinding = tryA (bracketed noted "r" slowWait (boom "x" :: Program ())) >>> noting noted "tryA returned" >>> done >>> instant >>> noting noted "past the point"
+      (winner <$> run (race unwinding (sleep (millis 5)))) `shouldReturn` "second"
+      readLog noted `shouldReturn` ["acquire r", "release r: failed user error (x)", "tryA returned"]
+
+    it "runs scopes, tryA and a deadline in a release while a failure unwinds" $ do
+      noted <- newLog
+      let inRelease :: (Rich arr) => arr ((), Exit) ()
+          inRelease =
+            noting noted "release begins"
+              >>> const ()
+              ^>> ( tryA (bracketed noted "inner" returnA (boom "inside the release" :: Program ()))
+                      >>> noting noted "tryA in the release returned"
+                      >>> done
+                      >>> Classes.within (millis 20) neverEnds
+                      >>> now (\timedOut -> note noted ("deadline gave " <> show timedOut))
+                      >>> const () ^>> Classes.within (secs 10) (arr (const 'x'))
+                      >>> now (\ended -> note noted ("body gave " <> show ended))
+                  )
+      result <- run (tryA (scope returnA inRelease (snd ^>> (boom "body failed" :: Program ()))))
+      describeFailure result `shouldBe` "Left user error (body failed)"
+      readLog noted
+        `shouldReturn` [ "release begins",
+                         "acquire inner",
+                         "release inner: failed user error (inside the release)",
+                         "tryA in the release returned",
+                         "deadline gave Nothing",
+                         "body gave Just 'x'"
+                       ]
+
+    it "releases nothing for a scope whose acquire fails, and tells the outer release" $ do
+      noted <- newLog
+      let acquiring :: Program ()
+          acquiring = scope (boom "acquire failed") (noting noted "inner release" >>> done) (snd ^>> noting noted "inner body")
+      result <- run (tryA (bracketed noted "outer" returnA acquiring))
+      describeFailure result `shouldBe` "Left user error (acquire failed)"
+      readLog noted `shouldReturn` ["acquire outer", "release outer: failed user error (acquire failed)"]
+
+    it "ends a group whose parts fail in one round with one of the failures, once both are released" $ do
+      noted <- newLog
+      result <- run (tryA (together [bracketed noted "a" returnA (boom "first" :: Program ()), bracketed noted "b" returnA (boom "second")]))
+      -- The parts of a group on threads race to fail.
+      if name == "threads"
+        then (describeFailure result `elem` ["Left user error (first)", "Left user error (second)"]) `shouldBe` True
+        else describeFailure result `shouldBe` "Left user error (first)"
+      sort <$> readLog noted `shouldReturn` ["acquire a", "acquire b", "release a: failed user error (first)", "release b: failed user error (second)"]
+
+    -- Run with @+RTS -K1K@, as dev builds are, only Compiled and Loop pass: the stacks of Threads and Delimited hold a frame
+    -- of each scope, and overflow.
+    it "unwinds four thousand nested scopes, which waited on the way in, innermost first" $ do
+      order <- newIORef []
+      result <- run (tryA (nestedScopes order 4096))
+      describeFailure result `shouldBe` "Left user error (bottom)"
+      released <- reverse <$> readIORef order
+      released `shouldBe` [(level, "failed") | level <- [1 .. 4096]]
+
+    it "rethrows a failure of the program unchanged, once its scopes are released" $ do
+      noted <- newLog
+      scoped' <- try (run (bracketed noted "r" returnA (boom "root failed" :: Program ())))
+      isLeftOf "user error (root failed)" scoped' `shouldBe` True
+      readLog noted `shouldReturn` ["acquire r", "release r: failed user error (root failed)"]
+      bare <- try (run (boom "bare" :: Program ()))
+      isLeftOf "user error (bare)" bare `shouldBe` True
+      -- The failure of a release replaces it, as it does when something catches it.
+      replaced <- try (run (scope returnA (boom "release failed") (snd ^>> (boom "body failed" :: Program ()))))
+      case replaced of
+        Left failure | Just (ReleaseFailed (Failed body) released) <- fromException failure -> (show body, show released) `shouldBe` ("user error (body failed)", "user error (release failed)")
+        other -> failTest ("rethrown as " <> either show (const "a result") (other :: Either SomeException ()))
 
   describe "concurrently" $ do
     it "cancels the other half at its wait when a half fails, waits for its release, and rethrows the failure" $ do
@@ -340,6 +472,126 @@ spec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe name $
     result `shouldBe` Nothing
     readCounter released `shouldReturn` count
 
+-- | Programs of scopes, failures, tryA, shields and races that a seed makes, run by every arrow: what each part of the
+-- program noted, in its order, and how the program ended, are those of "Network.Streaming.Loop", which is the model.
+differentialSpec :: Spec
+differentialSpec = describe "scopes, whichever arrow runs them," $
+  it "release what Loop releases, in the order it does, in every program of a seed" $
+    forM_ [1 .. 400 :: Word64] $ \seed -> do
+      shape <- generate seed
+      expected <- observe loopRunner shape
+      forM_ [runner | runner@(Runner name _) <- runners, name /= "loop"] $ \runner@(Runner name _) -> do
+        observed <- observe runner shape
+        when (observed /= expected) $
+          failTest ("seed " <> show seed <> ", on " <> name <> ": " <> show shape <> "\nexpected " <> show expected <> "\nobserved " <> show observed)
+  where
+    loopRunner = Runner "loop" (\program -> fst <$> runLoop program ())
+
+-- | What a scope's release does after it notes how the body ended.
+data Releases = Quietly | Slowly | Badly
+  deriving (Show)
+
+-- | A program, by what its parts do. A race has a half that ends and a half that never does, so that the winner is the
+-- same whatever runs it, and the half that never ends does nothing that waits before it does not.
+data Shape
+  = Skip
+  | Quick
+  | Fails Int
+  | Forever
+  | Then Shape Shape
+  | Holds Int Releases Shape
+  | Catches Shape
+  | Shields Shape
+  | Races Shape Shape
+  deriving (Show)
+
+-- | The program of the shape, in which each part notes, under its own name, what it does.
+build :: (Rich arr) => Log -> String -> Shape -> arr () ()
+build noted = go
+  where
+    go :: (Rich arr) => String -> Shape -> arr () ()
+    go part = \case
+      Skip -> noting noted (part <> "|skip")
+      Quick -> instant >>> noting noted (part <> "|quick")
+      Fails ident -> noting noted (part <> "|fails " <> show ident) >>> boom ("fail " <> show ident)
+      Forever -> noting noted (part <> "|forever") >>> neverEnds
+      Then first' second' -> go part first' >>> go part second'
+      Holds ident how body -> scope (noting noted (part <> "|acquire " <> show ident)) (releasing part ident how) (snd ^>> go part body)
+      Catches body -> tryA (go part body) >>> now (\caught -> note noted (part <> "|caught " <> either show (const "nothing") caught))
+      Shields body -> shield (go part body)
+      Races first' second' -> race (go (part <> ".1") first') (go (part <> ".2") second') >>> done
+    releasing :: (Rich arr) => String -> Int -> Releases -> arr ((), Exit) ()
+    releasing part ident how =
+      (case how of Slowly -> first instant; _ -> returnA)
+        >>> now (\((), exit) -> note noted (part <> "|release " <> show ident <> ": " <> describeExit exit))
+        >>> (case how of Badly -> boom ("release " <> show ident); _ -> returnA)
+
+-- | What a run of the shape came to: how it ended, and what each part noted, in its order.
+observe :: Runner -> Shape -> IO (String, Map.Map String [String])
+observe (Runner _ run) shape = do
+  noted <- newLog
+  ended <- run (tryA (build noted "0" shape))
+  entries <- readLog noted
+  pure (describeFailure ended, Map.fromListWith (flip (<>)) [(part, [rest]) | entry <- entries, let (part, rest) = drop 1 <$> break (== '|') entry])
+
+-- | A shape of the seed, which ends.
+generate :: Word64 -> IO Shape
+generate seed = do
+  state <- newIORef (seed * 0x9E3779B97F4A7C15 + 1)
+  idents <- newIORef 0
+  settling (Generator state idents) 5
+
+-- | The state of the random numbers, and the next number of a scope or a failure.
+data Generator = Generator (IORef Word64) (IORef Int)
+
+below :: Generator -> Int -> IO Int
+below (Generator state _) = randomBelow state
+
+fresh :: Generator -> IO Int
+fresh (Generator _ idents) = atomicModifyIORef' idents (\ident -> (ident + 1, ident))
+
+anyRelease :: Generator -> IO Releases
+anyRelease generator = below generator 3 >>= \case 0 -> pure Quietly; 1 -> pure Slowly; _ -> pure Badly
+
+-- | A shape that ends, by failing or not.
+settling :: Generator -> Int -> IO Shape
+settling generator depth =
+  below generator (if depth <= 0 then 3 else 10) >>= \case
+    0 -> pure Skip
+    1 -> pure Quick
+    2 -> Fails <$> fresh generator
+    3 -> Then <$> inner <*> inner
+    4 -> Holds <$> fresh generator <*> anyRelease generator <*> inner
+    5 -> Catches <$> inner
+    6 -> Shields <$> inner
+    7 -> Holds <$> fresh generator <*> anyRelease generator <*> inner
+    8 -> Races <$> inner <*> never generator (depth - 1)
+    _ -> Races <$> never generator (depth - 1) <*> inner
+  where
+    inner = settling generator (depth - 1)
+
+-- | A shape that never ends, but by a cancellation.
+never :: Generator -> Int -> IO Shape
+never generator depth =
+  below generator (if depth <= 0 then 1 else 4) >>= \case
+    0 -> pure Forever
+    1 -> Then <$> beforeNever generator (depth - 1) <*> never generator (depth - 1)
+    2 -> Holds <$> fresh generator <*> anyRelease generator <*> never generator (depth - 1)
+    _ -> Catches <$> never generator (depth - 1)
+
+-- | A shape that waits for nothing and fails with nothing that it doesn't catch, which can come before one that never ends.
+beforeNever :: Generator -> Int -> IO Shape
+beforeNever generator depth =
+  below generator (if depth <= 0 then 2 else 6) >>= \case
+    0 -> pure Skip
+    1 -> Catches . Fails <$> fresh generator
+    2 -> Then <$> inner <*> inner
+    3 -> Holds <$> fresh generator <*> pure Quietly <*> inner
+    4 -> Shields <$> inner
+    _ -> Catches <$> inner
+  where
+    inner = beforeNever generator (depth - 1)
+
 -- | A failure, as the text of what it was, or of the result.
 describeFailure :: (Show a) => Either SomeException a -> String
 describeFailure = either (\failure -> "Left " <> show failure) (\result -> "Right " <> show result)
@@ -566,6 +818,28 @@ callCancelledAtFulfil noted _ =
     found = maybe (Left ()) (\(Ask promise) -> Right (promise, 42))
     nothing = done >>^ const Nothing
     fulfils = fulfil >>^ Just
+
+-- | Whether the result is a failure that shows as the text, which the exception was not wrapped in anything else to be.
+isLeftOf :: String -> Either SomeException () -> Bool
+isLeftOf text = either (\failure -> show failure == text && isJust (fromException failure :: Maybe IOException)) (const False)
+
+-- | A wait that is over at once, at the instant of the round: a point where the cancellation that has reached the part is
+-- raised, which takes no descriptor.
+instant :: (Rich arr) => arr () ()
+instant = clock >>> (Until ^>> block)
+
+-- | A wait that nothing ends, which is a timer's and takes no descriptor.
+neverEnds :: (Rich arr) => arr a ()
+neverEnds = const () ^>> sleep (secs 3600)
+
+-- | A scope inside the scope of this many levels less, each of which waits before it goes in and notes at its release how
+-- its body ended, as the level it is; the innermost body fails.
+nestedScopes :: (Rich arr) => IORef [(Int, String)] -> Int -> arr () ()
+nestedScopes order = go
+  where
+    go 0 = instant >>> boom "bottom"
+    go level = scope returnA (now (\((), exit) -> atomicModifyIORef' order (\noted -> ((level, exitName exit) : noted, ())))) (snd ^>> instant >>> go (level - 1))
+    exitName = \case Done -> "done"; Failed _ -> "failed"; Cancelled' -> "cancelled"
 
 -- | A wait of about 20 ms, for a descriptor that another thread makes readable.
 slowWait :: (Rich arr) => arr () ()
