@@ -13,11 +13,13 @@
 module ConnectionPoolSpec (spec) where
 
 import Control.Arrow ((>>>), (^>>))
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forM_)
+import qualified Data.ByteString.Char8 as BC
 import Data.Int (Int64)
+import Data.Text (Text)
 import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), connectionPoolSettings, withConnection, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
@@ -36,6 +38,12 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       pooled change use = do
         buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
         withConnectionPool (change (connectionPoolSettings 1 settings)) $ \pool -> use (Env runner buffers pool)
+      -- What the server says a backend is doing, asked on a connection of its own: no row once the backend is gone.
+      stateOf :: Int64 -> IO (Either QueryError [Text])
+      stateOf pid =
+        ordinary runner (session settings (query (plain ("SELECT state FROM pg_stat_activity WHERE pid = " <> BC.pack (show pid)) single)))
+      gone :: Int64 -> IO Bool
+      gone pid = (== Right []) <$> stateOf pid
 
   -- How a checkout ends: by the deadline of the pool, or of the arrow that runs it, or by the pool's closing.
   describe "a checkout" $ do
@@ -71,6 +79,23 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
       finishHolding holder
 
+  -- What the pool does with its connections as it closes: those that are free close at once, and one that a request still
+  -- has closes as the request gives it back.
+  describe "closing" $ do
+    it "closes the connections that are free" $ do
+      pid <- pooled id pidOf
+      eventually 5 (gone pid) `shouldReturn` True
+
+    needs "pool eviction" $ it "closes the connection that a request still has, as the request gives it back" $ do
+      buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+      (pool, holder) <- withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> (pool,) <$> startHolding (Env runner buffers pool)
+      -- The pool's bracket has ended while the request holds the only connection: it is still open.
+      stateOf (holderBackend holder) `shouldReturn` Right ["idle"]
+      finishHolding holder
+      eventually 5 (gone (holderBackend holder)) `shouldReturn` True
+      -- The pool is used last: while it is reachable, its connection is not closed by the collection of its socket.
+      runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
+
 -- * The pool of the cases
 
 -- | The pool of real connections over the request buffers, and the way to run a program over them.
@@ -96,7 +121,9 @@ backend = committed Tx.Read (Tx.statement (plain "SELECT pg_backend_pid()::bigin
 
 -- | A request on a thread of its own, which holds the pool's connection until it is told to give it back.
 data Holder = Holder
-  { holderGoOn :: MVar (),
+  { -- | The backend of the connection that it holds.
+    holderBackend :: Int64,
+    holderGoOn :: MVar (),
     holderEnded :: MVar (Either SomeException ())
   }
 
@@ -107,12 +134,23 @@ startHolding env = do
   goOn <- newEmptyMVar
   ended <- newEmptyMVar
   let holdIt :: (Runtime arr) => OnConn arr ()
-      holdIt = backend >>> now (either (throwIO . userError . show) (\_ -> putMVar held () *> takeMVar goOn))
+      holdIt = backend >>> now (either (throwIO . userError . show) (\pid -> putMVar held pid *> takeMVar goOn))
   _ <- forkIO (try (onEnv env (withConnection (envPool env) holdIt >>> now (either throwIO pure))) >>= putMVar ended)
-  takeMVar held
-  pure (Holder goOn ended)
+  pid <- takeMVar held
+  pure (Holder pid goOn ended)
 
 -- | Tells the request to give the connection back, and waits until it has ended.
 finishHolding :: Holder -> IO ()
 finishHolding holder = putMVar (holderGoOn holder) () *> takeMVar (holderEnded holder) >>= either throwIO pure
 
+
+-- | Looks until the check is true, for at most this many seconds.
+eventually :: Double -> IO Bool -> IO Bool
+eventually seconds check = do
+  started <- getMonotonicTime
+  let go =
+        check >>= \ok ->
+          if ok
+            then pure True
+            else getMonotonicTime >>= \time -> if time - started > seconds then pure False else threadDelay 20000 *> go
+  go

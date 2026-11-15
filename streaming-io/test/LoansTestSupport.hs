@@ -40,6 +40,7 @@ module LoansTestSupport
     awaitSignal,
     awaitRequestWaiting,
     awaitSetupWaiting,
+    awaitPoolWaiting,
     Journal,
     newJournal,
     note,
@@ -66,7 +67,7 @@ import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited (runDelimited)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Pool (free, waiters)
+import Network.Streaming.Pool (Pool, free, waiters)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt)
 import Network.Streaming.Threads (runThreads)
 import Skeletest
@@ -232,6 +233,10 @@ pollWhen look = pollUntil (bool Nothing (Just ()) <$> look)
 awaitRequestWaiting, awaitSetupWaiting :: (Runtime arr) => BufferPool -> Int -> arr x ()
 awaitRequestWaiting pool count = pollWhen ((>= count) <$> requestWaiting pool)
 awaitSetupWaiting pool count = pollWhen ((>= count) <$> setupWaiting pool)
+
+-- | Waits until this many parts wait for the pool.
+awaitPoolWaiting :: (Runtime arr) => Pool c -> Int -> arr x ()
+awaitPoolWaiting pool count = pollWhen ((>= count) <$> waiters pool)
 
 -- | What happened, in order.
 newtype Journal = Journal (IORef [String])

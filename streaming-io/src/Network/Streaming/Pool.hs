@@ -20,6 +20,7 @@ module Network.Streaming.Pool
     urgently,
     newPool,
     closePool,
+    closePoolWith,
     checkout,
     checkoutWithin,
     reserve,
@@ -38,6 +39,7 @@ where
 
 import Control.Arrow (ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
 import Control.Exception (Exception)
+import Data.Functor (void)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
@@ -121,6 +123,13 @@ newPool conns = Pool <$> (newIORef $! State (length conns) conns 0 IntMap.empty)
 -- keeps waiting.
 closePool :: Pool conn -> IO [conn]
 closePool (Pool ref closed) = writeIORef closed True *> update ref (\(State _ conns arrival lanes) -> (State 0 [] arrival lanes, conns))
+
+-- | Closes the pool, and has the function dispose of the items that are free now, and of each item that is given back
+-- after: a pool that is closed lends nothing, so 'withLoan' fails with 'PoolClosed', and the items that come back as
+-- the last loans end are disposed of and not kept. Not yet: it closes the pool as 'closePool' does, and drops the items
+-- that are free.
+closePoolWith :: (conn -> IO ()) -> Pool conn -> IO ()
+closePoolWith _ = void . closePool
 
 -- | Whether the pool has been closed.
 isClosed :: Pool conn -> IO Bool
