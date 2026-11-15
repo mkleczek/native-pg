@@ -37,7 +37,7 @@ import Network.Streaming.Classes (Duration, Effect (..), Runtime, Scope (..))
 import Network.Streaming.Combinators (keeping, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
-import Network.Streaming.Pool (Pool, PoolError (..), closePool, newPool, urgently, withLoan, withLoanWithin)
+import Network.Streaming.Pool (Pool, PoolError (..), closePoolWith, newPool, urgently, withLoan, withLoanWithin)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 
 data ConnectionPoolSettings = ConnectionPoolSettings
@@ -72,8 +72,10 @@ data ConnectionPool = ConnectionPool
 -- | A place for a connection, which is empty until it is made, and empty again once it is broken.
 newtype Slot = Slot (IORef (Maybe Connection))
 
--- | The body, with a pool that keeps its connections. The pool is closed when the body ends, however it ends: its
--- connections close, and a checkout after that is 'PoolClosed'.
+-- | The body, with a pool that keeps its connections. The pool is closed when the body ends, however it ends: the
+-- connections that are free close, and each of the others closes as the request that has it gives it back, and a checkout
+-- after that is 'PoolClosed'. A request that waits for a connection when the pool closes is served by one that comes
+-- back, and its connection closes when it gives it back.
 --
 -- A connection is made under the arrow of the request that first has its slot, and is set up with the buffers of a pool
 -- of the pool's own, which needn't be the request's: for each slot an ordinary buffer, so that every connection can be
@@ -92,7 +94,7 @@ withConnectionPool settings use = do
         }
   slots <- replicateM size (Slot <$> newIORef Nothing)
   pool <- newPool slots
-  use (ConnectionPool pool buffers settings) `finally` (closePool pool >>= traverse_ closeSlot)
+  use (ConnectionPool pool buffers settings) `finally` closePoolWith closeSlot pool
   where
     size = max 1 (poolSize settings)
     positive :: Int -> PositiveInt

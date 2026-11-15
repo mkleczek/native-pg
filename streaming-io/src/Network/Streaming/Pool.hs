@@ -38,12 +38,11 @@ module Network.Streaming.Pool
 where
 
 import Control.Arrow (ArrowChoice, arr, first, returnA, second, (>>>), (>>^), (^>>), (|||))
-import Control.Exception (Exception)
-import Data.Functor (void)
+import Control.Exception (Exception, IOException, catch)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
-import Data.Sequence (Seq, ViewL (..), viewl, (|>))
+import Data.Sequence (Seq, ViewL (..), ViewR (..), viewl, viewr, (<|), (|>))
 import qualified Data.Sequence as Seq
 import Data.Tuple (swap)
 import Network.Streaming.Classes
@@ -60,15 +59,18 @@ data State conn = State !Int ![conn] !Int !(IntMap (Seq (Waiter conn)))
 data Pool conn = Pool !(IORef (State conn)) !(IORef Bool)
 
 -- | A waiter, by the ticket's promise that is fulfilled with its items, for one item or for a number of them at once, and by when it
--- came: the number that the pool counts arrivals with.
+-- came: the number that the pool counts arrivals with. A closed pool has a last waiter that takes every item that nobody who waited
+-- before it takes, and disposes of it: it stays at the end of its lane, and those that queue after it are put before it.
 data Waiter conn
   = One !(Promise 'Anywhere conn) !Int
   | Many !Int !(Promise 'Anywhere [conn]) !Int
+  | Disposal (conn -> IO ()) !Int
 
--- | The items that were taken from the free ones for a waiter, for its promise to be fulfilled with.
+-- | The items that were taken from the free ones for a waiter, for its promise to be fulfilled with, or for a closed pool to dispose of.
 data Handoff conn
   = OneTo !(Promise 'Anywhere conn) conn
   | ManyTo !(Promise 'Anywhere [conn]) [conn]
+  | Dispose (conn -> IO ()) conn
 
 -- | Why a pool gave nothing to use.
 data PoolError
@@ -120,16 +122,21 @@ newPool conns = Pool <$> (newIORef $! State (length conns) conns 0 IntMap.empty)
 -- | Closes the pool, and gives the items that are free now, for the caller to dispose of: a pool that is closed lends
 -- nothing, so 'withLoan' fails with 'PoolClosed'. The caller closes it once the parts that use it have ended: an item
 -- that is released after the pool was closed is free, and nobody collects it, and a part that waits for an item
--- keeps waiting.
+-- keeps waiting. 'closePoolWith' disposes of the items that come back.
 closePool :: Pool conn -> IO [conn]
 closePool (Pool ref closed) = writeIORef closed True *> update ref (\(State _ conns arrival lanes) -> (State 0 [] arrival lanes, conns))
 
 -- | Closes the pool, and has the function dispose of the items that are free now, and of each item that is given back
--- after: a pool that is closed lends nothing, so 'withLoan' fails with 'PoolClosed', and the items that come back as
--- the last loans end are disposed of and not kept. Not yet: it closes the pool as 'closePool' does, and drops the items
--- that are free.
+-- after, as the last loans end: a pool that is closed lends nothing, so 'withLoan' fails with 'PoolClosed', and keeps no
+-- item free. A part that waits for an item when the pool closes is served first, by the items that come back, and its
+-- item is disposed of when it gives it back. The disposal runs in the part that gives the item back, and must be
+-- quick; a failure of it to close something, an 'IOException', is ignored. Closing a pool again changes nothing.
 closePoolWith :: (conn -> IO ()) -> Pool conn -> IO ()
-closePoolWith _ = void . closePool
+closePoolWith dispose (Pool ref closed) = writeIORef closed True *> update ref disposing >>= handOver ref
+  where
+    disposing state@(State _ _ _ lanes)
+      | disposesIn lanes = (state, [])
+      | otherwise = settle (queued 1 (Disposal dispose) state)
 
 -- | Whether the pool has been closed.
 isClosed :: Pool conn -> IO Bool
@@ -139,16 +146,32 @@ isClosed (Pool _ closed) = readIORef closed
 free :: Pool conn -> IO [conn]
 free (Pool ref _) = (\(State _ conns _ _) -> conns) <$> readIORef ref
 
--- | How many waiters are queued: one that has gone is counted until the pool reaches it, to give it an item.
+-- | How many waiters are queued: one that has gone is counted until the pool reaches it, to give it an item. The disposal of a closed
+-- pool is not one.
 waiters :: Pool conn -> IO Int
-waiters (Pool ref _) = (\(State _ _ _ lanes) -> sum (Seq.length <$> lanes)) <$> readIORef ref
+waiters (Pool ref _) = (\(State _ _ _ lanes) -> sum (waitersOf <$> lanes)) <$> readIORef ref
+  where
+    waitersOf lane = if endsWithDisposal lane then Seq.length lane - 1 else Seq.length lane
 
 -- | The waiter queued, in the lane of those that need as many items free, with the number of its arrival.
 queued :: Int -> (Int -> Waiter conn) -> State conn -> State conn
 queued need make (State count conns arrival lanes) =
-  State count conns (arrival + 1) (IntMap.alter (Just . maybe (Seq.singleton waiter) (|> waiter)) need lanes)
+  State count conns (arrival + 1) (IntMap.alter (Just . maybe (Seq.singleton waiter) enqueue) need lanes)
   where
     waiter = make arrival
+    -- The disposal of a closed pool stays last: a waiter that comes after the pool closed is served before it.
+    enqueue lane = case viewr lane of
+      before :> disposal@(Disposal _ _) -> (before |> waiter) |> disposal
+      _ -> lane |> waiter
+
+-- | Whether the lane ends with the disposal of a closed pool, and whether the pool disposes of its items.
+endsWithDisposal :: Seq (Waiter conn) -> Bool
+endsWithDisposal lane = case viewr lane of
+  _ :> Disposal _ _ -> True
+  _ -> False
+
+disposesIn :: IntMap (Seq (Waiter conn)) -> Bool
+disposesIn lanes = maybe False endsWithDisposal (IntMap.lookup 1 lanes)
 
 -- | Serves the waiters that the free items can serve, and says what is taken for each: the oldest of the first waiters
 -- of the lanes that need no more than are free, as long as there is one.
@@ -160,12 +183,17 @@ settle state@(State _ _ _ lanes)
     go st@(State count conns arrival lanes') handed = case oldest count lanes' of
       Just (need, waiter, others)
         | Just (count', conns', handoff) <- serve count conns waiter ->
-            go (State count' conns' arrival (if Seq.null others then IntMap.delete need lanes' else IntMap.insert need others lanes')) (handoff : handed)
+            go (State count' conns' arrival (remaining need waiter others lanes')) (handoff : handed)
       _ -> (st, reverse handed)
     serve count conns = \case
       One promise _ | conn : others <- conns -> Just (count - 1, others, OneTo promise conn)
       Many many promise _ | many <= count -> let (taken, others) = splitAt many conns in Just (count - many, others, ManyTo promise taken)
+      Disposal dispose _ | conn : others <- conns -> Just (count - 1, others, Dispose dispose conn)
       _ -> Nothing
+    -- The lanes once the waiter that was served has left its lane: a disposal doesn't, as it serves every item.
+    remaining need waiter others lanes' = case waiter of
+      Disposal _ _ -> IntMap.insert need (waiter <| others) lanes'
+      _ -> if Seq.null others then IntMap.delete need lanes' else IntMap.insert need others lanes'
 
 -- | The first waiter of the lane whose first waiter is the oldest, among the lanes that need no more items than are free.
 oldest :: Int -> IntMap (Seq (Waiter conn)) -> Maybe (Int, Waiter conn, Seq (Waiter conn))
@@ -176,7 +204,7 @@ oldest count lanes = foldl' older Nothing (IntMap.toAscList (fst (IntMap.split (
         Just (_, earlier, _) | arrivalOf earlier < arrivalOf waiter -> best
         _ -> Just (need, waiter, others)
       EmptyL -> best
-    arrivalOf = \case One _ arrival -> arrival; Many _ _ arrival -> arrival
+    arrivalOf = \case One _ arrival -> arrival; Many _ _ arrival -> arrival; Disposal _ arrival -> arrival
 
 -- | The items, free again, and what is taken for the waiters that can have them now.
 putBack :: [conn] -> State conn -> (State conn, [Handoff conn])
@@ -390,3 +418,4 @@ handOver ref (handoff : others) =
     offer = \case
       OneTo promise conn -> (\taken -> [conn | not taken]) <$> fulfilNow promise conn
       ManyTo promise conns -> (\taken -> if taken then [] else conns) <$> fulfilNow promise conns
+      Dispose dispose conn -> [] <$ dispose conn `catch` \(_ :: IOException) -> pure ()

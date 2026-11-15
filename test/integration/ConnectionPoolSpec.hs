@@ -86,7 +86,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       pid <- pooled id pidOf
       eventually 5 (gone pid) `shouldReturn` True
 
-    needs "pool eviction" $ it "closes the connection that a request still has, as the request gives it back" $ do
+    it "closes the connection that a request still has, as the request gives it back" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
       (pool, holder) <- withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> (pool,) <$> startHolding (Env runner buffers pool)
       -- The pool's bracket has ended while the request holds the only connection: it is still open.

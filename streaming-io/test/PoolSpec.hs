@@ -59,7 +59,7 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       waiters pool `shouldReturn` 0
 
   describe "closePoolWith" $ do
-    evicting $ it "disposes of the items that are free when it closes, once each, and keeps none" $ do
+    it "disposes of the items that are free when it closes, once each, and keeps none" $ do
       pool <- newPool [7 :: Int, 8]
       disposed <- newIORef []
       closePoolWith (recording disposed) pool
@@ -67,7 +67,7 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       free pool `shouldReturn` []
       waiters pool `shouldReturn` 0
 
-    evicting $ it "disposes of an item that is given back after it closed, and keeps none" $ do
+    it "disposes of an item that is given back after it closed, and keeps none" $ do
       pool <- newPool [7 :: Int]
       disposed <- newIORef []
       run (withLoan pool (now (const (closePoolWith (recording disposed) pool)))) `shouldReturn` Right ()
@@ -75,7 +75,7 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       free pool `shouldReturn` []
       waiters pool `shouldReturn` 0
 
-    evicting $ it "disposes of the items of the loans that are out, as the last of them comes back" $ do
+    it "disposes of the items of the loans that are out, as the last of them comes back" $ do
       pool <- newPool [7 :: Int, 8, 9]
       disposed <- newIORef []
       run (withLoan pool (withLoan pool (now (const (closePoolWith (recording disposed) pool))) >>> done))
@@ -83,7 +83,7 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       sort <$> readIORef disposed `shouldReturn` [7, 8, 9]
       free pool `shouldReturn` []
 
-    evicting $ it "serves a part that waited when it closed with the item that comes back, and disposes of the item as that part gives it back" $ do
+    it "serves a part that waited when it closed with the item that comes back, and disposes of the item as that part gives it back" $ do
       pool <- newPool [7 :: Int]
       disposed <- newIORef []
       journal <- newJournal
@@ -98,7 +98,7 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       free pool `shouldReturn` []
       waiters pool `shouldReturn` 0
 
-    evicting $ it "disposes of each item once, though the pool was closed twice" $ do
+    it "disposes of each item once, though the pool was closed twice" $ do
       pool <- newPool [7 :: Int, 8]
       disposed <- newIORef []
       run (withLoan pool (now (const (closePoolWith (recording disposed) pool *> closePoolWith (recording disposed) pool)))) `shouldReturn` Right ()
@@ -180,12 +180,6 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
             ]
       readJournal journal `shouldReturn` ["first gave back", "second granted"]
 
-
 -- | A disposal that records what it was given.
 recording :: IORef [Int] -> Int -> IO ()
 recording disposed item = atomicModifyIORef' disposed (\items -> (item : items, ()))
-
--- | Marks a case that waits for a closed pool to dispose of its items: for now it drops those that are free and keeps
--- those that come back. The mark comes off when it does, and a case that then passes unexpectedly fails the suite.
-evicting :: Spec -> Spec
-evicting = xfail "a closed pool disposes of its items"
