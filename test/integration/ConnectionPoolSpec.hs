@@ -16,21 +16,26 @@ import Control.Arrow ((>>>), (^>>))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (nub)
 import Data.Text (Text)
 import Data.UUID (UUID)
+import Data.Word (Word64)
 import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), connectionPoolSettings, withConnection, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
+import GHC.Stats (allocated_bytes, getRTSStats)
 import Network.Socket (PortNumber)
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.PositiveInt (positiveInt)
 import Skeletest
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
+import System.Mem (performMinorGC)
 import TestPrograms
 
 spec :: FilePath -> PortNumber -> Spec
@@ -81,6 +86,23 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       -- The pool's bracket has ended while the request holds the only connection, so the checkout doesn't wait for it.
       runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
       finishHolding holder
+
+  -- What a request pays the pool when its connection is free: the bytes that a request allocates for the checkout, the
+  -- use of the connection and the release, with a body that does nothing. The ceiling is what each arrow allocated when it
+  -- was set: a change that makes a request dearer says so here, as one that makes it cheaper takes the ceiling down. With
+  -- @POOL_COST_REPORT@ set, the case says what it measured, on stderr.
+  describe "a request that finds its connection free" $
+    it "allocates no more than it did" $
+      pooled id $ \env -> do
+        void (pidOf env)
+        bytes <- perRequest env
+        lookupEnv "POOL_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("pool-cost " <> name <> " | withConnection | " <> show (round bytes :: Int)))
+        let ceiling' = case name of
+              "threads" -> 2560
+              "delimited" -> 2080
+              _ -> 3395
+        when (bytes > ceiling' + 24) $
+          failTest ("a request allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round ceiling' :: Int))
 
   -- What the pool does with its connections as it closes: those that are free close at once, and one that a request still
   -- has closes as the request gives it back.
@@ -278,3 +300,26 @@ describeEvent (ConnectionObservation _ status) = case status of
 -- | Which connection an event is of.
 connectionOf :: Observation -> UUID
 connectionOf (ConnectionObservation identifier _) = identifier
+
+-- | The bytes that a request allocates for the pool: the difference between a long run and a short one, after a run that
+-- loads the code.
+perRequest :: Env -> IO Double
+perRequest env = do
+  run 1000
+  few <- allocatedBy (run 5000)
+  many <- allocatedBy (run 25000)
+  pure ((fromIntegral many - fromIntegral few) / 20000)
+  where
+    run :: Int -> IO ()
+    run count = onEnv env (timesWith count (tap (withConnection (envPool env) done >>> done)) >>> done)
+
+-- | The bytes that the action allocated: the runtime counts a nursery when it is collected, so a collection is made on both
+-- sides.
+allocatedBy :: IO () -> IO Word64
+allocatedBy action = do
+  performMinorGC
+  before <- allocated_bytes <$> getRTSStats
+  action
+  performMinorGC
+  allocated <- allocated_bytes <$> getRTSStats
+  pure (allocated - before)
