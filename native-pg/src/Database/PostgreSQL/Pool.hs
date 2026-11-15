@@ -242,7 +242,7 @@ maintain = together [sweeping, cancelling]
     cancelling = foreverA (tap (alongside (queued ^>> checkoutIn) >>> now taken >>> sending))
     queued (Maintenance _ _ (Cancels queue _)) = queue
     taken (job, Maintenance _ _ (Cancels _ pending)) = job <$ atomicModifyIORef' pending (\count -> (count - 1, ()))
-    sending = (\(Cancellation settings key limit) -> (limit, (settings, key))) ^>> timeoutA (tryA cancel) >>^ const ()
+    sending = (\(Cancellation settings key limit) -> (limit, (settings, key))) ^>> timeoutA (tryA cancel) >>> done
 
 -- | Closes the connection that the slot holds, if it has one, for the reason, which is then told to the observer. The slot is
 -- empty.
