@@ -293,7 +293,7 @@ transactOn ::
   (a -> With Tx.Tx arr () y) ->
   arr (Connection, (Loans, p)) (Either QueryError y)
 transactOn level mode ending pipeline reading =
-  second (second (,())) ^>> Tx.transaction level mode (Tx.pipeline ending pipeline reading)
+  through (_2 . _2) (,()) ^>> Tx.transaction level mode (Tx.pipeline ending pipeline reading)
 
 -- | A transaction on the connection, for a pipeline that takes no input.
 transact ::
