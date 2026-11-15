@@ -22,8 +22,10 @@ module IntegrationSpec (spec) where
 
 import Control.Arrow (arr, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (IOException, SomeException, bracket, catch, displayException, finally)
 import Control.Monad (forM_, forever, unless, void)
+import Data.Foldable (traverse_)
 import Data.Bits (shiftR)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -255,7 +257,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     -- A server that doesn't have the protocol version that min_protocol_version asks for doesn't qualify, as with
     -- target_session_attrs.
     it "doesn't qualify a server below min_protocol_version, as libpq words it" $
-      withScripted (\client -> receiveStartup client *> SocketBytes.sendAll client (frame 'v' (int32 0x00030000 <> int32 0) <> frame 'R' (int32 0) <> frame 'Z' "I") *> drain client) $ \scripted ->
+      withScripted [\client -> receiveStartup client *> SocketBytes.sendAll client (frame 'v' (int32 0x00030000 <> int32 0) <> frame 'R' (int32 0) <> frame 'Z' "I") *> drain client] $ \scripted ->
         connectFailure ("host=127.0.0.1 user=postgres sslmode=disable max_protocol_version=3.2 min_protocol_version=3.2 port=" <> Char8.pack (show scripted))
           `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show scripted <> " failed: server only supports protocol version 3.0, but min_protocol_version was set to 3.2")
     it "qualifies a server that has the protocol version that min_protocol_version asks for" $ do
@@ -627,7 +629,11 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
 
-  needs "cancel" $ describe "cancel" $
+  needs "cancel" $ describe "cancel" $ do
+    let missing = unixSettings "/nonexistent/.s.PGSQL.5432" "postgres" Nothing
+        refused = \case
+          UnreachableSocket path _ -> path `shouldBe` "/nonexistent/.s.PGSQL.5432"
+          other -> failTest ("expected UnreachableSocket, got " <> show other)
     it "cancels a running statement, and the connection stays usable" $
       run
         ( session (unix "postgres" Nothing) $
@@ -640,6 +646,47 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
               ]
         )
         `shouldReturn` ()
+    it "does nothing to a connection that runs no statement" $
+      run (session (unix "postgres" Nothing) (steps [cancelling (unix "postgres" Nothing), selectOne `yields` Right [1]])) `shouldReturn` ()
+    -- The attempt is one: a failure to connect is its ConnectError, not a list of them, and the other hosts of the settings
+    -- are not tried: another server would be cancelling another session.
+    it "fails with the ConnectError of its one attempt" $
+      run (session (unix "postgres" Nothing) (cancelling missing `failsAs` refused)) `shouldReturn` ()
+    it "makes one attempt, to the host of its settings, whatever other hosts they have" $
+      run (session (unix "postgres" Nothing) (cancelling missing {connectFallbacks = [unix "postgres" Nothing]} `failsAs` refused)) `shouldReturn` ()
+    it "gives up after connect_timeout when the server doesn't close the connection" $
+      withSilentServer $ \silent -> do
+        started <- getMonotonicTime
+        run
+          ( session (unix "postgres" Nothing) $
+              cancelling ((unixSettings (silent </> ".s.PGSQL.5432") "postgres" Nothing) {connectTimeout = Just 1})
+                `failsAs` \case
+                  TimedOut -> pure ()
+                  other -> failTest ("expected TimedOut, got " <> show other)
+          )
+          `shouldReturn` ()
+        elapsed <- subtract started <$> getMonotonicTime
+        elapsed `shouldSatisfy` (P.gte 0.9 P.&& P.lt 5)
+    -- A pooler may not send the key. There is nothing to cancel with then, so nothing is asked of any server.
+    it "does nothing for a connection whose server sent no key" $
+      withScripted [\client -> receiveStartup client *> SocketBytes.sendAll client (frame 'R' (int32 0) <> frame 'Z' "I") *> drain client] $ \scripted -> do
+        settings <- settingsOf ("host=127.0.0.1 user=postgres sslmode=disable port=" <> Char8.pack (show scripted))
+        run (session settings (cancelling missing)) `shouldReturn` ()
+    it "sends the request of the protocol over a connection of its own, and waits for the server to close it" $ do
+      request <- newEmptyMVar
+      let startup client =
+            receiveStartup client
+              *> SocketBytes.sendAll client (frame 'R' (int32 0) <> frame 'K' (int32 1234 <> "abcd") <> frame 'Z' "I")
+              *> drain client
+          cancelRequest client = receiving client 16 >>= putMVar request >> threadDelay 200000
+      withScripted [startup, cancelRequest] $ \scripted -> do
+        settings <- settingsOf ("host=127.0.0.1 user=postgres sslmode=disable port=" <> Char8.pack (show scripted))
+        started <- getMonotonicTime
+        run (session settings (cancelling settings)) `shouldReturn` ()
+        elapsed <- subtract started <$> getMonotonicTime
+        -- The cancel returned after the server closed the connection, which it did 200 ms after the request.
+        elapsed `shouldSatisfy` P.gte 0.19
+        takeMVar request `shouldReturn` (int32 16 <> int32 80877102 <> int32 1234 <> "abcd")
 
   -- A program that is cancelled leaves its connection usable if and only if nothing is owed on it in either direction: no
   -- reply is still expected, and nothing is half sent.
@@ -986,17 +1033,17 @@ withUnusedPort action =
     (\sock -> Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1))) *> Socket.socketPort sock)
     >>= action
 
--- | Runs the action with the port at 127.0.0.1 of a server that serves one connection by the script, which is given its
--- socket. The connection is closed when the script ends, and what goes wrong in it shows in the client.
-withScripted :: (Socket.Socket -> IO ()) -> (Socket.PortNumber -> IO a) -> IO a
-withScripted script action =
+-- | Runs the action with the port at 127.0.0.1 of a server that serves the connections that come, one by each script in
+-- turn, which is given its socket. A connection is closed when its script ends, and what goes wrong in it shows in the client.
+withScripted :: [Socket.Socket -> IO ()] -> (Socket.PortNumber -> IO a) -> IO a
+withScripted scripts action =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
     Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
     Socket.listen listener 4
-    let serve = do
+    let serve script = do
           (client, _) <- Socket.accept listener
           script client `finally` Socket.close client
-    bracket (forkIO (serve `catch` \(_ :: SomeException) -> pure ())) killThread $ \_ -> action =<< Socket.socketPort listener
+    bracket (forkIO (traverse_ serve scripts `catch` \(_ :: SomeException) -> pure ())) killThread $ \_ -> action =<< Socket.socketPort listener
 
 -- | A message of the server: its tag, its length, and its payload.
 frame :: Char -> ByteString -> ByteString
@@ -1011,6 +1058,12 @@ receiveStartup :: Socket.Socket -> IO ByteString
 receiveStartup client = do
   size <- BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0 <$> SocketBytes.recv client 4
   SocketBytes.recv client (size - 4)
+
+-- | Takes this many bytes from the client.
+receiving :: Socket.Socket -> Int -> IO ByteString
+receiving client size
+  | size <= 0 = pure BS.empty
+  | otherwise = SocketBytes.recv client size >>= \piece -> if BS.null piece then pure piece else (piece <>) <$> receiving client (size - BS.length piece)
 
 -- | Takes what the client sends until it closes the connection.
 drain :: Socket.Socket -> IO ()
