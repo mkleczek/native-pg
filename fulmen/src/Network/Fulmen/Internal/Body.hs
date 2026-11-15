@@ -50,9 +50,9 @@ import Network.Streaming.Classes
     Link (..),
     Room (..),
     Stream (..),
-    giving,
-    taking,
     trySend,
+    (-|),
+    (|-),
   )
 import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, iterateWith, step, tap)
 import Network.Streaming.Loans (Loan, release)
@@ -132,9 +132,9 @@ type Reading = Step ((Socket, Room), Body) (Either BodyState (Maybe ByteString))
 instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => Stream arr Body where
   next =
     named (Label "next" "Gives the next piece of the request body, from the bytes in hand or else from the socket.") $
-      iterateWith (step "look at bytes in hand" (advance @(ModeOf arr)) `giving` "bytes in hand?") (taking "no" receiving)
-        `giving` "body ended?"
-        >>> (taking "yes" (ending Nothing) ||| taking "no" returnA)
+      iterateWith (step "look at bytes in hand" (advance @(ModeOf arr)) -| "bytes in hand?") ("no" |- receiving)
+        -| "body ended?"
+        >>> ("yes" |- ending Nothing ||| "no" |- returnA)
     where
       receiving = first receive >>> step "record arrival" arrived
   {-# INLINE next #-}
@@ -299,12 +299,12 @@ drain :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Ins
 drain =
   named (Label "drain" "Reads what is left of the request body and drops it, and says whether that could be done.") $
     (,0 :: Int)
-      ^>> iterateWith dropping (taking "no" receiving)
-        `giving` "body ended?"
-      >>> (taking "yes" (ending True) ||| taking "no" returnA)
+      ^>> iterateWith dropping ("no" |- receiving)
+        -| "body ended?"
+      >>> ("yes" |- ending True ||| "no" |- returnA)
   where
     -- Every way round the loop receives, and so waits: what is in hand is dropped without a wait, once for each receive.
-    dropping = step "drop bytes in hand" (uncurry dropInHand) `giving` "all dropped?"
+    dropping = step "drop bytes in hand" (uncurry dropInHand) -| "all dropped?"
     receiving = first receive >>> step "record arrival" (\(count, (body, total)) -> (,total) <$> arrived (count, body))
 
 -- | What dropping the bytes in hand comes to: a receive for the rest, which the drain goes on with, or the end of it, with

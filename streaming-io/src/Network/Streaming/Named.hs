@@ -59,7 +59,7 @@ import Data.Kind (Constraint)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
 import GHC.TypeLits (ErrorMessage (..), KnownSymbol, Symbol, TypeError, symbolVal)
-import Network.Streaming.Annotate (Annotate, giving, inout, taking)
+import Network.Streaming.Annotate (Annotate, (-|), (|-))
 import Network.Streaming.Plumbing (alongside)
 
 -- | A value with its name in its type: one field of an anonymous record.
@@ -67,7 +67,7 @@ newtype (name :: Symbol) := a = Is a
 
 -- | The arrow's result, as the field of the name, which the wire out of the arrow is called in diagrams.
 is :: forall name -> forall arr a b. (Arrow arr, Annotate arr, KnownSymbol name) => arr a b -> arr a (name := b)
-is name p = (p `giving` symbolVal (Proxy @name)) >>^ Is
+is name p = p -| symbolVal (Proxy @name) >>^ Is
 {-# INLINE is #-}
 
 -- * Reading
@@ -100,7 +100,7 @@ type Twice name = 'Text "The record has more than one field named " ':<>: 'ShowT
 
 -- | The field of a record, whose output wire is named after the field in diagrams.
 field :: forall name -> forall r a arr. (HasField name r a, KnownSymbol name, Arrow arr, Annotate arr) => arr r a
-field name = arr (getField @name) `giving` symbolVal (Proxy @name)
+field name = arr (getField @name) -| symbolVal (Proxy @name)
 {-# INLINE field #-}
 
 -- * Making
@@ -172,7 +172,7 @@ at ::
   (Arrow arr, Annotate arr, KnownSymbol name, HasField name r a, SetField name r b r') =>
   arr a b ->
   arr r r'
-at name p = (getField @name &&& id) ^>> first (inout label p label) >>^ uncurry (setField @name)
+at name p = (getField @name &&& id) ^>> first (label |- p -| label) >>^ uncurry (setField @name)
   where
     label = symbolVal (Proxy @name)
 {-# INLINE at #-}
@@ -255,7 +255,7 @@ infixr 6 ?>
 -- the wire into it is called the name in diagrams. A chain of them, @"a" ?> p ||| "b" ?> q ||| "c" ?> r@, takes apart what
 -- 'cases' gives.
 (?>) :: forall name -> forall arr x r b. (Arrow arr, Annotate arr, KnownSymbol name) => arr (name := x, r) b -> arr (name := (name := x, r)) b
-(?>) name p = taking (symbolVal (Proxy @name)) ((\(Is a) -> a) ^>> p)
+(?>) name p = symbolVal (Proxy @name) |- ((\(Is a) -> a) ^>> p)
 {-# INLINE (?>) #-}
 
 -- | Runs an arrow on the case of the name of a choice, with a change of its type if the arrow has one.
@@ -284,5 +284,5 @@ instance {-# OVERLAPPABLE #-} (a ~ TypeError (NoCase name), t ~ TypeError (NoCas
 -- | The prism of the case of the name: runs the arrow on the case, with a change of its type if the arrow has one, and
 -- passes the other cases through without running it. The wire into the arrow is called the name in diagrams.
 _Case :: forall name -> forall arr s t a b. (ArrowChoice arr, Annotate arr, KnownSymbol name, Case name s a b t) => arr a b -> arr s t
-_Case name p = caseOf @name (taking (symbolVal (Proxy @name)) p)
+_Case name p = caseOf @name (symbolVal (Proxy @name) |- p)
 {-# INLINE _Case #-}

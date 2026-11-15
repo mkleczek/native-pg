@@ -63,7 +63,6 @@ module Network.Streaming.Classes
     Annotate (named, wires, allowing),
     taking,
     giving,
-    inout,
     (-|),
     (|-),
     Effect (..),
@@ -101,7 +100,7 @@ import Foreign.Ptr (Ptr, plusPtr)
 import GHC.TypeLits (KnownSymbol, Symbol)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
-import Network.Streaming.Annotate (Annotate (..), Check (..), Label (..), box, giving, inout, taking, (-|), (|-))
+import Network.Streaming.Annotate (Annotate (..), Check (..), Label (..), box, giving, taking, (-|), (|-))
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Internal.Inboxes (Address)
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
@@ -404,7 +403,7 @@ writable sock = Writable . Fd <$> Socket.unsafeFdSocket sock
 receiveWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => (link -> Ptr Word8 -> Int -> IO (Maybe Int)) -> (link -> IO Event) -> arr (link, Room) Int
 receiveWith try readyToReceive =
   giveWay
-    >>> iterateWith (box "try receive" (now attempt) `giving` "received?") (taking "nothing ready" (consume block))
+    >>> iterateWith (box "try receive" (now attempt) -| "received?") ("nothing ready" |- consume block)
   where
     attempt (link, room@(Room (Buffer memory _) offset size)) =
       withForeignPtr memory (\pointer -> try link (pointer `plusPtr` offset) size) >>= \case
@@ -422,7 +421,7 @@ sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate ar
 sendAllWith send flush readyToSend =
   giveWay
     >>> second (filter (not . BS.null))
-    ^>> iterateWith (box "try send" (now attempt) `giving` "all sent?") (taking "socket full" (consume block))
+    ^>> iterateWith (box "try send" (now attempt) -| "all sent?") ("socket full" |- consume block)
   where
     attempt (link, pieces) = case pieces of
       [] -> flush link >>= \flushed -> if flushed then pure (Finish ()) else blocked link []

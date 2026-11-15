@@ -113,7 +113,7 @@ withLoanTimeoutA body = scope acquire giveBack run
   where
     acquire =
       now (\((limit, pool), _) -> (\closed -> if closed then Left () else Right (limit, pool)) <$> isClosed pool)
-        >>> (taking "closed" (arr (const (Left PoolClosed))) ||| taking "open" (alongside checkingOut >>^ \(got, (_, pool)) -> fmap (pool,) got))
+        >>> ("closed" |- arr (const (Left PoolClosed)) ||| "open" |- (alongside checkingOut >>^ \(got, (_, pool)) -> fmap (pool,) got))
     checkingOut = (\(limit, pool) -> (limit, (1, pool))) ^>> checkoutAtTimeoutA >>^ maybe (Left CheckoutTimedOut) Right
     giveBack = fst ^>> (done ||| offer)
     run = withInput ^>> (arr Left ||| (body >>^ Right))
@@ -138,7 +138,7 @@ loanedIn checkingOut body = scope acquire giveBack run
   where
     acquire =
       now (\(pool, _) -> (\closed -> if closed then Left () else Right pool) <$> isClosed pool)
-        >>> (taking "closed" (arr (const (Left PoolClosed))) ||| taking "open" (alongside checkingOut >>^ \(got, pool) -> fmap (pool,) got))
+        >>> ("closed" |- arr (const (Left PoolClosed)) ||| "open" |- (alongside checkingOut >>^ \(got, pool) -> fmap (pool,) got))
     giveBack = fst ^>> (done ||| offer)
     run = withInput ^>> (arr Left ||| (body >>^ Right))
     withInput (acquired, (_, input)) = fmap (\(_, item) -> (item, input)) acquired
@@ -286,8 +286,8 @@ reserved ::
 reserved ref need claim handout =
   named (Label "reserved" "Takes what is free if enough is, and else queues the promise and returns the future to await.") $
     giveWay
-      >>> step "claim from free items" (const (update ref claim)) `giving` "item free?"
-      >>> (taking "no" queue ||| taking "yes" (arr Right))
+      >>> step "claim from free items" (const (update ref claim)) -| "item free?"
+      >>> ("no" |- queue ||| "yes" |- arr Right)
   where
     queue = ticket >>> step "queue promise" (\(awaiting, promise) -> update ref (queueOrClaim awaiting promise))
     queueOrClaim awaiting promise state = case claim state of
@@ -319,14 +319,13 @@ waited giveBack =
   where
     giveUp =
       decide "got its item?" unlessDone
-        >>> ( taking "yes" returnA
-                ||| taking
-                  "no"
-                  ( swap
-                      ^>> first abandon
-                      >>> decide "fulfilled meanwhile?" (\(fulfilled, pool) -> maybe (Left ()) (Right . (pool,)) fulfilled)
-                      >>> (taking "no" returnA ||| taking "yes" giveBack)
-                  )
+        >>> ( "yes" |- returnA
+                ||| "no"
+                  |- ( swap
+                         ^>> first abandon
+                         >>> decide "fulfilled meanwhile?" (\(fulfilled, pool) -> maybe (Left ()) (Right . (pool,)) fulfilled)
+                         >>> ("no" |- returnA ||| "yes" |- giveBack)
+                     )
             )
 
 -- | The input of a release, which it has to give up, unless the body of the scope completed: then there is nothing to give up,
@@ -348,8 +347,8 @@ checkoutAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange 
 checkoutAt =
   named (Label "checkoutAt" "Takes an item of the pool if enough are free, and else queues for one and waits.") $
     giveWay
-      >>> step "claim from free items" claimAtNow `giving` "item free?"
-      >>> (taking "no" queueAt ||| taking "yes" returnA)
+      >>> step "claim from free items" claimAtNow -| "item free?"
+      >>> ("no" |- queueAt ||| "yes" |- returnA)
 
 -- | The same, but the checkout gives up after the time, once its place in the queue is given up: 'Nothing'. The deadline
 -- is armed when the checkout has to wait, and an item that is free is taken without it.
@@ -357,16 +356,16 @@ checkoutAtWithin :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exc
 checkoutAtWithin limit =
   named (Label "checkoutAtWithin" "Takes an item of the pool if enough are free, and else queues for one and waits for it until the deadline.") $
     giveWay
-      >>> step "claim from free items" claimAtNow `giving` "item free?"
-      >>> (taking "no" (within limit queueAt) ||| taking "yes" (arr Just))
+      >>> step "claim from free items" claimAtNow -| "item free?"
+      >>> ("no" |- within limit queueAt ||| "yes" |- arr Just)
 
 -- | The same, but the deadline is in the input, in front of the rest, as 'timeoutA' takes it.
 checkoutAtTimeoutA :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Within arr) => arr (Duration, (Int, Pool conn)) (Maybe conn)
 checkoutAtTimeoutA =
   named (Label "checkoutAtTimeoutA" "Takes an item of the pool if enough are free, and else queues for one and waits for it until the deadline that the input gives.") $
     giveWay
-      >>> step "claim from free items" (\(limit, input) -> either (Left . (limit,)) Right <$> claimAtNow input) `giving` "item free?"
-      >>> (taking "no" (timeoutA queueAt) ||| taking "yes" (arr Just))
+      >>> step "claim from free items" (\(limit, input) -> either (Left . (limit,)) Right <$> claimAtNow input) -| "item free?"
+      >>> ("no" |- timeoutA queueAt ||| "yes" |- arr Just)
 
 -- | The item, if at least this many are free, and else the input again.
 claimAtNow :: (Int, Pool conn) -> IO (Either (Int, Pool conn) conn)
@@ -378,9 +377,9 @@ claimAtNow input@(need, Pool ref _) = either (const (Left input)) Right <$> upda
 queueAt :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr (Int, Pool conn) conn
 queueAt =
   keeping ticket
-    >>> step "queue promise" queueing `giving` "item free?"
-    >>> ( taking "no" (waited (step "return item" (\(pool, item) -> releaseNow pool [item])))
-            ||| taking "yes" returnA
+    >>> step "queue promise" queueing -| "item free?"
+    >>> ( "no" |- waited (step "return item" (\(pool, item) -> releaseNow pool [item]))
+            ||| "yes" |- returnA
         )
   where
     queueing ((awaiting, promise), (need, pool@(Pool ref _))) =

@@ -53,7 +53,6 @@ module Network.Streaming.Combinators
     step,
     taking,
     giving,
-    inout,
     (-|),
     (|-),
     typed,
@@ -109,7 +108,7 @@ undoing :: (Steps arr) => (forall p. (Steps p) => p a b) -> (forall p. (Steps p)
 undoing body cleanup =
   alongside (tryA body)
     >>> decide "failed?" (\(result, input) -> either (Left . (input,)) Right result)
-    >>> (taking "failed" (consume cleanup >>> now throwIO) ||| taking "done" returnA)
+    >>> ("failed" |- (consume cleanup >>> now throwIO) ||| "done" |- returnA)
 {-# INLINE undoing #-}
 
 -- | A ticket of the arrow's own reach: one that only parts of this core fulfil and await.
@@ -159,7 +158,7 @@ withInbox dispose body = scope (keeping (inbox @arr @r @name)) (closing @name @r
 -- the input.
 closing :: forall name r arr a b. (ArrowChoice arr, Annotate arr, Inboxes arr r, KnownSymbol name) => arr (a, b) () -> arr (((Inbox arr name r a, Address name r a), b), Exit) ()
 closing dispose =
-  (\(((opened, _), b), _) -> (opened, b)) ^>> first (closeInbox @arr @r @name) >>> decide "value left?" left >>> (taking "no" returnA ||| taking "yes" dispose)
+  (\(((opened, _), b), _) -> (opened, b)) ^>> first (closeInbox @arr @r @name) >>> decide "value left?" left >>> ("no" |- returnA ||| "yes" |- dispose)
   where
     left (leftover, b) = maybe (Left ()) (Right . (,b)) leftover
 {-# INLINE closing #-}
@@ -175,7 +174,7 @@ tryTicket handOut dispose =
     ( handing . fst
         ^>> first handOut
         >>> decide "handed out?" routed
-        >>> (taking "no" declined ||| taking "yes" accepted)
+        >>> ("no" |- declined ||| "yes" |- accepted)
     )
   where
     -- The input stays with the future, for the disposal of a value that the hand-out fulfilled before it declined.
@@ -193,8 +192,8 @@ tryTicket handOut dispose =
 -- abandons the future, and hands a value that was fulfilled before to the disposal, with the input.
 abandoning :: (ArrowChoice arr, Annotate arr, Exchange arr r) => arr (a, b) () -> arr (Either () (Future arr r a, b)) ()
 abandoning dispose =
-  taking "yes" returnA
-    ||| taking "no" (first abandon >>> decide "value fulfilled already?" late >>> (taking "no" returnA ||| taking "yes" dispose))
+  "yes" |- returnA
+    ||| "no" |- (first abandon >>> decide "value fulfilled already?" late >>> ("no" |- returnA ||| "yes" |- dispose))
   where
     late (fulfilled, b) = maybe (Left ()) (Right . (,b)) fulfilled
 {-# INLINE abandoning #-}

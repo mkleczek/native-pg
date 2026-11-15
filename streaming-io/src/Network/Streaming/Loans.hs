@@ -92,9 +92,9 @@ withRequestBuffers body =
   where
     admit =
       fst
-        ^>> alongside ((\pool -> (1 + reserveCount pool, requestBuffers pool)) ^>> checkoutAt `giving` "primary buffer")
+        ^>> alongside ((\pool -> (1 + reserveCount pool, requestBuffers pool)) ^>> checkoutAt -| "primary buffer")
         >>> step "open loans" (\(buffer, pool) -> Loans pool buffer <$> newIORef (Open NotLent NoExtra 0))
-          `giving` "request loans"
+          -| "request loans"
 
 -- | The request has ended. What it holds goes back to the pool, once, and a borrow of it that still waits is told.
 ended :: (Effect arr, Annotate arr) => arr Loans ()
@@ -112,7 +112,7 @@ ended =
 borrow :: (Runtime arr) => arr Loans Loan
 borrow =
   named (Label "borrow" "Lends the primary buffer if it is free, and else waits for an extra loan.") $
-    step "try borrow" immediately `giving` "loan free now?" >>> (taking "no" wait ||| taking "yes" returnA)
+    step "try borrow" immediately -| "loan free now?" >>> ("no" |- wait ||| "yes" |- returnA)
 
 -- | The primary if it isn't lent. Or else, if the extra place is free, a buffer of the pool if one is free now, and
 -- if none is, the loans, to wait for an extra loan with. No waiter that could have the buffer is queued, so it doesn't pass one.
@@ -156,7 +156,7 @@ wait =
   named (Label "wait" "Holds the extra place and waits in the pool's queue for a buffer, and gives both up if cancelled.") $
     keeping ticket >>> scope (step "take extra place" register) giveUp body
   where
-    body = decide "primary given back?" registered >>> (taking "no" queueAndAwait ||| taking "yes" returnA)
+    body = decide "primary given back?" registered >>> ("no" |- queueAndAwait ||| "yes" |- returnA)
     registered (registration, ((_, promise), _)) = case registration of
       Got loan -> Right loan
       Queued loans number future -> Left (Asking loans number promise future)
@@ -164,7 +164,7 @@ wait =
     -- The pool queues a promise of a buffer, which lends the buffer to this borrow if it is still there to take it.
     queueing Asking {askLoans = loans@(Loans pool _ _), askNumber, askPromise, askFuture} =
       askFuture <$ queueNow (requestBuffers pool) 1 (forwarding loans askNumber askPromise)
-    giveUp = decide "give up place?" stillQueued >>> (taking "no" returnA ||| taking "yes" abandoned)
+    giveUp = decide "give up place?" stillQueued >>> ("no" |- returnA ||| "yes" |- abandoned)
     stillQueued (registration, exit) = case registration of
       Queued loans number future | not (isDone exit) -> Right (future, (loans, number))
       _ -> Left ()
@@ -173,7 +173,7 @@ wait =
     abandoned =
       first abandon
         >>> decide "loan already fulfilled?" fulfilledLoan
-        >>> (taking "no" (step "free extra place" (uncurry withdraw)) ||| taking "yes" release)
+        >>> ("no" |- step "free extra place" (uncurry withdraw) ||| "yes" |- release)
     fulfilledLoan (fulfilled, (loans, number)) = case fulfilled of
       Just (Just loan) -> Right loan
       _ -> Left (loans, number)

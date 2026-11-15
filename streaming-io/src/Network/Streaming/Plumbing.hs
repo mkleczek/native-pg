@@ -37,7 +37,7 @@ import Control.Arrow (Arrow, ArrowChoice, arr, first, left, returnA, right, seco
 import Data.Bool (bool)
 import Data.Foldable (toList)
 import Data.Functor.Const (Const (..))
-import Network.Streaming.Annotate (Annotate, giving, taking)
+import Network.Streaming.Annotate (Annotate, (-|), (|-))
 
 -- | What a step of a loop gives: 'Again' with the state to go round with, or 'Finish' with the result. It is 'Either',
 -- so 'Control.Arrow.left', '+++' and '|||' work on it.
@@ -63,7 +63,7 @@ iterateA step = iterateWith step returnA
 iterateWith :: (ArrowChoice arr, Annotate arr) => arr s (Step t r) -> arr t s -> arr s r
 iterateWith body next = loop
   where
-    loop = body >>> (taking "again" (next >>> loop) ||| taking "finish" returnA)
+    loop = body >>> ("again" |- (next >>> loop) ||| "finish" |- returnA)
 {-# INLINE iterateWith #-}
 
 -- | Runs the step for ever, each time on what it gave the time before.
@@ -91,7 +91,7 @@ whether test a = if test a then Left a else Right a
 
 -- | A pure step that chooses a branch, named by the question it answers.
 decide :: (Arrow arr, Annotate arr) => String -> (a -> Either b c) -> arr a (Either b c)
-decide question f = arr f `giving` question
+decide question f = arr f -| question
 {-# INLINE decide #-}
 
 -- | Runs the arrow on the input, and pairs its result with the input, unchanged.
@@ -155,7 +155,7 @@ prism build match p = match ^>> (returnA ||| (p >>^ build))
 -- | Runs the arrow on each element of a list in order, and gives the results in the same order. In diagrams the loop
 -- is named "each", and it asks "another focus?".
 each :: (ArrowChoice arr, Annotate arr) => arr a b -> arr [a] [b]
-each p = taking "each" ((\as -> (as, [])) ^>> iterateWith (arr pick `giving` "another focus?") (first p >>^ push))
+each p = "each" |- ((\as -> (as, [])) ^>> iterateWith (arr pick -| "another focus?") (first p >>^ push))
   where
     pick ([], bs) = Finish (reverse bs)
     pick (a : rest, bs) = Again (a, (rest, bs))
@@ -205,5 +205,5 @@ on l p = l p >>> done
 -- | Runs the first arrow if the input is 'False', and the second if it is 'True', like 'bool'. In diagrams the two
 -- branches are named "false" and "true".
 boolA :: (ArrowChoice arr, Annotate arr) => arr () b -> arr () b -> arr Bool b
-boolA no yes = bool (Left ()) (Right ()) ^>> (taking "false" no ||| taking "true" yes)
+boolA no yes = bool (Left ()) (Right ()) ^>> ("false" |- no ||| "true" |- yes)
 {-# INLINE boolA #-}

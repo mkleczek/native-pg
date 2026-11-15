@@ -11,7 +11,6 @@ module Network.Streaming.Annotate
     box,
     taking,
     giving,
-    inout,
     (-|),
     (|-),
     asking,
@@ -86,29 +85,20 @@ giving :: (Annotate arr) => arr a b -> String -> arr a b
 giving step output = wires Nothing (Just output) step
 {-# INLINE giving #-}
 
--- | The arrow, with names for its input and output wires in diagrams, written around it:
--- @inout "request" handler "answer"@.
-inout :: (Annotate arr) => String -> arr a b -> String -> arr a b
-inout input step output = wires (Just input) (Just output) step
-{-# INLINE inout #-}
-
--- '-|' binds tighter than the operators of arrows, as 'giving' does, and '|-' tighter still, so that
--- @"in" |- p -| "out"@ names both wires of @p@, and @a -| "x" >>> "y" |- b@ and @("yes" |- p ||| "no" |- q)@ need no
--- parentheses.
+-- '-|' binds as 'giving' does, tighter than the operators of arrows, and '|-' tighter still, so that @"in" |- p -| "out"@
+-- names both wires of @p@, and @a -| "x" >>> "y" |- b@ and @("yes" |- p ||| "no" |- q)@ need no parentheses.
 infixl 5 -|
 
 infixr 6 |-
 
--- | The arrow, with a name for its output wire in diagrams, written after it: @parse -| "request"@. It is 'giving'. A stub:
--- it fails when the program is built, until it is written.
+-- | The arrow, with a name for its output wire in diagrams, written after it: @parse -| "request"@. It is 'giving'.
 (-|) :: (Annotate arr) => arr a b -> String -> arr a b
-(-|) _ _ = error "-| is not implemented yet"
+(-|) = giving
 {-# INLINE (-|) #-}
 
--- | The arrow, with a name for its input wire in diagrams, written before it: @"request" |- handler@. It is 'taking'. A
--- stub: it fails when the program is built, until it is written.
+-- | The arrow, with a name for its input wire in diagrams, written before it: @"request" |- handler@. It is 'taking'.
 (|-) :: (Annotate arr) => String -> arr a b -> arr a b
-(|-) _ _ = error "|- is not implemented yet"
+(|-) = taking
 {-# INLINE (|-) #-}
 
 -- | The arrow as the asking end of an exchange of the named value in diagrams: the end that makes a ticket and waits.
