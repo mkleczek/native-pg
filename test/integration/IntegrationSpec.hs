@@ -503,7 +503,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    needs "streamed parameters" $ it "streams a parameter from its source" $ do
+    it "streams a parameter from its source" $ do
       let payload = BS.concat (replicate 4096 "0123456789abcdef")
           chunks = 128
       withSession
@@ -512,7 +512,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [streamedText (chunks * BS.length payload)]) Nothing (single @_ @Bool))))
         )
         `shouldReturn` Right [True]
-    needs "streamed parameters" $ it "streams an empty parameter, and one in a statement that follows a streamed one" $
+    it "streams an empty parameter, and one in a statement that follows a streamed one" $
       withSession
         ( steps
             [ streaming (newChunks []) (query' (Tx.streamFrom id (lengthWith (const [streamedText 0])))) `yields` Right [0],
@@ -520,13 +520,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    needs "streamed parameters" $ it "takes the parameters of a statement from consecutive parts of its stream, wherever the pieces end" $
+    it "takes the parameters of a statement from consecutive parts of its stream, wherever the pieces end" $
       withSession
         ( streaming (newChunks ["ab", "cdefg", "hi"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text, $2::text" (const [streamedText 4, streamedText 5]) Nothing pair)))
             `yields` Right [("abcd" :: Text, "efghi" :: Text)]
         )
         `shouldReturn` ()
-    needs "streamed parameters" $ it "gives each statement of a pipeline the stream that it declares" $
+    it "gives each statement of a pipeline the stream that it declares" $
       withSession
         ( streaming
             ((,) <$> newChunks ["ab", "c"] <*> newChunks ["defg", "h"])
@@ -543,7 +543,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             `yields` Right (3 :: Int32, 5 :: Int32)
         )
         `shouldReturn` ()
-    needs "streamed parameters" $ it "fails a streamed parameter of a statement that has no stream before anything is sent, and the connection stays usable" $
+    it "fails a streamed parameter of a statement that has no stream before anything is sent, and the connection stays usable" $
       withSession
         ( steps
             [ query (Tx.Statement "SELECT length($1::text)" (const [streamedText 3]) Nothing (single @_ @Int32))
@@ -559,7 +559,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           pieces = concatMap (\piece -> [BS.take 100 piece, BS.drop 100 piece]) (replicate 128 payload)
       withSession (query (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [piecesText pieces]) Nothing (single @_ @Bool)))
         `shouldReturn` Right [True]
-    needs "streamed parameters" $ it "streams a parameter to a prepared statement, whether it returns rows or not" $
+    it "streams a parameter to a prepared statement, whether it returns rows or not" $
       withSession
         ( steps
             [ ddl "CREATE TEMPORARY TABLE streamed (value text)" `yields` Right (),
@@ -570,7 +570,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    needs "streamed parameters" $ it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $
+    it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $
       withSession
         ( steps
             [ ddl "SET statement_timeout = '200ms'" `yields` Right (),
@@ -953,7 +953,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         `shouldReturn` Right [(42, "a,zażółć", "1", "[1, 2]", True)]
 
   -- A parameter stream that breaks its promise leaves the protocol in a state nobody can continue from.
-  needs "streamed parameters" $ describe "execute (failures)" $ do
+  describe "execute (failures)" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
     it "breaks the connection when a parameter stream is shorter than declared" $

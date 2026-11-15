@@ -21,10 +21,11 @@
 -- what the one before it said is answered. The queue of the answers that are
 -- expected is the statements of the pipeline that was sent, which the server
 -- answers in order, and the reading program takes the results from it in the
--- order of their statements. Streamed parameters are to come: they fail with
--- 'Network.Streaming.NotImplemented.NotImplemented'. A statement declares the one
--- stream that its 'FromStream' parameters take their bytes from, when the program is
--- built, with 'streamFrom'; the stream's state is taken from the input of the program.
+-- order of their statements. A statement declares the one stream that its
+-- 'FromStream' parameters take their bytes from, when the program is built, with
+-- 'streamFrom'; the stream's state is taken from the input of the program, and
+-- the pipeline's sending pulls the stream while it sends the parameters: each
+-- 'FromStream' takes the next bytes of the stream, as many as it declares.
 --
 -- A prepared statement is named by the program, which keeps the names of the
 -- connection: 'prepare' sends the Parse of a name, 'executePrepared' sends only the
@@ -86,7 +87,7 @@ module Database.PostgreSQL.Transaction
   )
 where
 
-import Control.Arrow (Arrow, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (IOException, SomeAsyncException, SomeException, displayException, evaluate, fromException, throwIO, toException)
 import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
@@ -94,7 +95,9 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.Int (Int32)
 import Data.Kind (Type)
+import qualified Data.List as List
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import Data.Word (Word8)
@@ -102,7 +105,7 @@ import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..), InPlace)
 import Database.PostgreSQL.Errors (ConnectionError (..), QueryError (..), ServerError (..), StatementError (..), UsageError (..), isConnectionFatal)
 import Database.PostgreSQL.Internal.Diagnostics (bodyDiagnostics)
-import Database.PostgreSQL.Internal.Frontend (sendOutput, sync)
+import Database.PostgreSQL.Internal.Frontend (sendOutput, sendStreamed, sync)
 import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
   ( At (..),
     CursorError (..),
@@ -122,7 +125,8 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
     valueLength,
     valueView,
   )
-import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output, outputLength, outputWriter, runWriter)
+import Database.PostgreSQL.Internal.Protocol.Codec (Serializable (..))
+import Database.PostgreSQL.Internal.Protocol.Codec.Output (Output, hole, int32, outputLength, outputWriter, runWriter)
 import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output (WriteResult (..), bytes)
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Carrier (Carrier)
@@ -133,7 +137,6 @@ import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, _1, _2, alongside, boolA, consume, done, iterateA, iterateWith, keeping, on, tap, through, undoing)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
-import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity, readerMemory)
 import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
@@ -701,16 +704,48 @@ foldRows step start result = const start ^>> iterateA (keeping (nextRow result) 
 -- positions to the reading program that follows. A program sends any number of
 -- pipelines in order: what the one before was answered with, and not read, is
 -- dropped, as is the field of a row.
+--
+-- What the server is sent is the statements, and a Sync, in as many sends as the buffer needs, once what the pipeline before it
+-- was answered with is read. BEGIN comes with the first, and the ending with the last. A pipeline whose statements declare a
+-- stream pulls the streams as it sends. All of it is sent before the reading program runs.
 pipeline :: (Runtime arr) => Ending -> Pipeline arr p a -> (a -> With Tx arr x y) -> With Tx arr (p, x) y
-pipeline finality (Pipeline _ sent value) reading = consume (sending finality sent) >>> reading (value 0)
-
--- | What the server is sent: the statements, and a Sync, in as many sends as the buffer needs, once what the pipeline
--- before it was answered with is read. BEGIN comes with the first, and the ending with the last.
-sending :: (Runtime arr) => Ending -> [Sent arr p] -> With Tx arr p ()
-sending finality sent =
+pipeline finality (Pipeline _ sent value) reading =
   tap (done >>> moved >>> readyToSend)
-    >>> withTx (layout finality sent)
-    >>> (returnA ||| transmit)
+    >>> withTx (layout finality streams numbered)
+    >>> ((program ||| streamed) ||| inTurn)
+  where
+    streams = List.any (isJust . streamOf) sent
+    numbered = numberStreams sent
+    program = reading (value 0)
+    inTurn = consume transmit >>> program
+    streamed = (\(output, input, rest) -> ((input, output), rest)) ^>> consume (transmitStreamed (selecting (concatMap puller sent))) >>> program
+
+-- | The step that pulls the stream that the statement declares, if it declares one, with the input that its state is taken from.
+puller :: (Arrow arr) => Sent arr p -> [arr p (Maybe ByteString)]
+puller item = case streamOf item of
+  Just (StreamSource source) -> [source ^>> next]
+  Nothing -> []
+
+-- | The stream that the statement declares.
+streamOf :: Sent arr p -> Maybe (StreamSource arr p)
+streamOf = \case
+  Execute given -> stream given
+  ExecutePrepared _ given -> stream given
+  _ -> Nothing
+
+-- | The statements, each with the number of its stream, among the streams of the pipeline's statements in order, if it has one.
+numberStreams :: [Sent arr p] -> [(Maybe Int, Sent arr p)]
+numberStreams = go 0
+  where
+    go _ [] = []
+    go number (item : others) = case streamOf item of
+      Nothing -> (Nothing, item) : go number others
+      Just _ -> (Just number, item) : go (number + 1) others
+
+-- | The next piece of the stream with the number, whose state is taken from the input.
+selecting :: (ArrowChoice arr) => [arr p (Maybe ByteString)] -> arr (Int, p) (Maybe ByteString)
+selecting [] = arr (const Nothing)
+selecting (this : others) = (\(number, input) -> if number == 0 then Left input else Right (number - 1, input)) ^>> (this ||| selecting others)
 
 -- | The pipeline before this was answered: what is owed is read, and a failure of the server found is raised.
 readyToSend :: (Runtime arr) => With Tx arr () ()
@@ -721,31 +756,42 @@ readyToSend = inTx check >>> drain True
       traverse_ throwIO (stFailure s)
       when (stFinal s || stEnded s) (throwIO AfterFinal)
 
--- | The output of a pipeline of the program, which is nothing if there is nothing to send. What the server is to answer
--- is put in the queue of the transaction, once all of it is rendered.
-layout :: Ending -> [Sent arr p] -> Tx -> p -> IO (Either () Output)
-layout finality sent tx input = do
+-- | The output of a pipeline of the program, and how it is sent: not at all if there is nothing to send, with the pulls of
+-- its streams if a statement declares one, and else as it is. What the server is to answer is put in the queue of the
+-- transaction, once all of it is rendered.
+layout :: Ending -> Bool -> [(Maybe Int, Sent arr p)] -> Tx -> (p, x) -> IO (Either (Either x (Output, p, x)) (Output, x))
+layout finality streams sent tx (input, rest) = do
   s <- inspect tx
   user <- traverse (rendered input) sent
   let starting = [(Entry (txBegin tx) Passed, txBeginOutput tx) | not (stBegun s), not (null sent) || finality == Final]
       closing = [(Entry text Passed, output) | finality == Final, let (text, output) = endingStatement (stCondemned s)]
   case starting <> user <> closing of
-    [] -> pure (Left ())
+    [] -> pure (Left (Left rest))
     queued -> do
       output <- evaluate (foldMap snd queued <> sync)
       modify tx (const s {stBegun = True, stFinal = stFinal s || finality == Final, stPending = map fst queued, stIndex = 0, stBase = length starting, stRows = 0, stTags = [], stOwed = True, stSending = True})
-      pure (Right output)
+      pure $ if streams then Left (Right (output, input, rest)) else Right (output, rest)
   where
     plain text = statementOutput text [] [] []
-    rendered parameters = \case
-      Execute given -> do
-        (types, formats, values) <- parametersOf (params given parameters)
-        pure (Entry (sql given) Wanted, statementOutput (sql given) types formats values)
+    rendered parameters (source, item) = case item of
+      Execute given -> case source of
+        Nothing -> do
+          (types, formats, values) <- parametersOf (params given parameters)
+          pure (Entry (sql given) Wanted, statementOutput (sql given) types formats values)
+        Just number -> do
+          (types, formats, values) <- argumentsOf number (params given parameters)
+          pure (Entry (sql given) Wanted, streamedStatementOutput (sql given) types formats values)
       Command text -> pure (Entry text Wanted, plain text)
       Prepare name given -> pure (Entry (sql given) Parsing, parseOutput name (sql given))
-      ExecutePrepared name given -> do
-        (_, formats, values) <- parametersOf (params given parameters)
-        pure (Entry (sql given) Wanted, boundOutput name formats values)
+      ExecutePrepared name given -> case source of
+        Nothing -> do
+          (_, formats, values) <- parametersOf (params given parameters)
+          pure (Entry (sql given) Wanted, boundOutput name formats values)
+        Just number -> do
+          (_, formats, values) <- argumentsOf number (params given parameters)
+          -- The server starts statement_timeout at a Describe, and reads a Bind whole before it runs it, so it is described first
+          -- for the time that the stream takes to count.
+          pure (Entry (sql given) Wanted, Wire.serialize (Wire.Describe Wire.PreparedStatement name) <> boundStreamed name formats values)
       Close name -> pure (Entry ("DEALLOCATE " <> name) Closing, Wire.serialize (Wire.Close Wire.PreparedStatement name))
 
 -- | The statement that ends a transaction: ROLLBACK if it is condemned, else COMMIT, as its SQL, which the errors name, and
@@ -778,6 +824,18 @@ statementOutput text types formats values =
   Wire.serialize (Wire.Parse "" text (map (fmap Wire.Scalar) types))
     <> boundOutput "" formats values
 
+-- | The messages for an unnamed statement that has a stream: Parse, Bind with arguments, and Execute.
+streamedStatementOutput :: ByteString -> [Maybe Oid] -> [FormatCode] -> [Maybe Argument] -> Output
+streamedStatementOutput text types formats values =
+  Wire.serialize (Wire.Parse "" text (map (fmap Wire.Scalar) types))
+    <> boundStreamed "" formats values
+
+-- | Bind of the statement that has the name, with arguments of which some are holes, and Execute.
+boundStreamed :: ByteString -> [FormatCode] -> [Maybe Argument] -> Output
+boundStreamed name formats values =
+  Wire.serialize (Wire.Bind (Wire.BindBody "" name formats values [BinaryFormat]))
+    <> Wire.serialize (Wire.Execute "" 0 :: Wire.Execute ByteString)
+
 -- | The Parse of the statement under the name, which names no types: the server infers them.
 parseOutput :: ByteString -> ByteString -> Output
 parseOutput name text = Wire.serialize (Wire.Parse name text [])
@@ -788,7 +846,8 @@ boundOutput name formats values =
   Wire.serialize (Wire.Bind (Wire.BindBody "" name formats values [BinaryFormat]))
     <> Wire.serialize (Wire.Execute "" 0 :: Wire.Execute ByteString)
 
--- | The types, the formats and the values of the parameters as the protocol has them.
+-- | The types, the formats and the values of the parameters as the protocol has them, for a statement that has no stream: a
+-- parameter that takes from one fails with 'StreamLengthError', since it is given no bytes.
 parametersOf :: [Param] -> IO ([Maybe Oid], [FormatCode], [Maybe Parameter])
 parametersOf given = (map paramType given,map paramFormat given,) <$> traverse (valueOf . paramValue) given
   where
@@ -796,13 +855,51 @@ parametersOf given = (map paramType given,map paramFormat given,) <$> traverse (
       Null -> pure Nothing
       Bytes bytes -> pure (Just (ParameterBytes bytes))
       Pieces pieces -> pure (Just (ParameterChunks pieces))
-      FromStream _ -> notImplementedIO "streamed parameters"
+      FromStream size -> throwIO (StreamLengthError size 0)
+
+-- | A parameter's value, as the Bind that carries it of a statement that has a stream renders it.
+data Argument
+  = Whole Parameter
+  | -- | This many bytes of the stream of the number, which are a hole of the output for the sender to fill, and whether
+    -- the parameter is the last of its statement that takes from the stream, which the sender then checks to be at its end,
+    -- before it renders what follows. The hole's tag is the number twice, and one more if it is the last.
+    Pulled !Int !Int !Bool
+
+instance Serializable (Maybe Argument) 'MaybeBytes32Atom where
+  serializeField = \case
+    Nothing -> serializeField @(Maybe Parameter) @'MaybeBytes32Atom Nothing
+    Just (Whole value) -> serializeField @(Maybe Parameter) @'MaybeBytes32Atom (Just value)
+    Just (Pulled number size final) -> int32 (fromIntegral size) <> hole (2 * number + fromEnum final) size
+  {-# INLINE serializeField #-}
+
+-- | The types, the formats and the values of the parameters of a statement whose stream has the number. A length that no
+-- Bind can carry fails with 'StreamLengthError', as the length of a stream that has none does.
+argumentsOf :: Int -> [Param] -> IO ([Maybe Oid], [FormatCode], [Maybe Argument])
+argumentsOf number given = (map paramType given,map paramFormat given,) <$> sequence (zipWith valueOf (map paramValue given) (drop 1 (scanr ((||) . pulls) False (map paramValue given))))
+  where
+    pulls = \case FromStream _ -> True; _ -> False
+    valueOf value more = case value of
+      Null -> pure Nothing
+      Bytes bytes -> pure (Just (Whole (ParameterBytes bytes)))
+      Pieces pieces -> pure (Just (Whole (ParameterChunks pieces)))
+      FromStream size
+        | size < 0 || size > fromIntegral (maxBound :: Int32) -> throwIO (StreamLengthError size 0)
+        | otherwise -> pure (Just (Pulled number size (not more)))
 
 -- | Sends what was laid out, in the loan of the transaction, whose buffer the replies are read into when it is sent.
 transmit :: (Runtime arr) => With Tx arr Output ()
 transmit =
   withTx (\tx output -> setAside tx >> pure (sessionCarrier (connectionSession (txConnection tx)), loanBuffer (txLoan tx), output))
     >>> lift sendOutput
+    >>> inTx (\tx -> bringBack tx >> modify tx (\s -> s {stSending = False}))
+
+-- | Sends what was laid out as 'transmit' does, with the bytes of its holes taken from the streams that the arrow pulls, with
+-- the input that the streams' state comes from. The messages are rendered into the loan of the transaction in turn with the
+-- pulls, and a pull that waits leaves them half sent.
+transmitStreamed :: (Runtime arr) => arr (Int, p) (Maybe ByteString) -> With Tx arr (p, Output) ()
+transmitStreamed pulling =
+  withTx (\tx (input, output) -> setAside tx >> pure (sessionCarrier (connectionSession (txConnection tx)), loanBuffer (txLoan tx), input, output))
+    >>> lift (sendStreamed pulling)
     >>> inTx (\tx -> bringBack tx >> modify tx (\s -> s {stSending = False}))
 
 -- | The buffer is rendered into, so what the reader holds of what the server sent after its last message goes to the

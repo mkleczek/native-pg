@@ -24,11 +24,13 @@ import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectFailure (..))
 import Database.PostgreSQL.Internal.Protocol
 import Database.PostgreSQL.Internal.Protocol.Codec
+import qualified Database.PostgreSQL.Internal.Protocol.Codec.Output as Output
 import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Session.Settings (ChannelBindingMode (..), ConnectSettings (..), SslMode (..))
 import qualified Database.PostgreSQL.Snippet as Snippet
 import Database.PostgreSQL.Types (Param (..))
 import Database.PostgreSQL.Transport (Address (..), RootCertificates (..), TcpOptions (..), TlsVersion (..), defaultTcpOptions, serverEndPoint)
+import Foreign.ForeignPtr (withForeignPtr)
 import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
 import Skeletest
 import qualified Skeletest.Predicate as P
@@ -75,6 +77,23 @@ spec = do
     it "keeps schema selection explicit for the same byte value" $ do
       staticBytes (serializeField @ByteString @'CStringAtom "value") `shouldBe` "value\0"
       staticBytes (serializeField @ByteString @'RemainingBytesAtom "value") `shouldBe` "value"
+
+  describe "outputs with holes" $
+    it "counts a hole in the length, and stops the writer before it, with its tag and its length" $ do
+      let output = Output.word8 1 <> Output.hole 3 4 <> Output.word8 2
+      outputLength output `shouldBe` 6
+      outputCopied output `shouldBe` 2
+      memory <- mallocPlainForeignPtrBytes 16
+      let writing writer = withForeignPtr memory (\pointer -> Output.runWriter writer pointer 16 0)
+      stopped <- writing (Output.outputWriter output)
+      case stopped of
+        Output.Hole used tag size rest -> do
+          (used, tag, size) `shouldBe` (1, 3, 4)
+          finished <- writing rest
+          case finished of
+            Output.Finished end -> end `shouldBe` 1
+            _ -> failTest "the writer did not finish after the hole"
+        _ -> failTest "the writer did not stop at the hole"
 
   describe "diagnostics" $ do
     it "decodes an error's fields, preferring the untranslated severity" $

@@ -200,7 +200,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       readIORef total `shouldReturn` 256
 
     -- The upload borrows a buffer for each piece it sends, from the loans of the request that also reads the response.
-    needs "streamed parameters" $ it "shares one primary across a borrowed upload and a streamed TLS response" $ do
+    it "shares one primary across a borrowed upload and a streamed TLS response" $ do
       remaining <- newIORef 16385
       held <- newIORef Nothing
       sharing
@@ -212,7 +212,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       (isNothing <$> readIORef held) `shouldReturn` True
 
     -- A source that is slow makes the request wait for it, and the response is read meanwhile: one wait of the arrow, not two.
-    needs "streamed parameters" $ it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $ do
+    it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $ do
       let pieces = replicate 64 (BS.replicate 256 120) <> [BS.replicate 1 120]
       sharing
         ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $

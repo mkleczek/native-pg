@@ -10,6 +10,7 @@ module Database.PostgreSQL.Internal.Protocol.Codec.Output
     outputLength,
     outputCopied,
     Uncopied (..),
+    hole,
     writeOutput,
     outputs,
     word8,
