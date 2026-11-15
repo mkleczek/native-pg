@@ -5,9 +5,9 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
--- | Anonymous records for the parts of a program's input: a value that has its name in its type, and the pairs that
--- nest to the right, so that a record is made by its names and its fields are read, put in front and changed by name,
--- and not by position. No record type is declared for it.
+-- | Anonymous records and sums for the parts of a program's input: a value that has its name in its type, and the pairs
+-- that nest to the right, so that a record is made by its names and its fields are read, put in front and changed by
+-- name, and not by position. No record type is declared for it.
 --
 -- A record is made by @newRecord ["name", "size"] \<$\> p \<*\> q@, with a step for each name, or by
 -- @is "name" p &&& is "size" q@, or from a record that is there, by @adding "kept" r@. A step reads the fields that
@@ -21,6 +21,16 @@
 -- other: 'newRecord' is applied with @\<$\>@, and the diagram's @fmap@ drops the function, so that it can't label
 -- anything.
 --
+-- A sum is the dual: its cases have their names in its type, as @Either ("refused" := x) (Either ("good" := y) ("quit"
+-- := z))@, which nests to the right as '|||' takes it apart. @inj "refused" x@ puts a value in the case of a name, and the
+-- type of the sum comes from the branches that take it apart, so that a producer needs no signature. @decide "how did it
+-- end?" (cases "head")@ gives each branch its case's value in front of the record that the sum is a field of, and a chain
+-- of branches, @"refused" ?> p ||| "good" ?> q ||| "quit" ?> r@, takes the record apart: each branch reads its case as a
+-- field named after the case, and the rest of the record by name, and names its wire in diagrams with the case. A
+-- classification that is made where the record is read, @casesBy "status" classify@, does the same. @_Case "refused" p@
+-- runs an arrow on the one case of a plain sum, which can change its type, and passes the others through. A name that the
+-- choice doesn't have is a type error that says so.
+--
 -- A field is read where it is used, inside 'Network.Streaming.Classes.now' or a step that takes the record, so that
 -- nothing is built of the field but the read: a record that is projected into a new pair has the thunks of the fields
 -- again.
@@ -33,15 +43,25 @@ module Network.Streaming.Named
     at,
     adding,
     field,
+    Inj,
+    inj,
+    Distribute,
+    cases,
+    casesBy,
+    (?>),
+    Case (..),
+    _Case,
   )
 where
 
-import Control.Arrow (Arrow, arr, first, (&&&), (>>^), (^>>))
+import Control.Arrow (Arrow, ArrowChoice, arr, first, (&&&), (>>^), (^>>))
+import Control.Exception (throw)
 import Data.Kind (Constraint)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
 import GHC.TypeLits (ErrorMessage (..), KnownSymbol, Symbol, TypeError, symbolVal)
-import Network.Streaming.Annotate (Annotate, giving, inout)
+import Network.Streaming.Annotate (Annotate, giving, inout, taking)
+import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 
 -- | A value with its name in its type: one field of an anonymous record.
@@ -164,3 +184,110 @@ at name p = (getField @name &&& id) ^>> first (inout label p label) >>^ uncurry 
 adding :: forall name -> forall arr r b. (Arrow arr, Annotate arr, KnownSymbol name) => arr r b -> arr r (name := b, r)
 adding name p = alongside (is name p)
 {-# INLINE adding #-}
+
+-- * Choosing
+
+-- | What is said of a name that no case of the choice has.
+type NoCase name = 'Text "The choice has no case " ':<>: 'ShowType name
+
+-- | Puts a value in the case of the name, in a sum that nests to the right, as '|||' takes it apart.
+class Inj (name :: Symbol) a s where
+  injWith :: a -> s
+
+-- | The last case, which has the name.
+instance (a ~ b) => Inj name a (name := b) where
+  injWith _ = unwritten "inj"
+  {-# INLINE injWith #-}
+
+-- | The first case, when it has the name.
+instance {-# OVERLAPPING #-} (a ~ b) => Inj name a (Either (name := b) rest) where
+  injWith _ = unwritten "inj"
+  {-# INLINE injWith #-}
+
+-- | A later case, found in the rest.
+instance (Inj name a rest) => Inj name a (Either other rest) where
+  injWith _ = unwritten "inj"
+  {-# INLINE injWith #-}
+
+-- | The last case, when it has another name: the choice has no case of the name.
+instance {-# OVERLAPPABLE #-} (TypeError (NoCase name)) => Inj name a (other := b) where
+  injWith _ = error "Network.Streaming.Named: a case that the choice doesn't have is a type error"
+
+-- | The value in the case of the name. The type of the sum comes from the branches that take it apart, so that a match
+-- of @inj "refused" x@ and the like needs no signature, and a name that the choice doesn't have is a type error.
+inj :: forall name -> forall a s. (Inj name a s) => a -> s
+inj name = injWith @name
+{-# INLINE inj #-}
+
+-- | Puts the case of a choice in front of the record that the choice is a field of, for the branch of the case: the value of
+-- the case is a field named after the case, and the rest of the record is as it was. The sum and the choice that it
+-- makes determine each other once the record is known, so that the type of a sum flows back from its branches to the
+-- code that makes it.
+class Distribute s r d | s r -> d, d r -> s where
+  distribute :: s -> r -> d
+
+-- | The last case: its value, in front of the record.
+instance (r' ~ r) => Distribute (name := x) r (name := (name := x, r')) where
+  distribute _ _ = unwritten "cases"
+  {-# INLINE distribute #-}
+
+-- | The first case, and the rest of them.
+instance (r' ~ r, Distribute rest r drest) => Distribute (Either (name := x) rest) r (Either (name := (name := x, r')) drest) where
+  distribute _ _ = unwritten "cases"
+  {-# INLINE distribute #-}
+
+-- | The sum that is the field of the name, with each case's value in front of the record, for the branches of a chain of
+-- '?>'. A pure function, for 'Network.Streaming.Plumbing.decide', which gives the decision the question that labels it in
+-- diagrams.
+cases :: forall name -> forall r s d. (HasField name r s, Distribute s r d) => r -> d
+cases name r = distribute (getField @name r) r
+{-# INLINE cases #-}
+
+-- | The same for a field that holds a value that the function puts in a case: a classification, such as the outcome of a
+-- handler.
+casesBy :: forall name -> forall r a s d. (HasField name r a, Distribute s r d) => (a -> s) -> r -> d
+casesBy name classify r = distribute (classify (getField @name r)) r
+{-# INLINE casesBy #-}
+
+-- '?>' binds tighter than '|||', so that a chain of branches needs no parentheses.
+infixr 6 ?>
+
+-- | The branch for the case of the name: it takes the case's value in front of the record, as a field of that name, and
+-- the wire into it is called the name in diagrams. A chain of them, @"a" ?> p ||| "b" ?> q ||| "c" ?> r@, takes apart what
+-- 'cases' gives.
+(?>) :: forall name -> forall arr x r b. (Arrow arr, Annotate arr, KnownSymbol name) => arr (name := x, r) b -> arr (name := (name := x, r)) b
+(?>) name _ = unwritten ("?> " <> symbolVal (Proxy @name))
+{-# INLINE (?>) #-}
+
+-- | Runs an arrow on the case of the name of a choice, with a change of its type if the arrow has one.
+class Case (name :: Symbol) s a b t | name s -> a, name s b -> t where
+  caseOf :: forall arr. (ArrowChoice arr) => arr a b -> arr s t
+
+-- | The last case, which has the name.
+instance (a ~ x, t ~ (name := b)) => Case name (name := x) a b t where
+  caseOf _ = unwritten "_Case"
+  {-# INLINE caseOf #-}
+
+-- | The first case, when it has the name: the rest passes through.
+instance {-# OVERLAPPING #-} (a ~ x, t ~ Either (name := b) rest) => Case name (Either (name := x) rest) a b t where
+  caseOf _ = unwritten "_Case"
+  {-# INLINE caseOf #-}
+
+-- | A later case, found in the rest: the first case passes through.
+instance (Case name rest a b rest', t ~ Either other rest') => Case name (Either other rest) a b t where
+  caseOf _ = unwritten "_Case"
+  {-# INLINE caseOf #-}
+
+-- | The last case, when it has another name: the choice has no case of the name.
+instance {-# OVERLAPPABLE #-} (a ~ TypeError (NoCase name), t ~ TypeError (NoCase name)) => Case name (other := x) a b t where
+  caseOf _ = error "Network.Streaming.Named: a case that the choice doesn't have is a type error"
+
+-- | The prism of the case of the name: runs the arrow on the case, with a change of its type if the arrow has one, and
+-- passes the other cases through without running it. The wire into the arrow is called the name in diagrams.
+_Case :: forall name -> forall arr s t a b. (ArrowChoice arr, Annotate arr, KnownSymbol name, Case name s a b t) => arr a b -> arr s t
+_Case name p = caseOf @name (taking (symbolVal (Proxy @name)) p)
+{-# INLINE _Case #-}
+
+-- | What the stubs fail with, until they are written.
+unwritten :: String -> a
+unwritten = throw . NotImplemented . ("Network.Streaming.Named: " <>)

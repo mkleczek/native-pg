@@ -13,10 +13,12 @@ check() {
 }
 
 # A successful control proves failures come from the names, not the environment. A name that a record has twice is no
-# error where it is read: the newer field, which is the first, shadows the older.
+# error where it is read: the newer field, which is the first, shadows the older. A choice is checked the same way: the
+# control puts a value in each of three cases and takes them apart, and a case that the choice doesn't have is rejected.
 check NamedFields
 check NamedRepeated
 check NamedPolymorphic
+check ChoiceThree
 while read -r fixture message; do
   if check "$fixture" >"$output_dir/$fixture.log" 2>&1; then
     echo "Expected $fixture to fail compilation" >&2
@@ -29,5 +31,8 @@ while read -r fixture message; do
 done <<EOF2
 NamedMisspelt The record has no field "count"
 NamedTwice The record has more than one field named "size"
+ChoiceMisspelt The choice has no case "smal"
+ChoiceBranchMisspelt The choice has no case "huge"
+ChoiceCaseMisspelt The choice has no case "faild"
 EOF2
-echo "Named: a record is read by name from any step that names its fields; a name that it lacks, or that newRecord has twice, is rejected"
+echo "Named: a record is read by name from any step that names its fields, and a choice is taken apart by the names of its cases; a name that a record lacks, that newRecord has twice, or that a choice lacks, is rejected"

@@ -4,14 +4,14 @@
 -- they should.
 module MermaidSpec (spec) where
 
-import Control.Arrow ((&&&), (>>>), (^>>))
+import Control.Arrow ((&&&), (>>>), (^>>), (|||))
 import Data.Char (isAlphaNum)
-import Data.List (isInfixOf, isPrefixOf)
+import Data.List (isInfixOf, isPrefixOf, nub)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (_Just, box, done, each, step, withInbox)
+import Network.Streaming.Combinators (_Just, box, decide, done, each, step, withInbox)
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
-import Network.Streaming.Named (adding, at, field, is, (:=))
+import Network.Streaming.Named (adding, at, cases, field, is, (:=), (?>))
 import Skeletest
 
 -- | A step that never waits.
@@ -36,6 +36,10 @@ beside (posting, collecting) = fst ^>> ((snd ^>> posting) &&& (fst ^>> collectin
 -- | The posts and the collects as parts that run together, which are lanes.
 together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhere ()), ()) ()
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
+
+-- | The stub of ?> fails when the program is built, until it is written, and the mark comes off with it.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Named has stubs: ?> is not written yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -94,6 +98,12 @@ spec = describe "the chart" $ do
         ((inside, after) `elem` edgesOf chart) `shouldBe` True
       found -> failTest ("the chart has the steps " <> show found)
 
+  stubbed $ it "has the question of the decision and the names of the cases on the branches of a chain of ?>" $ do
+    chart <- chartOf (decide "how did the head end?" (cases "head") >>> ("stream ended" ?> quick ||| "refused" ?> quick ||| "good" ?> quick) :: Diagram ("head" := Either ("stream ended" := ()) (Either ("refused" := Int) ("good" := Bool))) ())
+    [wiresNamed name chart | name <- ["stream ended", "refused", "good"]] `shouldBe` [1, 1, 1]
+    any ("{\"how did the head end?\"}" `isInfixOf`) chart `shouldBe` True
+    length (nub (concat [sourcesOf name chart | name <- ["stream ended", "refused", "good"]])) `shouldBe` 1
+
   it "has the name of the field that adding puts in front of a record, on the wire out of its step" $ do
     chart <- chartOf (adding "size" quick >>> quick :: Diagram () ())
     wiresNamed "size" chart `shouldBe` 1
@@ -125,6 +135,10 @@ afterwards = step "afterwards" (const (pure ()))
 -- | The edges of the chart, from a node to a node, whatever their labels.
 edgesOf :: [String] -> [(String, String)]
 edgesOf chart = [(takeWhile isAlphaNum line, last (words line)) | line <- stripped chart, " --> " `isInfixOf` line || " -->|" `isInfixOf` line]
+
+-- | The nodes that an edge of the label leaves.
+sourcesOf :: String -> [String] -> [String]
+sourcesOf label chart = [takeWhile isAlphaNum line | line <- stripped chart, ("-->|\"" ++ label ++ "\"|") `isInfixOf` line]
 
 -- | The nodes that an edge of the label goes to.
 targetsOf :: String -> [String] -> [String]
