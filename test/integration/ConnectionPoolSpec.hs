@@ -6,7 +6,7 @@
 {-# OPTIONS_GHC -F -pgmF=skeletest-preprocessor #-}
 
 -- | The connection pool against a real server: how a checkout ends, and what the pool does with its connections as it
--- closes and as they age. Every case is run by each arrow.
+-- closes and as they age, and what it tells of them. Every case is run by each arrow.
 --
 -- A case that the v2 code can't pass yet is marked with what it needs ('needs'): the marks come off as the part that they
 -- wait for lands.
@@ -16,12 +16,15 @@ import Control.Arrow ((>>>), (^>>))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forM_)
+import Control.Monad (forM_, void)
 import qualified Data.ByteString.Char8 as BC
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
+import Data.List (nub)
 import Data.Text (Text)
+import Data.UUID (UUID)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), connectionPoolSettings, withConnection, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import Network.Socket (PortNumber)
@@ -96,6 +99,106 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       -- The pool is used last: while it is reachable, its connection is not closed by the collection of its socket.
       runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
 
+  -- What the pool does with its connections as they age: it closes a connection when it is older than the pool's lifetime, and
+  -- when nobody has used it for the pool's idle time, and never one that a request has.
+  describe "maintenance" $ do
+    needs "pool maintenance" $ it "closes a connection that is older than the pool's lifetime, and makes another for the next request" $
+      pooled (\s -> s {poolLifetime = Just (millis 600)}) $ \env -> do
+        pid <- pidOf env
+        -- Within its lifetime the connection is the same.
+        pidOf env `shouldReturn` pid
+        -- Once it is older, the pool has closed it, though nothing used it.
+        eventually 6 (gone pid) `shouldReturn` True
+        pid' <- pidOf env
+        (pid' /= pid) `shouldBe` True
+
+    needs "pool maintenance" $ it "closes a connection that nobody has used for the pool's idle time, and not one that is used" $
+      pooled (\s -> s {poolIdleTime = Just (millis 600)}) $ \env -> do
+        pid <- pidOf env
+        -- Used every 150 milliseconds for longer than the idle time, the connection stays.
+        forM_ [1 .. 8 :: Int] $ \_ -> threadDelay 150000 *> (pidOf env `shouldReturn` pid)
+        -- Not used for the idle time, it is closed.
+        eventually 6 (gone pid) `shouldReturn` True
+        pid' <- pidOf env
+        (pid' /= pid) `shouldBe` True
+
+    needs "pool maintenance" $ it "leaves a connection to the request that has it, though it is older than the lifetime, and closes it once it is given back" $ do
+      buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+      withConnectionPool ((connectionPoolSettings 1 settings) {poolLifetime = Just (millis 300)}) $ \pool -> do
+        holder <- startHolding (Env runner buffers pool)
+        threadDelay 900000
+        stateOf (holderBackend holder) `shouldReturn` Right ["idle"]
+        finishHolding holder
+        eventually 6 (gone (holderBackend holder)) `shouldReturn` True
+
+    it "leaves the connections alone when the pool has neither a lifetime nor an idle time" $
+      pooled id $ \env -> do
+        pid <- pidOf env
+        threadDelay 1200000
+        pidOf env `shouldReturn` pid
+
+  -- What the pool tells its observer, as v1 told it: a connection is made, ready, in use, ready again or terminated.
+  describe "the observer" $ do
+    let observed :: (ConnectionPoolSettings -> ConnectionPoolSettings) -> IO (IORef [Observation], ConnectionPoolSettings -> ConnectionPoolSettings)
+        observed change = do
+          events <- newIORef []
+          pure (events, \s -> (change s) {poolObserver = Just (\event -> atomicModifyIORef' events (\told -> (event : told, ())))})
+        eventsOf events = reverse <$> readIORef events
+        said events = map describeEvent <$> eventsOf events
+
+    needs "the pool's observer" $ it "tells of a connection that is made, used and given back, and of its closing with the pool" $ do
+      (events, change) <- observed id
+      pooled change $ \env -> void (pidOf env *> pidOf env)
+      said events
+        `shouldReturn` ["connecting", "ready: established", "in use", "ready: succeeded", "in use", "ready: succeeded", "terminated: release"]
+      map connectionOf <$> eventsOf events >>= \ids -> length (nub ids) `shouldBe` 1
+
+    needs "the pool's observer" $ it "tells of a use that failed without breaking its connection" $ do
+      (events, change) <- observed id
+      pooled change $ \env -> do
+        onEnv env (withConnection (envPool env) (now (const (throwIO (userError "the use failed")))) `failsAs` \failure -> failure `shouldBe` userError "the use failed")
+          `shouldReturn` ()
+        void (pidOf env)
+      said events
+        `shouldReturn` ["connecting", "ready: established", "in use", "ready: failed", "in use", "ready: succeeded", "terminated: release"]
+
+    needs "the pool's observer" $ it "tells of a connection that a use broke, and of the one that replaces it" $ do
+      (events, change) <- observed id
+      pooled change $ \env -> do
+        onEnv env (withinFor (millis 100) (withConnection (envPool env) (committed Tx.Read (Tx.statement sleeping) Tx.single))) `shouldReturn` Nothing
+        void (pidOf env)
+      said events
+        `shouldReturn` ["connecting", "ready: established", "in use", "terminated: network error", "connecting", "ready: established", "in use", "ready: succeeded", "terminated: release"]
+
+    needs "the pool's observer" $ it "tells of a connection that the server ended, and of the one that replaces it" $ do
+      (events, change) <- observed id
+      pooled change $ \env -> do
+        pid <- pidOf env
+        ordinary runner (session settings (query (plain ("SELECT pg_terminate_backend(" <> BC.pack (show pid) <> ")") single))) `shouldReturn` Right [True]
+        eventually 6 (gone pid) `shouldReturn` True
+        void (pidOf env)
+      said events
+        `shouldReturn` ["connecting", "ready: established", "in use", "ready: succeeded", "terminated: network error", "connecting", "ready: established", "in use", "ready: succeeded", "terminated: release"]
+
+    needs "the pool's observer" $ it "tells of a connection that can't be made" $ do
+      (events, change) <- observed id
+      buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+      withConnectionPool (change (connectionPoolSettings 1 (unixSettings (socketPath <> "-missing") "postgres" Nothing))) $ \pool ->
+        runOn runner buffers (withConnection pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
+      said events `shouldReturn` ["connecting", "terminated: network error"]
+
+    needs "pool maintenance" $ it "tells of a connection that reached its lifetime, and of one that nobody used for the idle time" $ do
+      (aging, changeAging) <- observed (\s -> s {poolLifetime = Just (millis 500)})
+      pooled changeAging $ \env -> do
+        pid <- pidOf env
+        eventually 6 (gone pid) `shouldReturn` True
+      said aging `shouldReturn` ["connecting", "ready: established", "in use", "ready: succeeded", "terminated: aging"]
+      (idling, changeIdling) <- observed (\s -> s {poolIdleTime = Just (millis 500)})
+      pooled changeIdling $ \env -> do
+        pid <- pidOf env
+        eventually 6 (gone pid) `shouldReturn` True
+      said idling `shouldReturn` ["connecting", "ready: established", "in use", "ready: succeeded", "terminated: idleness"]
+
 -- * The pool of the cases
 
 -- | The pool of real connections over the request buffers, and the way to run a program over them.
@@ -154,3 +257,24 @@ eventually seconds check = do
             then pure True
             else getMonotonicTime >>= \time -> if time - started > seconds then pure False else threadDelay 20000 *> go
   go
+
+-- | A statement that runs for 30 seconds.
+sleeping :: (Runtime arr) => Tx.Statement arr () Int64
+sleeping = plain "SELECT 1::int8 FROM pg_sleep(30)" single
+
+-- | An event as the cases compare it: what it says of the connection, and not which connection.
+describeEvent :: Observation -> String
+describeEvent (ConnectionObservation _ status) = case status of
+  ConnectingConnectionStatus -> "connecting"
+  ReadyForUseConnectionStatus EstablishedConnectionReadyForUseReason -> "ready: established"
+  ReadyForUseConnectionStatus (SessionFailedConnectionReadyForUseReason _) -> "ready: failed"
+  ReadyForUseConnectionStatus SessionSucceededConnectionReadyForUseReason -> "ready: succeeded"
+  InUseConnectionStatus -> "in use"
+  TerminatedConnectionStatus AgingConnectionTerminationReason -> "terminated: aging"
+  TerminatedConnectionStatus IdlenessConnectionTerminationReason -> "terminated: idleness"
+  TerminatedConnectionStatus (NetworkErrorConnectionTerminationReason _) -> "terminated: network error"
+  TerminatedConnectionStatus ReleaseConnectionTerminationReason -> "terminated: release"
+
+-- | Which connection an event is of.
+connectionOf :: Observation -> UUID
+connectionOf (ConnectionObservation identifier _) = identifier
