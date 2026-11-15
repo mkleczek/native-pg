@@ -1221,16 +1221,15 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
   describe "snippets that stream a parameter" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
-    needs "ParameterStream in a snippet" $ do
-      it "takes the parameter that the snippet marks from the stream of its statement" $
-        withSession (streaming (newChunks ["abc", "def"]) (query' (Tx.streamFrom id (Snippet.fromSnippet (lengthOfStreamed 6) single))))
-          `shouldReturn` Right [6 :: Int32]
-      it "takes it among parameters that are bytes, in the order that the snippet has them" $
-        withSession (streaming (newChunks ["ab", "cd"]) (query' (Tx.streamFrom id (Snippet.fromSnippet (afterBytes 4) single))))
-          `shouldReturn` Right ["xyabcd" :: Text]
-      it "takes it from the stream of a statement made from the input, whose snippet the input makes" $ do
-        inputs <- traverse (\(size, pieces) -> (size,) <$> newChunks pieces) [(5, ["ab", "cde"]), (3, ["xyz"]), (0, [])]
-        withSession (overInputs (query' madeFromSnippet) inputs) `shouldReturn` [Right [5], Right [3], Right [0]]
+    it "takes the parameter that the snippet marks from the stream of its statement" $
+      withSession (streaming (newChunks ["abc", "def"]) (query' (Tx.streamFrom id (Snippet.fromSnippet (lengthOfStreamed 6) single))))
+        `shouldReturn` Right [6 :: Int32]
+    it "takes it among parameters that are bytes, in the order that the snippet has them" $
+      withSession (streaming (newChunks ["ab", "cd"]) (query' (Tx.streamFrom id (Snippet.fromSnippet (afterBytes 4) single))))
+        `shouldReturn` Right ["xyabcd" :: Text]
+    it "takes it from the stream of a statement made from the input, whose snippet the input makes" $ do
+      inputs <- traverse (\(size, pieces) -> (size,) <$> newChunks pieces) [(5, ["ab", "cde"]), (3, ["xyz"]), (0, [])]
+      withSession (overInputs (query' madeFromSnippet) inputs) `shouldReturn` [Right [5], Right [3], Right [0]]
 
   -- A parameter stream that breaks its promise leaves the protocol in a state nobody can continue from.
   describe "execute (failures)" $ do

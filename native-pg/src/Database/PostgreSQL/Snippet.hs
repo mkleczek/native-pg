@@ -13,7 +13,6 @@ module Database.PostgreSQL.Snippet
   )
 where
 
-import Control.Exception (throw)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Char8 as Char8
@@ -24,7 +23,6 @@ import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Transaction (Rows, Statement)
 import qualified Database.PostgreSQL.Transaction as Transaction
 import Database.PostgreSQL.Types (Param (..), Parameter (..))
-import Network.Streaming.NotImplemented (NotImplemented (..))
 
 -- | Text and parameters, in order. Appending is cheap, whatever the sizes.
 newtype Snippet = Snippet ([Chunk] -> [Chunk])
@@ -63,7 +61,8 @@ render (Snippet chunks) = finish (foldl' step (1 :: Int, mempty, id) (chunks [])
     finish (_, query, parameters) = (LBS.toStrict (Builder.toLazyByteString query), parameters [])
 
 -- | The statement that sends the snippet's SQL and its parameters, whatever the
--- input of the program is.
+-- input of the program is. A parameter that the snippet marks with 'ParameterStream' is
+-- taken from the stream that the statement declares with 'Transaction.streamFrom'.
 fromSnippet :: Snippet -> Rows arr row -> Statement arr p row
 fromSnippet snippet = Transaction.Statement query (const (map parameter parameters)) Nothing
   where
@@ -73,4 +72,4 @@ fromSnippet snippet = Transaction.Statement query (const (map parameter paramete
         Nothing -> Transaction.Null
         Just (ParameterBytes bytes) -> Transaction.Bytes bytes
         Just (ParameterChunks pieces) -> Transaction.Pieces pieces
-        Just (ParameterStream _) -> throw (NotImplemented "ParameterStream")
+        Just (ParameterStream size) -> Transaction.FromStream size
