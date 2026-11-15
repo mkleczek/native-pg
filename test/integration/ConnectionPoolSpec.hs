@@ -16,7 +16,7 @@ import Control.Arrow (arr, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, rtsSupportsBoundThreads, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forM_, replicateM_, void, when)
+import Control.Monad (forM_, replicateM, replicateM_, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
@@ -27,10 +27,10 @@ import Data.UUID (UUID)
 import Data.Word (Word64)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), connectSettings, connectionSlot)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), PoolStats (..), closeConnectionPool, connectionPoolSettings, connectionPoolStats, maintain, newConnectionPool, newMaintenance, withConnection)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), PoolStats (..), closeConnectionPool, connectionPoolSettings, connectionPoolStats, lookAt, maintain, newConnectionPool, newMaintenance, withConnection)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
-import GHC.Stats (allocated_bytes, getRTSStats)
+import GHC.Stats (allocated_bytes, gc, gcdetails_live_bytes, getRTSStats)
 import Network.Socket (PortNumber, Socket)
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
@@ -39,7 +39,7 @@ import Skeletest
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
-import System.Mem (performMinorGC)
+import System.Mem (performMajorGC, performMinorGC)
 import System.Timeout (timeout)
 import TestPools
 import TestPrograms
@@ -549,6 +549,57 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         threadDelay 1200000
         pidOf env `shouldReturn` pid
 
+  -- What a pool costs by the connections that it has, and not by the connections that it may have: one look at its connections, which the
+  -- maintenance makes for each pool every second, and the memory of a pool before it has a connection. A pool of 2,000 slots with two
+  -- connections costs what a pool of 20 slots with the same two does. With @POOL_COST_REPORT@ set, each case says what it measured, on stderr.
+  describe "the cost of a pool by its connections, and not by its size" $ do
+    let reported :: String -> String -> IO ()
+        reported label figures = lookupEnv "POOL_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("pool-size " <> name <> " | " <> label <> " | " <> figures))
+        -- What one look allocates, in bytes, and takes, in microseconds, at a pool of this size that has two connections, both free: the
+        -- pool has a lifetime that none has reached, so that every look goes through its connections.
+        lookCost :: Int -> IO (Double, Double)
+        lookCost size = do
+          buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+          maintenance <- newMaintenance
+          pool <- newConnectionPool maintenance ((connectionPoolSettings size settings) {poolLifetime = Just (secs 3600)})
+          let env = Env runner buffers pool
+          one <- startHolding env
+          two <- startHolding env
+          finishHolding one
+          finishHolding two
+          counts pool `shouldReturn` (2, 0, 0)
+          instant <- monotonicNanoseconds
+          let looks = 200 :: Int
+          started <- getMonotonicTime
+          bytes <- allocatedBy (replicateM_ looks (lookAt pool instant))
+          ended <- getMonotonicTime
+          counts pool `shouldReturn` (2, 0, 0)
+          closeConnectionPool pool
+          pure (fromIntegral bytes / fromIntegral looks, (ended - started) * 1e6 / fromIntegral looks)
+        -- What a pool of this size holds before it has a connection, in bytes: the live bytes of the heap with 500 of them, less without.
+        heldBy :: Int -> IO Double
+        heldBy size = do
+          maintenance <- newMaintenance
+          without <- liveBytes
+          pools <- replicateM 500 (newConnectionPool maintenance ((connectionPoolSettings size settings) {poolLifetime = Just (secs 1800)}))
+          holding <- liveBytes
+          mapM_ closeConnectionPool pools
+          pure (fromIntegral holding / 500 - fromIntegral without / 500)
+    needs "a look that visits the connections that a pool has" $
+      it "allocates for a pool of 2,000 slots no more than for a pool of 20 slots, with two connections in each" $ do
+        (smallBytes, smallMicros) <- lookCost 20
+        (largeBytes, largeMicros) <- lookCost 2000
+        reported "a look" (show (round smallBytes :: Int) <> " bytes, " <> show (round smallMicros :: Int) <> " us at 20 | " <> show (round largeBytes :: Int) <> " bytes, " <> show (round largeMicros :: Int) <> " us at 2000")
+        when (largeBytes > smallBytes * 1.05 + 64) $
+          failTest ("a look allocates " <> show (round largeBytes :: Int) <> " bytes at 2,000 slots, and " <> show (round smallBytes :: Int) <> " at 20")
+    needs "a pool whose memory goes by its connections" $
+      it "holds for a pool of 2,000 slots, before it has a connection, no more than for a pool of 20 slots" $ do
+        small <- heldBy 20
+        large <- heldBy 2000
+        reported "an empty pool" (show (round small :: Int) <> " bytes at 20 | " <> show (round large :: Int) <> " bytes at 2000")
+        when (large > small * 1.1 + 1024) $
+          failTest ("an empty pool holds " <> show (round large :: Int) <> " bytes at 2,000 slots, and " <> show (round small :: Int) <> " at 20")
+
   -- What the pool tells its observer, as v1 told it: a connection is made, ready, in use, ready again or terminated.
   describe "the observer" $ do
     let observed :: (ConnectionPoolSettings -> ConnectionPoolSettings) -> IO (IORef [Observation], ConnectionPoolSettings -> ConnectionPoolSettings)
@@ -744,3 +795,7 @@ allocatedBy action = do
   performMinorGC
   allocated <- allocated_bytes <$> getRTSStats
   pure (allocated - before)
+
+-- | The bytes of the heap that are live after a major collection.
+liveBytes :: IO Word64
+liveBytes = performMajorGC *> (gcdetails_live_bytes . gc <$> getRTSStats)
