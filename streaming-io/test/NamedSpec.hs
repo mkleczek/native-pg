@@ -32,13 +32,8 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The module of the fields is a stub for now, which fails with 'NotImplemented': every case is expected to fail, and
--- the mark comes off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Named is a stub: the fields are not read by name yet"
-
 spec :: Spec
-spec = describe "fields named in their type" $ forM_ runners $ \(Runner name run) -> describe name $ stubbed $ do
+spec = describe "fields named in their type" $ forM_ runners $ \(Runner name run) -> describe name $ do
   it "reads the first, a middle and the last field of a record of four that &&& makes" $
     run (record >>^ \r -> (r.name, r.size, r.kept, r.count)) `shouldReturn` ("pipe", 3, True, 4)
 

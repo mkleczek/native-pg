@@ -68,12 +68,10 @@ spec = describe "the chart" $ do
     chart <- chartOf (quick >>> quick :: Diagram () ())
     (storeIn chart, any ("-.->" `isInfixOf`) (stripped chart)) `shouldBe` (Nothing, False)
 
-  -- The stub of 'is' fails until it is written, and the mark comes off with it.
-  xfail "Network.Streaming.Named is a stub: is does not name the wire yet" $
-    it "has the name of each field that is made on the wire out of its step" $ do
-      chart <- chartOf ((is "name" quick &&& is "size" quick) >>> quick :: Diagram () ())
-      let labelled = [name | name <- ["name", "size"], any (("|\"" ++ name ++ "\"|") `isInfixOf`) (stripped chart)]
-      labelled `shouldBe` ["name", "size"]
+  it "has the name of each field that is made on the wire out of its step" $ do
+    chart <- chartOf ((is "name" quick &&& is "size" quick) >>> quick :: Diagram () ())
+    let labelled = [name | name <- ["name", "size"], any (("|\"" ++ name ++ "\"|") `isInfixOf`) (stripped chart)]
+    labelled `shouldBe` ["name", "size"]
 
 -- | The chart of the top page of the program, as lines.
 chartOf :: Diagram a b -> IO [String]
