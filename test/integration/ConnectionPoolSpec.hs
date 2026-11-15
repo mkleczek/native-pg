@@ -102,13 +102,13 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
     it "allocates no more than it did" $
       costs "withConnection" id $ case name of
         "threads" -> 2560
-        "delimited" -> 2080
-        _ -> 3395
+        "delimited" -> 2100
+        _ -> 3405
     it "allocates no more than it did when the pool has an observer" $
       costs "withConnection, observed" (\s -> s {poolObserver = Just (const (pure ()))}) $ case name of
         "threads" -> 2648
-        "delimited" -> 2148
-        _ -> 3415
+        "delimited" -> 2180
+        _ -> 3440
 
   -- What the pool does with its connections as it closes: those that are free close at once, and one that a request still
   -- has closes as the request gives it back.
@@ -130,7 +130,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
   -- What the pool does with its connections as they age: it closes a connection when it is older than the pool's lifetime, and
   -- when nobody has used it for the pool's idle time, and never one that a request has.
   describe "maintenance" $ do
-    needs "pool maintenance" $ it "closes a connection that is older than the pool's lifetime, and makes another for the next request" $
+    it "closes a connection that is older than the pool's lifetime, and makes another for the next request" $
       pooled (\s -> s {poolLifetime = Just (millis 600)}) $ \env -> do
         pid <- pidOf env
         -- Within its lifetime the connection is the same.
@@ -140,7 +140,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         pid' <- pidOf env
         (pid' /= pid) `shouldBe` True
 
-    needs "pool maintenance" $ it "closes a connection that nobody has used for the pool's idle time, and not one that is used" $
+    it "closes a connection that nobody has used for the pool's idle time, and not one that is used" $
       pooled (\s -> s {poolIdleTime = Just (millis 600)}) $ \env -> do
         pid <- pidOf env
         -- Used every 150 milliseconds for longer than the idle time, the connection stays.
@@ -150,7 +150,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         pid' <- pidOf env
         (pid' /= pid) `shouldBe` True
 
-    needs "pool maintenance" $ it "leaves a connection to the request that has it, though it is older than the lifetime, and closes it once it is given back" $ do
+    it "leaves a connection to the request that has it, though it is older than the lifetime, and closes it once it is given back" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
       withConnectionPool ((connectionPoolSettings 1 settings) {poolLifetime = Just (millis 300)}) $ \pool -> do
         holder <- startHolding (Env runner buffers pool)
@@ -215,7 +215,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         runOn runner buffers (withConnection pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
       said events `shouldReturn` ["connecting", "terminated: network error"]
 
-    needs "pool maintenance" $ it "tells of a connection that reached its lifetime, and of one that nobody used for the idle time" $ do
+    it "tells of a connection that reached its lifetime, and of one that nobody used for the idle time" $ do
       (aging, changeAging) <- observed (\s -> s {poolLifetime = Just (millis 500)})
       pooled changeAging $ \env -> do
         pid <- pidOf env
