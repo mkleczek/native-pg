@@ -54,46 +54,46 @@ import Network.Socket
   )
 import Network.Socket.Address (pokeSocketAddress, sizeOfSocketAddress)
 import Network.Streaming.Classes (Block (..), Effect (..), Event (..), Exit (..), Promise, Reach (..), Runtime, Scope (..))
-import Network.Streaming.Combinators (pattern Again, pattern Finish, deliver, done, iterateA, withTicket)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, _2, deliver, done, iterateA, through, withTicket)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Descriptors (fresh)
 import Network.Streaming.Mode (Instrumented (bump))
 import Network.Streaming.Threads (Threads, runThreads)
 import qualified System.Posix.Types as Posix
 
--- | Connects to the address, or says why it couldn't. The socket is closed if the part is cancelled while it connects, or
--- if it didn't connect. A host name is looked up, and the addresses it has are tried in order; the first that connects
--- is the result, and if none does, each failure is in the 'UnreachableHost'.
-connectSocket :: (Runtime arr) => TcpOptions -> arr Address (Either ConnectError Socket)
-connectSocket options =
-  (\case UnixAddress path -> Left path; TcpAddress host port -> Right (host, port)) ^>> (unix ||| tcp)
+-- | Connects to the address, with the TCP options that go with it, or says why it couldn't. The socket is closed if the part
+-- is cancelled while it connects, or if it didn't connect. A host name is looked up, and the addresses it has are tried in
+-- order; the first that connects is the result, and if none does, each failure is in the 'UnreachableHost'.
+connectSocket :: (Runtime arr) => arr (TcpOptions, Address) (Either ConnectError Socket)
+connectSocket =
+  (\(options, address) -> case address of UnixAddress path -> Left path; TcpAddress host port -> Right (options, (host, port))) ^>> (unix ||| tcp)
   where
     unix =
       (\path -> ((socket AF_UNIX Stream defaultProtocol, SockAddrUnix path), path))
         ^>> first attemptTo
         >>^ \(result, path) -> either (Left . UnreachableSocket path) Right result
-    tcp = lookedUp >>> (arr Left ||| each)
-    each = (\(host, port, found) -> Round host port found []) ^>> iterateA step
+    tcp = (through _2 lookedUp >>^ \(options, looked) -> fmap (options,) looked) >>> (arr Left ||| each)
+    each = (\(options, (host, port, found)) -> Round options host port found []) ^>> iterateA step
     -- The next address, which the loop tries, or the end of the addresses.
     step = choose ^>> (returnA ||| (first attemptTo >>> now concluded))
-    choose (Round host port found failures) = case found of
+    choose (Round options host port found failures) = case found of
       [] -> Left (Finish (Left (UnreachableHost host port (reverse failures))))
-      address : others -> Right ((opening address, addrAddress address), (Round host port others failures, address))
-    opening found = do
+      address : others -> Right ((opening options address, addrAddress address), (Round options host port others failures, address))
+    opening options found = do
       sock <- openSocket found
       -- Messages are small and sent whole, so don't wait to coalesce them.
       (setSocketOption sock NoDelay 1 *> setTcpOptions sock options) `onException` close sock
       pure sock
-    concluded (result, (Round host port others failures, address)) = case result of
+    concluded (result, (Round options host port others failures, address)) = case result of
       Right sock -> pure (Finish (Right sock))
-      Left failure -> (\numeric -> Again (Round host port others ((numeric, failure) : failures))) . fromMaybe host . fst <$> getNameInfo [NI_NUMERICHOST] True False (addrAddress address)
+      Left failure -> (\numeric -> Again (Round options host port others ((numeric, failure) : failures))) . fromMaybe host . fst <$> getNameInfo [NI_NUMERICHOST] True False (addrAddress address)
 
 -- | The addresses that a host name has for a port, in the order that they are to be tried.
 type Found = (HostName, PortNumber, [AddrInfo])
 
--- | What the loop over the addresses of a host knows: the host and the port, the addresses that are left to try, and the
--- failure of each address tried, the latest first, with the address as numbers.
-data Round = Round HostName PortNumber [AddrInfo] [(String, IOException)]
+-- | What the loop over the addresses of a host knows: the TCP options, the host and the port, the addresses that are left
+-- to try, and the failure of each address tried, the latest first, with the address as numbers.
+data Round = Round TcpOptions HostName PortNumber [AddrInfo] [(String, IOException)]
 
 -- | The addresses of the host: a numeric one is one address, which no lookup is needed for, and a name is looked up on
 -- a thread of its own, since resolving it waits for the network and would stall the core of the part.

@@ -30,6 +30,7 @@ import Control.Arrow (arr, second, (***), (>>>), (^>>), (|||))
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, threadDelay)
 import Control.Exception (ErrorCall (..), SomeException, bracket, finally, mask_, throwIO, toException, try)
 import Control.Monad (forever, replicateM, void)
+import Data.Tuple (swap)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (catMaybes, fromMaybe)
@@ -216,7 +217,7 @@ using pool body = scope acquire release run
     -- is ready, or that it could not be made.
     making =
       tap (now (\slot -> UUID.nextRandom >>= \identifier -> writeIORef (slotIdentifier slot) identifier *> observeNow slot ConnectingConnectionStatus))
-        >>> keeping ((poolBuffers pool,) ^>> withRequestBuffers (fst ^>> connect (poolConnect settings)))
+        >>> keeping ((\() -> (poolBuffers pool, poolConnect settings)) ^>> withRequestBuffers (swap ^>> connect))
         >>> now (uncurry made)
     made :: Either ConnectFailure Connection -> Slot -> IO (Slot, Connection)
     made result slot = case result of

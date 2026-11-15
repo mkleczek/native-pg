@@ -35,7 +35,7 @@ import GHC.IO.Exception (IOException (..))
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.Classes (Effect (..), Link (..), Room (..), Runtime, Scope (..), view)
-import Network.Streaming.Combinators (alongside, tap)
+import Network.Streaming.Combinators (tap)
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 #if defined(mingw32_HOST_OS)
 import System.Directory (getPermissions)
@@ -75,14 +75,14 @@ requested = tryA asking >>> now (either (fmap Left . classified) pure)
 
 -- | Starts TLS over the socket and shakes hands: the carrier, and the data that SCRAM's channel binding takes, or why none,
 -- or why TLS couldn't be started. The client certificate and the revocation lists are looked for as libpq looks for them.
-secured :: (Runtime arr) => ConnectSettings -> Securing -> arr Socket (Either ConnectError (Carrier, Maybe (Either String ByteString)))
-secured settings (Securing client verification _) = now opening >>> (now (pure . Left) ||| shaking)
+secured :: (Runtime arr) => arr ((ConnectSettings, Securing), Socket) (Either ConnectError (Carrier, Maybe (Either String ByteString)))
+secured = now opening >>> (now (pure . Left) ||| shaking)
   where
-    opening sock = guarded $ do
+    opening ((settings, Securing client verification _), sock) = guarded $ do
       certificate <- clientCertificate settings
       lists <- revocationLists settings
-      Right <$> startTls client (tlsSettings certificate lists) serverName sock
-    tlsSettings certificate lists =
+      Right . (,settings) <$> startTls client (tlsSettings settings verification certificate lists) (serverName settings) sock
+    tlsSettings settings verification certificate lists =
       TlsSettings
         verification
         certificate
@@ -90,14 +90,15 @@ secured settings (Securing client verification _) = now opening >>> (now (pure .
         (connectSslVersions settings)
         (connectSslServerNameIndication settings)
         (connectSslDirect settings)
-    serverName = case connectAddress settings of
+    serverName settings = case connectAddress settings of
       TcpAddress host _ -> fromMaybe host (connectServerName settings)
       UnixAddress path -> path
     -- The link is ended if the handshake failed, which closes the socket too.
     shaking =
-      alongside (tryA shake)
+      (\(link, settings) -> (link, (link, settings)))
+        ^>> first (tryA shake)
         >>> now
-          ( \(shaken, link) -> case shaken of
+          ( \(shaken, (link, settings)) -> case shaken of
               Right binding -> (\guard -> Right (Secure link guard, fromMaybe binding (connectEndPointOverride settings))) <$> newGuard
               Left failure -> Left <$> (linkEnd link *> classified failure)
           )

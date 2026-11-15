@@ -347,7 +347,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       -- With no standby to prefer, the primaries are tried again.
       withString (local "target_session_attrs=prefer-standby") done `shouldReturn` ()
     -- connect and cancel take their settings as input: one arrow, built once, serves the settings of each run.
-    needs "settings as input" $ describe "settings as input" $ do
+    describe "settings as input" $ do
       let connectingWith :: [ConnectSettings] -> (forall arr. (Runtime arr) => OnConn arr b) -> IO [Either ConnectFailure b]
           connectingWith settingsList body = run (acrossSettings (onSettings body) settingsList)
           reasons :: [Either ConnectFailure b] -> [Either String b]
@@ -391,8 +391,8 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           run $
             session (unix "postgres" Nothing) $
               steps
-                [ (concurrently (query sleeping) (after (millis 300) (cancelledWith settings)) >>^ serverCode . fst) `yields` Just "57014",
-                  cancelledWith refusing
+                [ (concurrently (query sleeping) (after (millis 300) (cancelling settings)) >>^ serverCode . fst) `yields` Just "57014",
+                  cancelling refusing
                     `failsAs` \case
                       TlsFailure reason -> reason `shouldBe` "server does not support SSL, but SSL was required"
                       other -> failTest ("expected TlsFailure, got " <> show other)
@@ -1107,20 +1107,16 @@ sleepFor duration = done >>> sleep duration
 -- made to the settings: those of the connection, or others, for the cases of TLS and channel binding on the cancel
 -- connection.
 cancelling :: (Runtime arr) => ConnectSettings -> OnConn arr ()
-cancelling settings = PG.cancelKey . fst ^>> PG.cancel settings
+cancelling settings = (\(connection, _) -> (settings, connection)) ^>> cancelWith
 
 -- | Cancels the statement that runs on the connection, with the settings that the input gives: one arrow for any settings.
 cancelWith :: (Runtime arr) => arr (ConnectSettings, Connection) ()
-cancelWith = (\(settings, connection) -> (settings, PG.cancelKey connection)) ^>> PG.cancelIn
-
--- | The cancel of the connection of a step, over a connection of its own that is made to the settings.
-cancelledWith :: (Runtime arr) => ConnectSettings -> OnConn arr ()
-cancelledWith settings = (\(connection, _) -> (settings, connection)) ^>> cancelWith
+cancelWith = (\(settings, connection) -> (settings, PG.cancelKey connection)) ^>> PG.cancel
 
 -- | The body on a connection made to the settings that the input gives, with the loans after them, closed when the body
 -- ends: the connection that 'session' makes, for settings that come at run time. A failure to connect is a value.
 onSettings :: (Runtime arr) => OnConn arr b -> arr (ConnectSettings, Loans) (Either ConnectFailure b)
-onSettings body = scope PG.connectIn (fst ^>> (done ||| PG.close)) ((\(connected, (_, loans)) -> fmap (,loans) connected) ^>> (arr Left ||| (body >>^ Right)))
+onSettings body = scope PG.connect (fst ^>> (done ||| PG.close)) ((\(connected, (_, loans)) -> fmap (,loans) connected) ^>> (arr Left ||| (body >>^ Right)))
 
 -- | The step on each of the settings in turn, whichever its number: one arrow, which takes the settings that it connects
 -- with from its input.

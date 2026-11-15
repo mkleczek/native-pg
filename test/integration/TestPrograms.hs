@@ -207,14 +207,14 @@ session settings body = connectedTo settings body >>> orFail
 
 -- | The same, with the failure to connect as a value, and the body not run.
 connectedTo :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans (Either ConnectFailure b)
-connectedTo settings body = scope (connect settings) closeConnected (withLoans ^>> right body)
+connectedTo settings body = scope ((settings,) ^>> connect) closeConnected (withLoans ^>> right body)
   where
     withLoans (connected, loans) = fmap (,loans) connected
 
 -- | The body on a second connection too, which is closed when the body ends. The body takes both connections, the
 -- one of the enclosing 'session' first. A connection that can't be made is the program's failure.
 alsoOn :: (Runtime arr) => ConnectSettings -> arr ((Connection, Connection), Loans) b -> OnConn arr b
-alsoOn settings body = scope (snd ^>> connect settings) closeConnected (bothWithLoans ^>> right body) >>> orFail
+alsoOn settings body = scope (((settings,) . snd) ^>> connect) closeConnected (bothWithLoans ^>> right body) >>> orFail
   where
     bothWithLoans (connected, (outer, loans)) = fmap (\inner -> ((outer, inner), loans)) connected
 
