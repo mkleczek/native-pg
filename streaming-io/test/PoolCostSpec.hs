@@ -8,7 +8,7 @@
 -- allocation is counted. With @POOL_COST_REPORT@ set, each case says what it measured, on stderr.
 module PoolCostSpec (spec) where
 
-import Control.Arrow ((>>>))
+import Control.Arrow ((>>>), (^>>))
 import Control.Monad (forM_, void, when)
 import Data.Word (Word64)
 import GHC.Stats (allocated_bytes, getRTSStats)
@@ -26,18 +26,20 @@ import System.Mem (performMinorGC)
 -- | A program of this many loans, for any arrow that has what 'Runtime' bundles.
 type Program = forall arr. (Runtime arr) => Int -> arr () ()
 
--- | An arrow, how it runs a program for the unit, and the most that a loan of a free item may allocate, in bytes.
+-- | An arrow, how it runs a program for the unit, and the most that a loan of a free item may allocate, in bytes, of a pool
+-- that is a parameter and of one that is the arrow's input.
 data Runner = Runner
   { runnerName :: String,
     runnerRun :: Program -> Int -> IO (),
-    runnerCeiling :: Double
+    runnerCeiling :: Double,
+    runnerCeilingIn :: Double
   }
 
 runners :: [Runner]
 runners =
-  [ Runner "threads" (\program count -> void (runThreads (program count) ())) 1752,
-    Runner "delimited" (\program count -> void (runDelimited (program count) ())) 1279,
-    Runner "compiled" (\program count -> void (runCompiled (program count) ())) 2037
+  [ Runner "threads" (\program count -> void (runThreads (program count) ())) 1752 1936,
+    Runner "delimited" (\program count -> void (runDelimited (program count) ())) 1279 1468,
+    Runner "compiled" (\program count -> void (runCompiled (program count) ())) 2037 2275
   ]
 
 spec :: Spec
@@ -48,6 +50,13 @@ spec = describe "a loan of a free item" $ forM_ runners $ \runner -> describe (r
     reported runner "withLoan" bytes
     when (bytes > runnerCeiling runner + tolerance) $
       failTest ("a loan allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round (runnerCeiling runner) :: Int))
+
+  it "allocates no more when the pool is the arrow's input" $ do
+    pool <- newPool [7 :: Int]
+    bytes <- perLoan runner (\count -> times count (const (pool, ()) ^>> withLoanIn done >>> done))
+    reported runner "withLoanIn" bytes
+    when (bytes > runnerCeilingIn runner + tolerance) $
+      failTest ("a loan allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round (runnerCeilingIn runner) :: Int))
 
   it "costs no more with a deadline than without one" $ do
     pool <- newPool [7 :: Int]

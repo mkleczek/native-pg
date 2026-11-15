@@ -50,10 +50,9 @@ import Data.Sequence (Seq, ViewL (..), ViewR (..), viewl, viewr, (<|), (|>))
 import qualified Data.Sequence as Seq
 import Data.Tuple (swap)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (boolA, decide, done, keeping, step)
+import Network.Streaming.Combinators (alongside, boolA, decide, done, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Tickets (fulfilNow)
-import Network.Streaming.NotImplemented (notImplemented)
 
 -- | The items that are free, and how many, the number that the next waiter to queue gets, which says which of two
 -- waiters came first, and the waiters in their lanes, by how many items must be free to serve the first of the lane.
@@ -102,13 +101,13 @@ withLoanWithin :: (Runtime arr) => Duration -> Pool c -> arr (c, a) b -> arr a (
 withLoanWithin limit pool = loaned pool (checkoutWithin limit pool)
 
 -- | The same for a pool that is the arrow's input, with the input of the body after it: a program that is built once serves any
--- pool, as the pools of tenants are. Not yet.
+-- pool, as the pools of tenants are.
 withLoanIn :: (Runtime arr) => arr (c, a) b -> arr (Pool c, a) (Either PoolError b)
-withLoanIn _ = notImplemented "withLoanIn"
+withLoanIn = loanedIn (checkoutIn >>^ Right)
 
--- | The same, but the checkout gives up after the time, as 'withLoanWithin' does. Not yet.
+-- | The same, but the checkout gives up after the time, as 'withLoanWithin' does.
 withLoanWithinIn :: (Runtime arr) => Duration -> arr (c, a) b -> arr (Pool c, a) (Either PoolError b)
-withLoanWithinIn _ _ = notImplemented "withLoanWithinIn"
+withLoanWithinIn limit = loanedIn ((1,) ^>> checkoutAtWithin limit >>^ maybe (Left CheckoutTimedOut) Right)
 
 -- | The scope around a checkout, which is the arrow that gives the item or, if
 -- its deadline passed, nothing, and the release of what it gave.
@@ -121,6 +120,18 @@ loaned pool checkingOut body = scope acquire giveBack run
     giveBack = fst ^>> (done ||| release pool)
     run = withInput ^>> (arr Left ||| (body >>^ Right))
     withInput (acquired, input) = fmap (,input) acquired
+
+-- | 'loaned' for a pool that is the arrow's input: the arrow that gives the item takes the pool, and the release takes it
+-- again, with the item.
+loanedIn :: (Runtime arr) => arr (Pool c) (Either PoolError c) -> arr (c, a) b -> arr (Pool c, a) (Either PoolError b)
+loanedIn checkingOut body = scope acquire giveBack run
+  where
+    acquire =
+      now (\(pool, _) -> (\closed -> if closed then Left () else Right pool) <$> isClosed pool)
+        >>> (taking "closed" (arr (const (Left PoolClosed))) ||| taking "open" (alongside checkingOut >>^ \(got, pool) -> fmap (pool,) got))
+    giveBack = fst ^>> (done ||| offer)
+    run = withInput ^>> (arr Left ||| (body >>^ Right))
+    withInput (acquired, (_, input)) = fmap (\(_, item) -> (item, input)) acquired
 
 -- | The body, as a holder of what the pool lent goes: the pool serves those
 -- that hold something first, so that they can give it back. For now it is the
@@ -383,9 +394,9 @@ checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
       unlessDone
         ^>> (returnA ||| (swap ^>> first abandon >>> now (\(fulfilled, pool) -> maybe (pure ()) (releaseNow pool) fulfilled)))
 
--- | An item of the pool that is the arrow's input, once one is free, as 'checkout' waits for it. Not yet.
+-- | An item of the pool that is the arrow's input, once one is free, as 'checkout' waits for it.
 checkoutIn :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => arr (Pool conn) conn
-checkoutIn = notImplemented "checkoutIn"
+checkoutIn = (1,) ^>> checkoutAt
 
 -- | A connection, if one is free within the time, as 'checkout' waits for it: 'Nothing' if it isn't, once the
 -- place in the queue is given up. The deadline is armed only if the checkout has to wait.
@@ -411,9 +422,9 @@ takeNowWith choose pool@(Pool ref _) = isClosed pool >>= \closed -> if closed th
 release :: (Effect arr, Annotate arr) => Pool conn -> arr conn ()
 release pool = step "return item" (releaseNow pool . pure)
 
--- | Gives the item back to the pool that is the arrow's input, as 'release' does. Not yet.
+-- | Gives the item back to the pool that is the arrow's input, as 'release' does.
 offer :: (Effect arr, Annotate arr) => arr (Pool conn, conn) ()
-offer = notImplemented "offer"
+offer = step "return item" (\(pool, conn) -> releaseNow pool [conn])
 
 -- | Gives the items back to the pool: the oldest waiters that can have them are given them, and the rest are free. It
 -- is one action that never waits, so a part that is cancelled can't lose an item between a waiter that has gone and the

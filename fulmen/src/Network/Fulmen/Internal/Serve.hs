@@ -67,7 +67,7 @@ import Network.Streaming.Combinators
     withTicket,
   )
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Pool (queueNow, releaseNow, takeNowWith)
+import Network.Streaming.Pool (offer, queueNow, takeNowWith)
 
 -- | The server: for each core, the workers, and for the first, the acceptor, which opens the listener.
 serve :: (Runtime arr) => Settings -> Listen arr -> arr (Call, Request) () -> arr Cores ()
@@ -113,9 +113,9 @@ checkout =
       >>> (taking "no" queued ||| taking "yes" returnA)
       >>^ freeAddress
   where
-    queued = asking "free worker" (withTicket (step "queue for a worker" queue) (step "put the worker back" putBack)) >>^ snd
+    queued = asking "free worker" (withTicket (step "queue for a worker" queue) (putBack ^>> offer)) >>^ snd
     queue (promise, Cores _ shared) = queueNow (sharedWorkers shared) 1 promise
-    putBack (free, Cores _ shared) = releaseNow (sharedWorkers shared) [free]
+    putBack (free, Cores _ shared) = (sharedWorkers shared, free)
 
 -- | The position of the first free worker, in the order that the pool takes them in, of the core that has the most of
 -- them, which is the first core of those that tie.
@@ -145,10 +145,10 @@ closeLateSocket = box "close late socket" (fst ^>> close)
 offered :: (Runtime arr) => arr ((Inbox arr "connections" 'Anywhere Socket, Address "connections" 'Anywhere Socket), Cores) (Shared, Socket)
 offered =
   named (Label "offered" "Offers the worker as free in the pool, and collects the connection that is posted to its inbox.") $
-    tap (answering "free worker" (step "offer as free" offer)) >>> ((,) <$> arr sharedOf <*> (fst . fst ^>> collect))
+    tap (answering "free worker" (free ^>> offer)) >>> ((,) <$> arr sharedOf <*> (fst . fst ^>> collect))
   where
     sharedOf (_, Cores _ shared) = shared
-    offer ((_, address), Cores core shared) = releaseNow (sharedWorkers shared) [Free core address]
+    free ((_, address), Cores core shared) = (sharedWorkers shared, Free core address)
 
 -- | What a connection is: its socket, the bytes of the next request that came early, which a request copies out of
 -- its buffer, and what the cores share.

@@ -110,13 +110,13 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       run (withLoan pool done) `shouldReturn` Left PoolClosed
 
   describe "a pool that is the input" $ do
-    inInput $ it "gives an item of the pool in the input, and 'offer' gives it back" $ do
+    it "gives an item of the pool in the input, and 'offer' gives it back" $ do
       pool <- newPool [7 :: Int]
       run (const pool ^>> checkoutIn >>> alongside (now (const (free pool)))) `shouldReturn` ([], 7)
       run (const (pool, 7) ^>> offer) `shouldReturn` ()
       free pool `shouldReturn` [7]
 
-    inInput $ it "serves the part that waits first with the item that 'offer' gives back" $ do
+    it "serves the part that waits first with the item that 'offer' gives back" $ do
       pool <- newPool ([] :: [Int])
       taken <- newIORef []
       run $
@@ -127,40 +127,40 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       readIORef taken `shouldReturn` [7]
       free pool `shouldReturn` []
 
-    inInput $ it "gives up the place of a checkout that is cancelled while it waits, and has nobody waiting for the item" $ do
+    it "gives up the place of a checkout that is cancelled while it waits, and has nobody waiting for the item" $ do
       pool <- newPool [7 :: Int]
       -- The item is held by the outer body, so the checkout of the inner one has to wait for it.
       run (withLoan pool (within (millis 20) (const pool ^>> checkoutIn))) `shouldReturn` Right Nothing
       free pool `shouldReturn` [7]
       waiters pool `shouldReturn` 0
 
-    inInput $ it "lends an item of the pool in the input for as long as the body runs, and takes it back when it ends" $ do
+    it "lends an item of the pool in the input for as long as the body runs, and takes it back when it ends" $ do
       pool <- newPool [7 :: Int]
       run (const (pool, ()) ^>> withLoanIn (now (\(item, ()) -> (item,) <$> free pool))) `shouldReturn` Right (7, [])
       free pool `shouldReturn` [7]
 
-    inInput $ it "takes the item back when the body fails" $ do
+    it "takes the item back when the body fails" $ do
       pool <- newPool [7 :: Int]
       run (const (pool, ()) ^>> failsWith "boom" (withLoanIn (now (const (throwIO (userError "boom") :: IO ()))))) `shouldReturn` ()
       free pool `shouldReturn` [7]
 
-    inInput $ it "serves a program that is built once with each pool that it is given" $ do
+    it "serves a program that is built once with each pool that it is given" $ do
       one <- newPool [1 :: Int]
       other <- newPool [2 :: Int]
       run ((,) <$> (const (one, ()) ^>> lending) <*> (const (other, ()) ^>> lending)) `shouldReturn` (Right 1, Right 2)
 
-    inInput $ it "is 'PoolClosed' once the pool is closed" $ do
+    it "is 'PoolClosed' once the pool is closed" $ do
       pool <- newPool [7 :: Int]
       closePoolWith (const (pure ())) pool
       run (const (pool, ()) ^>> withLoanIn done) `shouldReturn` Left PoolClosed
 
-    inInput $ it "gives up the checkout after the time, and has nobody waiting for the item" $ do
+    it "gives up the checkout after the time, and has nobody waiting for the item" $ do
       pool <- newPool [7 :: Int]
       run (withLoan pool (const (pool, ()) ^>> withLoanWithinIn (millis 20) done)) `shouldReturn` Right (Left CheckoutTimedOut)
       free pool `shouldReturn` [7]
       waiters pool `shouldReturn` 0
 
-    inInput $ it "lends an item that is free at once, within the time" $ do
+    it "lends an item that is free at once, within the time" $ do
       pool <- newPool [7 :: Int]
       run (const (pool, ()) ^>> withLoanWithinIn (millis 20) (arr fst)) `shouldReturn` Right 7
 
@@ -242,8 +242,3 @@ recording disposed item = atomicModifyIORef' disposed (\items -> (item : items, 
 -- | The item of the pool that is the input, as a program that is built once.
 lending :: (Runtime arr) => arr (Pool Int, ()) (Either PoolError Int)
 lending = withLoanIn (arr fst)
-
--- | Marks a case that waits for the forms of the pool's functions that take the pool as the arrow's input. The mark comes
--- off when they are there, and a case that then passes unexpectedly fails the suite.
-inInput :: Spec -> Spec
-inInput = xfail "a pool that is the arrow's input"
