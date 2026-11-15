@@ -271,6 +271,7 @@ combine tree inner = case tree of
   Ap {} -> inOrder inner
   Try {} -> inOrder inner
   Shield {} -> inOrder inner
+  Grace {} -> inOrder inner
   Within {} -> inOrder inner
   TimeoutA {} -> inOrder inner
   Wires {} -> inOrder inner

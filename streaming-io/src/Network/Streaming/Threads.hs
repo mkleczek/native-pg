@@ -31,7 +31,7 @@ import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, rtsSupports
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
-import Control.Monad (foldM, forM_, unless, when)
+import Control.Monad (foldM, forM_, unless, void, when)
 import Data.Bits ((.&.))
 import Data.Foldable (traverse_)
 import Data.Functor (($>))
@@ -51,9 +51,8 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Internal.Atomic (update)
-import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
+import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), Hold (..), arrivalOf, armOnce, cancelledAnywhere, cancelledFlagged, gracedFrame, heldIn, heldUntil, holdOf, isCancelled, newCancelScope, reachedBy, setCancelledAtomic)
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, closeShelf, collectedWrongly, hasValue, lookOrWait, newShelf, postNow, postOrQueue, stopWaiting, takeWoken, withdraw)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Watch (awaitWatch)
@@ -97,11 +96,6 @@ newScope = nextIdent >>= \ident -> newCancelScope ident IntMap.empty
 enter, leave :: CancelScope Members -> Part -> IO ()
 enter s part@(Part ident _ _ _ _) = update (scopeMembers s) (\parts -> (IntMap.insert ident part parts, ()))
 leave s (Part ident _ _ _ _) = update (scopeMembers s) (\parts -> (IntMap.delete ident parts, ()))
-
--- | Sets the scope's flag, and gives the parts that were inside it. The flag is set with a barrier, so that a
--- part that enters the scope after the parts are read sees it.
-markCancelled :: CancelScope Members -> IO [Part]
-markCancelled s = atomicWriteIORef (scopeCancelled s) True *> (IntMap.elems <$> readIORef (scopeMembers s))
 
 data Phase
   = Running
@@ -209,23 +203,67 @@ waiting part@(Part _ _ frames _ _) wait =
 {-# INLINE waiting #-}
 
 -- | Cancels the scope: every part inside it has its flag set, whether or not it waits and a shield holds it, and
--- those that wait, and whose scope lies above their innermost shield, are thrown to, once; the others see it at
--- their next wait. The flag is set, with a barrier, before the phase is read: a part that begins to wait meanwhile
--- swaps its phase, and then looks at its flag.
+-- those that wait, and whose scope lies above their innermost shield, with no grace between that has a period still to pass, are
+-- thrown to, once; the others see it at their next wait. For each period of a grace that holds it from a part, a timer walks the
+-- scope again when the period has passed since the scope was cancelled. The flag is set, with a barrier, before the phase is read: a
+-- part that begins to wait meanwhile swaps its phase, and then looks at its flag.
 cancelScope :: CancelScope Members -> IO ()
-cancelScope scope' = mask_ $ do
-  parts <- markCancelled scope'
-  forM_ parts $ \(Part _ thread _ phase flag) -> do
-    atomicWriteIORef flag True
-    -- A part that began to wait again meanwhile has another phase to look at.
-    let attempt' = do
-          current <- readIORef phase
-          case current of
-            Waiting frames | deliverable (scopeIdent scope') frames -> do
-              thrown <- casPhase phase current Thrown
-              if thrown then uninterruptibleMask_ (throwTo thread (Cancelled (scopeIdent scope'))) else attempt'
-            _ -> pure ()
-    attempt'
+cancelScope scope' = mask_ (setCancelledAtomic scope' *> reaching scope' True)
+
+-- | Tells the parts inside the scope of its cancellation, as 'cancelScope' does, or, if it is not arriving, as the timer of a period
+-- does, which finds that a part is held no longer when the period has passed since the scope was cancelled.
+reaching :: CancelScope Members -> Bool -> IO ()
+reaching scope' arriving = do
+  parts <- IntMap.elems <$> readIORef (scopeMembers scope')
+  periods <- foldM visit [] parts
+  when arriving (forM_ periods (laterIn scope'))
+  where
+    ident = scopeIdent scope'
+    -- The periods that graces hold the cancellation from some part for, each once.
+    visit periods (Part _ thread frames phase flag) = do
+      atomicWriteIORef flag True
+      -- What the part's frames say now, whether it waits or runs: a part that enters a grace meanwhile does the same itself.
+      Hold _ held <- holdOf ident <$> readIORef frames
+      -- A part that began to wait again meanwhile has another phase to look at.
+      let attempt' = do
+            current <- readIORef phase
+            case current of
+              Waiting asleep -> do
+                reached <- case holdOf ident asleep of
+                  Hold True _ -> pure False
+                  Hold False 0 -> pure True
+                  Hold False period -> if arriving then pure False else passed period
+                when reached $ do
+                  thrown <- casPhase phase current Thrown
+                  if thrown then uninterruptibleMask_ (throwTo thread (Cancelled ident)) else attempt'
+              _ -> pure ()
+      attempt'
+      pure (if arriving && held > 0 && held `notElem` periods then held : periods else periods)
+    passed period = do
+      instant <- monotonicNanoseconds
+      arrival <- arrivalOf scope' instant
+      pure (instant >= heldUntil arrival period)
+
+-- | A timer that walks the scope again when the period has passed since it was cancelled, unless one is armed for the period already,
+-- or the period ends at the end of time: on a thread of GHC's timer manager, or a thread of its own where the run time has none.
+laterIn :: CancelScope Members -> Word64 -> IO ()
+laterIn scope' period = do
+  instant <- monotonicNanoseconds
+  armOnce scope' instant period >>= \case
+    Nothing -> pure ()
+    Just end -> do
+      let wait = fromIntegral (min 1000000000000000 ((end - min end instant + 999) `div` 1000))
+          again = mask_ (reaching scope' False)
+      if rtsSupportsBoundThreads
+        then getSystemTimerManager >>= \manager -> void (registerTimeout manager wait again)
+        else void (mask_ (forkIO (threadDelay wait *> again)))
+
+-- | The part has entered a grace of this period: if a cancellation is pending, the timers that let in the cancelled scopes that the
+-- period of this grace holds from it.
+armHeld :: Word64 -> Part -> IO ()
+armHeld period (Part _ _ frames _ _) = do
+  held <- readIORef frames >>= heldIn
+  forM_ [s | (s, longest) <- held, longest == period] (`laterIn` period)
 
 -- | Pushes a frame on the part's stack, runs the action, and pops it.
 framed :: Frame Members -> Part -> IO a -> IO a
@@ -238,6 +276,17 @@ framed frame (Part _ _ frames _ _) action = do
 -- | Runs the action behind a shield.
 shielded :: Part -> IO a -> IO a
 shielded = framed Shielded
+
+-- | Runs the action behind a grace of this period, whose frame is given. The frame is put on the stack with a barrier, and then the
+-- part looks at its flag, as a thread that cancels a scope sets the flag and then looks at the stack: one of them sees the other, and
+-- a cancellation that is pending when the part enters has its timer armed.
+graced :: Word64 -> Frame Members -> Part -> IO a -> IO a
+graced period frame part@(Part _ _ frames _ flag) action = do
+  readIORef frames >>= atomicWriteIORef frames . (frame :)
+  readIORef flag >>= \flagged -> when flagged (armHeld period part)
+  outcome <- try action
+  readIORef frames >>= writeIORef frames . drop 1
+  either (\failure -> throwIO (failure :: SomeException)) pure outcome
 
 -- | The part goes behind a shield, and leaves it.
 pushed, popped :: Part -> IO ()
@@ -264,7 +313,10 @@ instance Scope (ThreadsM m) where
 
   shield (Threads inner) = Threads (\part value -> shielded part (inner part value))
 
-  grace _ _ = Threads (\_ _ -> notImplementedIO "grace")
+  -- The frame is made when the arrow is built, so that entering the region allocates what entering a shield does.
+  grace (Duration limit) (Threads inner) =
+    let !frame = gracedFrame limit
+     in Threads (\part value -> graced limit frame part (inner part value))
 
 -- | A part that runs in the scope as well as in those of the part that made it, on a thread of its own, and what
 -- it came to once it ended: the scopes are left before the pair's policy is told.
@@ -409,7 +461,7 @@ inScope part@(Part _ _ frames _ flag) scope' action = do
   readIORef frames >>= writeIORef frames . (Inside scope' :)
   enter scope' part
   -- The deadline may have passed before the part was among the scope's members.
-  readIORef (scopeCancelled scope') >>= \cancelled -> when cancelled (atomicWriteIORef flag True)
+  isCancelled scope' >>= \cancelled -> when cancelled (atomicWriteIORef flag True)
   outcome <- try action
   leave scope' part
   readIORef frames >>= writeIORef frames . drop 1

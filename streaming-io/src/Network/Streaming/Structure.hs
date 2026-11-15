@@ -66,6 +66,8 @@ data Tree
     Try Tree
   | -- | A body that cancellations from outside don't reach.
     Shield Tree
+  | -- | A body that cancellations from outside reach only after a period.
+    Grace Duration Tree
   | -- | Two steps that run until the first ends.
     Race Tree Tree
   | -- | A body with a deadline.
@@ -151,6 +153,7 @@ children = \case
   Scope acquire release body -> [acquire, release, body]
   Try inner -> [inner]
   Shield inner -> [inner]
+  Grace _ inner -> [inner]
   Race one two -> [one, two]
   Within _ inner -> [inner]
   TimeoutA inner -> [inner]

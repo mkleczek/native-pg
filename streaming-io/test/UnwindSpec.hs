@@ -80,4 +80,4 @@ userFailure = toException . userError
 frames :: Part -> IO [String]
 frames part = map named <$> readIORef (partFrames part)
   where
-    named = \case Inside _ -> "inside"; Shielded -> "shielded"; Held -> "held"; Owes _ -> "owes"; Marked -> "marked"
+    named = \case Inside _ -> "inside"; Shielded -> "shielded"; Graced _ -> "graced"; Held -> "held"; Owes _ -> "owes"; Marked -> "marked"

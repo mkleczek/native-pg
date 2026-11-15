@@ -45,7 +45,7 @@ runners =
   ]
 
 spec :: Spec
-spec = describe "grace" $ forM_ runners $ \(Runner name run) -> describe name $ xfail "grace is not implemented yet" $ do
+spec = describe "grace" $ forM_ runners $ \(Runner name run) -> describe name $ do
   it "changes nothing for a cancellation that arrives after its body has ended" $ do
     noted <- newLog
     started <- monotonicNanoseconds

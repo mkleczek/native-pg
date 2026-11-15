@@ -22,7 +22,6 @@ where
 
 import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
-import Control.Exception (throw)
 import Data.Maybe (listToMaybe)
 import Data.Proxy (Proxy (..))
 import GHC.Stack (CallStack, SrcLoc, callStack, getCallStack)
@@ -30,7 +29,6 @@ import GHC.TypeLits (KnownSymbol, symbolVal)
 import Network.Streaming.Annotate (Annotate (..))
 import Network.Streaming.Classes
 import Network.Streaming.Mode (Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Structure (Shape (..), Tree (..), unnamedAction)
 import Prelude hiding (id, (.))
 
@@ -88,7 +86,7 @@ instance Scope Diagram where
   scope (Diagram acquire) (Diagram release) (Diagram body) = Diagram (Scope acquire release body)
   tryA (Diagram body) = Diagram (Try body)
   shield (Diagram body) = Diagram (Shield body)
-  grace _ _ = throw (NotImplemented "grace")
+  grace duration (Diagram body) = Diagram (Grace duration body)
 
 instance Race Diagram where
   race (Diagram one) (Diagram two) = Diagram (Race one two)

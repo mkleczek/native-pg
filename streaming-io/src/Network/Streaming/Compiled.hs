@@ -39,7 +39,6 @@ import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (notImplementedIO)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -206,7 +205,18 @@ instance Scope (CompiledM m) where
     writeIORef (runFailure run) failed
     inner (Context run part failed) value (\result -> leaves *> next result)
 
-  grace _ _ = Compiled (\_ _ _ -> notImplementedIO "grace")
+  -- The frame is made when the arrow is built, so that entering the region allocates what entering a shield does.
+  grace (Duration limit) (Compiled inner) =
+    let !frame = gracedFrame limit
+     in Compiled $ \(Context run part outer) value next -> do
+          pushFrame run part frame
+          flagged <- readIORef (partCancelled part)
+          -- A cancellation that is pending has a timer armed now, which lets it in when the period has passed.
+          when flagged (armHeld run part limit)
+          let leaves = popFrame run part *> writeIORef (runFailure run) outer
+              failed failure = leaves *> outer failure
+          writeIORef (runFailure run) failed
+          inner (Context run part failed) value (\result -> leaves *> next result)
 
 -- | Annotations are for diagrams: the arrow is run as it is.
 instance Annotate (CompiledM m)

@@ -181,7 +181,7 @@ shields = describe "a shield" $ do
 
 -- | Graces, whose period bounds how long they hold a cancellation off.
 graces :: Spec
-graces = describe "a grace" $ xfail "grace is not implemented yet" $ do
+graces = describe "a grace" $ do
   it "around a wait is not found, as its period bounds how long it holds a cancellation off" $ do
     report <- lint (grace (secs 5) (giveWay >>> quick) :: Diagram () ())
     summary report `shouldBe` ([], [])

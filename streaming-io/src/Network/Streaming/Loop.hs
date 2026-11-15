@@ -44,7 +44,6 @@ import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, changeHere, closeShelf, collectedWrongly, lookOrWait, newShelf, postNow, postOrQueue, takeNow)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Watch (Watch (..), delayWatch, fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
@@ -67,6 +66,10 @@ data Loop a b where
   Try :: Loop a b -> Loop a (Either SomeException b)
   Shield' :: Loop a b -> Loop a b
   Race' :: Loop a b -> Loop a c -> Loop a (Either b c)
+  -- | Waits until a scope beyond the first shield that the part is in is cancelled, or reaches the part outside it: the watch of a grace.
+  Behind :: Beyond -> Loop () ()
+  -- | Raises the cancellation that reaches the part: what a grace does when its period ended and it cut its body.
+  Reraise :: Loop () b
 
 instance Category Loop where
   id = Arr Function.id
@@ -108,7 +111,33 @@ instance Scope Loop where
   scope = Scope'
   tryA = Try
   shield = Shield'
-  grace _ _ = Now (\_ -> notImplementedIO "grace")
+  grace (Duration limit) = graced limit
+
+-- | A grace is a shield around a race of its body and a watch, which waits until a cancellation from outside is there, waits for the
+-- period, and then waits until the cancellation reaches the part outside the shield: it ends, which cancels the body at its next
+-- wait. The body leaves its result where the grace finds it: if it ended, the result is the result, whichever half the race
+-- ended with, and the cancellation stays for the scope outside to find; if it was cut, the cancellation that is there is raised
+-- outside the shield. The periods of nested graces are waited for at once, as the cancellation of the scope outside all of them is,
+-- and each grace waits for the ones outside it to let it in.
+graced :: Word64 -> Loop a b -> Loop a b
+graced limit body =
+  Now (\input -> (,) input <$> newIORef Nothing)
+    `Seq` Arr (\both@(_, result) -> (both, result))
+    `Seq` First (Shield' (Race' (First body `Seq` Now (\(value, result) -> writeIORef result (Just value))) watch))
+    `Seq` Now (\(_, result) -> readIORef result)
+    `Seq` Arr (maybe (Left ()) Right)
+    `Seq` (Reraise ||| Arr Function.id)
+  where
+    watch =
+      Arr (const ())
+        `Seq` Behind Somewhere
+        `Seq` Clock
+        `Seq` Arr (\(Instant at) -> Until (Instant (at + limit)))
+        `Seq` Block
+        `Seq` Behind Deliverable
+
+-- | What a grace's watch waits for beyond its shield: a scope that is cancelled, or one whose cancellation reaches the part there.
+data Beyond = Somewhere | Deliverable
 
 instance Race Loop where
   race = Race'
@@ -251,6 +280,57 @@ cancelledSTM = go Nothing
       Shielding _ -> pure found
     inside (LoopScope ident flag _) found rest = readTVar flag >>= \cancelled -> go (if cancelled then Just ident else found) rest
 
+-- | The frames outside the first shield of a part's frames.
+data Outside r = forall y. Outside (Frames y r)
+
+outsideShield :: Frames b r -> Maybe (Outside r)
+outsideShield = \case
+  Return -> Nothing
+  Then _ rest -> outsideShield rest
+  Beside _ rest -> outsideShield rest
+  OnLeft rest -> outsideShield rest
+  Joining _ rest -> outsideShield rest
+  RaceFirst _ rest -> outsideShield rest
+  RaceSecond _ rest -> outsideShield rest
+  Acquired _ _ _ rest -> outsideShield rest
+  Guarded _ _ rest -> outsideShield rest
+  Releasing _ _ rest -> outsideShield rest
+  Trying rest -> outsideShield rest
+  Shielding rest -> Just (Outside rest)
+
+-- | Whether any scope in the frames, whatever lies between, is cancelled.
+cancelledAnywhereSTM :: Frames b r -> STM Bool
+cancelledAnywhereSTM = go
+  where
+    go :: Frames x y -> STM Bool
+    go = \case
+      Return -> pure False
+      Then _ rest -> go rest
+      Beside _ rest -> go rest
+      OnLeft rest -> go rest
+      Joining (Group scope' _ _) rest -> inside scope' rest
+      RaceFirst (Contest scope' _) rest -> inside scope' rest
+      RaceSecond (Contest scope' _) rest -> inside scope' rest
+      Acquired _ _ _ rest -> go rest
+      Guarded _ _ rest -> go rest
+      Releasing _ _ rest -> go rest
+      Trying rest -> go rest
+      Shielding rest -> go rest
+    inside (LoopScope _ flag _) rest = readTVar flag >>= \cancelled -> if cancelled then pure True else go rest
+
+-- | What a grace's watch waits for, in the frames of the part: retries until it is there.
+beyondSTM :: Beyond -> Frames b r -> STM ()
+beyondSTM beyond frames = case outsideShield frames of
+  Nothing -> retry
+  Just (Outside rest) -> case beyond of
+    Somewhere -> cancelledAnywhereSTM rest >>= check
+    Deliverable -> cancelledSTM rest >>= maybe retry (const (pure ()))
+
+-- | Whether a grace's watch has what it waits for, without waiting, if any scope has been cancelled at all.
+beyondNow :: Env -> Beyond -> Frames b r -> IO Bool
+beyondNow (Env anyCancelled _) beyond frames =
+  readTVarIO anyCancelled >>= \cancelled -> if cancelled then atomically ((True <$ beyondSTM beyond frames) `orElse` pure False) else pure False
+
 -- | The watch of a part that waits for an event: the event, or a cancellation that reaches the part.
 watchFor :: Env -> Event -> Process r -> IO Watch
 watchFor (Env anyCancelled _) event process = (\(Watch ready cancel) -> Watch (ready `orElse` cancelled) cancel) <$> watchOf event
@@ -357,6 +437,14 @@ advance env time fuel wake = go 0
             Scope' acquire release body -> go steps (Run acquire input (Acquired release body input frames))
             Try inner -> go steps (Run inner input (Trying frames))
             Shield' inner -> go steps (Run inner input (Shielding frames))
+            Behind beyond ->
+              beyondNow env beyond frames >>= \case
+                True -> go steps (Give () frames)
+                False -> pure (steps + 1, Waits (Watched (pure (Watch (beyondSTM beyond frames) (pure ())))) (Check frames))
+            Reraise ->
+              cancelledNow env frames >>= \case
+                Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
+                Nothing -> ioError (userError "a grace ended and found no cancellation to deliver")
           Give value frames -> case frames of
             Return -> pure (steps, Finished value)
             Then next rest -> go steps (Run next value rest)

@@ -67,7 +67,7 @@ spec = describe "the chart of an inbox" $ do
     chart <- chartOf (timeoutA (quick >>> quick) :: Diagram (Duration, ()) (Maybe ()))
     any ("within the duration of the input" `isInfixOf`) chart `shouldBe` True
 
-  xfail "grace is not implemented yet" $ it "has a group for a grace, which says its period" $ do
+  it "has a group for a grace, which says its period" $ do
     chart <- chartOf (grace (secs 30) (quick >>> quick) :: Diagram () ())
     any ("grace 30 s" `isInfixOf`) chart `shouldBe` True
 

@@ -74,6 +74,7 @@ module Network.Streaming.Internal.Scheduler
     pushFrame,
     popFrame,
     shieldTop,
+    armHeld,
     Floor (..),
     unwindFrames,
     observing,
@@ -97,7 +98,7 @@ where
 import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, yield)
 import Control.Concurrent.STM (atomically, orElse, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, toException, try)
-import Control.Monad (foldM, when)
+import Control.Monad (foldM, forM_, void, when)
 import Data.Bits ((.&.), (.|.))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
@@ -549,7 +550,7 @@ newScope run = nextWait run >>= (`newCancelScope` [])
 childPart :: Run -> Part -> PartScope -> IO Part
 childPart run parent scope' = do
   outer <- readIORef (partFrames parent)
-  flagged <- if null outer then readIORef (scopeCancelled (runRoot run)) else readIORef (partCancelled parent)
+  flagged <- if null outer then isCancelled (runRoot run) else readIORef (partCancelled parent)
   child <- Part <$> nextWait run <*> newIORef (Inside scope' : if null outer then [Inside (runRoot run)] else outer) <*> newIORef NotWaiting <*> newIORef flagged
   adjust run 9 1
   modifyIORef' (scopeMembers scope') (<> [child])
@@ -561,7 +562,7 @@ childPart run parent scope' = do
 childParts :: Run -> Part -> PartScope -> Int -> IO [Part]
 childParts run parent scope' count = do
   outer <- readIORef (partFrames parent)
-  flagged <- if null outer then readIORef (scopeCancelled (runRoot run)) else readIORef (partCancelled parent)
+  flagged <- if null outer then isCancelled (runRoot run) else readIORef (partCancelled parent)
   let frames = Inside scope' : if null outer then [Inside (runRoot run)] else outer
   -- Made in a loop that keeps no stack of its own: a group of thousands of parts starts under a small stack limit.
   children <- reverse <$> foldM (\made _ -> (: made) <$> (Part <$> nextWait run <*> newIORef frames <*> newIORef NotWaiting <*> newIORef flagged)) [] [1 .. count]
@@ -588,7 +589,7 @@ pushFrame run part frame = do
       adjust run 9 1
       writeIORef (partFrames part) [frame, Inside (runRoot run)]
       -- The root may have been cancelled while the part was in no scope.
-      readIORef (scopeCancelled (runRoot run)) >>= \cancelled -> when cancelled (writeIORef (partCancelled part) True)
+      isCancelled (runRoot run) >>= \cancelled -> when cancelled (writeIORef (partCancelled part) True)
     _ -> writeIORef (partFrames part) (frame : frames)
   case frame of Inside s -> writeIORef (scopeMembers s) [part]; _ -> pure ()
 {-# NOINLINE pushFrame #-}
@@ -651,28 +652,60 @@ checkpoint part =
     when flagged (readIORef (partFrames part) >>= reachedBy (partCancelled part) >>= maybe (pure ()) (throwIO . Cancelled))
 
 -- | Cancels the scope: its flag is set, and so is that of every part inside it, whether or not it waits and a shield
--- holds it. The parts that wait, and whose scope lies above their innermost shield, are taken off what they wait at,
--- and put back among those that can go on, with the cancellation to raise where they wait. The others see it at their
--- next wait. The parts inside it are those it began with, and the parts of the groups and the halves of the races that
--- those are suspended at, and so on.
+-- holds it. The parts that wait, and whose scope lies above their innermost shield, with no grace between that has a period still to
+-- pass, are taken off what they wait at, and put back among those that can go on, with the cancellation to raise where they wait.
+-- The others see it at their next wait, and for each period of a grace that holds it from a part, a timer of the run's wheel walks
+-- the scope again when the period has passed since now. The parts inside it are those it began with, and the parts of the groups and
+-- the halves of the races that those are suspended at, and so on.
 cancelScope :: Run -> PartScope -> IO ()
-cancelScope run scope' = do
-  writeIORef (scopeCancelled scope') True
-  readIORef (scopeMembers scope') >>= inside
+cancelScope run scope' = setCancelled scope' *> reach run scope' True
+
+-- | Tells the parts inside the scope of its cancellation, as 'cancelScope' does, or, if it is not arriving, as the timer of a
+-- period does, which finds that a part is held no longer when the period has passed since the scope was cancelled.
+reach :: Run -> PartScope -> Bool -> IO ()
+reach run scope' arriving = readIORef (scopeMembers scope') >>= inside []
   where
-    inside = \case
-      [] -> pure ()
+    ident = scopeIdent scope'
+    -- The periods that graces hold the cancellation from some part for, each once.
+    inside periods = \case
+      [] -> when arriving (forM_ periods (laterIn run scope'))
       part : others -> do
         frames <- readIORef (partFrames part)
         waiting <- readIORef (partWait part)
         writeIORef (partCancelled part) True
-        when (deliverable (scopeIdent scope') frames) $
-          stopWait run (Cancelled (scopeIdent scope')) waiting >>= \case
-            Nothing -> pure ()
-            Just resume -> modifyIORef' (runTickets run) (resume :)
+        let Hold shielded period = holdOf ident frames
+        reached <- if shielded then pure False else if period == 0 then pure True else if arriving then pure False else passed period
+        when reached (deliver waiting)
+        -- A grace holds the cancellation from the part, whether a shield does as well or not: a timer lets it in.
+        let periods' = if arriving && period > 0 && period `notElem` periods then period : periods else periods
         case waiting of
-          InGroup members -> readIORef (scopeMembers members) >>= \more -> inside (more <> others)
-          _ -> inside others
+          InGroup members -> readIORef (scopeMembers members) >>= \more -> inside periods' (more <> others)
+          _ -> inside periods' others
+    deliver waiting =
+      stopWait run (Cancelled ident) waiting >>= \case
+        Nothing -> pure ()
+        Just resume -> modifyIORef' (runTickets run) (resume :)
+    passed period = do
+      now <- roundNow run
+      arrival <- arrivalOf scope' now
+      pure (now >= heldUntil arrival period)
+
+-- | A timer that walks the scope again when the period has passed since it was cancelled, unless one is armed for the period already,
+-- or the period ends at the end of time.
+laterIn :: Run -> PartScope -> Word64 -> IO ()
+laterIn run scope' period = do
+  now <- roundNow run
+  armOnce scope' now period >>= \case
+    Nothing -> pure ()
+    Just end -> void (addTimer (runWheel run) end (reach run scope' False))
+
+-- | The part has entered a grace of this period: if a cancellation is pending, the timers that lets in the cancelled scopes that the
+-- period of this grace holds from it. Not inlined, as it is for the part that enters a region with a cancellation pending only.
+armHeld :: Run -> Part -> Word64 -> IO ()
+armHeld run part period = do
+  held <- readIORef (partFrames part) >>= heldIn
+  forM_ [s | (s, longest) <- held, longest == period] (\s -> laterIn run s period)
+{-# NOINLINE armHeld #-}
 
 -- | Takes the part off what it waits at, if it still does: what goes on with the part.
 stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))

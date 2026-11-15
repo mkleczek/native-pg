@@ -107,7 +107,7 @@ spec = do
     -- A region that keeps a cancellation for its period costs a loop in it nothing, and costs each entry what a shield does:
     -- a frame on the part's stack, and nothing of its own until a cancellation arrives (the interpreter of 'Loop' makes a race
     -- of the region, and is not held to that).
-    when (name /= "loop") $ xfail "grace is not implemented yet" $ do
+    when (name /= "loop") $ do
       it "costs a loop in a grace no allocation in it" $
         costsAtMost runner "grace" tolerance yielding (grace (secs 3600) . yielding)
 

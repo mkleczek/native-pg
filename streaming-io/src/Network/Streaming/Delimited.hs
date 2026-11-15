@@ -68,7 +68,6 @@ import Network.Streaming.Internal.Timers (Timer, addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Counters (Counter (Captures))
 import Network.Streaming.Mode (Instrumented (bump), Mode (..), ModeOf)
-import Network.Streaming.NotImplemented (notImplementedIO)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -250,7 +249,16 @@ shielding :: Context -> IO ()
 shielding (Context run _ part) = pushFrame run part Shielded
 {-# OPAQUE shielding #-}
 
--- | The shield ended with the result: the part leaves it. Not inlined, so that the frame that follows the arrow holds only the
+-- | The part goes behind a grace, which holds the cancellations from outside for its period. If a cancellation is pending already, the
+-- timer that lets it in is armed now. Not inlined, so that the frame that follows the body holds only the context.
+gracing :: Context -> Frame [Part] -> IO ()
+gracing (Context run _ part) frame = do
+  pushFrame run part frame
+  flagged <- readIORef (partCancelled part)
+  when flagged (case frame of Graced period -> armHeld run part period; _ -> pure ())
+{-# OPAQUE gracing #-}
+
+-- | The shield or the grace ended with the result: the part leaves it. Not inlined, so that the frame that follows the arrow holds only the
 -- context.
 unshielded :: Context -> b -> IO b
 unshielded (Context run _ part) result = result <$ popFrame run part
@@ -292,7 +300,12 @@ instance Scope (DelimitedM m s) where
     shielding context
     inner context value >>= unshielded context
 
-  grace _ _ = Delimited (\_ _ -> notImplementedIO "grace")
+  -- The frame is made when the arrow is built, so that entering the region allocates what entering a shield does.
+  grace (Duration limit) (Delimited inner) =
+    let !frame = gracedFrame limit
+     in Delimited $ \context value -> do
+          gracing context frame
+          inner context value >>= unshielded context
 
 -- | Annotations are for diagrams: the arrow is run as it is.
 instance Annotate (DelimitedM m s)
