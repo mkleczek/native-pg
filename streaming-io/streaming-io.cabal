@@ -9,6 +9,7 @@ extra-source-files: test/check-positive-int.sh
                     test/check-one-buffer.sh
                     test/check-no-io-waits.sh
                     test/check-steps.sh
+                    test/check-named.sh
                     test/compile/*.hs
 
 library
@@ -38,6 +39,7 @@ library
                    Network.Streaming.Pool
                    Network.Streaming.Loans
                    Network.Streaming.NotImplemented
+                   Network.Streaming.Named
                    Network.Streaming.Diagram
                    Network.Streaming.Diagram.Mermaid
                    Network.Streaming.Structure
@@ -93,6 +95,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Pool
                  Network.Streaming.Loans
                  Network.Streaming.NotImplemented
+                 Network.Streaming.Named
                  Network.Streaming.Diagram
                  Network.Streaming.Diagram.Mermaid
                  Network.Streaming.Structure
@@ -109,6 +112,7 @@ test-suite streaming-io-spec
                  EmptyPoolSpec
                  InboxSpec
                  MermaidSpec
+                 NamedSpec
                  PositiveIntSpec
                  ResourcesSpec
                  WatchSpec

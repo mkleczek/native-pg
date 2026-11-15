@@ -11,6 +11,7 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (box, done, withInbox)
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
+import Network.Streaming.Named (is)
 import Skeletest
 
 -- | A step that never waits.
@@ -37,7 +38,7 @@ together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhe
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 
 spec :: Spec
-spec = describe "the chart of an inbox" $ do
+spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
     chart <- chartOf (owning (beside (poster, collector)))
     case storeIn chart of
@@ -66,6 +67,13 @@ spec = describe "the chart of an inbox" $ do
   it "has no store, and no edge of a message, for a program with no inbox" $ do
     chart <- chartOf (quick >>> quick :: Diagram () ())
     (storeIn chart, any ("-.->" `isInfixOf`) (stripped chart)) `shouldBe` (Nothing, False)
+
+  -- The stub of 'is' fails until it is written, and the mark comes off with it.
+  xfail "Network.Streaming.Named is a stub: is does not name the wire yet" $
+    it "has the name of each field that is made on the wire out of its step" $ do
+      chart <- chartOf ((is "name" quick &&& is "size" quick) >>> quick :: Diagram () ())
+      let labelled = [name | name <- ["name", "size"], any (("|\"" ++ name ++ "\"|") `isInfixOf`) (stripped chart)]
+      labelled `shouldBe` ["name", "size"]
 
 -- | The chart of the top page of the program, as lines.
 chartOf :: Diagram a b -> IO [String]
