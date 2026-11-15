@@ -63,6 +63,7 @@ defaultSettings =
     Nothing
     (Just (secs 30))
     Nothing
+    (Just (secs 30))
 
 -- | The cores that a server runs on, from its settings and how many there are: what they share, the pool of request
 -- buffers that the settings size included, and the first core's own value.

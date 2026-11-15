@@ -48,7 +48,11 @@ data Settings = Settings
     -- | The event that starts a graceful shutdown, if the server has one: when it fires, the listener closes, a connection
     -- that waits for its next request closes, a request in flight finishes and says that its connection ends, and the
     -- server returns when none is left.
-    shutdown :: Maybe Event
+    shutdown :: Maybe Event,
+    -- | How long a request in flight has, once the shutdown has begun, to finish before it is cancelled: its handler's scopes are
+    -- released, its transactions roll back and its connection closes. 'Nothing' waits for ever, as Warp does unless it is given a
+    -- timeout. It counts from the start of the shutdown, and only a server that has a 'shutdown' event has a drain.
+    drainTimeout :: Maybe Duration
   }
 
 -- | One request in flight: its loans, its body and its answer.
