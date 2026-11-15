@@ -33,7 +33,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Database.PostgreSQL.Connection (ConnectSettings (connectResolver))
-import Database.PostgreSQL.ConnectionString (emptyDefaults, fromConnectionString, readConnectionString)
+import Database.PostgreSQL.ConnectionString (fromConnectionString, parseConnectionString, readDefaults)
 import Data.Maybe (isJust)
 import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), Maintenance, closeConnectionPool, connectionPoolSettings, maintain, newConnectionPool, newMaintenance, withConnection)
 import Database.PostgreSQL.Resolver (newResolver)
@@ -240,7 +240,8 @@ listening (host, port) info = tcp {Fulmen.openListener = Fulmen.openListener tcp
 connectSettingsOf :: String -> IO ConnectSettings
 connectSettingsOf uri = do
   resolver <- newResolver
-  settings <- readConnectionString (emptyDefaults "localhost" Nothing) (C.pack uri) >>= either die (either die pure . fromConnectionString)
+  defaults <- readDefaults "localhost" Nothing []
+  settings <- either die (either die pure . fromConnectionString) (parseConnectionString defaults (C.pack uri))
   pure settings {connectResolver = Just resolver}
 
 -- | The server, and the maintenance of the pools beside it if a pool has a lifetime or an idle time: one more part of the

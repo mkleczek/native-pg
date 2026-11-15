@@ -25,7 +25,7 @@ data ConnectionString = ConnectionString
     connectionHosts :: NonEmpty Host,
     connectionUser :: ByteString,
     connectionPassword :: Maybe ByteString,
-    -- | Password-file matches, resolved by 'readConnectionString' separately
+    -- | Password-file matches, resolved by 'Database.PostgreSQL.ConnectionString.parseConnectionString' separately
     -- for each host. An explicitly supplied password takes priority.
     connectionHostPasswords :: [(Host, ByteString)],
     connectionDatabase :: ByteString,

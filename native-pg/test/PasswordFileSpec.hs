@@ -29,23 +29,22 @@ spec = do
 -- | The password files, which the defaults read, and what a connection string takes from them.
 passwordFiles :: Spec
 passwordFiles = describe "password files" $ do
-  let once = xfail "v2: the defaults aren't read once yet"
-  once $ it "resolves a different password for each host and port" $ isolated $
+  it "resolves a different password for each host and port" $ isolated $
     withPassfile "h1:5432:d:u:first\nh2:5433:d:u:second\n" $ \file ->
       passwords file "host=h1,h2 port=5432,5433" `shouldReturn` [Just "first", Just "second"]
-  once $ it "uses the first matching entry, including wildcards in all four fields" $ isolated $
+  it "uses the first matching entry, including wildcards in all four fields" $ isolated $
     withPassfile "# comment\n\nbroken\nother:5432:d:u:no\nh:5433:d:u:no\nh:5432:other:u:no\nh:5432:d:other:no\n*:5432:d:u:first\nh:5432:d:u:second\n" $ \file -> do
       passwords file "host=h" `shouldReturn` [Just "first"]
       withPassfile "h:*:*:*:wild\n" $ \wild ->
         passwords wild "host=h port=6543 dbname=other user=other" `shouldReturn` [Just "wild"]
-  once $ it "unescapes colons and backslashes in matching fields and passwords" $ isolated $
+  it "unescapes colons and backslashes in matching fields and passwords" $ isolated $
     withPassfile "db\\:host\\\\slash:5432:db\\:name:u\\:ser:p\\:ass\\\\word\r\n" $ \file ->
       passwords file ("host=" <> quoted "db:host\\slash" <> " dbname=" <> quoted "db:name" <> " user=" <> quoted "u:ser") `shouldReturn` [Just "p:ass\\word"]
-  once $ it "treats an escaped asterisk as a literal rather than a wildcard" $ isolated $
+  it "treats an escaped asterisk as a literal rather than a wildcard" $ isolated $
     withPassfile "\\*:5432:d:u:literal\n*:5432:d:u:wild\n" $ \file -> do
       passwords file "host=other" `shouldReturn` [Just "wild"]
       passwords file "host=*" `shouldReturn` [Just "literal"]
-  once $ it "matches the named host before hostaddr and uses localhost for default sockets" $ isolated $
+  it "matches the named host before hostaddr and uses localhost for default sockets" $ isolated $
     withPassfile "localhost:5432:d:u:local\n/tmp:5432:d:u:socket-name\n/custom:5432:d:u:socket\n10.0.0.1:5432:d:u:address\nnamed:5432:d:u:name\n" $ \file -> do
       passwords file "" `shouldReturn` [Just "local"]
       passwords file "host=/tmp" `shouldReturn` [Just "local"]
@@ -54,23 +53,23 @@ passwordFiles = describe "password files" $ do
       passwords file "host=named hostaddr=10.0.0.1" `shouldReturn` [Just "name"]
       passwords file "host=/tmp hostaddr=10.0.0.1" `shouldReturn` [Just "socket-name"]
       passwords file "host=,named hostaddr=,10.0.0.1" `shouldReturn` [Just "local", Just "name"]
-  once $ it "uses the user as the database name when no database is supplied" $ isolated $
+  it "uses the user as the database name when no database is supplied" $ isolated $
     withPassfile "*:5432:u:u:default-db\n" $ \file ->
       readPasswordsFrom [file] ("user=u sslmode=disable passfile=" <> quoted (Char8.pack file)) `shouldReturn` [Just "default-db"]
-  once $ it "uses PGPASSFILE and lets an explicit passfile override it" $ isolated $
+  it "uses PGPASSFILE and lets an explicit passfile override it" $ isolated $
     withPassfile "*:5432:d:u:environment\n" $ \environmentFile ->
       withPassfile "*:5432:d:u:explicit\n" $ \explicitFile ->
         withVariable "PGPASSFILE" (Just environmentFile) $ do
           readPasswords base `shouldReturn` [Just "environment"]
           passwords explicitFile "" `shouldReturn` [Just "explicit"]
-  once $ it "gives supplied passwords priority over password files" $ isolated $
+  it "gives supplied passwords priority over password files" $ isolated $
     withPassfile "*:5432:d:u:file\n" $ \file ->
       withVariable "PGPASSWORD" (Just "environment") $ do
         passwords file "" `shouldReturn` [Just "environment"]
         passwords file "password=explicit" `shouldReturn` [Just "explicit"]
         -- An explicitly empty password suppresses PGPASSWORD and requests file lookup.
         passwords file "password=''" `shouldReturn` [Just "file"]
-  once $ it "reads the platform's default password file" $ isolated $
+  it "reads the platform's default password file" $ isolated $
     withTemporaryDirectory $ \directory -> do
 #if defined(mingw32_HOST_OS)
       let subdirectory = directory <> "/postgresql"
@@ -91,7 +90,7 @@ passwordFiles = describe "password files" $ do
       withPassfile "other:5432:d:u:password\n" $ \file ->
         passwords file "host=h" `shouldReturn` [Nothing]
 #if !defined(mingw32_HOST_OS)
-  once $ it "rejects any group or world access and accepts a private Unix file" $ isolated $
+  it "rejects any group or world access and accepts a private Unix file" $ isolated $
     withPassfile "*:5432:d:u:private\n" $ \file -> do
       setFileMode file 0o640
       passwords file "" `shouldReturn` [Nothing]
@@ -173,18 +172,17 @@ isolated action = do
 -- local user, the password files and the default root certificate file. Parsing a connection string then reads nothing.
 readOnce :: Spec
 readOnce = describe "defaults read once" $ do
-  let needsOnce = xfail "v2: the defaults aren't read once yet"
-      hostsOf string defaults = map hostName . toList . connectionHosts <$> parseConnectionString defaults string
-  needsOnce $ it "reads the environment when it reads the defaults, and parsing reads it no more" $ isolated $
+  let hostsOf string defaults = map hostName . toList . connectionHosts <$> parseConnectionString defaults string
+  it "reads the environment when it reads the defaults, and parsing reads it no more" $ isolated $
     withVariable "PGHOST" (Just "before.example") $ do
       defaults <- readDefaults "/tmp" Nothing []
       withVariable "PGHOST" (Just "after.example") $
         hostsOf "user=u" defaults `shouldBe` Right ["before.example"]
 #if !defined(mingw32_HOST_OS)
-  needsOnce $ it "reads the name of the local user" $ isolated $ do
+  it "reads the name of the local user" $ isolated $ do
     defaults <- readDefaults "/tmp" Nothing []
     getEffectiveUserName >>= \name -> defaultUser defaults `shouldBe` Just name
-  needsOnce $ it "reads the default password file when it reads the defaults, and parsing reads it no more" $ isolated $
+  it "reads the default password file when it reads the defaults, and parsing reads it no more" $ isolated $
     withTemporaryDirectory $ \directory -> do
       let file = directory <> "/.pgpass"
       BS.writeFile file "*:5432:d:u:first\n"
@@ -196,7 +194,7 @@ readOnce = describe "defaults read once" $ do
         removeFile file
         passwordsOf defaults base `shouldBe` Right [Just "first"]
 #endif
-  needsOnce $ it "reads a password file that a connection string names when it reads the defaults, and not again" $ isolated $
+  it "reads a password file that a connection string names when it reads the defaults, and not again" $ isolated $
     withPassfile "*:5432:d:u:first\n" $ \file -> do
       defaults <- readDefaults "/tmp" Nothing [file]
       BS.writeFile file "*:5432:d:u:second\n"
@@ -206,7 +204,7 @@ readOnce = describe "defaults read once" $ do
     withPassfile "*:5432:d:u:first\n" $ \file -> do
       defaults <- readDefaults "/tmp" Nothing []
       passwordsOf defaults (base <> " passfile=" <> quoted (Char8.pack file)) `shouldBe` Right [Nothing]
-  needsOnce $ it "looks for the default root certificate file when it reads the defaults, and parsing doesn't look again" $ isolated $
+  it "looks for the default root certificate file when it reads the defaults, and parsing doesn't look again" $ isolated $
     withTemporaryDirectory $ \directory -> do
       BS.writeFile (directory <> "/root.crt") ""
       defaults <- readDefaults "/tmp" (Just directory) []
