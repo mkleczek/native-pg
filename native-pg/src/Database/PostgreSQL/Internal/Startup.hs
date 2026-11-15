@@ -188,7 +188,7 @@ react settings (tag, body) phase = case (tag, phase) of
       Qualifies -> pure (Finish info)
       Disqualified why -> throwIO (Unsuitable why)
       Asks question -> answering (questionOutput question) (Checking info question (Right Nothing))
-    requirePassword = maybe (throwIO (AuthenticationError "the server asks for a password, but none is set")) pure (connectPassword settings)
+    requirePassword = maybe (throwIO (AuthenticationError "fe_sendauth: no password supplied")) pure (connectPassword settings)
     -- The server's first message: what it asks for.
     requested version = case code of
       0
@@ -200,14 +200,13 @@ react settings (tag, body) phase = case (tag, phase) of
             _ <- requirePassword
             (clientFirst, client) <- scramClientFirst WithoutChannelBinding "" <$> newScramNonce
             answering (serialize (SASLInitialResponse scramMechanism (Just clientFirst))) (Challenged version client)
-        | otherwise -> throwIO (UnsupportedAuthentication ("SASL with " <> show (takeWhile (not . BS.null) (BS.split 0 rest))))
+        | otherwise -> throwIO (UnsupportedAuthentication "none of the server's SASL authentication mechanisms are supported")
       _ | required -> throwIO (AuthenticationError "channel binding required but not supported by server's authentication request")
       3 -> requirePassword >>= \password -> answering (serialize (PasswordMessage password)) (Authenticated version)
       5 -> requirePassword >>= \password -> answering (serialize (PasswordMessage (md5Password (connectUser settings) password (BS.take 4 rest)))) (Authenticated version)
-      2 -> throwIO (UnsupportedAuthentication "Kerberos V5")
-      7 -> throwIO (UnsupportedAuthentication "GSSAPI")
-      9 -> throwIO (UnsupportedAuthentication "SSPI")
-      other -> throwIO (ProtocolError ("unknown authentication request " <> show other))
+      7 -> throwIO (UnsupportedAuthentication "GSSAPI authentication not supported")
+      9 -> throwIO (UnsupportedAuthentication "SSPI authentication not supported")
+      other -> throwIO (UnsupportedAuthentication ("authentication method " <> show other <> " not supported"))
 -- Not inlined: it is plain IO, the same for every runtime, and inlined it was copied into each runtime's startup.
 {-# NOINLINE react #-}
 

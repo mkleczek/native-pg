@@ -60,7 +60,8 @@ data ConnectError
   | -- | The server's messages don't follow the protocol.
     ProtocolError String
   | -- | The server asked for an authentication method this client doesn't
-    -- implement.
+    -- implement, in the words of libpq's: GSSAPI, SSPI, a method that no
+    -- client has, or SASL mechanisms that are all unknown.
     UnsupportedAuthentication String
   | -- | Authentication failed on the client's side: a password is needed but
     -- missing, or the server's SCRAM signature doesn't match.
@@ -95,7 +96,7 @@ instance Exception ConnectError where
       "connection to server on socket " <> show path <> " failed: " <> describe failure socketHint
     ConnectionRejected rejection -> displayException rejection
     ProtocolError reason -> "protocol error: " <> reason
-    UnsupportedAuthentication method -> "the server asks for authentication with " <> method <> ", which isn't supported"
+    UnsupportedAuthentication reason -> reason
     AuthenticationError reason -> reason
     TlsFailure reason -> reason
     Broke reason -> reason

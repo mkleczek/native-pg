@@ -95,7 +95,7 @@ scramClientFinal password client serverFirst = do
   iterations <- positiveInt =<< attribute 'i' attributes
   unless
     (scramNonce client `BS.isPrefixOf` serverNonce && BS.length serverNonce > BS.length (scramNonce client))
-    (Left "the server's nonce doesn't extend the client's")
+    (Left "invalid SCRAM response (nonce mismatch)")
   let saltedPassword = fastPBKDF2_SHA256 (Parameters iterations 32) password salt :: ByteString
       clientKey = hmacSha256 saltedPassword "Client Key"
       storedKey = ByteArray.convert (hashWith SHA256 clientKey)
@@ -115,9 +115,9 @@ scramVerifyServerFinal expected serverFinal =
   case attribute 'v' attributes of
     Right encoded -> do
       signature <- Base64.decode encoded
-      unless (ByteArray.constEq signature expected) (Left "the server's signature doesn't match")
+      unless (ByteArray.constEq signature expected) (Left "incorrect server signature")
     Left _ -> case attribute 'e' attributes of
-      Right serverError -> Left ("the server rejected the proof: " <> Char8.unpack serverError)
+      Right serverError -> Left ("error received from server in SCRAM exchange: " <> Char8.unpack serverError)
       Left _ -> Left ("invalid server-final-message " <> show serverFinal)
   where
     attributes = BS.split comma serverFinal

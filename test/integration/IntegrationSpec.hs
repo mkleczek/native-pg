@@ -102,7 +102,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
 
   -- What the client can't do in the authentication is worded as libpq words it, in the failure of the host. The cluster
   -- has no server that asks for what the client doesn't have, so a scripted server asks.
-  needs "authentication wording" $ describe "authentication wording" $ do
+  describe "authentication wording" $ do
     let failureAt settings = either displayException (const "connected") <$> run (connectedTo settings done)
         onSocket reason = "connection to server on socket \"" <> socketPath <> "\" failed: " <> reason
         startupThen reply client = receiveStartup client *> SocketBytes.sendAll client reply *> drain client
