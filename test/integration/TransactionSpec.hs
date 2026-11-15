@@ -650,6 +650,34 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
         `shouldReturn` ()
       readIORef calls `shouldReturn` 2
 
+    it "does not record a statement that the server skipped, after an earlier statement of its pipeline failed" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ ( overInputs (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,) <$> Tx.from (const ()) (Tx.statement dividingByZero) <*> adding calls) (\(failing, result) -> Tx.discard failing >>> Tx.single result)) (inputs [(1, 1)])
+                  >>^ map serverCode
+              )
+                `yields` [Just "22012"],
+              preparedStatements `yields` Right [],
+              overInputs (runOf (adding calls)) (inputs [(1, 1)]) `yields` [Right 2],
+              preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+            ]
+        )
+        `shouldReturn` ()
+      -- Evaluated for the pipeline that failed, whose statement was skipped, and for the run after.
+      readIORef calls `shouldReturn` 2
+    it "keeps a statement that its transaction rolled back, which the server does not take back with the rollback" $ do
+      calls <- newIORef 0
+      withCache 256
+        ( steps
+            [ overInputs (transactOn Tx.ReadCommitted Tx.Write Tx.Open (adding calls) (\result -> Tx.single result >>> tap (done >>> Tx.condemn))) (inputs [(1, 1)]) `yields` [Right 2],
+              overInputs (runOf (adding calls)) (inputs [(1, 5)]) `yields` [Right 6],
+              preparedStatements `yields` Right ["SELECT $1::int4 + 1"]
+            ]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 1
+
   -- What a cached statement allocates for a run, as a hit and as a miss, against the same statement sent unnamed (made from the input
   -- as well, so that the SQL is generated for each run) and against one that the program prepared itself. It measures only when
   -- CACHE_COST_REPORT is set, and says what it measured on stderr.
