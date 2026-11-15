@@ -28,13 +28,14 @@ import Data.Int (Int64)
 import Data.Text (Text)
 import Database.PostgreSQL.Connection (ConnectSettings)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), connectionPoolSettings)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import Network.Socket (PortNumber)
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.PositiveInt (positiveInt)
 import Skeletest
+import TestPools
 import TestPrograms
 
 spec :: FilePath -> PortNumber -> Spec
@@ -218,7 +219,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
   -- v1 ran these cases over TLS. The cases above are about the pool and the transactions in it, so they run over a
   -- Unix-domain socket, and this one is what stays to be run over TLS.
   describe "over TLS" $
-    it "commits the transaction, and gives the connection back" $ withEnv runner (tlsSettings port "native_pg_scram" (Just "scram secret")) 1 $ \env -> do
+    it "commits the transaction, and gives the connection back" $ withEnvIO runner (tlsSettings port "native_pg_scram" (Just "scram secret")) 1 $ \env -> do
       pid <- pidOf env
       onEnv env (request env (ddl "CREATE TEMP TABLE scope_commit (id int)")) `shouldReturn` Right ()
       onEnv env (request env (committed Tx.Write (Tx.statement (plain "INSERT INTO scope_commit VALUES (1)" Tx.none)) Tx.discard)) `shouldReturn` Right ()
@@ -228,8 +229,8 @@ spec socketPath port = describe "operations and transactions in a request" $ for
   -- v1 found out with a preflight check that the server had ended an idle connection, without waiting for it. The pool of v2 does
   -- the same when it hands the connection out: the request gets another connection, and fails no more than it waits.
   describe "an idle connection" $
-    forM_ [("without TLS", unixSettings socketPath "postgres" Nothing), ("with TLS", tlsSettings port "postgres" Nothing)] $ \(label, settings) ->
-      it ("is replaced when the server ended it, " <> label) $ withEnv runner settings 1 $ \env -> do
+    forM_ [("without TLS", pure (unixSettings socketPath "postgres" Nothing)), ("with TLS", tlsSettings port "postgres" Nothing)] $ \(label, settings) ->
+      it ("is replaced when the server ended it, " <> label) $ withEnvIO runner settings 1 $ \env -> do
         pid <- pidOf env
         -- with a timeout, it returns once the backend has exited
         administrator (query (valued "SELECT pg_terminate_backend($1::int, 10000)" [Just (BC.pack (show pid))] (single @_ @Bool))) `shouldReturn` Right [True]
@@ -311,17 +312,17 @@ spec socketPath port = describe "operations and transactions in a request" $ for
 
     it "gives CheckoutTimedOut to a checkout that waits longer than the pool's timeout, and doesn't lose the connection" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-      withConnectionPool ((connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) {poolCheckoutTimeout = Just (millis 50)}) $ \pool -> do
+      withPool runner buffers ((connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) {poolCheckoutTimeout = Just (millis 50)}) $ \pool -> do
         let env = Env runner buffers pool
         -- The only connection is held by the outer request, so the inner one waits for it.
-        onEnv env (withConnection pool (snd ^>> withConnection pool done))
+        onEnv env (viaPool pool (snd ^>> viaPool pool done))
           `shouldReturn` Right (Left CheckoutTimedOut)
         pidOf env >>= \pid -> (pid > 0) `shouldBe` True
 
     it "gives PoolClosed to a checkout after the pool has ended" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-      pool <- withConnectionPool (connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) pure
-      runOn runner buffers (withConnection pool done) `shouldReturn` Left PoolClosed
+      pool <- withPool runner buffers (connectionPoolSettings 1 (unixSettings socketPath "postgres" Nothing)) pure
+      runOn runner buffers (viaPool pool done) `shouldReturn` Left PoolClosed
 
 -- * The pool of the cases
 
@@ -337,16 +338,20 @@ onEnv :: Env -> Program a -> IO a
 onEnv env = runOn (envRunner env) (envBuffers env)
 
 -- | The environment for the use, with a pool that is closed when the use ends.
+-- | The same, for settings that are made in IO.
+withEnvIO :: Runner -> IO ConnectSettings -> Int -> (Env -> IO a) -> IO a
+withEnvIO runner making size use = making >>= \settings -> withEnv runner settings size use
+
 withEnv :: Runner -> ConnectSettings -> Int -> (Env -> IO a) -> IO a
 withEnv runner settings size use = do
   buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-  withConnectionPool (connectionPoolSettings size settings) $ \pool -> use (Env runner buffers pool)
+  withPool runner buffers (connectionPoolSettings size settings) $ \pool -> use (Env runner buffers pool)
 
 -- | The body in a request: a connection of the pool, which the body uses and gives back. A pool that has none is the
 -- program's failure.
 request :: (Runtime arr) => Env -> OnConn arr b -> arr Loans b
 request env body =
-  withConnection (envPool env) body
+  viaPool (envPool env) body
     >>> now (either (\failure -> failTest ("no connection: " <> show failure)) pure)
 
 selectOne :: (Runtime arr) => OnConn arr (Either QueryError [Int64])

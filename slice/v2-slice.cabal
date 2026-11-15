@@ -17,13 +17,22 @@ flag debug-mode
   default: False
   manual: True
 
+-- The slice is built for GHC's threaded run time. With -f-threaded it is built for the non-threaded one, which has one
+-- capability and one OS thread, so that it runs on one core: delimited takes --cores 1.
+flag threaded
+  description: Link with the threaded run time
+  default: True
+  manual: True
+
 -- The flags of the run time (the cores, the nursery, -T for the allocation counter) are not defaults in the binary:
 -- they are given with GHCRTS, as for postgrestream.
 executable v2-slice
   default-language: GHC2021
   hs-source-dirs: app
   main-is: Main.hs
-  ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively
+  ghc-options: -Wall -rtsopts -fspecialise-aggressively
+  if flag(threaded)
+    ghc-options: -threaded
   build-depends: base, bytestring, fulmen, native-pg, network, streaming-io
   if flag(debug-mode)
     cpp-options: -DDEBUG_MODE

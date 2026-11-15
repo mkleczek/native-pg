@@ -1,7 +1,7 @@
 # HLint checks only the plumbing of arrow programs: pure steps are composed as functions inside one arr, and the
 # shared combinators of Network.Streaming.Combinators and Network.Streaming.Plumbing are used where they fit. HLint's own hints are ignored.
 #
-# Run it with: hlint streaming-io native-pg native-pg-tls directions fulmen slice test
+# Run it with: hlint streaming-io native-pg native-pg-tls directions fulmen slice sieve test
 
 - group: {name: default, enabled: false}
 - ignore: {}

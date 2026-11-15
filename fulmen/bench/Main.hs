@@ -7,7 +7,7 @@
 --
 -- It has two modes, which are run as two processes:
 --
--- > fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS +RTS -T -N2
+-- > fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] +RTS -T -N2
 -- > fulmen-bench client PORT CONNECTIONS SECONDS /16k|/1m [fresh]
 --
 -- The server prints the port it listens on, and serves until it is killed. The client asks the server to note its
@@ -37,7 +37,7 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
-import Network.Streaming.Classes (Effect (..), Runtime)
+import Network.Streaming.Classes (Effect (..), Event (..), Runtime)
 import Network.Streaming.Combinators (consume)
 import Network.Streaming.Counters (Counter (Captures), Counts, countOf, since, snapshot)
 import Network.Streaming.Delimited (runCores, runCoresM)
@@ -46,16 +46,18 @@ import Network.Streaming.PositiveInt (mkPositiveInt)
 import Network.Streaming.Threads (runThreads)
 import System.Environment (getArgs)
 import System.Exit (die)
+import System.Posix.Types (Fd (..))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 
 main :: IO ()
 main = do
   args <- getArgs
   case args of
-    ["server", kind, cores, connections] -> server kind (read cores) (read connections)
+    ["server", kind, cores, connections] -> server False kind (read cores) (read connections)
+    ["server", kind, cores, connections, "graceful"] -> server True kind (read cores) (read connections)
     ["client", port, connections, seconds, path] -> client False (read port) (read connections) (read seconds) (C.pack path)
     ["client", port, connections, seconds, path, "fresh"] -> client True (read port) (read connections) (read seconds) (C.pack path)
-    _ -> die "usage: fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS | client PORT CONNECTIONS SECONDS /16k|/1m [fresh]"
+    _ -> die "usage: fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] | client PORT CONNECTIONS SECONDS /16k|/1m [fresh]"
 
 -- * The server
 
@@ -67,8 +69,10 @@ data Counters = Counters
     countsMarked :: !(IORef Counts)
   }
 
-server :: String -> Int -> Int -> IO ()
-server kind cores connections = do
+-- | The server. With @graceful@ it has an event to shut down on, which nothing fires, so that the cost of a shutdown that is
+-- possible is measured.
+server :: Bool -> String -> Int -> Int -> IO ()
+server graceful kind cores connections = do
   hSetBuffering stdout LineBuffering
   listening <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
   Socket.setSocketOption listening Socket.ReuseAddr 1
@@ -81,19 +85,25 @@ server kind cores connections = do
   reserve <- positive 2
   setup <- positive 1
   counters <- Counters <$> newIORef 0 <*> newIORef (0, 0) <*> (snapshot >>= newIORef)
+  -- The event fires when something is written to the socket pair, or its other end closes, which it does if it is not kept
+  -- (and a socket that is not kept is closed when it is collected).
+  (readEnd, writeEnd) <- Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol
+  event <- (\fd -> Readable (Fd fd)) <$> Socket.unsafeFdSocket readEnd
   let settings =
         Fulmen.defaultSettings
           { Fulmen.bufferPool = BufferPoolSettings size ordinary reserve setup,
             Fulmen.connectionsPerCore = connections,
-            Fulmen.clientTimeout = Nothing
+            Fulmen.clientTimeout = Nothing,
+            Fulmen.shutdown = if graceful then Just event else Nothing
           }
   shared <- Fulmen.newCores settings cores
   putStrLn ("port " <> show port)
-  case kind of
+  (case kind of
     "delimited" -> void (runCores cores (pure shared) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings (Fulmen.borrowed listening) (handler counters)))
     "delimited-debug" -> void (runCoresM @'Debug cores (pure shared) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings (Fulmen.borrowed listening) (handler counters)))
     "threads" -> runThreads (Fulmen.serve settings (Fulmen.borrowed listening) (handler counters)) shared
-    _ -> die "the server is delimited, delimited-debug or threads"
+    _ -> die "the server is delimited, delimited-debug or threads")
+    `finally` (Socket.close readEnd *> Socket.close writeEnd)
 
 -- | The 16 KiB body, and the 1 MiB body as 64 pieces of 16 KiB, which are made once.
 small :: ByteString

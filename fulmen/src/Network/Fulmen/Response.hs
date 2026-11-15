@@ -20,7 +20,8 @@ import Network.Streaming.Classes (Effect (..), Runtime)
 
 -- | Says how the request is answered: the head is sent with the first of the body, or at the end of the response. A
 -- response to a request whose method or status forbids a body has none, whatever the length says, and a
--- 'Known' length that the body doesn't have ends the connection.
+-- 'Known' length that the body doesn't have ends the connection. A response to HEAD has the framing fields that the
+-- handler gives, and the server adds none.
 respond :: (Runtime arr) => arr (Call, (Status, ResponseHeaders, Length)) Answering
 respond = now (\(Call _ _ exchange, response) -> Answering exchange <$ begin exchange response)
 

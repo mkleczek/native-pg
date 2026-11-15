@@ -15,13 +15,24 @@ extra-source-files: THIRD-PARTY-NOTICES
                     test/check-api-boundary.sh
                     test/api-boundary/Client.hs
 
+-- The executables and test suites are linked with GHC's threaded run time. With -f-threaded they are linked with the
+-- non-threaded one, which has one capability and one OS thread.
+flag threaded
+  description: Link the executables and test suites with the threaded run time
+  default: True
+  manual: True
+
 common implementation
   default-language:   GHC2021
   default-extensions: QuasiQuotes
   hs-source-dirs:     src
   ghc-options:        -Wall
+  -- c-ares looks host names up, without threads of its own; the version that has a channel safe to use from every thread
+  pkgconfig-depends:  libcares >= 1.24 && < 2
+  c-sources:          cbits/cares.c
   other-modules:      Database.PostgreSQL.Connection.Internal
                       Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Cares
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
@@ -76,6 +87,7 @@ library
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation
+                      Database.PostgreSQL.Resolver
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
                       Database.PostgreSQL.Transaction
@@ -96,6 +108,7 @@ test-suite native-pg-spec
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation
+                      Database.PostgreSQL.Resolver
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
                       Database.PostgreSQL.Transaction
@@ -104,7 +117,9 @@ test-suite native-pg-spec
                       CoreSpec
                       PasswordFileSpec
   main-is:            Main.hs
-  ghc-options:        -Wall -threaded -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  ghc-options:        -Wall -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  if flag(threaded)
+    ghc-options: -threaded
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   -- Whitebox tests compile the sources so hidden modules stay unavailable
   -- to clients without requiring a separate implementation library.
@@ -121,7 +136,9 @@ benchmark parsers-bench
   other-modules:      Database.PostgreSQL.Internal.Protocol.Codec.Cursor
                       Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
                       Database.PostgreSQL.Internal.Protocol.Codec.Payload
-  ghc-options:        -Wall -threaded -rtsopts -fspecialise-aggressively
+  ghc-options:        -Wall -rtsopts -fspecialise-aggressively
+  if flag(threaded)
+    ghc-options: -threaded
   build-depends:      base, bytestring, directions, streaming-io
 
 -- Tests of the streaming cursors that are derived from the payload schema.
@@ -136,6 +153,8 @@ test-suite cursors-spec
                       Database.PostgreSQL.Internal.Protocol.Codec.Cursor
                       Database.PostgreSQL.Internal.Protocol.Codec.CursorRows
                       Database.PostgreSQL.Internal.Protocol.Codec.Payload
-  ghc-options:        -Wall -threaded -rtsopts "-with-rtsopts=-T" -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  ghc-options:        -Wall -rtsopts "-with-rtsopts=-T" -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  if flag(threaded)
+    ghc-options: -threaded
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   build-depends:      base, bytestring, directions, streaming-io, skeletest >= 0.4.2 && < 0.5

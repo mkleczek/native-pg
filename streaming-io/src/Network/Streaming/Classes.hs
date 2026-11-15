@@ -70,6 +70,7 @@ module Network.Streaming.Classes
     Event (..),
     Reach (..),
     Promise,
+    Fulfilling (..),
     Exchange (..),
     Address,
     Inboxes (..),
@@ -104,7 +105,7 @@ import Network.Streaming.Internal.Inboxes (Address)
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)
 import Network.Streaming.Plumbing (pattern Again, pattern Finish, consume, iterateWith)
-import Network.Streaming.Internal.Tickets (Promise, Reach (..))
+import Network.Streaming.Internal.Tickets (Fulfilling (..), Promise, Reach (..))
 import Network.Streaming.Watch (Watch)
 import System.Posix.Types (Fd (..))
 
@@ -183,7 +184,7 @@ type Runtime arr =
 -- belongs to no core, so that shared structures can hold it, and the parts of
 -- any core can fulfil it: it costs what a value that crosses cores costs.
 -- An arrow has the instances for the reaches it can keep.
-class Exchange arr (r :: Reach) where
+class (Fulfilling r) => Exchange arr (r :: Reach) where
   data Future arr r a
 
   -- | The ends of a new ticket, made on this core.
@@ -336,6 +337,10 @@ class Within arr where
   -- | The body with a deadline: 'Nothing' when the deadline passed first, and the body was cancelled and its
   -- scopes released. A cancellation from outside passes through.
   within :: Duration -> arr a b -> arr a (Maybe b)
+
+  -- | The same for a deadline that the input gives, in front of the body's own input, so that a program that is built once
+  -- takes its deadline from the run: a connect timeout that is a setting, or a checkout deadline that is a pool's.
+  timeoutA :: arr a b -> arr (Duration, a) (Maybe b)
 
 -- | An action that never waits, as an arrow.
 class Effect arr where

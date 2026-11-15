@@ -14,6 +14,8 @@
 -- A connection's calls must not overlap: one part uses it at a time.
 module Database.PostgreSQL.Tls.Internal
   ( -- * Configurations
+    SystemRoots,
+    loadSystemRoots,
     TlsConfig,
     newTlsConfig,
 
@@ -41,8 +43,7 @@ module Database.PostgreSQL.Tls.Internal
   )
 where
 
-import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
-import Control.Exception (IOException, bracket, catch, finally, mask_, onException, throwIO)
+import Control.Exception (IOException, bracket, catch, finally, mask_, onException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Data.Bits (shiftR, (.&.))
 import Data.ByteString (ByteString)
@@ -65,7 +66,6 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (Storable, peek, pokeByteOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Socket (Socket, ShutdownCmd (ShutdownSend), close, shutdown, withFdSocket)
-import System.IO.Unsafe (unsafePerformIO)
 
 -- | A version's number in TLS.
 version :: TlsVersion -> Word16
@@ -101,11 +101,24 @@ channelBinding tls = withConnection tls $ \rustls -> do
 -- Own it until the configuration and every connection using it are freed.
 data TlsConfig = TlsConfig (ForeignPtr ClientConfig) (ForeignPtr CChar)
 
+-- | The verifier against the system's root certificates, which loads all of them, or why it couldn't: loaded once, with
+-- the client, and shared by the configurations that need it (each keeps a reference of its own).
+newtype SystemRoots = SystemRoots (Either TlsError (ForeignPtr ServerCertVerifier))
+
+-- | Loads the system's root certificates, which reads files on some systems. A failure is kept, and only a configuration
+-- that needs the roots fails with it.
+loadSystemRoots :: IO SystemRoots
+loadSystemRoots =
+  SystemRoots <$> try (do
+    verifier <- built "could not load the system's root certificates" c_platform_server_cert_verifier
+    Foreign.newForeignPtr verifier (c_server_cert_verifier_free verifier))
+
 -- | A configuration for the named host or IP address, with the settings.
 -- Its connections offer ALPN's @postgresql@. Throws 'TlsError' if a
--- certificate file can't be used.
-newTlsConfig :: TlsSettings -> String -> IO TlsConfig
-newTlsConfig settings serverName = do
+-- certificate file can't be used. It reads the files of the settings, so it is not for a core: a program builds it in
+-- IO, once, and makes the connections from it.
+newTlsConfig :: SystemRoots -> TlsSettings -> String -> IO TlsConfig
+newTlsConfig (SystemRoots systemRoots) settings serverName = do
   builder <-
     -- The default provider, rustls-ffi's from its build, made the process's.
     bracket (built "rustls has no crypto provider" c_crypto_provider_builder_new_from_default) c_crypto_provider_builder_free $ \providerBuilder ->
@@ -118,7 +131,7 @@ newTlsConfig settings serverName = do
         NoVerification -> check "could not configure the certificate verifier" =<< c_accept_any_certificate builder
         VerifyFull (RootCertificateFile roots) -> withVerifier roots (c_client_config_builder_set_server_verifier builder)
         VerifyFull SystemRootCertificates
-          | null (tlsRevocationLists settings) -> c_client_config_builder_set_server_verifier builder . ConstPtr =<< systemVerifier
+          | null (tlsRevocationLists settings) -> either throwIO (\verifier -> withForeignPtr verifier (c_client_config_builder_set_server_verifier builder . ConstPtr)) systemRoots
           | otherwise -> throwIO (TlsError "revocation lists with the system's root certificates aren't supported")
       for_ (tlsClientCertificate settings) $ \(chainFile, keyFile) -> do
         chain <- BS.readFile chainFile
@@ -171,17 +184,6 @@ newTlsConfig settings serverName = do
               (built "could not create the certificate verifier" (c_web_pki_server_cert_verifier_builder_build verifierBuilder))
               c_server_cert_verifier_free
               (useVerifier . ConstPtr)
-
--- | The verifier against the system's root certificates, the same each time,
--- since it loads all of them, and never freed.
-systemVerifier :: IO (Ptr ServerCertVerifier)
-systemVerifier = modifyMVar systemVerifierMade $ \made -> do
-  verifier <- maybe (built "could not load the system's root certificates" c_platform_server_cert_verifier) pure made
-  pure (Just verifier, verifier)
-
-systemVerifierMade :: MVar (Maybe (Ptr ServerCertVerifier))
-systemVerifierMade = unsafePerformIO (newMVar Nothing)
-{-# NOINLINE systemVerifierMade #-}
 
 -- | The link of the connection, which native-pg's connections use it through: its calls that never wait, and the
 -- handshake's, for the settings that the handshake is checked against.

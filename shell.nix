@@ -26,6 +26,7 @@ in
     pkgs.pkg-config
     pkgs.postgresql
     pkgs.rustls-ffi
+    pkgs.c-ares
   ] ++ pkgs.lib.optionals withHaskellTools [
     ghc
     pkgs.cabal-install

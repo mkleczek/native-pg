@@ -215,12 +215,13 @@ headersBody method target fields =
 data Settings = Settings
   { lineLimit :: Maybe Int
     -- ^ Bytes a request line or header line (and a chunk-size or trailer
-    -- line) may take, the size of the server's line buffer. Default 16384.
+    -- line) may take, the server's line limit, which a line buffer does not
+    -- bound except for a chunk-size or trailer line. Default 51200.
     -- Cases do not probe the exact boundary, only well inside and well
     -- outside it.
   , headLimit :: Maybe Int
     -- ^ Bytes the whole head (request line and header fields) may take.
-    -- Default: the server's own, larger than 'lineLimit'.
+    -- Default: the server's own, 51200.
   , bodyLimit :: Maybe Int
     -- ^ Bytes a request body may have. Default: none that a case reaches.
   , timeoutMs :: Maybe Int
@@ -747,7 +748,7 @@ headLimitCases =
       (refused 414)
       & withSettings smallLine
       & note "Warp's test feeds an endless line with no newline; Warp answers 400. fulmen answers 414 as soon as the buffer is full, without waiting for a line end."
-  , mk AHeadLimits (Spec "a line that fits the buffer is accepted")
+  , mk AHeadLimits (Spec "a line that fits the line limit is accepted")
       "a request line that fits the buffer is served"
       Headers
       [Send (get ("/" <> B.replicate 900 97))]
@@ -772,16 +773,16 @@ headLimitCases =
       [Send (getWith ["X-Long: " <> B.replicate 900 97])]
       [stays [okHeaders "GET" "/" [hostLocal, ("X-Long", B.replicate 900 97)]]]
       & withSettings smallLine
-  , mk AHeadLimits (Spec "the default buffer is 16 KiB")
-      "with the default buffer a header line of 20000 bytes is answered 431"
+  , mk AHeadLimits (Spec "the default limits are not the buffer's")
+      "with the default settings a header line of 20000 bytes is served"
       Headers
       [Send (getWith ["X-Long: " <> B.replicate 20000 97])]
-      (refused 431)
-  , mk AHeadLimits (Spec "the default buffer is 16 KiB")
-      "with the default buffer a request line of 20000 bytes is answered 414"
+      [stays [okHeaders "GET" "/" [hostLocal, ("X-Long", B.replicate 20000 97)]]]
+  , mk AHeadLimits (Spec "the default limits are not the buffer's")
+      "with the default settings a request line of 20000 bytes is served"
       Headers
       [Send (get ("/" <> B.replicate 20000 97))]
-      (refused 414)
+      [stays [okHeaders "GET" ("/" <> B.replicate 20000 97) [hostLocal]]]
   , mk AHeadLimits (Warp "warp/streams-test/AnswerSpec.hs" "a client that has gone / serves a request that arrives during the answer after the answer (X-Long of 5000 bytes)")
       "with the default buffer a header line of 5000 bytes is served"
       Headers
@@ -806,6 +807,48 @@ headLimitCases =
       [Send (getWith (replicate 3 ("X-Big: " <> B.replicate 400 98)))]
       [stays [okHeaders "GET" "/" (hostLocal : replicate 3 ("X-Big", B.replicate 400 98))]]
       & withSettings noSettings {lineLimit = Just 1024, headLimit = Just 2048}
+  , mk AHeadLimits (Spec "the limits are settings, whatever the size of the buffer")
+      "with the default settings a header line of 40000 bytes is served"
+      Headers
+      [Send (getWith ["X-Long: " <> B.replicate 40000 97])]
+      [stays [okHeaders "GET" "/" [hostLocal, ("X-Long", B.replicate 40000 97)]]]
+      & note "PostgREST under Warp took a Cookie of this size (its io suite sends one); Warp's limit is 50 KiB for the whole head."
+  , mk AHeadLimits (Spec "the limits are settings, whatever the size of the buffer")
+      "with the default settings a head of 100 lines of 400 bytes, which is more than the buffer, is served"
+      Headers
+      [Send (getWith (replicate 100 ("X-Big: " <> B.replicate 400 98)))]
+      [stays [okHeaders "GET" "/" (hostLocal : replicate 100 ("X-Big", B.replicate 400 98))]]
+  , mk AHeadLimits (Spec "the limits are settings, whatever the size of the buffer")
+      "a head that is more than the buffer, whose lines are cut at the end of the buffer where a CR and a LF are, is served"
+      Headers
+      [Send (getWith ["X-Pad: " <> B.replicate 16343 97, "X-Next: 1"])]
+      [stays [okHeaders "GET" "/" [hostLocal, ("X-Pad", B.replicate 16343 97), ("X-Next", "1")]]]
+      & note "The first 16384 bytes of the head are the request line, Host and X-Pad's name and value, and the CR of its line end; the LF is the first byte after."
+  , mk AHeadLimits (Spec "the limits are settings, whatever the size of the buffer")
+      "a request with a header line of 40000 bytes and a body is answered with the body"
+      Echo
+      [Send ("POST / HTTP/1.1\r\nHost: localhost\r\nX-Long: " <> B.replicate 40000 97 <> "\r\nContent-Length: 5\r\n\r\nhello")]
+      [stays [ok "hello"]]
+  , mk AHeadLimits (Spec "the head limit counts the whole head, however many buffers it is")
+      "with the default settings a head of 200 lines of 400 bytes is answered 431"
+      Headers
+      [Send (getWith (replicate 200 ("X-Big: " <> B.replicate 400 98)))]
+      (refused 431)
+  , mk AHeadLimits (Spec "the line limit is not the buffer's")
+      "with the default settings a header line of 60000 bytes is answered 431"
+      Headers
+      [Send (getWith ["X-Long: " <> B.replicate 60000 97])]
+      (refused 431)
+  , mk AHeadLimits (Spec "the line limit is not the buffer's")
+      "with the default settings a request line of 60000 bytes is answered 414"
+      Headers
+      [Send (get ("/" <> B.replicate 60000 97))]
+      (refused 414)
+  , mk AHeadLimits (Spec "the bytes after a head that is more than the buffer belong to the next request")
+      "a head that is more than the buffer is followed by the request that came with it"
+      Ignore
+      [Send (getWith ["X-Long: " <> B.replicate 40000 97] <> singleGet)]
+      [stays [ok ignoreBody, ok ignoreBody]]
   , mk AHeadLimits (Spec "after a framing error the connection is closed")
       "a request that follows an oversized head on the connection is not answered"
       Headers
@@ -1433,6 +1476,22 @@ responseFramingCases =
       [Send ("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n" <> singleGet)]
       [stays [toHead (ok ""), ok "neversent"]]
       & note "The head may or may not carry Transfer-Encoding: chunked (RFC 9110 9.3.2); it must have no body bytes."
+  , mk AResponseFraming (RFC "RFC 9110 9.3.2" "a server must not send a Content-Length in a response to HEAD unless it is the length of the body of the GET")
+      "the response to a HEAD gets no Content-Length that its handler did not give"
+      (Fixed 200 [] "hello")
+      [Send ("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n" <> singleGet)]
+      [stays [toHead (ok "" `withHeaders` [HeaderAbsent "Content-Length", HeaderAbsent "Transfer-Encoding"]), ok "hello" `withHeaders` [headerIs "Content-Length" "5"]]]
+      & note "PostgREST answers a HEAD with a declared length of 0, which Warp does not turn into a Content-Length: 0."
+  , mk AResponseFraming (RFC "RFC 9110 9.3.2" "a server must not send a Content-Length in a response to HEAD unless it is the length of the body of the GET")
+      "the response to a HEAD of a streamed body gets no Transfer-Encoding and no Content-Length"
+      (Streamed ["never", "sent"])
+      [Send ("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n" <> singleGet)]
+      [stays [toHead (ok "" `withHeaders` [HeaderAbsent "Content-Length", HeaderAbsent "Transfer-Encoding"]), ok "neversent"]]
+  , mk AResponseFraming (RFC "RFC 9110 9.3.2" "a server must not send a Content-Length in a response to HEAD unless it is the length of the body of the GET")
+      "the response to an HTTP/1.0 HEAD gets no Content-Length that its handler did not give"
+      (Fixed 200 [] "foo")
+      [Send "HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n"]
+      [closes [withVersion "HTTP/1.0" (toHead (ok "" `withHeaders` [HeaderAbsent "Content-Length", HeaderAbsent "Transfer-Encoding"]))]]
   , mk AResponseFraming (Warp "warp/streams-test/AnswerSpec.hs" "no body / sends only the header and pulls nothing, for a 204")
       "a 204 has no body, no Content-Length and no Transfer-Encoding"
       (Fixed 204 [] "")

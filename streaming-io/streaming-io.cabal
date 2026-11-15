@@ -12,6 +12,13 @@ extra-source-files: test/check-positive-int.sh
                     test/check-named.sh
                     test/compile/*.hs
 
+-- The executables and test suites are linked with GHC's threaded run time. With -f-threaded they are linked with the
+-- non-threaded one, which has one capability and one OS thread.
+flag threaded
+  description: Link the executables and test suites with the threaded run time
+  default: True
+  manual: True
+
 library
   default-language: GHC2021
   hs-source-dirs: src
@@ -70,6 +77,7 @@ test-suite streaming-io-spec
                  PoolSpec
                  PoolCostSpec
                  SetupBuffersSpec
+                 SignalsSpec
                  SpecialisedSpec
                  SyscallsSpec
                  LintSpec
@@ -127,6 +135,8 @@ test-suite streaming-io-spec
                  UnwindSpec
                  WithSpec
   -- -T counts the live heap that GroupCostSpec reads.
-  ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-T" -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  ghc-options: -Wall -rtsopts "-with-rtsopts=-T" -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  if flag(threaded)
+    ghc-options: -threaded
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, bytestring, containers, network, stm, streaming-io, skeletest >=0.4.2 && <0.5
+  build-depends: base, bytestring, containers, network, stm, streaming-io, unix, skeletest >=0.4.2 && <0.5

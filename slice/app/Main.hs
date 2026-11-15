@@ -28,13 +28,17 @@
 module Main (main) where
 
 import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
-import Control.Monad (void)
+import Control.Concurrent (rtsSupportsBoundThreads)
+import Control.Exception (bracket)
+import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
-import Database.PostgreSQL.Connection (ConnectSettings)
-import Database.PostgreSQL.ConnectionString (Defaults (..), fromConnectionString, readConnectionString)
-import Database.PostgreSQL.Pool (ConnectionPool, connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Connection (ConnectSettings (connectResolver))
+import Database.PostgreSQL.ConnectionString (fromConnectionString, parseConnectionString, readDefaults)
+import Data.Maybe (isJust)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), Maintenance, closeConnectionPool, connectionPoolSettings, maintain, newConnectionPool, newMaintenance, withConnection)
+import Database.PostgreSQL.Resolver (newResolver)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Records (HasField)
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
@@ -42,7 +46,7 @@ import Network.Fulmen (Call, Method (..), Request (..))
 import qualified Network.Fulmen as Fulmen
 import qualified Network.Socket as Socket
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
-import Network.Streaming.Classes (Effect (..), Runtime, Scope (..), Stream (..))
+import Network.Streaming.Classes (Concurrent (..), Effect (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, iterateWith)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Counters (Counts, counterName, toList)
@@ -92,13 +96,13 @@ routed = foldr step missing
 -- which fulmen does when a handler gives the head twice.
 rows :: (Runtime arr) => ConnectionPool -> ByteString -> arr Call ()
 rows pool sql =
-  alongside (tryA (Fulmen.loans &&& arr ((),) >>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement query) reading))))
+  alongside (tryA ((Fulmen.loans &&& arr ((),) >>^ (pool,)) >>> withConnection (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement query) reading))))
     >>> unlessSucceeded
     ^>> (failed ||| returnA)
   where
     unlessSucceeded (Right (Right (Right ())), _) = Right ()
     unlessSucceeded (_, call) = Left call
-    query = Tx.Statement sql (const []) (Tx.one Tx.field)
+    query = Tx.Statement sql (const []) Nothing (Tx.one Tx.field)
     failed = (,(500, "internal error\n")) ^>> plain
 
 -- | Takes the field of the result, says how long it is with the head, sends its pieces as they arrive, and ends the
@@ -237,9 +241,19 @@ listening (host, port) info = tcp {Fulmen.openListener = Fulmen.openListener tcp
     tcp = Fulmen.tcp info 2048
     announce socket = socket <$ putStrLn ("listening on " <> host <> ":" <> port)
 
--- | How the pool connects: the settings of the connection string, which v2compare gives with trust authentication.
+-- | How the pool connects: the settings of the connection string, which v2compare gives with trust authentication, and
+-- the resolver that looks its host names up.
 connectSettingsOf :: String -> IO ConnectSettings
-connectSettingsOf uri = readConnectionString (Defaults "localhost" Nothing) (C.pack uri) >>= either die (either die pure . fromConnectionString)
+connectSettingsOf uri = do
+  resolver <- newResolver
+  defaults <- readDefaults "localhost" Nothing []
+  settings <- either die (either die pure . fromConnectionString) (parseConnectionString defaults (C.pack uri))
+  pure settings {connectResolver = Just resolver}
+
+-- | The server, and the maintenance of the pools beside it if a pool has a lifetime or an idle time: one more part of the
+-- server's scope, so that its sleep is cancelled with the rest when the server ends.
+maintained :: (Runtime arr) => Bool -> Maintenance -> arr a () -> arr a ()
+maintained limited maintenance server = if limited then together [server, const maintenance ^>> maintain] else server
 
 positive :: Int -> IO PositiveInt
 positive n = maybe (die ("not a positive count: " <> show n)) pure (mkPositiveInt (toInteger n))
@@ -255,6 +269,9 @@ main = do
   -- (the other runners have one core, which is all of them), and a buffer of the pool for each, since a request holds one.
   let runningCores = case optRuntime options of Delimited -> optCores options; _ -> 1
       perCore = (optConnections options + runningCores - 1) `div` runningCores
+  -- The non-threaded run time (-f-threaded) has one OS thread for all the cores of delimited, and a core that waits in its poller
+  -- holds it: the others would not run.
+  when (not rtsSupportsBoundThreads && runningCores > 1) $ die "this build is for the non-threaded run time: delimited takes --cores 1"
   -- The buffers of requests in flight, a reserve for the second loan of a request (the head of a response, while its
   -- transaction holds the first), and the buffers that a connection is set up with, which a pool of connections has of
   -- its own as well.
@@ -273,14 +290,20 @@ main = do
       listener = listening listen info
   shared <- Fulmen.newCores settings runningCores
   -- The arrow is known where the handler is built, so that GHC specialises it to the arrow.
-  withConnectionPool (connectionPoolSettings (optPool options) connect) $ \pool -> case (optMode options, optRuntime options) of
-    (Release, Threads) -> runThreads (Fulmen.serve settings listener (handler (counted @'Release) pool)) shared
-    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings listener (handler (counted @'Release) pool)))
-    (Release, Compiled) -> void (runCompiled (Fulmen.serve settings listener (handler (counted @'Release) pool)) shared)
+  maintenance <- newMaintenance
+  let poolSettings = connectionPoolSettings (optPool options) connect
+      -- The pool is closed when the server ends. Its maintenance, if its connections have limits, runs beside the server, on the
+      -- first core of the runners that have several.
+      limited = isJust (poolLifetime poolSettings) || isJust (poolIdleTime poolSettings)
+      maintainedOn core = if core == (0 :: Int) then maintained limited maintenance else id
+  bracket (newConnectionPool maintenance poolSettings) closeConnectionPool $ \pool -> case (optMode options, optRuntime options) of
+    (Release, Threads) -> runThreads (maintained limited maintenance (Fulmen.serve settings listener (handler (counted @'Release) pool))) shared
+    (Release, Delimited) -> void (runCores runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> maintainedOn core (Fulmen.serve settings listener (handler (counted @'Release) pool))))
+    (Release, Compiled) -> void (runCompiled (maintained limited maintenance (Fulmen.serve settings listener (handler (counted @'Release) pool))) shared)
 #if defined(DEBUG_MODE)
-    (Debug, Threads) -> runThreadsM @'Debug (Fulmen.serve settings listener (handler (counted @'Debug) pool)) shared
-    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> Fulmen.serve settings listener (handler (counted @'Debug) pool)))
-    (Debug, Compiled) -> void (runCompiledM @'Debug (Fulmen.serve settings listener (handler (counted @'Debug) pool)) shared)
+    (Debug, Threads) -> runThreadsM @'Debug (maintained limited maintenance (Fulmen.serve settings listener (handler (counted @'Debug) pool))) shared
+    (Debug, Delimited) -> void (runCoresM @'Debug runningCores (pure shared) (\cores core -> const (Fulmen.onCore cores core) ^>> maintainedOn core (Fulmen.serve settings listener (handler (counted @'Debug) pool))))
+    (Debug, Compiled) -> void (runCompiledM @'Debug (maintained limited maintenance (Fulmen.serve settings listener (handler (counted @'Debug) pool))) shared)
 #else
     (Debug, _) -> die "this build has no debug mode: build the slice with -f debug-mode"
 #endif

@@ -101,14 +101,8 @@ atNode met@(Met tree _ _) = case tree of
             ++ "acquire in a step that never waits, and wait in the body, or have the waiting step undo itself."
         | Just waiting <- [way]
       ]
-  Within duration body -> do
-    way <- waitIn body
-    pure
-      [ found met DeadlineWithoutWait ("within " ++ readable duration) $
-          "The body of this deadline can't wait, so the deadline can never fire: "
-            ++ "drop the deadline, or put the wait that it is meant to bound inside it."
-        | isNothing way
-      ]
+  Within duration body -> deadline ("within " ++ readable duration) body
+  TimeoutA body -> deadline "within the duration of its input" body
   Race one two -> do
     stuck <- traverse (fmap isNothing . waitIn) [one, two]
     pure
@@ -127,6 +121,14 @@ atNode met@(Met tree _ _) = case tree of
       ]
   _ -> pure []
   where
+    deadline what body = do
+      way <- waitIn body
+      pure
+        [ found met DeadlineWithoutWait what $
+            "The body of this deadline can't wait, so the deadline can never fire: "
+              ++ "drop the deadline, or put the wait that it is meant to bound inside it."
+          | isNothing way
+        ]
     stuckSides = \case
       [True, True] -> Just "neither side can wait"
       [True, False] -> Just "the first side can't wait"
@@ -270,6 +272,7 @@ combine tree inner = case tree of
   Try {} -> inOrder inner
   Shield {} -> inOrder inner
   Within {} -> inOrder inner
+  TimeoutA {} -> inOrder inner
   Wires {} -> inOrder inner
   End {} -> inOrder inner
   Allowing {} -> inOrder inner

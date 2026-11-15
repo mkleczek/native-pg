@@ -4,6 +4,7 @@
 module Client where
 
 import Control.Arrow ((***), (>>>), (^>>))
+import Control.Exception (bracket)
 import Data.Int (Int64)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings, Connection, cancelKey, connectSettings, connectedHost, serverInfo)
 import Database.PostgreSQL.ConnectionString (ConnectionString, fromConnectionString)
@@ -13,7 +14,7 @@ import Database.PostgreSQL.Diagnostics ()
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectionError (..), PoolError (..), QueryError, UsageError (..))
 import Database.PostgreSQL.Encoders (Parameter (..))
 import Database.PostgreSQL.Notifications (Notification, listen, notification)
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings, connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings, Maintenance, closeConnectionPool, connectionPoolSettings, maintain, newConnectionPool, newMaintenance, withConnection)
 import Database.PostgreSQL.Session.Settings ()
 import Database.PostgreSQL.Snippet (fromSnippet)
 import Database.PostgreSQL.Transaction
@@ -50,17 +51,17 @@ timedOut failure = failure == CheckoutTimedOut
 -- connection, whose pipeline carries the COMMIT.
 countRequest :: Runtime arr => ConnectionPool -> arr Loans (Either PoolError (Either QueryError Int64))
 countRequest pool =
-  (, ((), ()))
-    ^>> withConnection pool (transaction ReadCommitted Read (pipeline Final (statement count) single))
+  (\loans -> (pool, (loans, ((), ()))))
+    ^>> withConnection (transaction ReadCommitted Read (pipeline Final (statement count) single))
   where
     count :: Runtime arr => Statement arr () Int64
-    count = Statement "SELECT count(*) FROM t" (const []) (one column)
+    count = Statement "SELECT count(*) FROM t" (const []) Nothing (one column)
 
 -- | The statement that a snippet makes, and a fold of its rows.
 foldRequest :: Runtime arr => ConnectionPool -> arr Loans (Either PoolError (Either QueryError Int))
 foldRequest pool =
-  (, ((), ()))
-    ^>> withConnection pool (transaction ReadCommitted Read (pipeline Final (statement ones) (foldRows (\n (_ :: Int64) -> n + 1) (0 :: Int))))
+  (\loans -> (pool, (loans, ((), ()))))
+    ^>> withConnection (transaction ReadCommitted Read (pipeline Final (statement ones) (foldRows (\n (_ :: Int64) -> n + 1) (0 :: Int))))
   where
     ones :: (Runtime arr, InPlace a) => Statement arr () a
     ones = fromSnippet "SELECT 1" (Rows ExactlyOne column)
@@ -72,8 +73,13 @@ settingsOf = Right (connectSettings (UnixAddress "/tmp") "postgres")
 hostOf :: Connection -> (Bool, Bool)
 hostOf connection = (serverInfo connection `seq` True, connectedHost connection `seq` cancelKey connection `seq` True)
 
+-- | A pool that lasts for the use, as a program that wants a lexical pool makes one.
 poolFor :: ConnectionPoolSettings -> (ConnectionPool -> IO a) -> IO a
-poolFor = withConnectionPool
+poolFor settings use = newMaintenance >>= \maintenance -> bracket (newConnectionPool maintenance settings) closeConnectionPool use
+
+-- | The part that looks after the pools of a maintenance.
+maintained :: Runtime arr => arr Maintenance ()
+maintained = maintain
 
 poolOf :: ConnectSettings -> ConnectionPoolSettings
 poolOf = connectionPoolSettings 4

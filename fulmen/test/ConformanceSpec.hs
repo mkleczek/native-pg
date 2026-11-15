@@ -16,17 +16,19 @@
 -- off when the part lands.
 module ConformanceSpec (spec) where
 
-import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>))
-import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
+import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Concurrent (forkFinally, forkIO, killThread, rtsSupportsBoundThreads, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Exception (IOException, SomeException, bracket, displayException, fromException, throwIO, try)
-import Control.Monad (forM_, void, when)
+import Control.Monad (foldM, forM_, void, when)
 import ConformanceCases
 import ConformanceWire
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Char (toLower)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Tuple (swap)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -44,11 +46,17 @@ import Network.Streaming.Mode (Mode (..))
 import Network.Streaming.Threads (runThreads, runThreadsM)
 import Skeletest
 import System.Info (os)
+import System.Directory (findExecutable)
+import System.IO (hGetLine)
+import System.Posix.Resource (Resource (..), ResourceLimits (..), getResourceLimit, setResourceLimit)
+import System.Posix.Signals (raiseSignal, sigTERM)
+import System.Posix.Types (Fd (..))
 import System.IO.Error (ioeGetErrorString, isAlreadyInUseError)
+import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, terminateProcess, waitForProcess)
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure
+spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> manyWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -96,6 +104,197 @@ listenerFailure =
           Fulmen.closeListener = now (const (pure ()))
         }
 
+-- | The request has the address that its connection came from, as the server saw it: the client's own address.
+peerAddress :: Spec
+peerAddress = describe "the peer address" $ forM_ runners $ \runner@(Runner runnerName _) ->
+  describe runnerName $
+    it "of a request is the address that its client connected from" (peerOf runner)
+
+peerOf :: Runner -> IO ()
+peerOf (Runner _ runServer) =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+    Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen accepting 128
+    port <- Socket.socketPort accepting
+    cores <- Fulmen.newCores Fulmen.defaultSettings 1
+    stopped <- newEmptyMVar
+    let serving = runServer Fulmen.defaultSettings (Listening (Fulmen.borrowed accepting)) (Handling peerHandler) cores
+    bracket (forkFinally serving (putMVar stopped)) killThread $ \_ ->
+      withClient port $ \client -> do
+        own <- Socket.getSocketName (socket client)
+        let outcome = Outcome [ResponseExpect (Status 200) Nothing [] (BodyIs (C.pack (show own))) False] ConnOpen
+            c =
+              Case
+                { caseName = "the peer address",
+                  caseArea = ARequestLine,
+                  caseOrigin = Spec "the peer address of a request",
+                  caseHandler = Fail,
+                  caseSettings = noSettings,
+                  caseSteps = [Send "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"],
+                  caseExpect = [outcome],
+                  caseNote = ""
+                }
+        exchange c client stopped
+  where
+    -- Answers with the address of the peer, as the network package shows it.
+    peerHandler :: (Runtime arr) => arr (Call, Request) ()
+    peerHandler = (\(call, request) -> (call, (Fulmen.Status 200, [], C.pack (show (Fulmen.peer request))))) ^>> reply
+
+-- | A graceful shutdown: it starts when the event of the server's settings fires, which a byte on a socket does here. The
+-- listener is closed, a connection that waits for its next request is closed, a request in flight finishes and says that
+-- the connection ends, and the server ends when none is left.
+shutdownSpec :: Spec
+shutdownSpec = describe "a graceful shutdown" $ forM_ (runners ++ [coresRunner]) $ \runner@(Runner runnerName _) ->
+  describe runnerName $ do
+    it "ends the server and closes its listener, with no connection open" $
+      withStoppable runner (handling (Fixed 200 [] "ok")) $ \shutting -> do
+        stopServer shutting
+        ended <- timeout 3000000 (readMVar (serverStopped shutting))
+        fmap (either (const False) (const True)) ended `shouldBe` Just True
+        readIORef (listenerClosed shutting) >>= (`shouldBe` True)
+    it "closes a connection that waits for its next request" $
+      withStoppable runner (handling (Fixed 200 [] "ok")) $ \shutting ->
+        withClient (serverPort shutting) $ \client -> do
+          SocketBytes.sendAll (socket client) "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          awaitBytes client "ok"
+          stopServer shutting
+          closed <- timeout 3000000 (waitUntil (readIORef (ended client)))
+          closed `shouldBe` Just ()
+          ended' <- timeout 3000000 (readMVar (serverStopped shutting))
+          fmap (either (const False) (const True)) ended' `shouldBe` Just True
+    it "lets a request in flight finish, and says that the connection ends" $
+      withStoppable runner quickOrSlow $ \shutting ->
+        withClient (serverPort shutting) $ \client -> do
+          SocketBytes.sendAll (socket client) "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          threadDelay 150000
+          stopServer shutting
+          closed <- timeout 5000000 (waitUntil (readIORef (ended client)))
+          closed `shouldBe` Just ()
+          bytes <- readIORef (received client)
+          case parsedResponses (parseResponses [False] True bytes) of
+            [response] -> do
+              responseStatus response `shouldBe` 200
+              responseBody response `shouldBe` "onetwo"
+              [value | (name, value) <- responseFields response, C.map toLower name == "connection"] `shouldBe` ["close"]
+            others -> failTest ("expected one response, got " <> show (length others))
+          ended' <- timeout 3000000 (readMVar (serverStopped shutting))
+          fmap (either (const False) (const True)) ended' `shouldBe` Just True
+    it "closes the idle connection at once while another request is in flight, which then finishes" $
+      withStoppable runner quickOrSlow $ \shutting ->
+        withClient (serverPort shutting) $ \busy -> withClient (serverPort shutting) $ \idle -> do
+          -- The connection that is idle has served a request, and waits for the next.
+          SocketBytes.sendAll (socket idle) "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          awaitBytes idle "ok"
+          SocketBytes.sendAll (socket busy) "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          threadDelay 200000
+          stopServer shutting
+          idleClosed <- timeout 1000000 (waitUntil (readIORef (ended idle)))
+          idleClosed `shouldBe` Just ()
+          busyClosed <- readIORef (ended busy)
+          busyClosed `shouldBe` False
+          finished <- timeout 6000000 (waitUntil (readIORef (ended busy)))
+          finished `shouldBe` Just ()
+          bytes <- readIORef (received busy)
+          fmap responseBody (parsedResponses (parseResponses [False] True bytes)) `shouldBe` ["onetwo"]
+    it "starts when the process is sent SIGTERM, with the event of terminating" $ do
+      event <- Fulmen.terminating
+      withStoppableOn event runner (handling (Fixed 200 [] "ok")) $ \shutting -> do
+        raiseSignal sigTERM
+        ended <- timeout 3000000 (readMVar (serverStopped shutting))
+        fmap (either (const False) (const True)) ended `shouldBe` Just True
+
+-- | A server that is running, and what a test needs to stop it and to see how it ended.
+data Stoppable = Stoppable
+  { serverPort :: Socket.PortNumber,
+    stopServer :: IO (),
+    serverStopped :: MVar (Either SomeException ()),
+    listenerClosed :: IORef Bool
+  }
+
+-- | A server whose shutdown starts when a byte is written to a socket, as the event of its settings says.
+withStoppable :: Runner -> Handling -> (Stoppable -> IO a) -> IO a
+withStoppable runner handler use =
+  bracket (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) (\(reader, writer) -> Socket.close reader *> Socket.close writer) $ \(reader, writer) -> do
+    fd <- Socket.unsafeFdSocket reader
+    withStoppableOn (Readable (Fd fd)) runner handler (\shutting -> use shutting {stopServer = void (try @IOException (SocketBytes.sendAll writer "x"))})
+
+-- | A server whose shutdown starts when the event fires. It listens on a socket that it closes as it ends, so that the
+-- test sees that it did.
+withStoppableOn :: Event -> Runner -> Handling -> (Stoppable -> IO a) -> IO a
+withStoppableOn event (Runner _ runServer) handler use =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+    Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen accepting 128
+    port <- Socket.socketPort accepting
+    closed <- newIORef False
+    -- Several workers, so that a connection that is idle and one that is busy are both served.
+    let settings = Fulmen.defaultSettings {Fulmen.shutdown = Just event, Fulmen.connectionsPerCore = 4}
+        listener =
+          Listening
+            Fulmen.Listen
+              { Fulmen.openListener = now (const (pure accepting)),
+                Fulmen.closeListener = now (\sock -> writeIORef closed True *> Socket.close sock)
+              }
+    cores <- Fulmen.newCores settings 1
+    stopped <- newEmptyMVar
+    bracket (forkFinally (runServer settings listener handler cores) (putMVar stopped)) killThread $ \_ ->
+      use (Stoppable port (pure ()) stopped closed)
+
+-- | Waits, a little at a time, until the check holds.
+waitUntil :: IO Bool -> IO ()
+waitUntil check = check >>= \holds -> if holds then pure () else threadDelay 5000 *> waitUntil check
+
+-- | Waits until what the client has received has the bytes.
+awaitBytes :: Client -> ByteString -> IO ()
+awaitBytes client needle = do
+  arrived <- timeout 3000000 (waitUntil ((needle `B.isInfixOf`) <$> readIORef (received client)))
+  when (isNothing arrived) (failTest ("waited for " <> show needle <> ", which did not arrive"))
+
+-- | A handler that answers /slow in two chunks, a second before each, and anything else at once.
+quickOrSlow :: Handling
+quickOrSlow = Handling program
+  where
+    program :: (Runtime arr) => arr (Call, Request) ()
+    program =
+      (\input@(_, request) -> if target request == "/slow" then Left input else Right input)
+        ^>> (streamedWith [pause 1000 >>> writing "one", pause 1000 >>> writing "two"] ||| ((, (Fulmen.Status 200, [], "ok")) . fst ^>> reply))
+
+-- | A server of thousands of workers starts and serves that many connections at once, under the small stack that a dev
+-- build runs with. Its workers are made at startup, and a loop that is not a tail loop overflows that stack, which the parts
+-- that run masked don't report: the server goes on with the workers that it had made, and spins. It is a process of its
+-- own, so that its spin doesn't hold up the test: it is the server of @fulmen-bench@.
+manyWorkers :: Spec
+manyWorkers = describe "a server of thousands of workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
+  describe kind $
+    it "serves that many connections that are open at once" (serveMany kind 2500)
+
+-- | A server of this many workers, and the same many clients that connect at once and ask it for the answer of 200: how
+-- many got it, within the time that they have.
+serveMany :: String -> Int -> IO ()
+serveMany kind count = do
+  -- Both ends of every connection are descriptors of this process.
+  limit <- getResourceLimit ResourceOpenFiles
+  setResourceLimit ResourceOpenFiles limit {softLimit = hardLimit limit}
+  bench <- findExecutable "fulmen-bench" >>= maybe (failTest "fulmen-bench is not on the path") pure
+  -- The server has ten capabilities where the run time has them: the non-threaded one refuses the flag, and has one.
+  let capabilities = ["-N10" | rtsSupportsBoundThreads]
+  bracket
+    (createProcess (proc bench (["server", kind, "1", show count, "+RTS", "-T"] <> capabilities <> ["-K1K", "-RTS"])) {std_out = CreatePipe})
+    (\(_, _, _, handle) -> terminateProcess handle *> void (waitForProcess handle))
+    $ \(_, out, _, _) -> do
+      port <- maybe (failTest "no output of the server") (fmap (fromIntegral . (read :: String -> Int) . drop 5 . filter (/= '\r') . takeWhile (/= '\n')) . hGetLine) out
+      -- Loops that keep no stack of their own: the stack of the test is small, too, as the stack of a dev build is.
+      answers <- foldM (\collected _ -> (: collected) <$> newEmptyMVar) [] [1 .. count]
+      forM_ answers $ \answer -> forkIO (asking port >>= putMVar answer)
+      answered <- timeout 30000000 (foldM (\total answer -> (\got -> if got then total + 1 else total) <$> readMVar answer) (0 :: Int) answers)
+      answered `shouldBe` Just count
+  where
+    asking port = (either (const False) id <$>) . try @IOException $
+      bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
+        Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1)))
+        SocketBytes.sendAll sock "GET /16k HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        ("HTTP/1.1 200" `B.isPrefixOf`) <$> SocketBytes.recv sock 4096
+
 -- | How the server ended, if it did in time: the runner runs it with a handler that answers 200, on one core made for it.
 endedWith :: Runner -> Listening -> IO (Maybe (Either SomeException ()))
 endedWith (Runner _ runServer) listening = do
@@ -117,13 +316,11 @@ shouldEndWith kind = \case
 marked :: Case -> Spec -> Spec
 marked c = maybe id xfail (expectedFailure c)
 
--- | Why a case is expected to fail, if it is: it needs a part of the server that is not there yet. Chunked request
--- bodies, @Expect: 100-continue@ and the timeouts are step 3.
+-- | Why a case is expected to fail, if it is: it needs a part of the server that is not there yet. @Expect: 100-continue@
+-- and the timeouts are step 3.
 expectedFailure :: Case -> Maybe String
 expectedFailure c
   | caseName c `elem` served = Nothing
-  | caseArea c == AChunked || caseName c `elem` needingChunkedBodies = Just "chunked request bodies are not there yet (step 3)"
-  | caseArea c == AExpect = Just "Expect: 100-continue is not there yet (step 3)"
   | caseArea c == ATimeouts = Just "the client timeout is not there yet (step 3)"
   | otherwise = Nothing
 
@@ -135,24 +332,6 @@ served =
     "a handler that ignores the body of an expecting request does not leave the connection in limbo",
     "an HTTP/1.0 request with Expect: 100-continue and its body is answered",
     "a body that arrives slowly but within the timeout is read in full"
-  ]
-
--- | The cases of the other areas that send a chunked request body that is to be decoded.
-needingChunkedBodies :: [String]
-needingChunkedBodies =
-  [ "a chunked body over the limit is answered 413",
-    "a chunked body exactly at the limit is echoed",
-    "the coding \"chunked \" (trailing space) frames a real chunked body",
-    "the coding \"chunked\" followed by a tab frames a real chunked body",
-    "the coding \"chunked,\" (empty element after) frames a real chunked body",
-    "the coding \", chunked\" (empty element before) frames a real chunked body",
-    "a small chunked body the handler ignores is drained and the next request answered",
-    "non-pipelining, chunked body, read (Echo)",
-    "non-pipelining, chunked body, ignore (Ignore)",
-    "pipelining, chunked body, read (Echo)",
-    "pipelining, chunked body, ignore (Ignore)",
-    "pipelined requests of different kinds are answered in order",
-    "a chunked request body is echoed as it arrives, before the last chunk"
   ]
 
 -- * Runners

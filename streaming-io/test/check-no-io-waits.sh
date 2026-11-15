@@ -16,7 +16,7 @@ cd "$root"
 if [ "$#" -gt 0 ]; then
   files=$*
 else
-  files=$(find streaming-io/src native-pg/src native-pg-tls/src directions/src fulmen/src -name '*.hs' | sort)
+  files=$(find streaming-io/src native-pg/src native-pg-tls/src directions/src fulmen/src sieve/src -name '*.hs' | sort)
 fi
 
 # What is allowed where: a file, what it may do (a name below, or * for all of
@@ -27,7 +27,6 @@ streaming-io/src/Network/Streaming/Internal/Scheduler.hs * the own wait of the s
 streaming-io/src/Network/Streaming/Loop.hs atomically the own wait of the Loop arrow on its watches, and its cancellation flags
 streaming-io/src/Network/Streaming/Simulated.hs atomically the tries of a simulated link, which never wait
 streaming-io/src/Network/Streaming/Watch.hs * the readiness registrations that the arrows wait on, and the wait of the Threads arrow
-native-pg/src/Database/PostgreSQL/Pool.hs threadDelay the sleep of the maintenance thread of the pool between its looks, which no request waits for
 directions/src/Network/Directions/PingPong.hs threadDelay a prototype program that sleeps in IO as a stand-in for slow work
 '
 

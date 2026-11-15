@@ -7,6 +7,10 @@
 -- | libpq's connection strings, URIs and key/value strings, with the defaults
 -- libpq takes from the environment.
 --
+-- What a string leaves out comes from 'Defaults', which a program reads once, in IO, when it starts: the environment, the
+-- local user's name, the password files and the default root certificate file. Parsing a string then reads nothing, so
+-- it can run on a core.
+--
 -- TLS is used as @sslmode@ asks, except for @verify-ca@, and @require@ with a
 -- root certificate file, which libpq verifies as @verify-ca@. Options this
 -- client doesn't implement are rejected, unless they only matter with TLS or
@@ -15,6 +19,7 @@
 module Database.PostgreSQL.ConnectionString
   ( ConnectionString (..),
     Defaults (..),
+    emptyDefaults,
     Host (..),
     InvalidConnectionString (..),
     TargetSessionAttrs (..),
@@ -22,7 +27,7 @@ module Database.PostgreSQL.ConnectionString
     hostSocketAddress,
     fromConnectionString,
     parseConnectionString,
-    readConnectionString
+    readDefaults
   ) where
 
 import Control.Applicative ((<|>))
@@ -32,12 +37,11 @@ import Control.Exception (IOException, try)
 import Control.Exception (IOException, bracket, try)
 #endif
 import Control.Monad (guard, join, mfilter, unless, when)
-import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_, toList)
-import Data.Functor ((<&>))
+import Data.List (nub)
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe)
 import qualified Data.Text as Text
@@ -65,58 +69,62 @@ fromConnectionString :: ConnectionString -> Either String ConnectSettings
 fromConnectionString string = case connectionHosts string of
   first :| others -> Right (hostConnectSettings string first) {connectFallbacks = map (hostConnectSettings string) others}
 
--- | Parses the connection string, and fills in what it leaves out from the
--- environment and the defaults as libpq does.
-readConnectionString :: Defaults -> ByteString -> IO (Either String ConnectionString)
-readConnectionString defaults string = do
-  -- Only the variables it reads: what it leaves unread keeps them, and a
-  -- connection that keeps its string to cancel with would keep a copy of the
-  -- whole environment.
+-- | Parses the connection string, and fills in what it leaves out from the defaults as libpq does: the environment, the
+-- local user's name, the password files and the root certificate file that the defaults have. It reads nothing.
+parseConnectionString :: Defaults -> ByteString -> Either String ConnectionString
+parseConnectionString defaults string = do
+  given <- options string
+  let option = setting (`lookup` defaultEnvironment defaults) given
+  resolved <- resolve option defaults (defaultUser defaults)
+  let parsed = passwordsFromFile defaults option resolved
+  -- libpq verifies the server's certificate with sslmode=require too if the default root certificate file exists.
+  case (connectionSslMode parsed, rootCertificateIn <$> defaultCertificateDirectory defaults) of
+    (SslRequire, Just roots) | defaultRootCertificateExists defaults -> Left (requireWithRoots roots)
+    _ -> Right parsed
+
+-- | The defaults of this process, read now, once: its environment (the variables that the options default to), the name
+-- of the local user, the password files and whether the default root certificate file is there. It takes where to
+-- connect when a string gives no host, the directory of the certificate files, and the password files that connection
+-- strings name, besides the one that @PGPASSFILE@ or the home directory has. A password file that can't be read, isn't
+-- a regular file or has group or world access holds nothing, as libpq takes it.
+readDefaults :: String -> Maybe FilePath -> [FilePath] -> IO Defaults
+readDefaults host directory named = do
+  -- Only the variables the options read: what it leaves unread keeps them, and a connection that keeps its string to
+  -- cancel with would keep a copy of the whole environment.
   environment <- catMaybes <$> traverse (\name -> fmap (name,) <$> lookupEnv name) (mapMaybe snd optionTable)
   user <- localUserName
-  let parsed = do
-        given <- options string
-        resolved <- resolve (setting (`lookup` environment) given) defaults user
-        pure (given, resolved)
-  case parsed of
-    Left failure -> pure (Left failure)
-    Right (given, resolved) -> do
-      withPasswords <- passwordsFromFile defaults (setting (`lookup` environment) given) resolved
-      -- libpq verifies the server's certificate with sslmode=require too if
-      -- the default root certificate file exists.
-      case withPasswords of
-        parsedWithPasswords
-          | connectionSslMode parsedWithPasswords == SslRequire,
-            Just roots <- rootCertificateIn <$> defaultCertificateDirectory defaults ->
-              doesFileExist roots <&> bool (Right parsedWithPasswords) (Left (requireWithRoots roots))
-          | otherwise -> pure (Right parsedWithPasswords)
-
--- | Like 'readConnectionString', with the environment variables and the local
--- user's name, if it could be looked up, given. This pure parser accepts
--- @passfile@ but leaves password-file lookup to 'readConnectionString'.
-parseConnectionString :: Defaults -> (String -> Maybe String) -> Maybe String -> ByteString -> Either String ConnectionString
-parseConnectionString defaults environment localUser string = do
-  given <- options string
-  resolve (setting environment given) defaults localUser
+  home <- homePasswordFile
+  let paths = nub (toList home <> toList (lookup "PGPASSFILE" environment) <> named)
+  files <- traverse (\path -> (path,) <$> readPasswordFile path) paths
+  rootExists <- maybe (pure False) (doesFileExist . rootCertificateIn) directory
+  pure
+    Defaults
+      { defaultHost = host,
+        defaultCertificateDirectory = directory,
+        defaultEnvironment = environment,
+        defaultUser = user,
+        defaultPasswordFiles = files,
+        defaultHomePasswordFile = home,
+        defaultRootCertificateExists = rootExists
+      }
 
 -- | Password files are only consulted when neither the connection string nor
 -- PGPASSWORD supplied a password. Keep the matches by host: a later host may
--- require different credentials after an earlier connection attempt fails.
-passwordsFromFile :: Defaults -> (ByteString -> Maybe Setting) -> ConnectionString -> IO ConnectionString
+-- require different credentials after an earlier connection attempt fails. A
+-- file that the defaults didn't read counts as one that can't be read.
+passwordsFromFile :: Defaults -> (ByteString -> Maybe Setting) -> ConnectionString -> ConnectionString
 passwordsFromFile defaults option parsed
-  | isJust (connectionPassword parsed) = pure parsed
-  | otherwise = do
-      file <- maybe defaultPasswordFile (pure . Just . text) (value "passfile")
-      case file of
-        Nothing -> pure parsed
-        Just path -> do
-          contents <- readPasswordFile path
-          let entries = map (Char8.dropWhileEnd (== '\r')) (Char8.lines contents)
-              names = maybe [] (Char8.split ',') (value "host")
-              addresses = maybe [] (Char8.split ',') (value "hostaddr")
-              matches (index, host) =
-                (host,) <$> passwordFor entries (matchingHost names addresses index) (Char8.pack (show (hostPort host))) (connectionDatabase parsed) (connectionUser parsed)
-          pure parsed{connectionHostPasswords = mapMaybe matches (zip [0 ..] (toList (connectionHosts parsed)))}
+  | isJust (connectionPassword parsed) = parsed
+  | otherwise = case maybe (defaultHomePasswordFile defaults) (Just . text) (value "passfile") of
+      Nothing -> parsed
+      Just path ->
+        let contents = fromMaybe BS.empty (lookup path (defaultPasswordFiles defaults))
+            entries = map (Char8.dropWhileEnd (== '\r')) (Char8.lines contents)
+            names = maybe [] (Char8.split ',') (value "host")
+            addresses = maybe [] (Char8.split ',') (value "hostaddr")
+            matches (index, host) =
+              (host,) <$> passwordFor entries (matchingHost names addresses index) (Char8.pack (show (hostPort host))) (connectionDatabase parsed) (connectionUser parsed)
+         in parsed{connectionHostPasswords = mapMaybe matches (zip [0 ..] (toList (connectionHosts parsed)))}
   where
     value keyword = case option keyword of
       Just (Setting bytes _) | not (BS.null bytes) -> Just bytes
@@ -135,8 +143,8 @@ passwordsFromFile defaults option parsed
     isSocket _ = False
 
 -- | The default path follows libpq, independently of the TLS directory.
-defaultPasswordFile :: IO (Maybe FilePath)
-defaultPasswordFile =
+homePasswordFile :: IO (Maybe FilePath)
+homePasswordFile =
 #if defined(mingw32_HOST_OS)
   fmap (<> "/postgresql/pgpass.conf") <$> lookupEnv "APPDATA"
 #else

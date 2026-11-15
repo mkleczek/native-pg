@@ -19,7 +19,7 @@
 module ScopeCostSpec (spec) where
 
 import Control.Arrow (Arrow, ArrowChoice, (>>>), (^>>))
-import Control.Concurrent (getNumCapabilities, setNumCapabilities)
+import Control.Concurrent (getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, tryReadMVar)
 import Control.Monad (forM_, void, when)
 import Data.Word (Word64)
@@ -86,6 +86,7 @@ spec = do
       costsAtMost runner "scope, inbox" tolerance exchanging (exchangingIn scoped)
 
     when (name == "delimited") $
+      sharedThread "the cores share one OS thread, and a wait that the other core ends is cut short again and again, which allocates" $
       it "costs a loop that waits at an inbox that a part on another core posts to no allocation in it" $ do
         cores <- getNumCapabilities
         when (cores < 2) (setNumCapabilities 2)
@@ -106,6 +107,11 @@ spec = do
     copied name "a part that waits captures the catch of a deadline, which a deadline adds to each wait, until stage C of the frame-free scopes" $
       it "costs a loop in a deadline no allocation in it" $
         costsAtMost runner "deadline" tolerance yielding (\count -> within (secs 3600) (yielding count) >>> done)
+
+    -- The same cost as a deadline that the program fixes.
+    copied name "a part that waits captures the catch of a deadline, which a deadline adds to each wait, until stage C of the frame-free scopes" $
+      it "costs a loop in a deadline that the input gives no allocation in it" $
+        costsAtMost runner "deadline, input" tolerance yielding (\count -> (secs 3600,) ^>> timeoutA (yielding count) >>> done)
 
     copied name "a part that waits captures the catch of tryA, which tryA adds to each wait, until stage C of the frame-free scopes" $
       it "costs a loop in tryA no allocation in it" $
@@ -204,3 +210,7 @@ atMostMore allowance outside inside =
   if fromIntegral (round ((inside - outside) / 8) * 8 :: Int) <= allowance
     then pure ()
     else failTest ("an iteration allocates " <> show (round inside :: Int) <> " bytes enclosed, where it allocates " <> show (round outside :: Int) <> " bare")
+
+-- | Skips the case on the non-threaded run time.
+sharedThread :: String -> Spec -> Spec
+sharedThread reason = if rtsSupportsBoundThreads then id else skip reason

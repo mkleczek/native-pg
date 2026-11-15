@@ -16,13 +16,14 @@
 -- Usage: @native-pg-bench [scale]@, which multiplies the number of requests of each workload (1 by default).
 module Main (main) where
 
-import Control.Arrow (returnA, second, (>>>), (>>^), (^>>))
+import Control.Arrow (returnA, (>>>), (>>^), (^>>))
+import Control.Exception (bracket)
 import Control.Monad (forM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int32)
 import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), connectSettings)
-import Database.PostgreSQL.Pool (ConnectionPool, connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings, closeConnectionPool, connectionPoolSettings, newConnectionPool, newMaintenance, withConnection)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats, getRTSStatsEnabled)
@@ -79,7 +80,7 @@ main = do
     let settings = (connectSettings (UnixAddress socketPath) "postgres") {connectDatabase = Just "postgres"}
     buffers <- newBufferPool (BufferPoolSettings (positiveInt @16384) (positiveInt @4) (positiveInt @2) (positiveInt @2))
     -- The tables that the fields are made of: 352 rows of about 46 bytes in JSON, which is 16 KiB, and 22,500, which is 1 MiB.
-    withConnectionPool (connectionPoolSettings 1 settings) $ \pool ->
+    withPool (connectionPoolSettings 1 settings) $ \pool ->
       runThreads
         ( commands
             buffers
@@ -96,16 +97,21 @@ main = do
     printf "%-10s %-22s %12s %14s\n" ("arrow" :: String) ("workload" :: String) ("tx/s" :: String) ("bytes/tx" :: String)
     forM_ runners $ \(name, run) -> forM_ [minBound .. maxBound] $ \workload ->
       -- A pool for each measurement, so that its connection is made under the arrow that measures it.
-      withConnectionPool (connectionPoolSettings 1 settings) $ \pool -> measure name workload (requestsOf workload * scale) (run workload buffers pool)
+      withPool (connectionPoolSettings 1 settings) $ \pool -> measure name workload (requestsOf workload * scale) (run workload buffers pool)
+
+-- | The use, with a pool of the settings that is closed when it ends: the bench's pools have no lifetime, so no maintenance
+-- is run.
+withPool :: ConnectionPoolSettings -> (ConnectionPool -> IO a) -> IO a
+withPool settings use = newMaintenance >>= \maintenance -> bracket (newConnectionPool maintenance settings) closeConnectionPool use
 
 -- | A statement that gives one number, and ones that give one JSON value, of the tables' rows, as a field.
 build :: (Runtime arr) => Workload -> BufferPool -> ConnectionPool -> arr () ()
 build workload buffers pool = case workload of
-  SelectOne -> request buffers pool (Tx.Statement "SELECT 1" (const []) (Tx.one (Tx.column @_ @Int32))) (\result -> Tx.single result >>> done)
+  SelectOne -> request buffers pool (Tx.Statement "SELECT 1" (const []) Nothing (Tx.one (Tx.column @_ @Int32))) (\result -> Tx.single result >>> done)
   Field16 -> field "SELECT json_agg(small) FROM small"
   Field1M -> field "SELECT json_agg(large) FROM large"
   where
-    field sql = request buffers pool (Tx.Statement sql (const []) (Tx.one Tx.field)) (\result -> Tx.single result >>> drained >>> done)
+    field sql = request buffers pool (Tx.Statement sql (const []) Nothing (Tx.one Tx.field)) (\result -> Tx.single result >>> drained >>> done)
 {-# INLINABLE build #-}
 
 -- | One request: a transaction on a pooled connection, in loans of its own, whose pipeline carries the COMMIT, and the
@@ -119,7 +125,7 @@ request ::
   arr () ()
 request buffers pool given reading =
   (buffers,)
-    ^>> withRequestBuffers (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement given) reading)))
+    ^>> withRequestBuffers ((\(loans, _) -> (pool, (loans, ((), ())))) ^>> withConnection (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement given) reading)))
     >>> now (\case Right (Right ()) -> pure (); other -> die ("a request failed: " <> show other))
 
 -- | The pieces of the field, one after the other, dropped: how many bytes they had.
@@ -132,7 +138,7 @@ drained = (,0) ^>> iterateA (alongside (fst ^>> next) >>^ counted)
 commands :: (Runtime arr) => BufferPool -> ConnectionPool -> [ByteString] -> arr () ()
 commands buffers pool texts =
   (buffers,)
-    ^>> withRequestBuffers (second (const ((), ())) ^>> withConnection pool (Tx.transaction Tx.ReadCommitted Tx.Write (Tx.pipeline Tx.Final (traverse Tx.command texts) (foldr ((>>>) . Tx.discard) returnA))))
+    ^>> withRequestBuffers ((\(loans, _) -> (pool, (loans, ((), ())))) ^>> withConnection (Tx.transaction Tx.ReadCommitted Tx.Write (Tx.pipeline Tx.Final (traverse Tx.command texts) (foldr ((>>>) . Tx.discard) returnA))))
     >>> now (\case Right (Right ()) -> pure (); other -> die ("the setup failed: " <> show other))
 
 -- | The workload under the arrow: transactions per second, and the bytes that each allocated. The first requests make

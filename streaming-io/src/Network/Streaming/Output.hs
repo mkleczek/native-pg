@@ -9,6 +9,7 @@ module Network.Streaming.Output
     WriteResult (..),
     outputWriter,
     Uncopied (..),
+    hole,
     writeOutput,
     outputs,
     word8,
@@ -53,7 +54,7 @@ data Output = Output
 -- | Write into the current buffer, stopping when a field needs more room or an
 -- uncopied part is reached. Resuming 'NeedSpace' requires an empty buffer
 -- with at least four bytes; its pointer and capacity may differ from before.
--- After 'Yield', resume at the same offset to retain contiguous copied bytes,
+-- After 'Yield' or 'Hole', resume at the same offset to retain contiguous copied bytes,
 -- or at zero once the previous buffer's bytes have been accepted.
 newtype Writer = Writer {runWriter :: Ptr Word8 -> Int -> Int -> IO WriteResult}
 
@@ -61,6 +62,9 @@ data WriteResult
   = Finished {-# UNPACK #-} !Int
   | NeedSpace {-# UNPACK #-} !Int Writer
   | Yield {-# UNPACK #-} !Int Uncopied Writer
+  | -- | The bytes before a part of the output that the sender fills from elsewhere: how many were copied, what the part
+    -- is, as the tag that 'hole' was given, how many bytes it has, and the rest of the writer.
+    Hole {-# UNPACK #-} !Int {-# UNPACK #-} !Int {-# UNPACK #-} !Int Writer
 
 outputWriter :: Output -> Writer
 outputWriter Output {outputBuild} = outputBuild (Writer (\_ _ used -> pure (Finished used)))
@@ -92,8 +96,16 @@ writeOutput memory output =
             Finished end -> pure (reverse (copied start end parts))
             NeedSpace {} -> error "copied output exceeds its allocated size"
             Yield end part rest -> go end end rest (Right part : copied start end parts)
+            Hole {} -> error "an output with a hole is sent, not written"
      in go 0 0 (outputWriter output) []
 
+
+-- | A part of the output of this many bytes that the sender fills from elsewhere: the writer stops before it, and says
+-- the tag and the length. The tag is the caller's to read. The part has the length in the output's length, so that the
+-- length prefixes around it count it, and none of it is copied.
+hole :: Int -> Int -> Output
+hole tag size = Output size 0 (\rest -> Writer (\_ _ used -> pure (Hole used tag size rest)))
+{-# INLINE hole #-}
 
 -- | Each value's output, one after another. Compute sizes without retaining
 -- a serializer for every value; build their writers as the sender advances.

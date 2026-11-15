@@ -6,7 +6,7 @@
 module PlacementSpec (spec) where
 
 import Control.Arrow ((&&&), (>>>), (^>>))
-import Control.Concurrent (forkFinally, getNumCapabilities, killThread, myThreadId, setNumCapabilities, threadCapability, threadDelay)
+import Control.Concurrent (forkFinally, getNumCapabilities, killThread, myThreadId, rtsSupportsBoundThreads, setNumCapabilities, threadCapability, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar)
 import Control.Exception (bracket)
 import Control.Monad (forM_, replicateM, void, when)
@@ -25,7 +25,7 @@ import Skeletest
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = describe "placement" $
+spec = parallelCores "a core's thread is pinned to the capability of its number, and the non-threaded run time has one" $ describe "placement" $
   it "gives new connections that are kept open to the cores in turn, when the workers that are free are all of one core" $ do
     -- Each core runs on the capability of its number.
     getNumCapabilities >>= \capabilities -> when (capabilities < 2) (setNumCapabilities 2)
@@ -88,3 +88,7 @@ askCore sock = do
     readAnswer sofar
       | B.length (snd (B.breakSubstring "\r\n\r\n" sofar)) > 4 = pure sofar
       | otherwise = SocketBytes.recv sock 4096 >>= \bytes -> if B.null bytes then failTest ("the connection ended before the answer: " <> show sofar) else readAnswer (sofar <> bytes)
+
+-- | Skips the case on the non-threaded run time, which has one capability.
+parallelCores :: String -> Spec -> Spec
+parallelCores reason = if rtsSupportsBoundThreads then id else skip reason

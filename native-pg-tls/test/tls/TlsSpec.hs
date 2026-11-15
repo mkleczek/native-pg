@@ -14,7 +14,7 @@ module TlsSpec (spec) where
 import Control.Arrow (Arrow, first, (>>>), (>>^), (^>>))
 import Control.Concurrent (threadWaitRead)
 import Control.Exception (IOException, bracket, displayException, evaluate, fromException, throwIO)
-import Control.Monad (forM_, replicateM, replicateM_, unless)
+import Control.Monad (forM_, replicateM, replicateM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
@@ -254,7 +254,7 @@ spec = do
 
   describe "a configuration" $ do
     it "keeps cached server names alive after a connection closes" $ do
-      config <- newTlsConfig (verifying "ca.crt") "localhost"
+      config <- configFor (verifying "ca.crt") "localhost"
       replicateM_ 2 $ do
         withEndsOf config "server" (verifying "ca.crt") $ \ends -> do
           let Runner _ run = onThreads
@@ -270,8 +270,15 @@ spec = do
         reclaimTemporaryBuffers
 
     it "needs its root certificate file" $
-      newTlsConfig (settings (VerifyFull (RootCertificateFile (certificate "missing.crt")))) "localhost"
+      configFor (settings (VerifyFull (RootCertificateFile (certificate "missing.crt")))) "localhost"
         `shouldSatisfy` P.throws (P.con (TlsError (P.hasInfix "could not read root certificate file")))
+
+    -- The system's root certificates are loaded once, with the client, and no global holds them: every configuration that
+    -- verifies against them takes the same ones.
+    it "shares the system's root certificates between the configurations that verify against them" $ do
+      roots <- loadSystemRoots
+      forM_ ["localhost", "other.example", "third.example"] $ \name ->
+        void (newTlsConfig roots (settings (VerifyFull SystemRootCertificates)) name)
 
 -- * The parts of a case
 
@@ -412,8 +419,12 @@ receiveCosts link peer buffer = go
 -- | A connected pair of sockets: the client's link to the test server, and the server's, before their handshakes.
 withEnds :: String -> TlsSettings -> (Ends -> IO a) -> IO a
 withEnds name clientSettings action = do
-  config <- newTlsConfig clientSettings "localhost"
+  config <- configFor clientSettings "localhost"
   withEndsOf config name clientSettings action
+
+-- | A configuration for the server's name, with the system's root certificates loaded for it.
+configFor :: TlsSettings -> String -> IO TlsConfig
+configFor clientSettings name = loadSystemRoots >>= \roots -> newTlsConfig roots clientSettings name
 
 -- | The same, for a configuration that the client's connection is made from.
 withEndsOf :: TlsConfig -> String -> TlsSettings -> (Ends -> IO a) -> IO a

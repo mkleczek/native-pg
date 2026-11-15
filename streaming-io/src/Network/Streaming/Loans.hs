@@ -15,6 +15,8 @@ module Network.Streaming.Loans
   ( Loans,
     Loan,
     loanBuffer,
+    loanIsPrimary,
+    loansOf,
     withRequestBuffers,
     borrow,
     release,
@@ -35,7 +37,7 @@ import Network.Streaming.Combinators (alongside, decide, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
-import Network.Streaming.Internal.Tickets (Promise (..), fulfilNow)
+import Network.Streaming.Internal.Tickets (Promise (..))
 import Network.Streaming.Pool (checkoutAt, checkoutMany, checkoutManyOf, queueNow, releaseNow, takeNow)
 
 -- | What a request borrows buffers with: the pool, its primary buffer, and what is lent of them.
@@ -64,6 +66,15 @@ twoLoans = userError "request already has two buffer loans"
 
 loanBuffer :: Loan -> Buffer
 loanBuffer (Loan _ _ _ buffer) = buffer
+
+-- | Whether the loan is the request's primary buffer. A request that has lent its primary to another part has an extra
+-- loan, and none more to lend.
+loanIsPrimary :: Loan -> Bool
+loanIsPrimary (Loan _ kind _ _) = case kind of Primary -> True; Extra -> False
+
+-- | The loans of the request that lent the loan, which a part that was given the loan borrows more from.
+loansOf :: Loan -> Loans
+loansOf (Loan loans _ _ _) = loans
 
 -- | The program as one request in flight: it is given its loans besides its input, and has them until it ends,
 -- however it ends. Every loan is returned then, and every alias of a buffer is invalid. A request that has to wait to

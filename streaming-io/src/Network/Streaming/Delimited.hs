@@ -55,6 +55,7 @@ import Control.Monad (replicateM_, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Kind (Type)
 import Data.List (sortOn)
+import Data.Word (Word64)
 import GHC.Exts (PromptTag#, control0#, newPromptTag#, prompt#)
 import GHC.IO (IO (..))
 import Network.Streaming.Classes
@@ -177,14 +178,22 @@ instance Time (DelimitedM m s) where
 -- that the part is in while the body runs, with a mark above it for the failure of the body. The scope is the body's own: the
 -- cancellation that ends it is recognised by it, and another passes through.
 instance Within (DelimitedM m s) where
-  within (Duration limit) (Delimited body) = Delimited $ \context@(Context run _ part) value -> do
-    scope' <- newScope run
-    started <- roundNow run
-    timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
-    pushFrame run part (Inside scope')
-    marking context
-    let deadline = Deadline context scope' timer
-    catch (body context value >>= deadlineDone deadline) (deadlineFailed deadline)
+  within (Duration limit) (Delimited body) = Delimited (deadlined limit body)
+  {-# INLINE within #-}
+  timeoutA (Delimited body) = Delimited (\context (Duration limit, value) -> deadlined limit body context value)
+  {-# INLINE timeoutA #-}
+
+-- | The body with a deadline of this many nanoseconds: nothing if the deadline passed first.
+deadlined :: Word64 -> (Context -> a -> IO b) -> Context -> a -> IO (Maybe b)
+deadlined limit body context@(Context run _ part) value = do
+  scope' <- newScope run
+  started <- roundNow run
+  timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
+  pushFrame run part (Inside scope')
+  marking context
+  let deadline = Deadline context scope' timer
+  catch (body context value >>= deadlineDone deadline) (deadlineFailed deadline)
+{-# INLINE deadlined #-}
 
 -- | A deadline that the part is in: the part, its scope and its timer, which is all that the frame that the deadline leaves on
 -- the stack holds, the one pointer.

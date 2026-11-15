@@ -11,6 +11,13 @@ extra-source-files: native-pg-tls/src/cbits/native-pg-tls.h
                     native-pg-tls/test/certificates/*.crl
                     native-pg-tls/test/certificates/*.sh
 
+-- The executables and test suites are linked with GHC's threaded run time. With -f-threaded they are linked with the
+-- non-threaded one, which has one capability and one OS thread.
+flag threaded
+  description: Link the executables and test suites with the threaded run time
+  default: True
+  manual: True
+
 -- The integration tests of the v2 API. Every group of them is marked as an expected
 -- failure until the v2 code is there.
 test-suite native-pg-integration
@@ -29,6 +36,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Encoders
                       Database.PostgreSQL.Errors
                       Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Cares
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
@@ -53,6 +61,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation
+                      Database.PostgreSQL.Resolver
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
                       Database.PostgreSQL.Tls
@@ -62,17 +71,23 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Types
                       BufferSpec
                       ConnectionPoolSpec
+                      DnsServer
                       IntegrationSpec
                       ScopeTransactionSpec
                       TestCluster
+                      TestPools
                       TestPrograms
+                      TestServers
                       TransactionSpec
   main-is: Main.hs
-  ghc-options: -Wall -threaded "-with-rtsopts=-T" -fspecialise-aggressively
+  ghc-options: -Wall "-with-rtsopts=-T" -fspecialise-aggressively
+  if flag(threaded)
+    ghc-options: -threaded
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   c-sources: native-pg-tls/src/cbits/native-pg-tls.c
+             native-pg/cbits/cares.c
   include-dirs: native-pg-tls/src/cbits
-  pkgconfig-depends: rustls >= 0.15 && < 0.16
+  pkgconfig-depends: rustls >= 0.15 && < 0.16, libcares >= 1.24 && < 2
   build-depends:      base              >= 4.9 && < 4.22
                     , base64-bytestring >= 1 && < 1.3
                     , bytestring        >= 0.10.8 && < 0.13
@@ -111,6 +126,7 @@ benchmark native-pg-bench
                       Database.PostgreSQL.Encoders
                       Database.PostgreSQL.Errors
                       Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Cares
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
@@ -142,7 +158,11 @@ benchmark native-pg-bench
                       Database.PostgreSQL.Types
                       TestCluster
   main-is: Bench.hs
-  ghc-options: -Wall -threaded -rtsopts "-with-rtsopts=-T" -fexpose-all-unfoldings -fspecialise-aggressively
+  ghc-options: -Wall -rtsopts "-with-rtsopts=-T" -fexpose-all-unfoldings -fspecialise-aggressively
+  if flag(threaded)
+    ghc-options: -threaded
+  pkgconfig-depends: libcares >= 1.24 && < 2
+  c-sources: native-pg/cbits/cares.c
   build-depends:      base              >= 4.9 && < 4.22
                     , base64-bytestring >= 1 && < 1.3
                     , bytestring        >= 0.10.8 && < 0.13

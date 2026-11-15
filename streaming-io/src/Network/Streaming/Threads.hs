@@ -27,16 +27,21 @@ where
 import Control.Applicative ((<|>))
 import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
-import Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, rtsSupportsBoundThreads, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
 import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
-import Control.Monad (forM_, when)
+import Control.Monad (foldM, forM_, unless, when)
+import Data.Bits ((.&.))
 import Data.Foldable (traverse_)
 import Data.Functor (($>))
 import Data.IORef (atomicWriteIORef, newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe (isNothing)
+import Data.Word (Word64)
+import Foreign.Marshal.Alloc (malloc)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek, poke)
 import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
 import GHC.Exts (casMutVar#)
 import GHC.IO (IO (..))
@@ -73,6 +78,12 @@ type Members = IntMap.IntMap Part
 counter :: IORef Int
 counter = unsafePerformIO (newIORef 0)
 {-# NOINLINE counter #-}
+
+-- | How many points to give way at the threads have passed, on the non-threaded run time, whose one OS thread runs them one at a
+-- time: not exact. Unboxed, so that counting allocates nothing.
+gaveWay :: Ptr Int
+gaveWay = unsafePerformIO (malloc >>= \cell -> cell <$ poke cell 0)
+{-# NOINLINE gaveWay #-}
 
 -- | A number that no other part or scope has, from any thread.
 nextIdent :: IO Int
@@ -153,7 +164,13 @@ instance GiveWay (ThreadsM m) where
 -- | The point itself, which what the part has in hand doesn't go through: the call is not given it, so that a caller
 -- doesn't have to build it, as a link's input is a pair of the link and where it receives, for the call to give it back.
 givingWay :: Part -> IO ()
-givingWay (Part _ _ frames _ flag) =
+givingWay (Part _ _ frames _ flag) = do
+  -- The non-threaded run time has one capability, and a thread that doesn't allocate is not preempted: a part that polls
+  -- for what another thread does has to let it run. One point in 64 yields, since a yield costs what the stack is deep.
+  unless rtsSupportsBoundThreads $ do
+    passed <- peek gaveWay
+    poke gaveWay (passed + 1)
+    when (passed .&. 63 == 0) yield
   readIORef flag >>= \flagged ->
     if flagged
       then readIORef frames >>= reachedBy flag >>= maybe allowInterrupt (throwIO . Cancelled)
@@ -281,9 +298,9 @@ awaitBoth scope' one other =
     `onException` (cancelScope scope' *> uninterruptibleMask_ (readMVar one *> readMVar other $> ()))
 
 -- | Waits for all, and if it is interrupted, cancels them and waits for them still: no part outlives the group.
-awaitAll :: CancelScope Members -> [MVar a] -> IO [a]
+awaitAll :: CancelScope Members -> [MVar a] -> IO ()
 awaitAll scope' dones =
-  traverse readMVar dones
+  traverse_ readMVar dones
     `onException` (cancelScope scope' *> uninterruptibleMask_ (traverse_ readMVar dones))
 
 -- | What a group does when one of its parts has ended: the first failure is kept, and cancels the scope.
@@ -307,8 +324,9 @@ instance Concurrent (ThreadsM m) where
     parts -> Threads $ \part input -> do
       scope' <- newScope
       failure <- newIORef Nothing
-      dones <- traverse (\(Threads body) -> spawn part scope' (`body` input) (failing failure scope')) parts
-      _ <- awaitAll scope' dones
+      -- Started and awaited in loops that keep no stack of their own: a group of thousands of parts starts under a small stack limit.
+      dones <- reverse <$> foldM (\started (Threads body) -> (: started) <$> spawn part scope' (`body` input) (failing failure scope')) [] parts
+      awaitAll scope' dones
       readIORef failure >>= maybe (pure ()) throwIO
 
 -- | The first half to end is the result, and the other is cancelled and waited for. The loser's failure is
@@ -349,21 +367,38 @@ waited = bump @m DescriptorWaits *> bump @m Armings
 instance Time (ThreadsM m) where
   clock = Threads (\_ () -> Instant <$> monotonicNanoseconds)
 
--- | The deadline is a timeout of GHC's timer manager, which cancels the scope when it fires, and a cancel scope
--- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another
--- passes through.
+-- | The deadline is a timeout of GHC's timer manager, or a thread that sleeps where the run time has none, which cancels
+-- the scope when it fires, and a cancel scope that the part is in while the body runs: the cancellation that ends it is
+-- recognised by it, and another passes through.
 instance Within (ThreadsM m) where
-  within (Duration limit) (Threads body) = Threads $ \part value -> do
-    scope' <- newScope
-    manager <- getSystemTimerManager
-    key <- registerTimeout manager (fromIntegral (limit `div` 1000)) (cancelScope scope')
-    outcome <- inScope part scope' (body part value)
-    unregisterTimeout manager key
-    case outcome of
-      Right result -> pure (Just result)
-      Left failure
-        | cancelledBy failure == Just (scopeIdent scope') -> pure Nothing
-        | otherwise -> throwIO failure
+  within (Duration limit) (Threads body) = Threads (\part value -> deadlined limit part (body part value))
+  {-# INLINE within #-}
+  timeoutA (Threads body) = Threads (\part (Duration limit, value) -> deadlined limit part (body part value))
+  {-# INLINE timeoutA #-}
+
+-- | The action with a deadline of this many nanoseconds: nothing if the deadline passed first.
+deadlined :: Word64 -> Part -> IO a -> IO (Maybe a)
+deadlined limit part action = do
+  scope' <- newScope
+  let wait = fromIntegral (limit `div` 1000)
+  outcome <-
+    if rtsSupportsBoundThreads
+      then do
+        manager <- getSystemTimerManager
+        key <- registerTimeout manager wait (cancelScope scope')
+        result <- inScope part scope' action
+        result <$ unregisterTimeout manager key
+      else do
+        -- The non-threaded run time has no timer manager: a thread of its own sleeps, and is stopped with the deadline.
+        timer <- mask_ (forkIO (threadDelay wait *> cancelScope scope'))
+        result <- inScope part scope' action
+        result <$ uninterruptibleMask_ (killThread timer)
+  case outcome of
+    Right result -> pure (Just result)
+    Left failure
+      | cancelledBy failure == Just (scopeIdent scope') -> pure Nothing
+      | otherwise -> throwIO failure
+{-# INLINE deadlined #-}
 
 -- | Runs the action as a part that is in the cancel scope, and how it ended.
 inScope :: Part -> CancelScope Members -> IO a -> IO (Either SomeException a)

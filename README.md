@@ -218,8 +218,9 @@ memory. Use borrowed field chunks for body transfer.
 
 ## Building
 
-`native-pg-tls` needs rustls-ffi 0.15, found through `pkg-config`. With Nix,
-`nix-shell` has it, GHC, cabal and PostgreSQL.
+`native-pg` needs c-ares (1.24 or later), which looks host names up, and
+`native-pg-tls` needs rustls-ffi 0.15; both are found through `pkg-config`. With
+Nix, `nix-shell` has them, GHC, cabal and PostgreSQL.
 
 ```bash
 cabal build all

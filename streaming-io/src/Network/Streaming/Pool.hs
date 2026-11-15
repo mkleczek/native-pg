@@ -18,7 +18,7 @@ module Network.Streaming.Pool
     withLoan,
     withLoanWithin,
     withLoanIn,
-    withLoanWithinIn,
+    withLoanTimeoutA,
     urgently,
     newPool,
     closePool,
@@ -31,6 +31,8 @@ module Network.Streaming.Pool
     offer,
     free,
     checkoutAt,
+    queueAt,
+    isClosed,
     checkoutMany,
     checkoutManyOf,
     takeNow,
@@ -52,7 +54,6 @@ import Data.Tuple (swap)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (alongside, boolA, decide, done, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
-import Network.Streaming.Internal.Tickets (fulfilNow)
 
 -- | The items that are free, and how many, the number that the next waiter to queue gets, which says which of two
 -- waiters came first, and the waiters in their lanes, by how many items must be free to serve the first of the lane.
@@ -105,9 +106,18 @@ withLoanWithin limit pool = loaned pool (checkoutWithin limit pool)
 withLoanIn :: (Runtime arr) => arr (c, a) b -> arr (Pool c, a) (Either PoolError b)
 withLoanIn = loanedIn (checkoutIn >>^ Right)
 
--- | The same, but the checkout gives up after the time, as 'withLoanWithin' does.
-withLoanWithinIn :: (Runtime arr) => Duration -> arr (c, a) b -> arr (Pool c, a) (Either PoolError b)
-withLoanWithinIn limit = loanedIn ((1,) ^>> checkoutAtWithin limit >>^ maybe (Left CheckoutTimedOut) Right)
+-- | The same, but the checkout gives up after a time, as 'withLoanWithin' does, which the input gives with the pool, as
+-- 'timeoutA' takes its deadline: a program that is built once gives up after the time that each run gives.
+withLoanTimeoutA :: (Runtime arr) => arr (c, a) b -> arr ((Duration, Pool c), a) (Either PoolError b)
+withLoanTimeoutA body = scope acquire giveBack run
+  where
+    acquire =
+      now (\((limit, pool), _) -> (\closed -> if closed then Left () else Right (limit, pool)) <$> isClosed pool)
+        >>> (taking "closed" (arr (const (Left PoolClosed))) ||| taking "open" (alongside checkingOut >>^ \(got, (_, pool)) -> fmap (pool,) got))
+    checkingOut = (\(limit, pool) -> (limit, (1, pool))) ^>> checkoutAtTimeoutA >>^ maybe (Left CheckoutTimedOut) Right
+    giveBack = fst ^>> (done ||| offer)
+    run = withInput ^>> (arr Left ||| (body >>^ Right))
+    withInput (acquired, (_, input)) = fmap (\(_, item) -> (item, input)) acquired
 
 -- | The scope around a checkout, which is the arrow that gives the item or, if
 -- its deadline passed, nothing, and the release of what it gave.
@@ -349,6 +359,14 @@ checkoutAtWithin limit =
     giveWay
       >>> step "claim from free items" claimAtNow `giving` "item free?"
       >>> (taking "no" (within limit queueAt) ||| taking "yes" (arr Just))
+
+-- | The same, but the deadline is in the input, in front of the rest, as 'timeoutA' takes it.
+checkoutAtTimeoutA :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Within arr) => arr (Duration, (Int, Pool conn)) (Maybe conn)
+checkoutAtTimeoutA =
+  named (Label "checkoutAtTimeoutA" "Takes an item of the pool if enough are free, and else queues for one and waits for it until the deadline that the input gives.") $
+    giveWay
+      >>> step "claim from free items" (\(limit, input) -> either (Left . (limit,)) Right <$> claimAtNow input) `giving` "item free?"
+      >>> (taking "no" (timeoutA queueAt) ||| taking "yes" (arr Just))
 
 -- | The item, if at least this many are free, and else the input again.
 claimAtNow :: (Int, Pool conn) -> IO (Either (Int, Pool conn) conn)

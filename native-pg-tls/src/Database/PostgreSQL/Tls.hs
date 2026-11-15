@@ -1,19 +1,24 @@
--- | TLS for native-pg through rustls-ffi: the configuration of a client, and the
--- client that a connection starts TLS with.
+-- | TLS for native-pg through rustls-ffi: the configuration of a client, and the client that a connection starts TLS with.
 module Database.PostgreSQL.Tls
-  ( TlsConfig,
+  ( SystemRoots,
+    loadSystemRoots,
+    TlsConfig,
     newTlsConfig,
-    tlsClient,
+    newTlsClient,
   )
 where
 
-import Database.PostgreSQL.Tls.Internal (TlsConfig, clientConnection, newTlsConfig, tlsLinkOf)
-import Database.PostgreSQL.Transport (TlsClient (..))
+import Database.PostgreSQL.Tls.Internal (SystemRoots, TlsConfig, clientConnection, loadSystemRoots, newTlsConfig, tlsLinkOf)
+import Database.PostgreSQL.Transport (TlsClient (..), TlsStarter (..))
 
--- | The client that starts TLS with rustls, which a connection's settings take: it is the same for every connection.
--- Each connection has a configuration of its own, so that changed certificate files count, as with libpq. What it makes
--- has not shaken hands: the connection does, waiting for the socket as it goes.
-tlsClient :: TlsClient
-tlsClient = TlsClient $ \settings serverName sock -> do
-  config <- newTlsConfig settings serverName
-  tlsLinkOf settings <$> clientConnection config sock
+-- | The client that starts TLS with rustls, which a program makes once, in IO, and puts in the settings of its connections.
+-- It loads the system's root certificates, which every configuration that verifies against them shares. It builds a
+-- configuration for the settings of a host, and for its server's name, reading the files that it needs: the program does
+-- that where it makes the settings, with @prepareTls@. A connection is made from the configuration, and has not shaken
+-- hands: it does, waiting for the socket as it goes.
+newTlsClient :: IO TlsClient
+newTlsClient = do
+  roots <- loadSystemRoots
+  pure . TlsClient $ \settings serverName -> do
+    config <- newTlsConfig roots settings serverName
+    pure (TlsStarter (\sock -> tlsLinkOf settings <$> clientConnection config sock))

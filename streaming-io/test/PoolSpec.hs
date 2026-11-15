@@ -15,7 +15,7 @@ import Data.Tuple (Solo)
 import LoansTestSupport
 import Network.Streaming.Buffer (Buffer, bufferCapacity)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (alongside, done, tap)
+import Network.Streaming.Combinators (alongside, concurrently, done, sleep, tap)
 import Network.Streaming.Loans (withSetupBuffersOf)
 import Network.Streaming.Pool
 import Skeletest
@@ -156,13 +156,26 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
 
     it "gives up the checkout after the time, and has nobody waiting for the item" $ do
       pool <- newPool [7 :: Int]
-      run (withLoan pool (const (pool, ()) ^>> withLoanWithinIn (millis 20) done)) `shouldReturn` Right (Left CheckoutTimedOut)
+      run (withLoan pool (const ((millis 20, pool), ()) ^>> withLoanTimeoutA done)) `shouldReturn` Right (Left CheckoutTimedOut)
       free pool `shouldReturn` [7]
       waiters pool `shouldReturn` 0
 
     it "lends an item that is free at once, within the time" $ do
       pool <- newPool [7 :: Int]
-      run (const (pool, ()) ^>> withLoanWithinIn (millis 20) (arr fst)) `shouldReturn` Right 7
+      run (const ((millis 20, pool), ()) ^>> withLoanTimeoutA (arr fst)) `shouldReturn` Right 7
+
+    it "takes the deadline of each run from the input, in one program that is built once" $ do
+      pool <- newPool [7 :: Int]
+      held <- newSignal
+      -- The item is held for 80 ms. The short deadline passes before it is given back, and the long one doesn't.
+      run
+        ( concurrently
+            (withLoan pool (raise held >>> sleep (millis 80)))
+            (concurrently (waiting held (millis 20) pool) (waiting held (secs 10) pool))
+        )
+        `shouldReturn` (Right (), (Left CheckoutTimedOut, Right 7))
+      free pool `shouldReturn` [7]
+      waiters pool `shouldReturn` 0
 
   describe "takeNowWith" $ do
     it "takes the item at the position that the chooser gives, from the free items in the order that the pool takes them in" $ do
@@ -238,6 +251,14 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
 -- | A disposal that records what it was given.
 recording :: IORef [Int] -> Int -> IO ()
 recording disposed item = atomicModifyIORef' disposed (\items -> (item : items, ()))
+
+-- | The item of the pool, once the signal is raised, with the deadline that the input gives: one program for any deadline.
+waiting :: (Runtime arr) => Signal -> Duration -> Pool Int -> arr () (Either PoolError Int)
+waiting signal limit pool = awaitSignal signal >>> const ((limit, pool), ()) ^>> lendingWithin
+
+-- | The deadline and the pool that are the input, as a program that is built once.
+lendingWithin :: (Runtime arr) => arr ((Duration, Pool Int), ()) (Either PoolError Int)
+lendingWithin = withLoanTimeoutA (arr fst)
 
 -- | The item of the pool that is the input, as a program that is built once.
 lending :: (Runtime arr) => arr (Pool Int, ()) (Either PoolError Int)

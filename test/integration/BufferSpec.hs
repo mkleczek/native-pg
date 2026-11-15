@@ -27,6 +27,7 @@ import Control.Exception (bracket)
 import Control.Monad (forM_, unless)
 import Foreign.ForeignPtr (withForeignPtr)
 import Foreign.Marshal.Utils (fillBytes)
+import Foreign.Storable (pokeByteOff)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as Builder
@@ -36,11 +37,11 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32, Int64)
 import Data.Maybe (isNothing)
 import Data.Word (Word8)
-import Database.PostgreSQL.Connection (ChannelBindingMode (..), ConnectSettings (..), Connection)
+import Database.PostgreSQL.Connection (ChannelBindingMode (..), ConnectSettings (..), Connection, prepareTls)
 import qualified Database.PostgreSQL.Connection as PG
-import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), fromConnectionString, parseConnectionString)
+import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), emptyDefaults, fromConnectionString, parseConnectionString)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Tls (tlsClient)
+import Database.PostgreSQL.Tls (newTlsClient)
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import qualified Network.Socket as Socket
@@ -60,6 +61,8 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       tiny = withBuffers smallBuffers runner
       unix = unixSettings socketPath
       scram = unix "native_pg_scram" (Just "scram secret")
+      -- The same role over TLS, with its TLS configuration built.
+      scramTls = tlsSettings port "native_pg_scram" (Just "scram secret")
       -- A request with room for one primary buffer and one borrowed one, of 256 bytes.
       sharing :: Program a -> IO a
       sharing = withBuffers (BufferPoolSettings (positiveInt @256) (positiveInt @1) (positiveInt @1) (positiveInt @2)) runner
@@ -74,8 +77,9 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
     it "authenticates with tiny setup buffers while the request's own is busy, and returns them" $
       tiny (thrice scram) `shouldReturn` Just ()
 
-    it "authenticates SCRAM over TLS with required binding and tiny setup buffers" $
-      tiny (thrice ((tlsSettings port "native_pg_scram" (Just "scram secret")) {connectChannelBinding = ChannelBindingRequire})) `shouldReturn` Just ()
+    it "authenticates SCRAM over TLS with required binding and tiny setup buffers" $ do
+      scramSettings <- scramTls
+      tiny (thrice (scramSettings {connectChannelBinding = ChannelBindingRequire})) `shouldReturn` Just ()
 
     -- A connection keeps nothing of the setup storage: what it learned there is its own, however the storage is used after.
     it "streams repeated operations after setup storage has been overwritten and loaned again" $
@@ -190,9 +194,10 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
     -- to fit the buffer, and one that does not is read as a field, so the smallest buffer that takes a request is the largest
     -- column that it decodes in place.
     it "authenticates over TLS and streams a field after a column, with buffers of 16 bytes" $ do
+      scramSettings <- scramTls
       total <- newIORef (0 :: Int)
       tiny
-        ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $
+        ( session scramSettings $
             committed Tx.Read (Tx.statement (plain "SELECT 42::bigint, repeat('x', 256)" columnAndBody)) $ \result ->
               Tx.single result >>> second (measure >>> now (\(bytes, _) -> atomicModifyIORef' total (\n -> (n + bytes, ())))) >>^ fst
         )
@@ -200,22 +205,67 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
       readIORef total `shouldReturn` 256
 
     -- The upload borrows a buffer for each piece it sends, from the loans of the request that also reads the response.
-    needs "streamed parameters" $ it "shares one primary across a borrowed upload and a streamed TLS response" $ do
+    it "shares one primary across a borrowed upload and a streamed TLS response" $ do
+      scramSettings <- scramTls
       remaining <- newIORef 16385
       held <- newIORef Nothing
       sharing
-        ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $
+        ( session scramSettings $
             streamingFrom (\loans -> pure (LoanSource loans remaining held)) echoed
         )
         `shouldReturn` Right (BS.replicate 16385 120)
       readIORef remaining `shouldReturn` 0
       (isNothing <$> readIORef held) `shouldReturn` True
 
+    -- The body of a request is views of its primary buffer, which the request holds until the body ends: the transaction works
+    -- in the one loan that is left, and the sender has none to borrow, so it renders into the transaction's own buffer while
+    -- nothing is owed. A pipeline that has another result besides the one that streams is sent while it is read, which takes a
+    -- second buffer that the request hasn't got: it fails before anything is sent, and the connection stays usable.
+    describe "a stream that holds the primary buffer" $ do
+      let held :: Program a -> IO a
+          held = sharing
+      it "is streamed into a parameter, the transaction sending and reading in its own buffer" $
+        held (session scram (holding 1000 (echoing [1000]))) `shouldReturn` Right (alphabet 1000)
+      it "is streamed into two parameters of a statement, the length of the second sent between the pieces" $
+        held (session scram (holding 1000 (echoing [400, 600]))) `shouldReturn` Right (alphabet 1000)
+      it "is streamed into a statement that is prepared in the same pipeline" $
+        held (session scram (holding 1000 (echoingPrepared 1000))) `shouldReturn` Right (alphabet 1000)
+      it "is streamed with buffers of 16 bytes" $
+        tiny (session scram (holding 5000 (echoing [5000]))) `shouldReturn` Right (alphabet 5000)
+      it "is refused by a pipeline that has another result before the statement that streams, and nothing is sent" $
+        held
+          ( session scram $
+              steps
+                [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32))) `before` Tx.statement (echoStatement [100])) discardBoth) `failsAs` noBuffer,
+                  selectOne `yields` Right [1]
+                ]
+          )
+          `shouldReturn` ()
+      it "is refused by a pipeline that has another result after the statement that streams, and nothing is sent" $
+        held
+          ( session scram $
+              steps
+                [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (echoStatement [100]) `before` Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32)))) discardBoth) `failsAs` noBuffer,
+                  selectOne `yields` Right [1]
+                ]
+          )
+          `shouldReturn` ()
+      it "has a pipeline that is larger than a buffer and streams nothing refused too, and nothing is sent" $
+        held
+          ( session scram $
+              steps
+                [ holding 0 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate 1000 'y')] (single @_ @Int32)))) Tx.discard) `failsAs` noBuffer,
+                  selectOne `yields` Right [1]
+                ]
+          )
+          `shouldReturn` ()
+
     -- A source that is slow makes the request wait for it, and the response is read meanwhile: one wait of the arrow, not two.
-    needs "streamed parameters" $ it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $ do
+    it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $ do
+      scramSettings <- scramTls
       let pieces = replicate 64 (BS.replicate 256 120) <> [BS.replicate 1 120]
       sharing
-        ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $
+        ( session scramSettings $
             streaming (newSlowChunks (millis 1) pieces) echoed
         )
         `shouldReturn` Right (BS.replicate 16385 120)
@@ -225,10 +275,11 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
     forM_ [Shape "a field alone" "SELECT repeat('x', 256)" Tx.field, Shape "a column and a field" "SELECT 42::bigint, repeat('x', 256)" (Tx.skip &&& Tx.field >>^ snd)] $
       \(Shape label sql shape) ->
         it ("reports a deferred COMMIT failure after a streamed body was delivered, with " <> label) $ do
+          scramSettings <- scramTls
           delivered <- newIORef False
           result <-
             tiny
-              ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $
+              ( session scramSettings $
                   committed
                     Tx.Write
                     ( (,,,)
@@ -245,9 +296,10 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
           readIORef delivered `shouldReturn` True
           result `shouldBe` Just "23503"
 
-    it "pulls a column and a streamed body and commits with its pipeline, and the connection is usable after" $
+    it "pulls a column and a streamed body and commits with its pipeline, and the connection is usable after" $ do
+      scramSettings <- scramTls
       tiny
-        ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $
+        ( session scramSettings $
             steps
               [ transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT 42::bigint, repeat('x', 256)" columnAndBody)) lengthsOf
                   `yields` Right (42, 256, 256),
@@ -256,9 +308,10 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
         )
         `shouldReturn` ()
 
-    it "rolls back a COMMIT failure after the pull, and reuses the connection" $
+    it "rolls back a COMMIT failure after the pull, and reuses the connection" $ do
+      scramSettings <- scramTls
       tiny
-        ( session (tlsSettings port "native_pg_scram" (Just "scram secret")) $
+        ( session scramSettings $
             steps
               [ ( committed
                     Tx.Write
@@ -302,8 +355,81 @@ echoed =
     Tx.ReadCommitted
     Tx.Read
     Tx.Final
-    (Tx.statement (Tx.Statement "SELECT $1::text" (\source -> [streamedText 16385 source]) (Tx.any Tx.field)))
+    (Tx.statement (Tx.streamFrom id (Tx.Statement "SELECT $1::text" (const [streamedText 16385]) Nothing (Tx.any Tx.field))))
     (\result -> Tx.single result >>> copyOut)
+
+-- | The text that the source streams as the parameters, of these lengths one after the other, as the server gives it back as a
+-- field: the statement.
+echoStatement :: (Runtime arr, Stream arr s) => [Int] -> Tx.Statement arr s Tx.Field
+echoStatement declared =
+  Tx.streamFrom id (Tx.Statement ("SELECT " <> BS.intercalate " || " [Char8.pack ('$' : show number <> "::text") | number <- [1 .. length declared]]) (const (map streamedText declared)) Nothing (Tx.any Tx.field))
+
+-- | The text that the source streams as the parameters, of these lengths one after the other, which the server gives back as a
+-- field, copied out.
+echoing :: (Runtime arr, Stream arr s) => [Int] -> arr (Connection, (Loans, s)) (Either QueryError ByteString)
+echoing declared =
+  transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (echoStatement declared)) (\result -> Tx.single result >>> copyOut)
+
+-- | The same, with the statement prepared in the pipeline that executes it.
+echoingPrepared :: (Runtime arr, Stream arr s) => Int -> arr (Connection, (Loans, s)) (Either QueryError ByteString)
+echoingPrepared size =
+  transactOn
+    Tx.ReadCommitted
+    Tx.Read
+    Tx.Final
+    ((,) <$> Tx.prepare "held" (echoStatement [size]) <*> Tx.executePrepared "held" (echoStatement [size]))
+    (\(preparation, result) -> Tx.prepared preparation >>> Tx.single result >>> copyOut)
+
+-- | Two pipelines put together, in order.
+before :: Tx.Pipeline arr p a -> Tx.Pipeline arr p b -> Tx.Pipeline arr p (a, b)
+before = liftA2 (,)
+
+-- | Discards both results, in order.
+discardBoth :: (Runtime arr) => (Tx.Result arr a, Tx.Result arr b) -> With Tx.Tx arr () ()
+discardBoth (earlier, later) = Tx.discard earlier >>> Tx.discard later
+
+-- | What a pipeline that has no buffer to be sent from fails with.
+noBuffer :: UsageError -> IO ()
+noBuffer = \case
+  NoBufferToSend -> pure ()
+  other -> failTest ("expected NoBufferToSend, got " <> show other)
+
+-- | The step, with a source of this many bytes that holds the primary buffer of the request, as the body of a request does.
+holding :: (Runtime arr) => Int -> arr (Connection, (Loans, HeldSource)) b -> OnConn arr b
+holding size step =
+  (\(connection, loans) -> (loans, (connection, loans)))
+    ^>> first borrow
+    >>> now (\(loan, (connection, loans)) -> (\left -> (connection, (loans, HeldSource loan size left))) <$> newIORef size)
+    >>> step
+
+-- | A source of bytes that are views of the primary buffer that it holds until the stream ends, a piece of the buffer's size at
+-- most: the letters of the alphabet in turn, so that a piece in the wrong place shows. The size and what is left of it.
+data HeldSource = HeldSource Loan Int (IORef Int)
+
+instance (Runtime arr) => Stream arr HeldSource where
+  next = remainingOrEnd >>> (ending ||| piece)
+    where
+      remainingOrEnd =
+        now (\source@(HeldSource _ _ left) -> (\n -> if n == 0 then Left source else Right (source, n)) <$> readIORef left)
+      -- The primary buffer is given back when the stream has ended.
+      ending = (\(HeldSource loan _ _) -> loan) ^>> release >>^ const Nothing
+      piece =
+        now
+          ( \(HeldSource loan size left, n) -> do
+              let buffer = loanBuffer loan
+                  count = min n (bufferCapacity buffer)
+              writeIORef left (n - count)
+              withForeignPtr (bufferMemory buffer) (\pointer -> forM_ [0 .. count - 1] (\at -> pokeByteOff pointer at (letter (size - n + at))))
+              pure (Just (view buffer count))
+          )
+
+-- | The letter that is the byte at the place in the text of the alphabet.
+letter :: Int -> Word8
+letter place = fromIntegral (97 + place `mod` 26)
+
+-- | The text of this many bytes that a source of the alphabet gives.
+alphabet :: Int -> ByteString
+alphabet size = BS.pack (map letter [0 .. size - 1])
 
 -- | The shape of a row that has a field in the end, as a value that any arrow takes.
 data Shape = Shape String ByteString (forall arr. (Runtime arr) => arr Tx.Columns Tx.Field)
@@ -361,11 +487,13 @@ failedCommitCode = \case
   Left (QueryError "COMMIT" (ServerFailed (ServerError diagnostics))) -> Just (diagnosticCode diagnostics)
   _ -> Nothing
 
--- | The settings of a connection string, with the TLS client of native-pg-tls.
+-- | The settings of a connection string, with the TLS client of native-pg-tls and its configuration built.
 settingsOf :: ByteString -> IO ConnectSettings
-settingsOf string = case parseConnectionString (Defaults "/tmp" Nothing) (const Nothing) (Just "postgres") string of
+settingsOf string = case parseConnectionString ((emptyDefaults "/tmp" Nothing) {defaultUser = Just "postgres"}) string of
   Left problem -> fail problem
-  Right parsed -> either fail (\settings -> pure settings {connectTlsClient = Just tlsClient}) (fromConnectionString parsed)
+  Right parsed -> do
+    client <- newTlsClient
+    either fail (\settings -> prepareTls settings {connectTlsClient = Just client}) (fromConnectionString parsed)
 
 -- | The step, with a new source made of the loans of the request for its input.
 streamingFrom :: (Runtime arr) => (Loans -> IO s) -> arr (Connection, (Loans, s)) b -> OnConn arr b

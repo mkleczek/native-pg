@@ -45,7 +45,7 @@ import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.Classes (Effect (..), Runtime, Scope (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, consume, iterateWith, keeping)
 import Network.Streaming.Reader (Reader, newReader)
-import Network.Streaming.With (With (..), asks, lift, withOnly)
+import Network.Streaming.With (With (..), ask, asks, lift, withOnly)
 import System.IO.Error (isUserError)
 
 -- | The messages of the startup, which are told apart by their tags, and each read whole.
@@ -64,10 +64,10 @@ type StartupMessages =
        FramedMessage 'C' 'RemainingBytesAtom
      ]
 
--- | What the startup works with: the carrier, the buffer that its messages are rendered into and received in, which,
--- one after the other, need no more than one, the reader of the replies, and the data that SCRAM's channel binding takes
--- from the TLS link: the bytes, or why there are none, or none.
-data Setup = Setup !Carrier !Buffer !(Reader Carrier) !(Maybe (Either String ByteString))
+-- | What the startup works with: the settings, the carrier, the buffer that its messages are rendered into and received in,
+-- which, one after the other, need no more than one, the reader of the replies, and the data that SCRAM's channel binding
+-- takes from the TLS link: the bytes, or why there are none, or none.
+data Setup = Setup !ConnectSettings !Carrier !Buffer !(Reader Carrier) !(Maybe (Either String ByteString))
 
 -- | Where the startup is, and what it keeps: the version of the protocol, whichever the server settled on.
 data Phase
@@ -100,9 +100,9 @@ data Verdict = Qualifies | Disqualified String | Asks Question
 -- | Starts the session: it sends the startup message, authenticates and reads the server's report, up to its being
 -- ready for a statement, or says why it couldn't. A server that ends the stream, and one that says what the client
 -- doesn't understand, are ways that it couldn't.
-startup :: (Runtime arr) => ConnectSettings -> arr (Carrier, Buffer, Maybe (Either String ByteString)) (Either ConnectError ServerInfo)
-startup settings =
-  tryA (now (\(carrier, buffer, binding) -> (\reader -> Setup carrier buffer reader binding) <$> newReader carrier buffer) >>> withOnly (opening settings))
+startup :: (Runtime arr) => arr (ConnectSettings, (Carrier, Buffer, Maybe (Either String ByteString))) (Either ConnectError ServerInfo)
+startup =
+  tryA (now (\(settings, (carrier, buffer, binding)) -> (\reader -> Setup settings carrier buffer reader binding) <$> newReader carrier buffer) >>> withOnly opening)
     >>> now (either failed (pure . Right))
 
 -- | What a failure of the startup is: the server's rejection and the client's own are as they were thrown, and a
@@ -120,29 +120,29 @@ failed failure
       | isUserError io = "server closed the connection unexpectedly"
       | otherwise = ioe_description io
 
-opening :: (Runtime arr) => ConnectSettings -> With Setup arr () ServerInfo
-opening settings =
-  const (startupMessage settings)
-    ^>> send
-    >>> const (Negotiating (connectProtocolVersion settings))
-    ^>> loop settings
+opening :: (Runtime arr) => With Setup arr () ServerInfo
+opening =
+  (ask >>^ \(Setup settings _ _ _ _) -> startupMessage settings)
+    >>> send
+    >>> (ask >>^ \(Setup settings _ _ _ _) -> Negotiating (connectProtocolVersion settings))
+    >>> loop
 
 -- | The loop: the message that comes, and what the phase makes of it.
-loop :: (Runtime arr) => ConnectSettings -> With Setup arr Phase ServerInfo
-loop settings =
+loop :: (Runtime arr) => With Setup arr Phase ServerInfo
+loop =
   iterateWith
-    (keeping received >>> With (now (\(Setup _ _ _ binding, (reply, phase)) -> react settings binding reply phase)))
+    (keeping received >>> With (now (\(Setup settings _ _ _ binding, (reply, phase)) -> react settings binding reply phase)))
     (answered ^>> (returnA ||| consume send))
   where
     answered (answer, phase) = maybe (Left phase) (Right . (,phase)) answer
 
 -- | Sends the output, rendered into the buffer.
 send :: (Runtime arr) => With Setup arr Output ()
-send = With ((\(Setup carrier buffer _ _, output) -> (carrier, buffer, output)) ^>> sendOutput)
+send = With ((\(Setup _ carrier buffer _ _, output) -> (carrier, buffer, output)) ^>> sendOutput)
 
 -- | The next message of the server: its tag, and its body.
 received :: forall arr. (Runtime arr) => With Setup arr () (Char, ByteString)
-received = asks (arr (\(Setup _ _ reader _) -> reader)) >>> lift readMessage
+received = asks (arr (\(Setup _ _ _ reader _) -> reader)) >>> lift readMessage
   where
     readMessage :: arr (Reader Carrier) (Char, ByteString)
     readMessage =

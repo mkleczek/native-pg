@@ -3,8 +3,11 @@
 -- it, and the one that sees a new second renders it: two that do at once render the same.
 module Network.Fulmen.Internal.Date
   ( Date,
-    newDate,
+    Pulse,
+    newPulse,
     currentDate,
+    draining,
+    beginDraining,
     formatDate,
   )
 where
@@ -12,20 +15,23 @@ where
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Foreign.C.Types (CTime (..))
 import Foreign.Ptr (Ptr, nullPtr)
 
 -- | A date, as the second of the epoch it was rendered for and its text.
 data Date = Date !Int !ByteString
 
--- | A date that has not been rendered yet.
-newDate :: IO (IORef Date)
-newDate = newIORef (Date 0 B.empty)
+-- | What every response of a server looks at, and the cores share: the date, which has not been rendered yet in a new one,
+-- and whether the server is shutting down.
+data Pulse = Pulse !(IORef Date) !(IORef Bool)
+
+newPulse :: IO Pulse
+newPulse = Pulse <$> newIORef (Date 0 B.empty) <*> newIORef False
 
 -- | The text of the date now, in the form of RFC 9110 section 5.6.7.
-currentDate :: IORef Date -> IO ByteString
-currentDate ref = do
+currentDate :: Pulse -> IO ByteString
+currentDate (Pulse ref _) = do
   CTime seconds <- c_time nullPtr
   Date rendered text <- readIORef ref
   if rendered == fromIntegral seconds
@@ -34,6 +40,14 @@ currentDate ref = do
       let text' = formatDate (fromIntegral seconds)
       writeIORef ref (Date (fromIntegral seconds) text')
       pure text'
+
+-- | Whether the server is shutting down: a response then says that its connection ends.
+draining :: Pulse -> IO Bool
+draining (Pulse _ flag) = readIORef flag
+
+-- | The server is shutting down. Every core that looks sees it at its next look.
+beginDraining :: Pulse -> IO ()
+beginDraining (Pulse _ flag) = atomicWriteIORef flag True
 
 foreign import ccall unsafe "time"
   c_time :: Ptr CTime -> IO CTime

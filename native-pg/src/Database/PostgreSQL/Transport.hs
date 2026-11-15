@@ -11,6 +11,9 @@ module Database.PostgreSQL.Transport
     TcpOptions (..),
     defaultTcpOptions,
     TlsClient (..),
+    TlsStarter (..),
+    TlsWanted (..),
+    TlsPrepared (..),
     TlsLink (..),
     Handshake (..),
     shake,
@@ -27,7 +30,7 @@ module Database.PostgreSQL.Transport
 where
 
 import Control.Arrow (ArrowChoice, (>>>))
-import Control.Exception (Exception (..))
+import Control.Exception (Exception (..), SomeException)
 import Crypto.Hash (HashAlgorithm, SHA224 (..), SHA256 (..), SHA384 (..), SHA512 (..), hashWith)
 import Data.Bits (shiftL, testBit, (.&.), (.|.))
 import qualified Data.ByteArray as ByteArray
@@ -69,11 +72,38 @@ data TcpOptions = TcpOptions
 defaultTcpOptions :: TcpOptions
 defaultTcpOptions = TcpOptions True Nothing Nothing Nothing Nothing
 
--- | The TLS implementation that a connection starts TLS with, which native-pg-tls
--- supplies: without one, a connection can't encrypt, as libpq built without TLS
--- can't. It starts a session over a connected socket, for the settings and the server's
--- name, which has not shaken hands yet.
-newtype TlsClient = TlsClient {startTls :: TlsSettings -> HostName -> Socket -> IO TlsLink}
+-- | The TLS implementation that a connection starts TLS with, which native-pg-tls supplies: without one, a connection can't
+-- encrypt, as libpq built without TLS can't. A program makes it once, in IO, and it builds the configuration of TLS for the
+-- settings of each host, when the program makes them: building one reads the files of the certificates, keys and
+-- revocation lists, which a connect never does.
+newtype TlsClient = TlsClient {buildTls :: TlsSettings -> HostName -> IO TlsStarter}
+
+-- | A TLS configuration that is built, for one server: it makes a session over a connected socket, which has not shaken hands
+-- yet. It reads no file and never waits.
+newtype TlsStarter = TlsStarter {startTls :: Socket -> IO TlsLink}
+
+-- | What a TLS configuration is built for, as the settings of a connection say it, before any file is looked at.
+data TlsWanted = TlsWanted
+  { wantedVerification :: ServerVerification,
+    wantedCertificate :: Maybe (FilePath, FilePath),
+    wantedRevocationList :: Maybe FilePath,
+    wantedRevocationListDirectory :: Maybe FilePath,
+    wantedVersions :: [TlsVersion],
+    wantedServerNameIndication :: Bool,
+    wantedDirect :: Bool,
+    wantedServerName :: HostName
+  }
+  deriving (Eq, Show)
+
+-- | What was built for the settings of a host, in IO, ahead of the connections that use it: what it was built for, so that settings
+-- that changed since don't use it, what libpq checks before it connects (the root certificate file's being there, as the
+-- words of the failure if it isn't), and the configuration, or why it could not be built, which a connection that gets
+-- as far as TLS fails with.
+data TlsPrepared = TlsPrepared
+  { preparedFor :: !TlsWanted,
+    preparedRootsProblem :: !(Maybe String),
+    preparedStarter :: !(Either SomeException TlsStarter)
+  }
 
 -- | A TLS session over a socket, as a TLS client makes it: its calls, none of which
 -- waits. Its 'Link' instance waits for them, by blocking on the socket's events while

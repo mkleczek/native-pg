@@ -29,6 +29,7 @@ import Control.Category (Category (..))
 import Control.Exception (SomeException, mask_, throwIO, toException)
 import Control.Monad (when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Cancel
@@ -146,17 +147,25 @@ instance Time (CompiledM m) where
 -- that the part is in while the body runs: the cancellation that ends it is recognised by it, and another
 -- passes through.
 instance Within (CompiledM m) where
-  within (Duration limit) (Compiled body) = Compiled $ \(Context run part outer) value next -> do
-    scope' <- newScope run
-    started <- roundNow run
-    timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
-    pushFrame run part (Inside scope')
-    let leaves = popFrame run part *> cancelTimer (runWheel run) timer *> writeIORef (runFailure run) outer
-        onFailure failure = do
-          leaves
-          if cancelledBy failure == Just (scopeIdent scope') then next Nothing else outer failure
-    writeIORef (runFailure run) onFailure
-    body (Context run part onFailure) value (\result -> leaves *> next (Just result))
+  within (Duration limit) (Compiled body) = Compiled (deadlined limit body)
+  {-# INLINE within #-}
+  timeoutA (Compiled body) = Compiled (\context (Duration limit, value) next -> deadlined limit body context value next)
+  {-# INLINE timeoutA #-}
+
+-- | The body with a deadline of this many nanoseconds, which goes on with nothing if the deadline passed first.
+deadlined :: Word64 -> (Context -> a -> (b -> IO Step) -> IO Step) -> Context -> a -> (Maybe b -> IO Step) -> IO Step
+deadlined limit body (Context run part outer) value next = do
+  scope' <- newScope run
+  started <- roundNow run
+  timer <- addTimer (runWheel run) (started + limit) (cancelScope run scope')
+  pushFrame run part (Inside scope')
+  let leaves = popFrame run part *> cancelTimer (runWheel run) timer *> writeIORef (runFailure run) outer
+      onFailure failure = do
+        leaves
+        if cancelledBy failure == Just (scopeIdent scope') then next Nothing else outer failure
+  writeIORef (runFailure run) onFailure
+  body (Context run part onFailure) value (\result -> leaves *> next (Just result))
+{-# INLINE deadlined #-}
 
 instance Scope (CompiledM m) where
   scope (Compiled acquire) (Compiled release) (Compiled body) = Compiled $ \context@(Context run part outer) value next ->

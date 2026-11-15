@@ -17,6 +17,13 @@ extra-source-files: src/cbits/native-pg-tls.h
                     test/certificates/*.sh
 tested-with:        GHC == 9.10.3, GHC == 9.12.3
 
+-- The executables and test suites are linked with GHC's threaded run time. With -f-threaded they are linked with the
+-- non-threaded one, which has one capability and one OS thread.
+flag threaded
+  description: Link the executables and test suites with the threaded run time
+  default: True
+  manual: True
+
 library
   default-language:   GHC2021
   -- cabal builds the components with quasi-quotes with dynamic objects too,
@@ -48,7 +55,9 @@ test-suite native-pg-tls-spec
   other-modules:      TlsSpec
                       Database.PostgreSQL.Tls.Internal
   main-is:            Main.hs
-  ghc-options:        -Wall -threaded -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  ghc-options:        -Wall -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  if flag(threaded)
+    ghc-options: -threaded
   build-tool-depends: skeletest:skeletest-preprocessor >= 0.4.2 && < 0.5
   c-sources:          src/cbits/native-pg-tls.c
   include-dirs:       src/cbits

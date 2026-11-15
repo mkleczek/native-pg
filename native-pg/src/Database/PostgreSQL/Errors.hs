@@ -159,6 +159,10 @@ data UsageError
     -- the declared length, and at least as many as were delivered. The message
     -- it belongs to is incomplete, so the connection is broken.
     StreamLengthError Int Int
+  | -- | A pipeline was to be sent while it is read, which takes a second buffer, and the request has none to lend: what the
+    -- program streams from holds its primary buffer, and the transaction works in the one that is left. Only a pipeline whose
+    -- one result is the statement that streams is sent from the transaction's buffer. Nothing was sent.
+    NoBufferToSend
   deriving (Eq, Show)
 
 instance Exception UsageError where
@@ -175,6 +179,9 @@ instance Exception UsageError where
     UnexpectedAmountOfRows count -> "the result had " <> show count <> " rows, which its shape doesn't allow"
     StreamLengthError declared delivered ->
       "a parameter stream declared " <> show declared <> " bytes, and delivered " <> show delivered
+    NoBufferToSend ->
+      "a pipeline that is sent while it is read needs a second buffer, which the request has not got: "
+        <> "put the statement that streams in a pipeline of its own"
 
 -- | The connection ended, and nothing more can be done with it.
 data ConnectionError

@@ -20,37 +20,38 @@
 -- they wait for lands.
 module IntegrationSpec (spec) where
 
-import Control.Arrow (arr, second, (&&&), (>>>), (>>^), (^>>))
+import Control.Arrow (arr, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (IOException, SomeException, bracket, catch, displayException, finally)
+import Control.Exception (IOException, bracket, displayException, finally)
 import Control.Monad (forM_, forever, unless, void)
-import Data.Foldable (traverse_)
-import Data.Bits (shiftR)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.Int (Int16, Int32, Int64)
-import Data.List (intercalate)
+import Data.List (intercalate, isPrefixOf, nub)
 import Data.Maybe (isJust, isNothing)
 import Data.Scientific (Scientific)
 import Data.Text (Text)
 import Data.Time (Day, DiffTime, UTCTime (..), fromGregorian)
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
-import Database.PostgreSQL.Connection (ChannelBindingMode (..), ConnectSettings (..), Connection)
+import Database.PostgreSQL.Connection (ChannelBindingMode (..), ConnectSettings (..), Connection, SslMode (..), prepareTls)
 import qualified Database.PostgreSQL.Connection as PG
 import qualified Database.PostgreSQL.Connection.Internal as PGInternal
-import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), fromConnectionString, parseConnectionString)
+import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), emptyDefaults, fromConnectionString, parseConnectionString)
 import Database.PostgreSQL.Decoding (DecodeValue (..), DecodingError (..), InPlace, Json (..), Jsonb (..), composite)
 import qualified Database.PostgreSQL.Decoding as Decoding
 import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Errors
+import Database.PostgreSQL.Internal.Cares (Resolver, ResolverOptions (..), defaultResolverOptions, newResolverWith)
 import qualified Database.PostgreSQL.Notifications as Notify
+import Database.PostgreSQL.Resolver (newResolver)
 import qualified Database.PostgreSQL.Snippet as Snippet
-import Database.PostgreSQL.Tls (tlsClient)
+import Database.PostgreSQL.Tls (newTlsClient)
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
+import Database.PostgreSQL.Transport (RootCertificates (..))
 import Database.PostgreSQL.Types (protocolVersion3_0, protocolVersion3_2)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
@@ -58,14 +59,16 @@ import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Skeletest
 import qualified Skeletest.Predicate as P
-import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive)
+import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive, removeFile, setModificationTime)
 import System.FilePath (takeDirectory, (</>))
 import System.Mem (performMajorGC)
 import System.Posix.Files (groupReadMode, otherReadMode, ownerReadMode, setFileMode, unionFileModes)
 import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (FileMode)
+import DnsServer (DnsServer (..), Reply (..), withDnsServer)
 import TestCluster (certificate)
 import TestPrograms
+import TestServers
 
 spec :: FilePath -> Socket.PortNumber -> Spec
 spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner name _) -> describe name $ do
@@ -145,11 +148,12 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
 
   -- A connection is closed when its scope ends. Closing it earlier is allowed, and so is closing it again.
   describe "close" $
-    forM_ [("without TLS", unix "postgres" Nothing), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
+    forM_ [("without TLS", pure (unix "postgres" Nothing)), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
       describe label $ do
-        it "rejects every operation after closing" $
+        it "rejects every operation after closing" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ closing,
                   selectOne `failsAs` unusable,
@@ -157,9 +161,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                   conn (Notify.listen ["events"]) `failsAs` unusable,
                   conn Notify.notification `failsAs` unusable
                 ]
-        it "can close repeatedly, also where its scope ends" $
+        it "can close repeatedly, also where its scope ends" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ closing,
                   withinFor (secs 5) (steps [closing, closing]) `yields` Just (),
@@ -169,9 +174,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         -- and the connection stays usable (see "TransactionSpec"). What breaks one is the cancellation rule: a statement
         -- that is cancelled while its answer is awaited leaves answers that nobody will read, and a connection is
         -- never drained for a client that has gone away. The case says only that closing works after it, however often.
-        it "can close a connection that a cancelled statement broke, repeatedly" $
+        it "can close a connection that a cancelled statement broke, repeatedly" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ withinFor (millis 300) (query sleeping) `yields` Nothing,
                   closing,
@@ -180,9 +186,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 ]
         -- The cancellation rule: v1 left the session unusable after a cancelled wait for a notification, but the reader
         -- is at a message boundary then and nothing is half sent or expected, so v2 leaves the connection usable.
-        it "keeps a connection usable when a wait for a notification is cancelled" $
+        it "keeps a connection usable when a wait for a notification is cancelled" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ conn (Notify.listen ["events"]),
                   withinFor (millis 100) (conn Notify.notification) `yields` Nothing,
@@ -190,17 +197,19 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 ]
         -- A connection has one user at a time, and a second one is turned away with 'ConnectionBusy', without disrupting
         -- the first. In v1 only 'close' was, and a nested statement broke the session.
-        it "rejects closing while a statement runs, without disrupting it" $
+        it "rejects closing while a statement runs, without disrupting it" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ concurrently (query (plain "SELECT 1 FROM pg_sleep(0.3)" (single @_ @Int32))) (after (millis 100) (closing `failsWith` ConnectionBusy))
                     `yields` (Right [1], ()),
                   selectOne `yields` Right [1]
                 ]
-        it "rejects a second statement while one runs, without disrupting it" $
+        it "rejects a second statement while one runs, without disrupting it" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ concurrently (query (plain "SELECT 1 FROM pg_sleep(0.3)" (single @_ @Int32))) (after (millis 100) (selectOne `failsWith` ConnectionBusy))
                     `yields` (Right [1], ()),
@@ -210,31 +219,32 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
   -- The binding data that SCRAM-PLUS signs comes from the TLS link. These cases replace it.
   describe "channel-binding data from TLS setup" $ do
     let suppliedBinding supplied mode user =
-          PGInternal.withEndPointOverride supplied ((encryptedAs user (Just "scram secret")) {connectChannelBinding = mode})
+          (\settings -> PGInternal.withEndPointOverride supplied (settings {connectChannelBinding = mode})) <$> encryptedAs user (Just "scram secret")
         bindingFailure = Just (Left "unsupported certificate hash")
         connectedWith settings = run (connectedTo settings done)
     it "uses the supplied binding bytes in SCRAM-PLUS" $
-      (rejection <$> connectedWith (suppliedBinding (Just (Right "wrong binding")) ChannelBindingRequire "native_pg_scram"))
+      (rejection <$> (suppliedBinding (Just (Right "wrong binding")) ChannelBindingRequire "native_pg_scram" >>= connectedWith))
         `shouldReturn` Just "28000"
     forM_ [("preferred", ChannelBindingPrefer), ("required", ChannelBindingRequire)] $ \(label, mode) ->
       it ("reports a binding error when SCRAM-PLUS is " <> label) $
-        (authenticationFailure <$> connectedWith (suppliedBinding bindingFailure mode "native_pg_scram"))
+        (authenticationFailure <$> (suppliedBinding bindingFailure mode "native_pg_scram" >>= connectedWith))
           `shouldReturn` Just "unsupported certificate hash"
     it "ignores a binding error when channel binding is disabled" $
-      run (session (suppliedBinding bindingFailure ChannelBindingDisable "native_pg_scram") currentUser)
+      (suppliedBinding bindingFailure ChannelBindingDisable "native_pg_scram" >>= \settings -> run (session settings currentUser))
         `shouldReturn` Right ["native_pg_scram"]
     it "does not require binding data for non-SCRAM authentication" $
-      run (session (suppliedBinding bindingFailure ChannelBindingPrefer "postgres") selectOne) `shouldReturn` Right [1]
+      (suppliedBinding bindingFailure ChannelBindingPrefer "postgres" >>= \settings -> run (session settings selectOne)) `shouldReturn` Right [1]
     it "allows unbound SCRAM when binding is unavailable and optional" $
-      run (session (suppliedBinding Nothing ChannelBindingPrefer "native_pg_scram") currentUser)
+      (suppliedBinding Nothing ChannelBindingPrefer "native_pg_scram" >>= \settings -> run (session settings currentUser))
         `shouldReturn` Right ["native_pg_scram"]
     it "rejects required binding when the TLS link supplies none" $
-      (authenticationFailure <$> connectedWith (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram"))
+      (authenticationFailure <$> (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram" >>= connectedWith))
         `shouldReturn` Just "channel binding is required, but server did not offer an authentication method that supports channel binding"
-    it "ignores binding errors on a cancellation connection" $
+    it "ignores binding errors on a cancellation connection" $ do
+      supplied <- suppliedBinding bindingFailure ChannelBindingRequire "postgres"
       run $
         session (unix "postgres" Nothing) $
-          cancelling (suppliedBinding bindingFailure ChannelBindingRequire "postgres")
+          cancelling supplied
 
   describe "connection strings" $ do
     let directory = takeDirectory socketPath
@@ -333,6 +343,122 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "words a host name that doesn't resolve as libpq does" $ do
       failure <- connectFailure "host=no-such-host.invalid"
       failure `shouldSatisfy` P.hasPrefix "could not translate host name \"no-such-host.invalid\" to address: "
+    -- A scripted DNS server stands for the system's, so that a lookup can be answered, answered late or not answered. The
+    -- resolver asks it only, and looks up no search domains.
+    describe "host names, looked up by c-ares" $ do
+      let loopback = Addresses [(127, 0, 0, 1)]
+          viaName resolver host extra = settingsVia resolver (viaPlaintext host extra)
+          connectedBy settings = run (session settings (arr (hostName . PG.connectedHost . fst) &&& selectOne))
+          failureOf' settings = either displayException (const "connected") <$> run (connectedTo settings done)
+          asked dns = nub . map fst <$> dnsQuestions dns
+          secondsOf start = subtract start <$> getMonotonicTime
+      it "connects to the address that a name has, and asks the server for it" $
+        withDnsServer (const loopback) $ \dns -> do
+          resolver <- resolverFor dns 2000 1
+          settings <- viaName resolver "scripted.test" ""
+          connectedBy settings `shouldReturn` ("scripted.test", Right [1])
+          asked dns `shouldReturn` ["scripted.test"]
+      it "waits for an answer that comes late" $
+        withDnsServer (const (Later 600000 loopback)) $ \dns -> do
+          resolver <- resolverFor dns 3000 1
+          settings <- viaName resolver "slow.test" ""
+          started <- getMonotonicTime
+          connectedBy settings `shouldReturn` ("slow.test", Right [1])
+          secondsOf started >>= (`shouldSatisfy` P.gte 0.5)
+      -- The part that looks the name up waits for the answer where the other parts can go on: here the other part ends
+      -- while the answer is still to come, which it couldn't if the lookup held up its core.
+      it "leaves the core running other parts while it waits for the answer" $
+        withDnsServer (const (Later 1500000 loopback)) $ \dns -> do
+          resolver <- resolverFor dns 5000 1
+          settings <- viaName resolver "slow.test" ""
+          ((connected, lookupTime), ((), tickTime)) <-
+            run (concurrently (timed (connectedTo settings done)) (timed (done >>> times 10 (sleep (millis 20)))))
+          connected `shouldSatisfy` P.right P.anything
+          (tickTime < lookupTime, lookupTime >= 1400000000) `shouldBe` (True, True)
+      it "gives up on a lookup after connect_timeout" $
+        withDnsServer (const Silent) $ \dns -> do
+          resolver <- resolverFor dns 30000 1
+          settings <- viaName resolver "silent.test" "connect_timeout=2"
+          started <- getMonotonicTime
+          failureOf' settings `shouldReturn` ("connection to server at \"silent.test\", port " <> show port <> " failed: timeout expired")
+          secondsOf started >>= (`shouldSatisfy` (P.gte 1.9 P.&& P.lt 6))
+      it "stops a lookup that is cancelled, and looks the next name up with the same resolver" $
+        withDnsServer (\queried -> if queried == "silent.test" then Silent else loopback) $ \dns -> do
+          resolver <- resolverFor dns 30000 1
+          silent <- viaName resolver "silent.test" ""
+          answered <- viaName resolver "scripted.test" ""
+          started <- getMonotonicTime
+          run (withinFor (millis 300) (connectedTo silent done)) >>= (`shouldSatisfy` P.nothing)
+          secondsOf started >>= (`shouldSatisfy` P.lt 2)
+          connectedBy answered `shouldReturn` ("scripted.test", Right [1])
+      -- The cancelled lookup cancels what the resolver is asking for, and the other lookup goes on.
+      it "lets a lookup go on when another one that the resolver serves is cancelled" $
+        withDnsServer (\queried -> if queried == "silent.test" then Silent else Later 1000000 loopback) $ \dns -> do
+          resolver <- resolverFor dns 30000 1
+          silent <- viaName resolver "silent.test" ""
+          slow <- viaName resolver "slow.test" ""
+          (slowAnswer, silentAnswer) <-
+            run (concurrently (session slow (arr (hostName . PG.connectedHost . fst) &&& selectOne)) (withinFor (millis 300) (connectedTo silent done)))
+          (slowAnswer, isNothing silentAnswer) `shouldBe` (("slow.test", Right [1]), True)
+      -- The resolver leaves the addresses in the order that the server gives them here. Both fail at once, as no address
+      -- of the loopback does on every system: a broadcast and a multicast address, which no connection can be made to.
+      it "tries the addresses of a name in order, and words the failure of each" $
+        withDnsServer (const (Addresses [(255, 255, 255, 255), (224, 0, 0, 1)])) $ \dns -> do
+          resolver <- newResolverWith (resolverOptionsFor dns 2000 1) {resolverSort = False}
+          settings <- settingsVia resolver ("host=ordered.test sslmode=disable port=" <> Char8.pack (show port))
+          failure <- failureOf' settings
+          let addressOf line = takeWhile (/= ')') (drop 1 (dropWhile (/= '(') line))
+          map addressOf (filter ("connection to server at \"ordered.test\"" `isPrefixOf`) (lines failure)) `shouldBe` ["255.255.255.255", "224.0.0.1"]
+      it "connects to a later address of a name after one that fails" $
+        withDnsServer (const (Addresses [(255, 255, 255, 255), (127, 0, 0, 1)])) $ \dns -> do
+          resolver <- newResolverWith (resolverOptionsFor dns 2000 1) {resolverSort = False}
+          settings <- viaName resolver "ordered.test" ""
+          connectedBy settings `shouldReturn` ("ordered.test", Right [1])
+      -- Over TCP the resolver waits for the socket's being readable and writable at once while it connects, which is one wait
+      -- for several events.
+      it "looks a name up over TCP" $
+        withDnsServer (const (Later 300000 loopback)) $ \dns -> do
+          resolver <- newResolverWith (resolverOptionsFor dns 3000 1) {resolverTcp = True}
+          settings <- viaName resolver "stream.test" ""
+          connectedBy settings `shouldReturn` ("stream.test", Right [1])
+          asked dns `shouldReturn` ["stream.test"]
+      -- Two servers, and a query that goes to either, make the resolver wait for the sockets of both at once: one wait for
+      -- several events. The names are looked up together, so that both servers are asked.
+      it "looks names up while it waits for the sockets of two servers" $
+        withDnsServer (const (Later 300000 loopback)) $ \primary -> withDnsServer (const (Later 300000 loopback)) $ \backup -> do
+          resolver <- newResolverWith (resolverOptionsFor primary 3000 1) {resolverServers = Just ("127.0.0.1:" <> show (dnsPort primary) <> ",127.0.0.1:" <> show (dnsPort backup)), resolverRotate = True}
+          settings <- traverse (\n -> viaName resolver ("many" <> Char8.pack (show n) <> ".test") "") [1 .. 8 :: Int]
+          results <- run (concurrentlyAll [connectedTo each done | each <- settings])
+          length (filter (either (const False) (const True)) results) `shouldBe` 8
+          (,) <$> (not . null <$> dnsQuestions primary) <*> (not . null <$> dnsQuestions backup) `shouldReturn` (True, True)
+      it "words a name that the server says doesn't exist as libpq does" $
+        withDnsServer (const NoSuchName) $ \dns -> do
+          resolver <- resolverFor dns 2000 1
+          settings <- settingsVia resolver "host=nope.test"
+          failure <- failureOf' settings
+          failure `shouldSatisfy` P.hasPrefix "could not translate host name \"nope.test\" to address: "
+          asked dns `shouldReturn` ["nope.test"]
+      -- A name in the hosts file is never asked for. The file is read when the resolver is made, and not by the first
+      -- lookup: the second content has the file's old modification time, which the resolver takes for a file it has
+      -- read, so only what the first content said is found.
+      it "reads the hosts file when it is made, and not when a name is looked up" $
+        withDnsServer (const NoSuchName) $ \dns -> withTemporaryHosts "127.0.0.1 hosted.test\n" $ \hosts -> do
+          resolver <- newResolverWith (resolverOptionsFor dns 2000 1) {resolverHostsFile = Just hosts}
+          writeHosts hosts "127.0.0.1 changed.test\n"
+          hosted <- viaName resolver "hosted.test" ""
+          changed <- viaName resolver "changed.test" ""
+          connectedBy hosted `shouldReturn` ("hosted.test", Right [1])
+          failureOf' changed >>= (`shouldSatisfy` P.hasPrefix "could not translate host name \"changed.test\" to address: ")
+          asked dns `shouldReturn` ["changed.test"]
+      -- An address and a Unix-domain socket need no lookup, and neither does a name with hostaddr.
+      it "doesn't ask the server for an address, or for a name with hostaddr" $
+        withDnsServer (const Silent) $ \dns -> do
+          resolver <- resolverFor dns 2000 1
+          numeric <- settingsVia resolver (viaPlaintext "127.0.0.1" "")
+          hostaddr <- viaName resolver "never.test" "hostaddr=127.0.0.1"
+          connectedBy numeric `shouldReturn` ("127.0.0.1", Right [1])
+          connectedBy hostaddr `shouldReturn` ("never.test", Right [1])
+          asked dns `shouldReturn` []
     it "names the application, with the fallback name if none is given" $ do
       withString (local "fallback_application_name=fallback") applicationName `shouldReturn` Right ["fallback"]
       withString (local "fallback_application_name=fallback application_name=app") applicationName `shouldReturn` Right ["app"]
@@ -346,12 +472,65 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         `shouldReturn` ("connection to server on socket \"" <> socketPath <> "\" failed: server is not in hot standby mode")
       -- With no standby to prefer, the primaries are tried again.
       withString (local "target_session_attrs=prefer-standby") done `shouldReturn` ()
+    -- connect and cancel take their settings as input: one arrow, built once, serves the settings of each run.
+    describe "settings as input" $ do
+      let connectingWith :: [ConnectSettings] -> (forall arr. (Runtime arr) => OnConn arr b) -> IO [Either ConnectFailure b]
+          connectingWith settingsList body = run (across (onSettings body) settingsList)
+          reasons :: [Either ConnectFailure b] -> [Either String b]
+          reasons = map (either (Left . displayException) Right)
+      it "connects with the settings of each run, one after the other, and a failure of one doesn't disturb the next" $ do
+        one <- settingsOf (local "application_name=one")
+        two <- settingsOf (local "application_name=two")
+        wrong <- settingsOf (local "user=native_pg_scram password=wrong")
+        results <- connectingWith [one, two, wrong, one] (arr (lookup "application_name" . PG.serverParameters . PG.serverInfo . fst))
+        map (\result -> (rejection result, either (const Nothing) id result)) results
+          `shouldBe` [(Nothing, Just "one"), (Nothing, Just "two"), (Just "28P01", Nothing), (Nothing, Just "one")]
+      it "takes the TLS mode and the TLS client from the settings of each run" $ do
+        secured <- settingsOf (tcp "sslmode=require")
+        unencrypted <- settingsOf (local "")
+        results <- connectingWith [secured, unencrypted, secured {connectTlsClient = Nothing}, secured] encrypted
+        reasons results
+          `shouldBe` [ Right (Right [True]),
+                       Right (Right [False]),
+                       Left ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: sslmode value \"require\" invalid when SSL support is not compiled in"),
+                       Right (Right [True])
+                     ]
+      it "takes connect_timeout from the settings of each run, and has none for settings that have none" $
+        withSilentServer $ \silent -> do
+          slow <- settingsOf ("host=" <> Char8.pack silent <> " connect_timeout=1")
+          unlimited <- settingsOf (local "")
+          started <- getMonotonicTime
+          results <- connectingWith [slow, unlimited] done
+          elapsed <- subtract started <$> getMonotonicTime
+          reasons results
+            `shouldBe` [Left ("connection to server on socket \"" <> silent <> "/.s.PGSQL.5432\" failed: timeout expired"), Right ()]
+          elapsed `shouldSatisfy` (P.gte 0.9 P.&& P.lt 5)
+      it "takes the hosts from the settings of each run" $ do
+        missing <- settingsOf "host=/nonexistent-1,/nonexistent-2"
+        fallback <- settingsOf ("host=/nonexistent," <> Char8.pack directory <> " port=" <> Char8.pack (show port) <> " dbname=postgres")
+        results <- connectingWith [missing, fallback, missing] (arr (hostName . PG.connectedHost . fst))
+        map (either (\(ConnectFailure failures) -> Left (length failures)) Right) results `shouldBe` [Left 2, Right directory, Left 2]
+      it "cancels with the settings of each run" $ do
+        settings <- settingsOf (tcp "sslmode=require")
+        withPlaintextServer $ \plaintext -> do
+          refusing <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
+          run $
+            session (unix "postgres" Nothing) $
+              steps
+                [ (concurrently (query sleeping) (after (millis 300) (cancelling settings)) >>^ serverCode . fst) `yields` Just "57014",
+                  cancelling refusing
+                    `failsAs` \case
+                      TlsFailure reason -> reason `shouldBe` "server does not support SSL, but SSL was required"
+                      other -> failTest ("expected TlsFailure, got " <> show other)
+                ]
     describe "with TLS" $ do
       let encryptedBy string = withString (tcp string) encrypted
       it "encrypts with sslmode=require, without verifying the server" $
         encryptedBy "sslmode=require" `shouldReturn` Right [True]
-      needs "a connection that sends and reads at once" $ it "sends a large batch while reading its responses over TLS" $
-        withString (tcp "sslmode=require") batchWhileReading `shouldReturn` Just (Right (1000000, 2000000))
+      -- The batch is larger than the buffers that the two ends of a TCP connection can grow to, so that the server stops
+      -- writing a result that nobody reads, and stops reading the request, for every platform and every run.
+      it "sends a large batch while reading its responses over TLS" $
+        withString (tcp "sslmode=require") (batchWhileReading 32000000 32000000) `shouldReturn` Just (Right (32000000, 32000000))
       it "doesn't encrypt over a Unix-domain socket, as libpq doesn't" $
         withString (local "sslmode=require") encrypted `shouldReturn` Right [False]
       it "fails if the server doesn't take TLS" $
@@ -367,6 +546,21 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         encryptedBy "" `shouldReturn` Right [True]
       it "falls back to plaintext with sslmode=prefer when the server rejects TLS" $
         encryptedBy "user=native_pg_plaintext" `shouldReturn` Right [False]
+      -- libpq tries again without TLS only after the server's rejection and a failure of TLS. A host that doesn't qualify, and
+      -- a failure of the client's own, are reported as they are: the cluster takes these users over TLS only, so a second
+      -- attempt in plaintext would report a rejection by pg_hba.conf in their place.
+      it "reports a host that doesn't qualify over TLS with sslmode=prefer, and doesn't try it in plaintext" $
+        connectFailure (tcp "options='-c default_transaction_read_only=on' target_session_attrs=read-write")
+          `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: session is read-only")
+      it "reports the client's own authentication failure over TLS with sslmode=prefer, and doesn't try plaintext" $
+        connectFailure (tcp "user=native_pg_scram")
+          `shouldReturn` ("connection to server at \"127.0.0.1\", port " <> show port <> " failed: fe_sendauth: no password supplied")
+      it "tries plaintext after a failure of TLS with sslmode=prefer" $
+        withScripted
+          [ \client -> receiveStartup client *> SocketBytes.sendAll client "S" *> SocketBytes.recv client 4096 *> SocketBytes.sendAll client "this is no TLS record" *> drain client,
+            \client -> receiveStartup client *> SocketBytes.sendAll client (frame 'R' (int32 0) <> frame 'Z' "I") *> drain client
+          ]
+          $ \scripted -> withString ("host=127.0.0.1 user=postgres sslmode=prefer port=" <> Char8.pack (show scripted)) done `shouldReturn` ()
       it "tries plaintext first with sslmode=allow, then TLS" $ do
         encryptedBy "sslmode=allow user=native_pg_plaintext" `shouldReturn` Right [False]
         encryptedBy "sslmode=allow" `shouldReturn` Right [True]
@@ -452,6 +646,34 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         withKeyCopy (ownerReadMode `unionFileModes` groupReadMode `unionFileModes` otherReadMode) $ \key ->
           connectFailure (certified key)
             `shouldReturn` (at <> "private key file \"" <> key <> "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root")
+      -- The TLS configuration of settings is built in IO, when the settings are made, from the files, once. A connect
+      -- makes a connection from it, and reads no file.
+      it "connects with a configuration that was built from files that are gone" $
+        withCertificateCopy "ca.crt" $ \roots -> do
+          settings <- settingsOf (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack roots <> " host=localhost hostaddr=127.0.0.1"))
+          removeFile roots
+          run (session settings encrypted) `shouldReturn` Right [True]
+          run (session settings encrypted) `shouldReturn` Right [True]
+      it "connects again and again with the configuration that was built once" $ do
+        settings <- settingsOf (tcp "sslmode=require")
+        run (session settings encrypted) `shouldReturn` Right [True]
+        run (session settings (alsoOn settings (onSecond encrypted))) `shouldReturn` Right [True]
+      -- Settings whose configuration wasn't built fail, also with sslmode=prefer, which would otherwise connect without TLS.
+      it "fails with TlsFailure, and says why, when the TLS configuration of the settings was never built" $
+        forM_ ["sslmode=require", "sslmode=prefer", "sslmode=allow", "sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt")] $ \mode -> do
+          settings <- unpreparedSettingsOf (tcp mode)
+          result <- run (connectedTo settings done)
+          case result of
+            Left (ConnectFailure [(_, TlsFailure reason)]) -> reason `shouldSatisfy` P.hasInfix "was not built"
+            _ -> failTest ("expected a TlsFailure for " <> show mode)
+      -- What a configuration was built for is part of it: settings that changed since don't use it.
+      it "fails with TlsFailure when the settings changed after their TLS configuration was built" $ do
+        settings <- settingsOf (tcp "sslmode=require")
+        let verifying = settings {connectSslMode = SslVerifyFull (RootCertificateFile (certificate "ca.crt"))}
+        result <- run (connectedTo verifying done)
+        case result of
+          Left (ConnectFailure [(_, TlsFailure reason)]) -> reason `shouldSatisfy` P.hasInfix "was not built"
+          _ -> failTest "expected a TlsFailure"
     -- connect_timeout is a deadline: 'within' around the setup, as the plan says.
     it "gives up on a host after connect_timeout" $
       withSilentServer $ \silent -> do
@@ -473,7 +695,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
       withSession
         ( withInput
             (("40", "2"), "unused" :: ByteString)
-            (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from fst (Tx.statement (Tx.Statement "SELECT $1::int + $2::int" (\(a, b) -> [textual (Just a), textual (Just b)]) (single @_ @Int32)))) readAll)
+            (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from fst (Tx.statement (Tx.Statement "SELECT $1::int + $2::int" (\(a, b) -> [textual (Just a), textual (Just b)]) Nothing (single @_ @Int32)))) readAll)
         )
         `shouldReturn` Right [42]
     it "passes NULL parameters and returns NULL columns" $
@@ -501,58 +723,109 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    needs "streamed parameters" $ it "streams a parameter from its source" $ do
+    it "streams a parameter from its source" $ do
       let payload = BS.concat (replicate 4096 "0123456789abcdef")
           chunks = 128
       withSession
         ( streaming
             (newChunks (replicate chunks payload))
-            (query' (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (\source -> [streamedText (chunks * BS.length payload) source]) (single @_ @Bool)))
+            (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [streamedText (chunks * BS.length payload)]) Nothing (single @_ @Bool))))
         )
         `shouldReturn` Right [True]
-    needs "streamed parameters" $ it "streams an empty parameter, and one in a statement that follows a streamed one" $
+    it "streams an empty parameter, and one in a statement that follows a streamed one" $
       withSession
         ( steps
-            [ streaming (newChunks []) (query' (lengthWith (\source -> [streamedText 0 source]))) `yields` Right [0],
-              streaming (newChunks ["ab", "", "c"]) (query' (Tx.Statement "SELECT length($1::text), length($2::text)" (\source -> [streamedText 3 source, textual (Just "four")]) pair)) `yields` Right [(3 :: Int32, 4 :: Int32)]
+            [ streaming (newChunks []) (query' (Tx.streamFrom id (lengthWith (const [streamedText 0])))) `yields` Right [0],
+              streaming (newChunks ["ab", "", "c"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT length($1::text), length($2::text)" (const [streamedText 3, textual (Just "four")]) Nothing pair))) `yields` Right [(3 :: Int32, 4 :: Int32)]
+            ]
+        )
+        `shouldReturn` ()
+    it "takes the parameters of a statement from consecutive parts of its stream, wherever the pieces end" $
+      withSession
+        ( streaming (newChunks ["ab", "cdefg", "hi"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text, $2::text" (const [streamedText 4, streamedText 5]) Nothing pair)))
+            `yields` Right [("abcd" :: Text, "efghi" :: Text)]
+        )
+        `shouldReturn` ()
+    it "gives each statement of a pipeline the stream that it declares" $
+      withSession
+        ( streaming
+            ((,) <$> newChunks ["ab", "c"] <*> newChunks ["defg", "h"])
+            ( transactOn
+                Tx.ReadCommitted
+                Tx.Write
+                Tx.Final
+                ( (,)
+                    <$> Tx.from fst (Tx.statement (Tx.streamFrom id (lengthWith (const [streamedText 3]))))
+                    <*> Tx.from snd (Tx.statement (Tx.streamFrom id (lengthWith (const [streamedText 5]))))
+                )
+                (\(shorter, longer) -> (,) <$> Tx.single shorter <*> Tx.single longer)
+            )
+            `yields` Right (3 :: Int32, 5 :: Int32)
+        )
+        `shouldReturn` ()
+    it "fails a streamed parameter of a statement that has no stream before anything is sent, and the connection stays usable" $
+      withSession
+        ( steps
+            [ query (Tx.Statement "SELECT length($1::text)" (const [streamedText 3]) Nothing (single @_ @Int32))
+                `failsAs` \case
+                  StreamLengthError 3 0 -> pure ()
+                  other -> failTest ("expected StreamLengthError 3 0, got " <> show other),
+              selectOne `yields` Right [1]
             ]
         )
         `shouldReturn` ()
     it "sends a parameter in pieces, short and long, larger than the socket's buffers" $ do
       let payload = BS.concat (replicate 4096 "0123456789abcdef")
           pieces = concatMap (\piece -> [BS.take 100 piece, BS.drop 100 piece]) (replicate 128 payload)
-      withSession (query (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [piecesText pieces]) (single @_ @Bool)))
+      withSession (query (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [piecesText pieces]) Nothing (single @_ @Bool)))
         `shouldReturn` Right [True]
-    needs "streamed parameters" $ it "streams a parameter to a prepared statement, whether it returns rows or not" $
+    it "streams a parameter to a prepared statement, whether it returns rows or not" $
       withSession
         ( steps
             [ ddl "CREATE TEMPORARY TABLE streamed (value text)" `yields` Right (),
               preparing "insert_streamed" (insertStreamed (const [])) `yields` Right (),
               preparing "length_of" (lengthWith (const [])) `yields` Right (),
-              streaming (newChunks ["abc", "def"]) (preparedStreamed "insert_streamed" (insertStreamed (\source -> [streamedText 6 source]))) `yields` Right [],
-              streaming (newChunks ["abc", "def"]) (preparedStreamed "length_of" (lengthWith (\source -> [streamedText 6 source]))) `yields` Right [6]
+              streaming (newChunks ["abc", "def"]) (preparedStreamed "insert_streamed" (Tx.streamFrom id (insertStreamed (const [streamedText 6])))) `yields` Right [],
+              streaming (newChunks ["abc", "def"]) (preparedStreamed "length_of" (Tx.streamFrom id (lengthWith (const [streamedText 6])))) `yields` Right [6]
             ]
         )
         `shouldReturn` ()
-    needs "streamed parameters" $ it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $
+    it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $
       withSession
         ( steps
             [ ddl "SET statement_timeout = '200ms'" `yields` Right (),
               preparing "slow_length" (lengthWith (const [])) `yields` Right (),
-              (streaming slowSource (query' (lengthWith (\source -> [streamedText 4000 source]))) >>^ serverCode) `yields` Just "57014",
-              (streaming slowSource (preparedStreamed "slow_length" (lengthWith (\source -> [streamedText 4000 source]))) >>^ serverCode) `yields` Just "57014",
+              (streaming slowSource (query' (Tx.streamFrom id (lengthWith (const [streamedText 4000])))) >>^ serverCode) `yields` Just "57014",
+              (streaming slowSource (preparedStreamed "slow_length" (Tx.streamFrom id (lengthWith (const [streamedText 4000])))) >>^ serverCode) `yields` Just "57014",
               selectOne `yields` Right [1]
             ]
         )
         `shouldReturn` ()
-    needs "a connection that sends and reads at once" $ it "sends a batch while reading its results, as the server answers before reading all of it" $
-      withSession batchWhileReading `shouldReturn` Just (Right (1000000, 2000000))
+    it "sends a batch while reading its results, as the server answers before reading all of it" $
+      withSession (batchWhileReading 1000000 2000000) `shouldReturn` Just (Right (1000000, 2000000))
+    it "streams a parameter while it reads the large result of a statement before it" $
+      withSession
+        ( withinFor (secs 10) $
+            streaming
+              (newChunks (replicate 64 (Char8.replicate 32768 'y')))
+              ( transactOn
+                  Tx.ReadCommitted
+                  Tx.Read
+                  Tx.Final
+                  ( (,)
+                      <$> Tx.from (const ()) (Tx.statement (plain "SELECT repeat('x', 1000000)" (Tx.any Tx.field)))
+                      <*> Tx.statement (Tx.streamFrom id (lengthWith (const [streamedText 2097152])))
+                  )
+                  (\(large, long) -> (Tx.single large >>> measure >>^ fst) &&& Tx.single long)
+              )
+        )
+        `shouldReturn` Just (Right (1000000, 2097152))
     -- The cancellation rule: the reading program is cancelled at its wait while the request side has not finished sending
     -- the 2 MB parameter, so something is half sent, and the connection is broken and closed rather than drained.
     it "closes a connection broken while sending, without waiting for the server to read" $
       withSession
         ( steps
-            [ withinFor (secs 1) (committed Tx.Read largeThenLong (\(large, _) -> Tx.single large >>> sleepFor (secs 60))) `yields` Nothing,
+            [ withinFor (secs 1) (committed Tx.Read (largeThenLong 1000000 2000000) (\(large, _) -> Tx.single large >>> sleepFor (secs 60))) `yields` Nothing,
               selectOne `failsAs` unusable,
               withinFor (secs 5) closing `yields` Just ()
             ]
@@ -595,6 +868,50 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             >>> (next `failsWith` FieldExpired)
         )
         `shouldReturn` ()
+
+  -- A program is built once, and a statement made from its input has the SQL, and the parameters, of each run.
+  describe "a statement made from the input" $ do
+    let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
+        withSession body = run (session (unix "postgres" Nothing) body)
+    it "sends the SQL and the parameters that the input makes, for each run of one program" $
+      withSession (overInputs (query' offsetBy) [(1, "41"), (10, "41"), (100, "41")])
+        `shouldReturn` [Right [42], Right [51], Right [141]]
+    it "names the SQL that it was sent with in the failure of its statement, and the connection goes on" $
+      withSession (overInputs (query' dividing >>^ failedSql) [2, 0, 5])
+        `shouldReturn` [Right [5], Left "SELECT 10 / 0", Right [2]]
+    it "takes the parameter from its stream, with the SQL that the input makes" $ do
+      inputs <- traverse (\(offset, size, pieces) -> (offset,size,) <$> newChunks pieces) [(0, 5, ["ab", "cde"]), (100, 5, ["fghij"]), (1000, 7, ["", "k", "lmnopq"])]
+      withSession (overInputs (query' lengthPlus) inputs) `shouldReturn` [Right [5], Right [105], Right [1007]]
+    it "has the parameters that the input makes, a stream and one more or not" $ do
+      inputs <- traverse (\extra -> (extra,) <$> newChunks ["abc"]) [False, True, False]
+      withSession (overInputs (query' lengthOrBoth) inputs) `shouldReturn` [Right [3], Right [7], Right [3]]
+    it "is prepared, executed and closed under one name in one pipeline, for SQL that differs from run to run" $
+      withSession ((,) <$> overInputs (preparedOnce "made" offsetBy) [(1, "41"), (10, "41")] <*> query (plain "SELECT name FROM pg_prepared_statements" (single @_ @Text)))
+        `shouldReturn` ([Right 42, Right 51], Right [])
+    it "takes the parameter from its stream when it is prepared, executed and closed under one name" $ do
+      inputs <- traverse (\(offset, size, pieces) -> (offset,size,) <$> newChunks pieces) [(0, 5, ["ab", "cde"]), (100, 5, ["fghij"])]
+      withSession (overInputs (preparedOnce "made_streamed" lengthPlus) inputs) `shouldReturn` [Right 5, Right 105]
+    it "executes a statement that the connection has prepared without evaluating the SQL that the input makes" $
+      withSession
+        ( steps
+            [ preparing "made_earlier" (addOneWith "0") `yields` Right (),
+              overInputs (transactOn Tx.ReadCommitted Tx.Write Tx.Open (Tx.executePrepared "made_earlier" withoutSql) Tx.single) ["1", "41"] `yields` [Right 2, Right 42]
+            ]
+        )
+        `shouldReturn` ()
+    it "is one statement of a pipeline among others, whose results are where they were built" $
+      withSession
+        ( overInputs
+            ( transactOn
+                Tx.ReadCommitted
+                Tx.Write
+                Tx.Final
+                ((,,) <$> Tx.from fst (Tx.statement offsetBy) <*> Tx.from (const ()) (Tx.statement (plain "SELECT 7::int" (single @_ @Int32))) <*> Tx.from snd (Tx.statement offsetBy))
+                (\(left, middle, right) -> Tx.single left &&& Tx.single middle &&& Tx.single right)
+            )
+            [((1, "41"), (10, "41")), ((100, "1"), (1000, "1"))]
+        )
+        `shouldReturn` [Right (42, (7, 51)), Right (101, (7, 1001))]
 
   describe "decoding" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
@@ -900,13 +1217,13 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         `shouldReturn` Right [(42, "a,zażółć", "1", "[1, 2]", True)]
 
   -- A parameter stream that breaks its promise leaves the protocol in a state nobody can continue from.
-  needs "streamed parameters" $ describe "execute (failures)" $ do
+  describe "execute (failures)" $ do
     let withSession :: (forall arr. (Runtime arr) => OnConn arr b) -> IO b
         withSession body = run (session (unix "postgres" Nothing) body)
     it "breaks the connection when a parameter stream is shorter than declared" $
       withSession
         ( steps
-            [ streaming (newChunks ["short"]) (query' (Tx.Statement "SELECT $1::text" (\source -> [streamedText 10 source]) (single @_ @Text)))
+            [ streaming (newChunks ["short"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text" (const [streamedText 10]) Nothing (single @_ @Text))))
                 `failsAs` \case
                   StreamLengthError {} -> pure ()
                   other -> failTest ("expected StreamLengthError, got " <> show other),
@@ -917,7 +1234,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "breaks the connection when a parameter stream is longer than declared" $
       withSession
         ( steps
-            [ streaming (newChunks ["more than", " declared"]) (query' (Tx.Statement "SELECT $1::text" (\source -> [streamedText 5 source]) (single @_ @Text)))
+            [ streaming (newChunks ["more than", " declared"]) (query' (Tx.streamFrom id (Tx.Statement "SELECT $1::text" (const [streamedText 5]) Nothing (single @_ @Text))))
                 `failsAs` \case
                   StreamLengthError {} -> pure ()
                   other -> failTest ("expected StreamLengthError, got " <> show other),
@@ -929,7 +1246,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "breaks the connection when the wait for a slow parameter stream is cancelled" $
       withSession
         ( steps
-            [ withinFor (millis 300) (streaming slowSource (query' (lengthWith (\source -> [streamedText 4000 source])))) `yields` Nothing,
+            [ withinFor (millis 300) (streaming slowSource (query' (Tx.streamFrom id (lengthWith (const [streamedText 4000]))))) `yields` Nothing,
               brokenConnection
             ]
         )
@@ -937,7 +1254,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "throws a parameter stream's failure, and breaks the connection" $
       withSession
         ( steps
-            [ streaming (newFailingChunks [Char8.replicate 1000000 'y']) (query' (Tx.Statement "SELECT length($1::text)" (\source -> [streamedText 2000000 source]) (single @_ @Int32)))
+            [ streaming (newFailingChunks [Char8.replicate 1000000 'y']) (query' (Tx.streamFrom id (Tx.Statement "SELECT length($1::text)" (const [streamedText 2000000]) Nothing (single @_ @Int32))))
                 `failsAs` \(_ :: IOException) -> pure (),
               brokenConnection
             ]
@@ -988,7 +1305,16 @@ sleepFor duration = done >>> sleep duration
 -- made to the settings: those of the connection, or others, for the cases of TLS and channel binding on the cancel
 -- connection.
 cancelling :: (Runtime arr) => ConnectSettings -> OnConn arr ()
-cancelling settings = PG.cancelKey . fst ^>> PG.cancel settings
+cancelling settings = (\(connection, _) -> (settings, connection)) ^>> cancelWith
+
+-- | Cancels the statement that runs on the connection, with the settings that the input gives: one arrow for any settings.
+cancelWith :: (Runtime arr) => arr (ConnectSettings, Connection) ()
+cancelWith = (\(settings, connection) -> (settings, PG.cancelKey connection)) ^>> PG.cancel
+
+-- | The body on a connection made to the settings that the input gives, with the loans after them, closed when the body
+-- ends: the connection that 'session' makes, for settings that come at run time. A failure to connect is a value.
+onSettings :: (Runtime arr) => OnConn arr b -> arr (ConnectSettings, Loans) (Either ConnectFailure b)
+onSettings body = scope PG.connect (fst ^>> (done ||| PG.close)) ((\(connected, (_, loans)) -> fmap (,loans) connected) ^>> (arr Left ||| (body >>^ Right)))
 
 -- | With two connections, the second ends the backend of the first. The process id is the text of a parameter.
 terminatingTheFirst :: (Runtime arr) => arr ((Connection, Connection), Loans) (Either QueryError [Bool])
@@ -998,7 +1324,7 @@ terminatingTheFirst =
         Nothing -> failTest "the server sent no process id"
         Just pid -> pure (administrator, (loans, Char8.pack (show pid)))
     )
-    >>> query' (Tx.Statement "SELECT pg_terminate_backend($1::int)" (\pid -> [textual (Just pid)]) single)
+    >>> query' (Tx.Statement "SELECT pg_terminate_backend($1::int)" (\pid -> [textual (Just pid)]) Nothing single)
 
 -- | Notifies the channel with the payload, from a function of the server, so that the payload is a parameter.
 notifying :: (Runtime arr) => ByteString -> OnConn arr (Either QueryError [Bool])
@@ -1020,15 +1346,73 @@ authenticationFailure = \case
   Left (ConnectFailure [(_, AuthenticationError reason)]) -> Just reason
   _ -> Nothing
 
--- | The settings of a connection string, with the TLS client of native-pg-tls.
+-- | The settings of a connection string, with the TLS client of native-pg-tls and its configuration built, and a resolver
+-- that has the system's configuration.
 settingsOf :: ByteString -> IO ConnectSettings
-settingsOf string = case parseConnectionString noDefaults (const Nothing) (Just "postgres") string of
+settingsOf string = case parseConnectionString noDefaults string of
   Left problem -> fail problem
-  Right parsed -> either fail (\settings -> pure settings {connectTlsClient = Just tlsClient}) (fromConnectionString parsed)
+  Right parsed -> do
+    resolver <- newResolver
+    client <- newTlsClient
+    either fail (\settings -> prepareTls settings {connectTlsClient = Just client, connectResolver = Just resolver}) (fromConnectionString parsed)
 
--- | No default host or certificate directory: every case gives its host.
+-- | The programs at once, each on the same input, and what each gave.
+concurrentlyAll :: (Runtime arr) => [arr a b] -> arr a [b]
+concurrentlyAll = foldr (\one others -> concurrently one others >>^ uncurry (:)) (arr (const []))
+
+-- | The settings of a connection string, as 'settingsOf' makes them, whose host names are looked up by the resolver.
+settingsVia :: Resolver -> ByteString -> IO ConnectSettings
+settingsVia resolver string = (\settings -> settings {connectResolver = Just resolver}) <$> settingsOf string
+
+-- | The options of a resolver that asks the scripted server only, which waits this many milliseconds for an answer, as
+-- many times as the query is tried, and looks up no search domains.
+resolverOptionsFor :: DnsServer -> Int -> Int -> ResolverOptions
+resolverOptionsFor dns timeoutMilliseconds tries =
+  defaultResolverOptions
+    { resolverServers = Just ("127.0.0.1:" <> show (dnsPort dns)),
+      resolverTimeout = Just timeoutMilliseconds,
+      resolverTries = Just tries,
+      resolverSearchDomains = False
+    }
+
+-- | A resolver that asks the scripted server only.
+resolverFor :: DnsServer -> Int -> Int -> IO Resolver
+resolverFor dns timeoutMilliseconds tries = newResolverWith (resolverOptionsFor dns timeoutMilliseconds tries)
+
+-- | Runs the action with a hosts file of this content, whose modification time is long past.
+withTemporaryHosts :: ByteString -> (FilePath -> IO a) -> IO a
+withTemporaryHosts content action = do
+  temporary <- getTemporaryDirectory
+  bracket (mkdtemp (temporary </> "native-pg-hosts-")) removeDirectoryRecursive $ \directory -> do
+    let hosts = directory </> "hosts"
+    writeHosts hosts content
+    action hosts
+
+-- | Writes the hosts file, and sets its modification time to a past one, so that a resolver takes it for a file that
+-- hasn't changed since it read it.
+writeHosts :: FilePath -> ByteString -> IO ()
+writeHosts hosts content = BS.writeFile hosts content *> setModificationTime hosts (UTCTime (fromGregorian 2001 1 1) 0)
+
+-- | The settings of a connection string, with the TLS client of native-pg-tls but no TLS configuration built.
+unpreparedSettingsOf :: ByteString -> IO ConnectSettings
+unpreparedSettingsOf string = case parseConnectionString noDefaults string of
+  Left problem -> fail problem
+  Right parsed -> do
+    client <- newTlsClient
+    either fail (\settings -> pure settings {connectTlsClient = Just client}) (fromConnectionString parsed)
+
+-- | Runs the action with a copy of the test certificate, which it may remove.
+withCertificateCopy :: FilePath -> (FilePath -> IO a) -> IO a
+withCertificateCopy name action = do
+  temporary <- getTemporaryDirectory
+  bracket (mkdtemp (temporary </> "native-pg-certificate-")) removeDirectoryRecursive $ \directory -> do
+    let copy = directory </> name
+    copyFile (certificate name) copy
+    action copy
+
+-- | No default host or certificate directory, nothing from the process but the user "postgres": every case gives its host.
 noDefaults :: Defaults
-noDefaults = Defaults "/tmp" Nothing
+noDefaults = (emptyDefaults "/tmp" Nothing) {defaultUser = Just "postgres"}
 
 -- | The body on a connection to the string's settings.
 onString :: Runner -> ByteString -> (forall arr. (Runtime arr) => OnConn arr b) -> IO b
@@ -1062,13 +1446,54 @@ preparedAnswer :: (Runtime arr) => ByteString -> ByteString -> OnConn arr (Eithe
 preparedAnswer name value =
   committed Tx.Write (Tx.executePrepared name ((addOneWith value) {Tx.sql = error "SQL forced"})) Tx.single
 
+-- | The statement whose SQL adds a number to its parameter: the number and the parameter come from the input.
+offsetBy :: (Runtime arr) => Tx.Statement arr (Int, ByteString) Int32
+offsetBy = Tx.statementFrom (\(offset, value) -> ("SELECT $1::int + " <> Char8.pack (show offset), [textual (Just value)])) single
+
+-- | The statement whose SQL divides ten by the number that is its input.
+dividing :: (Runtime arr) => Tx.Statement arr Int Int32
+dividing = Tx.statementFrom (\divisor -> ("SELECT 10 / " <> Char8.pack (show divisor), [])) single
+
+-- | The statement that adds a number to the length of the parameter that the stream gives: the number, the length and the stream
+-- are the input.
+lengthPlus :: (Runtime arr) => Tx.Statement arr (Int, Int, Chunks) Int32
+lengthPlus =
+  Tx.streamFrom (\(_, _, chunks) -> chunks) (Tx.statementFrom (\(offset, size, _) -> ("SELECT length($1::text) + " <> Char8.pack (show offset), [streamedText size])) single)
+
+-- | The statement whose parameters are the stream, of three bytes, and one more if the input says so, which its SQL then uses.
+lengthOrBoth :: (Runtime arr) => Tx.Statement arr (Bool, Chunks) Int32
+lengthOrBoth = Tx.streamFrom snd (Tx.statementFrom made single)
+  where
+    made (True, _) = ("SELECT length($1::text) + length($2::text)", [streamedText 3, textual (Just "four")])
+    made (False, _) = ("SELECT length($1::text)", [streamedText 3])
+
+-- | A statement that the connection has prepared under a name, whose SQL the input doesn't make: it has none.
+withoutSql :: (Runtime arr) => Tx.Statement arr ByteString Int32
+withoutSql = Tx.statementFrom (\value -> (error "SQL forced", [textual (Just value)])) single
+
+-- | The statement prepared, executed and closed under the name, in one pipeline that commits, and its one row.
+preparedOnce :: (Runtime arr) => ByteString -> Tx.Statement arr p Int32 -> arr (Connection, (Loans, p)) (Either QueryError Int32)
+preparedOnce name statement =
+  transactOn
+    Tx.ReadCommitted
+    Tx.Write
+    Tx.Final
+    ((,,) <$> Tx.prepare name statement <*> Tx.executePrepared name statement <*> Tx.closeStatement name)
+    (\(preparation, result, deallocation) -> Tx.prepared preparation >>> Tx.single result >>> tap (done >>> Tx.discard deallocation))
+
+-- | What failed a statement, if it was the server: the SQL that it was sent with.
+failedSql :: Either QueryError a -> Either ByteString a
+failedSql = \case
+  Left (QueryError text _) -> Left text
+  Right value -> Right value
+
 -- | The statement that inserts its parameter, which the function makes of the input.
-insertStreamed :: (Runtime arr) => (p -> [Tx.Param arr]) -> Tx.Statement arr p ()
-insertStreamed parameters = Tx.Statement "INSERT INTO streamed VALUES ($1)" parameters Tx.none
+insertStreamed :: (Runtime arr) => (p -> [Tx.Param]) -> Tx.Statement arr p ()
+insertStreamed parameters = Tx.Statement "INSERT INTO streamed VALUES ($1)" parameters Nothing Tx.none
 
 -- | The statement that takes the length of its parameter, which the function makes of the input.
-lengthWith :: (Runtime arr) => (p -> [Tx.Param arr]) -> Tx.Statement arr p Int32
-lengthWith parameters = Tx.Statement "SELECT length($1::text)" parameters single
+lengthWith :: (Runtime arr) => (p -> [Tx.Param]) -> Tx.Statement arr p Int32
+lengthWith parameters = Tx.Statement "SELECT length($1::text)" parameters Nothing single
 
 -- | A source of four slow pieces of a thousand bytes.
 slowSource :: IO SlowChunks
@@ -1088,18 +1513,18 @@ preparedStreamed name statement = transactOn Tx.ReadCommitted Tx.Write Tx.Open (
 
 -- | Both the first response and the remaining request exceed the socket buffers, so the connection must go on
 -- reading while it sends. The first result is a field of a million bytes.
-batchWhileReading :: (Runtime arr) => OnConn arr (Maybe (Either QueryError (Int, Int32)))
-batchWhileReading =
+batchWhileReading :: (Runtime arr) => Int -> Int -> OnConn arr (Maybe (Either QueryError (Int, Int32)))
+batchWhileReading resultSize parameterSize =
   withinFor (secs 10) $
-    committed Tx.Read largeThenLong $ \(large, long) ->
+    committed Tx.Read (largeThenLong resultSize parameterSize) $ \(large, long) ->
       (Tx.single large >>> measure >>^ fst) &&& Tx.single long
 
--- | A result with a large field, and a statement whose parameter is large.
-largeThenLong :: (Runtime arr) => Tx.Pipeline arr () (Tx.Result arr Tx.Field, Tx.Result arr Int32)
-largeThenLong =
+-- | A result with a field of the first size, and a statement whose parameter is of the second.
+largeThenLong :: (Runtime arr) => Int -> Int -> Tx.Pipeline arr () (Tx.Result arr Tx.Field, Tx.Result arr Int32)
+largeThenLong resultSize parameterSize =
   (,)
-    <$> Tx.statement (plain "SELECT repeat('x', 1000000)" (Tx.any Tx.field))
-    <*> Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate 2000000 'y')] single)
+    <$> Tx.statement (plain ("SELECT repeat('x', " <> Char8.pack (show resultSize) <> ")") (Tx.any Tx.field))
+    <*> Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate parameterSize 'y')] single)
 
 -- | Streams the single field slowly, checking its bytes and that no piece is larger than the buffer, while
 -- sampling the live heap. The accumulators are strict, so they don't keep the pieces alive.
@@ -1156,49 +1581,12 @@ liveBytes = do
   performMajorGC
   fromIntegral . gcdetails_live_bytes . gc <$> getRTSStats
 
--- | Runs the action with the directory of a Unix-domain socket that accepts connections but never answers.
-withSilentServer :: (FilePath -> IO a) -> IO a
-withSilentServer action = do
-  temporary <- getTemporaryDirectory
-  bracket (mkdtemp (temporary </> "native-pg-silent-")) removeDirectoryRecursive $ \directory ->
-    bracket (Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
-      Socket.bind sock (Socket.SockAddrUnix (directory </> ".s.PGSQL.5432"))
-      Socket.listen sock 4
-      action directory
-
 -- | Runs the action with a port at 127.0.0.1 that nothing listens on.
 withUnusedPort :: (Socket.PortNumber -> IO a) -> IO a
 withUnusedPort action =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close
     (\sock -> Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1))) *> Socket.socketPort sock)
     >>= action
-
--- | Runs the action with the port at 127.0.0.1 of a server that serves the connections that come, one by each script in
--- turn, which is given its socket. A connection is closed when its script ends, and what goes wrong in it shows in the client.
-withScripted :: [Socket.Socket -> IO ()] -> (Socket.PortNumber -> IO a) -> IO a
-withScripted scripts action =
-  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
-    Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
-    Socket.listen listener 4
-    -- Each connection is served on a thread of its own, since the first is still open while the second is made.
-    let serve script = do
-          (client, _) <- Socket.accept listener
-          void (forkIO (script client `finally` Socket.close client `catch` \(_ :: SomeException) -> pure ()))
-    bracket (forkIO (traverse_ serve scripts `catch` \(_ :: SomeException) -> pure ())) killThread $ \_ -> action =<< Socket.socketPort listener
-
--- | A message of the server: its tag, its length, and its payload.
-frame :: Char -> ByteString -> ByteString
-frame kind payload = Char8.singleton kind <> int32 (BS.length payload + 4) <> payload
-
--- | The four bytes of a number, the most significant first.
-int32 :: Int -> ByteString
-int32 number = BS.pack [fromIntegral (number `shiftR` shift) | shift <- [24, 16, 8, 0]]
-
--- | Takes the client's startup message, which has no tag: its length, and the rest.
-receiveStartup :: Socket.Socket -> IO ByteString
-receiveStartup client = do
-  size <- BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0 <$> SocketBytes.recv client 4
-  SocketBytes.recv client (size - 4)
 
 -- | Takes a message of the client, which has a tag: the tag, and the payload after the length.
 receiveMessage :: Socket.Socket -> IO (Char, ByteString)
@@ -1213,10 +1601,6 @@ receiving :: Socket.Socket -> Int -> IO ByteString
 receiving client size
   | size <= 0 = pure BS.empty
   | otherwise = SocketBytes.recv client size >>= \piece -> if BS.null piece then pure piece else (piece <>) <$> receiving client (size - BS.length piece)
-
--- | Takes what the client sends until it closes the connection.
-drain :: Socket.Socket -> IO ()
-drain client = SocketBytes.recv client 4096 >>= \received -> unless (BS.null received) (drain client)
 
 -- | Runs the action with a copy of the client certificate's key, with the file mode given.
 withKeyCopy :: FileMode -> (FilePath -> IO a) -> IO a

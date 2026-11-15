@@ -31,6 +31,9 @@ module TestPrograms
     tlsSettings,
     -- * A connection in a program
     OnConn,
+    across,
+    overInputs,
+    viaPool,
     session,
     connectedTo,
     alsoOn,
@@ -94,11 +97,12 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Word (Word64)
-import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), Connection, SslMode (..), connect, connectSettings)
+import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), Connection, SslMode (..), connect, connectSettings, prepareTls)
 import qualified Database.PostgreSQL.Connection as PG
 import Database.PostgreSQL.Decoding (InPlace)
 import Database.PostgreSQL.Errors (ConnectFailure, Diagnostics, QueryError (..), ServerError (..), StatementError (..), diagnosticCode)
-import Database.PostgreSQL.Tls (tlsClient)
+import Database.PostgreSQL.Pool (ConnectionPool, PoolError, withConnection)
+import Database.PostgreSQL.Tls (newTlsClient)
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Types (FormatCode (..))
@@ -185,15 +189,18 @@ unixSettings socketPath user password =
       connectDatabase = Just "postgres"
     }
 
--- | A connection to the cluster's TCP port, which requires TLS.
-tlsSettings :: PortNumber -> ByteString -> Maybe ByteString -> ConnectSettings
-tlsSettings port user password =
-  (connectSettings (TcpAddress "127.0.0.1" port) user)
-    { connectPassword = password,
-      connectDatabase = Just "postgres",
-      connectSslMode = SslRequire,
-      connectTlsClient = Just tlsClient
-    }
+-- | A connection to the cluster's TCP port, which requires TLS, with its TLS configuration built, as a program builds it
+-- when it makes the settings.
+tlsSettings :: PortNumber -> ByteString -> Maybe ByteString -> IO ConnectSettings
+tlsSettings port user password = do
+  client <- newTlsClient
+  prepareTls
+    (connectSettings (TcpAddress "127.0.0.1" port) user)
+      { connectPassword = password,
+        connectDatabase = Just "postgres",
+        connectSslMode = SslRequire,
+        connectTlsClient = Just client
+      }
 
 -- * A connection in a program
 
@@ -205,16 +212,42 @@ type OnConn arr b = arr (Connection, Loans) b
 session :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans b
 session settings body = connectedTo settings body >>> orFail
 
+-- | The body on a connection of the pool: 'withConnection' for a pool that the program has, as a test has.
+viaPool :: (Runtime arr) => ConnectionPool -> arr (Connection, a) b -> arr a (Either PoolError b)
+viaPool pool body = (pool,) ^>> withConnection body
+
+-- | The step on each of the inputs in turn, whichever their number: one arrow, built once, which takes what differs from run
+-- to run, the settings of a connection or a pool, from its input.
+across :: (Runtime arr) => arr (x, Loans) b -> [x] -> arr Loans [b]
+across step inputs = (\loans -> (inputs, loans, [])) ^>> iterateA following
+  where
+    following = untried ^>> (returnA ||| tried)
+    untried (remaining, loans, results) = case remaining of
+      [] -> Left (Finish (reverse results))
+      input : others -> Right ((input, loans), (others, loans, results))
+    tried = first step >>^ \(result, (others, loans, results)) -> Again (others, loans, result : results)
+
+-- | The step on each of the inputs in turn, on the connection, and its results in order: one arrow, built once, that takes what
+-- differs from run to run as its input.
+overInputs :: (Runtime arr) => arr (Connection, (Loans, p)) b -> [p] -> OnConn arr [b]
+overInputs step inputs = (\(connection, loans) -> (inputs, connection, loans, [])) ^>> iterateA following
+  where
+    following = untried ^>> (returnA ||| tried)
+    untried (remaining, connection, loans, results) = case remaining of
+      [] -> Left (Finish (reverse results))
+      input : others -> Right ((connection, (loans, input)), (others, connection, loans, results))
+    tried = first step >>^ \(result, (others, connection, loans, results)) -> Again (others, connection, loans, result : results)
+
 -- | The same, with the failure to connect as a value, and the body not run.
 connectedTo :: (Runtime arr) => ConnectSettings -> OnConn arr b -> arr Loans (Either ConnectFailure b)
-connectedTo settings body = scope (connect settings) closeConnected (withLoans ^>> right body)
+connectedTo settings body = scope ((settings,) ^>> connect) closeConnected (withLoans ^>> right body)
   where
     withLoans (connected, loans) = fmap (,loans) connected
 
 -- | The body on a second connection too, which is closed when the body ends. The body takes both connections, the
 -- one of the enclosing 'session' first. A connection that can't be made is the program's failure.
 alsoOn :: (Runtime arr) => ConnectSettings -> arr ((Connection, Connection), Loans) b -> OnConn arr b
-alsoOn settings body = scope (snd ^>> connect settings) closeConnected (bothWithLoans ^>> right body) >>> orFail
+alsoOn settings body = scope (((settings,) . snd) ^>> connect) closeConnected (bothWithLoans ^>> right body) >>> orFail
   where
     bothWithLoans (connected, (outer, loans)) = fmap (\inner -> ((outer, inner), loans)) connected
 
@@ -293,7 +326,7 @@ transactOn ::
   (a -> With Tx.Tx arr () y) ->
   arr (Connection, (Loans, p)) (Either QueryError y)
 transactOn level mode ending pipeline reading =
-  second (second (,())) ^>> Tx.transaction level mode (Tx.pipeline ending pipeline reading)
+  through (_2 . _2) (,()) ^>> Tx.transaction level mode (Tx.pipeline ending pipeline reading)
 
 -- | A transaction on the connection, for a pipeline that takes no input.
 transact ::
@@ -371,22 +404,23 @@ triple = Tx.any ((,,) <$> Tx.column <*> Tx.column <*> Tx.column)
 
 -- | A statement without parameters.
 plain :: ByteString -> Rows arr row -> Tx.Statement arr () row
-plain sql = Tx.Statement sql (const [])
+plain sql = Tx.Statement sql (const []) Nothing
 
 -- | A statement whose parameters are these values, as text, and NULL for 'Nothing'.
 valued :: ByteString -> [Maybe ByteString] -> Rows arr row -> Tx.Statement arr () row
-valued sql values = Tx.Statement sql (const (map textual values))
+valued sql values = Tx.Statement sql (const (map textual values)) Nothing
 
 -- | A parameter that is text of a type that the server infers, or NULL.
-textual :: Maybe ByteString -> Tx.Param arr
+textual :: Maybe ByteString -> Tx.Param
 textual value = Tx.Param Nothing TextFormat (maybe Tx.Null Tx.Bytes value)
 
--- | A parameter that is text of a type that the server infers, which the stream gives, and declares this long.
-streamedText :: (Stream arr s) => Int -> s -> Tx.Param arr
-streamedText declared source = Tx.Param Nothing TextFormat (Tx.Streamed declared source)
+-- | A parameter that is text of a type that the server infers, of this many bytes, which are the next of the stream of
+-- its statement.
+streamedText :: Int -> Tx.Param
+streamedText declared = Tx.Param Nothing TextFormat (Tx.FromStream declared)
 
 -- | A parameter that is text of a type that the server infers, which is sent as these pieces.
-piecesText :: [ByteString] -> Tx.Param arr
+piecesText :: [ByteString] -> Tx.Param
 piecesText pieces = Tx.Param Nothing TextFormat (Tx.Pieces pieces)
 
 -- * Streams

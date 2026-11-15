@@ -9,6 +9,13 @@ license: AGPL-3.0-or-later
 license-file: LICENSE
 build-type: Simple
 
+-- The executables and test suites are linked with GHC's threaded run time. With -f-threaded they are linked with the
+-- non-threaded one, which has one capability and one OS thread.
+flag threaded
+  description: Link the executables and test suites with the threaded run time
+  default: True
+  manual: True
+
 library
   default-language: GHC2021
   hs-source-dirs: src
@@ -19,6 +26,7 @@ library
                    Network.Fulmen.Listen
                    Network.Fulmen.Request
                    Network.Fulmen.Response
+                   Network.Fulmen.Shutdown
   other-modules: Network.Fulmen.Internal
                  Network.Fulmen.Internal.Accept
                  Network.Fulmen.Internal.Body
@@ -27,6 +35,7 @@ library
                  Network.Fulmen.Internal.Head
                  Network.Fulmen.Internal.Response
                  Network.Fulmen.Internal.Serve
+  c-sources: cbits/signals.c
   build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, containers, network >=3.1 && <3.3, streaming-io
 
 -- The HTTP/1.1 conformance cases, which are data of bytes in and bytes out, run against a
@@ -42,9 +51,12 @@ test-suite fulmen-conformance
                  ConformanceSpec
                  ConformanceWire
                  PlacementSpec
-  ghc-options: -Wall -threaded -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
-  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, bytestring, fulmen, network, streaming-io, skeletest >=0.4.2 && <0.5
+  ghc-options: -Wall -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  if flag(threaded)
+    ghc-options: -threaded
+  -- The server of the bench runs in a process of its own, under a small stack, for the case of a server of thousands of workers.
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5, fulmen:fulmen-bench
+  build-depends: base, bytestring, directory, fulmen, network, process, streaming-io, skeletest >=0.4.2 && <0.5, unix
 
 -- A quick measurement: a client of C keep-alive connections and a server that answers with a static body, run as two
 -- processes of this one program. Its numbers are for looking at, and nothing checks them.
@@ -52,7 +64,9 @@ executable fulmen-bench
   default-language: GHC2021
   hs-source-dirs: bench
   main-is: Main.hs
-  ghc-options: -Wall -threaded -rtsopts -fspecialise-aggressively
+  ghc-options: -Wall -rtsopts -fspecialise-aggressively
+  if flag(threaded)
+    ghc-options: -threaded
   build-depends: base, bytestring, fulmen, network, streaming-io
 
 -- Draws the server as Mermaid flowcharts, one for each named box of its program, with the program built at the arrow that

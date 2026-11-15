@@ -32,16 +32,18 @@ module Network.Fulmen
     module Network.Fulmen.Listen,
     module Network.Fulmen.Request,
     module Network.Fulmen.Response,
+    module Network.Fulmen.Shutdown,
   )
 where
 
 import Control.Arrow (Arrow, arr)
 import Network.Fulmen.Internal (Call (..), Cores (..), Settings (..), Shared (..))
-import Network.Fulmen.Internal.Date (newDate)
+import Network.Fulmen.Internal.Date (newPulse)
 import Network.Fulmen.Internal.Serve (serve)
 import Network.Fulmen.Listen
 import Network.Fulmen.Request
 import Network.Fulmen.Response
+import Network.Fulmen.Shutdown
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (secs)
 import Network.Streaming.Loans (Loans)
@@ -49,22 +51,23 @@ import Network.Streaming.Pool (newPool)
 import Network.Streaming.PositiveInt (positiveInt)
 
 -- | A server of one worker for each core, with a pool of 16 buffers of 16 KiB for requests in flight, 2 of them in
--- reserve, and 2 for setup, a line limit of 16 KiB, a head limit of 64 KiB, no limit on bodies, and a silent client
--- given 30 seconds.
+-- reserve, and 2 for setup, a line limit and a head limit of 50 KiB, which are Warp's default for the whole head, no limit
+-- on bodies, and a silent client given 30 seconds.
 defaultSettings :: Settings
 defaultSettings =
   Settings
     (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
     1
-    16384
-    65536
+    51200
+    51200
     Nothing
     (Just (secs 30))
+    Nothing
 
 -- | The cores that a server runs on, from its settings and how many there are: what they share, the pool of request
 -- buffers that the settings size included, and the first core's own value.
 newCores :: Settings -> Int -> IO Cores
-newCores settings _ = Cores 0 <$> (Shared <$> newPool [] <*> newDate <*> newBufferPool (bufferPool settings))
+newCores settings _ = Cores 0 <$> (Shared <$> newPool [] <*> newPulse <*> newBufferPool (bufferPool settings))
 
 -- | The value of the core of this number, for the program that runs on it. The first core runs the acceptor.
 onCore :: Cores -> Int -> Cores

@@ -14,13 +14,12 @@ module Network.Fulmen.Internal
   )
 where
 
-import Data.IORef (IORef)
 import Network.Fulmen.Internal.Body (Body (..))
-import Network.Fulmen.Internal.Date (Date)
+import Network.Fulmen.Internal.Date (Pulse)
 import Network.Fulmen.Internal.Response (Exchange)
 import Network.Socket (Socket)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings)
-import Network.Streaming.Classes (Address, Duration, Reach (..))
+import Network.Streaming.Classes (Address, Duration, Event, Reach (..))
 import Network.Streaming.Loans (Loans)
 import Network.Streaming.Pool (Pool)
 
@@ -33,19 +32,23 @@ data Settings = Settings
     -- | How many workers each core has at startup, which is how many connections
     -- it serves at once: its share of the connection cap.
     connectionsPerCore :: Int,
-    -- | The bytes that a request line or a header line may take, as well as a
-    -- chunk-size line and a trailer line: the size of the line buffer. A longer
-    -- request line is answered with 414, and a longer header line with 431.
+    -- | The bytes that a request line or a header line may take. A longer request line is answered with 414, and a longer
+    -- header line with 431. A line may be longer than a buffer: the head is read in as many fills of the buffer as it
+    -- takes, up to its limit. A chunk-size line and a trailer line of a chunked body must fit a buffer as well.
     lineLimit :: Int,
     -- | The bytes that the whole head, the request line and the header fields,
-    -- may take. A longer head is answered with 431.
+    -- may take, however many buffers they come in. A longer head is answered with 431.
     headLimit :: Int,
     -- | The bytes that a request body may have, if limited. A longer body is
     -- answered with 413.
     bodyLimit :: Maybe Int,
     -- | How long a client may be silent in the middle of a head or a body before
     -- the server closes the connection.
-    clientTimeout :: Maybe Duration
+    clientTimeout :: Maybe Duration,
+    -- | The event that starts a graceful shutdown, if the server has one: when it fires, the listener closes, a connection
+    -- that waits for its next request closes, a request in flight finishes and says that its connection ends, and the
+    -- server returns when none is left.
+    shutdown :: Maybe Event
   }
 
 -- | One request in flight: its loans, its body and its answer.
@@ -58,11 +61,11 @@ newtype Answering = Answering Exchange
 -- is the one that runs the acceptor, if it is the first.
 data Cores = Cores !Int !Shared
 
--- | What the cores share: the free workers, which the acceptor hands connections to, the date that responses carry, and
--- the buffers that requests in flight work in.
+-- | What the cores share: the free workers, which the acceptor hands connections to, the date that responses carry and
+-- whether the server is shutting down, and the buffers that requests in flight work in.
 data Shared = Shared
   { sharedWorkers :: !(Pool Free),
-    sharedDate :: !(IORef Date),
+    sharedPulse :: !Pulse,
     sharedBuffers :: !BufferPool
   }
 

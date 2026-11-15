@@ -115,9 +115,11 @@ instance (Arrow arr, Time arr) => Time (With r arr) where
   {-# INLINE clock #-}
 
 -- | The deadline is the arrow's: the body is given the environment as it is.
-instance (Within arr) => Within (With r arr) where
+instance (Arrow arr, Within arr) => Within (With r arr) where
   within duration (With body) = With (within duration body)
   {-# INLINE within #-}
+  timeoutA (With body) = With ((\(r, (duration, a)) -> (duration, (r, a))) ^>> timeoutA body)
+  {-# INLINE timeoutA #-}
 
 -- | What the scope acquires is acquired in the environment, and the release and the body are given both.
 instance (Arrow arr, Scope arr) => Scope (With r arr) where
