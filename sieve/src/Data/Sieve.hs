@@ -14,6 +14,9 @@
 -- A program looks a key up with 'cached', which runs a loader, an arrow fixed when the program is built, for a miss, so that
 -- the callers that miss the same key share one load. The value that is found or loaded is checked by a hook of the caller's,
 -- which can ask for it to be loaded again.
+--
+-- A cache's type says which cores use it, and nothing checks that they do: a cache of one core that parts of two cores use has
+-- no lock to keep them apart, and the tickets of one core can't be fulfilled by another.
 module Data.Sieve
   ( Sharing (..),
     ReachOf,
@@ -145,11 +148,11 @@ make shared settings = do
   table <- newTable shared (capacity settings)
   Cache shared <$> newIORef table <*> newInts 2 0 <*> traverse (const (newIORef noGhosts)) (thrashed settings) <*> newIORef IntMap.empty <*> pure settings
 
--- | A cache of one core, for programs whose parts switch only at waits.
+-- | A cache of one core, for programs whose parts switch only at waits. The parts that use it are all on one core.
 newCache :: (Key k) => Config k v -> IO (Cache 'OneCore k v)
 newCache = make False
 
--- | A cache that the parts of every core share.
+-- | A cache that the parts of every core share: its writes take one lock, and its hits take none.
 newSharedCache :: (Key k) => Config k v -> IO (Cache 'AllCores k v)
 newSharedCache = make True
 
@@ -169,7 +172,10 @@ data Slow c k v = Slow !(Cache c k v) !k !Bool
 -- * **The load:** the loader is an arrow, fixed when the program is built, that runs as part of the caller's own program, so it
 --   may wait. What it gives is cached, unless the key was cached meanwhile, and then that is what the caller has. The hook runs
 --   once on the value, as it does on one that is found.
--- * **The listeners:** 'requested' is told once for each call, and the eviction listener of what the load evicts.
+-- * **The listeners:** 'requested' is told once for each call, and the eviction listener of what the load evicts. A value that
+--   was loaded and not cached, because the key was cached meanwhile, is not told to the eviction listener.
+-- * **The hook:** it runs once on the value that is found, or that the load gave, and never waits. A hook that asks for a
+--   reload every time makes the call load for ever.
 cached ::
   forall c arr k v u.
   (Runtime arr, Key k, Reaching c arr) =>
@@ -202,7 +208,7 @@ cached loader hook =
     claimed :: arr (Slow c k v) (Step (Slow c k v) u)
     claimed =
       tryTicket handOut done
-        >>> (taking "claimed" ((\(claimed', caller) -> route claimed' caller) ^>> (taking "cached" applying ||| taking "load" loading)) ||| taking "waited" waited)
+        >>> (taking "claimed" (uncurry route ^>> (taking "cached" applying ||| taking "load" loading)) ||| taking "waited" waited)
 
     handOut :: arr (Promise (ReachOf c arr) (Outcome k v), Slow c k v) (Either (Claimed k v, Slow c k v) (Slow c k v))
     handOut = step "claim" claim `giving` "claimed or joined?"
