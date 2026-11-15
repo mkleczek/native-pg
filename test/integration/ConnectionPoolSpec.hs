@@ -154,6 +154,18 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       finishHolding held
       eventually 5 (gone (holderBackend held)) `shouldReturn` True
 
+    it "has as many connections at once as its size, for as many requests that hold one, and the next request waits" $ do
+      -- Each request that holds a connection holds a buffer, and the next request is admitted only if as many are free as the reserve.
+      buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @8) (positiveInt @2) (positiveInt @2))
+      withPool runner buffers ((connectionPoolSettings 3 settings) {poolCheckoutTimeout = Just (millis 200)}) $ \pool -> do
+        let env = Env runner buffers pool
+        holders <- replicateM 3 (startHolding env)
+        length (nub (map holderBackend holders)) `shouldBe` 3
+        counts pool `shouldReturn` (0, 3, 0)
+        onEnv env (withinFor (secs 5) (viaPool pool done)) `shouldReturn` Just (Left CheckoutTimedOut)
+        mapM_ finishHolding holders
+        counts pool `shouldReturn` (3, 0, 0)
+
     it "closes a connection that is older than the pool's lifetime, and makes another for the next request" $
       lasting (\s -> s {poolLifetime = Just (millis 600)}) $ \env -> do
         pid <- pidOf env
@@ -533,6 +545,34 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         eventually 6 (gone pid) `shouldReturn` True
         pid' <- pidOf env
         (pid' /= pid) `shouldBe` True
+
+    -- The pool lends the slot that was given back last, so that a look that closes one connection must leave the others, and the slot of
+    -- the closed one, where they were: the next request has the slot at the front, and the one after it the empty slot, and then the last.
+    it "closes the connection that is past its lifetime among three, and lends the slots after it as before, the empty one in its place" $ do
+      buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+      maintenance <- newMaintenance
+      pool <- newConnectionPool maintenance ((connectionPoolSettings 3 settings) {poolLifetime = Just (secs 60)})
+      let env = Env runner buffers pool
+      -- The first connection is the oldest: it is made, and the other two are made after the instant that the look is made as of.
+      oldest <- startHolding env
+      threadDelay 100000
+      instant <- monotonicNanoseconds
+      threadDelay 100000
+      newer <- startHolding env
+      newest <- startHolding env
+      -- They are given back as the last, the oldest, and the first of the others, so that the oldest is the middle of the free slots.
+      finishHolding newest
+      finishHolding oldest
+      finishHolding newer
+      lookAt pool (instant + 60 * 1000000000)
+      eventually 5 (gone (holderBackend oldest)) `shouldReturn` True
+      first' <- startHolding env
+      second' <- startHolding env
+      third <- startHolding env
+      (holderBackend first', holderBackend third) `shouldBe` (holderBackend newer, holderBackend newest)
+      (holderBackend second' `notElem` map holderBackend [oldest, newer, newest]) `shouldBe` True
+      mapM_ finishHolding [first', second', third]
+      closeConnectionPool pool
 
     it "leaves a connection to the request that has it, though it is older than the lifetime, and closes it once it is given back" $ do
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
