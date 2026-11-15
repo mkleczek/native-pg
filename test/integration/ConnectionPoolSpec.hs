@@ -284,12 +284,11 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
 
     -- The pool keeps a soft limit, which its size is until the server refuses a connection for its connection limit, and the count of
     -- the refusals: a program that reports on the pool, as PostgREST's metrics do, reads both with the counts of the connections.
-    needs "the soft limit and the refusals in the pool's stats" $
-      it "reports the size of the pool as its soft limit, and no refusals, while the server has refused nothing" $
-        pooled (\s -> s {poolSize = 4, poolMaxOverflow = 1}) $ \env -> do
-          void (pidOf env)
-          stats <- connectionPoolStats (envPool env)
-          (statsSoftLimit stats, statsRefusals stats) `shouldBe` (4, 0)
+    it "reports the size of the pool as its soft limit, and no refusals, while the server has refused nothing" $
+      pooled (\s -> s {poolSize = 4, poolMaxOverflow = 1}) $ \env -> do
+        void (pidOf env)
+        stats <- connectionPoolStats (envPool env)
+        (statsSoftLimit stats, statsRefusals stats) `shouldBe` (4, 0)
 
   -- What a program keeps for a connection, as a program that prepares statements keeps the names that its connection has, lives as
   -- long as the connection does: through every use of it by a pool, and not beyond.
@@ -396,29 +395,28 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
           readIORef attempts `shouldReturn` 1
 
   -- What the stats say of the refusals: how many the server made, and the soft limit that they cut, to 70% of what it was for each.
-  needs "the soft limit and the refusals in the pool's stats" $
-    describe "the refusals that the stats report" $ do
-      let refusal :: Socket -> IO ()
-          refusal client = receiveStartup client *> SocketBytes.sendAll client (frame 'E' "SFATAL\0VFATAL\0C53300\0Msorry, too many clients already\0\0")
-          accepting :: Socket -> IO ()
-          accepting client = receiveStartup client *> SocketBytes.sendAll client (frame 'R' (int32 0) <> frame 'Z' "I") *> drain client
-          poolTo port change = change (connectionPoolSettings 1 (connectSettings (TcpAddress "127.0.0.1" port) "postgres"))
-          buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-          limits pool = (\stats -> (statsRefusals stats, statsSoftLimit stats)) <$> connectionPoolStats pool
-      it "counts each refusal that a pool with overflow tries again, and cuts its soft limit by 30% for each" $ do
-        buffers <- buffersOf
-        withScripted [refusal, refusal, accepting] $ \port ->
-          withPool runner buffers (poolTo port (\s -> s {poolSize = 10, poolMaxOverflow = 1, poolOverflowDelay = millis 60})) $ \pool -> do
-            limits pool `shouldReturn` (0, 10)
-            runOn runner buffers (viaPool pool done) `shouldReturn` Right ()
-            -- 70% of 10 is 7, and 70% of 7 is 4.
-            limits pool `shouldReturn` (2, 4)
-      it "counts the refusal that a pool without overflow reports, and keeps its soft limit" $ do
-        buffers <- buffersOf
-        withScripted [refusal, accepting] $ \port ->
-          withPool runner buffers (poolTo port (\s -> s {poolSize = 5})) $ \pool -> do
-            runOn runner buffers (viaPool pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
-            limits pool `shouldReturn` (1, 5)
+  describe "the refusals that the stats report" $ do
+    let refusal :: Socket -> IO ()
+        refusal client = receiveStartup client *> SocketBytes.sendAll client (frame 'E' "SFATAL\0VFATAL\0C53300\0Msorry, too many clients already\0\0")
+        accepting :: Socket -> IO ()
+        accepting client = receiveStartup client *> SocketBytes.sendAll client (frame 'R' (int32 0) <> frame 'Z' "I") *> drain client
+        poolTo port change = change (connectionPoolSettings 1 (connectSettings (TcpAddress "127.0.0.1" port) "postgres"))
+        buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+        limits pool = (\stats -> (statsRefusals stats, statsSoftLimit stats)) <$> connectionPoolStats pool
+    it "counts each refusal that a pool with overflow tries again, and cuts its soft limit by 30% for each" $ do
+      buffers <- buffersOf
+      withScripted [refusal, refusal, accepting] $ \port ->
+        withPool runner buffers (poolTo port (\s -> s {poolSize = 10, poolMaxOverflow = 1, poolOverflowDelay = millis 60})) $ \pool -> do
+          limits pool `shouldReturn` (0, 10)
+          runOn runner buffers (viaPool pool done) `shouldReturn` Right ()
+          -- 70% of 10 is 7, and 70% of 7 is 4.
+          limits pool `shouldReturn` (2, 4)
+    it "counts the refusal that a pool without overflow reports, and keeps its soft limit" $ do
+      buffers <- buffersOf
+      withScripted [refusal, accepting] $ \port ->
+        withPool runner buffers (poolTo port (\s -> s {poolSize = 5})) $ \pool -> do
+          runOn runner buffers (viaPool pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
+          limits pool `shouldReturn` (1, 5)
 
   -- What a request pays the pool when its connection is free: the bytes that a request allocates for the checkout, the
   -- use of the connection and the release, with a body that does nothing. The ceiling is what each arrow allocated when it

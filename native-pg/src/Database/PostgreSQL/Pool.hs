@@ -110,7 +110,9 @@ data ConnectionPool = ConnectionPool
     -- | When the maintenance last looked at the pool for its idle time, on the monotonic clock, in nanoseconds.
     poolLastLook :: !(IORef Word64),
     -- | The maintenance that the pool is registered with, and its place there, until it is closed.
-    poolRegistration :: !(IORef (Maybe (Maintenance, Int)))
+    poolRegistration :: !(IORef (Maybe (Maintenance, Int))),
+    -- | How many times the server has refused a connection for its connection limit, as the failure of a request to make one.
+    poolRefused :: !(IORef Int)
   }
 
 -- | A place for a connection, which is empty until it is made, and empty again once it is broken, and the identifier that the
@@ -166,7 +168,7 @@ newConnectionPool maintenance settings = do
     fixIO $ \self -> do
       slots <- replicateM size (slotOf self False)
       extra <- replicateM overflow (slotOf self True)
-      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing
+      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing <*> newIORef 0
   case maintenancePeriod settings of
     Nothing -> pure ()
     Just period -> register maintenance period (lookAt pool) >>= \place -> writeIORef (poolRegistration pool) (Just (maintenance, place))
@@ -339,8 +341,12 @@ using body = scope acquire release run
     waited = first sleepIn >>^ \((), slot) -> Again slot
     attempt = alongside connectionFor >>> now concluded
     connectionFor = (\slot -> (poolBuffers (slotOwner slot), poolConnect (poolSettings (slotOwner slot)))) ^>> withRequestBuffers (swap ^>> connect)
+    -- A refusal is counted whether the pool has overflow or not; only a pool that has overflow backs off and tries again.
     concluded (result, slot) = case result of
-      Left failure | refusal failure && poolMaxOverflow (poolSettings (slotOwner slot)) > 0 -> Again slot <$ backOff (slotOwner slot)
+      Left failure | refusal failure -> do
+        let pool = slotOwner slot
+        atomicModifyIORef' (poolRefused pool) (\count -> (count + 1, ()))
+        if poolMaxOverflow (poolSettings pool) > 0 then Again slot <$ backOff pool else pure (Finish result)
       _ -> pure (Finish result)
     made :: Either ConnectFailure Connection -> Slot -> IO (Slot, Connection)
     made result slot = case result of
@@ -383,7 +389,9 @@ connectionPoolStats pool = do
   idle <- connected free'
   have <- connected (poolEvery pool)
   let held = length (poolEvery pool) - length free'
-  pure (PoolStats idle (have - idle) (held - (have - idle)) 0 0)
+  soft <- softLimit pool
+  refused <- readIORef (poolRefused pool)
+  pure (PoolStats idle (have - idle) (held - (have - idle)) soft refused)
   where
     connected slots = length . filter isJust <$> traverse (readIORef . slotConnection) slots
 
@@ -412,8 +420,8 @@ softLimit pool = do
   where
     size = max 1 (poolSize (poolSettings pool))
 
--- | The server refused a connection for its connection limit: the pool keeps 70% of what it kept, and makes no connection for
--- the overflow delay.
+-- | The server refused a connection for its connection limit, and the pool has overflow: it keeps 70% of what it kept, and makes no
+-- connection for the overflow delay.
 backOff :: ConnectionPool -> IO ()
 backOff pool = do
   now' <- monotonicNanoseconds
