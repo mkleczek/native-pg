@@ -94,7 +94,7 @@ module Network.Streaming.Internal.Scheduler
   )
 where
 
-import Control.Concurrent (rtsSupportsBoundThreads, yield)
+import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, yield)
 import Control.Concurrent.STM (atomically, orElse, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, toException, try)
 import Control.Monad (foldM, replicateM, when)
@@ -109,6 +109,7 @@ import Foreign.C.Types (CInt (..))
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
+import GHC.Conc (BlockReason (..), ThreadStatus (..), listThreads, threadStatus)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Classes (Cancelled (..), Event (..), Instant (..), ReleaseFailed (..), cancelledBy, exitOf, monotonicNanoseconds)
 import Network.Streaming.Counters (Counter (..))
@@ -200,7 +201,9 @@ data Run = Run
     -- yet back from the mailbox, the parts that wait on descriptors, those that
     -- wait for tickets, the number of the next wait, the rounds, the time that
     -- the round began at, or 0 before it is read, the parts that are in a
-    -- scope, the armings that no poll has taken yet, the run's own number, and the time of the last poll: unboxed, so that
+    -- scope, the armings that no poll has taken yet, the run's own number, the time of the last poll, and, on the non-threaded
+    -- run time, whether another thread needed the OS thread at the last wait that ended with nothing, and how long the next
+    -- wait may last if none did: unboxed, so that
     -- counting allocates nothing. A step is a point to
     -- give way at, which a link's receive or send is, or a wait, or a ticket
     -- fulfilled or awaited.
@@ -271,8 +274,8 @@ pendingArmings = 64
 -- parts run for turns of that length.
 newRun :: Turn -> IO Run
 newRun (Turn turn) = do
-  counters <- mallocForeignPtrArray 13
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 12]
+  counters <- mallocForeignPtrArray 15
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 14]
   number <- newRunNumber
   unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
@@ -938,9 +941,30 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
     -- while the scheduler waits, so it waits unmasked: a masked thread in an interruptible foreign call returns
     -- from it with the exception still to come.
     pollWait timeout =
-      bump @m PollsBlocking *> try (interruptible (rawPoll c_pollerWait (bounded timeout))) >>= \case
+      bump @m PollsBlocking *> capped timeout >>= \limit -> try (interruptible (rawPoll c_pollerWait limit)) >>= \case
         Left failure -> [] <$ shuttingDown failure
-        Right count -> afterPoll count >>= \ready -> ready <$ when (null ready && not rtsSupportsBoundThreads) yield
+        Right count -> afterPoll count >>= \ready -> ready <$ afterWait ready
+    -- How long the wait may last: as told on the threaded run time. On the non-threaded one, a millisecond while other
+    -- threads need the OS thread, and else the cap that 'afterWait' has settled on.
+    capped timeout
+      | rtsSupportsBoundThreads = pure timeout
+      | otherwise = do
+          shared <- counter run 13
+          settled <- counter run 14
+          let limit = if shared /= 0 then sharedCap else if settled == 0 then firstCap else settled
+          pure (if timeout < 0 || fromIntegral timeout > limit then fromIntegral limit else timeout)
+    -- What a wait that ended means for the next, on the non-threaded run time. A wait that gave nothing, which a signal or
+    -- its cap ended, lets the other threads run, and the next one is cut short if any of them needs the OS thread, and
+    -- else may last twice as long, up to 'lastCap': an idle scheduler settles at that. A wait that gave something starts
+    -- the caps over.
+    afterWait ready
+      | rtsSupportsBoundThreads = pure ()
+      | null ready = do
+          shared <- yieldToOthers
+          setCounter run 13 (fromEnum shared)
+          settled <- counter run 14
+          setCounter run 14 (min lastCap (max firstCap settled * 2))
+      | otherwise = setCounter run 14 0
     rawPoll call timeout =
       unsafeWithForeignPtr (runReady run) $ \fds ->
         unsafeWithForeignPtr (runKinds run) $ \kinds ->
@@ -971,17 +995,38 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
       when (kindsOf waiting /= 0) (arm fd 0 waiting)
       pure (woken <> reverse fromReaders <> reverse fromWriters, settle key waiting waiters)
 
--- | How long the scheduler waits in its poller at most on the non-threaded run time, in milliseconds. That run time has
--- one OS thread, which a blocking foreign call holds: no other thread of the program runs while the scheduler waits,
--- and a signal that ends the wait has the handler's thread started only once the scheduler thread has gone back to the
--- run time's scheduler, which it doesn't do by itself when it waits again at once. So the wait is short, and the scheduler
--- thread yields when it ends with nothing ready, so that the handler's thread, and the thread that it tells to stop the
--- run, get their turns. The threaded run time runs the others on OS threads of their own, and waits as long as it is told.
-bounded :: CInt -> CInt
-bounded timeout
-  | rtsSupportsBoundThreads = timeout
-  | timeout < 0 || timeout > 100 = 100
-  | otherwise = timeout
+-- | How long the scheduler waits in its poller on the non-threaded run time, in milliseconds: the first wait that ends with
+-- nothing, the longest, and while other threads need the OS thread. That run time has one OS thread, which a blocking
+-- foreign call holds: no other thread of the program runs while the scheduler waits. A signal ends the wait, and the
+-- handler's thread, which the run time starts only once the scheduler thread has gone back to it, gets its turn then
+-- ('yieldToOthers'). But a signal that arrived before the wait, while a part ran, ends nothing: its handler's thread waits
+-- behind the scheduler thread, which would wait for ever. So a wait ends by itself, and an idle scheduler wakes up twice a
+-- second, after the first few waits, which are shorter. The threaded run time runs the handler's thread on another OS
+-- thread, and waits as long as it is told.
+firstCap, lastCap, sharedCap :: Int
+firstCap = 10
+lastCap = 500
+sharedCap = 1
+
+-- | Lets the other threads of the program run until each has ended or waits, which a signal's handler needs to stop the
+-- run: its thread throws to the thread that waits for the run, which stops the scheduler's thread in its turn. The
+-- scheduler thread yields as long as another thread can run, at most four times. It says whether another thread
+-- needs the OS thread: one that can still run, or that waits for the run time's own wait for a descriptor or for a delay,
+-- which the run time serves only when the scheduler thread gives the OS thread back. A thread that waits for an 'MVar'
+-- or a transaction is woken by another thread, and needs nothing from the scheduler.
+yieldToOthers :: IO Bool
+yieldToOthers = myThreadId >>= \me -> go me (4 :: Int)
+  where
+    go me turns = do
+      yield
+      others <- filter (/= me) <$> listThreads
+      statuses <- traverse threadStatus others
+      let running = any (== ThreadRunning) statuses
+      if running && turns > 1 then go me (turns - 1) else pure (any needsThread statuses)
+    needsThread = \case
+      ThreadRunning -> True
+      ThreadBlocked BlockedOnOther -> True
+      _ -> False
 
 -- | The kinds of readiness that the poller reports and is armed for: those of C, which are bits.
 kindReadable, kindWritable :: CInt

@@ -11,7 +11,7 @@
 module SignalsSpec (spec) where
 
 import Control.Arrow (ArrowChoice, (>>>), (^>>))
-import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, throwTo)
+import Control.Concurrent (myThreadId, throwTo)
 import Control.Exception (ErrorCall (..), bracket, try)
 import Control.Monad (forM_, void)
 import Foreign.C.Types (CUInt (..))
@@ -49,7 +49,7 @@ onCompiled built = void (built >>= \program -> runCompiled program ())
 spec :: Spec
 spec = describe "a signal" $
   forM_ runners $ \(Runner name run) -> describe name $ do
-    nonThreadedFails $ it "ends the run as soon as it arrives while the scheduler waits for a descriptor" $ do
+    it "ends the run as soon as it arrives while the scheduler waits for a descriptor" $ do
       withPair $ \waiting _ -> do
         let delay = 500000
         due <- (+ fromIntegral delay * 1000) <$> monotonicNanoseconds
@@ -87,7 +87,3 @@ withPair :: (Socket -> Socket -> IO a) -> IO a
 withPair =
   bracket (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) (\(a, b) -> Socket.close a *> Socket.close b)
     . uncurry
-
--- | The cases fail on the non-threaded run time until the scheduler gives the OS thread back as soon as a signal ends its wait.
-nonThreadedFails :: Spec -> Spec
-nonThreadedFails = if rtsSupportsBoundThreads then id else xfail "the handler of a signal that ended the scheduler's wait runs only after its next wait"
