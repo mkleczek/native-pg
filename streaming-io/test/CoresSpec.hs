@@ -97,14 +97,13 @@ spec = describe "cores" $ do
       fst <$> runCompiled (goneNow @'Anywhere) () `shouldReturn` (Nothing, False)
       runThreads (goneNow @'Anywhere) () `shouldReturn` (Nothing, False)
 
-    xfail "fulfilNow of a promise of the arrow's own core is not there yet" $
-      it "does the same for a ticket of the arrow's own core" $ do
-        fst <$> runDelimited fulfilledNowToLocal () `shouldReturn` (42, True)
-        fst <$> runCompiled fulfilledNowToLocal () `shouldReturn` (42, True)
-        fst <$> runLoop fulfilledNowToLocal () `shouldReturn` (42, True)
-        fst <$> runDelimited goneNowLocal () `shouldReturn` (Nothing, False)
-        fst <$> runCompiled goneNowLocal () `shouldReturn` (Nothing, False)
-        fst <$> runLoop goneNowLocal () `shouldReturn` (Nothing, False)
+    it "does the same for a ticket of the arrow's own core" $ do
+      fst <$> runDelimited fulfilledNowToLocal () `shouldReturn` (42, True)
+      fst <$> runCompiled fulfilledNowToLocal () `shouldReturn` (42, True)
+      fst <$> runLoop fulfilledNowToLocal () `shouldReturn` (42, True)
+      fst <$> runDelimited goneNowLocal () `shouldReturn` (Nothing, False)
+      fst <$> runCompiled goneNowLocal () `shouldReturn` (Nothing, False)
+      fst <$> runLoop goneNowLocal () `shouldReturn` (Nothing, False)
 
   describe "the pool of connections" $ do
     it "loses and duplicates no connection, and no part waits for ever, with parts on 2 and 4 cores" $ do

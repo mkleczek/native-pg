@@ -50,9 +50,10 @@ instance Fulfilling 'Anywhere where
   fulfilNow (AnywherePromise fulfilling) = fulfilling
   {-# INLINE fulfilNow #-}
 
--- | Not yet.
+-- | A promise of one core is fulfilled in its slot, as the arrow's own 'fulfil' does it.
 instance Fulfilling ('Here s) where
-  fulfilNow _ _ = ioError (userError "fulfilNow of a promise of the arrow's own core is not implemented yet")
+  fulfilNow (HerePromise slot) = fulfilHere slot
+  {-# INLINE fulfilNow #-}
 
 -- | Fulfils the slot with its value, and puts the part that waits for it back among those that can go on. It says
 -- whether the waiter takes it: it doesn't if the waiter has gone. The value is evaluated, whether it is
