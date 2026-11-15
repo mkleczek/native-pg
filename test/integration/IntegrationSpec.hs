@@ -629,7 +629,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         )
         `shouldReturn` ()
 
-  needs "cancel" $ describe "cancel" $ do
+  describe "cancel" $ do
     let missing = unixSettings "/nonexistent/.s.PGSQL.5432" "postgres" Nothing
         refused = \case
           UnreachableSocket path _ -> path `shouldBe` "/nonexistent/.s.PGSQL.5432"
@@ -1040,9 +1040,10 @@ withScripted scripts action =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
     Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
     Socket.listen listener 4
+    -- Each connection is served on a thread of its own, since the first is still open while the second is made.
     let serve script = do
           (client, _) <- Socket.accept listener
-          script client `finally` Socket.close client
+          void (forkIO (script client `finally` Socket.close client `catch` \(_ :: SomeException) -> pure ()))
     bracket (forkIO (traverse_ serve scripts `catch` \(_ :: SomeException) -> pure ())) killThread $ \_ -> action =<< Socket.socketPort listener
 
 -- | A message of the server: its tag, its length, and its payload.

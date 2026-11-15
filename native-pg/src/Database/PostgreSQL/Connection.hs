@@ -1,6 +1,8 @@
--- | Connections, one at a time for a part, over a socket. The step that cancels is
--- a stub, which fails with 'Network.Streaming.NotImplemented.NotImplemented' until
--- the code is there, and so is TLS.
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE PatternSynonyms #-}
+
+-- | Connections, one at a time for a part, over a socket. TLS is a stub: a mode that
+-- needs it fails until the code is there.
 --
 -- A program that is cancelled leaves its connection usable if and only if nothing
 -- is owed on it in either direction: no reply is still expected, and nothing is
@@ -56,8 +58,9 @@ module Database.PostgreSQL.Connection
 where
 
 import Control.Arrow (arr, first, second, (>>>), (>>^), (^>>), (|||))
-import Control.Exception (throwIO)
+import Control.Exception (IOException, fromException, throwIO)
 import Control.Monad (unless, when)
+import Data.ByteString (ByteString)
 import Data.IORef (readIORef)
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
@@ -65,16 +68,18 @@ import Data.Tuple (Solo (MkSolo))
 import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.ConnectionString.Types (Host (..))
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectFailure (..), UsageError (..))
+import Database.PostgreSQL.Internal.Frontend (sendOutput)
+import Database.PostgreSQL.Internal.Protocol.Messages (BackendKey, pattern CancelRequest, serialize)
 import Database.PostgreSQL.Internal.Socket (connectSocket)
 import Database.PostgreSQL.Internal.Startup (startup)
 import Database.PostgreSQL.Session.Settings
 import Database.PostgreSQL.Transport (Address (..), TlsClient)
 import qualified Network.Socket as Socket
-import Network.Streaming.Buffer (Buffer)
-import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Within (..), secs)
-import Network.Streaming.Combinators (alongside)
+import Network.Streaming.Buffer (Buffer, newBuffer)
+import Network.Streaming.Classes (Effect (..), Exit (..), Link (receive), Room, Runtime, Scope (..), Within (..), roomOf, secs)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, iterateA)
 import Network.Streaming.Loans (Loans, withSetupBuffersOf)
-import Network.Streaming.NotImplemented (notImplemented)
+import Network.Streaming.PositiveInt (positiveInt)
 
 -- | Connects to the first of the settings' hosts that qualifies: the settings' own, then the settings of its fallbacks,
 -- in order. For each it connects the socket as its address says, the Unix-domain socket or the numeric address, sends
@@ -200,6 +205,42 @@ cancelKey :: Connection -> CancelKey
 cancelKey = connectionKey
 
 -- | Cancels the statement that the key's connection runs, out of band: over a
--- connection of its own, made as the settings say, TLS included.
-cancel :: (Effect arr) => ConnectSettings -> arr CancelKey ()
-cancel _ = notImplemented "cancel"
+-- connection of its own, made as the settings say, TLS included. It makes one
+-- attempt, to the host of the settings, and fails with that attempt's
+-- 'ConnectError' itself, also when the settings' @connect_timeout@ passes first.
+-- It returns once the server has closed the connection, which it does when it has
+-- handled the request: a statement that was cancelled fails in its own session
+-- with SQLSTATE 57014, and a request that comes too late does nothing. A server
+-- that sent no key, as some connection poolers don't, can't cancel anything: then
+-- there is nothing to ask of any server.
+--
+-- The request is rendered into a small buffer of its own, since the step has no
+-- loans.
+cancel :: (Runtime arr) => ConnectSettings -> arr CancelKey ()
+cancel settings =
+  (\(CancelKey key) -> maybe (Left ()) Right key)
+    ^>> (done ||| (bounded (requesting settings) >>> now (maybe (throwIO TimedOut) (either throwIO pure))))
+  where
+    bounded = maybe (>>^ Just) (within . secs . fromIntegral) (connectTimeout settings)
+
+-- | The request on a socket of its own, which is closed when the step ends, however it ends.
+requesting :: forall arr. (Runtime arr) => ConnectSettings -> arr (BackendKey ByteString) (Either ConnectError ())
+requesting settings = case encrypting settings of
+  Just reason -> arr (const (Left reason))
+  Nothing ->
+    (\key -> (connectAddress settings, key))
+      ^>> first (connectSocket (connectTcpOptions settings))
+      >>> (\(reached, key) -> fmap (,key) reached)
+      ^>> (arr Left ||| asked)
+  where
+    asked :: arr (Socket.Socket, BackendKey ByteString) (Either ConnectError ())
+    asked = scope (arr fst) (now (\(sock, _) -> Socket.close sock)) (now rendered >>> alongside sendOutput >>> waiting ^>> orClosed >>^ Right)
+    -- The socket, the room that the reply would be received into, and the request, rendered into the buffer.
+    rendered (_, (sock, key)) = (\buffer -> (sock, buffer, serialize (CancelRequest key))) <$> newBuffer (positiveInt @512)
+    waiting (_, (sock, buffer, _)) = (sock, roomOf buffer)
+    -- The server closes the connection once it has handled the request, and ends the stream; a connection that breaks
+    -- first is as good.
+    orClosed :: arr (Socket.Socket, Room) ()
+    orClosed = tryA untilClosed >>> now (either (\failure -> maybe (throwIO failure) (\(_ :: IOException) -> pure ()) (fromException failure)) pure)
+    untilClosed :: arr (Socket.Socket, Room) ()
+    untilClosed = iterateA (alongside receive >>^ \(count, link) -> if count == 0 then Finish () else Again link)
