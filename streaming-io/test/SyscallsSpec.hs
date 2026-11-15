@@ -10,7 +10,7 @@
 module SyscallsSpec (spec) where
 
 import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>))
-import Control.Concurrent (forkIO, getNumCapabilities, setNumCapabilities, threadDelay)
+import Control.Concurrent (forkIO, getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, replicateM_, void, when)
@@ -130,7 +130,7 @@ spec = describe "system calls" $ do
       countOf DescriptorWaits counts `shouldBe` 2
 
   forM_ runners $ \(Runner name polls run) -> when polls $ describe name $ do
-    it "makes no poll that doesn't wait, and one that waits for each wake-up, while no other part can go on" $ do
+    sharedThread "a wait that the test's own threads share the OS thread with is cut short, and polls again and again" $ it "makes no poll that doesn't wait, and one that waits for each wake-up, while no other part can go on" $ do
       counts <- counting (echoing 20 run)
       countOf PollsImmediate counts `shouldBe` 0
       countOf PollsBlocking counts `shouldBe` countOf DescriptorWaits counts
@@ -179,6 +179,10 @@ spec = describe "system calls" $ do
       Socket.close theirs
       results `shouldBe` Just [(), ()]
       countOf DescriptorMoves (after `since` before) `shouldBe` 1
+
+-- | Skips the case on the non-threaded run time.
+sharedThread :: String -> Spec -> Spec
+sharedThread reason = if rtsSupportsBoundThreads then id else skip reason
 
 -- | A test that waits for ever fails instead: the scheduler stops where it waits for a descriptor.
 bounded :: IO a -> IO (Maybe a)
