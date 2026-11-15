@@ -97,7 +97,7 @@ data ConnectionPool = ConnectionPool
     poolEvery :: ![Slot],
     poolBuffers :: !BufferPool,
     poolSettings :: !ConnectionPoolSettings,
-    -- | The count of the looks that the pool's thread has made at its connections, which a request that gives a connection
+    -- | The count of the looks that the maintenance has made at the pool's connections, which a request that gives a connection
     -- back stamps it with, if the pool has an idle time.
     poolEpoch :: !(IORef Int),
     -- | How many connections the pool keeps: its size, until the server refuses a connection for its connection limit, which
