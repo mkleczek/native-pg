@@ -269,7 +269,7 @@ data Prepared = Prepared
 request :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr (Loans, Conn) Bool
 request settings handler =
   named (Label "request" "Reads the head of a request, runs the handler, and says whether the connection is kept.") $
-    uncurry (newRecord ["loans", "conn"])
+    (\(loans, conn) -> newRecord ["loans", "conn"] loans conn)
       ^>> adding "loan" (field "loans" >>> borrow)
       >>> adding "req" (step "copy carry-over" begin')
       >>> adding "head" (field "req" >>> readHead settings)

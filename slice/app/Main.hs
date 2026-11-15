@@ -123,7 +123,7 @@ reading result =
 -- until the next step on the source. At its end, the response ends. The input has the answering and the source by name.
 pieces :: (Runtime arr, Stream arr s, HasField "answering" r Fulmen.Answering, HasField "source" r s) => arr r ()
 pieces =
-  (\r -> (r.answering, r.source))
+  (\r -> let !answering = r.answering; !source = r.source in (answering, source))
     ^>> iterateWith (withSource ^>> first next >>^ chunked) (consume Fulmen.send)
     >>> Fulmen.finish
   where
