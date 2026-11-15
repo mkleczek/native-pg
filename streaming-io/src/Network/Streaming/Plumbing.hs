@@ -15,6 +15,13 @@ module Network.Streaming.Plumbing
     through,
     _1,
     _2,
+    _Left,
+    _Right,
+    _Just,
+    prism,
+    each,
+    traversal,
+    folding,
     on,
     boolA,
     Step,
@@ -121,6 +128,53 @@ _1 = first
 _2 :: (Arrow arr) => arr a b -> arr (c, a) (c, b)
 _2 = second
 {-# INLINE _2 #-}
+
+-- | The left of an 'Either', as a prism: runs the arrow on a 'Left' and passes a 'Right' through. A stub: it fails when it
+-- runs, until it is written.
+_Left :: (ArrowChoice arr) => arr a b -> arr (Either a c) (Either b c)
+_Left _ = unwritten "_Left"
+{-# INLINE _Left #-}
+
+-- | The right of an 'Either', as a prism: runs the arrow on a 'Right' and passes a 'Left' through. A stub: it fails when it
+-- runs, until it is written.
+_Right :: (ArrowChoice arr) => arr a b -> arr (Either c a) (Either c b)
+_Right _ = unwritten "_Right"
+{-# INLINE _Right #-}
+
+-- | The 'Just' of a 'Maybe', as a prism: runs the arrow on the value and passes 'Nothing' through. A stub: it fails when it
+-- runs, until it is written.
+_Just :: (ArrowChoice arr) => arr a b -> arr (Maybe a) (Maybe b)
+_Just _ = unwritten "_Just"
+{-# INLINE _Just #-}
+
+-- | A prism from how a case is built and how it is matched: the arrow runs on the focus of a 'Right', and a 'Left' is
+-- the whole result already and passes through without running it. A stub: it fails when it runs, until it is written.
+prism :: (ArrowChoice arr) => (b -> t) -> (s -> Either t a) -> arr a b -> arr s t
+prism _ _ _ = unwritten "prism"
+{-# INLINE prism #-}
+
+-- | Runs the arrow on each element of a list in order, and gives the results in the same order. In diagrams the loop
+-- is named "each", and it asks "another focus?". A stub: it fails when it runs, until it is written.
+each :: (ArrowChoice arr, Annotate arr) => arr a b -> arr [a] [b]
+each _ = unwritten "each"
+{-# INLINE each #-}
+
+-- | Runs the arrow on each focus of a traversal, in the order that the traversal visits them, and puts the results in
+-- the places of the foci. The traversal is in the form of the van Laarhoven lenses, as 'traverse' is. A stub: it fails
+-- when it runs, until it is written.
+traversal :: (ArrowChoice arr, Annotate arr) => (forall f. (Applicative f) => (a -> f b) -> s -> f t) -> arr a b -> arr s t
+traversal _ _ = unwritten "traversal"
+{-# INLINE traversal #-}
+
+-- | Runs the arrow on each part that the function gives, in order, and combines the results. A stub: it fails when it
+-- runs, until it is written.
+folding :: (ArrowChoice arr, Annotate arr, Foldable f, Monoid m) => (s -> f a) -> arr a m -> arr s m
+folding _ _ = unwritten "folding"
+{-# INLINE folding #-}
+
+-- | What the stubs are until they are written: an arrow that fails when it runs.
+unwritten :: (Arrow arr) => String -> arr a b
+unwritten operation = arr (const (error (operation <> " is not implemented yet")))
 
 -- | Runs the arrow on the part that the lens picks, and ignores the rest.
 on :: (Arrow arr) => (arr a () -> arr s t) -> arr a () -> arr s ()

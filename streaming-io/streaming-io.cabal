@@ -121,6 +121,7 @@ test-suite streaming-io-spec
                  InboxSpec
                  MermaidSpec
                  NamedSpec
+                 OpticsSpec
                  PositiveIntSpec
                  ResourcesSpec
                  WatchSpec

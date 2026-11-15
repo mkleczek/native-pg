@@ -8,7 +8,7 @@ import Control.Arrow ((&&&), (>>>), (^>>))
 import Data.Char (isAlphaNum)
 import Data.List (isInfixOf, isPrefixOf)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (box, done, withInbox)
+import Network.Streaming.Combinators (_Just, box, done, each, step, withInbox)
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
 import Network.Streaming.Named (adding, at, field, is, (:=))
@@ -36,6 +36,10 @@ beside (posting, collecting) = fst ^>> ((snd ^>> posting) &&& (fst ^>> collectin
 -- | The posts and the collects as parts that run together, which are lanes.
 together' :: Diagram ((Inbox Diagram "jobs" 'Anywhere (), Address "jobs" 'Anywhere ()), ()) ()
 together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
+
+-- | The stubs of each and the prisms draw as one pure step, until they are written, and the marks come off with them.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Plumbing has stubs: the prisms and each are not written yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -77,6 +81,23 @@ spec = describe "the chart" $ do
     let labelled = [name | name <- ["name", "size"], any (("|\"" ++ name ++ "\"|") `isInfixOf`) (stripped chart)]
     labelled `shouldBe` ["name", "size"]
 
+  stubbed $ it "has the loop of each: the step goes round, the decision asks for another focus, and the loop is named" $ do
+    chart <- chartOf (each working :: Diagram [Int] [()])
+    (wiresNamed "each" chart, wiresNamed "again" chart, wiresNamed "finish" chart) `shouldBe` (1, 1, 1)
+    any (("{\"another focus?\"}" `isInfixOf`)) chart `shouldBe` True
+    let worked = nodesDeclared "working" chart
+    length worked `shouldBe` 1
+    [from | (from, _) <- edgesOf chart, from `elem` worked, reaches chart from from] `shouldBe` worked
+
+  stubbed $ it "has the branches of a prism: the arrow is on the branch of the focus, and the other case goes past it" $ do
+    chart <- chartOf (_Just working >>> afterwards :: Diagram (Maybe Int) ())
+    case (nodesDeclared "working" chart, nodesDeclared "afterwards" chart) of
+      ([inside], [after]) -> do
+        targetsOf "Right" chart `shouldBe` [inside]
+        targetsOf "Left" chart `shouldBe` [after]
+        ((inside, after) `elem` edgesOf chart) `shouldBe` True
+      found -> failTest ("the chart has the steps " <> show found)
+
   it "has the name of the field that adding puts in front of a record, on the wire out of its step" $ do
     chart <- chartOf (adding "size" quick >>> quick :: Diagram () ())
     wiresNamed "size" chart `shouldBe` 1
@@ -96,6 +117,36 @@ chartOf program = do
   pure $ case found of
     page : _ -> lines (pageMermaid page)
     [] -> []
+
+-- | A step that is a node of the chart of its own, of the name.
+working :: Diagram Int ()
+working = step "working" (const (pure ()))
+
+-- | The step after it.
+afterwards :: Diagram (Maybe ()) ()
+afterwards = step "afterwards" (const (pure ()))
+
+-- | The edges of the chart, from a node to a node, whatever their labels.
+edgesOf :: [String] -> [(String, String)]
+edgesOf chart = [(takeWhile isAlphaNum line, last (words line)) | line <- stripped chart, " --> " `isInfixOf` line || " -->|" `isInfixOf` line]
+
+-- | The nodes that an edge of the label goes to.
+targetsOf :: String -> [String] -> [String]
+targetsOf label chart = [last (words line) | line <- stripped chart, ("-->|\"" ++ label ++ "\"|") `isInfixOf` line]
+
+-- | The nodes that are declared with the text, as a step of its own.
+nodesDeclared :: String -> [String] -> [String]
+nodesDeclared text chart = [takeWhile isAlphaNum line | line <- stripped chart, ("[\"" ++ text ++ "\"]") `isInfixOf` line]
+
+-- | Whether the edges lead from the node to the target, in one step or more.
+reaches :: [String] -> String -> String -> Bool
+reaches chart from target = go [] [from]
+  where
+    edges = edgesOf chart
+    go _ [] = False
+    go seen (node : rest)
+      | node `elem` seen = go seen rest
+      | otherwise = let onward = [to | (source, to) <- edges, source == node] in target `elem` onward || go (node : seen) (onward ++ rest)
 
 -- | How many wires of the chart are labelled with the name.
 wiresNamed :: String -> [String] -> Int
