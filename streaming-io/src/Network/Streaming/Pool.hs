@@ -17,14 +17,18 @@ module Network.Streaming.Pool
     PoolError (..),
     withLoan,
     withLoanWithin,
+    withLoanIn,
+    withLoanWithinIn,
     urgently,
     newPool,
     closePool,
     closePoolWith,
     checkout,
     checkoutWithin,
+    checkoutIn,
     reserve,
     release,
+    offer,
     free,
     checkoutAt,
     checkoutMany,
@@ -49,6 +53,7 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (boolA, decide, done, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Tickets (fulfilNow)
+import Network.Streaming.NotImplemented (notImplemented)
 
 -- | The items that are free, and how many, the number that the next waiter to queue gets, which says which of two
 -- waiters came first, and the waiters in their lanes, by how many items must be free to serve the first of the lane.
@@ -95,6 +100,15 @@ withLoan pool = loaned pool (checkout pool >>^ Just)
 -- checkout has to wait: an item that is free is lent as 'withLoan' lends it.
 withLoanWithin :: (Runtime arr) => Duration -> Pool c -> arr (c, a) b -> arr a (Either PoolError b)
 withLoanWithin limit pool = loaned pool (checkoutWithin limit pool)
+
+-- | The same for a pool that is the arrow's input, with the input of the body after it: a program that is built once serves any
+-- pool, as the pools of tenants are. Not yet.
+withLoanIn :: (Runtime arr) => arr (c, a) b -> arr (Pool c, a) (Either PoolError b)
+withLoanIn _ = notImplemented "withLoanIn"
+
+-- | The same, but the checkout gives up after the time, as 'withLoanWithin' does. Not yet.
+withLoanWithinIn :: (Runtime arr) => Duration -> arr (c, a) b -> arr (Pool c, a) (Either PoolError b)
+withLoanWithinIn _ _ = notImplemented "withLoanWithinIn"
 
 -- | The scope around a checkout, which is the arrow that gives the item or, if
 -- its deadline passed, nothing, and the release of what it gave.
@@ -369,6 +383,10 @@ checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
       unlessDone
         ^>> (returnA ||| (swap ^>> first abandon >>> now (\(fulfilled, pool) -> maybe (pure ()) (releaseNow pool) fulfilled)))
 
+-- | An item of the pool that is the arrow's input, once one is free, as 'checkout' waits for it. Not yet.
+checkoutIn :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => arr (Pool conn) conn
+checkoutIn = notImplemented "checkoutIn"
+
 -- | A connection, if one is free within the time, as 'checkout' waits for it: 'Nothing' if it isn't, once the
 -- place in the queue is given up. The deadline is armed only if the checkout has to wait.
 checkoutWithin :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr, Within arr) => Duration -> Pool conn -> arr () (Maybe conn)
@@ -393,6 +411,10 @@ takeNowWith choose pool@(Pool ref _) = isClosed pool >>= \closed -> if closed th
 release :: (Effect arr, Annotate arr) => Pool conn -> arr conn ()
 release pool = step "return item" (releaseNow pool . pure)
 
+-- | Gives the item back to the pool that is the arrow's input, as 'release' does. Not yet.
+offer :: (Effect arr, Annotate arr) => arr (Pool conn, conn) ()
+offer = notImplemented "offer"
+
 -- | Gives the items back to the pool: the oldest waiters that can have them are given them, and the rest are free. It
 -- is one action that never waits, so a part that is cancelled can't lose an item between a waiter that has gone and the
 -- next: it hands them over as the arrow's 'fulfil' does it, but without its point to give way at.
@@ -410,12 +432,12 @@ queueNow (Pool ref _) need promise = update ref (settle . queued need (One promi
 handOver :: IORef (State conn) -> [Handoff conn] -> IO ()
 handOver _ [] = pure ()
 handOver ref (handoff : others) =
-  offer handoff >>= \case
+  giveTo handoff >>= \case
     [] -> handOver ref others
     untaken -> update ref (putBack untaken) >>= \more -> handOver ref (more ++ others)
   where
     -- Gives them, and says what the waiter didn't take.
-    offer = \case
+    giveTo = \case
       OneTo promise conn -> (\taken -> [conn | not taken]) <$> fulfilNow promise conn
       ManyTo promise conns -> (\taken -> if taken then [] else conns) <$> fulfilNow promise conns
       Dispose dispose conn -> [] <$ dispose conn `catch` \(_ :: IOException) -> pure ()
