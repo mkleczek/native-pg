@@ -23,7 +23,7 @@ where
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as BU
-import Network.Fulmen.Internal.Bytes (commaList, equalsLower, isToken, lowerCase, trim)
+import Network.Fulmen.Internal.Bytes (commaList, equalsLower, isToken, lowerCase, parseField, trim)
 import Network.Fulmen.Request (Method (..), Request (..), Version (..))
 import Network.Socket (SockAddr)
 
@@ -149,21 +149,6 @@ parseRequestLine line = case B.split 32 line of
           _ | "HTTP/" `B.isPrefixOf` version -> Left 505
           _ -> Left 400
   _ -> Left 400
-
--- | A header field: a name that is a token, a colon, and a value without the whitespace around it. A line that
--- begins with whitespace is the continuation of the line before, which is refused.
-parseField :: ByteString -> Maybe (ByteString, ByteString)
-parseField line = case B.elemIndex 58 line of
-  Just colon
-    | colon > 0,
-      B.all isToken (B.take colon line),
-      not (B.any isControl value) ->
-        Just (B.take colon line, value)
-    where
-      value = trim (B.drop (colon + 1) line)
-  _ -> Nothing
-  where
-    isControl byte = (byte < 32 && byte /= 9) || byte == 127
 
 -- | The framing of the body, from the lengths and the transfer codings that the head states.
 framingOf :: Maybe Int -> [ByteString] -> [ByteString] -> Either Int Framing

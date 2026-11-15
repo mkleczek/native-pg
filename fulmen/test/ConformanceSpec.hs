@@ -154,12 +154,11 @@ shouldEndWith kind = \case
 marked :: Case -> Spec -> Spec
 marked c = maybe id xfail (expectedFailure c)
 
--- | Why a case is expected to fail, if it is: it needs a part of the server that is not there yet. Chunked request
--- bodies, @Expect: 100-continue@ and the timeouts are step 3.
+-- | Why a case is expected to fail, if it is: it needs a part of the server that is not there yet. @Expect: 100-continue@
+-- and the timeouts are step 3.
 expectedFailure :: Case -> Maybe String
 expectedFailure c
   | caseName c `elem` served = Nothing
-  | caseArea c == AChunked || caseName c `elem` needingChunkedBodies = Just "chunked request bodies are not there yet (step 3)"
   | caseArea c == AExpect = Just "Expect: 100-continue is not there yet (step 3)"
   | caseArea c == ATimeouts = Just "the client timeout is not there yet (step 3)"
   | otherwise = Nothing
@@ -172,24 +171,6 @@ served =
     "a handler that ignores the body of an expecting request does not leave the connection in limbo",
     "an HTTP/1.0 request with Expect: 100-continue and its body is answered",
     "a body that arrives slowly but within the timeout is read in full"
-  ]
-
--- | The cases of the other areas that send a chunked request body that is to be decoded.
-needingChunkedBodies :: [String]
-needingChunkedBodies =
-  [ "a chunked body over the limit is answered 413",
-    "a chunked body exactly at the limit is echoed",
-    "the coding \"chunked \" (trailing space) frames a real chunked body",
-    "the coding \"chunked\" followed by a tab frames a real chunked body",
-    "the coding \"chunked,\" (empty element after) frames a real chunked body",
-    "the coding \", chunked\" (empty element before) frames a real chunked body",
-    "a small chunked body the handler ignores is drained and the next request answered",
-    "non-pipelining, chunked body, read (Echo)",
-    "non-pipelining, chunked body, ignore (Ignore)",
-    "pipelining, chunked body, read (Echo)",
-    "pipelining, chunked body, ignore (Ignore)",
-    "pipelined requests of different kinds are answered in order",
-    "a chunked request body is echoed as it arrives, before the last chunk"
   ]
 
 -- * Runners

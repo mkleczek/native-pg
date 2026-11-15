@@ -39,7 +39,7 @@ import Foreign.Ptr (castPtr)
 import Foreign.Storable (poke)
 import Network.Fulmen.Internal
 import Network.Fulmen.Internal.Accept (acceptor, listening)
-import Network.Fulmen.Internal.Body (BodyState (..), ConnectionLost (..), Marks (..), drain)
+import Network.Fulmen.Internal.Body (BodyRefused (..), BodyState (..), ChunkState (..), ConnectionLost (..), Decoding (..), Marks (..), drain)
 import Network.Fulmen.Internal.Head (Framing (..), Parsed (..), Scan (..), Spill (..), joined, notYet, parseHead, scanHead, startScan)
 import Network.Fulmen.Internal.Response (Exchange (..), Phase (..), newExchange, refusal)
 import Network.Fulmen.Listen (Listen (..))
@@ -254,7 +254,7 @@ request settings handler =
       >>> step "copy carry-over" begin' `giving` "Req"
       >>> readHead settings
       >>> decide "how did the head end?" byHead
-      >>> ((taking "stream ended" quit ||| taking "refused" refuse) ||| taking "good" (answered handler))
+      >>> ((taking "stream ended" quit ||| taking "refused" refuse) ||| taking "good" (answered settings handler))
   where
     byHead (req, outcome) = case outcome of
       HeadEnded -> Left (Left ())
@@ -329,10 +329,10 @@ advance settings req@Req {reqConn = Conn {connSocket, connPeer}, reqLoan, reqPro
 
 -- | A request that has a head: the handler runs, and the connection is kept if the response, and the request's body,
 -- leave it in a state that another request can follow.
-answered :: (Runtime arr) => arr (Call, Request) () -> arr Headed Bool
-answered handler =
+answered :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Headed Bool
+answered settings handler =
   named (Label "answered" "Runs the handler on a request that has a head, and says whether the connection is kept.") $
-    ( typed @Headed @Prepared (step "prepare call" prepare)
+    ( typed @Headed @Prepared (step "prepare call" (prepare settings))
         >>> decide "give back loan?" heldLoan
         >>> (taking "yes" (consume release) ||| taking "no" returnA)
         >>> alongside (tryA handler)
@@ -345,17 +345,21 @@ answered handler =
 
 -- | The call: the body of the request, and the response. What follows a request that has no body goes to the next
 -- request, and its primary loan is given back before the handler runs, to be used for what the handler reads.
-prepare :: Headed -> IO Prepared
-prepare Headed {headedReq = Req {reqConn = Conn {..}, ..}, headedParsed = Parsed request' framing keep, headedEnd = consumed} = do
+prepare :: Settings -> Headed -> IO Prepared
+prepare settings Headed {headedReq = Req {reqConn = Conn {..}, ..}, headedParsed = Parsed request' framing keep, headedEnd = consumed} = do
   Progress {progressEnd = end} <- readIORef reqProgress
   let buffer = loanBuffer reqLoan
       Method name = method request'
-  exchange <- newExchange connSocket reqLoans (name == "HEAD") (version request' == Http11) (sharedDate connShared) (keep && framing /= Chunked)
+  exchange <- newExchange connSocket reqLoans (name == "HEAD") (version request' == Http11) (sharedDate connShared) keep
   case framing of
     Length size -> do
       marks <- newIORef Marks {markStart = consumed, markEnd = end, markRemaining = size}
       pure (Prepared (Call reqLoans (Sized (BodyState connSocket buffer reqLoan connCarry marks)) exchange) request' Nothing)
-    Chunked -> pure (Prepared (Call reqLoans ChunkedBody exchange) request' (Just reqLoan))
+    Chunked -> do
+      marks <- newIORef Marks {markStart = consumed, markEnd = end, markRemaining = 0}
+      decoding <- newIORef (AtSize 0)
+      let state = BodyState connSocket buffer reqLoan connCarry marks
+      pure (Prepared (Call reqLoans (ChunkedBody (ChunkState state decoding (lineLimit settings) (bodyLimit settings) (headLimit settings))) exchange) request' Nothing)
     NoContent -> do
       -- Copied now, while the bytes are there: a lazy copy would be made after the buffer was used for something else.
       when (end > consumed) $ writeIORef connCarry $! B.copy (BSI.BS (bufferMemory buffer `plusForeignPtr` consumed) (end - consumed))
@@ -373,10 +377,11 @@ aftermath =
     byOutcome (outcome, (call, _)) = case outcome of
       Left failure
         | Just ConnectionLost <- fromException failure -> Left (Left ())
-        | otherwise -> Left (Right call)
+        | Just (BodyRefused status) <- fromException failure -> Left (Right (status, call))
+        | otherwise -> Left (Right (500, call))
       Right () -> Right call
     quit = arr (const False) `giving` "keep alive"
-    failed = step "check if answered" (\(Call _ _ exchange) -> unanswered exchange) >>> internalError
+    failed = step "check if answered" (\(status, Call _ _ exchange) -> (,) status <$> unanswered exchange) >>> internalError
     finished =
       step
         "read response phase"
@@ -387,7 +392,7 @@ aftermath =
               _ -> pure (Left Nothing)
         )
         `giving` "response complete?"
-        >>> (taking "no" internalError ||| taking "yes" completed)
+        >>> (taking "no" ((500,) ^>> internalError) ||| taking "yes" completed)
     -- The body that the handler didn't read is read now and dropped, if it is not too long.
     completed =
       (\(Call _ requestBody exchange) -> (requestBody, exchange))
@@ -395,12 +400,12 @@ aftermath =
         >>> step "check keep alive" (\(drained, exchange) -> (drained &&) <$> readIORef (exKeep exchange))
           `giving` "keep alive"
     unanswered exchange = readIORef (exPhase exchange) >>= \case Unanswered -> pure (Just exchange); _ -> pure Nothing
-    -- Answers 500 if nothing was answered, and ends the connection.
+    -- Answers with the status (500, or what refused the request) if nothing was answered, and ends the connection.
     internalError =
-      decide "unanswered?" (maybe (Right ()) Left)
+      decide "unanswered?" (\(status, unanswered') -> maybe (Right ()) (Left . (,) status) unanswered')
         >>> ( taking
                 "yes"
-                (step "render 500" (\exchange -> (,) (exSocket exchange) <$> refusal (exDate exchange) 500) >>> sendAll)
+                (step "render the refusal" (\(status, exchange) -> (,) (exSocket exchange) <$> refusal (exDate exchange) status) >>> sendAll)
                 ||| taking "no" returnA
             )
         >>> quit
