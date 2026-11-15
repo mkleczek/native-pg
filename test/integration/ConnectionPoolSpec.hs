@@ -467,50 +467,49 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
   -- A statement that a request left running, by being cancelled or by missing its deadline, runs on in the server until it ends, since
   -- the pool only closes its connection. The pool has the maintenance send the cancel request, so that the interrupted request does
   -- not wait for it and a server that doesn't answer can't hold it for longer than the pool's cancel timeout.
-  needs "cancelling an interrupted statement on the server" $
-    describe "a statement that is interrupted" $ do
-      let sleepingOn :: (Runtime arr) => ConnectionPool -> arr Loans (Either PoolError (Either QueryError Int64))
-          sleepingOn pool = viaPool pool (committed Tx.Read (Tx.statement sleeping) Tx.single)
-      it "is cancelled on the server when the deadline of its request passes, and its backend is gone within a second" $
-        pooled id $ \env -> do
-          pid <- pidOf env
+  describe "a statement that is interrupted" $ do
+    let sleepingOn :: (Runtime arr) => ConnectionPool -> arr Loans (Either PoolError (Either QueryError Int64))
+        sleepingOn pool = viaPool pool (committed Tx.Read (Tx.statement sleeping) Tx.single)
+    it "is cancelled on the server when the deadline of its request passes, and its backend is gone within a second" $
+      pooled id $ \env -> do
+        pid <- pidOf env
+        started <- getMonotonicTime
+        (() <$) <$> onEnv env (withinFor (millis 100) (sleepingOn (envPool env))) `shouldReturn` Nothing
+        ended <- getMonotonicTime
+        -- The request ended at its deadline, and did not wait for the cancel.
+        (ended - started < 1) `shouldBe` True
+        eventually 1 (gone pid) `shouldReturn` True
+    it "is cancelled on the server when the part that runs it is cancelled from outside" $
+      pooled id $ \env -> do
+        pid <- pidOf env
+        (either (const ()) (const ()) <$> onEnv env (race (sleepingOn (envPool env)) (after (millis 100) done))) `shouldReturn` ()
+        eventually 1 (gone pid) `shouldReturn` True
+    it "does not reach the statement of the request that comes next, which has a connection of its own" $
+      pooled id $ \env -> do
+        pid <- pidOf env
+        (() <$) <$> onEnv env (withinFor (millis 100) (sleepingOn (envPool env))) `shouldReturn` Nothing
+        later <- onEnv env (viaPool (envPool env) (committed Tx.Read (Tx.statement (plain "SELECT 1::int8 FROM pg_sleep(0.6)" (single @_ @Int64))) Tx.single))
+        either (const Nothing) (either (const Nothing) Just) later `shouldBe` Just (1 :: Int64)
+        eventually 1 (gone pid) `shouldReturn` True
+    it "is given the pool's cancel timeout, and a server that does not answer the cancel delays neither the request nor the next cancel" $ do
+      buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+      firstCancel <- newEmptyMVar
+      secondCancel <- newEmptyMVar
+      let serving :: Socket -> IO ()
+          serving client = receiveStartup client *> SocketBytes.sendAll client (frame 'R' (int32 0) <> frame 'K' (int32 7 <> int32 9) <> frame 'Z' "I") *> drain client
+          silent :: MVar () -> Socket -> IO ()
+          silent signal client = receiveStartup client *> putMVar signal () *> drain client
+          interrupted pool = (() <$) <$> runOn runner buffers (withinFor (millis 100) (viaPool pool (committed Tx.Read (Tx.statement (plain "SELECT 1::int8" (single @_ @Int64))) Tx.single)))
+      withScripted [serving, silent firstCancel, serving, silent secondCancel] $ \port ->
+        withPool runner buffers ((connectionPoolSettings 1 (connectSettings (TcpAddress "127.0.0.1" port) "postgres")) {poolCancelTimeout = millis 300}) $ \pool -> do
           started <- getMonotonicTime
-          (() <$) <$> onEnv env (withinFor (millis 100) (sleepingOn (envPool env))) `shouldReturn` Nothing
+          interrupted pool `shouldReturn` Nothing
           ended <- getMonotonicTime
-          -- The request ended at its deadline, and did not wait for the cancel.
           (ended - started < 1) `shouldBe` True
-          eventually 1 (gone pid) `shouldReturn` True
-      it "is cancelled on the server when the part that runs it is cancelled from outside" $
-        pooled id $ \env -> do
-          pid <- pidOf env
-          (either (const ()) (const ()) <$> onEnv env (race (sleepingOn (envPool env)) (after (millis 100) done))) `shouldReturn` ()
-          eventually 1 (gone pid) `shouldReturn` True
-      it "does not reach the statement of the request that comes next, which has a connection of its own" $
-        pooled id $ \env -> do
-          pid <- pidOf env
-          (() <$) <$> onEnv env (withinFor (millis 100) (sleepingOn (envPool env))) `shouldReturn` Nothing
-          later <- onEnv env (viaPool (envPool env) (committed Tx.Read (Tx.statement (plain "SELECT 1::int8 FROM pg_sleep(0.6)" (single @_ @Int64))) Tx.single))
-          either (const Nothing) (either (const Nothing) Just) later `shouldBe` Just (1 :: Int64)
-          eventually 1 (gone pid) `shouldReturn` True
-      it "is given the pool's cancel timeout, and a server that does not answer the cancel delays neither the request nor the next cancel" $ do
-        buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
-        firstCancel <- newEmptyMVar
-        secondCancel <- newEmptyMVar
-        let serving :: Socket -> IO ()
-            serving client = receiveStartup client *> SocketBytes.sendAll client (frame 'R' (int32 0) <> frame 'K' (int32 7 <> int32 9) <> frame 'Z' "I") *> drain client
-            silent :: MVar () -> Socket -> IO ()
-            silent signal client = receiveStartup client *> putMVar signal () *> drain client
-            interrupted pool = (() <$) <$> runOn runner buffers (withinFor (millis 100) (viaPool pool (committed Tx.Read (Tx.statement (plain "SELECT 1::int8" (single @_ @Int64))) Tx.single)))
-        withScripted [serving, silent firstCancel, serving, silent secondCancel] $ \port ->
-          withPool runner buffers ((connectionPoolSettings 1 (connectSettings (TcpAddress "127.0.0.1" port) "postgres")) {poolCancelTimeout = millis 300}) $ \pool -> do
-            started <- getMonotonicTime
-            interrupted pool `shouldReturn` Nothing
-            ended <- getMonotonicTime
-            (ended - started < 1) `shouldBe` True
-            timeout 3000000 (takeMVar firstCancel) `shouldReturn` Just ()
-            -- The first cancel waits for a server that says nothing, until the cancel timeout: the second goes on after it.
-            interrupted pool `shouldReturn` Nothing
-            timeout 3000000 (takeMVar secondCancel) `shouldReturn` Just ()
+          timeout 3000000 (takeMVar firstCancel) `shouldReturn` Just ()
+          -- The first cancel waits for a server that says nothing, until the cancel timeout: the second goes on after it.
+          interrupted pool `shouldReturn` Nothing
+          timeout 3000000 (takeMVar secondCancel) `shouldReturn` Just ()
 
   -- What the pool does with its connections as they age: it closes a connection when it is older than the pool's lifetime, and
   -- when nobody has used it for the pool's idle time, and never one that a request has.

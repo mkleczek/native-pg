@@ -12,7 +12,10 @@
 -- A pool is a value, made and closed in IO that never waits. A connection is closed when it is older than the pool's lifetime,
 -- and when nobody has used it for the pool's idle time, by 'maintain', which is one arrow for all the pools that are registered
 -- with a 'Maintenance': a part that the server runs beside its others, which sleeps with the arrow's clock, looks at the
--- connections that are free a few times in the shortest of the limits, and never at one that a request has.
+-- connections that are free a few times in the shortest of the limits, and never at one that a request has. It also sends the
+-- cancel requests of the statements that a use of a connection left running: a use that was cancelled, or missed its deadline,
+-- breaks its connection, which the pool closes, and the server runs the statement on until it ends, unless it is asked to
+-- cancel it. The request that broke the connection only queues the cancel, so that it neither waits for it nor delays its exit.
 module Database.PostgreSQL.Pool
   ( ConnectionPoolSettings (..),
     connectionPoolSettings,
@@ -39,25 +42,25 @@ import Control.Monad (replicateM, void, when)
 import System.IO (fixIO)
 import Data.Tuple (swap)
 import qualified Data.ByteString.Char8 as BC
-import Data.Foldable (traverse_)
+import Data.Foldable (find, traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (catMaybes, fromMaybe, isJust)
 import qualified Data.Text as Text
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
-import Database.PostgreSQL.Connection (ConnectSettings (connectReadSize), connect)
-import Database.PostgreSQL.Connection.Internal (Connection (..), Session (..), Status (..), breakSession, leased)
+import Database.PostgreSQL.Connection (ConnectSettings (connectFallbacks, connectReadSize), cancel, connect)
+import Database.PostgreSQL.Connection.Internal (CancelKey (..), Connection (..), Session (..), Status (..), breakSession, hostOf, leased)
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectFailure (..), ServerError (..), diagnosticCode)
 import Database.PostgreSQL.Internal.Carrier (isQuiet)
 import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Data.Word (Word64)
-import Network.Streaming.Classes (Block (..), Duration (..), Effect (..), Event (..), Exit (..), GiveWay (..), Instant (..), Race (..), Runtime, Scope (..), Time (..), Within (..), giving, micros, millis, monotonicNanoseconds, plus, secs, taking)
+import Network.Streaming.Classes (Block (..), Concurrent (..), Duration (..), Effect (..), Event (..), Exit (..), GiveWay (..), Instant (..), Race (..), Runtime, Scope (..), Time (..), Within (..), giving, micros, millis, monotonicNanoseconds, plus, secs, taking)
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, foreverA, iterateA, keeping, step, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
-import Network.Streaming.Pool (Pool, PoolError (..), closePoolWith, free, isClosed, newPool, queueAt, releaseNow, takeNow, urgently)
+import Network.Streaming.Pool (Pool, PoolError (..), checkoutIn, closePoolWith, free, isClosed, newPool, queueAt, releaseNow, takeNow, urgently)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 
 data ConnectionPoolSettings = ConnectionPoolSettings
@@ -115,7 +118,9 @@ data ConnectionPool = ConnectionPool
     -- | The maintenance that the pool is registered with, and its place there, until it is closed.
     poolRegistration :: !(IORef (Maybe (Maintenance, Int))),
     -- | How many times the server has refused a connection for its connection limit, as the failure of a request to make one.
-    poolRefused :: !(IORef Int)
+    poolRefused :: !(IORef Int),
+    -- | Where the pool queues the cancel of a statement that a use of a connection left running: the maintenance's.
+    poolCancels :: !Cancels
   }
 
 -- | A place for a connection, which is empty until it is made, and empty again once it is broken, and the identifier that the
@@ -138,7 +143,23 @@ observe settings event = maybe (pure ()) ($ event) (poolObserver settings)
 
 -- | The pools whose connections have a lifetime or an idle time, which one arrow, 'maintain', looks after: the pools, each with
 -- how often it is to be looked at, and what the next place is.
-data Maintenance = Maintenance !(IORef [Registered]) !(IORef Int)
+data Maintenance = Maintenance !(IORef [Registered]) !(IORef Int) !Cancels
+
+-- | The cancels that the pools of a maintenance have queued and the maintenance has not sent yet, and how many they are. The queue
+-- is a pool of the cancels, so that the part that sends them waits for one at a ticket, and a cancel that is queued wakes it.
+data Cancels = Cancels !(Pool Cancellation) !(IORef Int)
+
+-- | A statement to cancel: where its server is, the key of its backend, and how long the cancel may take.
+data Cancellation = Cancellation ConnectSettings CancelKey Duration
+
+-- | The cancels that a maintenance sends.
+maintenanceCancels :: Maintenance -> Cancels
+maintenanceCancels (Maintenance _ _ cancels) = cancels
+
+-- | How many cancels may wait to be sent: a server that the cancels cannot reach doesn't make the queue grow for ever, and a cancel
+-- that finds it full is not sent, as the statement ran on before there were cancels.
+cancelBacklog :: Int
+cancelBacklog = 1024
 
 -- | A pool that is registered: its place, how often it is looked at, in microseconds, and the look at it, which is given the
 -- time.
@@ -146,7 +167,7 @@ data Registered = Registered !Int !Int (Word64 -> IO ())
 
 -- | A maintenance with no pool.
 newMaintenance :: IO Maintenance
-newMaintenance = Maintenance <$> newIORef [] <*> newIORef 0
+newMaintenance = Maintenance <$> newIORef [] <*> newIORef 0 <*> (Cancels <$> newPool [] <*> newIORef 0)
 
 -- | A pool, made without waiting: its slots are empty until a request first has them, and it is registered with the
 -- maintenance if it has a lifetime or an idle time, until it is closed. The maintenance keeps it until then.
@@ -171,7 +192,7 @@ newConnectionPool maintenance settings = do
     fixIO $ \self -> do
       slots <- replicateM size (slotOf self False)
       extra <- replicateM overflow (slotOf self True)
-      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing <*> newIORef 0
+      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing <*> newIORef 0 <*> pure (maintenanceCancels maintenance)
   case maintenancePeriod settings of
     Nothing -> pure ()
     Just period -> register maintenance period (lookAt pool) >>= \place -> writeIORef (poolRegistration pool) (Just (maintenance, place))
@@ -197,24 +218,31 @@ closeConnectionPool pool = do
 
 -- | Registers the pool's look, which is made every this many microseconds, and says its place.
 register :: Maintenance -> Int -> (Word64 -> IO ()) -> IO Int
-register (Maintenance pools places) period look = do
+register (Maintenance pools places _) period look = do
   place <- atomicModifyIORef' places (\next -> (next + 1, next))
   atomicModifyIORef' pools (\registered -> (Registered place period look : registered, ()))
   pure place
 
 -- | Takes the pool at the place out of the maintenance.
 unregister :: Maintenance -> Int -> IO ()
-unregister (Maintenance pools _) place = atomicModifyIORef' pools (\registered -> ([one | one@(Registered kept _ _) <- registered, kept /= place], ()))
+unregister (Maintenance pools _ _) place = atomicModifyIORef' pools (\registered -> ([one | one@(Registered kept _ _) <- registered, kept /= place], ()))
 
--- | Looks after the pools of the maintenance for ever, as one part: it sleeps, by the arrow's clock, as long as the shortest
--- period that a pool asks for (a second if there is none), and then looks at each pool, which closes the connections that are
--- free and past their lifetime or idle time, without waiting. A cancellation reaches the part where it sleeps, and a look is
--- not interrupted. A part that the server runs beside its others.
+-- | Looks after the pools of the maintenance for ever, as two parts of one: the one sleeps, by the arrow's clock, as long as the
+-- shortest period that a pool asks for (a second if there is none), and then looks at each pool, which closes the connections
+-- that are free and past their lifetime or idle time, without waiting; the other waits at a ticket for the cancel of a
+-- statement that a pool queued, and sends it, one after another, each within the pool's cancel timeout, and a failure of a cancel is
+-- dropped, since the statement can't be helped then. A cancellation reaches the parts where they wait, and a look is not
+-- interrupted. A part that the server runs beside its others.
 maintain :: (Runtime arr) => arr Maintenance ()
-maintain = foreverA (tap (now periodOf >>> sleepIn) >>> tap (keeping clock >>> now (\(Instant at, maintenance) -> lookAtAll at maintenance)))
+maintain = together [sweeping, cancelling]
   where
-    periodOf (Maintenance pools _) = (\registered -> micros (fromIntegral (minimum (1000000 : [period | Registered _ period _ <- registered])))) <$> readIORef pools
-    lookAtAll at (Maintenance pools _) = readIORef pools >>= traverse_ (\(Registered _ _ look) -> void (try @SomeException (look at)))
+    sweeping = foreverA (tap (now periodOf >>> sleepIn) >>> tap (keeping clock >>> now (\(Instant at, maintenance) -> lookAtAll at maintenance)))
+    periodOf (Maintenance pools _ _) = (\registered -> micros (fromIntegral (minimum (1000000 : [period | Registered _ period _ <- registered])))) <$> readIORef pools
+    lookAtAll at (Maintenance pools _ _) = readIORef pools >>= traverse_ (\(Registered _ _ look) -> void (try @SomeException (look at)))
+    cancelling = foreverA (tap (alongside (queued ^>> checkoutIn) >>> now taken >>> sending))
+    queued (Maintenance _ _ (Cancels queue _)) = queue
+    taken (job, Maintenance _ _ (Cancels _ pending)) = job <$ atomicModifyIORef' pending (\count -> (count - 1, ()))
+    sending = (\(Cancellation settings key limit) -> (limit, (settings, key))) ^>> timeoutA (tryA cancel) >>^ const ()
 
 -- | Closes the connection that the slot holds, if it has one, for the reason, which is then told to the observer. The slot is
 -- empty.
@@ -474,8 +502,29 @@ giveBack slot connection = do
       let reason = "the connection was still in use when its request ended"
       breakSession (connectionSession connection) reason
       writeIORef (slotConnection slot) Nothing
+      requestCancel (slotOwner slot) connection
       pure (Closed reason)
-    Broken reason -> Closed reason <$ writeIORef (slotConnection slot) Nothing
+    Broken reason -> do
+      writeIORef (slotConnection slot) Nothing
+      requestCancel (slotOwner slot) connection
+      pure (Closed reason)
+
+-- | Queues the cancel of the statement that the server may still run for the connection, which a use broke and the pool closes: the
+-- connection is gone, so the cancel can only reach the statement that it was broken in, and no later one. It never waits, so the
+-- request that gave the connection back isn't delayed; the maintenance sends it. The settings are those of the host that the
+-- connection is at, which is one of a pool's fallbacks if the pool has them. A connection whose server sent no key can't be
+-- cancelled, and nothing is queued for it, or for any cancel beyond the backlog.
+requestCancel :: ConnectionPool -> Connection -> IO ()
+requestCancel pool connection = case connectionKey connection of
+  CancelKey Nothing -> pure ()
+  key -> do
+    let Cancels queue pending = poolCancels pool
+        settings = poolSettings pool
+        primary = poolConnect settings
+        hosts = primary : connectFallbacks primary
+        at = fromMaybe primary (find ((== connectionHost connection) . hostOf) hosts)
+    room <- atomicModifyIORef' pending (\count -> if count >= cancelBacklog then (count, False) else (count + 1, True))
+    when room (releaseNow queue [Cancellation at key (poolCancelTimeout settings)])
 
 -- | What the observer is told when a request has ended: its connection is ready again, as the use ended, or it was closed.
 afterUse :: Exit -> Ended -> ConnectionStatus

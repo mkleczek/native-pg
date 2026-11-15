@@ -30,6 +30,7 @@ module Database.PostgreSQL.Connection.Internal
     pastLastMessage,
     midMessage,
     withEndPointOverride,
+    hostOf,
   )
 where
 
@@ -45,11 +46,13 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Dynamic (Dynamic)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Database.PostgreSQL.ConnectionString.Types (Host)
+import Data.List (isPrefixOf)
+import Database.PostgreSQL.ConnectionString.Types (Host (..))
 import Database.PostgreSQL.Errors (ConnectionError (..), UsageError (..))
 import Database.PostgreSQL.Internal.Carrier (Carrier, closeCarrier)
 import Database.PostgreSQL.Internal.Protocol.Messages.Types (BackendKey)
 import Database.PostgreSQL.Session.Settings (ConnectSettings (..), ServerInfo)
+import Database.PostgreSQL.Transport (Address (..))
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.Reader (Reader, mark, markEnd, markLimit, markStart, readerCapacity, readerMemory, setMark)
 import Network.Streaming.Internal.Atomic (update)
@@ -199,3 +202,25 @@ modifyKept session change = readIORef (sessionKept session) >>= \kept -> writeIO
 -- replaced: by the bytes, or by why there are none, or by none.
 withEndPointOverride :: Maybe (Either String ByteString) -> ConnectSettings -> ConnectSettings
 withEndPointOverride override settings = settings {connectEndPointOverride = Just override}
+
+-- | The host that the settings connect to, as a connection string would have named it.
+hostOf :: ConnectSettings -> Host
+hostOf settings = case connectAddress settings of
+  TcpAddress address port -> case connectServerName settings of
+    Just name | name /= address -> Host name (Just address) port
+    _ -> Host address Nothing port
+  UnixAddress ('\0' : name) -> unixHost ('@' : name)
+  UnixAddress path -> unixHost path
+  where
+    -- The directory of the socket, and the port in its file name.
+    unixHost path = go [] path
+      where
+        marker = "/.s.PGSQL."
+        go before rest
+          | marker `isPrefixOf` rest = Host (reverse before) Nothing (port (drop (length marker) rest))
+          | otherwise = case rest of
+              [] -> Host path Nothing 5432
+              c : others -> go (c : before) others
+        port digits = case reads digits of
+          [(number, "")] -> number
+          _ -> 5432

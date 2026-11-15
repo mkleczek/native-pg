@@ -67,7 +67,6 @@ import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import Data.Dynamic (fromDynamic, toDyn)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
-import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Tuple (Solo (MkSolo))
 import Data.Typeable (Typeable)
@@ -278,28 +277,6 @@ encrypted = (alongside asking >>^ answered) >>> (arr Left ||| (onSocket ||| shak
       (\((settings, securing), (sock, buffer)) -> (((settings, securing), sock), buffer))
         ^>> first secured
         >>^ \(result, buffer) -> either (Left . NotMade True) (\(carrier, binding) -> Right (carrier, binding, buffer)) result
-
--- | The host that the settings connect to, as a connection string would have named it.
-hostOf :: ConnectSettings -> Host
-hostOf settings = case connectAddress settings of
-  TcpAddress address port -> case connectServerName settings of
-    Just name | name /= address -> Host name (Just address) port
-    _ -> Host address Nothing port
-  UnixAddress ('\0' : name) -> unixHost ('@' : name)
-  UnixAddress path -> unixHost path
-  where
-    -- The directory of the socket, and the port in its file name.
-    unixHost path = go [] path
-      where
-        marker = "/.s.PGSQL."
-        go before rest
-          | marker `isPrefixOf` rest = Host (reverse before) Nothing (port (drop (length marker) rest))
-          | otherwise = case rest of
-              [] -> Host path Nothing 5432
-              c : others -> go (c : before) others
-        port digits = case reads digits of
-          [(number, "")] -> number
-          _ -> 5432
 
 -- | Closes the connection, once or again. It fails if another part is using it.
 close :: (Runtime arr) => arr Connection ()
