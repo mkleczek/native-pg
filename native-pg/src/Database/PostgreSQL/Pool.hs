@@ -52,14 +52,14 @@ data ConnectionPoolSettings = ConnectionPoolSettings
     -- is.
     poolLifetime :: Maybe Duration,
     poolIdleTime :: Maybe Duration,
-    -- | Told of each connection's events, for logs and metrics.
-    poolObserver :: Observation -> IO ()
+    -- | Told of each connection's events, for logs and metrics. A pool that has none builds no events.
+    poolObserver :: Maybe (Observation -> IO ())
   }
 
 -- | A pool of this size that makes its connections as the settings say, and has
 -- no deadlines, and observes nothing.
 connectionPoolSettings :: Int -> ConnectSettings -> ConnectionPoolSettings
-connectionPoolSettings size settings = ConnectionPoolSettings size settings Nothing Nothing Nothing (const (pure ()))
+connectionPoolSettings size settings = ConnectionPoolSettings size settings Nothing Nothing Nothing Nothing
 
 -- | A pool of connections: its slots, which are empty until a request first has them, and the buffers that its
 -- connections are set up with.
