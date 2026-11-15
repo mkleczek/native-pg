@@ -1433,6 +1433,22 @@ responseFramingCases =
       [Send ("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n" <> singleGet)]
       [stays [toHead (ok ""), ok "neversent"]]
       & note "The head may or may not carry Transfer-Encoding: chunked (RFC 9110 9.3.2); it must have no body bytes."
+  , mk AResponseFraming (RFC "RFC 9110 9.3.2" "a server must not send a Content-Length in a response to HEAD unless it is the length of the body of the GET")
+      "the response to a HEAD gets no Content-Length that its handler did not give"
+      (Fixed 200 [] "hello")
+      [Send ("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n" <> singleGet)]
+      [stays [toHead (ok "" `withHeaders` [HeaderAbsent "Content-Length", HeaderAbsent "Transfer-Encoding"]), ok "hello" `withHeaders` [headerIs "Content-Length" "5"]]]
+      & note "PostgREST answers a HEAD with a declared length of 0, which Warp does not turn into a Content-Length: 0."
+  , mk AResponseFraming (RFC "RFC 9110 9.3.2" "a server must not send a Content-Length in a response to HEAD unless it is the length of the body of the GET")
+      "the response to a HEAD of a streamed body gets no Transfer-Encoding and no Content-Length"
+      (Streamed ["never", "sent"])
+      [Send ("HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n" <> singleGet)]
+      [stays [toHead (ok "" `withHeaders` [HeaderAbsent "Content-Length", HeaderAbsent "Transfer-Encoding"]), ok "neversent"]]
+  , mk AResponseFraming (RFC "RFC 9110 9.3.2" "a server must not send a Content-Length in a response to HEAD unless it is the length of the body of the GET")
+      "the response to an HTTP/1.0 HEAD gets no Content-Length that its handler did not give"
+      (Fixed 200 [] "foo")
+      [Send "HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n"]
+      [closes [withVersion "HTTP/1.0" (toHead (ok "" `withHeaders` [HeaderAbsent "Content-Length", HeaderAbsent "Transfer-Encoding"]))]]
   , mk AResponseFraming (Warp "warp/streams-test/AnswerSpec.hs" "no body / sends only the header and pulls nothing, for a 204")
       "a 204 has no body, no Content-Length and no Transfer-Encoding"
       (Fixed 204 [] "")

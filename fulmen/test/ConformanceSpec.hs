@@ -122,6 +122,7 @@ marked c = maybe id xfail (expectedFailure c)
 expectedFailure :: Case -> Maybe String
 expectedFailure c
   | caseName c `elem` served = Nothing
+  | caseName c `elem` needingHeadFraming = Just "a response to HEAD still gets the framing field of the server's (step 3)"
   | caseArea c == AChunked || caseName c `elem` needingChunkedBodies = Just "chunked request bodies are not there yet (step 3)"
   | caseArea c == AExpect = Just "Expect: 100-continue is not there yet (step 3)"
   | caseArea c == ATimeouts = Just "the client timeout is not there yet (step 3)"
@@ -135,6 +136,14 @@ served =
     "a handler that ignores the body of an expecting request does not leave the connection in limbo",
     "an HTTP/1.0 request with Expect: 100-continue and its body is answered",
     "a body that arrives slowly but within the timeout is read in full"
+  ]
+
+-- | The cases of a response to HEAD that gets no framing field from the server.
+needingHeadFraming :: [String]
+needingHeadFraming =
+  [ "the response to a HEAD gets no Content-Length that its handler did not give",
+    "the response to a HEAD of a streamed body gets no Transfer-Encoding and no Content-Length",
+    "the response to an HTTP/1.0 HEAD gets no Content-Length that its handler did not give"
   ]
 
 -- | The cases of the other areas that send a chunked request body that is to be decoded.
