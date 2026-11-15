@@ -39,6 +39,7 @@ import Foreign.ForeignPtr (plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import Foreign.Storable (poke)
+import GHC.Records (HasField)
 import Network.Fulmen.Internal
 import Network.Fulmen.Internal.Accept (acceptor, listening)
 import Network.Fulmen.Internal.Body (BodyRefused (..), BodyState (..), ChunkState (..), ConnectionLost (..), Decoding (..), Marks (..), drain)
@@ -73,7 +74,7 @@ import Network.Streaming.Combinators
     withTicket,
   )
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Named (is, (:=))
+import Network.Streaming.Named (adding, field, is, newRecord)
 import Network.Streaming.Pool (offer, queueNow, takeNowWith)
 
 -- | The server: for each core, the workers, and for the first, the acceptor, which opens the listener.
@@ -269,7 +270,8 @@ data Prepared = Prepared
 request :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr (Loans, Conn) Bool
 request settings handler =
   named (Label "request" "Reads the head of a request, runs the handler, and says whether the connection is kept.") $
-    (is "loan" (fst ^>> borrow) &&& is "loans" (arr fst) &&& is "conn" (arr snd))
+    uncurry (newRecord ["loans", "conn"])
+      ^>> adding "loan" (field "loans" >>> borrow)
       >>> step "copy carry-over" begin' `giving` "Req"
       >>> readHead settings
       >>> decide "how did the head end?" byHead
@@ -289,7 +291,7 @@ request settings handler =
         >>> sendAll
         >>> quit
     -- The request has the connection's first bytes, which came with the one before.
-    begin' :: ("loan" := Loan, ("loans" := Loans, "conn" := Conn)) -> IO Req
+    begin' :: (HasField "loan" r Loan, HasField "loans" r Loans, HasField "conn" r Conn) => r -> IO Req
     begin' r = do
       carried <- readIORef r.conn.connCarry
       unless (B.null carried) $ do
@@ -402,7 +404,7 @@ awaited request' nothingYet requestBody
 -- | What the handler left: a connection that the client has gone from, or a response that is not there or not
 -- complete, ends the connection, with a 500 if the handler had not answered; and one that is complete is kept if the
 -- body of the request was read, or could be, and the response didn't end the connection.
-aftermath :: (Runtime arr) => arr ("outcome" := Either SomeException (), "call" := Call) Bool
+aftermath :: (Runtime arr, HasField "outcome" r (Either SomeException ()), HasField "call" r Call) => arr r Bool
 aftermath =
   named (Label "aftermath" "Decides whether the connection is kept, and answers 500 if nothing was answered.") $
     decide "how did the handler end?" byOutcome
