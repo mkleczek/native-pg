@@ -66,6 +66,7 @@ test-suite native-pg-integration
                       ScopeTransactionSpec
                       TestCluster
                       TestPrograms
+                      TestServers
                       TransactionSpec
   main-is: Main.hs
   ghc-options: -Wall -threaded "-with-rtsopts=-T" -fspecialise-aggressively

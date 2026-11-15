@@ -16,7 +16,7 @@ import Control.Arrow ((>>>), (^>>))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, replicateM_, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
@@ -24,20 +24,24 @@ import Data.List (nub)
 import Data.Text (Text)
 import Data.UUID (UUID)
 import Data.Word (Word64)
+import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), connectSettings)
 import Database.PostgreSQL.Errors
-import Database.PostgreSQL.Connection (ConnectSettings (..))
-import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), connectionPoolSettings, withConnection, withConnectionPool)
+import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), PoolStats (..), connectionPoolSettings, connectionPoolStats, withConnection, withConnectionPool)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (allocated_bytes, getRTSStats)
-import Network.Socket (PortNumber)
+import Network.Socket (PortNumber, Socket)
+import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.PositiveInt (positiveInt)
 import Skeletest
 import System.Environment (lookupEnv)
+import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.Mem (performMinorGC)
+import System.Timeout (timeout)
 import TestPrograms
+import TestServers
 
 spec :: FilePath -> PortNumber -> Spec
 spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner@(Runner name _) -> describe name $ do
@@ -114,6 +118,149 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       withConnectionPool (applicationPool "two") $ \open ->
         runOn runner buffers (across applicationOf [shut, open, shut])
           `shouldReturn` [Left PoolClosed, Right (Right ["two"]), Left PoolClosed]
+
+  -- What the pool does past its size, as v1's overflow policy did: a request that finds every connection in use waits for one
+  -- to come back, and after the overflow delay opens one more, up to the overflow. That connection is closed as its request ends.
+  needs "pool overflow" $ describe "overflow" $ do
+    let bounded :: Env -> Program a -> IO (Maybe a)
+        bounded env program = onEnv env (withinFor (secs 5) program)
+        backendOf :: Env -> IO Int64
+        backendOf env =
+          bounded env (viaPool (envPool env) backend) >>= \case
+            Just (Right (Right pid)) -> pure pid
+            other -> failTest ("no connection: " <> show other)
+    it "opens a connection past the pool's size only after the overflow delay, and closes it as its request ends" $
+      pooled (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 300}) $ \env -> do
+        holder <- startHolding env
+        started <- getMonotonicTime
+        pid <- backendOf env
+        ended <- getMonotonicTime
+        (ended - started >= 0.25) `shouldBe` True
+        (pid /= holderBackend holder) `shouldBe` True
+        eventually 5 (gone pid) `shouldReturn` True
+        stateOf (holderBackend holder) `shouldReturn` Right ["idle"]
+        finishHolding holder
+
+    -- A connection that is ready is the first that is wanted: a request that waits for the delay of an overflow connection has
+    -- the one that comes back, and no other is opened.
+    it "gives a connection that comes back during the delay to the request that waits, and opens none" $
+      pooled (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = secs 5}) $ \env -> do
+        holder <- startHolding env
+        answer <- newEmptyMVar
+        _ <- forkIO (try (onEnv env (viaPool (envPool env) backend)) >>= putMVar answer)
+        threadDelay 200000
+        started <- getMonotonicTime
+        finishHolding holder
+        result <- takeMVar answer
+        ended <- getMonotonicTime
+        case result of
+          Right (Right (Right pid)) -> pid `shouldBe` holderBackend holder
+          other -> failTest ("no connection: " <> show (other :: Either SomeException (Either PoolError (Either QueryError Int64))))
+        (ended - started < 2) `shouldBe` True
+        -- The only connection that the pool has is the holder's: none was opened for the delay that ran out meanwhile.
+        connectionPoolStats (envPool env) `shouldReturn` PoolStats 1 0 0
+
+    it "keeps to the size and the overflow: a request past both waits for a connection to come back, and gives up at the pool's timeout" $
+      pooled (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 50, poolCheckoutTimeout = Just (millis 600)}) $ \env -> do
+        base <- startHolding env
+        extra <- startHolding env
+        bounded env (viaPool (envPool env) done) `shouldReturn` Just (Left CheckoutTimedOut)
+        finishHolding extra
+        finishHolding base
+
+    it "serves the requests that wait in the order they came, and leaves no place for one that gave up" $
+      pooled (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 150}) $ \env -> do
+        base <- startHolding env
+        order <- newIORef []
+        finished <- newEmptyMVar
+        let arrives :: String -> IO ()
+            arrives label = void (forkIO (onEnv env (viaPool (envPool env) (now (const (atomicModifyIORef' order (\told -> (label : told, ())))))) *> putMVar finished ()))
+        -- The first gives up before its delay is over.
+        gaveUp <- newEmptyMVar
+        _ <- forkIO (onEnv env (withinFor (millis 100) (viaPool (envPool env) done)) >>= putMVar gaveUp)
+        threadDelay 50000
+        arrives "first"
+        threadDelay 50000
+        arrives "second"
+        takeMVar gaveUp `shouldReturn` Nothing
+        timeout 5000000 (replicateM_ 2 (takeMVar finished)) `shouldReturn` Just ()
+        reverse <$> readIORef order `shouldReturn` ["first", "second"]
+        finishHolding base
+
+  -- What the pool counts: the connections that are idle, in use, and being made.
+  needs "pool stats" $ describe "stats" $ do
+    it "counts the connections that are idle, that a request has, and that are being made" $
+      pooled (\s -> s {poolSize = 2}) $ \env -> do
+        connectionPoolStats (envPool env) `shouldReturn` PoolStats 0 0 0
+        void (pidOf env)
+        connectionPoolStats (envPool env) `shouldReturn` PoolStats 1 0 0
+        first <- startHolding env
+        connectionPoolStats (envPool env) `shouldReturn` PoolStats 0 1 0
+        second <- startHolding env
+        connectionPoolStats (envPool env) `shouldReturn` PoolStats 0 2 0
+        finishHolding first
+        finishHolding second
+        connectionPoolStats (envPool env) `shouldReturn` PoolStats 2 0 0
+
+    it "counts the connection that a request is making as opening" $
+      withSilentServer $ \silent -> do
+        buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+        withConnectionPool (connectionPoolSettings 1 (connectSettings (UnixAddress (silent </> ".s.PGSQL.5432")) "postgres")) $ \pool -> do
+          _ <- forkIO (void (runOn runner buffers (withinFor (secs 2) (viaPool pool done))))
+          eventually 3 ((== PoolStats 0 0 1) <$> connectionPoolStats pool) `shouldReturn` True
+          -- The request gave up: its slot is empty and free again.
+          eventually 5 ((== PoolStats 0 0 0) <$> connectionPoolStats pool) `shouldReturn` True
+
+  -- A server that refuses a connection for its connection limit, which v1's overflow policy took for a reason to wait and try again:
+  -- the request that is making the connection waits for the overflow delay, and goes on. A pool without overflow reports it.
+  describe "a connection that the server refuses for its limit" $ do
+    let refusal :: Socket -> IO ()
+        refusal client = receiveStartup client *> SocketBytes.sendAll client (frame 'E' "SFATAL\0VFATAL\0C53300\0Msorry, too many clients already\0\0")
+        rejected :: Socket -> IO ()
+        rejected client = receiveStartup client *> SocketBytes.sendAll client (frame 'E' "SFATAL\0VFATAL\0C28P01\0Mpassword authentication failed\0\0")
+        accepting :: Socket -> IO ()
+        accepting client = receiveStartup client *> SocketBytes.sendAll client (frame 'R' (int32 0) <> frame 'Z' "I") *> drain client
+        counting :: IORef Int -> (Socket -> IO ()) -> Socket -> IO ()
+        counting attempts script client = atomicModifyIORef' attempts (\n -> (n + 1, ())) *> script client
+        poolTo port change = change (connectionPoolSettings 1 (connectSettings (TcpAddress "127.0.0.1" port) "postgres"))
+        buffersOf = newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+    needs "pool overflow" $ it "is tried again after the overflow delay, and the request gets its connection" $ do
+      attempts <- newIORef 0
+      buffers <- buffersOf
+      withScripted [counting attempts refusal, counting attempts accepting] $ \port ->
+        withConnectionPool (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 150})) $ \pool -> do
+          started <- getMonotonicTime
+          runOn runner buffers (viaPool pool done) `shouldReturn` Right ()
+          ended <- getMonotonicTime
+          (ended - started >= 0.12) `shouldBe` True
+          readIORef attempts `shouldReturn` 2
+
+    needs "pool overflow" $ it "is tried again until the deadline of the arrow that runs the request, and leaves its slot free" $ do
+      attempts <- newIORef 0
+      buffers <- buffersOf
+      withScripted (repeat (counting attempts refusal)) $ \port ->
+        withConnectionPool (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 60})) $ \pool -> do
+          runOn runner buffers (withinFor (millis 500) (viaPool pool done)) `shouldReturn` Nothing
+          tried <- readIORef attempts
+          (tried >= 3 && tried < 12) `shouldBe` True
+          connectionPoolStats pool `shouldReturn` PoolStats 0 0 0
+
+    -- What the pool did before it had overflow, and still does when it has none, or when the failure is another.
+    it "is reported by a pool that has no overflow" $ do
+      attempts <- newIORef 0
+      buffers <- buffersOf
+      withScripted [counting attempts refusal, counting attempts accepting] $ \port ->
+        withConnectionPool (poolTo port id) $ \pool -> do
+          runOn runner buffers (viaPool pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
+          readIORef attempts `shouldReturn` 1
+
+    it "is the only failure that is tried again: another is reported at once" $ do
+      attempts <- newIORef 0
+      buffers <- buffersOf
+      withScripted [counting attempts rejected, counting attempts accepting] $ \port ->
+        withConnectionPool (poolTo port (\s -> s {poolMaxOverflow = 1, poolOverflowDelay = millis 50})) $ \pool -> do
+          runOn runner buffers (viaPool pool done `failsAs` \(ConnectFailure failures) -> length failures `shouldBe` 1) `shouldReturn` ()
+          readIORef attempts `shouldReturn` 1
 
   -- What a request pays the pool when its connection is free: the bytes that a request allocates for the checkout, the
   -- use of the connection and the release, with a body that does nothing. The ceiling is what each arrow allocated when it
@@ -300,7 +447,7 @@ startHolding env = do
   let holdIt :: (Runtime arr) => OnConn arr ()
       holdIt = backend >>> now (either (throwIO . userError . show) (\pid -> putMVar held pid *> takeMVar goOn))
   _ <- forkIO (try (onEnv env (viaPool (envPool env) holdIt >>> now (either throwIO pure))) >>= putMVar ended)
-  pid <- takeMVar held
+  pid <- timeout 5000000 (takeMVar held) >>= maybe (failTest "the request did not get its connection in five seconds") pure
   pure (Holder pid goOn ended)
 
 -- | Tells the request to give the connection back, and waits until it has ended.

@@ -23,10 +23,8 @@ module IntegrationSpec (spec) where
 import Control.Arrow (arr, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (IOException, SomeException, bracket, catch, displayException, finally)
+import Control.Exception (IOException, bracket, displayException, finally)
 import Control.Monad (forM_, forever, unless, void)
-import Data.Foldable (traverse_)
-import Data.Bits (shiftR)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
@@ -66,6 +64,7 @@ import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (FileMode)
 import TestCluster (certificate)
 import TestPrograms hiding (field)
+import TestServers
 
 spec :: FilePath -> Socket.PortNumber -> Spec
 spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner name _) -> describe name $ do
@@ -1284,49 +1283,12 @@ liveBytes = do
   performMajorGC
   fromIntegral . gcdetails_live_bytes . gc <$> getRTSStats
 
--- | Runs the action with the directory of a Unix-domain socket that accepts connections but never answers.
-withSilentServer :: (FilePath -> IO a) -> IO a
-withSilentServer action = do
-  temporary <- getTemporaryDirectory
-  bracket (mkdtemp (temporary </> "native-pg-silent-")) removeDirectoryRecursive $ \directory ->
-    bracket (Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
-      Socket.bind sock (Socket.SockAddrUnix (directory </> ".s.PGSQL.5432"))
-      Socket.listen sock 4
-      action directory
-
 -- | Runs the action with a port at 127.0.0.1 that nothing listens on.
 withUnusedPort :: (Socket.PortNumber -> IO a) -> IO a
 withUnusedPort action =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close
     (\sock -> Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1))) *> Socket.socketPort sock)
     >>= action
-
--- | Runs the action with the port at 127.0.0.1 of a server that serves the connections that come, one by each script in
--- turn, which is given its socket. A connection is closed when its script ends, and what goes wrong in it shows in the client.
-withScripted :: [Socket.Socket -> IO ()] -> (Socket.PortNumber -> IO a) -> IO a
-withScripted scripts action =
-  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \listener -> do
-    Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
-    Socket.listen listener 4
-    -- Each connection is served on a thread of its own, since the first is still open while the second is made.
-    let serve script = do
-          (client, _) <- Socket.accept listener
-          void (forkIO (script client `finally` Socket.close client `catch` \(_ :: SomeException) -> pure ()))
-    bracket (forkIO (traverse_ serve scripts `catch` \(_ :: SomeException) -> pure ())) killThread $ \_ -> action =<< Socket.socketPort listener
-
--- | A message of the server: its tag, its length, and its payload.
-frame :: Char -> ByteString -> ByteString
-frame kind payload = Char8.singleton kind <> int32 (BS.length payload + 4) <> payload
-
--- | The four bytes of a number, the most significant first.
-int32 :: Int -> ByteString
-int32 number = BS.pack [fromIntegral (number `shiftR` shift) | shift <- [24, 16, 8, 0]]
-
--- | Takes the client's startup message, which has no tag: its length, and the rest.
-receiveStartup :: Socket.Socket -> IO ByteString
-receiveStartup client = do
-  size <- BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0 <$> SocketBytes.recv client 4
-  SocketBytes.recv client (size - 4)
 
 -- | Takes a message of the client, which has a tag: the tag, and the payload after the length.
 receiveMessage :: Socket.Socket -> IO (Char, ByteString)
@@ -1341,10 +1303,6 @@ receiving :: Socket.Socket -> Int -> IO ByteString
 receiving client size
   | size <= 0 = pure BS.empty
   | otherwise = SocketBytes.recv client size >>= \piece -> if BS.null piece then pure piece else (piece <>) <$> receiving client (size - BS.length piece)
-
--- | Takes what the client sends until it closes the connection.
-drain :: Socket.Socket -> IO ()
-drain client = SocketBytes.recv client 4096 >>= \received -> unless (BS.null received) (drain client)
 
 -- | Runs the action with a copy of the client certificate's key, with the file mode given.
 withKeyCopy :: FileMode -> (FilePath -> IO a) -> IO a

@@ -18,6 +18,8 @@ module Database.PostgreSQL.Pool
     ConnectionPool,
     withConnectionPool,
     withConnection,
+    PoolStats (..),
+    connectionPoolStats,
     Observation (..),
     ConnectionStatus (..),
     ConnectionReadyForUseReason (..),
@@ -46,10 +48,11 @@ import Database.PostgreSQL.Internal.Carrier (isQuiet)
 import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Data.Word (Word64)
-import Network.Streaming.Classes (Duration (..), Effect (..), Exit (..), GiveWay (..), Runtime, Scope (..), Within (..), giving, monotonicNanoseconds, taking)
+import Network.Streaming.Classes (Duration (..), Effect (..), Exit (..), GiveWay (..), Runtime, Scope (..), Within (..), giving, millis, monotonicNanoseconds, taking)
 import Network.Streaming.Combinators (alongside, done, step, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Pool (Pool, PoolError (..), closePoolWith, isClosed, newPool, queueAt, releaseNow, takeNow, urgently)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt, positiveInt)
 
@@ -66,13 +69,19 @@ data ConnectionPoolSettings = ConnectionPoolSettings
     poolLifetime :: Maybe Duration,
     poolIdleTime :: Maybe Duration,
     -- | Told of each connection's events, for logs and metrics. A pool that has none builds no events.
-    poolObserver :: Maybe (Observation -> IO ())
+    poolObserver :: Maybe (Observation -> IO ()),
+    -- | How many connections the pool may have besides its size, which are opened only after a request has waited the
+    -- delay for one of its own, and are closed as their request ends.
+    poolMaxOverflow :: Int,
+    -- | How long a request waits for a connection of the pool before it opens one of the overflow, which it waits for
+    -- as many times as the overflow has connections in use, and one more.
+    poolOverflowDelay :: Duration
   }
 
 -- | A pool of this size that makes its connections as the settings say, and has
 -- no deadlines, and observes nothing.
 connectionPoolSettings :: Int -> ConnectSettings -> ConnectionPoolSettings
-connectionPoolSettings size settings = ConnectionPoolSettings size settings Nothing Nothing Nothing Nothing
+connectionPoolSettings size settings = ConnectionPoolSettings size settings Nothing Nothing Nothing Nothing 0 (millis 100)
 
 -- | A pool of connections: its slots, which are empty until a request first has them, and the buffers that its
 -- connections are set up with.
@@ -267,6 +276,16 @@ using body = scope acquire release run
         Nothing -> pure ()
         Just _ -> observeNow slot (afterUse exit ended)
     run = (snd *** snd) ^>> body
+
+-- | How many connections the pool has, as they are now: those that are free in their slot, those that a request has, and
+-- the slots that a request has to fill, and is filling.
+data PoolStats = PoolStats {statsIdle :: Int, statsInUse :: Int, statsOpening :: Int}
+  deriving (Eq, Show)
+
+-- | The counts of the pool's connections, read without stopping the pool, so that a request that comes and goes meanwhile may
+-- or may not be counted.
+connectionPoolStats :: ConnectionPool -> IO PoolStats
+connectionPoolStats _ = notImplementedIO "connectionPoolStats"
 
 -- | Tells the observer of the event of the slot's connection, if the pool has one: the event is not built if it has none.
 observeNow :: Slot -> ConnectionStatus -> IO ()
