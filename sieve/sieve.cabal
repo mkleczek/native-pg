@@ -20,6 +20,9 @@ library
   exposed-modules: Data.Sieve
                    Data.Sieve.Lease
                    Data.Sieve.Teardown
+  other-modules: Data.Sieve.Ghosts
+                 Data.Sieve.Memory
+                 Data.Sieve.Table
   build-depends: base >=4.18 && <5, containers >=0.6 && <0.8, streaming-io
 
 test-suite sieve-spec

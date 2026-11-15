@@ -69,7 +69,7 @@ data Part
 -- | The parts that the code doesn't have yet. A change that adds one takes it off the list, and with it the marks of the cases
 -- that wait for it.
 notThere :: [Part]
-notThere = [Table, Cached, SingleFlight, Shared, Lease, Teardown]
+notThere = [Cached, SingleFlight, Lease, Teardown]
 
 -- | Marks every case of the spec as an expected failure while a part that it needs is missing. A case that then passes
 -- unexpectedly fails the suite.
