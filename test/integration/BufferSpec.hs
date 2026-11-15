@@ -219,8 +219,9 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
 
     -- The body of a request is views of its primary buffer, which the request holds until the body ends: the transaction works
     -- in the one loan that is left, and the sender has none to borrow, so it renders into the transaction's own buffer while
-    -- nothing is owed. A pipeline that has another result besides the one that streams is sent while it is read, which takes a
-    -- second buffer that the request hasn't got: it fails before anything is sent, and the connection stays usable.
+    -- nothing is owed. A pipeline that has another result besides the one that streams, or is larger than a buffer, is sent while
+    -- it is read, which takes a second buffer that the request hasn't got: the sender takes one of the setup buffers of the pool
+    -- for the time that it sends, a separate inventory that the reserve that a request's loans come from doesn't share.
     describe "a stream that holds the primary buffer" $ do
       let held :: Program a -> IO a
           held = sharing
@@ -232,33 +233,38 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
         held (session scram (holding 1000 (echoingPrepared 1000))) `shouldReturn` Right (alphabet 1000)
       it "is streamed with buffers of 16 bytes" $
         tiny (session scram (holding 5000 (echoing [5000]))) `shouldReturn` Right (alphabet 5000)
-      it "is refused by a pipeline that has another result before the statement that streams, and nothing is sent" $
-        held
-          ( session scram $
-              steps
-                [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32))) `before` Tx.statement (echoStatement [100])) discardBoth) `failsAs` noBuffer,
-                  selectOne `yields` Right [1]
-                ]
-          )
-          `shouldReturn` ()
-      it "is refused by a pipeline that has another result after the statement that streams, and nothing is sent" $
-        held
-          ( session scram $
-              steps
-                [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (echoStatement [100]) `before` Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32)))) discardBoth) `failsAs` noBuffer,
-                  selectOne `yields` Right [1]
-                ]
-          )
-          `shouldReturn` ()
-      it "has a pipeline that is larger than a buffer and streams nothing refused too, and nothing is sent" $
-        held
-          ( session scram $
-              steps
-                [ holding 0 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate 1000 'y')] (single @_ @Int32)))) Tx.discard) `failsAs` noBuffer,
-                  selectOne `yields` Right [1]
-                ]
-          )
-          `shouldReturn` ()
+      needs "a send buffer for a pipeline that is sent while a stream holds the primary" $ do
+        it "sends a pipeline that has another result before the statement that streams, and reads it while it sends" $
+          held
+            ( session scram $
+                steps
+                  [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32))) `before` Tx.statement (echoStatement [100])) (\(one, text) -> Tx.single one &&& (Tx.single text >>> copyOut)))
+                      `yields` Right (1, alphabet 100),
+                    selectOne `yields` Right [1]
+                  ]
+            )
+            `shouldReturn` ()
+        it "sends a pipeline that has another result after the statement that streams, and reads it while it sends" $
+          held
+            ( session scram $
+                steps
+                  [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (echoStatement [100]) `before` Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32)))) (\(text, one) -> (Tx.single text >>> copyOut) &&& Tx.single one))
+                      `yields` Right (alphabet 100, 1),
+                    selectOne `yields` Right [1]
+                  ]
+            )
+            `shouldReturn` ()
+        -- The request's pool has buffers of 256 bytes, so these are three buffers' worth of parameters, which streams nothing.
+        it "sends a pipeline of three buffers' worth of parameters that streams nothing" $
+          held (session scram (holding 0 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (parametersEcho threeBuffers))) (\result -> Tx.single result >>> copyOut))))
+            `shouldReturn` Right (BS.concat threeBuffers)
+        -- The answer is as large as the request, and both are larger than what the socket holds: the server stops reading while its
+        -- answer is not read, so a send that waited for the whole of it to be sent before it read would stall.
+        it "sends a pipeline larger than the socket holds, whose answer is as large, while it reads the answer" $
+          held (withinFor (secs 20) (session scram (holding 0 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (parametersEcho (replicate 64 (BS.replicate 65536 120))))) (\result -> Tx.single result >>> measure >>^ fst)))))
+            `shouldReturn` Just (Right 4194304)
+        it "sends a first pipeline of three buffers' worth of parameters, as transaction variables are, and then the statement that streams" $
+          held (session scram (holding 300 (variablesThenStream 300))) `shouldReturn` Right (alphabet 300)
 
     -- A source that is slow makes the request wait for it, and the response is read meanwhile: one wait of the arrow, not two.
     it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $ do
@@ -384,15 +390,31 @@ echoingPrepared size =
 before :: Tx.Pipeline arr p a -> Tx.Pipeline arr p b -> Tx.Pipeline arr p (a, b)
 before = liftA2 (,)
 
--- | Discards both results, in order.
-discardBoth :: (Runtime arr) => (Tx.Result arr a, Tx.Result arr b) -> With Tx.Tx arr () ()
-discardBoth (earlier, later) = Tx.discard earlier >>> Tx.discard later
+-- | Three buffers' worth of text, which the pool of the cases has buffers of 256 bytes for.
+threeBuffers :: [ByteString]
+threeBuffers = [Char8.replicate 256 'a', Char8.replicate 256 'b', Char8.replicate 256 'c']
 
--- | What a pipeline that has no buffer to be sent from fails with.
-noBuffer :: UsageError -> IO ()
-noBuffer = \case
-  NoBufferToSend -> pure ()
-  other -> failTest ("expected NoBufferToSend, got " <> show other)
+-- | The statement that takes the pieces as parameters and gives their text back as a field: each piece is a parameter, and a
+-- piece that is a text of its own is its pieces.
+parametersEcho :: (Runtime arr) => [ByteString] -> Tx.Statement arr () Tx.Field
+parametersEcho pieces
+  | length pieces <= 3 = Tx.Statement ("SELECT " <> BS.intercalate " || " [Char8.pack ('$' : show number <> "::text") | number <- [1 .. length pieces]]) (const (map (textual . Just) pieces)) Nothing (Tx.any Tx.field)
+  | otherwise = Tx.Statement "SELECT $1::text" (const [piecesText pieces]) Nothing (Tx.any Tx.field)
+
+-- | A first pipeline whose one parameter is of three buffers' worth, as the variables of a request's transaction are, and then the
+-- statement that takes this many bytes of the stream, in one transaction: the text that the source streams, as the server gives
+-- it back, copied out.
+variablesThenStream :: (Runtime arr, Stream arr s) => Int -> arr (Connection, (Loans, s)) (Either QueryError ByteString)
+variablesThenStream size =
+  through (_2 . _2) ((),)
+    ^>> Tx.transaction
+      Tx.ReadCommitted
+      Tx.Read
+      ( Tx.pipeline Tx.Open variables $ \set ->
+          tap (done >>> Tx.discard set) >>> ((,()) ^>> Tx.pipeline Tx.Final (Tx.statement (echoStatement [size])) (\result -> Tx.single result >>> copyOut))
+      )
+  where
+    variables = Tx.statement (Tx.Statement "SELECT length($1::text)" (const [textual (Just (BS.concat threeBuffers))]) Nothing (single @_ @Int32))
 
 -- | The step, with a source of this many bytes that holds the primary buffer of the request, as the body of a request does.
 holding :: (Runtime arr) => Int -> arr (Connection, (Loans, HeldSource)) b -> OnConn arr b
