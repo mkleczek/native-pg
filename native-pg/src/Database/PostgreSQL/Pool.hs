@@ -53,7 +53,7 @@ import Database.PostgreSQL.Internal.Carrier (isQuiet)
 import Database.PostgreSQL.Pool.Observation
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Data.Word (Word64)
-import Network.Streaming.Classes (Block (..), Duration (..), Effect (..), Event (..), Exit (..), GiveWay (..), Instant (..), Race (..), Runtime, Scope (..), Time (..), Within (..), giving, micros, millis, monotonicNanoseconds, plus, taking)
+import Network.Streaming.Classes (Block (..), Duration (..), Effect (..), Event (..), Exit (..), GiveWay (..), Instant (..), Race (..), Runtime, Scope (..), Time (..), Within (..), giving, micros, millis, monotonicNanoseconds, plus, secs, taking)
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, foreverA, iterateA, keeping, step, tap)
 import Network.Streaming.Loans (withRequestBuffers)
 import Network.Streaming.Mode (Instrumented, ModeOf)
@@ -79,13 +79,16 @@ data ConnectionPoolSettings = ConnectionPoolSettings
     poolMaxOverflow :: Int,
     -- | How long a request waits for a connection of the pool before it opens one of the overflow, which it waits for
     -- as many times as the overflow has connections in use, and one more.
-    poolOverflowDelay :: Duration
+    poolOverflowDelay :: Duration,
+    -- | How long the maintenance gives the request that cancels a statement, which the pool sends for a connection that a use
+    -- broke, as long as the statement may still run on the server, before it gives the request up.
+    poolCancelTimeout :: Duration
   }
 
 -- | A pool of this size that makes its connections as the settings say, and has
 -- no deadlines, and observes nothing.
 connectionPoolSettings :: Int -> ConnectSettings -> ConnectionPoolSettings
-connectionPoolSettings size settings = ConnectionPoolSettings size settings Nothing Nothing Nothing Nothing 0 (millis 100)
+connectionPoolSettings size settings = ConnectionPoolSettings size settings Nothing Nothing Nothing Nothing 0 (millis 100) (secs 5)
 
 -- | A pool of connections: its slots, which are empty until a request first has them, and the buffers that its
 -- connections are set up with.
