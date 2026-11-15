@@ -96,12 +96,12 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Word (Word64)
-import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), Connection, SslMode (..), connect, connectSettings)
+import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), Connection, SslMode (..), connect, connectSettings, prepareTls)
 import qualified Database.PostgreSQL.Connection as PG
 import Database.PostgreSQL.Decoding (InPlace)
 import Database.PostgreSQL.Errors (ConnectFailure, Diagnostics, QueryError (..), ServerError (..), StatementError (..), diagnosticCode)
 import Database.PostgreSQL.Pool (ConnectionPool, PoolError, withConnection)
-import Database.PostgreSQL.Tls (tlsClient)
+import Database.PostgreSQL.Tls (newTlsClient)
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
 import Database.PostgreSQL.Types (FormatCode (..))
@@ -188,15 +188,18 @@ unixSettings socketPath user password =
       connectDatabase = Just "postgres"
     }
 
--- | A connection to the cluster's TCP port, which requires TLS.
-tlsSettings :: PortNumber -> ByteString -> Maybe ByteString -> ConnectSettings
-tlsSettings port user password =
-  (connectSettings (TcpAddress "127.0.0.1" port) user)
-    { connectPassword = password,
-      connectDatabase = Just "postgres",
-      connectSslMode = SslRequire,
-      connectTlsClient = Just tlsClient
-    }
+-- | A connection to the cluster's TCP port, which requires TLS, with its TLS configuration built, as a program builds it
+-- when it makes the settings.
+tlsSettings :: PortNumber -> ByteString -> Maybe ByteString -> IO ConnectSettings
+tlsSettings port user password = do
+  client <- newTlsClient
+  prepareTls
+    (connectSettings (TcpAddress "127.0.0.1" port) user)
+      { connectPassword = password,
+        connectDatabase = Just "postgres",
+        connectSslMode = SslRequire,
+        connectTlsClient = Just client
+      }
 
 -- * A connection in a program
 

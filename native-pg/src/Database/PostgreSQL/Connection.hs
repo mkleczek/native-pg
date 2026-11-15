@@ -41,6 +41,7 @@ module Database.PostgreSQL.Connection
     ChannelBindingMode (..),
     TargetSessionAttrs (..),
     TlsClient,
+    prepareTls,
     Resolver,
 
     -- * Connections
@@ -86,6 +87,10 @@ import Network.Streaming.Classes (Effect (..), Exit (..), Link (receive), Room, 
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, iterateA)
 import Network.Streaming.Loans (Loans, withSetupBuffersOf)
 import Network.Streaming.PositiveInt (positiveInt)
+
+-- | The settings, with the TLS configuration of each of their hosts built. (A stub: it builds nothing yet.)
+prepareTls :: ConnectSettings -> IO ConnectSettings
+prepareTls = pure
 
 -- | Connects to the first of the settings' hosts that qualifies: the settings' own, then the settings of its fallbacks,
 -- in order. For each it connects the socket as its address says, the Unix-domain socket or the address, which a host name

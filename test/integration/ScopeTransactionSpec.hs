@@ -219,7 +219,7 @@ spec socketPath port = describe "operations and transactions in a request" $ for
   -- v1 ran these cases over TLS. The cases above are about the pool and the transactions in it, so they run over a
   -- Unix-domain socket, and this one is what stays to be run over TLS.
   describe "over TLS" $
-    it "commits the transaction, and gives the connection back" $ withEnv runner (tlsSettings port "native_pg_scram" (Just "scram secret")) 1 $ \env -> do
+    it "commits the transaction, and gives the connection back" $ withEnvIO runner (tlsSettings port "native_pg_scram" (Just "scram secret")) 1 $ \env -> do
       pid <- pidOf env
       onEnv env (request env (ddl "CREATE TEMP TABLE scope_commit (id int)")) `shouldReturn` Right ()
       onEnv env (request env (committed Tx.Write (Tx.statement (plain "INSERT INTO scope_commit VALUES (1)" Tx.none)) Tx.discard)) `shouldReturn` Right ()
@@ -229,8 +229,8 @@ spec socketPath port = describe "operations and transactions in a request" $ for
   -- v1 found out with a preflight check that the server had ended an idle connection, without waiting for it. The pool of v2 does
   -- the same when it hands the connection out: the request gets another connection, and fails no more than it waits.
   describe "an idle connection" $
-    forM_ [("without TLS", unixSettings socketPath "postgres" Nothing), ("with TLS", tlsSettings port "postgres" Nothing)] $ \(label, settings) ->
-      it ("is replaced when the server ended it, " <> label) $ withEnv runner settings 1 $ \env -> do
+    forM_ [("without TLS", pure (unixSettings socketPath "postgres" Nothing)), ("with TLS", tlsSettings port "postgres" Nothing)] $ \(label, settings) ->
+      it ("is replaced when the server ended it, " <> label) $ withEnvIO runner settings 1 $ \env -> do
         pid <- pidOf env
         -- with a timeout, it returns once the backend has exited
         administrator (query (valued "SELECT pg_terminate_backend($1::int, 10000)" [Just (BC.pack (show pid))] (single @_ @Bool))) `shouldReturn` Right [True]
@@ -338,6 +338,10 @@ onEnv :: Env -> Program a -> IO a
 onEnv env = runOn (envRunner env) (envBuffers env)
 
 -- | The environment for the use, with a pool that is closed when the use ends.
+-- | The same, for settings that are made in IO.
+withEnvIO :: Runner -> IO ConnectSettings -> Int -> (Env -> IO a) -> IO a
+withEnvIO runner making size use = making >>= \settings -> withEnv runner settings size use
+
 withEnv :: Runner -> ConnectSettings -> Int -> (Env -> IO a) -> IO a
 withEnv runner settings size use = do
   buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))

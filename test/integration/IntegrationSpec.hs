@@ -36,7 +36,7 @@ import Data.Text (Text)
 import Data.Time (Day, DiffTime, UTCTime (..), fromGregorian)
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
-import Database.PostgreSQL.Connection (ChannelBindingMode (..), ConnectSettings (..), Connection)
+import Database.PostgreSQL.Connection (ChannelBindingMode (..), ConnectSettings (..), Connection, SslMode (..), prepareTls)
 import qualified Database.PostgreSQL.Connection as PG
 import qualified Database.PostgreSQL.Connection.Internal as PGInternal
 import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), emptyDefaults, fromConnectionString, parseConnectionString)
@@ -48,9 +48,10 @@ import Database.PostgreSQL.Internal.Cares (Resolver, ResolverOptions (..), defau
 import qualified Database.PostgreSQL.Notifications as Notify
 import Database.PostgreSQL.Resolver (newResolver)
 import qualified Database.PostgreSQL.Snippet as Snippet
-import Database.PostgreSQL.Tls (tlsClient)
+import Database.PostgreSQL.Tls (newTlsClient)
 import Database.PostgreSQL.Transaction (Rows (..))
 import qualified Database.PostgreSQL.Transaction as Tx
+import Database.PostgreSQL.Transport (RootCertificates (..))
 import Database.PostgreSQL.Types (protocolVersion3_0, protocolVersion3_2)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
@@ -58,7 +59,7 @@ import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Skeletest
 import qualified Skeletest.Predicate as P
-import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive, setModificationTime)
+import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive, removeFile, setModificationTime)
 import System.FilePath (takeDirectory, (</>))
 import System.Mem (performMajorGC)
 import System.Posix.Files (groupReadMode, otherReadMode, ownerReadMode, setFileMode, unionFileModes)
@@ -147,11 +148,12 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
 
   -- A connection is closed when its scope ends. Closing it earlier is allowed, and so is closing it again.
   describe "close" $
-    forM_ [("without TLS", unix "postgres" Nothing), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
+    forM_ [("without TLS", pure (unix "postgres" Nothing)), ("with TLS", encryptedAs "postgres" Nothing)] $ \(label, connecting) ->
       describe label $ do
-        it "rejects every operation after closing" $
+        it "rejects every operation after closing" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ closing,
                   selectOne `failsAs` unusable,
@@ -159,9 +161,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                   conn (Notify.listen ["events"]) `failsAs` unusable,
                   conn Notify.notification `failsAs` unusable
                 ]
-        it "can close repeatedly, also where its scope ends" $
+        it "can close repeatedly, also where its scope ends" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ closing,
                   withinFor (secs 5) (steps [closing, closing]) `yields` Just (),
@@ -171,9 +174,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         -- and the connection stays usable (see "TransactionSpec"). What breaks one is the cancellation rule: a statement
         -- that is cancelled while its answer is awaited leaves answers that nobody will read, and a connection is
         -- never drained for a client that has gone away. The case says only that closing works after it, however often.
-        it "can close a connection that a cancelled statement broke, repeatedly" $
+        it "can close a connection that a cancelled statement broke, repeatedly" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ withinFor (millis 300) (query sleeping) `yields` Nothing,
                   closing,
@@ -182,9 +186,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 ]
         -- The cancellation rule: v1 left the session unusable after a cancelled wait for a notification, but the reader
         -- is at a message boundary then and nothing is half sent or expected, so v2 leaves the connection usable.
-        it "keeps a connection usable when a wait for a notification is cancelled" $
+        it "keeps a connection usable when a wait for a notification is cancelled" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ conn (Notify.listen ["events"]),
                   withinFor (millis 100) (conn Notify.notification) `yields` Nothing,
@@ -192,17 +197,19 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                 ]
         -- A connection has one user at a time, and a second one is turned away with 'ConnectionBusy', without disrupting
         -- the first. In v1 only 'close' was, and a nested statement broke the session.
-        it "rejects closing while a statement runs, without disrupting it" $
+        it "rejects closing while a statement runs, without disrupting it" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ concurrently (query (plain "SELECT 1 FROM pg_sleep(0.3)" (single @_ @Int32))) (after (millis 100) (closing `failsWith` ConnectionBusy))
                     `yields` (Right [1], ()),
                   selectOne `yields` Right [1]
                 ]
-        it "rejects a second statement while one runs, without disrupting it" $
+        it "rejects a second statement while one runs, without disrupting it" $ do
+          settings <- connecting
           run $
-            session connecting $
+            session settings $
               steps
                 [ concurrently (query (plain "SELECT 1 FROM pg_sleep(0.3)" (single @_ @Int32))) (after (millis 100) (selectOne `failsWith` ConnectionBusy))
                     `yields` (Right [1], ()),
@@ -212,31 +219,32 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
   -- The binding data that SCRAM-PLUS signs comes from the TLS link. These cases replace it.
   describe "channel-binding data from TLS setup" $ do
     let suppliedBinding supplied mode user =
-          PGInternal.withEndPointOverride supplied ((encryptedAs user (Just "scram secret")) {connectChannelBinding = mode})
+          (\settings -> PGInternal.withEndPointOverride supplied (settings {connectChannelBinding = mode})) <$> encryptedAs user (Just "scram secret")
         bindingFailure = Just (Left "unsupported certificate hash")
         connectedWith settings = run (connectedTo settings done)
     it "uses the supplied binding bytes in SCRAM-PLUS" $
-      (rejection <$> connectedWith (suppliedBinding (Just (Right "wrong binding")) ChannelBindingRequire "native_pg_scram"))
+      (rejection <$> (suppliedBinding (Just (Right "wrong binding")) ChannelBindingRequire "native_pg_scram" >>= connectedWith))
         `shouldReturn` Just "28000"
     forM_ [("preferred", ChannelBindingPrefer), ("required", ChannelBindingRequire)] $ \(label, mode) ->
       it ("reports a binding error when SCRAM-PLUS is " <> label) $
-        (authenticationFailure <$> connectedWith (suppliedBinding bindingFailure mode "native_pg_scram"))
+        (authenticationFailure <$> (suppliedBinding bindingFailure mode "native_pg_scram" >>= connectedWith))
           `shouldReturn` Just "unsupported certificate hash"
     it "ignores a binding error when channel binding is disabled" $
-      run (session (suppliedBinding bindingFailure ChannelBindingDisable "native_pg_scram") currentUser)
+      (suppliedBinding bindingFailure ChannelBindingDisable "native_pg_scram" >>= \settings -> run (session settings currentUser))
         `shouldReturn` Right ["native_pg_scram"]
     it "does not require binding data for non-SCRAM authentication" $
-      run (session (suppliedBinding bindingFailure ChannelBindingPrefer "postgres") selectOne) `shouldReturn` Right [1]
+      (suppliedBinding bindingFailure ChannelBindingPrefer "postgres" >>= \settings -> run (session settings selectOne)) `shouldReturn` Right [1]
     it "allows unbound SCRAM when binding is unavailable and optional" $
-      run (session (suppliedBinding Nothing ChannelBindingPrefer "native_pg_scram") currentUser)
+      (suppliedBinding Nothing ChannelBindingPrefer "native_pg_scram" >>= \settings -> run (session settings currentUser))
         `shouldReturn` Right ["native_pg_scram"]
     it "rejects required binding when the TLS link supplies none" $
-      (authenticationFailure <$> connectedWith (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram"))
+      (authenticationFailure <$> (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram" >>= connectedWith))
         `shouldReturn` Just "channel binding is required, but server did not offer an authentication method that supports channel binding"
-    it "ignores binding errors on a cancellation connection" $
+    it "ignores binding errors on a cancellation connection" $ do
+      supplied <- suppliedBinding bindingFailure ChannelBindingRequire "postgres"
       run $
         session (unix "postgres" Nothing) $
-          cancelling (suppliedBinding bindingFailure ChannelBindingRequire "postgres")
+          cancelling supplied
 
   describe "connection strings" $ do
     let directory = takeDirectory socketPath
@@ -638,6 +646,34 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         withKeyCopy (ownerReadMode `unionFileModes` groupReadMode `unionFileModes` otherReadMode) $ \key ->
           connectFailure (certified key)
             `shouldReturn` (at <> "private key file \"" <> key <> "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root")
+      -- The TLS configuration of settings is built in IO, when the settings are made, from the files, once. A connect
+      -- makes a connection from it, and reads no file.
+      needs "TLS configs built once" $ it "connects with a configuration that was built from files that are gone" $
+        withCertificateCopy "ca.crt" $ \roots -> do
+          settings <- settingsOf (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack roots <> " host=localhost hostaddr=127.0.0.1"))
+          removeFile roots
+          run (session settings encrypted) `shouldReturn` Right [True]
+          run (session settings encrypted) `shouldReturn` Right [True]
+      it "connects again and again with the configuration that was built once" $ do
+        settings <- settingsOf (tcp "sslmode=require")
+        run (session settings encrypted) `shouldReturn` Right [True]
+        run (session settings (alsoOn settings (onSecond encrypted))) `shouldReturn` Right [True]
+      -- Settings whose configuration wasn't built fail, also with sslmode=prefer, which would otherwise connect without TLS.
+      needs "TLS configs built once" $ it "fails with TlsFailure, and says why, when the TLS configuration of the settings was never built" $
+        forM_ ["sslmode=require", "sslmode=prefer", "sslmode=allow", "sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt")] $ \mode -> do
+          settings <- unpreparedSettingsOf (tcp mode)
+          result <- run (connectedTo settings done)
+          case result of
+            Left (ConnectFailure [(_, TlsFailure reason)]) -> reason `shouldSatisfy` P.hasInfix "was not built"
+            _ -> failTest ("expected a TlsFailure for " <> show mode)
+      -- What a configuration was built for is part of it: settings that changed since don't use it.
+      needs "TLS configs built once" $ it "fails with TlsFailure when the settings changed after their TLS configuration was built" $ do
+        settings <- settingsOf (tcp "sslmode=require")
+        let verifying = settings {connectSslMode = SslVerifyFull (RootCertificateFile (certificate "ca.crt"))}
+        result <- run (connectedTo verifying done)
+        case result of
+          Left (ConnectFailure [(_, TlsFailure reason)]) -> reason `shouldSatisfy` P.hasInfix "was not built"
+          _ -> failTest "expected a TlsFailure"
     -- connect_timeout is a deadline: 'within' around the setup, as the plan says.
     it "gives up on a host after connect_timeout" $
       withSilentServer $ \silent -> do
@@ -1266,14 +1302,15 @@ authenticationFailure = \case
   Left (ConnectFailure [(_, AuthenticationError reason)]) -> Just reason
   _ -> Nothing
 
--- | The settings of a connection string, with the TLS client of native-pg-tls and a resolver that has the system's
--- configuration.
+-- | The settings of a connection string, with the TLS client of native-pg-tls and its configuration built, and a resolver
+-- that has the system's configuration.
 settingsOf :: ByteString -> IO ConnectSettings
 settingsOf string = case parseConnectionString noDefaults string of
   Left problem -> fail problem
   Right parsed -> do
     resolver <- newResolver
-    either fail (\settings -> pure settings {connectTlsClient = Just tlsClient, connectResolver = Just resolver}) (fromConnectionString parsed)
+    client <- newTlsClient
+    either fail (\settings -> prepareTls settings {connectTlsClient = Just client, connectResolver = Just resolver}) (fromConnectionString parsed)
 
 -- | The programs at once, each on the same input, and what each gave.
 concurrentlyAll :: (Runtime arr) => [arr a b] -> arr a [b]
@@ -1311,6 +1348,23 @@ withTemporaryHosts content action = do
 -- hasn't changed since it read it.
 writeHosts :: FilePath -> ByteString -> IO ()
 writeHosts hosts content = BS.writeFile hosts content *> setModificationTime hosts (UTCTime (fromGregorian 2001 1 1) 0)
+
+-- | The settings of a connection string, with the TLS client of native-pg-tls but no TLS configuration built.
+unpreparedSettingsOf :: ByteString -> IO ConnectSettings
+unpreparedSettingsOf string = case parseConnectionString noDefaults string of
+  Left problem -> fail problem
+  Right parsed -> do
+    client <- newTlsClient
+    either fail (\settings -> pure settings {connectTlsClient = Just client}) (fromConnectionString parsed)
+
+-- | Runs the action with a copy of the test certificate, which it may remove.
+withCertificateCopy :: FilePath -> (FilePath -> IO a) -> IO a
+withCertificateCopy name action = do
+  temporary <- getTemporaryDirectory
+  bracket (mkdtemp (temporary </> "native-pg-certificate-")) removeDirectoryRecursive $ \directory -> do
+    let copy = directory </> name
+    copyFile (certificate name) copy
+    action copy
 
 -- | No default host or certificate directory, nothing from the process but the user "postgres": every case gives its host.
 noDefaults :: Defaults

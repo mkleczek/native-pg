@@ -3,6 +3,7 @@
 module Database.PostgreSQL.Tls
   ( TlsConfig,
     newTlsConfig,
+    newTlsClient,
     tlsClient,
   )
 where
@@ -17,3 +18,7 @@ tlsClient :: TlsClient
 tlsClient = TlsClient $ \settings serverName sock -> do
   config <- newTlsConfig settings serverName
   tlsLinkOf settings <$> clientConnection config sock
+
+-- | The client that starts TLS with rustls, made in IO. (A stub: it is 'tlsClient' still.)
+newTlsClient :: IO TlsClient
+newTlsClient = pure tlsClient
