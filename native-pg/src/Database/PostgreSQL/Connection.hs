@@ -88,7 +88,8 @@ import Network.Streaming.Loans (Loans, withSetupBuffersOf)
 import Network.Streaming.PositiveInt (positiveInt)
 
 -- | Connects to the first of the settings' hosts that qualifies: the settings' own, then the settings of its fallbacks,
--- in order. For each it connects the socket as its address says, the Unix-domain socket or the numeric address, TLS as
+-- in order. For each it connects the socket as its address says, the Unix-domain socket or the address, which a host name
+-- is looked up for by the settings' resolver (also for its fallbacks), TLS as
 -- @sslmode@ and @sslnegotiation@ say, sends the startup message and authenticates as the server asks, with SCRAM-SHA-256
 -- (bound to the TLS link if the server offers it), MD5 or a cleartext password, and then checks that the server
 -- qualifies: it has the protocol version that @min_protocol_version@ asks for, and the session attributes that
@@ -118,7 +119,7 @@ passes settings = case connectTargetSessionAttrs settings of
   PreferStandbySession -> [hosts StandbySession, hosts AnySession]
   target -> [hosts target]
   where
-    hosts target = [host {connectTargetSessionAttrs = target} | host <- settings : connectFallbacks settings]
+    hosts target = [host {connectTargetSessionAttrs = target, connectResolver = connectResolver settings} | host <- settings : connectFallbacks settings]
 
 -- | What the loop over the hosts knows: the hosts that are left to try, why each of those tried didn't qualify, the latest
 -- first, and the loans.
@@ -228,7 +229,7 @@ oneTry :: (Runtime arr) => Use arr a -> arr (ConnectSettings, (Maybe Securing, B
 oneTry use =
   reaching ^>> first connectSocket >>> withInput ^>> (arr (Left . NotMade False) ||| session)
   where
-    reaching (settings, (securing, buffer)) = ((connectTcpOptions settings, connectAddress settings), (settings, securing, buffer))
+    reaching (settings, (securing, buffer)) = ((connectResolver settings, (connectTcpOptions settings, connectAddress settings)), (settings, securing, buffer))
     withInput (reached, input) = fmap (,input) reached
     -- The socket is closed unless the use was made: also when the part is cancelled while it is.
     session = scope (arr fst) (now released) (snd ^>> alongside starting >>> (unready ^>> (now closed ||| use)))

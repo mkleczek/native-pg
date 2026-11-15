@@ -715,7 +715,8 @@ any -> Broken | Closed
 - native-pg-tls supplies a TLS `Link` through rustls-ffi. Its public API is
   just `tlsClient`, which a client gives native-pg as a `TlsClient`.
   TLS configuration construction, connection operations and FFI helpers
-  stay in a private implementation module. This keeps native-pg free of C.
+  stay in a private implementation module. This keeps rustls out of native-pg,
+  whose only C is the file that calls c-ares for host names.
 - A private TLS configuration is tied to one server name. rustls-ffi 0.15
   borrows that name for both the connection and its configuration's session
   cache, so a temporary `withCString` allocation is insufficient even after

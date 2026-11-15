@@ -22,6 +22,7 @@ common implementation
   ghc-options:        -Wall
   -- c-ares looks host names up, without threads of its own; the version that has a channel safe to use from every thread
   pkgconfig-depends:  libcares >= 1.24 && < 2
+  c-sources:          cbits/cares.c
   other-modules:      Database.PostgreSQL.Connection.Internal
                       Database.PostgreSQL.Internal.Authentication
                       Database.PostgreSQL.Internal.Cares

@@ -32,10 +32,11 @@ import Control.Monad (void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
-import Database.PostgreSQL.Connection (ConnectSettings)
+import Database.PostgreSQL.Connection (ConnectSettings (connectResolver))
 import Database.PostgreSQL.ConnectionString (Defaults (..), fromConnectionString, readConnectionString)
 import Data.Maybe (isJust)
 import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), Maintenance, closeConnectionPool, connectionPoolSettings, maintain, newConnectionPool, newMaintenance, withConnection)
+import Database.PostgreSQL.Resolver (newResolver)
 import qualified Database.PostgreSQL.Transaction as Tx
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
 import Network.Fulmen (Call, Method (..), Request (..))
@@ -234,9 +235,13 @@ listening (host, port) info = tcp {Fulmen.openListener = Fulmen.openListener tcp
     tcp = Fulmen.tcp info 2048
     announce socket = socket <$ putStrLn ("listening on " <> host <> ":" <> port)
 
--- | How the pool connects: the settings of the connection string, which v2compare gives with trust authentication.
+-- | How the pool connects: the settings of the connection string, which v2compare gives with trust authentication, and
+-- the resolver that looks its host names up.
 connectSettingsOf :: String -> IO ConnectSettings
-connectSettingsOf uri = readConnectionString (Defaults "localhost" Nothing) (C.pack uri) >>= either die (either die pure . fromConnectionString)
+connectSettingsOf uri = do
+  resolver <- newResolver
+  settings <- readConnectionString (Defaults "localhost" Nothing) (C.pack uri) >>= either die (either die pure . fromConnectionString)
+  pure settings {connectResolver = Just resolver}
 
 -- | The server, and the maintenance of the pools beside it if a pool has a lifetime or an idle time: one more part of the
 -- server's scope, so that its sleep is cancelled with the rest when the server ends.
