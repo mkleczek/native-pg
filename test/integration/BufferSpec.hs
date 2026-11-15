@@ -106,7 +106,7 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
     --
     -- Without TLS the first host fails before the server sees it, so the case also says that the first host alone is
     -- rejected by the server.
-    needs "TLS and host selection" $ it "closes a host that rejects the connection and tries the next one with the same setup buffers" $ do
+    it "closes a host that rejects the connection and tries the next one with the same setup buffers" $ do
       settings <- settingsOf ("host=127.0.0.1," <> Char8.pack (takeDirectory socketPath) <> " port=" <> Char8.pack (show port) <> " dbname=postgres user=native_pg_plaintext sslmode=require")
       rejecting <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show port) <> " dbname=postgres user=native_pg_plaintext sslmode=require")
       tiny

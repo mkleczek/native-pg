@@ -231,7 +231,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "rejects required binding when the TLS link supplies none" $
       (authenticationFailure <$> connectedWith (suppliedBinding Nothing ChannelBindingRequire "native_pg_scram"))
         `shouldReturn` Just "channel binding is required, but server did not offer an authentication method that supports channel binding"
-    needs "cancel" $ it "ignores binding errors on a cancellation connection" $
+    it "ignores binding errors on a cancellation connection" $
       run $
         session (unix "postgres" Nothing) $
           cancelling (suppliedBinding bindingFailure ChannelBindingRequire "postgres")
@@ -395,7 +395,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
                          )
       it "starts TLS directly with sslnegotiation=direct, as PostgreSQL 17 takes it" $
         encryptedBy "sslnegotiation=direct sslmode=require" `shouldReturn` Right [True]
-      needs "cancel" $ it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
+      needs "cancel over TLS" $ it "cancels over TLS, and asks for TLS to cancel, as libpq does since PostgreSQL 17" $ do
         settings <- settingsOf (tcp "sslmode=require")
         withPlaintextServer $ \plaintext -> do
           refusing <- settingsOf ("host=127.0.0.1 port=" <> Char8.pack (show plaintext) <> " sslmode=require")
