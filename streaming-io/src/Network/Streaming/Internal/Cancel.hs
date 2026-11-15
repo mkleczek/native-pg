@@ -30,7 +30,7 @@ where
 
 import Control.Monad (when)
 import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
-import Network.Streaming.Classes (ScopeId (..))
+import Network.Streaming.Classes (Exit, ScopeId (..))
 
 -- | A scope: which it is, whether it was cancelled, and what the arrow keeps of the parts inside it, in a reference.
 data CancelScope m = CancelScope
@@ -39,9 +39,12 @@ data CancelScope m = CancelScope
     scopeMembers :: !(IORef m)
   }
 
--- | What a part is in, innermost first: a cancel scope, a shield, or a resource's scope, which a cancellation
--- passes through: a part in one is in the run's root scope, which a shutdown cancels.
-data Frame m = Inside !(CancelScope m) | Shielded | Held
+-- | What a part is in, innermost first: a cancel scope, a shield, a resource's scope, a release that is due, or the mark of a
+-- catcher. A cancellation passes through the last three: a part in a resource's scope or with a release due is in the run's
+-- root scope, which a shutdown cancels. A release that is due is what a scope that has no frame of its own on the part's stack
+-- leaves for a failure to find: it is run with how the body ended, by the catcher that the failure comes to, and the mark is the
+-- lowest frame that catcher runs the releases of.
+data Frame m = Inside !(CancelScope m) | Shielded | Held | Owes !(Exit -> IO ()) | Marked
 
 -- | A scope with this number, which the arrow takes care that no other scope that its parts can be in has, and
 -- what it keeps of the parts inside it to begin with.
@@ -55,9 +58,9 @@ cancelledIn = go Nothing
   where
     go !found [] = pure found
     go !found (Shielded : _) = pure found
-    go !found (Held : outer) = go found outer
     go !found (Inside s : outer) =
       readIORef (scopeCancelled s) >>= \cancelled -> if cancelled then go (Just (scopeIdent s)) outer else go found outer
+    go !found (_ : outer) = go found outer
 
 -- | Whether any of these frames is a cancelled scope, shields or not.
 cancelledAnywhere :: [Frame m] -> IO Bool
@@ -91,5 +94,5 @@ reachedBy flag frames = do
 deliverable :: ScopeId -> [Frame m] -> Bool
 deliverable _ [] = False
 deliverable _ (Shielded : _) = False
-deliverable ident (Held : outer) = deliverable ident outer
 deliverable ident (Inside s : outer) = scopeIdent s == ident || deliverable ident outer
+deliverable ident (_ : outer) = deliverable ident outer

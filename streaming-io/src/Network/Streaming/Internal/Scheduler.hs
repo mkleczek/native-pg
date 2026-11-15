@@ -73,6 +73,9 @@ module Network.Streaming.Internal.Scheduler
     endPart,
     pushFrame,
     popFrame,
+    shieldTop,
+    Floor (..),
+    unwindFrames,
     checkpoint,
     cancelScope,
     registering,
@@ -91,7 +94,7 @@ module Network.Streaming.Internal.Scheduler
 where
 
 import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDelay, retry)
-import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, try)
+import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, toException, try)
 import Control.Monad (foldM, replicateM, when, (>=>))
 import Data.Bits ((.&.), (.|.))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -105,7 +108,7 @@ import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
-import Network.Streaming.Classes (Cancelled (..), Event (..), Instant (..), cancelledBy, monotonicNanoseconds)
+import Network.Streaming.Classes (Cancelled (..), Event (..), Instant (..), ReleaseFailed (..), cancelledBy, exitOf, monotonicNanoseconds)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel
@@ -157,7 +160,8 @@ defaultTurn = microseconds 10
 -- | A part: the scopes it is in and the shields between them, innermost first, where it waits, and whether a
 -- cancellation may have reached it, which is all its points look at until it is (see "Network.Streaming.Internal.Cancel").
 -- A part that is in a scope is in the run's root scope too, outermost, which a shutdown cancels; a part that is in none
--- has no frames, and says nothing of where it waits.
+-- has no frames, and says nothing of where it waits. A part that has a release due, or a mark, is in a scope in this sense. The
+-- frames of a child begin with those of its parent, which it shares: its own end at its mark.
 data Part = Part
   { partIdent :: !Int,
     partFrames :: !(IORef [Frame [Part]]),
@@ -592,6 +596,39 @@ popFrame run part = do
     [] -> pure ()
   where
     forget = \case Inside s -> writeIORef (scopeMembers s) []; _ -> pure ()
+
+-- | The innermost frame of the part is a shield, whatever it was: a release that is due runs behind one.
+shieldTop :: Part -> IO ()
+shieldTop part =
+  readIORef (partFrames part) >>= \case
+    _ : outer -> writeIORef (partFrames part) (Shielded : outer)
+    [] -> pure ()
+
+-- | Where the unwinding of a failure stops: at the mark that a catcher pushed, or at the bottom, for the base of a part that
+-- is not a child, which has no catcher of its own to push one.
+data Floor = AtMark | AtBottom
+
+-- | The failure leaves the frames of the part, down to the floor, innermost first: a release that is due is run behind a shield,
+-- with how the body ended, and its failure replaces the failure, with how the body ended, for the releases that follow; the
+-- other frames are dropped. It gives the failure that is left. A release may wait, and runs on the part's own stack. In a build
+-- that observes, a part whose frames run out before its mark is found has no mark at its base, and the releases of the parts
+-- that its frames are shared with have been run.
+unwindFrames :: forall m. (Instrumented m) => Run -> Part -> Floor -> SomeException -> IO SomeException
+unwindFrames run part floor' failure =
+  readIORef (partFrames part) >>= \case
+    Owes owed : _ -> do
+      let exit = exitOf (Left failure)
+      shieldTop part
+      released <- try (owed exit)
+      popFrame run part
+      unwindFrames @m run part floor' (either (toException . ReleaseFailed exit) (const failure) released)
+    Marked : _ | AtMark <- floor' -> pure failure
+    [] -> do
+      case floor' of
+        AtMark -> debugging @m (ioError (userError "a failure unwound the frames of a part to the bottom, and found no mark at its base"))
+        AtBottom -> pure ()
+      pure failure
+    _ : _ -> popFrame run part *> unwindFrames @m run part floor' failure
 
 -- | Raises the cancellation that reaches the part, if there is one: it looks at the part's scopes only if its flag says
 -- that one may have.
