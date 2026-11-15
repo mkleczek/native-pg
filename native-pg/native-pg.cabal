@@ -22,6 +22,7 @@ common implementation
   ghc-options:        -Wall
   other-modules:      Database.PostgreSQL.Connection.Internal
                       Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Cares
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
@@ -76,6 +77,7 @@ library
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation
+                      Database.PostgreSQL.Resolver
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
                       Database.PostgreSQL.Transaction
@@ -96,6 +98,7 @@ test-suite native-pg-spec
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation
+                      Database.PostgreSQL.Resolver
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
                       Database.PostgreSQL.Transaction

@@ -29,7 +29,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import Data.Int (Int16, Int32, Int64)
-import Data.List (intercalate)
+import Data.List (intercalate, isPrefixOf, nub)
 import Data.Maybe (isJust, isNothing)
 import Data.Scientific (Scientific)
 import Data.Text (Text)
@@ -44,6 +44,7 @@ import Database.PostgreSQL.Decoding (DecodeValue (..), DecodingError (..), InPla
 import qualified Database.PostgreSQL.Decoding as Decoding
 import qualified Database.PostgreSQL.Encoders as Encoders
 import Database.PostgreSQL.Errors
+import Database.PostgreSQL.Internal.Cares (Resolver, ResolverOptions (..), defaultResolverOptions, newResolverWith)
 import qualified Database.PostgreSQL.Notifications as Notify
 import qualified Database.PostgreSQL.Snippet as Snippet
 import Database.PostgreSQL.Tls (tlsClient)
@@ -56,12 +57,13 @@ import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Skeletest
 import qualified Skeletest.Predicate as P
-import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive)
+import System.Directory (copyFile, getTemporaryDirectory, removeDirectoryRecursive, setModificationTime)
 import System.FilePath (takeDirectory, (</>))
 import System.Mem (performMajorGC)
 import System.Posix.Files (groupReadMode, otherReadMode, ownerReadMode, setFileMode, unionFileModes)
 import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (FileMode)
+import DnsServer (DnsServer (..), Reply (..), withDnsServer)
 import TestCluster (certificate)
 import TestPrograms hiding (field)
 import TestServers
@@ -332,6 +334,105 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "words a host name that doesn't resolve as libpq does" $ do
       failure <- connectFailure "host=no-such-host.invalid"
       failure `shouldSatisfy` P.hasPrefix "could not translate host name \"no-such-host.invalid\" to address: "
+    -- A scripted DNS server stands for the system's, so that a lookup can be answered, answered late or not answered. The
+    -- resolver asks it only, and looks up no search domains.
+    describe "host names, looked up by c-ares" $ do
+      let loopback = Addresses [(127, 0, 0, 1)]
+          viaName resolver host extra = settingsVia resolver (viaPlaintext host extra)
+          connectedBy settings = run (session settings (arr (hostName . PG.connectedHost . fst) &&& selectOne))
+          failureOf' settings = either displayException (const "connected") <$> run (connectedTo settings done)
+          asked dns = nub . map fst <$> dnsQuestions dns
+          secondsOf start = subtract start <$> getMonotonicTime
+      needs "c-ares" $ it "connects to the address that a name has, and asks the server for it" $
+        withDnsServer (const loopback) $ \dns -> do
+          resolver <- resolverFor dns 2000 1
+          settings <- viaName resolver "scripted.test" ""
+          connectedBy settings `shouldReturn` ("scripted.test", Right [1])
+          asked dns `shouldReturn` ["scripted.test"]
+      needs "c-ares" $ it "waits for an answer that comes late" $
+        withDnsServer (const (Later 600000 loopback)) $ \dns -> do
+          resolver <- resolverFor dns 3000 1
+          settings <- viaName resolver "slow.test" ""
+          started <- getMonotonicTime
+          connectedBy settings `shouldReturn` ("slow.test", Right [1])
+          secondsOf started >>= (`shouldSatisfy` P.gte 0.5)
+      -- The part that looks the name up waits for the answer where the other parts can go on: here the other part ends
+      -- while the answer is still to come, which it couldn't if the lookup held up its core.
+      needs "c-ares" $ it "leaves the core running other parts while it waits for the answer" $
+        withDnsServer (const (Later 1500000 loopback)) $ \dns -> do
+          resolver <- resolverFor dns 5000 1
+          settings <- viaName resolver "slow.test" ""
+          ((connected, lookupTime), ((), tickTime)) <-
+            run (concurrently (timed (connectedTo settings done)) (timed (done >>> times 10 (sleep (millis 20)))))
+          connected `shouldSatisfy` P.right P.anything
+          (tickTime < lookupTime, lookupTime >= 1400000000) `shouldBe` (True, True)
+      needs "c-ares" $ it "gives up on a lookup after connect_timeout" $
+        withDnsServer (const Silent) $ \dns -> do
+          resolver <- resolverFor dns 30000 1
+          settings <- viaName resolver "silent.test" "connect_timeout=2"
+          started <- getMonotonicTime
+          failureOf' settings `shouldReturn` ("connection to server at \"silent.test\", port " <> show port <> " failed: timeout expired")
+          secondsOf started >>= (`shouldSatisfy` (P.gte 1.9 P.&& P.lt 6))
+      needs "c-ares" $ it "stops a lookup that is cancelled, and looks the next name up with the same resolver" $
+        withDnsServer (\queried -> if queried == "silent.test" then Silent else loopback) $ \dns -> do
+          resolver <- resolverFor dns 30000 1
+          silent <- viaName resolver "silent.test" ""
+          answered <- viaName resolver "scripted.test" ""
+          started <- getMonotonicTime
+          run (withinFor (millis 300) (connectedTo silent done)) >>= (`shouldSatisfy` P.nothing)
+          secondsOf started >>= (`shouldSatisfy` P.lt 2)
+          connectedBy answered `shouldReturn` ("scripted.test", Right [1])
+      -- The cancelled lookup cancels what the resolver is asking for, and the other lookup goes on.
+      needs "c-ares" $ it "lets a lookup go on when another one that the resolver serves is cancelled" $
+        withDnsServer (\queried -> if queried == "silent.test" then Silent else Later 1000000 loopback) $ \dns -> do
+          resolver <- resolverFor dns 30000 1
+          silent <- viaName resolver "silent.test" ""
+          slow <- viaName resolver "slow.test" ""
+          (slowAnswer, silentAnswer) <-
+            run (concurrently (session slow (arr (hostName . PG.connectedHost . fst) &&& selectOne)) (withinFor (millis 300) (connectedTo silent done)))
+          (slowAnswer, isNothing silentAnswer) `shouldBe` (("slow.test", Right [1]), True)
+      -- The addresses are asked for in this order, which no rule of preference changes: both are IPv4 addresses of the
+      -- loopback, and the one that comes first has the longer common prefix with the source address, where it matters.
+      needs "c-ares" $ it "tries the addresses of a name in order, and words the failure of each" $
+        withDnsServer (const (Addresses [(127, 0, 0, 3), (127, 0, 0, 2)])) $ \dns -> withUnusedPort $ \unused -> do
+          resolver <- resolverFor dns 2000 1
+          settings <- settingsVia resolver ("host=ordered.test sslmode=disable port=" <> Char8.pack (show unused))
+          failure <- failureOf' settings
+          let addressOf line = takeWhile (/= ')') (drop 1 (dropWhile (/= '(') line))
+          map addressOf (filter ("connection to server at \"ordered.test\"" `isPrefixOf`) (lines failure)) `shouldBe` ["127.0.0.3", "127.0.0.2"]
+      needs "c-ares" $ it "connects to a later address of a name after one that fails" $
+        withDnsServer (const (Addresses [(127, 0, 0, 2), (127, 0, 0, 1)])) $ \dns -> do
+          resolver <- resolverFor dns 2000 1
+          settings <- viaName resolver "ordered.test" ""
+          connectedBy settings `shouldReturn` ("ordered.test", Right [1])
+      needs "c-ares" $ it "words a name that the server says doesn't exist as libpq does" $
+        withDnsServer (const NoSuchName) $ \dns -> do
+          resolver <- resolverFor dns 2000 1
+          settings <- settingsVia resolver "host=nope.test"
+          failure <- failureOf' settings
+          failure `shouldSatisfy` P.hasPrefix "could not translate host name \"nope.test\" to address: "
+          asked dns `shouldReturn` ["nope.test"]
+      -- A name in the hosts file is never asked for. The file is read when the resolver is made, and not by the first
+      -- lookup: the second content has the file's old modification time, which the resolver takes for a file it has
+      -- read, so only what the first content said is found.
+      needs "c-ares" $ it "reads the hosts file when it is made, and not when a name is looked up" $
+        withDnsServer (const NoSuchName) $ \dns -> withTemporaryHosts "127.0.0.1 hosted.test\n" $ \hosts -> do
+          resolver <- newResolverWith (resolverOptionsFor dns 2000 1) {resolverHostsFile = Just hosts}
+          writeHosts hosts "127.0.0.1 changed.test\n"
+          hosted <- viaName resolver "hosted.test" ""
+          changed <- viaName resolver "changed.test" ""
+          connectedBy hosted `shouldReturn` ("hosted.test", Right [1])
+          failureOf' changed >>= (`shouldSatisfy` P.hasPrefix "could not translate host name \"changed.test\" to address: ")
+          asked dns `shouldReturn` ["changed.test"]
+      -- An address and a Unix-domain socket need no lookup, and neither does a name with hostaddr.
+      it "doesn't ask the server for an address, or for a name with hostaddr" $
+        withDnsServer (const Silent) $ \dns -> do
+          resolver <- resolverFor dns 2000 1
+          numeric <- settingsVia resolver (viaPlaintext "127.0.0.1" "")
+          hostaddr <- viaName resolver "never.test" "hostaddr=127.0.0.1"
+          connectedBy numeric `shouldReturn` ("127.0.0.1", Right [1])
+          connectedBy hostaddr `shouldReturn` ("never.test", Right [1])
+          asked dns `shouldReturn` []
     it "names the application, with the fallback name if none is given" $ do
       withString (local "fallback_application_name=fallback") applicationName `shouldReturn` Right ["fallback"]
       withString (local "fallback_application_name=fallback application_name=app") applicationName `shouldReturn` Right ["app"]
@@ -1152,6 +1253,39 @@ settingsOf :: ByteString -> IO ConnectSettings
 settingsOf string = case parseConnectionString noDefaults (const Nothing) (Just "postgres") string of
   Left problem -> fail problem
   Right parsed -> either fail (\settings -> pure settings {connectTlsClient = Just tlsClient}) (fromConnectionString parsed)
+
+-- | The settings of a connection string, as 'settingsOf' makes them, whose host names are looked up by the resolver.
+settingsVia :: Resolver -> ByteString -> IO ConnectSettings
+settingsVia resolver string = (\settings -> settings {connectResolver = Just resolver}) <$> settingsOf string
+
+-- | The options of a resolver that asks the scripted server only, which waits this many milliseconds for an answer, as
+-- many times as the query is tried, and looks up no search domains.
+resolverOptionsFor :: DnsServer -> Int -> Int -> ResolverOptions
+resolverOptionsFor dns timeoutMilliseconds tries =
+  defaultResolverOptions
+    { resolverServers = Just ("127.0.0.1:" <> show (dnsPort dns)),
+      resolverTimeout = Just timeoutMilliseconds,
+      resolverTries = Just tries,
+      resolverSearchDomains = False
+    }
+
+-- | A resolver that asks the scripted server only.
+resolverFor :: DnsServer -> Int -> Int -> IO Resolver
+resolverFor dns timeoutMilliseconds tries = newResolverWith (resolverOptionsFor dns timeoutMilliseconds tries)
+
+-- | Runs the action with a hosts file of this content, whose modification time is long past.
+withTemporaryHosts :: ByteString -> (FilePath -> IO a) -> IO a
+withTemporaryHosts content action = do
+  temporary <- getTemporaryDirectory
+  bracket (mkdtemp (temporary </> "native-pg-hosts-")) removeDirectoryRecursive $ \directory -> do
+    let hosts = directory </> "hosts"
+    writeHosts hosts content
+    action hosts
+
+-- | Writes the hosts file, and sets its modification time to a past one, so that a resolver takes it for a file that
+-- hasn't changed since it read it.
+writeHosts :: FilePath -> ByteString -> IO ()
+writeHosts hosts content = BS.writeFile hosts content *> setModificationTime hosts (UTCTime (fromGregorian 2001 1 1) 0)
 
 -- | No default host or certificate directory: every case gives its host.
 noDefaults :: Defaults

@@ -30,6 +30,7 @@ module Database.PostgreSQL.Connection
         connectSslDirect,
         connectChannelBinding,
         connectTlsClient,
+        connectResolver,
         connectFallbacks,
         connectTargetSessionAttrs,
         connectTimeout
@@ -40,6 +41,7 @@ module Database.PostgreSQL.Connection
     ChannelBindingMode (..),
     TargetSessionAttrs (..),
     TlsClient,
+    Resolver,
 
     -- * Connections
     Connection,
@@ -69,6 +71,7 @@ import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.ConnectionString.Types (Host (..))
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectFailure (..), UsageError (..))
 import Database.PostgreSQL.Internal.Carrier (Carrier (..), closeCarrier)
+import Database.PostgreSQL.Internal.Cares (Resolver)
 import Database.PostgreSQL.Internal.Encryption (NotMade (..), Securing (..), checkedRoots, requested, secured)
 import Database.PostgreSQL.Internal.Frontend (sendOutput)
 import Database.PostgreSQL.Internal.Protocol.Messages (BackendKey, pattern CancelRequest, serialize)

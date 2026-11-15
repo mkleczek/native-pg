@@ -11,6 +11,7 @@ module Database.PostgreSQL.Session.Settings
 
 import Data.ByteString (ByteString)
 import Data.Int (Int32)
+import Database.PostgreSQL.Internal.Cares (Resolver)
 import Database.PostgreSQL.Internal.Protocol.Messages.Types (BackendKey, Scalar (..))
 import Database.PostgreSQL.Types (ProtocolVersion, protocolVersion3_0)
 import Database.PostgreSQL.Transport (Address, RootCertificates, TcpOptions, TlsClient, TlsVersion, defaultTcpOptions)
@@ -61,6 +62,9 @@ data ConnectSettings = ConnectSettings
     -- | What starts TLS, as libpq's TLS support does: without it a connection
     -- can't encrypt, whatever 'connectSslMode' says.
     connectTlsClient :: Maybe TlsClient,
+    -- | What looks up the names of hosts, made once for the program: the settings' own and its fallbacks'. Without one,
+    -- a host that is a name fails to resolve, and an address never needs one.
+    connectResolver :: Maybe Resolver,
     -- | The settings of the hosts to try after this one, in order, which a
     -- connection string with several hosts makes. Each has its own address,
     -- password and server name, and none has hosts of its own.
@@ -140,6 +144,7 @@ connectSettings address user =
       connectSslDirect = False,
       connectChannelBinding = ChannelBindingPrefer,
       connectTlsClient = Nothing,
+      connectResolver = Nothing,
       connectFallbacks = [],
       connectTargetSessionAttrs = AnySession,
       connectTimeout = Nothing,

@@ -29,6 +29,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Encoders
                       Database.PostgreSQL.Errors
                       Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Cares
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
@@ -53,6 +54,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Notifications
                       Database.PostgreSQL.Pool
                       Database.PostgreSQL.Pool.Observation
+                      Database.PostgreSQL.Resolver
                       Database.PostgreSQL.Session.Settings
                       Database.PostgreSQL.Snippet
                       Database.PostgreSQL.Tls
@@ -62,6 +64,7 @@ test-suite native-pg-integration
                       Database.PostgreSQL.Types
                       BufferSpec
                       ConnectionPoolSpec
+                      DnsServer
                       IntegrationSpec
                       ScopeTransactionSpec
                       TestCluster
@@ -113,6 +116,7 @@ benchmark native-pg-bench
                       Database.PostgreSQL.Encoders
                       Database.PostgreSQL.Errors
                       Database.PostgreSQL.Internal.Authentication
+                      Database.PostgreSQL.Internal.Cares
                       Database.PostgreSQL.Internal.Diagnostics
                       Database.PostgreSQL.Internal.Protocol
                       Database.PostgreSQL.Internal.Protocol.Codec
