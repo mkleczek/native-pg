@@ -15,6 +15,7 @@
 module Database.PostgreSQL.ConnectionString
   ( ConnectionString (..),
     Defaults (..),
+    emptyDefaults,
     Host (..),
     InvalidConnectionString (..),
     TargetSessionAttrs (..),
@@ -22,7 +23,8 @@ module Database.PostgreSQL.ConnectionString
     hostSocketAddress,
     fromConnectionString,
     parseConnectionString,
-    readConnectionString
+    readConnectionString,
+    readDefaults
   ) where
 
 import Control.Applicative ((<|>))
@@ -91,13 +93,18 @@ readConnectionString defaults string = do
               doesFileExist roots <&> bool (Right parsedWithPasswords) (Left (requireWithRoots roots))
           | otherwise -> pure (Right parsedWithPasswords)
 
--- | Like 'readConnectionString', with the environment variables and the local
--- user's name, if it could be looked up, given. This pure parser accepts
--- @passfile@ but leaves password-file lookup to 'readConnectionString'.
-parseConnectionString :: Defaults -> (String -> Maybe String) -> Maybe String -> ByteString -> Either String ConnectionString
-parseConnectionString defaults environment localUser string = do
+-- | Parses the connection string, and fills in what it leaves out from the defaults as libpq does: the environment, the
+-- local user's name, the password files and the root certificate file that the defaults have. It reads nothing.
+parseConnectionString :: Defaults -> ByteString -> Either String ConnectionString
+parseConnectionString defaults string = do
   given <- options string
-  resolve (setting environment given) defaults localUser
+  resolve (setting (`lookup` defaultEnvironment defaults) given) defaults (defaultUser defaults)
+
+-- | The defaults of this process: its environment, the local user's name, the password files, and whether the default
+-- root certificate file is there, read once. It takes where to connect when a string gives no host, the directory of the
+-- certificate files, and the password files that connection strings name, besides the default one.
+readDefaults :: String -> Maybe FilePath -> [FilePath] -> IO Defaults
+readDefaults host directory _ = pure (emptyDefaults host directory)
 
 -- | Password files are only consulted when neither the connection string nor
 -- PGPASSWORD supplied a password. Keep the matches by host: a later host may

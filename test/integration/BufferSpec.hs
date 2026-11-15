@@ -38,7 +38,7 @@ import Data.Maybe (isNothing)
 import Data.Word (Word8)
 import Database.PostgreSQL.Connection (ChannelBindingMode (..), ConnectSettings (..), Connection)
 import qualified Database.PostgreSQL.Connection as PG
-import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), fromConnectionString, parseConnectionString)
+import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), emptyDefaults, fromConnectionString, parseConnectionString)
 import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Tls (tlsClient)
 import Database.PostgreSQL.Transaction (Rows (..))
@@ -363,7 +363,7 @@ failedCommitCode = \case
 
 -- | The settings of a connection string, with the TLS client of native-pg-tls.
 settingsOf :: ByteString -> IO ConnectSettings
-settingsOf string = case parseConnectionString (Defaults "/tmp" Nothing) (const Nothing) (Just "postgres") string of
+settingsOf string = case parseConnectionString ((emptyDefaults "/tmp" Nothing) {defaultUser = Just "postgres"}) string of
   Left problem -> fail problem
   Right parsed -> either fail (\settings -> pure settings {connectTlsClient = Just tlsClient}) (fromConnectionString parsed)
 

@@ -39,7 +39,7 @@ import qualified Data.UUID as UUID
 import Database.PostgreSQL.Connection (ChannelBindingMode (..), ConnectSettings (..), Connection)
 import qualified Database.PostgreSQL.Connection as PG
 import qualified Database.PostgreSQL.Connection.Internal as PGInternal
-import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), fromConnectionString, parseConnectionString)
+import Database.PostgreSQL.ConnectionString (Defaults (..), Host (..), emptyDefaults, fromConnectionString, parseConnectionString)
 import Database.PostgreSQL.Decoding (DecodeValue (..), DecodingError (..), InPlace, Json (..), Jsonb (..), composite)
 import qualified Database.PostgreSQL.Decoding as Decoding
 import qualified Database.PostgreSQL.Encoders as Encoders
@@ -1269,7 +1269,7 @@ authenticationFailure = \case
 -- | The settings of a connection string, with the TLS client of native-pg-tls and a resolver that has the system's
 -- configuration.
 settingsOf :: ByteString -> IO ConnectSettings
-settingsOf string = case parseConnectionString noDefaults (const Nothing) (Just "postgres") string of
+settingsOf string = case parseConnectionString noDefaults string of
   Left problem -> fail problem
   Right parsed -> do
     resolver <- newResolver
@@ -1312,9 +1312,9 @@ withTemporaryHosts content action = do
 writeHosts :: FilePath -> ByteString -> IO ()
 writeHosts hosts content = BS.writeFile hosts content *> setModificationTime hosts (UTCTime (fromGregorian 2001 1 1) 0)
 
--- | No default host or certificate directory: every case gives its host.
+-- | No default host or certificate directory, nothing from the process but the user "postgres": every case gives its host.
 noDefaults :: Defaults
-noDefaults = Defaults "/tmp" Nothing
+noDefaults = (emptyDefaults "/tmp" Nothing) {defaultUser = Just "postgres"}
 
 -- | The body on a connection to the string's settings.
 onString :: Runner -> ByteString -> (forall arr. (Runtime arr) => OnConn arr b) -> IO b

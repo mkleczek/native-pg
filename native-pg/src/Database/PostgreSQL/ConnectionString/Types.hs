@@ -2,6 +2,7 @@
 module Database.PostgreSQL.ConnectionString.Types
   ( ConnectionString (..),
     Defaults (..),
+    emptyDefaults,
     Host (..),
     InvalidConnectionString (..),
     TargetSessionAttrs (..),
@@ -80,17 +81,38 @@ newtype InvalidConnectionString = InvalidConnectionString String
 instance Exception InvalidConnectionString where
   displayException (InvalidConnectionString reason) = reason
 
--- | What libpq builds in, given by the client: where to connect when a string
--- gives no host, and where the files libpq looks for by default are.
+-- | What libpq builds in, given by the client: where to connect when a string gives no host, and where the files libpq
+-- looks for by default are. And what a connection string's defaults take from the process: its environment, the local
+-- user's name, the password files and whether the default root certificate file is there. They are read once, when a
+-- program starts ('Database.PostgreSQL.ConnectionString.readDefaults'), so that parsing a connection string reads
+-- nothing.
 data Defaults = Defaults
   { -- | A socket directory, or a host name. libpq's is @/tmp@, or the
     -- directory it was built with, and @localhost@ on Windows.
     defaultHost :: String,
     -- | The directory of @root.crt@, @postgresql.crt@, @postgresql.key@ and
     -- @root.crl@, if any: libpq's is @~/.postgresql@.
-    defaultCertificateDirectory :: Maybe FilePath
+    defaultCertificateDirectory :: Maybe FilePath,
+    -- | The environment variables that the options default to, with their values.
+    defaultEnvironment :: [(String, String)],
+    -- | The name of the local user, if it could be looked up, which is the user when a string gives none.
+    defaultUser :: Maybe String,
+    -- | The password files that were read, by the path that names them, with what they hold: nothing for a file that is
+    -- missing, can't be read, isn't a regular file or has group or world access, as libpq takes it. A file that a string
+    -- names and that isn't among them is a file that couldn't be read.
+    defaultPasswordFiles :: [(FilePath, ByteString)],
+    -- | The password file that applies when neither @passfile@ nor @PGPASSFILE@ names one: @~\/.pgpass@.
+    defaultHomePasswordFile :: Maybe FilePath,
+    -- | Whether the default root certificate file is in the certificate directory, as libpq checks it for
+    -- @sslmode=require@.
+    defaultRootCertificateExists :: Bool
   }
   deriving (Eq, Show)
+
+-- | Defaults with nothing from the process: no environment variables, no user, no password files and no root certificate
+-- file. 'Database.PostgreSQL.ConnectionString.readDefaults' fills them in from the process.
+emptyDefaults :: String -> Maybe FilePath -> Defaults
+emptyDefaults host directory = Defaults host directory [] Nothing [] Nothing False
 
 -- | The settings for connecting to one of the hosts.
 hostConnectSettings :: ConnectionString -> Host -> ConnectSettings
