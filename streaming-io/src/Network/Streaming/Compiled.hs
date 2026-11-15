@@ -38,6 +38,7 @@ import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers (addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Mode (Instrumented, Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -157,6 +158,7 @@ instance Within (CompiledM m) where
           if cancelledBy failure == Just (scopeIdent scope') then next Nothing else outer failure
     writeIORef (runFailure run) onFailure
     body (Context run part onFailure) value (\result -> leaves *> next (Just result))
+  withinIn _ = Compiled (\_ _ _ -> notImplementedIO "withinIn")
 
 instance Scope (CompiledM m) where
   scope (Compiled acquire) (Compiled release) (Compiled body) = Compiled $ \context@(Context run part outer) value next ->

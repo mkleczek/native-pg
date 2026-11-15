@@ -337,6 +337,10 @@ class Within arr where
   -- scopes released. A cancellation from outside passes through.
   within :: Duration -> arr a b -> arr a (Maybe b)
 
+  -- | The same for a deadline that the input gives, in front of the body's own input, so that a program that is built once
+  -- takes its deadline from the run: a connect timeout that is a setting, or a checkout deadline that is a pool's.
+  withinIn :: arr a b -> arr (Duration, a) (Maybe b)
+
 -- | An action that never waits, as an arrow.
 class Effect arr where
   now :: (a -> IO b) -> arr a b

@@ -44,6 +44,7 @@ import Network.Streaming.Combinators (done)
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, changeHere, closeShelf, collectedWrongly, lookOrWait, newShelf, postNow, postOrQueue, takeNow)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Watch (Watch (..), fdReadable, fdWritable)
 import Prelude hiding (id, (.))
 
@@ -119,6 +120,7 @@ instance Within Loop where
       `Seq` First Clock
       `Seq` Race' (Arr snd `Seq` body) (Arr (\(Instant at, _) -> Until (Instant (at + limit))) `Seq` Block)
       `Seq` Arr (either Just (const Nothing))
+  withinIn _ = Now (\_ -> notImplementedIO "withinIn")
 
 -- | Nothing: the interpreter counts a step for every action that a part runs,
 -- not only at a link, and gives way after 64 of them (a simulation, after each,

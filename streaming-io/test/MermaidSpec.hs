@@ -63,6 +63,10 @@ spec = describe "the chart of an inbox" $ do
         [any (("subgraph " ++ lane ++ " ") `isPrefixOf`) (stripped chart) | lane <- into chart store ++ outOf chart store]
           `shouldBe` [True, True]
 
+  xfail "withinIn is not there yet" $ it "has a group for a deadline that the input gives, which says so" $ do
+    chart <- chartOf (withinIn (quick >>> quick) :: Diagram (Duration, ()) (Maybe ()))
+    any ("within the duration of the input" `isInfixOf`) chart `shouldBe` True
+
   it "has no store, and no edge of a message, for a program with no inbox" $ do
     chart <- chartOf (quick >>> quick :: Diagram () ())
     (storeIn chart, any ("-.->" `isInfixOf`) (stripped chart)) `shouldBe` (Nothing, False)

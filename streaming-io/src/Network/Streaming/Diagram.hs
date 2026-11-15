@@ -92,6 +92,7 @@ instance Race Diagram where
 
 instance Within Diagram where
   within duration (Diagram body) = Diagram (Within duration body)
+  withinIn (Diagram body) = Diagram (Within (Duration 0) body)
 
 instance Concurrent Diagram where
   together parts = Diagram (Together [part | Diagram part <- parts])

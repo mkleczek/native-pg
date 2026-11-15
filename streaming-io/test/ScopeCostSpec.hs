@@ -107,6 +107,11 @@ spec = do
       it "costs a loop in a deadline no allocation in it" $
         costsAtMost runner "deadline" tolerance yielding (\count -> within (secs 3600) (yielding count) >>> done)
 
+    -- The same cost as a deadline that the program fixes.
+    xfail "withinIn is not there yet" $
+      it "costs a loop in a deadline that the input gives no allocation in it" $
+        costsAtMost runner "deadline, input" tolerance yielding (\count -> (secs 3600,) ^>> withinIn (yielding count) >>> done)
+
     copied name "a part that waits captures the catch of tryA, which tryA adds to each wait, until stage C of the frame-free scopes" $
       it "costs a loop in tryA no allocation in it" $
         costsAtMost runner "tryA" tolerance yielding (\count -> tryA (yielding count) >>> done)

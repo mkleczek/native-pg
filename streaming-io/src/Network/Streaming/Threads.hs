@@ -46,6 +46,7 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel (CancelScope (..), Frame (..), cancelledAnywhere, cancelledFlagged, deliverable, newCancelScope, reachedBy)
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, closeShelf, collectedWrongly, hasValue, lookOrWait, newShelf, postNow, postOrQueue, stopWaiting, takeWoken, withdraw)
@@ -364,6 +365,7 @@ instance Within (ThreadsM m) where
       Left failure
         | cancelledBy failure == Just (scopeIdent scope') -> pure Nothing
         | otherwise -> throwIO failure
+  withinIn _ = Threads (\_ _ -> notImplementedIO "withinIn")
 
 -- | Runs the action as a part that is in the cancel scope, and how it ended.
 inScope :: Part -> CancelScope Members -> IO a -> IO (Either SomeException a)

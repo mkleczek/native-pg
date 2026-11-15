@@ -67,6 +67,7 @@ import Network.Streaming.Internal.Timers (Timer, addTimer, cancelTimer)
 import Network.Streaming.Loop (Report)
 import Network.Streaming.Counters (Counter (Captures))
 import Network.Streaming.Mode (Instrumented (bump), Mode (..), ModeOf)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import System.Posix.Types (Fd (..))
 import Prelude hiding (id, (.))
 
@@ -185,6 +186,7 @@ instance Within (DelimitedM m s) where
     marking context
     let deadline = Deadline context scope' timer
     catch (body context value >>= deadlineDone deadline) (deadlineFailed deadline)
+  withinIn _ = Delimited (\_ _ -> notImplementedIO "withinIn")
 
 -- | A deadline that the part is in: the part, its scope and its timer, which is all that the frame that the deadline leaves on
 -- the stack holds, the one pointer.

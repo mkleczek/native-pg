@@ -7,7 +7,7 @@
 -- wheel by itself, in time that the test makes up.
 module TimeSpec (spec) where
 
-import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (>>>), (>>^), (^>>))
+import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Monad (forM, forM_, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Word (Word64)
@@ -145,6 +145,62 @@ spec = describe "time" $ do
       result <- withinTime (run (times 100000 (within (secs 10) returnA >>> done) >>^ const 'z'))
       result `shouldBe` Just 'z'
 
+    -- The deadline is the first of the input, in front of what the body takes: one program, built once, has the deadline
+    -- of each run.
+    xfail "withinIn is not there yet" $ describe "a deadline that the input gives" $ do
+      it "gives Nothing when the deadline passes first, and releases what the body held" $ do
+        noted <- newLog
+        started <- monotonicNanoseconds
+        result <- run (given (millis 30) (bracketed noted "r" returnA waitsForEver))
+        ended <- monotonicNanoseconds
+        result `shouldBe` Nothing
+        readLog noted `shouldReturn` ["acquire r", "release r: cancelled"]
+        (ended - started >= 30000000) `shouldBe` True
+        (ended - started < 2000000000) `shouldBe` True
+
+      it "gives the body's result when it ends first, and leaves no deadline behind" $ do
+        run (given (secs 10) (arr (const 'x'))) `shouldReturn` Just 'x'
+        run (given (secs 10) (sleep (millis 5) >>^ const 'y')) `shouldReturn` Just 'y'
+
+      it "takes the deadline of each run from the input, in one program that is built once" $
+        run bothDeadlines `shouldReturn` (Nothing, Just 'x')
+
+      it "gives the outer deadline Nothing when it passes while an inner one is active, whichever way each is given" $ do
+        run (given (millis 30) (given (secs 10) waitsForEver)) `shouldReturn` Nothing
+        run (given (secs 10) (given (millis 30) waitsForEver)) `shouldReturn` Just Nothing
+        run (within (millis 30) (given (secs 10) waitsForEver)) `shouldReturn` Nothing
+        run (given (secs 10) (within (millis 30) waitsForEver)) `shouldReturn` Just Nothing
+
+      it "tells the deadlines apart: the inner one passes, and the part goes on until the outer does" $ do
+        noted <- newLog
+        result <- run (within (millis 120) (given (millis 20) waitsForEver >>> noting noted "inner ended" >>> waitsForEver))
+        result `shouldBe` Nothing
+        readLog noted `shouldReturn` ["inner ended"]
+
+      it "lets a cancellation from outside pass through it" $ do
+        noted <- newLog
+        winner' <- run (race (given (secs 10) waitsForEver >>> noting noted "within returned") giveWayAndEnd)
+        either (const "first") (const "second") winner' `shouldBe` "second"
+        readLog noted `shouldReturn` []
+
+      it "fires a deadline that is inside a shield, whatever outside cancels" $ do
+        noted <- newLog
+        started <- monotonicNanoseconds
+        winner' <-
+          run $
+            race
+              (scope returnA (done >>> shield (given (millis 30) waitsForEver) >>> noting noted "release ended" >>> done) (snd ^>> waitsForEver))
+              giveWayAndEnd
+        ended <- monotonicNanoseconds
+        either (const "first") (const "second") winner' `shouldBe` "second"
+        readLog noted `shouldReturn` ["release ended"]
+        (ended - started >= 30000000) `shouldBe` True
+        (ended - started < 2000000000) `shouldBe` True
+
+      when (name /= "loop") $ it "stops 100,000 deadlines that were set one after the other, none of which passes" $ do
+        result <- withinTime (run (times 100000 (given (secs 10) returnA >>> done) >>^ const 'z'))
+        result `shouldBe` Just 'z'
+
   describe "the pool" $
     forM_ poolRunners $ \(PoolRunner name run) -> do
       it ("gives Nothing when the deadline passes while the part waits for a ticket of any core, and releases what the body held (" <> name <> ")") $ do
@@ -194,6 +250,24 @@ spec = describe "time" $ do
         simulatedOutcome outer `shouldBe` Completed Nothing
         inner <- runSimulation seed 100000 (within (secs 10) (within (secs 3) (sleep (secs 100)))) ()
         simulatedOutcome inner `shouldBe` Completed (Just Nothing)
+
+    xfail "withinIn is not there yet" $ describe "a deadline that the input gives" $ do
+      it "gives Nothing at its instant, for every seed, and releases what the body held" $
+        forM_ [1 .. 20] $ \seed -> do
+          noted <- newLog
+          outcome <- runSimulation seed 100000 (given (secs 5) (bracketed noted "r" returnA (sleep (secs 100))) >>> done >>> clock >>^ \(Instant at) -> at) ()
+          simulatedOutcome outcome `shouldBe` Completed (5 * 1000000000)
+          readLog noted `shouldReturn` ["acquire r", "release r: cancelled"]
+
+      it "gives the body's result when it ends before the deadline, and then the clock is where the body left it" $
+        forM_ [1 .. 20] $ \seed -> do
+          outcome <- runSimulation seed 100000 (given (secs 100) (sleep (secs 5) >>^ const 'x') >>> done >>> clock) ()
+          simulatedOutcome outcome `shouldBe` Completed (Instant (5 * 1000000000))
+
+      it "gives the deadline of each run from the input, in one program that is built once" $
+        forM_ [1 .. 20] $ \seed -> do
+          outcome <- runSimulation seed 100000 bothDeadlines ()
+          simulatedOutcome outcome `shouldBe` Completed (Nothing, Just 'x')
 
     it "gives the same run for the same seed, and finds that a part waits for ever when nothing will end its wait" $ do
       first' <- simulatedTrace <$> runSimulation 5 100000 (together [sleep (secs 2), sleep (secs 1)]) ()
@@ -258,6 +332,16 @@ spec = describe "time" $ do
       readIORef fired `shouldReturn` []
       expire wheel 2000000
       readIORef fired `shouldReturn` ["second"]
+
+-- | The body with a deadline that its input gives.
+given :: (Rich arr) => Duration -> arr () b -> arr () (Maybe b)
+given duration body = const (duration, ()) ^>> withinIn body
+
+-- | One body, whose deadline is the input's, which a short deadline cuts short and a long one doesn't, in one program.
+bothDeadlines :: (Rich arr) => arr () (Maybe Char, Maybe Char)
+bothDeadlines = (const (millis 10, ()) ^>> once) &&& (const (secs 10, ()) ^>> once)
+  where
+    once = withinIn (sleep (millis 100) >>^ const 'x')
 
 type Log = IORef [String]
 
