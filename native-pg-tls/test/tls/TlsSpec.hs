@@ -9,8 +9,6 @@
 -- | TLS links against a server in the same process, over a pair of Unix-domain sockets. The server is rustls too,
 -- through its server API, and its side of a connection is a link made by the same functions as the client's. The two ends
 -- are the parts of one program, which runs under each of the arrows: they wait for each other by blocking on the sockets.
---
--- A case that the code can't pass yet is marked with what it needs ('needs'), and the mark comes off as the code lands.
 module TlsSpec (spec) where
 
 import Control.Arrow (Arrow, first, (>>>), (>>^), (^>>))
@@ -47,10 +45,6 @@ import System.Mem (performMajorGC)
 import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
--- | Marks every case of the spec as an expected failure, for what it needs and the code doesn't have yet.
-needs :: String -> Spec -> Spec
-needs what = xfail ("v2: " <> what <> " is not there yet")
-
 -- | A program for any arrow that has what 'Runtime' bundles.
 type Program i a = forall arr. (Runtime arr) => arr i a
 
@@ -72,23 +66,23 @@ spec :: Spec
 spec = do
   forM_ runners $ \(Runner name run) -> describe name $ do
     describe "the handshake" $ do
-      needs "TLS" $ it "verifies the server's certificate against the roots, and its name" $
+      it "verifies the server's certificate against the roots, and its name" $
         withEnds "server" (verifying "ca.crt") $ \ends ->
           run handshaking ends `shouldReturn` ()
 
-      needs "TLS" $ it "connects to any server without verification" $
+      it "connects to any server without verification" $
         withEnds "server-other-name" (settings NoVerification) $ \ends ->
           run handshaking ends `shouldReturn` ()
 
-      needs "TLS" $ it "refuses a certificate that no root signed" $
+      it "refuses a certificate that no root signed" $
         withEnds "server" (verifying "other-ca.crt") $ \ends ->
           run refusal ends `shouldReturn` "SSL error: invalid peer certificate: UnknownIssuer"
 
-      needs "TLS" $ it "refuses a certificate for another name" $
+      it "refuses a certificate for another name" $
         withEnds "server-other-name" (verifying "ca.crt") $ \ends ->
           run refusal ends `shouldReturn` "SSL error: invalid peer certificate: NotValidForName"
 
-      needs "TLS" $ it "gives the hash of the server's certificate for SCRAM's channel binding, and the server none" $
+      it "gives the hash of the server's certificate for SCRAM's channel binding, and the server none" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           let expected =
                 BS.pack
@@ -100,18 +94,18 @@ spec = do
           run (concurrently (atClient (fst ^>> shake)) (atServer (fst ^>> shake))) ends
             `shouldReturn` (Just (Right expected), Nothing)
 
-      needs "TLS" $ it "refuses a server that doesn't choose ALPN's postgresql, when the settings say it has to" $
+      it "refuses a server that doesn't choose ALPN's postgresql, when the settings say it has to" $
         withEnds "server" ((verifying "ca.crt") {tlsAlpnRequired = True}) $ \ends ->
           run refusal ends `shouldReturn` "SSL error: direct SSL connection was established without ALPN protocol negotiation extension"
 
       -- The client has made its native connection and waits for the server, and the constructor's temporary storage
       -- is gone by the time that the server answers.
-      needs "TLS" $ it "keeps the server name alive while it waits for the server" $
+      it "keeps the server name alive while it waits for the server" $
         withEnds "server" (verifying "ca.crt") $ \ends ->
           run (concurrently (atClient shaken) (atServer (after (millis 50) (reclaiming >>> shaken))) >>> done) ends `shouldReturn` ()
 
     describe "a link" $ do
-      needs "TLS" $ it "carries more bytes both ways than the sockets hold" $
+      it "carries more bytes both ways than the sockets hold" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           let payload = BS.pack (take 1000000 (cycle [0 .. 250]))
               size = BS.length payload
@@ -124,7 +118,7 @@ spec = do
               ends
           echoed `shouldBe` payload
 
-      needs "TLS" $ it "hands out a record bigger than the room in order, over several receives" $
+      it "hands out a record bigger than the room in order, over several receives" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           let payload = BS.pack (take 1000 (cycle [0 .. 250]))
           (pieces, ()) <-
@@ -137,25 +131,25 @@ spec = do
           BS.concat pieces `shouldBe` payload
           (length pieces > 1, all ((<= 100) . BS.length) pieces) `shouldBe` (True, True)
 
-      needs "TLS" $ it "ends the peer's stream when it shuts its output down" $
+      it "ends the peer's stream when it shuts its output down" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           run handshaking ends `shouldReturn` ()
           run (concurrently (atServer (receivingUpTo 16)) (atClient (fst ^>> shutdownSend))) ends `shouldReturn` (BS.empty, ())
 
       -- Both handshakes are over first: the server writes its session tickets as it finishes, and a client that closed
       -- by then would make that write fail.
-      needs "TLS" $ it "ends the peer's stream when it closes" $
+      it "ends the peer's stream when it closes" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           run handshaking ends `shouldReturn` ()
           run (concurrently (atServer (receivingUpTo 16)) (atClient (fst ^>> close))) ends `shouldReturn` (BS.empty, ())
 
-      needs "TLS" $ it "ends the stream when the peer's socket closes without a close_notify" $
+      it "ends the stream when the peer's socket closes without a close_notify" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           run handshaking ends `shouldReturn` ()
           Socket.close (serverSocketOf ends)
           run (atClient (receivingUpTo 16)) ends `shouldReturn` BS.empty
 
-      needs "TLS" $ it "throws TlsError for a record that can't be decrypted, after sending the alert for it" $
+      it "throws TlsError for a record that can't be decrypted, after sending the alert for it" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           run handshaking ends `shouldReturn` ()
           -- An application data record of 16 zero bytes, which can be no more than the authentication tag of an empty
@@ -166,7 +160,7 @@ spec = do
           server `shouldSatisfy` P.just (P.hasInfix "BadRecordMac")
 
     describe "awaiting input" $ do
-      needs "TLS" $ it "waits for input and takes none of it" $
+      it "waits for input and takes none of it" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           let payload = "five!" :: ByteString
           (received, ()) <-
@@ -178,14 +172,14 @@ spec = do
               ends
           received `shouldBe` payload
 
-      needs "TLS" $ it "doesn't return while the peer sends nothing" $
+      it "doesn't return while the peer sends nothing" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           run handshaking ends `shouldReturn` ()
           run (atClient (fst ^>> within (millis 200) awaitInput)) ends `shouldReturn` Nothing
 
       -- The first receive takes a hundred of the bytes of a record, and the rest of them are decrypted, in rustls,
       -- while the socket has nothing.
-      needs "TLS" $ it "returns at once when the bytes are in hand" $
+      it "returns at once when the bytes are in hand" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           let payload = BS.pack (take 1000 (cycle [0 .. 250]))
           run (concurrently (atClient shaken) (atServer (shaken >>> sending [payload] >>> done)) >>> done) ends `shouldReturn` ()
@@ -193,7 +187,7 @@ spec = do
             run (atClient ((,) <$> receivingUpTo 100 <*> ((,) <$> (fst ^>> within (secs 5) awaitInput) <*> receivingUpTo 1000))) ends
           (one, waited, other) `shouldBe` (BS.take 100 payload, Just (), BS.drop 100 payload)
 
-      needs "TLS" $ it "returns at the end of the stream" $
+      it "returns at the end of the stream" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           run handshaking ends `shouldReturn` ()
           run (concurrently (atClient (fst ^>> within (secs 5) awaitInput)) (atServer (fst ^>> close))) ends `shouldReturn` (Just (), ())
@@ -201,7 +195,7 @@ spec = do
 
     describe "a link's lifetime" $ do
       -- TLS 1.3's session tickets precede these application bytes.
-      needs "TLS" $ it "keeps the server name alive for the tickets, after the setup returns" $
+      it "keeps the server name alive for the tickets, after the setup returns" $
         withEnds "server" (verifying "ca.crt") $ \ends -> do
           run handshaking ends `shouldReturn` ()
           reclaimTemporaryBuffers
@@ -210,13 +204,13 @@ spec = do
           received `shouldBe` payload
 
   describe "the calls that never wait" $ do
-    needs "TLS" $ it "give nothing while the peer sends nothing" $
+    it "give nothing while the peer sends nothing" $
       withEnds "server" (verifying "ca.crt") $ \ends -> do
         handshaken ends
         allocaBytes 16384 $ \buffer ->
           replicateM_ 2 (linkTryReceive (clientLinkOf ends) buffer 16384 `shouldReturn` Nothing)
 
-    needs "TLS" $ it "throw the socket's error as an IOException" $
+    it "throw the socket's error as an IOException" $
       withEnds "server" (verifying "ca.crt") $ \ends -> do
         handshaken ends
         Socket.close (clientSocketOf ends)
@@ -224,7 +218,7 @@ spec = do
           linkTryReceive (clientLinkOf ends) buffer 16384
             `shouldSatisfy` P.throws (displayException @IOException P.>>> P.eq "recv: invalid argument (Bad file descriptor)")
 
-    needs "TLS" $ it "bound the output they retain when the peer stops reading, and resume without loss" $
+    it "bound the output they retain when the peer stops reading, and resume without loss" $
       withEnds "server" (verifying "ca.crt") $ \ends -> do
         Socket.setSocketOption (clientSocketOf ends) Socket.SendBuffer 4096
         handshaken ends
@@ -244,7 +238,7 @@ spec = do
 
     -- All that a receive needs to allocate is its result, a 'Just' and an 'Int', and the call's own arguments. The bound
     -- leaves room for what measuring it adds.
-    needs "TLS" $ it "allocate next to nothing for bytes that are ready" $
+    it "allocate next to nothing for bytes that are ready" $
       withEnds "server" (verifying "ca.crt") $ \ends -> do
         handshaken ends
         let client = clientLinkOf ends
@@ -259,7 +253,7 @@ spec = do
           maximum (concat costs) `shouldSatisfy` P.lte 128
 
   describe "a configuration" $ do
-    needs "TLS" $ it "keeps cached server names alive after a connection closes" $ do
+    it "keeps cached server names alive after a connection closes" $ do
       config <- newTlsConfig (verifying "ca.crt") "localhost"
       replicateM_ 2 $ do
         withEndsOf config "server" (verifying "ca.crt") $ \ends -> do

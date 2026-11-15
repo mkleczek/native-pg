@@ -51,7 +51,7 @@ import qualified Data.ByteString.Unsafe as BS
 import Data.Foldable (for_)
 import Data.Int (Int64)
 import Data.Word (Word16, Word32, Word8)
-import Database.PostgreSQL.Transport (RootCertificates (..), ServerVerification (..), TlsError (..), TlsLink (..), TlsSettings (..), TlsVersion (..), serverEndPoint)
+import Database.PostgreSQL.Transport (Handshake (..), RootCertificates (..), ServerVerification (..), TlsError (..), TlsLink (..), TlsSettings (..), TlsVersion (..), serverEndPoint)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString, withCStringLen)
@@ -64,8 +64,7 @@ import Foreign.Marshal.Utils (copyBytes, fromBool, with)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (Storable, peek, pokeByteOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
-import Network.Socket (Socket, close, withFdSocket)
-import Network.Streaming.NotImplemented (notImplementedIO)
+import Network.Socket (Socket, ShutdownCmd (ShutdownSend), close, shutdown, withFdSocket)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- | A version's number in TLS.
@@ -184,13 +183,65 @@ systemVerifierMade :: MVar (Maybe (Ptr ServerCertVerifier))
 systemVerifierMade = unsafePerformIO (newMVar Nothing)
 {-# NOINLINE systemVerifierMade #-}
 
--- | The link of the connection, which a connection of native-pg uses it through, for the
--- settings that its handshake is checked against. A stub, until the calls are there.
+-- | The link of the connection, which native-pg's connections use it through: its calls that never wait, and the
+-- handshake's, for the settings that the handshake is checked against.
 tlsLinkOf :: TlsSettings -> TlsConnection -> TlsLink
-tlsLinkOf _ tls = TlsLink (tlsSocket tls) (\_ _ -> unfinished) (const unfinished) unfinished unfinished unfinished unfinished unfinished
+tlsLinkOf settings tls =
+  TlsLink
+    { linkSocket = tlsSocket tls,
+      linkTryReceive = receiveTls tls,
+      linkTrySend = sendTls tls,
+      linkFlush = flushTls tls,
+      linkHasInput = hasInput tls,
+      linkHandshake = handshakeStep settings tls,
+      linkShutdownSend = shutdownTls tls,
+      linkEnd = closeTls tls
+    }
+
+-- | Whether input is in hand: decrypted bytes, or the end of the stream. rustls wants no more bytes while it holds
+-- decrypted ones, or has been told that the stream ends. Otherwise it reads what the socket has, which may be records
+-- without any, such as TLS 1.3's session tickets, and asks again.
+hasInput :: TlsConnection -> IO Bool
+hasInput tls = do
+  wanting <- withConnection tls c_connection_wants_read
+  if wanting == CBool 0
+    then pure True
+    else
+      readRecords tls >>= \case
+        Read -> hasInput tls
+        WouldBlock -> pure False
+        Ended -> pure True
+
+-- | The next of the handshake's steps, which don't wait: what the handshake needs before it can go on, or its end, with
+-- the data for channel binding. Its own records are written first. A server that has to choose ALPN's @postgresql@, as
+-- one does when TLS starts directly, and doesn't, ends the connection.
+handshakeStep :: TlsSettings -> TlsConnection -> IO Handshake
+handshakeStep settings tls = do
+  flushed <- flushTls tls
+  handshaking <- isHandshaking tls
+  if
+    | not flushed -> pure NeedsRoom
+    | not handshaking -> Complete <$> finished
+    | otherwise ->
+        readRecords tls >>= \case
+          Read -> handshakeStep settings tls
+          WouldBlock -> pure NeedsInput
+          Ended -> throwIO (TlsError "the connection closed during the handshake")
   where
-    unfinished :: IO a
-    unfinished = notImplementedIO "the link of a TLS connection"
+    finished = do
+      when (tlsAlpnRequired settings) $ do
+        protocol <- alpnProtocol tls
+        unless (protocol == "postgresql") $ do
+          closeTls tls
+          throwIO (TlsError "direct SSL connection was established without ALPN protocol negotiation extension")
+      channelBinding tls
+
+-- | Tells the peer that the output ends, if the socket takes it at once, and ends the socket's output.
+shutdownTls :: TlsConnection -> IO ()
+shutdownTls tls =
+  ( (withConnection tls c_connection_send_close_notify *> void (flushTls tls) *> shutdown (tlsSocket tls) ShutdownSend)
+      `catch` \(_ :: IOException) -> pure ()
+  )
 
 -- | A TLS connection over a socket.
 data TlsConnection = TlsConnection
@@ -473,6 +524,9 @@ foreign import capi unsafe "rustls.h rustls_connection_set_buffer_limit"
 
 foreign import capi unsafe "rustls.h rustls_connection_is_handshaking"
   c_connection_is_handshaking :: Ptr RustlsConnection -> IO CBool
+
+foreign import capi unsafe "rustls.h rustls_connection_wants_read"
+  c_connection_wants_read :: Ptr RustlsConnection -> IO CBool
 
 foreign import capi unsafe "rustls.h rustls_connection_wants_write"
   c_connection_wants_write :: Ptr RustlsConnection -> IO CBool
