@@ -7,6 +7,7 @@
 -- have holes, which are bytes that a stream gives: they are sent as the stream gives them.
 module Database.PostgreSQL.Internal.Frontend
   ( sendOutput,
+    Room (..),
     sendStreamed,
     sync,
   )
@@ -25,7 +26,7 @@ import Database.PostgreSQL.Internal.Carrier (Carrier)
 import Foreign.ForeignPtr (withForeignPtr)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes (Effect (..), Link (..), Runtime, Scope (..), view)
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateA, tap)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, iterateA, tap)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
 
 -- | What is left to send: the carrier, the buffer that the writer renders into, and the writer.
@@ -72,11 +73,16 @@ sendOutput =
 sync :: Output
 sync = serialize Sync
 
--- | What a send that has holes has in hand: the carrier, the loans of the request that the writer's buffer is borrowed from, what
--- the streams' state is taken from, the writer, and what the streams have given.
+-- | Where a send that has holes renders what it sends: into a buffer that it borrows from the loans of the request for each part
+-- that it renders, and gives back before it pulls a stream, or into the buffer of a loan that its caller holds, which stays the
+-- caller's.
+data Room = Borrowed Loans | Held Loan
+
+-- | What a send that has holes has in hand: the carrier, where the writer's buffer is, what the streams' state is taken from, the
+-- writer, and what the streams have given.
 data Streamed p = Streamed
   { streamCarrier :: Carrier,
-    streamLoans :: Loans,
+    streamRoom :: Room,
     streamInput :: p,
     streamWriter :: Writer,
     -- | The rest of the piece that a stream gave last, which no hole has taken yet.
@@ -103,13 +109,16 @@ data Taking p = Taking !(Streamed p) !Int !Int
 -- its holes are full. No byte that a stream gave beyond its holes is sent.
 --
 -- The writer renders into a buffer that is borrowed from the loans, for each part of the output that is rendered and sent,
--- and is given back before a stream is pulled, so that a stream may borrow of the loans itself.
-sendStreamed :: (Runtime arr) => arr (Int, p) (Maybe ByteString) -> arr (Carrier, Loans, p, Output) ()
+-- and is given back before a stream is pulled, so that a stream may borrow of the loans itself; or else into the buffer of the
+-- loan that the caller holds.
+sendStreamed :: (Runtime arr) => arr (Int, p) (Maybe ByteString) -> arr (Carrier, Room, p, Output) ()
 sendStreamed pull =
-  (\(carrier, loans, input, output) -> Streamed carrier loans input (outputWriter output) BS.empty 0 0)
+  (\(carrier, room, input, output) -> Streamed carrier room input (outputWriter output) BS.empty 0 0)
     ^>> iterateA (burst >>> next')
   where
-    burst = scope (streamLoans ^>> borrow) (fst ^>> release) (now renderStreamed >>> shown ^>> consume sendPieces)
+    -- A loan that was borrowed is given back, and one that was held is not.
+    burst = scope (streamRoom ^>> roomed) (fst ^>> (done ||| release)) (now (renderStreamed . first (either id id)) >>> shown ^>> consume sendPieces)
+    roomed = (\case Held loan -> Left loan; Borrowed loans -> Right loans) ^>> (arr Left ||| (borrow >>^ Right))
     shown (Showing carrier pieces following) = ((carrier, pieces), following)
     sendPieces = somePieces ^>> (returnA ||| sendAll)
     somePieces (carrier, pieces) = if null pieces then Left () else Right (carrier, pieces)

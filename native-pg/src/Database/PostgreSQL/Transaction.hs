@@ -111,7 +111,7 @@ import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..), InPlace)
 import Database.PostgreSQL.Errors (ConnectionError (..), QueryError (..), ServerError (..), StatementError (..), UsageError (..), isConnectionFatal)
 import Database.PostgreSQL.Internal.Diagnostics (bodyDiagnostics)
-import Database.PostgreSQL.Internal.Frontend (sendOutput, sendStreamed, sync)
+import Database.PostgreSQL.Internal.Frontend (Room (..), sendOutput, sendStreamed, sync)
 import Database.PostgreSQL.Internal.Protocol.Codec.Cursor
   ( At (..),
     CursorError (..),
@@ -143,7 +143,7 @@ import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Buffer (Buffer (bufferCapacity))
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, _1, _2, alongside, boolA, concurrently, consume, done, iterateA, iterateWith, keeping, on, tap, through, undoing)
-import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, loansOf, release)
+import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, loanIsPrimary, loansOf, release)
 import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity, readerMemory)
 import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
@@ -741,10 +741,13 @@ foldRows step start result = const start ^>> iterateA (keeping (nextRow result) 
 pipeline :: (Runtime arr) => Ending -> Pipeline arr p a -> (a -> With Tx arr x y) -> With Tx arr (p, x) y
 pipeline finality (Pipeline _ sent value) reading =
   tap (done >>> moved >>> readyToSend)
-    >>> withTx (layout finality streams numbered)
-    >>> ((program ||| atOnce) ||| inTurn)
+    >>> withTx (layout finality streams streamsAlone numbered)
+    >>> ((program ||| (atOnce ||| onBuffer)) ||| inTurn)
   where
     streams = List.any (isJust . streamOf) sent
+    -- Whether the one statement of the pipeline that gives a result is the one that streams.
+    streamsAlone = case filter gives sent of [item] -> isJust (streamOf item); _ -> False
+    gives = \case Prepare _ _ -> False; Close _ -> False; _ -> True
     numbered = numberStreams sent
     program = reading (value 0)
     inTurn = consume transmit >>> program
@@ -755,9 +758,18 @@ pipeline finality (Pipeline _ sent value) reading =
         >>> sharing (regrouped ^>> concurrently (fst ^>> request) (snd ^>> program) >>^ snd)
     regrouped (output, input, rest) = ((input, output), rest)
     request =
-      withTx (\tx (input, output) -> pure (carrierOf tx, loansOf (txLoan tx), input, output))
+      withTx (\tx (input, output) -> pure (carrierOf tx, Borrowed (loansOf (txLoan tx)), input, output))
         >>> lift (sendStreamed (selecting (concatMap puller sent)))
         >>> inTx (\tx -> writeIORef (txSending tx) False)
+    -- Sent in turn with the reading, as a send in turn is, from the buffer of the transaction: the request had no other to lend.
+    onBuffer =
+      regrouped
+        ^>> consume
+          ( withTx (\tx (input, output) -> setAside tx >> pure (carrierOf tx, Held (txLoan tx), input, output))
+              >>> lift (sendStreamed (selecting (concatMap puller sent)))
+              >>> inTx (\tx -> bringBack tx >> writeIORef (txSending tx) False)
+          )
+        >>> program
 
 -- | The connection's carrier of the transaction.
 carrierOf :: Tx -> Carrier
@@ -804,10 +816,14 @@ readyToSend = inTx check >>> drain True
       when (stFinal s || stEnded s) (throwIO AfterFinal)
 
 -- | The output of a pipeline of the program, and how it is sent: not at all if there is nothing to send, in turn with the
--- reading if it is no larger than one buffer and no statement of it streams, and else at once with it. What the server is
--- to answer is put in the queue of the transaction, once all of it is rendered.
-layout :: Ending -> Bool -> [(Maybe Int, Sent arr p)] -> Tx -> (p, x) -> IO (Either (Either x (Output, p, x)) (Output, x))
-layout finality streams sent tx (input, rest) = do
+-- reading if it is no larger than one buffer and no statement of it streams, and else at once with it, which takes a second
+-- buffer, borrowed from the request. A request that has none to lend, since its primary is held by what the program streams from,
+-- sends a pipeline of which one statement gives a result, and it is the one that streams, in turn with the reading, from the
+-- buffer of the transaction: nothing is answered before what it sends is all in the socket but what follows the stream, which is
+-- a few bytes. Else the pipeline is refused, before anything is sent. What the server is to answer is put in the queue of the
+-- transaction, once all of it is rendered.
+layout :: Ending -> Bool -> Bool -> [(Maybe Int, Sent arr p)] -> Tx -> (p, x) -> IO (Either (Either x (Either (Output, p, x) (Output, p, x))) (Output, x))
+layout finality streams streamsAlone sent tx (input, rest) = do
   s <- inspect tx
   user <- traverse (rendered input) sent
   let starting = [(Entry (txBegin tx) Passed, txBeginOutput tx) | not (stBegun s), not (null sent) || finality == Final]
@@ -816,11 +832,13 @@ layout finality streams sent tx (input, rest) = do
     [] -> pure (Left (Left rest))
     queued -> do
       output <- evaluate (foldMap snd queued <> sync)
+      let !together = streams || outputLength output > bufferCapacity (loanBuffer (txLoan tx))
+      when (together && not (loanIsPrimary (txLoan tx)) && not streamsAlone) (throwIO NoBufferToSend)
       modify tx (const s {stBegun = True, stFinal = stFinal s || finality == Final, stPending = map fst queued, stIndex = 0, stBase = length starting, stRows = 0, stTags = [], stOwed = True})
       writeIORef (txSending tx) True
       pure $
-        if streams || outputLength output > bufferCapacity (loanBuffer (txLoan tx))
-          then Left (Right (output, input, rest))
+        if together
+          then Left (Right (if loanIsPrimary (txLoan tx) then Left (output, input, rest) else Right (output, input, rest)))
           else Right (output, rest)
   where
     plain text = statementOutput text [] [] []

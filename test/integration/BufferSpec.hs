@@ -221,45 +221,44 @@ spec socketPath port = describe "bounded buffers" $ forM_ runners $ \runner@(Run
     -- in the one loan that is left, and the sender has none to borrow, so it renders into the transaction's own buffer while
     -- nothing is owed. A pipeline that has another result besides the one that streams is sent while it is read, which takes a
     -- second buffer that the request hasn't got: it fails before anything is sent, and the connection stays usable.
-    needs "a stream that holds the request's primary buffer" $
-      describe "a stream that holds the primary buffer" $ do
-        let held :: Program a -> IO a
-            held = sharing
-        it "is streamed into a parameter, the transaction sending and reading in its own buffer" $
-          held (session scram (holding 1000 (echoing [1000]))) `shouldReturn` Right (alphabet 1000)
-        it "is streamed into two parameters of a statement, the length of the second sent between the pieces" $
-          held (session scram (holding 1000 (echoing [400, 600]))) `shouldReturn` Right (alphabet 1000)
-        it "is streamed into a statement that is prepared in the same pipeline" $
-          held (session scram (holding 1000 (echoingPrepared 1000))) `shouldReturn` Right (alphabet 1000)
-        it "is streamed with buffers of 16 bytes" $
-          tiny (session scram (holding 5000 (echoing [5000]))) `shouldReturn` Right (alphabet 5000)
-        it "is refused by a pipeline that has another result before the statement that streams, and nothing is sent" $
-          held
-            ( session scram $
-                steps
-                  [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32))) `before` Tx.statement (echoStatement [100])) discardBoth) `failsAs` noBuffer,
-                    selectOne `yields` Right [1]
-                  ]
-            )
-            `shouldReturn` ()
-        it "is refused by a pipeline that has another result after the statement that streams, and nothing is sent" $
-          held
-            ( session scram $
-                steps
-                  [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (echoStatement [100]) `before` Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32)))) discardBoth) `failsAs` noBuffer,
-                    selectOne `yields` Right [1]
-                  ]
-            )
-            `shouldReturn` ()
-        it "has a pipeline that is larger than a buffer and streams nothing refused too, and nothing is sent" $
-          held
-            ( session scram $
-                steps
-                  [ holding 0 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate 1000 'y')] (single @_ @Int32)))) Tx.discard) `failsAs` noBuffer,
-                    selectOne `yields` Right [1]
-                  ]
-            )
-            `shouldReturn` ()
+    describe "a stream that holds the primary buffer" $ do
+      let held :: Program a -> IO a
+          held = sharing
+      it "is streamed into a parameter, the transaction sending and reading in its own buffer" $
+        held (session scram (holding 1000 (echoing [1000]))) `shouldReturn` Right (alphabet 1000)
+      it "is streamed into two parameters of a statement, the length of the second sent between the pieces" $
+        held (session scram (holding 1000 (echoing [400, 600]))) `shouldReturn` Right (alphabet 1000)
+      it "is streamed into a statement that is prepared in the same pipeline" $
+        held (session scram (holding 1000 (echoingPrepared 1000))) `shouldReturn` Right (alphabet 1000)
+      it "is streamed with buffers of 16 bytes" $
+        tiny (session scram (holding 5000 (echoing [5000]))) `shouldReturn` Right (alphabet 5000)
+      it "is refused by a pipeline that has another result before the statement that streams, and nothing is sent" $
+        held
+          ( session scram $
+              steps
+                [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32))) `before` Tx.statement (echoStatement [100])) discardBoth) `failsAs` noBuffer,
+                  selectOne `yields` Right [1]
+                ]
+          )
+          `shouldReturn` ()
+      it "is refused by a pipeline that has another result after the statement that streams, and nothing is sent" $
+        held
+          ( session scram $
+              steps
+                [ holding 100 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (echoStatement [100]) `before` Tx.from (const ()) (Tx.statement (plain "SELECT 1" (single @_ @Int32)))) discardBoth) `failsAs` noBuffer,
+                  selectOne `yields` Right [1]
+                ]
+          )
+          `shouldReturn` ()
+      it "has a pipeline that is larger than a buffer and streams nothing refused too, and nothing is sent" $
+        held
+          ( session scram $
+              steps
+                [ holding 0 (transactOn Tx.ReadCommitted Tx.Read Tx.Final (Tx.from (const ()) (Tx.statement (valued "SELECT length($1::text)" [Just (Char8.replicate 1000 'y')] (single @_ @Int32)))) Tx.discard) `failsAs` noBuffer,
+                  selectOne `yields` Right [1]
+                ]
+          )
+          `shouldReturn` ()
 
     -- A source that is slow makes the request wait for it, and the response is read meanwhile: one wait of the arrow, not two.
     it "uploads through a source that has nothing ready for every pull, waiting for it beside the socket" $ do

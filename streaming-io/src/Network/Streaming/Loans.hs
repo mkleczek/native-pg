@@ -15,6 +15,7 @@ module Network.Streaming.Loans
   ( Loans,
     Loan,
     loanBuffer,
+    loanIsPrimary,
     loansOf,
     withRequestBuffers,
     borrow,
@@ -65,6 +66,11 @@ twoLoans = userError "request already has two buffer loans"
 
 loanBuffer :: Loan -> Buffer
 loanBuffer (Loan _ _ _ buffer) = buffer
+
+-- | Whether the loan is the request's primary buffer. A request that has lent its primary to another part has an extra
+-- loan, and none more to lend.
+loanIsPrimary :: Loan -> Bool
+loanIsPrimary (Loan _ kind _ _) = case kind of Primary -> True; Extra -> False
 
 -- | The loans of the request that lent the loan, which a part that was given the loan borrows more from.
 loansOf :: Loan -> Loans
