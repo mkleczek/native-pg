@@ -32,13 +32,15 @@ import qualified Data.ByteString.Unsafe as BU
 import qualified Data.IntMap.Strict as IntMap
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (findIndex)
+import Data.Word (Word8)
 import Foreign.ForeignPtr (plusForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
+import Foreign.Storable (poke)
 import Network.Fulmen.Internal
 import Network.Fulmen.Internal.Accept (acceptor, listening)
 import Network.Fulmen.Internal.Body (BodyState (..), ConnectionLost (..), Marks (..), drain)
-import Network.Fulmen.Internal.Head (Framing (..), Parsed (..), Scan (..), parseHead, scanHead, startScan)
+import Network.Fulmen.Internal.Head (Framing (..), Parsed (..), Scan (..), Spill (..), joined, notYet, parseHead, scanHead, startScan)
 import Network.Fulmen.Internal.Response (Exchange (..), Phase (..), newExchange, refusal)
 import Network.Fulmen.Listen (Listen (..))
 import Network.Fulmen.Request (Method (..), Request (..), Version (..))
@@ -294,12 +296,25 @@ advance settings req@Req {reqConn = Conn {connSocket}, reqLoan, reqProgress} = d
       bytes = view buffer progressEnd
   case scanHead (lineLimit settings) (headLimit settings) (bufferCapacity buffer) bytes progressScan of
     Refused status -> pure (Finish (req, HeadRefused status))
-    Complete start stop -> do
+    Complete start stop spill -> do
       -- The head is copied and parsed while the bytes are there, and the request owns them.
-      let !owned = B.copy (B.take (stop - start) (B.drop start bytes))
+      let !owned = joined spill (B.copy (B.take (stop - max 0 start) (B.drop (max 0 start) bytes)))
       pure . Finish $ case parseHead (bodyLimit settings) owned of
         Left status -> (req, HeadRefused status)
         Right parsed -> (req, HeadGood parsed stop)
+    Full lineStart requestStart spill -> do
+      -- The buffer is full and the head goes on: its bytes are copied out, but for a CR that ends them, which stays at
+      -- the start of the buffer so that it is with the LF that follows it, and the buffer is received into again.
+      let keep = if BU.unsafeIndex bytes (progressEnd - 1) == 13 then 1 else 0
+          shift = progressEnd - keep
+          from = max 0 (min shift (if requestStart == notYet then lineStart else requestStart))
+          !piece = B.copy (B.take (shift - from) (B.drop from bytes))
+          !spill' = case spill of
+            NoSpill -> Spill (B.length piece) [piece]
+            Spill size pieces -> Spill (size + B.length piece) (piece : pieces)
+      when (keep == 1) $ withForeignPtr (bufferMemory buffer) (\target -> poke target (13 :: Word8))
+      writeIORef reqProgress progress {progressEnd = keep, progressScan = Scanning 0 (lineStart - shift) (if requestStart == notYet then notYet else requestStart - shift) spill'}
+      pure (Again ((connSocket, Room buffer keep (bufferCapacity buffer - keep)), req))
     scanning
       | progressEnded -> pure (Finish (req, HeadEnded))
       | otherwise ->

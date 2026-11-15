@@ -122,7 +122,6 @@ marked c = maybe id xfail (expectedFailure c)
 expectedFailure :: Case -> Maybe String
 expectedFailure c
   | caseName c `elem` served = Nothing
-  | caseName c `elem` needingLargeHeads = Just "the limits of the head are the buffer's still (step 3)"
   | caseArea c == AChunked || caseName c `elem` needingChunkedBodies = Just "chunked request bodies are not there yet (step 3)"
   | caseArea c == AExpect = Just "Expect: 100-continue is not there yet (step 3)"
   | caseArea c == ATimeouts = Just "the client timeout is not there yet (step 3)"
@@ -136,16 +135,6 @@ served =
     "a handler that ignores the body of an expecting request does not leave the connection in limbo",
     "an HTTP/1.0 request with Expect: 100-continue and its body is answered",
     "a body that arrives slowly but within the timeout is read in full"
-  ]
-
--- | The cases of a head that is more than the buffer, or a line that is.
-needingLargeHeads :: [String]
-needingLargeHeads =
-  [ "with the default settings a header line of 40000 bytes is served",
-    "with the default settings a head of 100 lines of 400 bytes, which is more than the buffer, is served",
-    "a head that is more than the buffer, whose lines are cut at the end of the buffer where a CR and a LF are, is served",
-    "a request with a header line of 40000 bytes and a body is answered with the body",
-    "a head that is more than the buffer is followed by the request that came with it"
   ]
 
 -- | The cases of the other areas that send a chunked request body that is to be decoded.

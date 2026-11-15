@@ -49,15 +49,15 @@ import Network.Streaming.Pool (newPool)
 import Network.Streaming.PositiveInt (positiveInt)
 
 -- | A server of one worker for each core, with a pool of 16 buffers of 16 KiB for requests in flight, 2 of them in
--- reserve, and 2 for setup, a line limit of 16 KiB, a head limit of 64 KiB, no limit on bodies, and a silent client
--- given 30 seconds.
+-- reserve, and 2 for setup, a line limit and a head limit of 50 KiB, which are Warp's default for the whole head, no limit
+-- on bodies, and a silent client given 30 seconds.
 defaultSettings :: Settings
 defaultSettings =
   Settings
     (BufferPoolSettings (positiveInt @16384) (positiveInt @16) (positiveInt @2) (positiveInt @2))
     1
-    16384
-    65536
+    51200
+    51200
     Nothing
     (Just (secs 30))
 

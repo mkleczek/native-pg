@@ -33,12 +33,12 @@ data Settings = Settings
     -- | How many workers each core has at startup, which is how many connections
     -- it serves at once: its share of the connection cap.
     connectionsPerCore :: Int,
-    -- | The bytes that a request line or a header line may take, as well as a
-    -- chunk-size line and a trailer line: the size of the line buffer. A longer
-    -- request line is answered with 414, and a longer header line with 431.
+    -- | The bytes that a request line or a header line may take. A longer request line is answered with 414, and a longer
+    -- header line with 431. A line may be longer than a buffer: the head is read in as many fills of the buffer as it
+    -- takes, up to its limit. A chunk-size line and a trailer line of a chunked body must fit a buffer as well.
     lineLimit :: Int,
     -- | The bytes that the whole head, the request line and the header fields,
-    -- may take. A longer head is answered with 431.
+    -- may take, however many buffers they come in. A longer head is answered with 431.
     headLimit :: Int,
     -- | The bytes that a request body may have, if limited. A longer body is
     -- answered with 413.

@@ -215,12 +215,13 @@ headersBody method target fields =
 data Settings = Settings
   { lineLimit :: Maybe Int
     -- ^ Bytes a request line or header line (and a chunk-size or trailer
-    -- line) may take, the size of the server's line buffer. Default 16384.
+    -- line) may take, the server's line limit, which a line buffer does not
+    -- bound except for a chunk-size or trailer line. Default 51200.
     -- Cases do not probe the exact boundary, only well inside and well
     -- outside it.
   , headLimit :: Maybe Int
     -- ^ Bytes the whole head (request line and header fields) may take.
-    -- Default: the server's own, larger than 'lineLimit'.
+    -- Default: the server's own, 51200.
   , bodyLimit :: Maybe Int
     -- ^ Bytes a request body may have. Default: none that a case reaches.
   , timeoutMs :: Maybe Int
@@ -747,7 +748,7 @@ headLimitCases =
       (refused 414)
       & withSettings smallLine
       & note "Warp's test feeds an endless line with no newline; Warp answers 400. fulmen answers 414 as soon as the buffer is full, without waiting for a line end."
-  , mk AHeadLimits (Spec "a line that fits the buffer is accepted")
+  , mk AHeadLimits (Spec "a line that fits the line limit is accepted")
       "a request line that fits the buffer is served"
       Headers
       [Send (get ("/" <> B.replicate 900 97))]
@@ -772,16 +773,16 @@ headLimitCases =
       [Send (getWith ["X-Long: " <> B.replicate 900 97])]
       [stays [okHeaders "GET" "/" [hostLocal, ("X-Long", B.replicate 900 97)]]]
       & withSettings smallLine
-  , mk AHeadLimits (Spec "the default buffer is 16 KiB")
-      "with the default buffer a header line of 20000 bytes is answered 431"
+  , mk AHeadLimits (Spec "the default limits are not the buffer's")
+      "with the default settings a header line of 20000 bytes is served"
       Headers
       [Send (getWith ["X-Long: " <> B.replicate 20000 97])]
-      (refused 431)
-  , mk AHeadLimits (Spec "the default buffer is 16 KiB")
-      "with the default buffer a request line of 20000 bytes is answered 414"
+      [stays [okHeaders "GET" "/" [hostLocal, ("X-Long", B.replicate 20000 97)]]]
+  , mk AHeadLimits (Spec "the default limits are not the buffer's")
+      "with the default settings a request line of 20000 bytes is served"
       Headers
       [Send (get ("/" <> B.replicate 20000 97))]
-      (refused 414)
+      [stays [okHeaders "GET" ("/" <> B.replicate 20000 97) [hostLocal]]]
   , mk AHeadLimits (Warp "warp/streams-test/AnswerSpec.hs" "a client that has gone / serves a request that arrives during the answer after the answer (X-Long of 5000 bytes)")
       "with the default buffer a header line of 5000 bytes is served"
       Headers
