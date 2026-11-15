@@ -648,7 +648,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             `shouldReturn` (at <> "private key file \"" <> key <> "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root")
       -- The TLS configuration of settings is built in IO, when the settings are made, from the files, once. A connect
       -- makes a connection from it, and reads no file.
-      needs "TLS configs built once" $ it "connects with a configuration that was built from files that are gone" $
+      it "connects with a configuration that was built from files that are gone" $
         withCertificateCopy "ca.crt" $ \roots -> do
           settings <- settingsOf (tcp ("sslmode=verify-full sslrootcert=" <> Char8.pack roots <> " host=localhost hostaddr=127.0.0.1"))
           removeFile roots
@@ -659,7 +659,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         run (session settings encrypted) `shouldReturn` Right [True]
         run (session settings (alsoOn settings (onSecond encrypted))) `shouldReturn` Right [True]
       -- Settings whose configuration wasn't built fail, also with sslmode=prefer, which would otherwise connect without TLS.
-      needs "TLS configs built once" $ it "fails with TlsFailure, and says why, when the TLS configuration of the settings was never built" $
+      it "fails with TlsFailure, and says why, when the TLS configuration of the settings was never built" $
         forM_ ["sslmode=require", "sslmode=prefer", "sslmode=allow", "sslmode=verify-full sslrootcert=" <> Char8.pack (certificate "ca.crt")] $ \mode -> do
           settings <- unpreparedSettingsOf (tcp mode)
           result <- run (connectedTo settings done)
@@ -667,7 +667,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             Left (ConnectFailure [(_, TlsFailure reason)]) -> reason `shouldSatisfy` P.hasInfix "was not built"
             _ -> failTest ("expected a TlsFailure for " <> show mode)
       -- What a configuration was built for is part of it: settings that changed since don't use it.
-      needs "TLS configs built once" $ it "fails with TlsFailure when the settings changed after their TLS configuration was built" $ do
+      it "fails with TlsFailure when the settings changed after their TLS configuration was built" $ do
         settings <- settingsOf (tcp "sslmode=require")
         let verifying = settings {connectSslMode = SslVerifyFull (RootCertificateFile (certificate "ca.crt"))}
         result <- run (connectedTo verifying done)

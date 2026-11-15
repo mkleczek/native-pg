@@ -73,13 +73,13 @@ import Database.PostgreSQL.ConnectionString.Types (Host (..))
 import Database.PostgreSQL.Errors (ConnectError (..), ConnectFailure (..), UsageError (..))
 import Database.PostgreSQL.Internal.Carrier (Carrier (..), closeCarrier)
 import Database.PostgreSQL.Internal.Cares (Resolver)
-import Database.PostgreSQL.Internal.Encryption (NotMade (..), Securing (..), checkedRoots, requested, secured)
+import Database.PostgreSQL.Internal.Encryption (NotMade (..), Securing (..), prepareTls, requested, secured, unbuilt)
 import Database.PostgreSQL.Internal.Frontend (sendOutput)
 import Database.PostgreSQL.Internal.Protocol.Messages (BackendKey, pattern CancelRequest, serialize)
 import Database.PostgreSQL.Internal.Socket (connectSocket)
 import Database.PostgreSQL.Internal.Startup (startup)
 import Database.PostgreSQL.Session.Settings
-import Database.PostgreSQL.Transport (Address (..), RootCertificates, ServerVerification (..), TlsClient)
+import Database.PostgreSQL.Transport (Address (..), RootCertificates, ServerVerification (..), TlsClient, TlsPrepared (..))
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer, newBuffer)
@@ -87,10 +87,6 @@ import Network.Streaming.Classes (Effect (..), Exit (..), Link (receive), Room, 
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, done, iterateA)
 import Network.Streaming.Loans (Loans, withSetupBuffersOf)
 import Network.Streaming.PositiveInt (positiveInt)
-
--- | The settings, with the TLS configuration of each of their hosts built. (A stub: it builds nothing yet.)
-prepareTls :: ConnectSettings -> IO ConnectSettings
-prepareTls = pure
 
 -- | Connects to the first of the settings' hosts that qualifies: the settings' own, then the settings of its fallbacks,
 -- in order. For each it connects the socket as its address says, the Unix-domain socket or the address, which a host name
@@ -170,7 +166,7 @@ connecting = servable ^>> (arr Left ||| withSetupBuffersOf (theBuffer ^>> connec
 encrypting :: ConnectSettings -> Maybe ConnectError
 encrypting settings = case (connectAddress settings, connectSslMode settings, connectTlsClient settings) of
   (UnixAddress _, _, _) -> Nothing
-  (_, _, Just _) -> Nothing
+  (_, _, Just _) -> unbuilt settings
   (_, SslRequire, Nothing) -> Just (without "require")
   (_, SslVerifyFull _, Nothing) -> Just (without "verify-full")
   _ -> Nothing
@@ -225,9 +221,10 @@ attempting use = planned ^>> rootsChecked >>> (arr Left ||| tries) >>^ either (\
       (Left failed, Just (Retry again securing)) | again failed -> Left (settings, (securing, buffer))
       _ -> Right result
 
--- | The input, or the failure of the root certificate file's not being there, which libpq finds out before it connects.
-rootsChecked :: (Runtime arr) => arr (ConnectSettings, Plan, Buffer) (Either NotMade (ConnectSettings, Plan, Buffer))
-rootsChecked = now (\input@(_, Plan roots _ _, _) -> maybe (pure (Right input)) (fmap (maybe (Right input) (Left . NotMade False)) . checkedRoots) roots)
+-- | The input, or the failure of the root certificate file's not being there, which libpq finds out before it connects,
+-- and which 'prepareTls' found out when the settings were made.
+rootsChecked :: (Arrow arr) => arr (ConnectSettings, Plan, Buffer) (Either NotMade (ConnectSettings, Plan, Buffer))
+rootsChecked = arr (\input@(settings, Plan roots _ _, _) -> maybe (Right input) (const (maybe (Right input) (Left . NotMade False . TlsFailure) (connectTlsPrepared settings >>= preparedRootsProblem))) roots)
 
 -- | One attempt: a new socket, TLS over it as the securing says, if there is one, and the use made of it.
 oneTry :: (Runtime arr) => Use arr a -> arr (ConnectSettings, (Maybe Securing, Buffer)) (Either NotMade a)
