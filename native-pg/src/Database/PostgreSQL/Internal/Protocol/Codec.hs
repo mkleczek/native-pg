@@ -297,6 +297,7 @@ instance Serializable (Maybe Parameter) 'MaybeBytes32Atom where
   serializeField Nothing = int32 (-1)
   serializeField (Just (ParameterBytes value)) = int32 (parameterLengthAsInt32 (BS.length value)) <> bytes value
   serializeField (Just (ParameterChunks chunks)) = int32 (parameterLengthAsInt32 (sum (map BS.length chunks))) <> outputs bytes chunks
+  serializeField (Just (ParameterStream _)) = error "a streamed parameter has no bytes to serialize: a transaction sends it from the stream of its statement"
   {-# INLINE serializeField #-}
 
 parameterLengthAsInt32 :: Int -> Int32

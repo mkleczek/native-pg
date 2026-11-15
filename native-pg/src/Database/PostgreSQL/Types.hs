@@ -57,3 +57,7 @@ data Parameter
   | -- | Sent one after another, each from where it is, as the serializer sends a
     -- long one, so that they aren't copied into one first.
     ParameterChunks [ByteString]
+  | -- | This many bytes of the stream of the statement that takes the parameter: they are not there to serialize, and a
+    -- transaction sends them from the stream, as 'Database.PostgreSQL.Transaction.FromStream' does. A statement from a snippet
+    -- marks the parameter that it streams so.
+    ParameterStream Int

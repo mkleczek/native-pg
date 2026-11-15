@@ -439,6 +439,7 @@ paramView (Param oid format value) = (oid, format, bytes <$> value)
   where
     bytes (ParameterBytes strict) = strict
     bytes (ParameterChunks chunks) = BS.concat chunks
+    bytes (ParameterStream _) = error "a streamed parameter has no bytes"
 
 failsWith :: String -> Predicate IO (Either String a)
 failsWith message = P.left (P.hasInfix message)
