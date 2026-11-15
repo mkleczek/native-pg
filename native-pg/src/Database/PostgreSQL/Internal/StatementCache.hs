@@ -80,6 +80,7 @@ data Reserved = Reserved {reservedName :: !ByteString, reservedClose :: !(Maybe 
 -- | What the part that reads the answers tells the cache.
 data Memory = Memory {memoryParsed :: IO (), memoryClosed :: IO (), memoryFailed :: IO ()}
 
+
 -- | Looks the key up. A statement that is there is marked as used now, and takes a name to close if there is one.
 find :: (Typeable k, Hashable k) => Statements -> k -> IO Looked
 find (Statements limit ref clock) key

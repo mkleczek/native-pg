@@ -217,6 +217,8 @@ data Sent arr p
   | forall row. Prepare ByteString (Statement arr p row)
   | forall row. ExecutePrepared ByteString (Statement arr p row)
   | forall k row. (Typeable k, Hashable k) => Cached (p -> k) (p -> ByteString) (Statement arr p row)
+  | -- | What a cached statement is for a run, once 'layoutCached' has looked it up: its entry and its messages.
+    Rendered Entry Output
   | Close ByteString
   | Command ByteString
 
@@ -285,6 +287,7 @@ from function (Pipeline count' sent value) = Pipeline count' (map sentFrom sent)
       Prepare name given -> Prepare name (taken given)
       ExecutePrepared name given -> ExecutePrepared name (taken given)
       Cached key makeSql given -> Cached (key . function) (makeSql . function) (taken given)
+      Rendered entry output -> Rendered entry output
       Close name -> Close name
       Command given -> Command given
     taken = \case
@@ -326,6 +329,7 @@ data Role
 
 -- | Whether a later read may pass the entry, as it isn't a result that the program has yet to read.
 entrySkippable :: Entry -> Bool
+{-# NOINLINE entrySkippable #-}
 entrySkippable entry = case entryRole entry of
   Wanted -> False
   Remembered _ -> False
@@ -786,10 +790,13 @@ foldRows step start result = const start ^>> iterateA (keeping (nextRow result) 
 pipeline :: (Runtime arr) => Ending -> Pipeline arr p a -> (a -> With Tx arr x y) -> With Tx arr (p, x) y
 pipeline finality (Pipeline _ sent value) reading =
   tap (done >>> moved >>> readyToSend)
-    >>> withTx (layout finality streams numbered)
+    >>> withTx (layouter finality streams numbered)
     >>> ((program ||| apart) ||| inTurn)
   where
     streams = List.any (isJust . streamOf) sent
+    -- A pipeline that has a cached statement looks the connection's cache up for it, as it is laid out.
+    layouter = if List.any isCached sent then layoutCached else layout
+    isCached = \case Cached {} -> True; _ -> False
     -- Whether the one statement of the pipeline that gives a result is the one that streams.
     streamsAlone = case filter gives sent of [item] -> isJust (streamOf item); _ -> False
     gives = \case Prepare _ _ -> False; Close _ -> False; _ -> True
@@ -913,14 +920,29 @@ layout finality streams sent tx (input, rest) = do
           -- The server starts statement_timeout at a Describe, and reads a Bind whole before it runs it, so it is described first
           -- for the time that the stream takes to count.
           pure (Entry (sql given) Wanted, Wire.serialize (Wire.Describe Wire.PreparedStatement name) <> boundStreamed name formats values)
-      Cached key makeSql given -> case source of
-        Nothing -> do
-          (types, formats, values) <- parametersOf (params given parameters)
-          cachedStatement tx (key parameters) makeSql parameters types False (\name -> boundOutput name formats values) (\text -> statementOutput text types formats values)
-        Just number -> do
-          (types, formats, values) <- argumentsOf number (params given parameters)
-          cachedStatement tx (key parameters) makeSql parameters types True (\name -> boundStreamed name formats values) (\text -> streamedStatementOutput text types formats values)
+      Rendered entry output -> pure (entry, output)
+      Cached {} -> throwIO (userError "a cached statement is laid out by layoutCached")
       Close name -> pure (Entry ("DEALLOCATE " <> name) Closing, Wire.serialize (Wire.Close Wire.PreparedStatement name))
+
+-- | The output of a pipeline that has a statement that the connection keeps prepared for a key, and how it is sent, as 'layout' says:
+-- the connection's cache is looked up for each such statement first, which becomes what it sends in this run, and the pipeline is laid
+-- out as one that has no cached statement. A pipeline that has none is laid out by 'layout' alone.
+layoutCached :: Ending -> Bool -> [(Maybe Int, Sent arr p)] -> Tx -> (p, x) -> IO (Either (Either x (Output, p, x)) (Output, x))
+layoutCached finality streams sent tx (input, rest) = do
+  resolvedSent <- traverse (resolving tx input) sent
+  layout finality streams resolvedSent tx (input, rest)
+
+-- | What the statement is for a run: a cached statement is what the cache makes of it, and any other is as it is.
+resolving :: Tx -> p -> (Maybe Int, Sent arr p) -> IO (Maybe Int, Sent arr p)
+resolving tx parameters (source, item) = case item of
+  Cached key makeSql given -> (source,) . uncurry Rendered <$> case source of
+    Nothing -> do
+      (types, formats, values) <- parametersOf (params given parameters)
+      cachedStatement tx (key parameters) makeSql parameters types False (\name -> boundOutput name formats values) (\text -> statementOutput text types formats values)
+    Just number -> do
+      (types, formats, values) <- argumentsOf number (params given parameters)
+      cachedStatement tx (key parameters) makeSql parameters types True (\name -> boundStreamed name formats values) (\text -> streamedStatementOutput text types formats values)
+  _ -> pure (source, item)
 
 -- | A statement that the connection keeps prepared for the key: the entry that stands for it, and its messages. A statement
 -- that the cache has is executed under its name: a Close of a name that the connection is to close goes before it, and for a
