@@ -91,18 +91,24 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
   -- use of the connection and the release, with a body that does nothing. The ceiling is what each arrow allocated when it
   -- was set: a change that makes a request dearer says so here, as one that makes it cheaper takes the ceiling down. With
   -- @POOL_COST_REPORT@ set, the case says what it measured, on stderr.
-  describe "a request that finds its connection free" $
+  describe "a request that finds its connection free" $ do
+    let costs :: String -> (ConnectionPoolSettings -> ConnectionPoolSettings) -> Double -> IO ()
+        costs label change ceiling' = pooled change $ \env -> do
+          void (pidOf env)
+          bytes <- perRequest env
+          lookupEnv "POOL_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("pool-cost " <> name <> " | " <> label <> " | " <> show (round bytes :: Int)))
+          when (bytes > ceiling' + 24) $
+            failTest ("a request allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round ceiling' :: Int))
     it "allocates no more than it did" $
-      pooled id $ \env -> do
-        void (pidOf env)
-        bytes <- perRequest env
-        lookupEnv "POOL_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("pool-cost " <> name <> " | withConnection | " <> show (round bytes :: Int)))
-        let ceiling' = case name of
-              "threads" -> 2560
-              "delimited" -> 2080
-              _ -> 3395
-        when (bytes > ceiling' + 24) $
-          failTest ("a request allocates " <> show (round bytes :: Int) <> " bytes, where the ceiling is " <> show (round ceiling' :: Int))
+      costs "withConnection" id $ case name of
+        "threads" -> 2560
+        "delimited" -> 2080
+        _ -> 3395
+    it "allocates no more than it did when the pool has an observer" $
+      costs "withConnection, observed" (\s -> s {poolObserver = Just (const (pure ()))}) $ case name of
+        "threads" -> 2648
+        "delimited" -> 2148
+        _ -> 3415
 
   -- What the pool does with its connections as it closes: those that are free close at once, and one that a request still
   -- has closes as the request gives it back.
@@ -168,14 +174,14 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         eventsOf events = reverse <$> readIORef events
         said events = map describeEvent <$> eventsOf events
 
-    needs "the pool's observer" $ it "tells of a connection that is made, used and given back, and of its closing with the pool" $ do
+    it "tells of a connection that is made, used and given back, and of its closing with the pool" $ do
       (events, change) <- observed id
       pooled change $ \env -> void (pidOf env *> pidOf env)
       said events
         `shouldReturn` ["connecting", "ready: established", "in use", "ready: succeeded", "in use", "ready: succeeded", "terminated: release"]
       map connectionOf <$> eventsOf events >>= \ids -> length (nub ids) `shouldBe` 1
 
-    needs "the pool's observer" $ it "tells of a use that failed without breaking its connection" $ do
+    it "tells of a use that failed without breaking its connection" $ do
       (events, change) <- observed id
       pooled change $ \env -> do
         onEnv env (withConnection (envPool env) (now (const (throwIO (userError "the use failed")))) `failsAs` \failure -> failure `shouldBe` userError "the use failed")
@@ -184,7 +190,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       said events
         `shouldReturn` ["connecting", "ready: established", "in use", "ready: failed", "in use", "ready: succeeded", "terminated: release"]
 
-    needs "the pool's observer" $ it "tells of a connection that a use broke, and of the one that replaces it" $ do
+    it "tells of a connection that a use broke, and of the one that replaces it" $ do
       (events, change) <- observed id
       pooled change $ \env -> do
         onEnv env (withinFor (millis 100) (withConnection (envPool env) (committed Tx.Read (Tx.statement sleeping) Tx.single))) `shouldReturn` Nothing
@@ -192,7 +198,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       said events
         `shouldReturn` ["connecting", "ready: established", "in use", "terminated: network error", "connecting", "ready: established", "in use", "ready: succeeded", "terminated: release"]
 
-    needs "the pool's observer" $ it "tells of a connection that the server ended, and of the one that replaces it" $ do
+    it "tells of a connection that the server ended, and of the one that replaces it" $ do
       (events, change) <- observed id
       pooled change $ \env -> do
         pid <- pidOf env
@@ -202,7 +208,7 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       said events
         `shouldReturn` ["connecting", "ready: established", "in use", "ready: succeeded", "terminated: network error", "connecting", "ready: established", "in use", "ready: succeeded", "terminated: release"]
 
-    needs "the pool's observer" $ it "tells of a connection that can't be made" $ do
+    it "tells of a connection that can't be made" $ do
       (events, change) <- observed id
       buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
       withConnectionPool (change (connectionPoolSettings 1 (unixSettings (socketPath <> "-missing") "postgres" Nothing))) $ \pool ->
