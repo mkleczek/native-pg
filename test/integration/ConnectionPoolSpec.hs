@@ -104,6 +104,11 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         "threads" -> 2560
         "delimited" -> 2100
         _ -> 3405
+    it "allocates no more than it did when the pool has a checkout timeout" $
+      costs "withConnection, with a timeout" (\s -> s {poolCheckoutTimeout = Just (secs 3600)}) $ case name of
+        "threads" -> 2576
+        "delimited" -> 2100
+        _ -> 3375
     it "allocates no more than it did when the pool has an observer" $
       costs "withConnection, observed" (\s -> s {poolObserver = Just (const (pure ()))}) $ case name of
         "threads" -> 2648
