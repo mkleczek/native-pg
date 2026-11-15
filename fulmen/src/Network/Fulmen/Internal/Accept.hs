@@ -113,7 +113,7 @@ foreign import ccall unsafe "accept"
 -- a connection doesn't keep the others of its core from running.
 acceptor :: forall arr. (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr Socket Socket
 acceptor =
-  giveWay >>> iterateWith (giving "accepted?" (step "try accept" attempt)) (taking "none waiting" (consume block))
+  giveWay >>> iterateWith (step "try accept" attempt `giving` "accepted?") (taking "none waiting" (consume block))
   where
     attempt listener =
       tryAccept @(ModeOf arr) listener >>= \case

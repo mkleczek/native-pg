@@ -81,10 +81,9 @@ withRequestBuffers body =
   where
     admit =
       fst
-        ^>> alongside ((\pool -> (1 + reserveCount pool, requestBuffers pool)) ^>> giving "primary buffer" checkoutAt)
-        >>> giving
-          "request loans"
-          (step "open loans" (\(buffer, pool) -> Loans pool buffer <$> newIORef (Open NotLent NoExtra 0)))
+        ^>> alongside ((\pool -> (1 + reserveCount pool, requestBuffers pool)) ^>> checkoutAt `giving` "primary buffer")
+        >>> step "open loans" (\(buffer, pool) -> Loans pool buffer <$> newIORef (Open NotLent NoExtra 0))
+          `giving` "request loans"
 
 -- | The request has ended. What it holds goes back to the pool, once, and a borrow of it that still waits is told.
 ended :: (Effect arr, Annotate arr) => arr Loans ()
@@ -102,7 +101,7 @@ ended =
 borrow :: (Runtime arr) => arr Loans Loan
 borrow =
   named (Label "borrow" "Lends the primary buffer if it is free, and else waits for an extra loan.") $
-    giving "loan free now?" (step "try borrow" immediately) >>> (taking "no" wait ||| taking "yes" returnA)
+    step "try borrow" immediately `giving` "loan free now?" >>> (taking "no" wait ||| taking "yes" returnA)
 
 -- | The primary if it isn't lent. Or else, if the extra place is free, a buffer of the pool if one is free now, and
 -- if none is, the loans, to wait for an extra loan with. No waiter that could have the buffer is queued, so it doesn't pass one.

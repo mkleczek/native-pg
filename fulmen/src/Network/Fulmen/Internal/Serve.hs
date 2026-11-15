@@ -87,13 +87,13 @@ serve !settings listen handler =
 acceptance :: (Runtime arr) => Listen arr -> arr Cores ()
 acceptance Listen {openListener, closeListener} =
   named (Label "acceptance" "Opens the listener, accepts connections, and gives each to a free worker of the core that has the most free workers.") $
-    scope (done >>> giving "listener" openListener) (fst ^>> closeListener) $
+    scope (done >>> openListener `giving` "listener") (fst ^>> closeListener) $
       tap (step "make listener non-blocking" (listening . fst)) >>> foreverA (tap place)
   where
     place =
       ( (,)
-          <$> giving "worker's address" (snd ^>> checkout)
-          <*> giving "accepted socket" (fst ^>> accept)
+          <$> (snd ^>> checkout) `giving` "worker's address"
+          <*> (fst ^>> accept) `giving` "accepted socket"
       )
         >>> alongside post
         >>> decide "worker took it?" untaken
@@ -135,7 +135,7 @@ freest workers = busiest >>= \core -> findIndex ((== core) . freeCore) workers
 worker :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
 worker settings handler =
   named (Label "worker" "Opens its inbox of connections, then offers itself as free, collects a connection, and serves it, for ever.") $
-    withInbox @"connections" closeLateSocket (foreverA (tap (giving "accepted socket" offered >>> connection settings handler)))
+    withInbox @"connections" closeLateSocket (foreverA (tap (offered `giving` "accepted socket" >>> connection settings handler)))
 
 -- | The socket that was left in the worker's inbox when it ended, which is closed.
 closeLateSocket :: (Runtime arr) => arr (Socket, Cores) ()
@@ -166,9 +166,8 @@ connection settings handler =
     scope (arr snd) (fst ^>> close) (snd ^>> serving)
   where
     serving =
-      giving
-        "Conn"
-        (step "make connection state" (\(shared, socket) -> (\carry -> Conn socket carry shared) <$> newIORef B.empty))
+      step "make connection state" (\(shared, socket) -> (\carry -> Conn socket carry shared) <$> newIORef B.empty)
+        `giving` "Conn"
         >>> tryA (requests settings handler)
         >>> done
 
@@ -177,13 +176,13 @@ requests :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Conn ()
 requests settings handler =
   named (Label "requests" "Serves request after request, while the connection is kept.") $
     typed @Conn @() $
-      iterateA (giving "connection kept?" (alongside one >>^ whileKept))
+      iterateA ((alongside one >>^ whileKept) `giving` "connection kept?")
   where
     whileKept (keep, conn) = if keep then Again conn else Finish ()
     -- An idle connection waits holding no buffer: a request is admitted once there is input.
     one =
       tap idle
-        >>> alongside (giving "buffer pool" (arr (sharedBuffers . connShared)))
+        >>> alongside (arr (sharedBuffers . connShared) `giving` "buffer pool")
         >>> withRequestBuffers (request settings handler)
 
 -- | Waits until the connection has input, which may be its end, unless it has bytes of a request already.
@@ -191,7 +190,7 @@ idle :: (Runtime arr) => arr Conn ()
 idle =
   named (Label "idle" "Waits until the connection has input, which may be its end, unless it has bytes in hand.") $
     typed @Conn @() $
-      giving "bytes carried over?" (step "check carry-over" ready)
+      step "check carry-over" ready `giving` "bytes carried over?"
         >>> (taking "no" awaitInput ||| taking "yes" returnA)
   where
     ready Conn {connSocket, connCarry} =
@@ -244,7 +243,7 @@ request settings handler =
   named (Label "request" "Reads the head of a request, runs the handler, and says whether the connection is kept.") $
     (fst &&& id)
       ^>> first borrow
-      >>> giving "Req" (step "copy carry-over" begin')
+      >>> step "copy carry-over" begin' `giving` "Req"
       >>> readHead settings
       >>> decide "how did the head end?" byHead
       >>> ((taking "stream ended" quit ||| taking "refused" refuse) ||| taking "good" (answered handler))
@@ -253,7 +252,7 @@ request settings handler =
       HeadEnded -> Left (Left ())
       HeadRefused status -> Left (Right (req, status))
       HeadGood parsed consumed -> Right (Headed req parsed consumed)
-    quit = giving "keep alive" (arr (const False))
+    quit = arr (const False) `giving` "keep alive"
     refuse =
       step
         "render refusal"
@@ -276,7 +275,7 @@ readHead :: (Runtime arr) => Settings -> arr Req (Req, Head)
 readHead settings =
   named (Label "readHead" "Receives until the head is there, or is refused, or the stream has ended.") $
     typed @Req @(Req, Head) $
-      iterateWith (giving "head complete?" (step "scan head" (advance settings))) (taking "needs more" more)
+      iterateWith (step "scan head" (advance settings) `giving` "head complete?") (taking "needs more" more)
   where
     more = first receive >>> step "record arrival" arrived
     arrived (count, req@Req {reqProgress}) = do
@@ -312,12 +311,13 @@ advance settings req@Req {reqConn = Conn {connSocket}, reqLoan, reqProgress} = d
 answered :: (Runtime arr) => arr (Call, Request) () -> arr Headed Bool
 answered handler =
   named (Label "answered" "Runs the handler on a request that has a head, and says whether the connection is kept.") $
-    giving "keep alive" $
-      typed @Headed @Prepared (step "prepare call" prepare)
+    ( typed @Headed @Prepared (step "prepare call" prepare)
         >>> decide "give back loan?" heldLoan
         >>> (taking "yes" (consume release) ||| taking "no" returnA)
         >>> alongside (tryA handler)
         >>> aftermath
+    )
+      `giving` "keep alive"
   where
     heldLoan Prepared {preparedCall, preparedRequest, preparedLoan} =
       maybe (Right (preparedCall, preparedRequest)) (\loan -> Left (loan, (preparedCall, preparedRequest))) preparedLoan
@@ -354,28 +354,25 @@ aftermath =
         | Just ConnectionLost <- fromException failure -> Left (Left ())
         | otherwise -> Left (Right call)
       Right () -> Right call
-    quit = giving "keep alive" (arr (const False))
+    quit = arr (const False) `giving` "keep alive"
     failed = step "check if answered" (\(Call _ _ exchange) -> unanswered exchange) >>> internalError
     finished =
-      giving
-        "response complete?"
-        ( step
-            "read response phase"
-            ( \call@(Call _ _ exchange) ->
-                readIORef (exPhase exchange) >>= \case
-                  Ended -> pure (Right call)
-                  Unanswered -> pure (Left (Just exchange))
-                  _ -> pure (Left Nothing)
-            )
+      step
+        "read response phase"
+        ( \call@(Call _ _ exchange) ->
+            readIORef (exPhase exchange) >>= \case
+              Ended -> pure (Right call)
+              Unanswered -> pure (Left (Just exchange))
+              _ -> pure (Left Nothing)
         )
+        `giving` "response complete?"
         >>> (taking "no" internalError ||| taking "yes" completed)
     -- The body that the handler didn't read is read now and dropped, if it is not too long.
     completed =
       (\(Call _ requestBody exchange) -> (requestBody, exchange))
         ^>> first drain
-        >>> giving
-          "keep alive"
-          (step "check keep alive" (\(drained, exchange) -> (drained &&) <$> readIORef (exKeep exchange)))
+        >>> step "check keep alive" (\(drained, exchange) -> (drained &&) <$> readIORef (exKeep exchange))
+          `giving` "keep alive"
     unanswered exchange = readIORef (exPhase exchange) >>= \case Unanswered -> pure (Just exchange); _ -> pure Nothing
     -- Answers 500 if nothing was answered, and ends the connection.
     internalError =

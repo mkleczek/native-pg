@@ -56,6 +56,10 @@
 - warn: {name: Use fst, lhs: consume x >>> done, rhs: fst ^>> x}
 - warn: {name: Use deliver, lhs: second x >>> fulfil >>> done, rhs: deliver x}
 
+# The names of both wires of an arrow are written around it by inout.
+- warn: {name: Use inout, lhs: "taking x (p `giving` y)", rhs: inout x p y}
+- warn: {name: Use inout, lhs: "(taking x p) `giving` y", rhs: inout x p y}
+
 # An effect that returns its own input, or a part of it, makes the value flow through the IO step instead of around it:
 # the effect should get only what it reads, and the rest go by tap, alongside, consume, first, second or <*>. The rules
 # for a pair come in two: the first applies if the effect doesn't read the part that is kept, and then it is a plain

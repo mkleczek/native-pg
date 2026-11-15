@@ -82,7 +82,7 @@ whether test a = if test a then Left a else Right a
 
 -- | A pure step that chooses a branch, named by the question it answers.
 decide :: (Arrow arr, Annotate arr) => String -> (a -> Either b c) -> arr a (Either b c)
-decide question = giving question . arr
+decide question f = arr f `giving` question
 {-# INLINE decide #-}
 
 -- | Runs the arrow on the input, and pairs its result with the input, unchanged.

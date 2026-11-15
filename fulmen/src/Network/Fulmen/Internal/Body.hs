@@ -85,9 +85,8 @@ type Reading = Step ((Socket, Room), BodyState) (Either BodyState (Maybe ByteStr
 instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Instrumented (ModeOf arr)) => Stream arr Body where
   next =
     named (Label "next" "Gives the next piece of the request body, from the bytes in hand or else from the socket.") $
-      giving
-        "body ended?"
-        (iterateWith (giving "bytes in hand?" (step "look at bytes in hand" advance)) (taking "no" receiving))
+      iterateWith (step "look at bytes in hand" advance `giving` "bytes in hand?") (taking "no" receiving)
+        `giving` "body ended?"
         >>> (taking "yes" (ending Nothing) ||| taking "no" returnA)
     where
       receiving = first receive >>> step "record arrival" arrived
@@ -145,7 +144,7 @@ drain =
       >>> ( taking "yes" returnA
               ||| taking
                 "no"
-                ( giving "body ended?" (iterateWith dropping (taking "no" receiving))
+                ( iterateWith dropping (taking "no" receiving) `giving` "body ended?"
                     >>> (taking "yes" (ending True) ||| taking "no" returnA)
                 )
           )
@@ -153,7 +152,7 @@ drain =
     start ChunkedBody = Left False
     start body = Right (body, 0 :: Int)
     -- Every way round the loop receives, and so waits: what is in hand is dropped without a wait, once for each receive.
-    dropping = giving "all dropped?" (step "drop bytes in hand" (uncurry dropInHand))
+    dropping = step "drop bytes in hand" (uncurry dropInHand) `giving` "all dropped?"
     receiving = first receive >>> step "record arrival" (\(count, (state, total)) -> (,total) <$> arrived (count, state))
 
 -- | What dropping the bytes in hand comes to: a receive for the rest, which the drain goes on with, or the end of it, with

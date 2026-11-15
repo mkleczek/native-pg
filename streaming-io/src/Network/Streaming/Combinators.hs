@@ -46,6 +46,7 @@ module Network.Streaming.Combinators
     step,
     taking,
     giving,
+    inout,
     typed,
     field,
   )
@@ -239,5 +240,5 @@ typed = wires (typeName (Proxy @a)) (typeName (Proxy @b))
 
 -- | The field of a record, whose output wire is named after the field in diagrams.
 field :: forall name r a arr. (HasField name r a, KnownSymbol name, Arrow arr, Annotate arr) => arr r a
-field = giving (symbolVal (Proxy @name)) (arr (getField @name))
+field = arr (getField @name) `giving` symbolVal (Proxy @name)
 {-# INLINE field #-}

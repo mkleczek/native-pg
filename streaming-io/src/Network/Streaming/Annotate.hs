@@ -11,6 +11,7 @@ module Network.Streaming.Annotate
     box,
     taking,
     giving,
+    inout,
     asking,
     answering,
   )
@@ -70,15 +71,24 @@ box :: (HasCallStack, Annotate arr) => String -> arr a b -> arr a b
 box title = named (Label title "")
 {-# INLINE box #-}
 
--- | The arrow, with a name for its input wire in diagrams.
+-- | The arrow, with a name for its input wire in diagrams, written before it: @taking "request" handler@.
 taking :: (Annotate arr) => String -> arr a b -> arr a b
 taking input = wires (Just input) Nothing
 {-# INLINE taking #-}
 
--- | The arrow, with a name for its output wire in diagrams.
-giving :: (Annotate arr) => String -> arr a b -> arr a b
-giving output = wires Nothing (Just output)
+-- 'giving' binds tighter than the operators of arrows, so that @a `giving` "x" >>> b@ needs no parentheses.
+infixl 5 `giving`
+
+-- | The arrow, with a name for its output wire in diagrams, written after it: @parse `giving` "request"@.
+giving :: (Annotate arr) => arr a b -> String -> arr a b
+giving step output = wires Nothing (Just output) step
 {-# INLINE giving #-}
+
+-- | The arrow, with names for its input and output wires in diagrams, written around it:
+-- @inout "request" handler "answer"@.
+inout :: (Annotate arr) => String -> arr a b -> String -> arr a b
+inout input step output = wires (Just input) (Just output) step
+{-# INLINE inout #-}
 
 -- | The arrow as the asking end of an exchange of the named value in diagrams: the end that makes a ticket and waits.
 asking :: (Annotate arr) => String -> arr a b -> arr a b

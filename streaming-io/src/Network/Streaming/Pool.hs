@@ -276,7 +276,7 @@ reserved ::
 reserved ref need claim handout =
   named (Label "reserved" "Takes what is free if enough is, and else queues the promise and returns the future to await.") $
     giveWay
-      >>> giving "item free?" (step "claim from free items" (const (update ref claim)))
+      >>> step "claim from free items" (const (update ref claim)) `giving` "item free?"
       >>> (taking "no" queue ||| taking "yes" (arr Right))
   where
     queue = ticket >>> step "queue promise" (\(awaiting, promise) -> update ref (queueOrClaim awaiting promise))
@@ -338,7 +338,7 @@ checkoutAt :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange 
 checkoutAt =
   named (Label "checkoutAt" "Takes an item of the pool if enough are free, and else queues for one and waits.") $
     giveWay
-      >>> giving "item free?" (step "claim from free items" claimAtNow)
+      >>> step "claim from free items" claimAtNow `giving` "item free?"
       >>> (taking "no" queueAt ||| taking "yes" returnA)
 
 -- | The same, but the checkout gives up after the time, once its place in the queue is given up: 'Nothing'. The deadline
@@ -347,7 +347,7 @@ checkoutAtWithin :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exc
 checkoutAtWithin limit =
   named (Label "checkoutAtWithin" "Takes an item of the pool if enough are free, and else queues for one and waits for it until the deadline.") $
     giveWay
-      >>> giving "item free?" (step "claim from free items" claimAtNow)
+      >>> step "claim from free items" claimAtNow `giving` "item free?"
       >>> (taking "no" (within limit queueAt) ||| taking "yes" (arr Just))
 
 -- | The item, if at least this many are free, and else the input again.
@@ -360,7 +360,7 @@ claimAtNow input@(need, Pool ref _) = either (const (Left input)) Right <$> upda
 queueAt :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr (Int, Pool conn) conn
 queueAt =
   keeping ticket
-    >>> giving "item free?" (step "queue promise" queueing)
+    >>> step "queue promise" queueing `giving` "item free?"
     >>> ( taking "no" (waited (step "return item" (\(pool, item) -> releaseNow pool [item])))
             ||| taking "yes" returnA
         )
