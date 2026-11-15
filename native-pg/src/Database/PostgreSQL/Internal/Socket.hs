@@ -122,15 +122,24 @@ byName = resolvable ^>> (now (\host -> pure (Left (UnresolvedHost host "no resol
       progress started >>= \case
         Answered answer -> pure (Right (resolved host port answer))
         Waiting sockets delay -> pure (Left (current, (sockets, delay)))
-    -- The wait is for the sockets and for the timeout, whichever comes first. A resolver that has no timeout is looked at
-    -- again after a second, and one that has no sockets waits for its timeout only.
+    -- The wait is for the first two events of the resolver's sockets and for its timeout, whichever comes first, and then
+    -- the resolver is processed for all of its sockets. A resolver with more than two events is looked at again after 50
+    -- milliseconds at most, and one with no timeout after a second. A wait that fails does so for a socket that another
+    -- lookup closed meanwhile, which the resolver has dropped by then: it is processed again.
     waited =
       (keeping clock >>^ events)
-        >>> tap (snd ^>> race (fst ^>> block) (snd ^>> block) >>> done)
+        >>> tap (tryA (race (first3 ^>> block) (race (second3 ^>> block) (third3 ^>> block))) >>> done)
         >>> now (\(current@(Named started _ _), _) -> Again current <$ process started)
     events (instant, (current, (sockets, delay))) =
-      let deadline = Until (plus instant (fromMaybe (millis 1000) delay))
-       in (current, (fromMaybe deadline sockets, deadline))
+      let limit = if length sockets > 2 then min (millis 50) else id
+          deadline = Until (plus instant (limit (fromMaybe (millis 1000) delay)))
+       in case sockets of
+            one : two : _ -> (current, (one, two, deadline))
+            [one] -> (current, (one, deadline, deadline))
+            [] -> (current, (deadline, deadline, deadline))
+    first3 (_, (one, _, _)) = one
+    second3 (_, (_, two, _)) = two
+    third3 (_, (_, _, deadline)) = deadline
 
 -- | The addresses that a lookup gave, or why there are none.
 resolved :: HostName -> PortNumber -> Either String [SockAddr] -> Either ConnectError Found

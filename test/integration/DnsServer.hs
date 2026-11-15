@@ -1,6 +1,8 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
--- | A scripted DNS server over UDP at 127.0.0.1, for the cases about host names: for each name that it is asked, the
+-- | A scripted DNS server over UDP and TCP at 127.0.0.1, for the cases about host names: for each name that it is asked, the
 -- script says whether it answers with addresses, says that the name doesn't exist, answers late, or says nothing. It
 -- answers a question for any other type of record than A as for a name that has no records of that type, as a server does
 -- for a name without IPv6 addresses.
@@ -13,8 +15,8 @@ module DnsServer
 where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
-import Control.Exception (SomeException, bracket, catch)
-import Control.Monad (forever, void)
+import Control.Exception (IOException, SomeException, bracket, catch, finally, throwIO, try)
+import Control.Monad (forM_, forever, void)
 import Data.Bits (shiftR, (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -50,27 +52,39 @@ data DnsServer = DnsServer
 -- repeats.
 data Question = Question ByteString ByteString Word16 ByteString
 
--- | Runs the action while a server that follows the script is running.
+-- | Runs the action while a server that follows the script is running, over UDP and over TCP on the same port.
 withDnsServer :: Script -> (DnsServer -> IO a) -> IO a
 withDnsServer script action =
-  bracket (Socket.socket Socket.AF_INET Socket.Datagram Socket.defaultProtocol) Socket.close $ \sock -> do
-    Socket.bind sock (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
-    port <- Socket.socketPort sock
-    asked <- newIORef []
-    let serve = forever $ do
-          (packet, from) <- SocketBytes.recvFrom sock 512
-          case parsed packet of
-            Nothing -> pure ()
-            Just asking@(Question _ name kind _) -> do
-              atomicModifyIORef' asked (\before -> (before <> [(name, kind)], ()))
-              answer asking (script name) from
-        answer asking@(Question identifier _ kind echoed) reply from = case reply of
-          Silent -> pure ()
-          Later microseconds later -> void (forkIO (threadDelay microseconds *> answer asking later from `catch` \(_ :: SomeException) -> pure ()))
-          NoSuchName -> void (SocketBytes.sendTo sock (response identifier 3 echoed []) from)
-          Addresses found -> void (SocketBytes.sendTo sock (response identifier 0 echoed (if kind == 1 then found else [])) from)
-    bracket (forkIO (serve `catch` \(_ :: SomeException) -> pure ())) killThread $ \_ ->
-      action (DnsServer port (readIORef asked))
+  bracket bound (\(sock, listener, _) -> Socket.close sock *> Socket.close listener) $ \(sock, listener, port) -> do
+      Socket.listen listener 4
+      asked <- newIORef []
+      let -- The reply that the script gives to a question, which is noted.
+          ask (Question _ name kind _) = atomicModifyIORef' asked (\before -> (before <> [(name, kind)], ())) *> pure (script name)
+          -- The reply to a question, with what sends it.
+          answer send asking@(Question identifier _ kind echoed) = \case
+            Silent -> pure ()
+            Later microseconds later -> void (forkIO (threadDelay microseconds *> answer send asking later `catch` \(_ :: SomeException) -> pure ()))
+            NoSuchName -> send (response identifier 3 echoed [])
+            Addresses found -> send (response identifier 0 echoed (if kind == 1 then found else []))
+          serveUdp = forever $ do
+            (packet, from) <- SocketBytes.recvFrom sock 512
+            forM_ (parsed packet) $ \asking -> ask asking >>= answer (\bytes -> void (SocketBytes.sendTo sock bytes from)) asking
+          -- Over TCP each message has its length in two bytes before it, in both directions.
+          serveTcp = forever $ do
+            (client, _) <- Socket.accept listener
+            void . forkIO $ (`finally` Socket.close client) $ (`catch` \(_ :: SomeException) -> pure ()) $ forever $ do
+              header <- received client 2
+              packet <- received client (fromIntegral (BS.index header 0) * 256 + fromIntegral (BS.index header 1))
+              forM_ (parsed packet) $ \asking -> ask asking >>= answer (\bytes -> SocketBytes.sendAll client (BS.pack [fromIntegral (BS.length bytes `shiftR` 8), fromIntegral (BS.length bytes .&. 0xff)] <> bytes)) asking
+          received client size
+            | size <= 0 = pure BS.empty
+            | otherwise = do
+                piece <- SocketBytes.recv client size
+                if BS.null piece then ioError (userError "closed") else (piece <>) <$> received client (size - BS.length piece)
+          quietly serving = forkIO (serving `catch` \(_ :: SomeException) -> pure ())
+      bracket (quietly serveUdp) killThread $ \_ ->
+        bracket (quietly serveTcp) killThread $ \_ ->
+          action (DnsServer port (readIORef asked))
 
 -- | The first question of a query. A query's header is twelve bytes, then the name as labels that end with an empty one,
 -- the type of record and the class.
@@ -106,3 +120,25 @@ response identifier code echoed found =
   where
     word :: Int -> ByteString
     word number = BS.pack [fromIntegral ((number `shiftR` 8) .&. 0xff), fromIntegral (number .&. 0xff)]
+
+-- | A UDP socket and a TCP socket that listens on the same port, which the system chooses for the UDP socket, and tries
+-- again with another one if that is taken for TCP.
+bound :: IO (Socket.Socket, Socket.Socket, Socket.PortNumber)
+bound = attempt (20 :: Int)
+  where
+    loopback port = Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1))
+    attempt count = do
+      sock <- Socket.socket Socket.AF_INET Socket.Datagram Socket.defaultProtocol
+      listener <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
+      tried <-
+        try $ do
+          Socket.bind sock (loopback 0)
+          port <- Socket.socketPort sock
+          Socket.setSocketOption listener Socket.ReuseAddr 1
+          Socket.bind listener (loopback port)
+          pure (sock, listener, port)
+      case tried of
+        Right found -> pure found
+        Left (failure :: IOException)
+          | count > 0 -> Socket.close sock *> Socket.close listener *> attempt (count - 1)
+          | otherwise -> Socket.close sock *> Socket.close listener *> throwIO failure

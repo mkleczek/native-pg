@@ -56,11 +56,11 @@ static void np_start(np_lookup *lookup)
 /* A channel, with the system's configuration except where an option replaces it, or NULL and why: a c-ares status, or -1
    if c-ares has no thread support, which a channel that every core uses needs. It also reads the hosts file now, so that
    no lookup has to read it for the first time. */
-ares_channel_t *np_cares_new(const char *servers, int timeout_ms, int tries, const char *hosts, int search, int *status)
+ares_channel_t *np_cares_new(const char *servers, int timeout_ms, int tries, const char *hosts, int search, int tcp, int rotate, int *status)
 {
   struct ares_options options;
   ares_channel_t *channel = NULL;
-  int mask = ARES_OPT_FLAGS;
+  int mask = ARES_OPT_FLAGS | (rotate ? ARES_OPT_ROTATE : 0);
   int code;
 
   if (!ares_threadsafety()) {
@@ -69,7 +69,9 @@ ares_channel_t *np_cares_new(const char *servers, int timeout_ms, int tries, con
   }
   memset(&options, 0, sizeof options);
   /* HOSTALIASES names a file that c-ares would read for every lookup, if the variable is set. */
-  options.flags = ARES_FLAG_NOALIASES | (search ? 0 : ARES_FLAG_NOSEARCH);
+  /* Sockets stay open when no query is waiting: the lookups that wait on them at the time are not left with a socket that
+     was closed under them, and the next lookup needs no new one. */
+  options.flags = ARES_FLAG_NOALIASES | ARES_FLAG_STAYOPEN | (search ? 0 : ARES_FLAG_NOSEARCH) | (tcp ? ARES_FLAG_USEVC : 0);
   if (timeout_ms > 0) {
     options.timeout = timeout_ms;
     mask |= ARES_OPT_TIMEOUTMS;

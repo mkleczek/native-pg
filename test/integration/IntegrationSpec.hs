@@ -406,6 +406,23 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           resolver <- newResolverWith (resolverOptionsFor dns 2000 1) {resolverSort = False}
           settings <- viaName resolver "ordered.test" ""
           connectedBy settings `shouldReturn` ("ordered.test", Right [1])
+      -- Over TCP the resolver waits for the socket's being readable and writable at once while it connects, which is one wait
+      -- for several events.
+      it "looks a name up over TCP" $
+        withDnsServer (const (Later 300000 loopback)) $ \dns -> do
+          resolver <- newResolverWith (resolverOptionsFor dns 3000 1) {resolverTcp = True}
+          settings <- viaName resolver "stream.test" ""
+          connectedBy settings `shouldReturn` ("stream.test", Right [1])
+          asked dns `shouldReturn` ["stream.test"]
+      -- Two servers, and a query that goes to either, make the resolver wait for the sockets of both at once: one wait for
+      -- several events. The names are looked up together, so that both servers are asked.
+      it "looks names up while it waits for the sockets of two servers" $
+        withDnsServer (const (Later 300000 loopback)) $ \primary -> withDnsServer (const (Later 300000 loopback)) $ \backup -> do
+          resolver <- newResolverWith (resolverOptionsFor primary 3000 1) {resolverServers = Just ("127.0.0.1:" <> show (dnsPort primary) <> ",127.0.0.1:" <> show (dnsPort backup)), resolverRotate = True}
+          settings <- traverse (\n -> viaName resolver ("many" <> Char8.pack (show n) <> ".test") "") [1 .. 8 :: Int]
+          results <- run (concurrentlyAll [connectedTo each done | each <- settings])
+          length (filter (either (const False) (const True)) results) `shouldBe` 8
+          (,) <$> (not . null <$> dnsQuestions primary) <*> (not . null <$> dnsQuestions backup) `shouldReturn` (True, True)
       it "words a name that the server says doesn't exist as libpq does" $
         withDnsServer (const NoSuchName) $ \dns -> do
           resolver <- resolverFor dns 2000 1
@@ -1257,6 +1274,10 @@ settingsOf string = case parseConnectionString noDefaults (const Nothing) (Just 
   Right parsed -> do
     resolver <- newResolver
     either fail (\settings -> pure settings {connectTlsClient = Just tlsClient, connectResolver = Just resolver}) (fromConnectionString parsed)
+
+-- | The programs at once, each on the same input, and what each gave.
+concurrentlyAll :: (Runtime arr) => [arr a b] -> arr a [b]
+concurrentlyAll = foldr (\one others -> concurrently one others >>^ uncurry (:)) (arr (const []))
 
 -- | The settings of a connection string, as 'settingsOf' makes them, whose host names are looked up by the resolver.
 settingsVia :: Resolver -> ByteString -> IO ConnectSettings

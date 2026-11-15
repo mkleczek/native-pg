@@ -40,7 +40,6 @@ import Foreign.Storable (peek)
 import Network.Socket (HostName, PortNumber, SockAddr)
 import Network.Socket.Address (peekSocketAddress)
 import Network.Streaming.Classes (Duration, Event (..), millis)
-import Network.Streaming.Watch (anyWatch, fdReadable, fdWritable)
 import System.Posix.Types (Fd (..))
 
 -- | What looks names up: a c-ares channel, freed with the last reference to it, and whether its lookups sort the addresses.
@@ -68,6 +67,10 @@ data ResolverOptions = ResolverOptions
     resolverHostsFile :: Maybe FilePath,
     -- | Whether a name that isn't found is looked up with each of the system's search domains added.
     resolverSearchDomains :: Bool,
+    -- | Whether queries go over TCP and not UDP, as c-ares does for an answer that is cut short.
+    resolverTcp :: Bool,
+    -- | Whether each query goes to a server of the list at random, and not to the first that works.
+    resolverRotate :: Bool,
     -- | Whether the addresses of a name are put in the order that RFC 6724 gives, as @getaddrinfo@ puts them, which
     -- prefers the family and the address that a connection from here can use. Without it they are in the order that
     -- the server gave them.
@@ -76,7 +79,7 @@ data ResolverOptions = ResolverOptions
 
 -- | The system's configuration, and the addresses sorted.
 defaultResolverOptions :: ResolverOptions
-defaultResolverOptions = ResolverOptions Nothing Nothing Nothing Nothing True True
+defaultResolverOptions = ResolverOptions Nothing Nothing Nothing Nothing True False False True
 
 -- | A resolver that is made as the options say. It reads the files of the system's configuration, so a program makes it
 -- where it starts, and not where it connects. It fails with an 'IOError' if c-ares can't make one, or has no thread
@@ -93,6 +96,8 @@ newResolverWith options =
             (maybe 0 fromIntegral (resolverTries options))
             hosts
             (if resolverSearchDomains options then 1 else 0)
+            (if resolverTcp options then 1 else 0)
+            (if resolverRotate options then 1 else 0)
             status
         if channel /= nullPtr
           then (\pointer -> Resolver pointer (resolverSort options)) <$> Foreign.newForeignPtr channel (c_destroy channel)
@@ -122,8 +127,9 @@ endLookup (Lookup channel pending) = withForeignPtr channel $ \_ -> c_end pendin
 data Progress
   = -- | It has its answer: why there is none, or the addresses, in the order to try them.
     Answered (Either String [SockAddr])
-  | -- | It waits for this event, if the resolver has sockets to wait for, and at most this long, if a query can time out.
-    Waiting (Maybe Event) (Maybe Duration)
+  | -- | It waits for these events, one for each socket that the resolver wants to read and one for each that it wants to
+    -- write, and at most this long, if a query can time out.
+    Waiting [Event] (Maybe Duration)
 
 -- | Whether the lookup has its answer, and else what it waits for.
 progress :: Lookup -> IO Progress
@@ -133,16 +139,12 @@ progress (Lookup channel pending) = withForeignPtr channel $ \pointer ->
       count <- fromIntegral <$> c_wanted pointer fds wants (fromIntegral sockets) remaining
       watched <- zip <$> peekArray count fds <*> peekArray count wants
       milliseconds <- peek remaining
-      pure (Waiting (combined (concatMap watching watched)) (if milliseconds < 0 then Nothing else Just (millis (fromIntegral milliseconds))))
+      pure (Waiting (concatMap events watched) (if milliseconds < 0 then Nothing else Just (millis (fromIntegral milliseconds))))
     _ -> Answered <$> answer
   where
     sockets = 16
     -- Each socket, for what the resolver wants of it: reading or writing, or both.
-    watching (fd, wants) = [(False, Fd fd) | wants .&. 1 /= 0] <> [(True, Fd fd) | wants .&. 2 /= 0]
-    combined = \case
-      [] -> Nothing
-      [(writing, fd)] -> Just (if writing then Writable fd else Readable fd)
-      several -> Just (Watched (anyWatch [if writing then fdWritable fd else fdReadable fd | (writing, fd) <- several]))
+    events (fd, wants) = [Readable (Fd fd) | wants .&. 1 /= 0] <> [Writable (Fd fd) | wants .&. 2 /= 0]
     answer = do
       status <- c_status pending
       if status /= 0
@@ -158,7 +160,7 @@ process :: Lookup -> IO ()
 process (Lookup channel _) = withForeignPtr channel c_process
 
 foreign import ccall unsafe "np_cares_new"
-  c_new :: CString -> CInt -> CInt -> CString -> CInt -> Ptr CInt -> IO (Ptr Channel)
+  c_new :: CString -> CInt -> CInt -> CString -> CInt -> CInt -> CInt -> Ptr CInt -> IO (Ptr Channel)
 
 foreign import ccall unsafe "np_cares_destroy"
   c_destroy :: Ptr Channel -> IO ()
