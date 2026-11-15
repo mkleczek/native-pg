@@ -50,6 +50,12 @@ spec = describe "the pool" $ forM_ runners $ \runner@(Runner name _) -> describe
       pool <- newPool [7 :: Int]
       run (withLoanWithin (millis 20) pool (arr fst)) `shouldReturn` Right 7
 
+    it "gives up the place of a checkout that the deadline of an enclosing 'within' cancels, and has nobody waiting for the item" $ do
+      pool <- newPool [7 :: Int]
+      run (withLoan pool (within (millis 20) (withLoan pool done))) `shouldReturn` Right Nothing
+      free pool `shouldReturn` [7]
+      waiters pool `shouldReturn` 0
+
   describe "takeNowWith" $ do
     it "takes the item at the position that the chooser gives, from the free items in the order that the pool takes them in" $ do
       pool <- newPool [7 :: Int, 8, 9]

@@ -1,6 +1,7 @@
 module Main (main) where
 
 import qualified BufferSpec
+import qualified ConnectionPoolSpec
 import qualified IntegrationSpec
 import qualified ScopeTransactionSpec
 import Skeletest.Internal.Paths (setOriginalDirectory)
@@ -24,5 +25,6 @@ main = do
       [ ("test/integration/IntegrationSpec.hs", IntegrationSpec.spec socketPath port),
         ("test/integration/TransactionSpec.hs", TransactionSpec.spec socketPath),
         ("test/integration/ScopeTransactionSpec.hs", ScopeTransactionSpec.spec socketPath port),
-        ("test/integration/BufferSpec.hs", BufferSpec.spec socketPath port)
+        ("test/integration/BufferSpec.hs", BufferSpec.spec socketPath port),
+        ("test/integration/ConnectionPoolSpec.hs", ConnectionPoolSpec.spec socketPath port)
       ]
