@@ -300,7 +300,7 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
         )
         `shouldReturn` ()
 
-  needs "prepared statements" $ describe "prepared statements" $ do
+  describe "prepared statements" $ do
     it "runs a statement prepared earlier on the connection by its name, without evaluating its SQL" $
       withSession
         ( steps

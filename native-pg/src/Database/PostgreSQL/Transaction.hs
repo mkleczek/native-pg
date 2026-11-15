@@ -21,9 +21,13 @@
 -- what the one before it said is answered. The queue of the answers that are
 -- expected is the statements of the pipeline that was sent, which the server
 -- answers in order, and the reading program takes the results from it in the
--- order of their statements. Prepared statements, streamed parameters and the
--- notifications are to come: their steps fail with
+-- order of their statements. Streamed parameters are to come: they fail with
 -- 'Network.Streaming.NotImplemented.NotImplemented'.
+--
+-- A prepared statement is named by the program, which keeps the names of the
+-- connection: 'prepare' sends the Parse of a name, 'executePrepared' sends only the
+-- Bind and Execute of a name that the connection has, without its SQL, and
+-- 'closeStatement' sends the Close. The library keeps no record of the names.
 module Database.PostgreSQL.Transaction
   ( -- * Statements
     Statement (..),
@@ -80,7 +84,7 @@ where
 
 import Control.Arrow (Arrow, arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (IOException, SomeAsyncException, SomeException, displayException, evaluate, fromException, throwIO, toException, try)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
@@ -89,6 +93,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Kind (Type)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
+import Data.Word (Word8)
 import Database.PostgreSQL.Connection.Internal
 import Database.PostgreSQL.Decoding (DecodeField (..), DecodingError (..), InPlace)
 import Database.PostgreSQL.Errors (ConnectionError (..), QueryError (..), ServerError (..), StatementError (..), UsageError (..), isConnectionFatal)
@@ -119,11 +124,13 @@ import Database.PostgreSQL.Internal.Protocol.Codec.Payload (Payload (..))
 import Database.PostgreSQL.Internal.Carrier (Carrier)
 import qualified Database.PostgreSQL.Internal.Protocol.Messages as Wire
 import Database.PostgreSQL.Types (FormatCode (..), Oid, Parameter (..))
+import Foreign.Storable (peekByteOff)
+import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Classes (Effect (..), Exit (..), Runtime, Scope (..), Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, boolA, consume, done, iterateA, iterateWith, keeping, tap)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release)
-import Network.Streaming.NotImplemented (notImplemented, notImplementedIO)
-import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity)
+import Network.Streaming.NotImplemented (notImplementedIO)
+import Network.Streaming.Reader (Reader, markFrame, markLimit, markStart, mark, newReader, readerCapacity, readerMemory)
 import Network.Streaming.With (With (..), ask, asks, lift, with, withOnly)
 import Prelude hiding (any)
 
@@ -238,9 +245,26 @@ data Ending = Open | Final
 
 -- * The transaction at run time
 
--- | A statement that the server answers: its SQL, for the errors that name it, and whether it belongs to the
--- transaction and not to the program, as BEGIN and the ending do, which no result stands for.
-data Entry = Entry {entrySql :: ByteString, entrySkippable :: !Bool}
+-- | A statement that the server answers: its SQL, for the errors that name it, and what it is.
+data Entry = Entry {entrySql :: ByteString, entryRole :: !Role}
+
+-- | What an entry of the queue is: whether a result of the program stands for it, and what the server answers it with.
+data Role
+  = -- | A statement of the program that gives rows, which a CommandComplete or an EmptyQueryResponse answers: a result
+    -- stands for it, which has to be read or discarded before a later one is read.
+    Wanted
+  | -- | A statement that nobody has to read: one of the transaction's own, as BEGIN and the ending are, or one whose
+    -- result the program is done with. A later read passes it.
+    Passed
+  | -- | A Parse of a name, which a ParseComplete answers: a preparation, which a later read passes.
+    Parsing
+  | -- | A Close of a name, which a CloseComplete answers, and which a later read passes.
+    Closing
+  deriving (Eq)
+
+-- | Whether a later read may pass the entry, as it isn't a result that the program has yet to read.
+entrySkippable :: Entry -> Bool
+entrySkippable entry = entryRole entry /= Wanted
 
 -- | Where the transaction is, which only the part that runs it changes.
 data State = State
@@ -402,7 +426,7 @@ unexpected reason = ConnectionBroken ("the server broke the protocol: " <> reaso
 -- or has a row, or the pipeline is answered whole.
 settleEvent :: Tx -> Event -> IO Step
 settleEvent tx = \case
-  Other -> pure Stepped
+  Other -> acknowledged tx
   Row cursor -> Rowed cursor <$ modify tx (\s -> s {stRows = stRows s + 1})
   Complete tag -> answered tx (Just tag)
   EmptyQuery -> answered tx Nothing
@@ -421,6 +445,35 @@ answered tx tag = do
           kept = if entrySkippable entry then stTags s else (stIndex s, copied) : stTags s
       modify tx (const s {stPending = others, stIndex = stIndex s + 1, stRows = 0, stTags = kept})
       pure (Completed (stRows s))
+
+-- | A message that no statement's answer is made of: it is the ParseComplete or the CloseComplete that the entry which is
+-- being read waits for, as its tag tells, or else one that nothing waits for. A ParseComplete of an unnamed statement's
+-- own Parse is one of these, as the entry being read is that statement.
+acknowledged :: Tx -> IO Step
+acknowledged tx = do
+  s <- inspect tx
+  case stPending s of
+    entry : _ -> case entryRole entry of
+      Parsing -> awaiting tx parseCompleteTag
+      Closing -> awaiting tx closeCompleteTag
+      _ -> pure Stepped
+    [] -> pure Stepped
+
+-- | The entry that is being read is answered if the message that was framed last has the tag that answers it.
+awaiting :: Tx -> Word8 -> IO Step
+awaiting tx tag = lastTag (txReader tx) >>= \found -> if found == tag then answered tx Nothing else pure Stepped
+
+-- | The tags of ParseComplete and CloseComplete, as numbers.
+parseCompleteTag, closeCompleteTag :: Word8
+parseCompleteTag = 0x31
+closeCompleteTag = 0x33
+
+-- | The tag of the message that was framed last, which is five bytes before the bytes in hand when nothing of its body
+-- is taken, as is so for the messages that no cursor reads.
+lastTag :: Reader Carrier -> IO Word8
+lastTag reader = do
+  start <- mark reader markStart
+  unsafeWithForeignPtr (readerMemory reader) (\memory -> peekByteOff memory (start - 5))
 
 -- | The server failed the statement that was being read, and skipped the ones after it. The first failure is the
 -- transaction's, which every read that follows raises, and the connection is lost if the server ended the session.
@@ -483,8 +536,10 @@ data Located
 -- | The way to the result at the position, which says whether it is the one that is being read, as opposed to answered
 -- already. What the transaction owes before it is read past, if it isn't the program's: what is the program's, and
 -- unread, is a failure to read out of order, after the failure of a statement before it, if the server reported one.
-seek :: (Runtime arr) => Int -> With Tx arr () Bool
-seek target = loop
+-- An entry that was answered already is found without the failure of the server being raised if the first argument says
+-- that it is as it was, as a preparation is.
+seek :: (Runtime arr) => Bool -> Int -> With Tx arr () Bool
+seek answeredIsFine target = loop
   where
     loop = inTx locate >>> byLocation ^>> (returnA ||| ((finishEntry True >>> loop) ||| misordered))
     byLocation Finished = Left False
@@ -493,8 +548,8 @@ seek target = loop
     byLocation (Misordered unread) = Right (Right unread)
     locate tx = do
       s <- inspect tx
-      traverse_ throwIO (stFailure s)
       let wanted = stBase s + target
+      unless (answeredIsFine && wanted < stIndex s) (traverse_ throwIO (stFailure s))
       pure $
         if
           | wanted < stIndex s -> Finished
@@ -516,7 +571,7 @@ seek target = loop
 -- its 'QueryError' here.
 nextRow :: (Runtime arr) => Result arr row -> With Tx arr () (Maybe row)
 nextRow (Result position reading) =
-  moved >>> seek position >>> boolA noRow loop
+  moved >>> seek False position >>> boolA noRow loop
   where
     noRow = arr (const Nothing)
     loop = iterateA (pull >>> withTx arrived) >>> (decoding ||| noRow)
@@ -575,11 +630,14 @@ failedColumns Columns {colsState} reason = do
 
 -- | Drops the rest of the result.
 discard :: (Runtime arr) => Result arr row -> With Tx arr () ()
-discard (Result position _) = moved >>> seek position >>> boolA returnA (finishEntry True)
+discard (Result position _) = moved >>> seek False position >>> boolA returnA (finishEntry True)
 
--- | Awaits the server's acknowledgement of a preparation.
+-- | Awaits the server's acknowledgement of a preparation, as a result is read: it fails with the 'QueryError' of a Parse
+-- that the server rejected, or skipped after a statement that failed, and with 'ResultOutOfOrder' while an earlier
+-- result is neither read nor discarded. A preparation that was acknowledged stays so, however a statement after it
+-- ended.
 prepared :: (Runtime arr) => Preparation -> With Tx arr () ()
-prepared _ = notImplemented "prepared"
+prepared (Preparation position) = moved >>> seek True position >>> boolA returnA (finishEntry True)
 
 -- | The command tag of the result, once its rows are read: of the one that is being read, what is left of it is dropped.
 commandTag :: (Runtime arr) => Result arr row -> With Tx arr () ByteString
@@ -604,9 +662,9 @@ optional result@(Result position _) = nextRow result >>> concluded position
 -- | The program is done with the result: it is no longer one that has to be read to its end before a later one is read,
 -- and the rest of it is read past, with the row that is being read, when that is. If it is answered, nothing is left.
 concluded :: (Arrow arr, Effect arr) => Int -> With Tx arr a a
-concluded position = withTx (\tx input -> input <$ modify tx (\s -> if stBase s + position == stIndex s then s {stPending = skippable (stPending s)} else s))
+concluded position = withTx (\tx input -> input <$ modify tx (\s -> if stBase s + position == stIndex s then s {stPending = passed (stPending s)} else s))
   where
-    skippable = \case entry : others -> entry {entrySkippable = True} : others; [] -> []
+    passed = \case entry : others -> entry {entryRole = Passed} : others; [] -> []
 
 -- | Folds the rows of the result, one at a time, from the first to the last.
 foldRows :: (Runtime arr) => (s -> row -> s) -> s -> Result arr row -> With Tx arr () s
@@ -646,8 +704,8 @@ layout :: Ending -> [Sent arr p] -> Tx -> p -> IO (Either () Output)
 layout finality sent tx input = do
   s <- inspect tx
   user <- traverse (rendered input) sent
-  let starting = [(Entry (txBegin tx) True, txBeginOutput tx) | not (stBegun s), not (null sent) || finality == Final]
-      closing = [(Entry text True, output) | finality == Final, let (text, output) = endingStatement (stCondemned s)]
+  let starting = [(Entry (txBegin tx) Passed, txBeginOutput tx) | not (stBegun s), not (null sent) || finality == Final]
+      closing = [(Entry text Passed, output) | finality == Final, let (text, output) = endingStatement (stCondemned s)]
   case starting <> user <> closing of
     [] -> pure (Left ())
     queued -> do
@@ -659,11 +717,13 @@ layout finality sent tx input = do
     rendered parameters = \case
       Execute given -> do
         (types, formats, values) <- parametersOf (params given parameters)
-        pure (Entry (sql given) False, statementOutput (sql given) types formats values)
-      Command text -> pure (Entry text False, plain text)
-      Prepare {} -> notImplementedIO "prepare"
-      ExecutePrepared {} -> notImplementedIO "executePrepared"
-      Close _ -> notImplementedIO "closeStatement"
+        pure (Entry (sql given) Wanted, statementOutput (sql given) types formats values)
+      Command text -> pure (Entry text Wanted, plain text)
+      Prepare name given -> pure (Entry (sql given) Parsing, parseOutput name (sql given))
+      ExecutePrepared name given -> do
+        (_, formats, values) <- parametersOf (params given parameters)
+        pure (Entry (sql given) Wanted, boundOutput name formats values)
+      Close name -> pure (Entry ("DEALLOCATE " <> name) Closing, Wire.serialize (Wire.Close Wire.PreparedStatement name))
 
 -- | The statement that ends a transaction: ROLLBACK if it is condemned, else COMMIT, as its SQL, which the errors name, and
 -- the messages that carry it.
@@ -693,7 +753,16 @@ prerendered output = Output.bytes (BSI.unsafeCreate size render)
 statementOutput :: ByteString -> [Maybe Oid] -> [FormatCode] -> [Maybe Parameter] -> Output
 statementOutput text types formats values =
   Wire.serialize (Wire.Parse "" text (map (fmap Wire.Scalar) types))
-    <> Wire.serialize (Wire.Bind (Wire.BindBody "" "" formats values [BinaryFormat]))
+    <> boundOutput "" formats values
+
+-- | The Parse of the statement under the name, which names no types: the server infers them.
+parseOutput :: ByteString -> ByteString -> Output
+parseOutput name text = Wire.serialize (Wire.Parse name text [])
+
+-- | Bind of the statement that has the name, with the parameters, which says that the rows come in binary, and Execute.
+boundOutput :: ByteString -> [FormatCode] -> [Maybe Parameter] -> Output
+boundOutput name formats values =
+  Wire.serialize (Wire.Bind (Wire.BindBody "" name formats values [BinaryFormat]))
     <> Wire.serialize (Wire.Execute "" 0 :: Wire.Execute ByteString)
 
 -- | The types, the formats and the values of the parameters as the protocol has them.
@@ -721,7 +790,7 @@ alone validating = moved >>> withTx queued >>> transmit >>> drain validating
     queued tx (text, carrier) = do
       s <- inspect tx
       let !output = carrier <> sync
-      modify tx (const s {stPending = [Entry text True], stIndex = 0, stBase = 0, stRows = 0, stTags = [], stOwed = True, stSending = True})
+      modify tx (const s {stPending = [Entry text Passed], stIndex = 0, stBase = 0, stRows = 0, stTags = [], stOwed = True, stSending = True})
       pure output
 
 -- | Ends the transaction as the program didn't: what is owed is read, and what the server may have left open is rolled

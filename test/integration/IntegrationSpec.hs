@@ -484,7 +484,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
     it "reads many rows, one at a time" $
       withSession (transact Tx.ReadCommitted Tx.Read Tx.Final (Tx.statement (plain "SELECT generate_series(1, 10000)" (single @_ @Int32))) countRows)
         `shouldReturn` Right 10000
-    needs "prepared statements" $ it "runs a prepared statement until it's closed" $
+    it "runs a prepared statement until it's closed" $
       withSession
         ( steps
             [ preparing "add_one" (addOneWith "0") `yields` Right (),
@@ -517,7 +517,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
           pieces = concatMap (\piece -> [BS.take 100 piece, BS.drop 100 piece]) (replicate 128 payload)
       withSession (query (Tx.Statement "SELECT $1::text = repeat('0123456789abcdef', 524288)" (const [piecesText pieces]) (single @_ @Bool)))
         `shouldReturn` Right [True]
-    needs "prepared statements" $ it "streams a parameter to a prepared statement, whether it returns rows or not" $
+    needs "streamed parameters" $ it "streams a parameter to a prepared statement, whether it returns rows or not" $
       withSession
         ( steps
             [ ddl "CREATE TEMPORARY TABLE streamed (value text)" `yields` Right (),
@@ -528,7 +528,7 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
             ]
         )
         `shouldReturn` ()
-    needs "prepared statements" $ it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $
+    needs "streamed parameters" $ it "counts a slow parameter stream against statement_timeout, whether the statement is prepared or not" $
       withSession
         ( steps
             [ ddl "SET statement_timeout = '200ms'" `yields` Right (),
