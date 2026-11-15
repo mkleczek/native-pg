@@ -8,6 +8,9 @@ module Database.PostgreSQL.Transport
     TcpOptions (..),
     defaultTcpOptions,
     TlsClient (..),
+    TlsLink (..),
+    Handshake (..),
+    shake,
     TlsSettings (..),
     ServerVerification (..),
     RootCertificates (..),
@@ -24,7 +27,10 @@ import qualified Data.ByteArray as ByteArray
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word8)
-import Network.Socket (HostName, PortNumber)
+import Foreign.Ptr (Ptr)
+import Network.Socket (HostName, PortNumber, Socket)
+import Network.Streaming.Classes (Effect, Link (..))
+import Network.Streaming.NotImplemented (notImplemented)
 
 data Address
   = -- | A host name or IP address, and a port.
@@ -57,8 +63,58 @@ defaultTcpOptions = TcpOptions True Nothing Nothing Nothing Nothing
 
 -- | The TLS implementation that a connection starts TLS with, which native-pg-tls
 -- supplies: without one, a connection can't encrypt, as libpq built without TLS
--- can't. A stub, until a connection can use one.
-data TlsClient = TlsClient
+-- can't. It starts a session over a connected socket, for the settings and the server's
+-- name, which has not shaken hands yet.
+newtype TlsClient = TlsClient {startTls :: TlsSettings -> HostName -> Socket -> IO TlsLink}
+
+-- | A TLS session over a socket, as a TLS client makes it: its calls, none of which
+-- waits. Its 'Link' instance waits for them, by blocking on the socket's events while
+-- they find nothing ready, and 'shake' does the handshake the same way.
+data TlsLink = TlsLink
+  { -- | The socket that the session is over, whose events say when a call may find something.
+    linkSocket :: !Socket,
+    -- | Receives decrypted bytes into the memory, up to the size: how many, 0 at the end of
+    -- the stream, or 'Nothing' if none are ready.
+    linkTryReceive :: !(Ptr Word8 -> Int -> IO (Maybe Int)),
+    -- | Encrypts what it can of the pieces and writes what the socket takes: how many bytes of
+    -- the pieces it took. What it took and has not written waits for 'linkFlush'.
+    linkTrySend :: !([ByteString] -> IO Int),
+    -- | Writes what was taken and not written yet: 'True' once none is left.
+    linkFlush :: !(IO Bool),
+    -- | Whether input is in hand: decrypted bytes, or the end of the stream. It reads what the
+    -- socket has, and takes none of the decrypted bytes.
+    linkHasInput :: !(IO Bool),
+    -- | Does what the handshake can do next, and says what it needs.
+    linkHandshake :: !(IO Handshake),
+    -- | Tells the peer that the output ends, if the socket takes it at once, and ends the
+    -- socket's output.
+    linkShutdownSend :: !(IO ()),
+    -- | Tells the peer that the session ends, if the socket takes it at once, closes the socket,
+    -- and frees the session.
+    linkEnd :: !(IO ())
+  }
+
+-- | What the handshake needs to go on, or its end with the data that SCRAM's channel binding
+-- takes, for tls-server-end-point: the bytes, or why there are none, or none.
+data Handshake
+  = -- | Bytes from the socket.
+    NeedsInput
+  | -- | Room in the socket.
+    NeedsRoom
+  | Complete (Maybe (Either String ByteString))
+
+-- | A stub, until the code is there: the handshake of the link, which waits for the
+-- socket as the handshake needs, and gives the data for channel binding.
+shake :: (Effect arr) => arr TlsLink (Maybe (Either String ByteString))
+shake = notImplemented "the TLS handshake"
+
+-- | A stub, until the code is there.
+instance (Effect arr) => Link arr TlsLink where
+  receive = notImplemented "a receive over TLS"
+  sendAll = notImplemented "a send over TLS"
+  awaitInput = notImplemented "a wait for input over TLS"
+  shutdownSend = notImplemented "the end of output over TLS"
+  close = notImplemented "closing a TLS link"
 
 -- | How a TLS link is configured.
 data TlsSettings = TlsSettings

@@ -33,6 +33,9 @@ module Database.PostgreSQL.Tls.Internal
     alpnProtocol,
     channelBinding,
 
+    -- * The link of a connection
+    tlsLinkOf,
+
     -- * Connections rustls made elsewhere, e.g. a test's server
     RustlsConnection,
   )
@@ -48,7 +51,7 @@ import qualified Data.ByteString.Unsafe as BS
 import Data.Foldable (for_)
 import Data.Int (Int64)
 import Data.Word (Word16, Word32, Word8)
-import Database.PostgreSQL.Transport (RootCertificates (..), ServerVerification (..), TlsError (..), TlsSettings (..), TlsVersion (..), serverEndPoint)
+import Database.PostgreSQL.Transport (RootCertificates (..), ServerVerification (..), TlsError (..), TlsLink (..), TlsSettings (..), TlsVersion (..), serverEndPoint)
 import Foreign.C.ConstPtr (ConstPtr (..))
 import Foreign.C.Error (Errno (..), eAGAIN, eINTR, eWOULDBLOCK, errnoToIOError)
 import Foreign.C.String (CString, peekCStringLen, withCString, withCStringLen)
@@ -62,6 +65,7 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (Storable, peek, pokeByteOff)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Socket (Socket, close, withFdSocket)
+import Network.Streaming.NotImplemented (notImplementedIO)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- | A version's number in TLS.
@@ -179,6 +183,14 @@ systemVerifier = modifyMVar systemVerifierMade $ \made -> do
 systemVerifierMade :: MVar (Maybe (Ptr ServerCertVerifier))
 systemVerifierMade = unsafePerformIO (newMVar Nothing)
 {-# NOINLINE systemVerifierMade #-}
+
+-- | The link of the connection, which a connection of native-pg uses it through, for the
+-- settings that its handshake is checked against. A stub, until the calls are there.
+tlsLinkOf :: TlsSettings -> TlsConnection -> TlsLink
+tlsLinkOf _ tls = TlsLink (tlsSocket tls) (\_ _ -> unfinished) (const unfinished) unfinished unfinished unfinished unfinished unfinished
+  where
+    unfinished :: IO a
+    unfinished = notImplementedIO "the link of a TLS connection"
 
 -- | A TLS connection over a socket.
 data TlsConnection = TlsConnection
