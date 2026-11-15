@@ -12,19 +12,20 @@
 -- wait for lands.
 module ConnectionPoolSpec (spec) where
 
-import Control.Arrow ((>>>), (^>>))
+import Control.Arrow (arr, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forM_, replicateM_, void, when)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
-import Data.Int (Int64)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Data.Int (Int32, Int64)
 import Data.List (nub)
 import Data.Text (Text)
 import Data.UUID (UUID)
 import Data.Word (Word64)
-import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), connectSettings)
+import Database.PostgreSQL.Connection (Address (..), ConnectSettings (..), connectSettings, connectionSlot)
 import Database.PostgreSQL.Errors
 import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), ConnectionReadyForUseReason (..), ConnectionStatus (..), ConnectionTerminationReason (..), Observation (..), PoolStats (..), closeConnectionPool, connectionPoolSettings, connectionPoolStats, maintain, newConnectionPool, newMaintenance, withConnection)
 import qualified Database.PostgreSQL.Transaction as Tx
@@ -281,6 +282,59 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
           -- The request gave up: its slot is empty and free again.
           eventually 5 ((== PoolStats 0 0 0) <$> connectionPoolStats pool) `shouldReturn` True
 
+  -- What a program keeps for a connection, as a program that prepares statements keeps the names that its connection has, lives as
+  -- long as the connection does: through every use of it by a pool, and not beyond.
+  needs "connectionSlot" $ describe "the slot of a connection" $ do
+    let terminated pid = ordinary runner (session settings (query (plain ("SELECT pg_terminate_backend(" <> BC.pack (show pid) <> ")") single))) `shouldReturn` Right [True]
+    it "starts with the value that it is given on a new connection, and is the connection's own" $
+      ordinary
+        runner
+        ( session settings $
+            alsoOn settings $
+              steps
+                [ onFirst seen `yields` 0,
+                  onFirst raised `yields` 1,
+                  onSecond seen `yields` 0,
+                  onSecond raised `yields` 1,
+                  onFirst raised `yields` 2
+                ]
+        )
+        `shouldReturn` ()
+    it "keeps a cell for each type of value" $
+      ordinary runner (session settings (steps [raised `yields` 1, noted `yields` "none", noted `yields` "none!", raised `yields` 2]))
+        `shouldReturn` ()
+    it "survives the checkouts of the same pooled connection" $
+      pooled id $ \env -> do
+        pid <- pidOf env
+        onEnv env (viaPool (envPool env) raised) `shouldReturn` Right 1
+        onEnv env (viaPool (envPool env) raised) `shouldReturn` Right 2
+        pidOf env `shouldReturn` pid
+    it "is gone when the pool replaces the connection, which starts with the value that it is given" $
+      pooled id $ \env -> do
+        pid <- pidOf env
+        onEnv env (viaPool (envPool env) raised) `shouldReturn` Right 1
+        terminated pid
+        eventually 6 (gone pid) `shouldReturn` True
+        onEnv env (viaPool (envPool env) (backend &&& seen)) >>= \case
+          Right (Right pid', value) -> do
+            (pid' /= pid) `shouldBe` True
+            value `shouldBe` 0
+          other -> failTest ("the replacing connection failed: " <> show other)
+    it "is not reached through a handle that was given up" $
+      pooled id $ \env -> do
+        leaked <- onEnv env (viaPool (envPool env) (arr fst)) >>= either (\failure -> failTest ("no connection: " <> show failure)) pure
+        (either Just (const Nothing) <$> try @UsageError (connectionSlot leaked (0 :: Int))) `shouldReturn` Just ConnectionReleased
+    it "keeps the names that a program has prepared on a connection, so that it prepares once for each connection" $
+      pooled id $ \env -> do
+        pid <- pidOf env
+        let asked = onEnv env (viaPool (envPool env) slotted)
+        -- The first use prepares the statement, the second executes what the connection has, and the replacing connection has none.
+        asked `shouldReturn` Right (Right 2)
+        asked `shouldReturn` Right (Right 2)
+        terminated pid
+        eventually 6 (gone pid) `shouldReturn` True
+        asked `shouldReturn` Right (Right 2)
+
   -- A server that refuses a connection for its connection limit, which v1's overflow policy took for a reason to wait and try again:
   -- the request that is making the connection waits for the overflow delay, and goes on. A pool without overflow reports it.
   describe "a connection that the server refuses for its limit" $ do
@@ -493,6 +547,33 @@ onEnv env = runOn (envRunner env) (envBuffers env)
 -- | The backend of the connection that a request runs on.
 pidOf :: Env -> IO Int64
 pidOf env = onEnv env (viaPool (envPool env) backend) >>= either (\failure -> failTest ("no connection: " <> show failure)) (either (\failure -> failTest ("no backend: " <> show failure)) pure)
+
+-- | The count that the slot of the connection keeps, which starts at zero.
+seen :: (Runtime arr) => OnConn arr Int
+seen = now (\(connection, _) -> connectionSlot connection (0 :: Int) >>= readIORef)
+
+-- | The count in the slot of the connection, raised by one: what it is then.
+raised :: (Runtime arr) => OnConn arr Int
+raised = now (\(connection, _) -> connectionSlot connection (0 :: Int) >>= \slot -> atomicModifyIORef' slot (\n -> (n + 1, n + 1)))
+
+-- | The text that the slot of the connection keeps, which starts as none: what it was, and then it is told with a mark.
+noted :: (Runtime arr) => OnConn arr Text
+noted = now (\(connection, _) -> connectionSlot connection ("none" :: Text) >>= \slot -> atomicModifyIORef' slot (\text -> (text <> "!", text)))
+
+-- | The names that a program has prepared on a connection, as a program keeps them in the slot of the connection.
+newtype Prepared = Prepared [ByteString]
+
+-- | A request that prepares its statement on a connection that doesn't have it, and remembers that the connection has it, and else
+-- executes what the connection has.
+slotted :: (Runtime arr) => OnConn arr (Either QueryError Int32)
+slotted = alongside known >>> (\(has, input) -> if has then Left input else Right input) ^>> (executing ||| (preparing &&& remember >>^ fst))
+  where
+    statement = valued "SELECT $1::int + 1" [Just "1"] (single @_ @Int32)
+    slot connection = connectionSlot connection (Prepared [])
+    known = now (\(connection, _) -> slot connection >>= fmap (\(Prepared names) -> "slotted" `elem` names) . readIORef)
+    remember = now (\(connection, _) -> slot connection >>= \cell -> modifyIORef' cell (\(Prepared names) -> Prepared ("slotted" : names)))
+    preparing = committed Tx.Read ((,) <$> Tx.prepare "slotted" statement <*> Tx.executePrepared "slotted" statement) (\(preparation, result) -> Tx.prepared preparation >>> Tx.single result)
+    executing = committed Tx.Read (Tx.executePrepared "slotted" statement) Tx.single
 
 -- | The backend of the connection that a request runs on, as a step on it.
 backend :: (Runtime arr) => OnConn arr (Either QueryError Int64)
