@@ -74,7 +74,7 @@ import Network.Streaming.Combinators
     withTicket,
   )
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Named (adding, field, is, newRecord)
+import Network.Streaming.Named (Inj, adding, cases, casesBy, field, inj, is, newRecord, (:=), (?>))
 import Network.Streaming.Pool (offer, queueNow, takeNowWith)
 
 -- | The server: for each core, the workers, and for the first, the acceptor, which opens the listener.
@@ -243,21 +243,12 @@ data Progress = Progress
     progressEnded :: !Bool
   }
 
--- | What the head came to.
-data Head
-  = -- | The stream ended before the head did, or there was no request.
-    HeadEnded
-  | -- | The request is refused with this status.
-    HeadRefused !Int
-  | -- | The request, and where its head ends in the buffer.
-    HeadGood !Parsed !Int
+-- | A request that has a head: what the head parsed to, and where it ends in the buffer.
+type Good = ("parsed" := Parsed, "consumed" := Int)
 
--- | A request that has a head: the request being read, what its head parsed to, and where the head ends in the buffer.
-data Headed = Headed
-  { headedReq :: !Req,
-    headedParsed :: !Parsed,
-    headedEnd :: !Int
-  }
+-- | The cases of a sum that the head can come to: the stream ended before the head did, or there was no request ("stream
+-- ended"), the request is refused with a status ("refused"), or it has a head ("good").
+type Ends s = (Inj "stream ended" () s, Inj "refused" Int s, Inj "good" Good s)
 
 -- | What the handler is run with: the call, the request, and the primary loan, if the handler is to have it back.
 data Prepared = Prepared
@@ -272,21 +263,18 @@ request settings handler =
   named (Label "request" "Reads the head of a request, runs the handler, and says whether the connection is kept.") $
     uncurry (newRecord ["loans", "conn"])
       ^>> adding "loan" (field "loans" >>> borrow)
-      >>> step "copy carry-over" begin' -| "Req"
-      >>> readHead settings
-      >>> decide "how did the head end?" byHead
-      >>> (("stream ended" |- quit ||| "refused" |- refuse) ||| "good" |- answered settings handler)
+      >>> adding "req" (step "copy carry-over" begin')
+      >>> adding "head" (field "req" >>> readHead settings)
+      >>> decide "how did the head end?" (cases "head")
+      >>> ("stream ended" ?> quit ||| "refused" ?> refuse ||| "good" ?> answered settings handler)
   where
-    byHead (req, outcome) = case outcome of
-      HeadEnded -> Left (Left ())
-      HeadRefused status -> Left (Right (req, status))
-      HeadGood parsed consumed -> Right (Headed req parsed consumed)
+    quit :: (Runtime arr) => arr a Bool
     quit = arr (const False) -| "keep alive"
     refuse =
       step
         "render refusal"
-        ( \(Req {reqConn = Conn {connSocket, connShared}}, status) ->
-            (,) connSocket <$> refusal (sharedPulse connShared) status
+        ( \r ->
+            (,) r.conn.connSocket <$> refusal (sharedPulse r.conn.connShared) r.refused
         )
         >>> sendAll
         >>> quit
@@ -301,11 +289,10 @@ request settings handler =
       Req r.conn r.loans r.loan <$> newIORef Progress {progressEnd = B.length carried, progressScan = startScan, progressEnded = False}
 
 -- | Receives until the head is there, or is refused, or the stream has ended.
-readHead :: (Runtime arr) => Settings -> arr Req (Req, Head)
+readHead :: (Runtime arr, Ends s) => Settings -> arr Req s
 readHead settings =
   named (Label "readHead" "Receives until the head is there, or is refused, or the stream has ended.") $
-    typed @Req @(Req, Head) $
-      iterateWith (step "scan head" (advance settings) -| "head complete?") ("needs more" |- more)
+    "Req" |- iterateWith (step "scan head" (advance settings) -| "head complete?") ("needs more" |- more)
   where
     more = first receive >>> step "record arrival" arrived
     arrived (count, req@Req {reqProgress}) = do
@@ -317,19 +304,19 @@ readHead settings =
       pure req
 
 -- | Looks at the bytes that arrived: what the head came to, or the socket and the room to receive more into.
-advance :: Settings -> Req -> IO (Step ((Socket, Room), Req) (Req, Head))
+advance :: (Ends s) => Settings -> Req -> IO (Step ((Socket, Room), Req) s)
 advance settings req@Req {reqConn = Conn {connSocket, connPeer}, reqLoan, reqProgress} = do
   progress@Progress {progressEnd, progressScan, progressEnded} <- readIORef reqProgress
   let buffer = loanBuffer reqLoan
       bytes = view buffer progressEnd
   case scanHead (lineLimit settings) (headLimit settings) (bufferCapacity buffer) bytes progressScan of
-    Refused status -> pure (Finish (req, HeadRefused status))
+    Refused status -> pure (Finish (inj "refused" status))
     Complete start stop spill -> do
       -- The head is copied and parsed while the bytes are there, and the request owns them.
       let !owned = joined spill (B.copy (B.take (stop - max 0 start) (B.drop (max 0 start) bytes)))
       pure . Finish $ case parseHead (bodyLimit settings) connPeer owned of
-        Left status -> (req, HeadRefused status)
-        Right parsed -> (req, HeadGood parsed stop)
+        Left status -> inj "refused" status
+        Right parsed -> inj "good" (newRecord ["parsed", "consumed"] parsed stop)
     Full lineStart requestStart spill -> do
       -- The buffer is full and the head goes on: its bytes are copied out, but for a CR that ends them, which stays at
       -- the start of the buffer so that it is with the LF that follows it, and the buffer is received into again.
@@ -344,17 +331,17 @@ advance settings req@Req {reqConn = Conn {connSocket, connPeer}, reqLoan, reqPro
       writeIORef reqProgress progress {progressEnd = keep, progressScan = Scanning 0 (lineStart - shift) (if requestStart == notYet then notYet else requestStart - shift) spill'}
       pure (Again ((connSocket, Room buffer keep (bufferCapacity buffer - keep)), req))
     scanning
-      | progressEnded -> pure (Finish (req, HeadEnded))
+      | progressEnded -> pure (Finish (inj "stream ended" ()))
       | otherwise ->
           Again ((connSocket, Room buffer progressEnd (bufferCapacity buffer - progressEnd)), req)
             <$ writeIORef reqProgress progress {progressScan = scanning}
 
 -- | A request that has a head: the handler runs, and the connection is kept if the response, and the request's body,
 -- leave it in a state that another request can follow.
-answered :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Headed Bool
+answered :: (Runtime arr, HasField "req" r Req, HasField "good" r Good) => Settings -> arr (Call, Request) () -> arr r Bool
 answered settings handler =
   named (Label "answered" "Runs the handler on a request that has a head, and says whether the connection is kept.") $
-    ( typed @Headed @Prepared (step "prepare call" (prepare settings))
+    ( step "prepare call" (prepare settings) -| "Prepared"
         >>> decide "give back loan?" heldLoan
         >>> ("yes" |- consume release ||| "no" |- returnA)
         >>> (is "outcome" (protected (tryA handler)) &&& is "call" (arr fst))
@@ -370,8 +357,11 @@ answered settings handler =
 
 -- | The call: the body of the request, and the response. What follows a request that has no body goes to the next
 -- request, and its primary loan is given back before the handler runs, to be used for what the handler reads.
-prepare :: Settings -> Headed -> IO Prepared
-prepare settings Headed {headedReq = Req {reqConn = Conn {..}, ..}, headedParsed = Parsed request' framing keep, headedEnd = consumed} = do
+prepare :: (HasField "req" r Req, HasField "good" r Good) => Settings -> r -> IO Prepared
+prepare settings r = do
+  let !Req {reqConn = Conn {..}, ..} = r.req
+      !(Parsed request' framing keep) = r.good.parsed
+      !consumed = r.good.consumed
   Progress {progressEnd = end} <- readIORef reqProgress
   let buffer = loanBuffer reqLoan
       Method name = method request'
@@ -408,24 +398,33 @@ aftermath :: (Runtime arr, HasField "outcome" r (Either SomeException ()), HasFi
 aftermath =
   named (Label "aftermath" "Decides whether the connection is kept, and answers 500 if nothing was answered.") $
     decide "how did the handler end?" byOutcome
-      >>> (("connection lost" |- quit ||| "failed" |- failed) ||| "returned" |- finished)
+      >>> ("connection lost" ?> quit ||| "failed" ?> failed ||| "returned" ?> finished)
   where
-    byOutcome r = case r.outcome of
+    -- Inlined where it is used, so that the branches take the sum apart where it is made, and it is not built.
+    byOutcome r = casesBy "outcome" classify r
+    {-# INLINE byOutcome #-}
+    classify = \case
       Left failure
-        | Just ConnectionLost <- fromException failure -> Left (Left ())
-        | Just (BodyRefused status) <- fromException failure -> Left (Right (status, r.call))
-        | otherwise -> Left (Right (500, r.call))
-      Right () -> Right r.call
+        | Just ConnectionLost <- fromException failure -> inj "connection lost" ()
+        | Just (BodyRefused status) <- fromException failure -> inj "failed" status
+        | otherwise -> inj "failed" (500 :: Int)
+      Right () -> inj "returned" ()
+    quit :: (Runtime arr) => arr a Bool
     quit = arr (const False) -| "keep alive"
-    failed = step "check if answered" (\(status, Call _ _ exchange) -> (,) status <$> unanswered exchange) >>> internalError
+    failed =
+      step
+        "check if answered"
+        (\r -> case r.call of Call _ _ exchange -> (,) r.failed <$> unanswered exchange)
+        >>> internalError
     finished =
       step
         "read response phase"
-        ( \call@(Call _ _ exchange) ->
-            readIORef (exPhase exchange) >>= \case
-              Ended -> pure (Right call)
-              Unanswered -> pure (Left (Just exchange))
-              _ -> pure (Left Nothing)
+        ( \r -> case r.call of
+            call@(Call _ _ exchange) ->
+              readIORef (exPhase exchange) >>= \case
+                Ended -> pure (Right call)
+                Unanswered -> pure (Left (Just exchange))
+                _ -> pure (Left Nothing)
         )
         -| "response complete?"
         >>> ("no" |- ((500,) ^>> internalError) ||| "yes" |- completed)
