@@ -269,10 +269,10 @@ spec socketPath port = describe "integration" $ forM_ runners $ \runner@(Runner 
         Left failure -> failTest ("failed otherwise: " <> displayException failure)
     -- A name is looked up, and the addresses it resolves to are tried in order. The cluster listens on 127.0.0.1 only, so
     -- an address of another family that comes first is refused.
-    needs "host names" $ it "connects to a host by its name" $ do
+    it "connects to a host by its name" $ do
       settings <- settingsOf (viaPlaintext "localhost" "")
       run (session settings (arr (hostName . PG.connectedHost . fst) &&& selectOne)) `shouldReturn` ("localhost", Right [1])
-    needs "host names" $ it "words the failure of each address that a host name resolves to as libpq does" $
+    it "words the failure of each address that a host name resolves to as libpq does" $
       withUnusedPort $ \unused -> do
         failure <- connectFailure ("host=localhost sslmode=disable port=" <> Char8.pack (show unused))
         failure
