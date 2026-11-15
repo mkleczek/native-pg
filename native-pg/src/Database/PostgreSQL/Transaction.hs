@@ -242,8 +242,8 @@ readingOf (Rows cardinality cursor) = Reading cardinality cursor
 statement :: Statement arr p row -> Pipeline arr p (Result arr row)
 statement given = Pipeline 1 [Execute given] (\base -> Result base (readingOf (rows given)))
 
--- | Parses the statement under the name. Parse sends no parameters, so the input of the pipeline matters only to a
--- statement made from it.
+-- | Parses the statement under the name, with the types of the parameters that the input of the pipeline gives it, which
+-- the server infers for a parameter that has none.
 prepare :: ByteString -> Statement arr p row -> Pipeline arr p Preparation
 prepare name given = Pipeline 1 [Prepare name given] Preparation
 
@@ -851,7 +851,7 @@ layout finality streams sent tx (input, rest) = do
           (types, formats, values) <- argumentsOf number (params given parameters)
           pure (Entry (sql given) Wanted, streamedStatementOutput (sql given) types formats values)
       Command text -> pure (Entry text Wanted, plain text)
-      Prepare name (resolved parameters -> given) -> pure (Entry (sql given) Parsing, parseOutput name (sql given))
+      Prepare name (resolved parameters -> given) -> pure (Entry (sql given) Parsing, parseOutput name (sql given) (map paramType (params given parameters)))
       ExecutePrepared name (resolved parameters -> given) -> case source of
         Nothing -> do
           (_, formats, values) <- parametersOf (params given parameters)
@@ -921,9 +921,9 @@ boundStreamed name formats values =
   Wire.serialize (Wire.Bind (Wire.BindBody "" name formats values [BinaryFormat]))
     <> Wire.serialize (Wire.Execute "" 0 :: Wire.Execute ByteString)
 
--- | The Parse of the statement under the name, which names no types: the server infers them.
-parseOutput :: ByteString -> ByteString -> Output
-parseOutput name text = Wire.serialize (Wire.Parse name text [])
+-- | The Parse of the statement under the name, with the types of its parameters: the server infers the ones that have none.
+parseOutput :: ByteString -> ByteString -> [Maybe Oid] -> Output
+parseOutput name text types = Wire.serialize (Wire.Parse name text (map (fmap Wire.Scalar) types))
 
 -- | Bind of the statement that has the name, with the parameters, which says that the rows come in binary, and Execute.
 boundOutput :: ByteString -> [FormatCode] -> [Maybe Parameter] -> Output

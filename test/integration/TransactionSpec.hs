@@ -321,23 +321,22 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
         `shouldReturn` ()
     -- A parameter that only a typed function takes has no type for the server to infer, as the body of a request that PostgREST
     -- sends as json does, so Parse has to name the types of the statement's parameters.
-    needs "prepare sending the types of its parameters" $ do
-      it "sends the types of the parameters of a statement that it prepares" $
-        withSession
-          ( steps
-              [ preparedResult "typed" jsonField `yields` Right "x",
-                committed Tx.Read (Tx.executePrepared "typed" (unrendered jsonField)) Tx.single `yields` Right "x"
-              ]
-          )
-          `shouldReturn` ()
-      it "sends the types that the input of the pipeline gives, for each run of one program" $
-        withSession
-          ( overInputs
-              (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,,) <$> Tx.prepare "typed_input" typeOfInput <*> Tx.executePrepared "typed_input" typeOfInput <*> Tx.closeStatement "typed_input") typedInput)
-              [(114, "{}"), (3802, "{}"), (114, "[]")]
-              `yields` [Right "json", Right "jsonb", Right "json"]
-          )
-          `shouldReturn` ()
+    it "sends the types of the parameters of a statement that it prepares" $
+      withSession
+        ( steps
+            [ preparedResult "typed" jsonField `yields` Right "x",
+              committed Tx.Read (Tx.executePrepared "typed" (unrendered jsonField)) Tx.single `yields` Right "x"
+            ]
+        )
+        `shouldReturn` ()
+    it "sends the types that the input of the pipeline gives, for each run of one program" $
+      withSession
+        ( overInputs
+            (transactOn Tx.ReadCommitted Tx.Write Tx.Open ((,,) <$> Tx.prepare "typed_input" typeOfInput <*> Tx.executePrepared "typed_input" typeOfInput <*> Tx.closeStatement "typed_input") typedInput)
+            [(114, "{}"), (3802, "{}"), (114, "[]")]
+            `yields` [Right "json", Right "jsonb", Right "json"]
+        )
+        `shouldReturn` ()
     it "keeps a name whose preparation was awaited when its execution fails and the transaction rolls back" $ do
       acknowledged <- newIORef False
       withSession
