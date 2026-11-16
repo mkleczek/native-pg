@@ -14,8 +14,8 @@ check() {
 
 # A successful control proves failures come from the names, not the environment. A name that a record has twice is no
 # error where it is read: the newer field, which is the first, shadows the older. A choice is checked the same way: the
-# control puts a value in each of three cases and takes them apart, a case that the choice doesn't have is rejected, and so
-# is a name that two of its cases have.
+# control puts a value in each of three cases and takes them apart, a case that the choice doesn't have is rejected, and
+# so is a name that two of its cases have.
 check NamedFields
 check NamedRepeated
 check NamedPolymorphic
@@ -38,4 +38,4 @@ ChoiceBranchMisspelt The choice has no case "huge"
 ChoiceCaseMisspelt The choice has no case "faild"
 ChoiceTwice The choice has more than one case named "small"
 EOF2
-echo "Named: a record is read by name from any step that names its fields, and a choice is taken apart by the names of its cases; a name that a record lacks, that newRecord has twice, that a choice lacks, or that two of its cases have, is rejected"
+echo "Named: records are read by name and choices taken apart by case; a missing or repeated name is rejected"

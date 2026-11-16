@@ -165,7 +165,11 @@ each p = "each" |- ((\as -> (as, [])) ^>> iterateWith (arr pick -| "another focu
 
 -- | Runs the arrow on each focus of a traversal, in the order that the traversal visits them, and puts the results in
 -- the places of the foci. The traversal is in the form of the van Laarhoven lenses, as 'traverse' is.
-traversal :: (ArrowChoice arr, Annotate arr) => (forall f. (Applicative f) => (a -> f b) -> s -> f t) -> arr a b -> arr s t
+traversal ::
+  (ArrowChoice arr, Annotate arr) =>
+  (forall f. (Applicative f) => (a -> f b) -> s -> f t) ->
+  arr a b ->
+  arr s t
 traversal trav p = alongside (focuses ^>> each p) >>^ \(bs, s) -> refill (trav (const pop) s) bs
   where
     focuses = getConst . trav (\a -> Const [a])

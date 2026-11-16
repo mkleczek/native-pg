@@ -154,7 +154,10 @@ withInbox dispose body = scope (keeping (inbox @arr @r @name)) (closing @name @r
 -- the input.
 closing :: forall name r arr a b. (ArrowChoice arr, Annotate arr, Inboxes arr r, KnownSymbol name) => arr (a, b) () -> arr (((Inbox arr name r a, Address name r a), b), Exit) ()
 closing dispose =
-  (\(((opened, _), b), _) -> (opened, b)) ^>> first (closeInbox @arr @r @name) >>> decide "value left?" left >>> ("no" |- returnA ||| "yes" |- dispose)
+  (\(((opened, _), b), _) -> (opened, b))
+    ^>> first (closeInbox @arr @r @name)
+    >>> decide "value left?" left
+    >>> ("no" |- returnA ||| "yes" |- dispose)
   where
     left (leftover, b) = maybe (Left ()) (Right . (,b)) leftover
 {-# INLINE closing #-}

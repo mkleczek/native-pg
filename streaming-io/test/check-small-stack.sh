@@ -14,4 +14,4 @@ cabal build -v0 streaming-io:test:streaming-io-spec
 spec=$(cabal list-bin -v0 streaming-io:test:streaming-io-spec)
 
 "$spec" test/OpticsSpec.hs '[stops 100,000 deadlines]' '[polls at most once for a turn]' --ansi never +RTS -K1K -RTS
-echo "Small stack: the optics, 100,000 deadlines one after the other and the rounds of a part that waits run in a stack of one chunk"
+echo "Small stack: the optics, 100,000 deadlines and the rounds of a part that waits run in a stack of one chunk"

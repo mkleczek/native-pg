@@ -26,5 +26,9 @@ choice =
       | otherwise = inj "huge" r.number
 
 -- | The prism of a case of a plain sum, which changes its type.
-changed :: (Steps arr) => arr (Either ("small" := Int) (Either ("big" := Int) ("huge" := Int))) (Either ("small" := Int) (Either ("big" := String) ("huge" := Int)))
+changed ::
+  (Steps arr) =>
+  arr
+    (Either ("small" := Int) (Either ("big" := Int) ("huge" := Int)))
+    (Either ("small" := Int) (Either ("big" := String) ("huge" := Int)))
 changed = _Case "big" (arr show)

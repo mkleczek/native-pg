@@ -83,15 +83,18 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const (Left 3 :: Either Int Bool, "kept") ^>> (_1 . _Left) (seeing noted)) `shouldReturn` (Left 30, "kept")
       readLog noted `shouldReturn` ["saw 3"]
       passed <- newLog
-      run (const (Right True :: Either Int Bool, "kept") ^>> (_1 . _Left) (seeing passed)) `shouldReturn` (Right True, "kept")
+      run (const (Right True :: Either Int Bool, "kept") ^>> (_1 . _Left) (seeing passed))
+        `shouldReturn` (Right True, "kept")
       readLog passed `shouldReturn` []
 
     it "composes with at: at \"x\" . _Just runs the arrow on the value of a field that is a Just" $ do
       noted <- newLog
-      run (maybeField (Just 3) >>> (at "x" . _Just) (seeing noted) >>^ \r -> (r.x, r.kept)) `shouldReturn` (Just 30, True)
+      run (maybeField (Just 3) >>> (at "x" . _Just) (seeing noted) >>^ \r -> (r.x, r.kept))
+        `shouldReturn` (Just 30, True)
       readLog noted `shouldReturn` ["saw 3"]
       passed <- newLog
-      run (maybeField Nothing >>> (at "x" . _Just) (seeing passed) >>^ \r -> (r.x, r.kept)) `shouldReturn` (Nothing, True)
+      run (maybeField Nothing >>> (at "x" . _Just) (seeing passed) >>^ \r -> (r.x, r.kept))
+        `shouldReturn` (Nothing, True)
       readLog passed `shouldReturn` []
 
     it "composes with the lens _2: _Just . _2 runs the arrow on the second of a pair that is in a Just" $ do
@@ -160,7 +163,8 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
 
     it "composes with at: at \"rows\" . traversal traverse runs the arrow on each element of a field" $ do
       noted <- newLog
-      run (rows >>> (at "rows" . traversal traverse) (seeing noted) >>^ \r -> (r.rows, r.name)) `shouldReturn` ([10, 20, 30], "pipe")
+      run (rows >>> (at "rows" . traversal traverse) (seeing noted) >>^ \r -> (r.rows, r.name))
+        `shouldReturn` ([10, 20, 30], "pipe")
       readLog noted `shouldReturn` ["saw 1", "saw 2", "saw 3"]
 
     it "runs the arrow on 10,000 foci of a list, and on 10,000 foci of 5,000 pairs, once each" $ do
@@ -170,7 +174,8 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       -- The last result is read first, which a lazy putting back would have to follow a chain of thunks to.
       run (const [1 .. 10000 :: Int] ^>> traversal traverse (arr (+ 1)) >>^ last) `shouldReturn` 10001
       paired <- newCount
-      run (const (pairs 5000) ^>> traversal (traverse . both) (counting paired)) `shouldReturn` fmap (\(a, b) -> (a + 1, b + 1)) (pairs 5000)
+      run (const (pairs 5000) ^>> traversal (traverse . both) (counting paired))
+        `shouldReturn` fmap (\(a, b) -> (a + 1, b + 1)) (pairs 5000)
       readIORef paired `shouldReturn` 10000
 
   describe "folding" $ do

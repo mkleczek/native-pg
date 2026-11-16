@@ -32,4 +32,4 @@ CleanupCollects Inboxes
 StepWithin Within
 StepEachAwaits Exchange
 EOF2
-echo "Steps: undoing takes steps and cleanups that can't wait, each of them too; an await, a block, a give way, a collect, a within and each of an await are rejected"
+echo "Steps: undoing takes steps and cleanups that can't wait, and each of them; steps that wait are rejected"

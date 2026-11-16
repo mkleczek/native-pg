@@ -221,7 +221,10 @@ instance (r' ~ r) => Distribute (name := x) r (name := (name := x, r')) where
   {-# INLINE distribute #-}
 
 -- | The first case, and the rest of them.
-instance (r' ~ r, Distribute rest r drest) => Distribute (Either (name := x) rest) r (Either (name := (name := x, r')) drest) where
+instance
+  (r' ~ r, Distribute rest r drest) =>
+  Distribute (Either (name := x) rest) r (Either (name := (name := x, r')) drest)
+  where
   distribute (Left (Is x)) r = Left (Is (Is x, r))
   distribute (Right rest) r = Right (distribute rest r)
   {-# INLINE distribute #-}
@@ -273,7 +276,12 @@ infixr 6 ?>
 
 -- | The branch for the case of the name: it takes the value of the case in front of the record, as a field of that
 -- name, and the wire into it has the name in diagrams. A chain of them takes apart what 'cases' gives.
-(?>) :: forall name -> forall arr x r b. (Arrow arr, Annotate arr, KnownSymbol name) => arr (name := x, r) b -> arr (name := (name := x, r)) b
+(?>) ::
+  forall name ->
+  forall arr x r b.
+  (Arrow arr, Annotate arr, KnownSymbol name) =>
+  arr (name := x, r) b ->
+  arr (name := (name := x, r)) b
 (?>) name p = symbolVal (Proxy @name) |- ((\(Is a) -> a) ^>> p)
 {-# INLINE (?>) #-}
 
@@ -297,11 +305,20 @@ instance (Case name rest a b rest', t ~ Either other rest') => Case name (Either
   {-# INLINE caseOf #-}
 
 -- | The last case, when it has another name: the choice has no case of the name.
-instance {-# OVERLAPPABLE #-} (a ~ TypeError (NoCase name), t ~ TypeError (NoCase name)) => Case name (other := x) a b t where
+instance
+  {-# OVERLAPPABLE #-}
+  (a ~ TypeError (NoCase name), t ~ TypeError (NoCase name)) =>
+  Case name (other := x) a b t
+  where
   caseOf _ = error "Network.Streaming.Named: a case that the choice doesn't have is a type error"
 
 -- | The prism of the case of the name: runs the arrow on that case, which the arrow may give another type, and passes
 -- the other cases through. The wire into the arrow has the name in diagrams.
-_Case :: forall name -> forall arr s t a b. (ArrowChoice arr, Annotate arr, KnownSymbol name, Case name s a b t) => arr a b -> arr s t
+_Case ::
+  forall name ->
+  forall arr s t a b.
+  (ArrowChoice arr, Annotate arr, KnownSymbol name, Case name s a b t) =>
+  arr a b ->
+  arr s t
 _Case name p = caseOf @name (symbolVal (Proxy @name) |- p)
 {-# INLINE _Case #-}

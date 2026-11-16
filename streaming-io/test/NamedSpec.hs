@@ -140,44 +140,77 @@ spec = describe "fields named in their type" $ do
       run (newRecord ["size", "name"] <$> arr (const 6) <*> arr (const "bar") >>> sized) `shouldReturn` "bar6"
 
     it "hands each case of a choice of three to its branch, with its value, the rest of the record and a record" $ do
-      forM_ [(0, "ended GET /", "stream ended"), (404, "GET / refused 404", "refused"), (1000, "GET / good head 1000", "good")] $ \(number, expected, taken) -> do
-        noted <- newLog
-        run (const number ^>> heads noted) `shouldReturn` expected
-        readLog noted `shouldReturn` [taken]
+      forM_
+        [ (0, "ended GET /", "stream ended"),
+          (404, "GET / refused 404", "refused"),
+          (1000, "GET / good head 1000", "good")
+        ]
+        $ \(number, expected, taken) -> do
+          noted <- newLog
+          run (const number ^>> heads noted) `shouldReturn` expected
+          readLog noted `shouldReturn` [taken]
 
     it "hands each case of a choice of four to its branch, with its value and the rest of the record" $ do
-      forM_ [(5, "GET / tiny 5", "tiny"), (50, "GET / small 50", "small"), (500, "GET / medium 500", "medium"), (5000, "GET / large 5000", "large")] $ \(number, expected, taken) -> do
-        noted <- newLog
-        run (const number ^>> sizes noted) `shouldReturn` expected
-        readLog noted `shouldReturn` [taken]
+      forM_
+        [ (5, "GET / tiny 5", "tiny"),
+          (50, "GET / small 50", "small"),
+          (500, "GET / medium 500", "medium"),
+          (5000, "GET / large 5000", "large")
+        ]
+        $ \(number, expected, taken) -> do
+          noted <- newLog
+          run (const number ^>> sizes noted) `shouldReturn` expected
+          readLog noted `shouldReturn` [taken]
 
     it "hands each case of a classification of a field to its branch, with casesBy" $ do
-      forM_ [(200, "GET / ok 200", "ok"), (404, "GET / missing 404", "missing"), (503, "GET / broken 503", "broken")] $ \(status, expected, taken) -> do
-        noted <- newLog
-        run (const status ^>> classified noted) `shouldReturn` expected
-        readLog noted `shouldReturn` [taken]
+      forM_
+        [ (200, "GET / ok 200", "ok"),
+          (404, "GET / missing 404", "missing"),
+          (503, "GET / broken 503", "broken")
+        ]
+        $ \(status, expected, taken) -> do
+          noted <- newLog
+          run (const status ^>> classified noted) `shouldReturn` expected
+          readLog noted `shouldReturn` [taken]
 
-    it "runs the arrow on the case of the name of a plain sum, with another type, and passes the other cases through" $ do
+    it "runs the arrow on a case of a plain sum, with another type, and passes the other cases through" $ do
       noted <- newLog
-      run (const (inj "failed" "boom" :: Outcome) ^>> _Case "failed" (tap (noting' noted "failed") >>^ length) >>^ showOutcome)
+      run
+        ( const (inj "failed" "boom" :: Outcome)
+            ^>> _Case "failed" (tap (noting' noted "failed") >>^ length)
+            >>^ showOutcome
+        )
         `shouldReturn` "failed 4"
       readLog noted `shouldReturn` ["failed \"boom\""]
       passed <- newLog
-      run (const (inj "done" 7 :: Outcome) ^>> _Case "failed" (tap (noting' passed "failed") >>^ length) >>^ showOutcome)
+      run
+        ( const (inj "done" 7 :: Outcome)
+            ^>> _Case "failed" (tap (noting' passed "failed") >>^ length)
+            >>^ showOutcome
+        )
         `shouldReturn` "done 7"
       readLog passed `shouldReturn` []
 
     it "runs the arrow on the first case of a plain sum, and on the last, with _Case" $ do
       run (const (inj "done" 7 :: Outcome) ^>> _Case "done" (arr show) >>^ showOutcome) `shouldReturn` "done \"7\""
-      run (const (inj "failed" "boom" :: Outcome) ^>> _Case "failed" (arr (const True)) >>^ showOutcome) `shouldReturn` "failed True"
+      run (const (inj "failed" "boom" :: Outcome) ^>> _Case "failed" (arr (const True)) >>^ showOutcome)
+        `shouldReturn` "failed True"
 
     it "composes with at: at \"outcome\" . _Case \"failed\" runs the arrow on the case of a field that is a sum" $ do
       noted <- newLog
-      run (withOutcome (inj "failed" "boom") >>> (at "outcome" . _Case "failed") (tap (noting' noted "failed") >>^ length) >>^ \r -> (showOutcome r.outcome, r.kept))
+      run
+        ( withOutcome (inj "failed" "boom")
+            >>> (at "outcome" . _Case "failed") (tap (noting' noted "failed") >>^ length)
+            >>^ \r -> (showOutcome r.outcome, r.kept)
+        )
         `shouldReturn` ("failed 4", True)
       readLog noted `shouldReturn` ["failed \"boom\""]
       passed <- newLog
-      run (withOutcome (inj "done" 7) >>> (at "outcome" . _Case "failed") (tap (noting' passed "failed") >>^ length) >>^ \r -> (showOutcome r.outcome, r.kept))
+      run
+        ( withOutcome (inj "done" 7)
+            >>> (at "outcome" . _Case "failed") (tap (noting' passed "failed") >>^ length)
+            >>^ \r -> (showOutcome r.outcome, r.kept)
+        )
         `shouldReturn` ("done 7", True)
       readLog passed `shouldReturn` []
 
@@ -222,9 +255,9 @@ readLog = fmap reverse . readIORef
 noting :: (Effect arr) => Log -> String -> Int -> arr () Int
 noting noted entry number = now (\() -> atomicModifyIORef' noted (\entries -> (entry : entries, ())) >> pure number)
 
--- | How the head of the request ended, which the producer makes by naming the case, and a chain of branches takes apart.
--- Neither the producer nor the branches has a signature: the type of the choice comes from the branches. Each branch reads
--- its case, the request and, for the good head, a record.
+-- | How the head of the request ended, which the producer makes by naming the case, and a chain of branches takes
+-- apart. Neither has a signature: the type of the choice comes from the branches. Each branch reads its case, the
+-- request and, for the good head, a record.
 heads :: (Steps arr) => Log -> arr Int String
 heads noted =
   newRecord ["req", "number"] "GET /"
@@ -286,8 +319,10 @@ withOutcome outcome = is "outcome" (arr (const outcome)) &&& is "kept" (arr (con
 
 -- | A step that notes its name, and gives the text that the function makes of its input.
 branch :: (Effect arr) => Log -> String -> (a -> String) -> arr a String
-branch noted entry text = now (\input -> atomicModifyIORef' noted (\entries -> (entry : entries, ())) >> pure (text input))
+branch noted entry text =
+  now (\input -> atomicModifyIORef' noted (\entries -> (entry : entries, ())) >> pure (text input))
 
 -- | A step that notes its name and its input, and gives nothing.
 noting' :: (Effect arr, Show a) => Log -> String -> arr a ()
-noting' noted entry = now (\input -> atomicModifyIORef' noted (\entries -> ((entry <> " " <> show input) : entries, ())))
+noting' noted entry =
+  now (\input -> atomicModifyIORef' noted (\entries -> ((entry <> " " <> show input) : entries, ())))

@@ -112,7 +112,9 @@ withLoanTimeoutA body = scope acquire giveBack run
   where
     acquire =
       now (\((limit, pool), _) -> (\closed -> if closed then Left () else Right (limit, pool)) <$> isClosed pool)
-        >>> ("closed" |- arr (const (Left PoolClosed)) ||| "open" |- (alongside checkingOut >>^ \(got, (_, pool)) -> fmap (pool,) got))
+        >>> ( "closed" |- arr (const (Left PoolClosed))
+                ||| "open" |- (alongside checkingOut >>^ \(got, (_, pool)) -> fmap (pool,) got)
+            )
     checkingOut = (\(limit, pool) -> (limit, (1, pool))) ^>> checkoutAtTimeoutA >>^ maybe (Left CheckoutTimedOut) Right
     giveBack = fst ^>> (done ||| offer)
     run = withInput ^>> (arr Left ||| (body >>^ Right))
@@ -137,7 +139,9 @@ loanedIn checkingOut body = scope acquire giveBack run
   where
     acquire =
       now (\(pool, _) -> (\closed -> if closed then Left () else Right pool) <$> isClosed pool)
-        >>> ("closed" |- arr (const (Left PoolClosed)) ||| "open" |- (alongside checkingOut >>^ \(got, pool) -> fmap (pool,) got))
+        >>> ( "closed" |- arr (const (Left PoolClosed))
+                ||| "open" |- (alongside checkingOut >>^ \(got, pool) -> fmap (pool,) got)
+            )
     giveBack = fst ^>> (done ||| offer)
     run = withInput ^>> (arr Left ||| (body >>^ Right))
     withInput (acquired, (_, input)) = fmap (\(_, item) -> (item, input)) acquired
@@ -321,7 +325,9 @@ waited giveBack =
         >>> ( "yes" |- returnA
                 ||| "no"
                   |- ( through _2 abandon
-                         >>> decide "fulfilled meanwhile?" (\(pool, fulfilled) -> maybe (Left ()) (Right . (pool,)) fulfilled)
+                         >>> decide
+                           "fulfilled meanwhile?"
+                           (\(pool, fulfilled) -> maybe (Left ()) (Right . (pool,)) fulfilled)
                          >>> ("no" |- returnA ||| "yes" |- giveBack)
                      )
             )
@@ -362,7 +368,10 @@ checkoutAtTimeoutA :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, E
 checkoutAtTimeoutA =
   named (Label "checkoutAtTimeoutA" "Takes an item of the pool if enough are free, and else queues for one and waits for it until the deadline that the input gives.") $
     giveWay
-      >>> step "claim from free items" (\(limit, input) -> either (Left . (limit,)) Right <$> claimAtNow input) -| "item free?"
+      >>> step
+        "claim from free items"
+        (\(limit, input) -> either (Left . (limit,)) Right <$> claimAtNow input)
+        -| "item free?"
       >>> ("no" |- timeoutA queueAt ||| "yes" |- arr Just)
 
 -- | The item, if at least this many are free, and else the input again.
@@ -407,7 +416,9 @@ checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
     waitedIn = scope returnA giveUp (fst ^>> through _2 await)
     giveUp =
       unlessDone
-        ^>> (returnA ||| (through _2 abandon >>> now (\(pool, fulfilled) -> maybe (pure ()) (releaseNow pool) fulfilled)))
+        ^>> ( returnA
+                ||| (through _2 abandon >>> now (\(pool, fulfilled) -> maybe (pure ()) (releaseNow pool) fulfilled))
+            )
 
 -- | An item of the pool that is the arrow's input, once one is free, as 'checkout' waits for it.
 checkoutIn :: (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Exchange arr 'Anywhere, Scope arr) => arr (Pool conn) conn

@@ -112,7 +112,12 @@ spec = describe "the chart" $ do
       found -> failTest ("the chart has the steps " <> show found)
 
   it "has the question of the decision and the names of the cases on the branches of a chain of ?>" $ do
-    chart <- chartOf (decide "how did the head end?" (cases "head") >>> ("stream ended" ?> quick ||| "refused" ?> quick ||| "good" ?> quick) :: Diagram ("head" := Either ("stream ended" := ()) (Either ("refused" := Int) ("good" := Bool))) ())
+    let program ::
+          Diagram ("head" := Either ("stream ended" := ()) (Either ("refused" := Int) ("good" := Bool))) ()
+        program =
+          decide "how did the head end?" (cases "head")
+            >>> ("stream ended" ?> quick ||| "refused" ?> quick ||| "good" ?> quick)
+    chart <- chartOf program
     [wiresNamed name chart | name <- ["stream ended", "refused", "good"]] `shouldBe` [1, 1, 1]
     any ("{\"how did the head end?\"}" `isInfixOf`) chart `shouldBe` True
     length (nub (concat [sourcesOf name chart | name <- ["stream ended", "refused", "good"]])) `shouldBe` 1
@@ -209,11 +214,16 @@ afterwards = step "afterwards" (const (pure ()))
 
 -- | The edges of the chart, from a node to a node, whatever their labels.
 edgesOf :: [String] -> [(String, String)]
-edgesOf chart = [(takeWhile isAlphaNum line, last (words line)) | line <- stripped chart, " --> " `isInfixOf` line || " -->|" `isInfixOf` line]
+edgesOf chart =
+  [ (takeWhile isAlphaNum line, last (words line))
+  | line <- stripped chart,
+    " --> " `isInfixOf` line || " -->|" `isInfixOf` line
+  ]
 
 -- | The nodes that an edge of the label leaves.
 sourcesOf :: String -> [String] -> [String]
-sourcesOf label chart = [takeWhile isAlphaNum line | line <- stripped chart, ("-->|\"" ++ label ++ "\"|") `isInfixOf` line]
+sourcesOf label chart =
+  [takeWhile isAlphaNum line | line <- stripped chart, ("-->|\"" ++ label ++ "\"|") `isInfixOf` line]
 
 -- | The nodes that an edge of the label goes to.
 targetsOf :: String -> [String] -> [String]
@@ -221,7 +231,8 @@ targetsOf label chart = [last (words line) | line <- stripped chart, ("-->|\"" +
 
 -- | The nodes that are declared with the text, as a step of its own.
 nodesDeclared :: String -> [String] -> [String]
-nodesDeclared text chart = [takeWhile isAlphaNum line | line <- stripped chart, ("[\"" ++ text ++ "\"]") `isInfixOf` line]
+nodesDeclared text chart =
+  [takeWhile isAlphaNum line | line <- stripped chart, ("[\"" ++ text ++ "\"]") `isInfixOf` line]
 
 -- | Whether the edges lead from the node to the target, in one step or more.
 reaches :: [String] -> String -> String -> Bool
@@ -231,7 +242,9 @@ reaches chart from target = go [] [from]
     go _ [] = False
     go seen (node : rest)
       | node `elem` seen = go seen rest
-      | otherwise = let onward = [to | (source, to) <- edges, source == node] in target `elem` onward || go (node : seen) (onward ++ rest)
+      | otherwise =
+          let onward = [to | (source, to) <- edges, source == node]
+           in target `elem` onward || go (node : seen) (onward ++ rest)
 
 -- | How many wires of the chart are labelled with the name.
 wiresNamed :: String -> [String] -> Int

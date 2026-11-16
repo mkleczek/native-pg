@@ -8,8 +8,8 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (decide)
 import Network.Streaming.Named
 
--- | A value put in a case that the choice doesn't have: the branches take "small", "big" and "huge", and the producer puts
--- it in "smal".
+-- | A value put in a case that the choice doesn't have: the branches take "small", "big" and "huge", and the producer
+-- puts it in "smal".
 misspelt :: (Steps arr) => arr Int String
 misspelt =
   newRecord ["req", "number"] "GET /"

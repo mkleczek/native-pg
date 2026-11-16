@@ -158,7 +158,8 @@ freest workers = busiest >>= \core -> findIndex ((== core) . freeCore) workers
 worker :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
 worker settings handler =
   named (Label "worker" "Opens its inbox of connections, then offers itself as free, collects a connection, and serves it, for ever.") $
-    withInbox @"connections" closeLateSocket (foreverA (tap (offered -| "accepted socket" >>> connection settings handler)))
+    withInbox @"connections" closeLateSocket $
+      foreverA (tap (offered -| "accepted socket" >>> connection settings handler))
 
 -- | The socket that was left in the worker's inbox when it ended, which is closed.
 closeLateSocket :: (Runtime arr) => arr (Socket, Cores) ()
@@ -172,7 +173,8 @@ offered ::
     ("shared" := Shared, "socket" := Socket)
 offered =
   named (Label "offered" "Offers the worker as free in the pool, and collects the connection that is posted to its inbox.") $
-    tap (answering "free worker" (free ^>> offer)) >>> (is "shared" (arr sharedOf) &&& is "socket" (fst . fst ^>> collect))
+    tap (answering "free worker" (free ^>> offer))
+      >>> (is "shared" (arr sharedOf) &&& is "socket" (fst . fst ^>> collect))
   where
     sharedOf (_, Cores _ shared) = shared
     free ((_, address), Cores core shared) = (sharedWorkers shared, Free core address)
@@ -256,7 +258,7 @@ type Good = ("parsed" := Parsed, "consumed" := Int)
 
 -- | The ways that the head can end: the stream ended before it did ("stream ended"), the request is refused with a
 -- status ("refused"), or the request has a head ("good").
-type Ends s = (Inj "stream ended" () s, Inj "refused" Int s, Inj "good" Good s)
+type HeadEnds s = (Inj "stream ended" () s, Inj "refused" Int s, Inj "good" Good s)
 
 -- | What the handler is run with: the call, the request, and the primary loan, if the handler is to have it back.
 data Prepared = Prepared
@@ -264,6 +266,10 @@ data Prepared = Prepared
     preparedRequest :: Request,
     preparedLoan :: Maybe Loan
   }
+
+-- | Ends the connection: it is not kept for another request.
+quit :: (Runtime arr) => arr a Bool
+quit = arr (const False) -| "keep alive"
 
 -- | Reads a request, runs the handler, and says whether the connection is kept for another.
 request :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr (Loans, Conn) Bool
@@ -276,8 +282,6 @@ request settings handler =
       >>> decide "how did the head end?" (cases "head")
       >>> ("stream ended" ?> quit ||| "refused" ?> refuse ||| "good" ?> answered settings handler)
   where
-    quit :: (Runtime arr) => arr a Bool
-    quit = arr (const False) -| "keep alive"
     refuse =
       step
         "render refusal"
@@ -297,7 +301,7 @@ request settings handler =
       Req r.conn r.loans r.loan <$> newIORef Progress {progressEnd = B.length carried, progressScan = startScan, progressEnded = False}
 
 -- | Receives until the head is there, or is refused, or the stream has ended.
-readHead :: (Runtime arr, Ends s) => Settings -> arr Req s
+readHead :: (Runtime arr, HeadEnds s) => Settings -> arr Req s
 readHead settings =
   named (Label "readHead" "Receives until the head is there, or is refused, or the stream has ended.") $
     "Req" |- iterateWith (step "scan head" (advance settings) -| "head complete?") ("needs more" |- more)
@@ -312,7 +316,7 @@ readHead settings =
       pure req
 
 -- | Looks at the bytes that arrived: what the head came to, or the socket and the room to receive more into.
-advance :: (Ends s) => Settings -> Req -> IO (Step ((Socket, Room), Req) s)
+advance :: (HeadEnds s) => Settings -> Req -> IO (Step ((Socket, Room), Req) s)
 advance settings req@Req {reqConn = Conn {connSocket, connPeer}, reqLoan, reqProgress} = do
   progress@Progress {progressEnd, progressScan, progressEnded} <- readIORef reqProgress
   let buffer = loanBuffer reqLoan
@@ -346,7 +350,11 @@ advance settings req@Req {reqConn = Conn {connSocket, connPeer}, reqLoan, reqPro
 
 -- | A request that has a head: the handler runs, and the connection is kept if the response, and the request's body,
 -- leave it in a state that another request can follow.
-answered :: (Runtime arr, HasField "req" r Req, HasField "good" r Good) => Settings -> arr (Call, Request) () -> arr r Bool
+answered ::
+  (Runtime arr, HasField "req" r Req, HasField "good" r Good) =>
+  Settings ->
+  arr (Call, Request) () ->
+  arr r Bool
 answered settings handler =
   named (Label "answered" "Runs the handler on a request that has a head, and says whether the connection is kept.") $
     ( step "prepare call" (prepare settings) -| "Prepared"
@@ -417,8 +425,6 @@ aftermath =
         | Just (BodyRefused status) <- fromException failure -> inj "failed" status
         | otherwise -> inj "failed" (500 :: Int)
       Right () -> inj "returned" ()
-    quit :: (Runtime arr) => arr a Bool
-    quit = arr (const False) -| "keep alive"
     failed =
       step
         "check if answered"
@@ -447,7 +453,11 @@ aftermath =
     internalError =
       decide "unanswered?" (\(status, unanswered') -> maybe (Right ()) (Left . (,) status) unanswered')
         >>> ( "yes"
-                |- (step "render the refusal" (\(status, exchange) -> (,) (exSocket exchange) <$> refusal (exPulse exchange) status) >>> sendAll)
+                |- ( step
+                       "render the refusal"
+                       (\(status, exchange) -> (,) (exSocket exchange) <$> refusal (exPulse exchange) status)
+                       >>> sendAll
+                   )
                 ||| "no" |- returnA
             )
         >>> quit
