@@ -76,8 +76,9 @@ import Network.Streaming.Combinators
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (group, spawn))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Named (Inj, adding, cases, casesBy, field, inj, is, newRecord, (:=), (?>))
+import Network.Streaming.Named (Inj, cases, casesBy, field, inj, is, newRecord, (:=), (?>))
 import Network.Streaming.Pool (checkoutIn, releaseNow, takeNowWith)
+import Network.Streaming.Wiring (result, (-<), (<:))
 
 -- | The server: for each core, its connection workers, and for the first, the acceptor, which opens the listener.
 serve :: (Runtime arr) => Settings -> Listen arr -> arr (Call, Request) () -> arr Cores ()
@@ -327,12 +328,18 @@ request :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr (Loans, Co
 request settings handler =
   named (Label "request" "Reads the head of a request, runs the handler, and says whether the connection is kept.") $
     (\(loans, conn) -> newRecord ["loans", "conn"] loans conn)
-      ^>> adding "loan" (field "loans" >>> borrow)
-      >>> adding "req" (step "copy carry-over" begin')
-      >>> adding "head" (field "req" >>> readHead settings)
-      >>> decide "how did the head end?" (cases "head")
-      >>> ("stream ended" ?> quit ||| "refused" ?> refuse ||| "good" ?> answered settings handler)
+      ^>> result
+        "kept"
+        ( "loan" <: borrowed -< ["loans"]
+            >>> "req" <: step "copy carry-over" begin' -< ["loan", "loans", "conn"]
+            >>> "head" <: readHead settings -< ["req"]
+            >>> "kept" <: afterHead -< ["head", "conn", "req"]
+        )
   where
+    borrowed = field "loans" >>> borrow
+    afterHead =
+      decide "how did the head end?" (cases "head")
+        >>> ("stream ended" ?> quit ||| "refused" ?> refuse ||| "good" ?> answered settings handler)
     refuse =
       step
         "render refusal"
@@ -352,10 +359,11 @@ request settings handler =
       Req r.conn r.loans r.loan <$> newIORef Progress {progressEnd = B.length carried, progressScan = startScan, progressEnded = False}
 
 -- | Receives until the head is there, or is refused, or the stream has ended.
-readHead :: (Runtime arr, HeadEnds s) => Settings -> arr Req s
+readHead :: (Runtime arr, HeadEnds s, HasField "req" r Req) => Settings -> arr r s
 readHead settings =
   named (Label "readHead" "Receives until the head is there, or is refused, or the stream has ended.") $
-    "Req" |- iterateWith (step "scan head" (advance settings) -| "head complete?") ("needs more" |- more)
+    field "req"
+      >>> "Req" |- iterateWith (step "scan head" (advance settings) -| "head complete?") ("needs more" |- more)
   where
     more = first receive >>> step "record arrival" arrived
     arrived (count, req@Req {reqProgress}) = do
