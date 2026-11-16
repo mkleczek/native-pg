@@ -76,14 +76,20 @@ newtype Answering = Answering Exchange
 data Cores = Cores !Int !Shared
 
 -- | What the cores share: the free workers, which the acceptor hands connections to, the date that responses carry and
--- whether the server is shutting down, and the buffers that requests in flight work in.
+-- whether the server is shutting down, and the pools of the buffers that requests in flight work in, of which a value
+-- of one core has its own.
 data Shared = Shared
   { sharedWorkers :: !(Pool Free),
     -- | How many workers of each core are free, which each worker counts for itself before it offers itself and the acceptor
     -- counts down as it takes one, so that the acceptor tells the core that has the most without going through the free workers.
     sharedFreeCounts :: !(IORef (IntMap Int)),
     sharedPulse :: !Pulse,
-    sharedBuffers :: !BufferPool
+    -- | The pool of request buffers of the core that the value is for: a request is admitted from its own core's pool, so that
+    -- the buffer that a request gives back goes to a request of the same core, and not to one that waits on another core while
+    -- this core has none to run.
+    sharedBuffers :: !BufferPool,
+    -- | The pools of request buffers of all the cores, by the number of the core.
+    sharedCorePools :: !(IntMap BufferPool)
   }
 
 -- | A free worker: the core that it is on, and the address of the inbox that it collects its connections from.

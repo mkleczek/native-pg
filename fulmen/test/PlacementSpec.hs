@@ -67,8 +67,7 @@ placementSpec = parallelCores "a core's thread is pinned to the capability of it
 -- waiting never idles because the buffers went to requests of another core.
 bufferSpec :: Spec
 bufferSpec = parallelCores "a core's thread is pinned to the capability of its number, and the non-threaded run time has one" $ describe "request buffers" $
-  xfail "the cores share one pool of request buffers, and a buffer that a request gives back goes to the request that has waited longest, on whichever core" $
-    it "gives the buffer that a request gives back to the request that waits on its own core, though a request of the other core waited longer" $ do
+  it "gives the buffer that a request gives back to the request that waits on its own core, though a request of the other core waited longer" $ do
       getNumCapabilities >>= \capabilities -> when (capabilities < 2) (setNumCapabilities 2)
       bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
         Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
