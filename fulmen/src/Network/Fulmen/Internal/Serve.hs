@@ -13,7 +13,8 @@
 -- again. The acceptor takes a free worker of the core that has the most free workers, so that the connections are shared
 -- out between the cores, and waits for one when there is none, so that past the cap on connections they wait in the
 -- listen backlog. A connection that waits for its next request for longer than the idle timeout is closed, so that the connections
--- that wait in the backlog are served though the ones that have a worker are idle.
+-- that wait in the backlog are served though the ones that have a worker are idle: the connection has a watcher beside the part that
+-- serves its requests, which sleeps until the connection can have waited that long, and ends it if it has.
 --
 -- A request is read into the primary buffer that it was admitted with. The bytes that follow it in the buffer, which
 -- belong to the next request on the connection, are copied out before the buffer is used for anything else, and
@@ -31,7 +32,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BU
 import qualified Data.IntMap.Strict as IntMap
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.List (findIndex)
 import Data.Maybe (isJust)
 import Data.Word (Word8)
@@ -65,6 +66,7 @@ import Network.Streaming.Combinators
     foreverA,
     iterateA,
     iterateWith,
+    keeping,
     step,
     tap,
     typed,
@@ -72,6 +74,7 @@ import Network.Streaming.Combinators
     withInbox,
     withTicket,
   )
+import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
 import Network.Streaming.Pool (offer, queueNow, takeNowWith)
 
@@ -190,8 +193,21 @@ data Conn = Conn
   { connSocket :: !Socket,
     connCarry :: !(IORef ByteString),
     connShared :: !Shared,
-    connPeer :: !SockAddr
+    connPeer :: !SockAddr,
+    connWaiting :: !(IORef Waiting)
   }
+
+-- | Whether a connection waits for its next request, and since when, which its two parts agree on when there is an idle timeout. The part that
+-- serves the requests marks the connection as waiting before it waits, and takes the mark when input comes, and the watcher takes it
+-- when the connection has waited for the timeout. Each takes it by a compare-and-swap, so the one that comes second finds that it lost,
+-- and a request in flight is never the watcher's: it can only take a connection that waits.
+data Waiting
+  = -- | A request is in hand, or in flight.
+    Busy
+  | -- | The connection has waited for a request since this instant.
+    Idle !Instant
+  | -- | The watcher took the connection, whose wait is over.
+    TimedOut
 
 -- | The connection until it ends, which closes its socket however it ends. What goes wrong on a connection is that
 -- connection's: the worker goes on to the next.
@@ -201,10 +217,16 @@ connection settings handler =
     scope (arr snd) (fst ^>> close) (snd ^>> serving)
   where
     serving =
-      step "make connection state" (\(shared, socket) -> Conn socket <$> newIORef B.empty <*> pure shared <*> peerOf socket)
+      step "make connection state" (\(shared, socket) -> Conn socket <$> newIORef B.empty <*> pure shared <*> peerOf socket <*> newIORef Busy)
         `giving` "Conn"
-        >>> tryA (requests settings handler)
+        >>> tryA watched
         >>> done
+    -- With an idle timeout, the connection has a watcher besides the part that serves its requests, which ends the connection once it has
+    -- waited for its next request for the timeout. The watcher's wait is a timer for the connection, which is armed again when it fires, and
+    -- not a deadline for each wait for input: a request costs a mark of the connection, where a deadline costs a scope and a timer.
+    watched = case idleTimeout settings of
+      Nothing -> requests settings handler
+      Just limit -> race (watching limit) (requests settings handler) >>> done
 
 -- | The address that the socket's peer has, or a Unix address with no name if the peer has gone already, as a client of
 -- a Unix socket has no other.
@@ -219,13 +241,13 @@ requests settings handler =
       iterateA ((alongside one >>^ whileKept) `giving` "connection kept?")
   where
     whileKept (keep, conn) = if keep then Again conn else Finish ()
-    -- An idle connection waits holding no buffer: a request is admitted once there is input. With an idle timeout, a connection that
-    -- has none by then ends, and its worker is free for the next connection: it gives way as it ends, since the lint can't tell that
-    -- the connections that have bytes in hand are not the ones that end, and so sees a way round the loop that waits nowhere.
+    -- An idle connection waits holding no buffer: a request is admitted once there is input. With an idle timeout, a connection that the
+    -- watcher has ended by then ends, and its worker is free for the next connection: it gives way as it ends, since the lint can't tell
+    -- that the connections that have bytes in hand are not the ones that end, and so sees a way round the loop that waits nowhere.
     one = case idleTimeout settings of
       Nothing -> tap idle >>> admitted
-      Just limit ->
-        alongside (idleWithin limit)
+      Just _ ->
+        alongside idleWatched
           >>> decide "input before the idle timeout?" (\(arrived, conn) -> if arrived then Right conn else Left ())
           >>> (inout "no" (giveWay >>^ const False) "keep alive" ||| taking "yes" admitted)
     admitted =
@@ -240,14 +262,44 @@ idle =
       step "check carry-over" ready `giving` "bytes carried over?"
         >>> (taking "no" awaitInput ||| taking "yes" returnA)
 
--- | The same, for at most this long, and says whether the connection has input: a connection that waits for the whole time has none.
--- The deadline is armed only if the connection has to wait, and is gone when its input comes.
-idleWithin :: (Runtime arr) => Duration -> arr Conn Bool
-idleWithin limit =
-  named (Label "idle within" "Waits until the connection has input, which may be its end, unless it has bytes in hand, for as long as the idle timeout.") $
+-- | The same, with the connection marked as waiting while it waits and the mark taken when its input comes, and says whether the connection
+-- has input: it has none if the watcher took the mark first, and the connection ends. A connection that has bytes in hand waits for
+-- nothing, and is not marked.
+idleWatched :: (Runtime arr) => arr Conn Bool
+idleWatched =
+  named (Label "idle watched" "Waits until the connection has input, which may be its end, unless it has bytes in hand, with the connection marked as waiting.") $
     typed @Conn @Bool $
-      step "check carry-over" ready `giving` "bytes carried over?"
-        >>> (taking "no" (within limit awaitInput >>^ isJust) ||| taking "yes" (arr (const True)))
+      step "check carry-over" held `giving` "bytes carried over?"
+        >>> (taking "no" (marked >>> tap (connSocket ^>> awaitInput) >>> taken) ||| taking "yes" (arr (const True)))
+  where
+    marked = keeping clock >>> tap (step "mark as waiting" (\(at, conn) -> atomicWriteIORef (connWaiting conn) (Idle at))) >>^ snd
+    taken = step "take the mark" (\conn -> update (connWaiting conn) (\case Idle _ -> (Busy, True); other -> (other, False)))
+
+-- | The connection, unless it has bytes of a request already.
+held :: Conn -> IO (Either Conn ())
+held conn@Conn {connCarry} = (\carried -> if B.null carried then Left conn else Right ()) <$> readIORef connCarry
+
+-- | The watcher of a connection: it ends when the connection has waited for its next request for the idle timeout and the watcher has
+-- taken it from the part that serves the requests. When it looks, it waits for as long as it takes the connection to have waited for the
+-- timeout: from when it began to wait, if it does, and from now if it is busy, which has not begun to wait before now.
+watching :: (Runtime arr) => Duration -> arr Conn ()
+watching limit =
+  named (Label "watching" "Looks at the connection when it can have waited for the idle timeout, and ends when it has.") $
+    typed @Conn @() $
+      iterateWith (keeping clock >>> step "look at the connection" (look limit) `giving` "waited for the idle timeout?") (taking "not yet" (consume (Until ^>> block)))
+
+-- | What the watcher finds when it looks: it has taken the connection, or when to look again.
+look :: Duration -> (Instant, Conn) -> IO (Step (Instant, Conn) ())
+look limit (now', conn@Conn {connWaiting}) =
+  readIORef connWaiting >>= \case
+    Busy -> pure (Again (plus now' limit, conn))
+    TimedOut -> pure (Finish ())
+    Idle since
+      | now' >= plus since limit ->
+          -- The connection has waited for the timeout: unless the part that serves the requests took the mark first, in which case the
+          -- watcher looks again, at once.
+          update connWaiting (\case Idle at | at == since -> (TimedOut, Finish ()); other -> (other, Again (now', conn)))
+      | otherwise -> pure (Again (plus since limit, conn))
 
 -- | The socket to wait for input on, unless the connection has bytes of a request already.
 ready :: Conn -> IO (Either Socket ())

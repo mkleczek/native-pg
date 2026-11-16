@@ -51,7 +51,9 @@ data Settings = Settings
     -- closes it and its worker offers itself again, so that a connection that waits in the listen backlog is served. It is the wait
     -- for the first byte of a request, so that a client that is gone without closing the connection, or that connects and says
     -- nothing, doesn't hold a worker for ever; a connection that is serving a request, the time its handler takes included, is not
-    -- timed. 'Nothing' waits for ever.
+    -- timed. 'Nothing' waits for ever. A connection that has an idle timeout has a watcher, a part of its own that sleeps until the
+    -- connection can have waited that long and looks at it then, so that the timeout costs a request a clock read and two changes of a mark,
+    -- a few hundred bytes, and a connection a timer for each timeout that it lasts, and not a deadline for each wait for a request.
     idleTimeout :: Maybe Duration,
     -- | The event that starts a graceful shutdown, if the server has one: when it fires, the listener closes, a connection
     -- that waits for its next request closes, a request in flight finishes (until the 'drainTimeout' has passed) and says that

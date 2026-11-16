@@ -300,14 +300,13 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
 idleCost :: Spec
 idleCost = describe "the cost of the idle timeout" $ forM_ measured $ \runner@(Runner runnerName _) ->
   describe runnerName $
-    (if runnerName `elem` ["threads", "delimited", "compiled"] then xfail "the idle timeout costs a request more than the allowance" else id) $
-      it "is no more than the allowance for a request" $ do
-        pairs <- forM [1 .. 3 :: Int] $ \_ -> (,) <$> perRequest runner (Just (secs 30)) <*> perRequest runner Nothing
-        let with = mean (map fst pairs)
-            without = mean (map snd pairs)
-        lookupEnv "IDLE_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("idle | " <> runnerName <> " | " <> show (round with :: Int) <> " bytes with | " <> show (round without :: Int) <> " bytes without"))
-        when (with - without > allowance) $
-          failTest ("a request allocates " <> show (round with :: Int) <> " bytes with the idle timeout, and " <> show (round without :: Int) <> " without")
+    it "is no more than the allowance for a request" $ do
+      pairs <- forM [1 .. 3 :: Int] $ \_ -> (,) <$> perRequest runner (Just (secs 30)) <*> perRequest runner Nothing
+      let with = mean (map fst pairs)
+          without = mean (map snd pairs)
+      lookupEnv "IDLE_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("idle | " <> runnerName <> " | " <> show (round with :: Int) <> " bytes with | " <> show (round without :: Int) <> " bytes without"))
+      when (with - without > allowance) $
+        failTest ("a request allocates " <> show (round with :: Int) <> " bytes with the idle timeout, and " <> show (round without :: Int) <> " without")
   where
     -- The non-threaded run time runs the parts of the other arrows on the one thread that the client has too, and what they allocate
     -- while a request waits goes by the time that it takes: only Threads is measured there, as in 'acceptCost'.
