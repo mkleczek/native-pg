@@ -14,6 +14,8 @@ module Network.Fulmen.Internal
   )
 where
 
+import Data.IORef (IORef)
+import Data.IntMap.Strict (IntMap)
 import Network.Fulmen.Internal.Body (Body (..))
 import Network.Fulmen.Internal.Date (Pulse)
 import Network.Fulmen.Internal.Response (Exchange)
@@ -75,6 +77,9 @@ data Cores = Cores !Int !Shared
 -- whether the server is shutting down, and the buffers that requests in flight work in.
 data Shared = Shared
   { sharedWorkers :: !(Pool Free),
+    -- | How many workers of each core are free, which each worker counts for itself before it offers itself and the acceptor
+    -- counts down as it takes one, so that the acceptor tells the core that has the most without going through the free workers.
+    sharedFreeCounts :: !(IORef (IntMap Int)),
     sharedPulse :: !Pulse,
     sharedBuffers :: !BufferPool
   }

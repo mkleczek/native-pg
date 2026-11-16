@@ -300,13 +300,12 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
 acceptCost :: Spec
 acceptCost = describe "accepting with many workers free" $ forM_ (runners ++ [coresRunner]) $ \runner@(Runner runnerName _) ->
   describe runnerName $
-    xfail "the acceptor goes through the free workers to count them by core" $
-      it "allocates for a connection no more with 1,024 workers than with 8" $ do
-        few <- perConnection runner 8
-        many <- perConnection runner 1024
-        lookupEnv "ACCEPT_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("accept | " <> runnerName <> " | " <> show (round few :: Int) <> " bytes at 8 workers | " <> show (round many :: Int) <> " bytes at 1024"))
-        when (many > few * 1.1 + 4096) $
-          failTest ("a connection allocates " <> show (round many :: Int) <> " bytes with 1,024 workers, and " <> show (round few :: Int) <> " with 8")
+    it "allocates for a connection no more with 1,024 workers than with 8" $ do
+      few <- perConnection runner 8
+      many <- perConnection runner 1024
+      lookupEnv "ACCEPT_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("accept | " <> runnerName <> " | " <> show (round few :: Int) <> " bytes at 8 workers | " <> show (round many :: Int) <> " bytes at 1024"))
+      when (many > few * 1.1 + 4096) $
+        failTest ("a connection allocates " <> show (round many :: Int) <> " bytes with 1,024 workers, and " <> show (round few :: Int) <> " with 8")
   where
     -- The bytes that a connection costs the process, the client's own included, which don't depend on the workers.
     perConnection :: Runner -> Int -> IO Double

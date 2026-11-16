@@ -31,7 +31,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BU
 import qualified Data.IntMap.Strict as IntMap
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (findIndex)
 import Data.Maybe (isJust)
 import Data.Word (Word8)
@@ -130,25 +130,35 @@ acceptance Listen {openListener, closeListener} =
 checkout :: (Runtime arr) => arr Cores (Address "connections" 'Anywhere Socket)
 checkout =
   named (Label "checkout" "Takes a free worker of the core that has the most free workers at once, and else waits for the worker that is freed first, on any core, and puts back one that comes too late.") $
-    alongside (step "take a free worker" (\(Cores _ shared) -> takeNowWith freest (sharedWorkers shared)))
-      >>> decide "worker free now?" (\(taken, cores) -> maybe (Left cores) Right taken)
+    alongside (step "take a free worker" takeFree)
+      >>> decide "worker free now?" (\(taken, cores) -> maybe (Left cores) (\taken' -> Right (taken', cores)) taken)
       >>> (taking "no" queued ||| taking "yes" returnA)
+      >>> step "count the worker taken" (\(taken', Cores _ shared) -> taken' <$ counted (freeCore taken') (-1) shared)
       >>^ freeAddress
   where
-    queued = asking "free worker" (withTicket (step "queue for a worker" queue) (putBack ^>> offer)) >>^ snd
+    -- The first free worker of the core that has the most free workers, by the counts that the workers keep: it doesn't go through the
+    -- free workers, so it costs the same with a thousand of them. A count that is ahead of the workers in the pool, because a worker
+    -- is about to offer itself, finds none of the core, and then the part waits for the first that is freed, as it does when none is.
+    takeFree (Cores _ shared) =
+      readIORef (sharedFreeCounts shared) >>= \counts -> case freest counts of
+        Nothing -> pure Nothing
+        Just core -> takeNowWith (findIndex ((== core) . freeCore)) (sharedWorkers shared)
+    queued = alongside (asking "free worker" (withTicket (step "queue for a worker" queue) (putBack ^>> offer))) >>^ \((_, queuedFor), cores) -> (queuedFor, cores)
     queue (promise, Cores _ shared) = queueNow (sharedWorkers shared) 1 promise
     putBack (free, Cores _ shared) = (sharedWorkers shared, free)
 
--- | The position of the first free worker, in the order that the pool takes them in, of the core that has the most of
--- them, which is the first core of those that tie.
-freest :: [Free] -> Maybe Int
-freest workers = busiest >>= \core -> findIndex ((== core) . freeCore) workers
+-- | The core that has the most free workers by the counts, which is the first core of those that tie, if any has one.
+freest :: IntMap.IntMap Int -> Maybe Int
+freest counts = fst <$> IntMap.foldlWithKey' mostFree Nothing counts
   where
-    busiest = fst <$> IntMap.foldlWithKey' mostFree Nothing tally
     mostFree best core count = case best of
+      _ | count <= 0 -> best
       Just (_, most) | count <= most -> best
       _ -> Just (core, count)
-    tally = foldl' (\counts (Free core _) -> IntMap.insertWith (+) core (1 :: Int) counts) IntMap.empty workers
+
+-- | Changes the count of the free workers of the core.
+counted :: Int -> Int -> Shared -> IO ()
+counted core change shared = atomicModifyIORef' (sharedFreeCounts shared) (\counts -> (IntMap.insertWith (+) core change counts, ()))
 
 -- * The workers
 
@@ -167,9 +177,11 @@ closeLateSocket = box "close late socket" (fst ^>> close)
 offered :: (Runtime arr) => arr ((Inbox arr "connections" 'Anywhere Socket, Address "connections" 'Anywhere Socket), Cores) (Shared, Socket)
 offered =
   named (Label "offered" "Offers the worker as free in the pool, and collects the connection that is posted to its inbox.") $
-    tap (answering "free worker" (free ^>> offer)) >>> ((,) <$> arr sharedOf <*> (fst . fst ^>> collect))
+    tap (answering "free worker" (step "count the free worker" counting >>> free ^>> offer)) >>> ((,) <$> arr sharedOf <*> (fst . fst ^>> collect))
   where
     sharedOf (_, Cores _ shared) = shared
+    -- The worker counts itself before it offers itself, so that the count is never below the workers in the pool.
+    counting input@(_, Cores core shared) = input <$ counted core 1 shared
     free ((_, address), Cores core shared) = (sharedWorkers shared, Free core address)
 
 -- | What a connection is: its socket, the bytes of the next request that came early, which a request copies out of
