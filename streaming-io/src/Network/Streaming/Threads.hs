@@ -29,8 +29,8 @@ import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, rtsSupportsBoundThreads, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
-import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
+import Control.Concurrent.STM (TMVar, TVar, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
+import Control.Exception (SomeException, allowInterrupt, finally, mask_, onException, throwIO, toException, try, uninterruptibleMask_)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.Bits ((.&.))
 import Data.Foldable (traverse_)
@@ -49,7 +49,8 @@ import GHC.IORef (IORef (..), atomicSwapIORef)
 import GHC.STRef (STRef (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
-import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn), Joiner)
+import qualified Network.Streaming.Concurrent as Joiner
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
 import Network.Streaming.Internal.Atomic (update)
@@ -269,11 +270,18 @@ instance Scope (ThreadsM m) where
 forkPart :: Part -> CancelScope Members -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO (MVar (Either SomeException a))
 forkPart (Part _ _ parent _ parentFlag) scope' run ended = do
   finished <- newEmptyMVar
+  startPart parentFlag ((Inside scope' :) <$> readIORef parent) run (\outcome -> ended outcome *> putMVar finished outcome)
+  pure finished
+
+-- | A part that runs on a thread of its own, in the scopes that the action gives, which it enters and leaves, and tells how it
+-- ended once it has left them.
+startPart :: IORef Bool -> IO [Frame Members] -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO ()
+startPart parentFlag framesOf run ended = do
   -- Forked masked, as its part is.
   _ <- forkIO $ do
     thread <- myThreadId
     ident <- nextIdent
-    frames <- (Inside scope' :) <$> readIORef parent
+    frames <- framesOf
     state <- newIORef frames
     phase <- newIORef Running
     -- The part begins with the flag of its parent, which a cancellation that came before it existed has set.
@@ -286,8 +294,7 @@ forkPart (Part _ _ parent _ parentFlag) scope' run ended = do
     outcome <- try (run part)
     forM_ frames (outside part)
     ended outcome
-    putMVar finished outcome
-  pure finished
+  pure ()
   where
     inside part = \case Inside s -> enter s part; _ -> pure ()
     outside part = \case Inside s -> leave s part; _ -> pure ()
@@ -319,9 +326,23 @@ instance Annotate (ThreadsM m)
 -- their waits, and waited for, and the first failure is rethrown. When several fail, the later are dropped. A part is
 -- entered into the scope of the group and the scopes that enclose it: a group of many parts doesn't make them deeper.
 instance Concurrent (ThreadsM m) where
-  data Group (ThreadsM m) s j
-  group _ _ = error "not yet"
-  spawn _ = error "not yet"
+  newtype Group (ThreadsM m) s j = ThreadsGroup (Gang j)
+
+  group joiner (Threads body) = Threads $ \part input -> do
+    outer <- framesIn part
+    scope' <- newScope
+    gang <- Gang scope' (Inside scope' : outer) <$> (newIORef $! Joiner.begin joiner) <*> newIORef 0 <*> newTVarIO 0
+    -- The body runs as the first member of the group, on the thread that runs the group.
+    outcome <- try (body part (ThreadsGroup gang, input))
+    -- A body that failed, or was cancelled, cancels the parts at once.
+    either (\_ -> cancelScope scope') (\_ -> pure ()) outcome
+    awaitParts gang
+    grouped gang outcome
+  {-# INLINE group #-}
+
+  spawn (Threads body) = Threads (\part (ThreadsGroup gang, input) -> spawned gang part (`body` input))
+  {-# INLINE spawn #-}
+
   together = \case
     [] -> done
     [one] -> one
@@ -332,6 +353,55 @@ instance Concurrent (ThreadsM m) where
       dones <- reverse <$> foldM (\started (Threads body) -> (: started) <$> forkPart part scope' (`body` input) (failing failure scope')) [] parts
       awaitAll scope' dones
       readIORef failure >>= maybe (pure ()) throwIO
+
+-- | The scopes that the part is in, innermost first.
+framesIn :: Part -> IO [Frame Members]
+framesIn (Part _ _ frames _ _) = readIORef frames
+
+-- | A group that parts are spawned into: the cancel scope of its parts, the scopes that its parts begin in, the joiner's tally, how
+-- many parts were spawned, and how many of them are running. Threads change them all atomically.
+data Gang j = Gang
+  { gangScope :: !(CancelScope Members),
+    gangFrames :: [Frame Members],
+    gangTally :: !(IORef (Joiner.Tally j)),
+    gangSpawned :: !(IORef Int),
+    gangRunning :: !(TVar Int)
+  }
+
+-- | Starts the arrow as a part of the group, on a thread of its own, in the scopes of the group and the scopes outside it, and
+-- not in those that the spawning part is in. If the parts of the group were cancelled, it doesn't run, and counts as
+-- cancelled.
+spawned :: forall j. (Joiner j) => Gang j -> Part -> (Part -> IO (Joiner.Part j)) -> IO ()
+spawned gang (Part _ _ _ _ flag) run = do
+  number <- update (gangSpawned gang) (\n -> (n + 1, n))
+  readIORef (scopeCancelled (gangScope gang)) >>= \cancelled ->
+    if cancelled
+      then partEnded gang number (Left (toException (Cancelled (scopeIdent (gangScope gang)))))
+      else do
+        atomically (modifyTVar' (gangRunning gang) (+ 1))
+        startPart flag (pure (gangFrames gang)) run (\outcome -> partEnded gang number outcome `finally` atomically (modifyTVar' (gangRunning gang) (subtract 1)))
+{-# INLINE spawned #-}
+
+-- | The joiner is told that the part of this number ended in this way, and the parts are cancelled if it says so.
+partEnded :: forall j. (Joiner j) => Gang j -> Int -> Either SomeException (Joiner.Part j) -> IO ()
+partEnded gang number outcome = do
+  cancelling <- update (gangTally gang) (Joiner.ended @j number outcome)
+  when cancelling (cancelScope (gangScope gang))
+{-# INLINE partEnded #-}
+
+-- | Waits until no part of the group is running, and if it is interrupted, cancels them and waits for them still: no part
+-- outlives the group.
+awaitParts :: Gang j -> IO ()
+awaitParts gang = none `onException` (cancelScope (gangScope gang) *> uninterruptibleMask_ none)
+  where
+    none = atomically (readTVar (gangRunning gang) >>= check . (== 0))
+
+-- | What the group gives once all of it ended: the failure of the body, or the result of the body with what the joiner made of the
+-- parts, or the failure that it gives.
+grouped :: forall j b. (Joiner j) => Gang j -> Either SomeException b -> IO (b, Joiner.Joined j)
+grouped gang = \case
+  Left failure -> throwIO failure
+  Right result -> readIORef (gangTally gang) >>= either throwIO (pure . (,) result) . Joiner.joined @j
 
 -- | The first half to end is the result, and the other is cancelled and waited for. The loser's failure is
 -- rethrown too, unless it is a cancellation.

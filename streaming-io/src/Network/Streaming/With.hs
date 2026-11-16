@@ -137,12 +137,14 @@ instance (Arrow arr, Scope arr) => Scope (With r arr) where
   {-# INLINE shield #-}
 
 -- | Every part is given the environment.
-instance (Concurrent arr) => Concurrent (With r arr) where
-  data Group (With r arr) s j
-  group _ _ = error "not yet"
-  spawn _ = error "not yet"
+instance (Arrow arr, Concurrent arr) => Concurrent (With r arr) where
+  newtype Group (With r arr) s j = WithGroup (Group arr s j)
   together parts = With (together [part | With part <- parts])
   {-# INLINE together #-}
+  group joiner body = With (group joiner ((\(handle, (r, a)) -> (r, (WithGroup handle, a))) ^>> with body))
+  {-# INLINE group #-}
+  spawn (With part) = With ((\(r, (WithGroup handle, x)) -> (handle, (r, x))) ^>> spawn part)
+  {-# INLINE spawn #-}
 
 instance (Race arr) => Race (With r arr) where
   race (With one) (With two) = With (race one two)

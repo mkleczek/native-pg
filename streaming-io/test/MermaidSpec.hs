@@ -193,29 +193,23 @@ spec = describe "the chart" $ do
         length (filter (gear `isInfixOf`) inside) `shouldBe` 2
       found -> failTest ("the box has " <> show (length found) <> " pages, and not its own and the page that has it")
 
-  pending $
-    it "has a box for a group, which has its body" $ do
-      chart <- chartOf (group AwaitAll spawnsWorking :: Diagram Int ((), ()))
-      case subgraphTitled "group" chart of
-        Nothing -> failTest "the chart has no box for the group"
-        Just (_, inside) -> length (nodesDeclared (gear ++ "collected") inside) `shouldBe` 1
+  it "has a box for a group, which has its body" $ do
+    chart <- chartOf (group AwaitAll spawnsWorking :: Diagram Int ((), ()))
+    case subgraphTitled "group" chart of
+      Nothing -> failTest "the chart has no box for the group"
+      Just (_, inside) -> length (nodesDeclared (gear ++ "collected") inside) `shouldBe` 1
 
-  pending $
-    it "has a box labelled spawn for a spawn, which holds the part, has an edge into it from the step before, and has no edge out of the part" $ do
-      chart <- chartOf (group AwaitAll spawnsWorking :: Diagram Int ((), ()))
-      case subgraphTitled "spawn" chart of
-        Nothing -> failTest "the chart has no box for the spawn"
-        Just (spawned, inside) -> do
-          case (nodesDeclared (gear ++ "working") inside, nodesDeclared (gear ++ "collected") chart) of
-            ([part], [collected]) -> do
-              ((collected, spawned) `elem` edgesOf chart) `shouldBe` True
-              [to | (from, to) <- edgesOf chart, from == part] `shouldBe` []
-            found -> failTest ("the chart has the steps " <> show found)
-          length (nodesDeclared (gear ++ "working") chart) `shouldBe` 1
-
--- | Marks a case as one that fails until group and spawn are made.
-pending :: Spec -> Spec
-pending = xfail "group and spawn are not made yet"
+  it "has a box labelled spawn for a spawn, which holds the part, has an edge into it from the step before, and has no edge out of the part" $ do
+    chart <- chartOf (group AwaitAll spawnsWorking :: Diagram Int ((), ()))
+    case subgraphTitled "spawn" chart of
+      Nothing -> failTest "the chart has no box for the spawn"
+      Just (spawned, inside) -> do
+        case (nodesDeclared (gear ++ "working") inside, nodesDeclared (gear ++ "collected") chart) of
+          ([part], [collected]) -> do
+            ((collected, spawned) `elem` edgesOf chart) `shouldBe` True
+            [to | (from, to) <- edgesOf chart, from == part] `shouldBe` []
+          found -> failTest ("the chart has the steps " <> show found)
+        length (nodesDeclared (gear ++ "working") chart) `shouldBe` 1
 
 -- | A body that collects, and spawns the part that works.
 spawnsWorking :: Diagram (Group Diagram s AwaitAll, Int) ()

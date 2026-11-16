@@ -65,6 +65,7 @@ module Network.Streaming.Internal.Scheduler
     schedule,
     Part (..),
     PartScope,
+    Members,
     Parked (..),
     newPart,
     newScope,
@@ -85,6 +86,12 @@ module Network.Streaming.Internal.Scheduler
     Joined (..),
     groupEnded,
     raceEnded,
+    Gang,
+    newGang,
+    spawnedPart,
+    bodyEnded,
+    partEnded,
+    enqueue,
     Escaped (..),
     guardedBy,
     runFailure,
@@ -112,6 +119,8 @@ import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Conc (BlockReason (..), ThreadStatus (..), listThreads, threadStatus)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Classes (Cancelled (..), Event (..), Instant (..), ReleaseFailed (..), cancelledBy, exitOf, monotonicNanoseconds)
+import Network.Streaming.Concurrent (Joiner)
+import qualified Network.Streaming.Concurrent as Joiner
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel
@@ -167,7 +176,7 @@ defaultTurn = microseconds 10
 -- frames of a child begin with those of its parent, which it shares: its own end at its mark.
 data Part = Part
   { partIdent :: !Int,
-    partFrames :: !(IORef [Frame [Part]]),
+    partFrames :: !(IORef [Frame Members]),
     partWait :: !(IORef Parked),
     partCancelled :: !(IORef Bool)
   }
@@ -175,7 +184,10 @@ data Part = Part
 -- | A scope of a run, with the parts that its body began with: those of a group or the halves of a race, or the part
 -- that entered a deadline. The others inside it are reached through those: a part that is suspended at a group says so
 -- (see 'InGroup'), and its parts are inside what the part is inside.
-type PartScope = CancelScope [Part]
+type PartScope = CancelScope Members
+
+-- | The parts that a scope holds, by their numbers, so that a part that ends is taken out of it.
+type Members = IntMap.IntMap Part
 
 -- | Where a part waits, as what takes it off that.
 data Parked
@@ -280,7 +292,7 @@ newRun (Turn turn) = do
   unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
-  Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False
+  Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 IntMap.empty <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
@@ -537,11 +549,11 @@ postTo seat run part shelf value posted capture = do
 newPart :: Run -> IO Part
 newPart run = do
   part <- Part <$> nextWait run <*> newIORef [] <*> newIORef NotWaiting <*> newIORef False
-  part <$ modifyIORef' (scopeMembers (runRoot run)) (part :)
+  part <$ modifyIORef' (scopeMembers (runRoot run)) (IntMap.insert (partIdent part) part)
 
 -- | A scope for a group, a race or a deadline of the run.
 newScope :: Run -> IO PartScope
-newScope run = nextWait run >>= (`newCancelScope` [])
+newScope run = nextWait run >>= (`newCancelScope` IntMap.empty)
 
 -- | A part for a half of a race, in the scope of the race as well as in those of the part that made it. The
 -- parent, which is suspended until the race has ended, says where its halves are. The part begins with the flag of its
@@ -552,7 +564,7 @@ childPart run parent scope' = do
   flagged <- if null outer then readIORef (scopeCancelled (runRoot run)) else readIORef (partCancelled parent)
   child <- Part <$> nextWait run <*> newIORef (Inside scope' : if null outer then [Inside (runRoot run)] else outer) <*> newIORef NotWaiting <*> newIORef flagged
   adjust run 9 1
-  modifyIORef' (scopeMembers scope') (<> [child])
+  modifyIORef' (scopeMembers scope') (IntMap.insert (partIdent child) child)
   child <$ writeIORef (partWait parent) (InGroup scope')
 
 -- | The parts of a group of this many, in the scope of the group as well as in those of the part that made it. The
@@ -566,7 +578,7 @@ childParts run parent scope' count = do
   -- Made in a loop that keeps no stack of its own: a group of thousands of parts starts under a small stack limit.
   children <- reverse <$> foldM (\made _ -> (: made) <$> (Part <$> nextWait run <*> newIORef frames <*> newIORef NotWaiting <*> newIORef flagged)) [] [1 .. count]
   adjust run 9 count
-  writeIORef (scopeMembers scope') children
+  writeIORef (scopeMembers scope') (IntMap.fromDistinctAscList [(partIdent child, child) | child <- children])
   children <$ writeIORef (partWait parent) (InGroup scope')
 
 -- | A part that has ended is in no scope any more.
@@ -580,7 +592,7 @@ endPart run part = do
 -- | The part goes in a scope, or behind a shield; a part that was in none goes in the run's root scope too. A
 -- scope that a part goes in this way begins with it. Not inlined, so that the frames of a part that was in none
 -- are built only then, and not at every scope.
-pushFrame :: Run -> Part -> Frame [Part] -> IO ()
+pushFrame :: Run -> Part -> Frame Members -> IO ()
 pushFrame run part frame = do
   frames <- readIORef (partFrames part)
   case frames of
@@ -590,7 +602,7 @@ pushFrame run part frame = do
       -- The root may have been cancelled while the part was in no scope.
       readIORef (scopeCancelled (runRoot run)) >>= \cancelled -> when cancelled (writeIORef (partCancelled part) True)
     _ -> writeIORef (partFrames part) (frame : frames)
-  case frame of Inside s -> writeIORef (scopeMembers s) [part]; _ -> pure ()
+  case frame of Inside s -> writeIORef (scopeMembers s) (IntMap.singleton (partIdent part) part); _ -> pure ()
 {-# NOINLINE pushFrame #-}
 
 -- | The part leaves the innermost scope or shield, which it went in with 'pushFrame'; the scope holds no part
@@ -603,7 +615,7 @@ popFrame run part = do
     frame : outer -> writeIORef (partFrames part) outer *> forget frame
     [] -> pure ()
   where
-    forget = \case Inside s -> writeIORef (scopeMembers s) []; _ -> pure ()
+    forget = \case Inside s -> writeIORef (scopeMembers s) IntMap.empty; _ -> pure ()
 
 -- | The innermost frame of the part is a shield, whatever it was: a release that is due runs behind one.
 shieldTop :: Part -> IO ()
@@ -658,7 +670,7 @@ checkpoint part =
 cancelScope :: Run -> PartScope -> IO ()
 cancelScope run scope' = do
   writeIORef (scopeCancelled scope') True
-  readIORef (scopeMembers scope') >>= inside
+  readIORef (scopeMembers scope') >>= inside . IntMap.elems
   where
     inside = \case
       [] -> pure ()
@@ -671,7 +683,7 @@ cancelScope run scope' = do
             Nothing -> pure ()
             Just resume -> modifyIORef' (runTickets run) (resume :)
         case waiting of
-          InGroup members -> readIORef (scopeMembers members) >>= \more -> inside (more <> others)
+          InGroup members -> readIORef (scopeMembers members) >>= \more -> inside (IntMap.elems more <> others)
           _ -> inside others
 
 -- | Takes the part off what it waits at, if it still does: what goes on with the part.
@@ -747,7 +759,7 @@ groupEnded run scope' size joined failure success part outcome = do
   writeIORef joined (Joined failed' (count + 1))
   if count + 1 < size
     then pure Ended
-    else writeIORef (scopeMembers scope') [] *> maybe (success ()) failure failed'
+    else writeIORef (scopeMembers scope') IntMap.empty *> maybe (success ()) failure failed'
 
 -- | What a race does when one of its halves has ended: the first to end is the winner, which cancels the other;
 -- the loser, once it has ended, lets the race go on with the parent, with the winner's failure, or the loser's
@@ -761,11 +773,99 @@ raceEnded run scope' winner failure success half outcome = do
       cancelScope run scope'
       pure Ended
     Just won -> do
-      writeIORef (scopeMembers scope') []
+      writeIORef (scopeMembers scope') IntMap.empty
       case (won, outcome) of
         (Left thrown, _) -> failure thrown
         (Right _, Left thrown) | isNothing (cancelledBy thrown) -> failure thrown
         (Right result, _) -> success result
+
+-- | A group that parts are spawned into, for the arrows that run every part on one thread: the cancel scope of its parts, the part
+-- that made it, the scopes that its parts begin in, and what it has of its parts. Its body is a part of its own, which is in
+-- the scope of the part that made the group and not in that of the parts, so that the joiner's cancellation doesn't reach it.
+data Gang j = Gang
+  { gangScope :: !PartScope,
+    gangParent :: !Part,
+    gangFrames :: [Frame Members],
+    gangStanding :: !(IORef (Standing j))
+  }
+
+-- | What a group has of its parts: how many were spawned, how many members are yet to end (the body is one), the joiner's tally,
+-- and what goes on with the part that made the group, which the body gives once it has ended.
+data Standing j = Standing !Int !Int !(Joiner.Tally j) (Maybe (Joiner.Tally j -> IO Step))
+
+-- | A new group of the part, and the part that is its body. The part that made it is suspended until the group has ended, and
+-- says where its members are, so that a cancellation finds them.
+newGang :: (Joiner j) => Run -> Part -> j -> IO (Gang j, Part)
+newGang run parent joiner = do
+  scope' <- newScope run
+  outer <- readIORef (partFrames parent)
+  flagged <- if null outer then readIORef (scopeCancelled (runRoot run)) else readIORef (partCancelled parent)
+  let below = if null outer then [Inside (runRoot run)] else outer
+  body <- Part <$> nextWait run <*> newIORef below <*> newIORef NotWaiting <*> newIORef flagged
+  adjust run 9 1
+  modifyIORef' (scopeMembers scope') (IntMap.insert (partIdent body) body)
+  standing <- newIORef $! Standing 0 1 (Joiner.begin joiner) Nothing
+  writeIORef (partWait parent) (InGroup scope')
+  pure (Gang scope' parent (Inside scope' : below) standing, body)
+
+-- | The part for the next spawn, with its number, which is in the scope of the group and in those outside it, and is a member of
+-- the group. If the parts of the group were cancelled, there is none: the spawn counts as a part that ended cancelled.
+spawnedPart :: forall j. (Joiner j) => Run -> Gang j -> IO (Maybe (Int, Part))
+spawnedPart run gang = do
+  Standing number live tally finish <- readIORef (gangStanding gang)
+  cancelled <- readIORef (scopeCancelled (gangScope gang))
+  if cancelled
+    then do
+      let refused = Left (toException (Cancelled (scopeIdent (gangScope gang))))
+      Nothing <$ (writeIORef (gangStanding gang) $! Standing (number + 1) live (fst (Joiner.ended @j number refused tally)) finish)
+    else do
+      outer <- readIORef (partFrames (gangParent gang))
+      flagged <- if null outer then readIORef (scopeCancelled (runRoot run)) else readIORef (partCancelled (gangParent gang))
+      child <- Part <$> nextWait run <*> newIORef (gangFrames gang) <*> newIORef NotWaiting <*> newIORef flagged
+      adjust run 9 1
+      modifyIORef' (scopeMembers (gangScope gang)) (IntMap.insert (partIdent child) child)
+      writeIORef (gangStanding gang) $! Standing (number + 1) (live + 1) tally finish
+      pure (Just (number, child))
+{-# INLINE spawnedPart #-}
+
+-- | The body of the group ended: it leaves its frames and the members, and cancels the parts if it failed, or was cancelled. If no part
+-- is left, the part that made the group goes on, with the body's failure, or its result and what the joiner made of the parts, or
+-- the failure that it gives; if some are, the one that ends last does.
+bodyEnded :: forall j b. (Joiner j) => Run -> Gang j -> Part -> (SomeException -> IO Step) -> ((b, Joiner.Joined j) -> IO Step) -> Either SomeException b -> IO Step
+bodyEnded run gang part failure success outcome = do
+  endPart run part
+  modifyIORef' (scopeMembers (gangScope gang)) (IntMap.delete (partIdent part))
+  either (\_ -> cancelScope run (gangScope gang)) (\_ -> pure ()) outcome
+  Standing spawned live tally _ <- readIORef (gangStanding gang)
+  let finish tally' = case outcome of
+        Left thrown -> failure thrown
+        Right result -> either failure (success . (,) result) (Joiner.joined @j tally')
+  writeIORef (gangStanding gang) $! Standing spawned (live - 1) tally (Just finish)
+  groupDone gang (live - 1) tally finish
+{-# INLINE bodyEnded #-}
+
+-- | A part of the group, spawned as this number, ended in this way: it leaves its frames and the members, the joiner is told, and
+-- the parts are cancelled if it says so. The part that ends last goes on with the part that made the group.
+partEnded :: forall j. (Joiner j) => Run -> Gang j -> Part -> Int -> Either SomeException (Joiner.Part j) -> IO Step
+partEnded run gang part number outcome = do
+  endPart run part
+  modifyIORef' (scopeMembers (gangScope gang)) (IntMap.delete (partIdent part))
+  Standing spawned live tally finish <- readIORef (gangStanding gang)
+  let (tally', cancelling) = Joiner.ended @j number outcome tally
+  when cancelling (cancelScope run (gangScope gang))
+  writeIORef (gangStanding gang) $! Standing spawned (live - 1) tally' finish
+  maybe (pure Ended) (groupDone gang (live - 1) tally') finish
+{-# INLINE partEnded #-}
+
+-- | The group has ended if no member is left: its scope holds no part, and the part that made it goes on.
+groupDone :: Gang j -> Int -> Joiner.Tally j -> (Joiner.Tally j -> IO Step) -> IO Step
+groupDone gang live tally finish
+  | live > 0 = pure Ended
+  | otherwise = writeIORef (scopeMembers (gangScope gang)) IntMap.empty *> finish tally
+
+-- | Gives the scheduler a part to go on with, in its next round: the part that a spawn made.
+enqueue :: Run -> IO Step -> IO ()
+enqueue run part = modifyIORef' (runTickets run) (part :)
 
 -- | What goes on with a part that waits, from its step.
 resumeOf :: Step -> IO () -> IO Step

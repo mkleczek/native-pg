@@ -97,9 +97,9 @@ instance Within Diagram where
 
 instance Concurrent Diagram where
   data Group Diagram s j
-  group _ _ = error "not yet"
-  spawn _ = error "not yet"
   together parts = Diagram (Together [part | Diagram part <- parts])
+  group _ (Diagram body) = Diagram (Grouped body)
+  spawn (Diagram part) = Diagram (Spawned part)
 
 -- | The box records where the code asked for it: the outermost call of the stack, which is the one in the program, and
 -- not the helpers that the box was called through.

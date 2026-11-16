@@ -214,9 +214,30 @@ instance Annotate (CompiledM m)
 -- wait, and their scopes are released before the group ends, which fails with the first failure. A later failure is
 -- dropped.
 instance Concurrent (CompiledM m) where
-  data Group (CompiledM m) s j
-  group _ _ = error "not yet"
-  spawn _ = error "not yet"
+  newtype Group (CompiledM m) s j = CompiledGroup (Gang j)
+
+  -- The part that makes the group hands what follows it to the group, and the member that ends last goes on with it. The body
+  -- runs as a part of its own, which is not in the scope of the parts.
+  group joiner (Compiled body) = Compiled $ \(Context run part outer) input next -> do
+    (gang, first') <- newGang run part joiner
+    let failure thrown = writeIORef (runFailure run) outer *> outer thrown
+        success result = writeIORef (runFailure run) outer *> next result
+        ended = bodyEnded run gang first' failure success
+        failing = Context run first' (ended . Left)
+    pure (Forked [resumed failing (body failing (CompiledGroup gang, input) (ended . Right))])
+  {-# INLINE group #-}
+
+  -- The part is given the scheduler for its next round, and the one that spawns it goes on. It is not a point to give way at.
+  spawn (Compiled program) = Compiled $ \(Context run _ _) (CompiledGroup gang, input) next ->
+    spawnedPart run gang >>= \case
+      Nothing -> next ()
+      Just (number, child) -> do
+        let ended = partEnded run gang child number
+            failing = Context run child (ended . Left)
+        enqueue run (resumed failing (program failing input (ended . Right)))
+        next ()
+  {-# INLINE spawn #-}
+
   together = \case
     [] -> done
     [one] -> one

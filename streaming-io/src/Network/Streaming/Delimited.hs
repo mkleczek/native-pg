@@ -300,9 +300,32 @@ instance Annotate (DelimitedM m s)
 -- cancelled where they wait, and their scopes are released before the group ends, which rethrows the first
 -- failure. A later failure is dropped.
 instance Concurrent (DelimitedM m s) where
-  data Group (DelimitedM m s) t j
-  group _ _ = error "not yet"
-  spawn _ = error "not yet"
+  newtype Group (DelimitedM m s) t j = DelimitedGroup (Gang j)
+
+  -- The part that makes the group hands its continuation to the group, and the member that ends last goes on with it. The body
+  -- runs as a part of its own, which is not in the scope of the parts.
+  group joiner (Delimited body) = Delimited $ \(Context run tag part) input ->
+    control0 tag $ \resume -> do
+      (gang, first') <- newGang run part joiner
+      pure $
+        Forked
+          [ pushFrame run first' Marked
+              *> catch (Right <$> body (Context run tag first') (DelimitedGroup gang, input)) (unwinding run first')
+              >>= bodyEnded run gang first' (resume . throwIO) (resume . pure)
+          ]
+  {-# INLINE group #-}
+
+  -- The part is given the scheduler for its next round, and the one that spawns it goes on. It is not a point to give way at.
+  spawn (Delimited program) = Delimited $ \(Context run tag _) (DelimitedGroup gang, input) ->
+    spawnedPart run gang >>= \case
+      Nothing -> pure ()
+      Just (number, child) ->
+        enqueue run $
+          pushFrame run child Marked
+            *> catch (Right <$> program (Context run tag child) input) (unwinding run child)
+            >>= partEnded run gang child number
+  {-# INLINE spawn #-}
+
   together = \case
     [] -> done
     [one] -> one

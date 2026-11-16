@@ -560,6 +560,8 @@ drawStep ctx path = \case
   Sum one two -> chosen ctx path (\case Sum a b -> Just (a, b); _ -> Nothing) one two
   Choice one two -> chosen ctx path (\case Choice a b -> Just (a, b); _ -> Nothing) one two
   Together parts -> laned ctx path parts
+  Grouped inner -> grouped ctx "group" (render ctx path inner)
+  Spawned inner -> spawned ctx path inner
   Race one two -> traverse (render ctx path) [one, two] >>= barred ctx "race"
   Leaf text how -> do
     when (text == unnamedAction) $ modifyIORef' (ctxUnnamed ctx) (+ 1)
@@ -888,6 +890,18 @@ grouped ctx title draw = do
     Nodes {} -> do
       node <- fresh ctx
       fragment <$ emit ctx (Group node Plain title items)
+
+-- | A spawn: the part in a box labelled "spawn", which the input of the spawn goes into and the part that spawns it goes on from,
+-- as it goes on at once. No edge leaves the part: it runs on its own.
+spawned :: Ctx -> Path -> Tree -> IO Fragment
+spawned ctx path inner = do
+  (fragment, items) <- collect ctx (render ctx path inner)
+  case fragmentCore fragment of
+    Bare _ -> single <$> declare ctx (leafText Round "spawn")
+    Nodes {} -> do
+      node <- fresh ctx
+      emit ctx (Group node Plain "spawn" items)
+      pure (Fragment (fragmentInput fragment) (Nodes node False [plain node]))
 
 -- | A scope as a group: the body after the acquire, and the release after it by a dashed edge named for the exit, from a
 -- junction if the acquire has no node.

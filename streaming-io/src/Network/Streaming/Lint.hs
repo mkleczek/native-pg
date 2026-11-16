@@ -259,6 +259,8 @@ below top path tree = combine tree <$> traverse (waysOf top path) (children tree
 -- * @Together@ runs its parts at once, each a way of its own: a part that loops without a wait keeps the core, whatever
 --   the other parts wait for. The way out is a way out of every part.
 -- * A scope runs its acquire, its body and its release.
+-- * A @Grouped@ runs its body. A @Spawned@ part runs on its own, as a part of its own that the lint judges by itself: the step that
+--   starts it is a way through that waits for nothing, whatever the part waits for.
 combine :: Tree -> [Ways] -> Ways
 combine tree inner = case tree of
   Pure -> Ways Nothing (Just [])
@@ -288,6 +290,8 @@ combine tree inner = case tree of
   Choice {} -> eitherOf inner
   Race {} -> eitherOf inner
   Together {} -> Ways (asum (wayBack <$> inner)) (concat <$> traverse wayOut inner)
+  Grouped {} -> inOrder inner
+  Spawned {} -> Ways Nothing (Just ["spawn"])
 
 -- | The ways through parts that run one after the other: a way round in a part, or a way out of the parts before it and a
 -- way round in the part after.
