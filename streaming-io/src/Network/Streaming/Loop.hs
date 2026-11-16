@@ -160,6 +160,10 @@ instance Exchange Loop ('Here Core) where
   await = Seq (Arr (\(LoopFuture slot) -> slot)) Await
   fulfil = Now (\(HerePromise slot, value) -> fulfilHere slot value)
   abandon = Now (\(LoopFuture slot) -> abandonHere slot)
+  awaitRegistering = error "not yet"
+  willAwait = error "not yet"
+  handWaiting = error "not yet"
+  untilParked = error "not yet"
 
 -- | An inbox is a shelf on this thread, and a part that waits at it is parked there, with no watch, as at a ticket, until a post
 -- or a collect lets it go on. Closing never waits, so it is an action; the collect and the post are primitives, which raise a

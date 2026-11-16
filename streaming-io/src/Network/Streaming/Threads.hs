@@ -502,6 +502,10 @@ instance Exchange (ThreadsM m) 'Anywhere where
   await = Threads (\part (ThreadFuture var _) -> waiting part (atomically (readTMVar var)))
   fulfil = Threads (\_ (AnywherePromise promise, value) -> promise value)
   abandon = Threads $ \_ (ThreadFuture var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
+  awaitRegistering = error "not yet"
+  willAwait = error "not yet"
+  handWaiting = error "not yet"
+  untilParked = error "not yet"
 
 -- | The promise evaluates the value, before the transaction, as the other arrows' promises do.
 fulfilThread :: TMVar a -> TVar Bool -> a -> IO Bool

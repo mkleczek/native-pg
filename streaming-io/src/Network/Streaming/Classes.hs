@@ -208,6 +208,24 @@ class (Fulfilling r) => Exchange arr (r :: Reach) where
   -- and this returns it.
   abandon :: arr (Future arr r a) (Maybe a)
 
+  -- | Waits as 'await' does, and runs the action at the moment the receiver parks, in the same atomic step, if no sender waits
+  -- already. The action is given the promise, to put in a structure that senders share, such as the queue of waiters of a pool. It
+  -- may give a value instead, which the receiver takes at once without parking.
+  awaitRegistering :: arr (Future arr r a, Promise r a -> IO (Maybe a)) a
+
+  -- | The receiver is about to hand its promise out, with steps that may wait, and then to await the future: a 'fulfil' in
+  -- between is held for it, as one at its await is. It does not wait.
+  willAwait :: arr (Future arr r a) ()
+
+  -- | Hands the value over, and waits until the receiver takes it. It returns 'Nothing' if the receiver took it, and @'Just' value@ if
+  -- the ticket was abandoned first: the value is the sender's still, as it is when the sender is cancelled. A second sender that
+  -- waits while one waits fails.
+  handWaiting :: arr (Promise r a, a) (Maybe a)
+
+  -- | Waits until the receiver is parked, and takes nothing. One part watches at a time. A watcher is let go when the ticket is
+  -- abandoned too, since no receiver will park: a hand then gives its value back.
+  untilParked :: arr (Promise r a) ()
+
 -- | The cheapest reach that an arrow has: that of the tickets whose parts all
 -- run on one core, which is @'Here s@ for an arrow with a region @s@, and
 -- @'Anywhere@ for one that has no cores to belong to.

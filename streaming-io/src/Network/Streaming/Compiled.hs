@@ -294,6 +294,10 @@ instance Exchange (CompiledM m) ('Here Core) where
       Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
   fulfil = Compiled (\context (HerePromise slot, value) next -> fulfilHere slot value >>= \taken -> steppedIn context (next taken))
   abandon = Compiled (\_ (CompiledFuture slot) next -> abandonHere slot >>= next)
+  awaitRegistering = error "not yet"
+  willAwait = error "not yet"
+  handWaiting = error "not yet"
+  untilParked = error "not yet"
 
 -- | The waiter of a ticket that any thread can fulfil is parked in the slot as a local ticket's is, but the
 -- promise, on another thread, doesn't run it: it puts it in the mailbox of this scheduler, which goes on with it in
@@ -308,6 +312,10 @@ instance Exchange (CompiledM m) 'Anywhere where
     awaitRemote run part slot (steppedIn context . next) (\park -> park (\action -> resumed context (action >>= next)))
   fulfil = Compiled $ \context (AnywherePromise promise, value) next -> promise value >>= \taken -> steppedIn context (next taken)
   abandon = Compiled $ \_ (CompiledRemoteFuture slot) next -> abandonRemote slot >>= next
+  awaitRegistering = error "not yet"
+  willAwait = error "not yet"
+  handWaiting = error "not yet"
+  untilParked = error "not yet"
 
 -- | An inbox of this core is a shelf of plain memory, and a part that waits at it is parked there, as at a ticket, until a post
 -- or a collect lets it go on. Posting and collecting count a step and can give way, as a ticket does, before they act: a

@@ -121,6 +121,10 @@ instance Exchange Diagram ('Here DiagramCore) where
   await = leaf "await" Wait
   fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
+  awaitRegistering = error "not yet"
+  willAwait = error "not yet"
+  handWaiting = error "not yet"
+  untilParked = error "not yet"
 
 instance Exchange Diagram 'Anywhere where
   data Future Diagram 'Anywhere a
@@ -128,6 +132,10 @@ instance Exchange Diagram 'Anywhere where
   await = leaf "await" Wait
   fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
+  awaitRegistering = error "not yet"
+  willAwait = error "not yet"
+  handWaiting = error "not yet"
+  untilParked = error "not yet"
 
 -- | The inboxes of a diagram are never made either, and have the two reaches for the same reason. Each step is a leaf that
 -- has the inbox's name in its text and in its shape: a post is a handover, and a collect is a wait.

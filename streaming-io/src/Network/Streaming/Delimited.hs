@@ -384,6 +384,10 @@ instance Exchange (DelimitedM m s) ('Here s) where
       Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
   fulfil = Delimited (\context (HerePromise slot, value) -> fulfilHere slot value <* step context)
   abandon = Delimited (\_ (HereFuture slot) -> abandonHere slot)
+  awaitRegistering = error "not yet"
+  willAwait = error "not yet"
+  handWaiting = error "not yet"
+  untilParked = error "not yet"
 
 -- | The waiter of a ticket that any core can fulfil is parked in the slot as a local ticket's is, but the
 -- promise, on another core, doesn't run it: it puts it in the mailbox of the
@@ -398,6 +402,10 @@ instance Exchange (DelimitedM m s) 'Anywhere where
     awaitRemote run part slot (\value -> value <$ step context) (control0 tag)
   fulfil = Delimited $ \context (AnywherePromise promise, value) -> promise value <* step context
   abandon = Delimited $ \_ (AnywhereFuture slot) -> abandonRemote slot
+  awaitRegistering = error "not yet"
+  willAwait = error "not yet"
+  handWaiting = error "not yet"
+  untilParked = error "not yet"
 
 -- | An inbox of this core is a shelf of plain memory, and a part that waits at it is parked there, as at a ticket, until a post
 -- or a collect lets it go on. Posting and collecting count a step and can give way, as a ticket does, before they act: a

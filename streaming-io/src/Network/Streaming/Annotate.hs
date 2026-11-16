@@ -41,6 +41,8 @@ data Check
     DeadInbox
   | -- | The same name is opened at two sites of the program, so that its posts and collects can't be told apart.
     InboxOpenedTwice
+  | -- | An exchange that 'asking' and 'answering' name has ends of only one side anywhere in the program: nothing pairs by its name.
+    DeadExchange
   deriving (Eq, Show, Enum, Bounded)
 
 -- | Annotations for the diagrams that "Network.Streaming.Diagram" draws of a program, and for its lint. Every other arrow
