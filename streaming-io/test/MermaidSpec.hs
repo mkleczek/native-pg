@@ -15,7 +15,6 @@ import Network.Streaming.Combinators (_Just, box, decide, done, step, tap, withI
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (..))
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
-import qualified Network.Streaming.Internal.Patterns as Patterns
 import Network.Streaming.Named (adding, at, cases, field, inj, is, newRecord, (:=), (?>))
 import Network.Streaming.Plumbing (each, prism)
 import Network.Streaming.Wiring (choice, result, type (=:), type (@:), (-<), (<:))
@@ -48,11 +47,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 -- emoji (U+FE0E), and a space.
 gear :: String
 gear = "\x2699\xFE0E "
-
--- | The stub of a branch with a pattern fails with 'NotImplemented': the cases that need only it are expected to fail, and
--- the marks come off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Internal.Patterns has a stub: a branch with a pattern is not written yet"
 
 -- | The code that draws the names of a pattern as boxes, nested as the pattern nests, each with the edges that leave it, and
 -- the edges that say only the order as dotted ones, is not written yet: the cases that need it are expected to fail, and
@@ -182,7 +176,7 @@ spec = describe "the chart" $ do
     -- The step that gives nothing is no box of its own.
     subgraphTitled "note" chart `shouldBe` Nothing
 
-  stubbed $ it "has the question of a choice in the box of its line" $ do
+  it "has the question of a choice in the box of its line" $ do
     chart <- chartOf choosing
     case subgraphTitled "picked" chart of
       Just (_, inside) -> any ("{\"how big?\"}" `isInfixOf`) inside `shouldBe` True
@@ -423,12 +417,12 @@ choosing =
           <: choice
             "how big?"
             "size"
-            ( "small" =: "s" Patterns.?> step "take" (\r -> pure (getField @"n" r)) -< ["n" =: "s"]
-                ||| "big" =: ["x", "y"] Patterns.?> step "add" (\r -> pure (getField @"n" r + getField @"m" r)) -< ["n" =: "x", "m" =: "y"]
+            ( "small" =: "s" ?> step "take" (\r -> pure (getField @"n" r)) -< ["n" =: "s"]
+                ||| "big" =: ["x", "y"] ?> step "add" (\r -> pure (getField @"n" r + getField @"m" r)) -< ["n" =: "x", "m" =: "y"]
                 ||| "huge" =: "h" @: ["lo", "hi"]
-                  Patterns.?> step "span" (\r -> pure (getField @"n" r + getField @"m" r + getField @"j" r))
+                  ?> step "span" (\r -> pure (getField @"n" r + getField @"m" r + getField @"j" r))
                   -< ["n" =: "lo", "m" =: "h.hi", "j"]
-                ||| "none" Patterns.?> step "zero" (const (pure 0)) -< []
+                ||| "none" ?> step "zero" (const (pure 0)) -< []
             )
     )
     >>> quick

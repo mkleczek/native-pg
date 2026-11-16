@@ -19,10 +19,14 @@
 -- A sum has the names of its cases in its type, as @Either ("refused" := x) (Either ("good" := y) ("quit" := z))@,
 -- which nests to the right as '|||' takes it apart. @inj "refused" x@ makes it, and its type comes from the branches
 -- that take it apart, so that a producer needs no signature. @decide "how did it end?" (cases "head")@ takes the sum
--- that is a field of the record apart, and a chain of branches, @"refused" ?> p ||| "good" ?> q ||| "quit" ?> r@, gives
--- each branch the value of its case, as a field named after the case, in front of the record. @casesBy "status"
--- classify@ does the same for a value that a function puts in a case. @_Case "refused" p@ runs an arrow on one case of
--- a plain sum. A name that the choice doesn't have, and a name that two of its cases have, are type errors that say so.
+-- that is a field of the record apart, and a chain of branches, @"refused" =: "status" ?> p ||| "good" =: ["parsed",
+-- "consumed"] ?> q ||| "quit" ?> r@, runs the branch of the case. The label of a branch selects its case, like a prism
+-- does, and binds nothing: a branch that has no pattern, as @"quit"@, doesn't have the value of its case. The pattern
+-- after @"case" =:@ takes the value apart, as a pattern on the left of @<:@ in "Network.Streaming.Wiring" does, with a
+-- name, a list, or @name \@: list@, which nest, and its names join the record that the branch takes, in front of it.
+-- @casesBy "status" classify@ does the same for a value that a function puts in a case. @_Case "refused" p@ runs an arrow
+-- on one case of a plain sum. A name that the choice doesn't have, and a name that two of its cases have, are type errors
+-- that say so, and so is an error in a pattern, which says where in the pattern it is.
 --
 -- The names of wires in diagrams come from 'is', 'adding', 'at', 'field' and '?>'. 'newRecord' is applied with @\<$\>@,
 -- which a diagram draws without the function, so that it names nothing.
@@ -59,7 +63,7 @@ import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
 import GHC.TypeLits (ErrorMessage (..), KnownSymbol, Symbol, TypeError, symbolVal)
 import Network.Streaming.Annotate (Annotate, (-|), (|-))
-import Network.Streaming.Internal.Patterns ((:=) (..), type (=:), type (@:))
+import Network.Streaming.Internal.Patterns ((:=) (..), type (=:), type (@:), (?>))
 import Network.Streaming.Plumbing (alongside)
 
 -- | The arrow's result as a field of the name, which also names the wire out of the arrow in diagrams.
@@ -190,8 +194,8 @@ inj :: forall name -> forall a s. (Inj name a s) => a -> s
 inj name = injWith @name
 {-# INLINE inj #-}
 
--- | Puts the value of a case of a sum in front of the record, as a field named after the case, for the branch of that
--- case. The sum and the result determine each other, so that the type of the sum comes from the branches.
+-- | Puts the value of a case of a sum, with the record, in the case of that name, for the branch of that case to take
+-- apart by its pattern. The sum and the result determine each other, so that the type of the sum comes from the branches.
 class Distribute s r d | s r -> d, d r -> s where
   distribute :: s -> r -> d
 
@@ -228,9 +232,9 @@ type family AbsentCase (name :: Symbol) (names :: [Symbol]) :: Constraint where
   AbsentCase name (name ': names) = TypeError (TwiceCase name)
   AbsentCase name (other ': names) = AbsentCase name names
 
--- | Takes the sum that is the field of the name apart for a chain of '?>': the value of its case goes in front of the
--- record. It is the function that 'Network.Streaming.Plumbing.decide' takes, so that the decision has its question in
--- diagrams. Two cases of one name are a type error.
+-- | Takes the sum that is the field of the name apart for a chain of '?>': the value of its case goes with the record,
+-- for the pattern of the branch to take apart. It is the function that 'Network.Streaming.Plumbing.decide' takes, so
+-- that the decision has its question in diagrams. Two cases of one name are a type error.
 cases ::
   forall name ->
   forall r s d.
@@ -250,20 +254,6 @@ casesBy ::
   d
 casesBy name classify r = distribute (classify (getField @name r)) r
 {-# INLINE casesBy #-}
-
--- '?>' binds tighter than '|||', so that a chain of branches needs no parentheses.
-infixr 6 ?>
-
--- | The branch for the case of the name: it takes the value of the case in front of the record, as a field of that
--- name, and the wire into it has the name in diagrams. A chain of them takes apart what 'cases' gives.
-(?>) ::
-  forall name ->
-  forall arr x r b.
-  (Arrow arr, Annotate arr, KnownSymbol name) =>
-  arr (name := x, r) b ->
-  arr (name := (name := x, r)) b
-(?>) name p = (\(Is a) -> a) ^>> (symbolVal (Proxy @name) |- p)
-{-# INLINE (?>) #-}
 
 -- | Runs an arrow on the case of the name of a choice, with a change of its type if the arrow has one.
 class Case (name :: Symbol) s a b t | name s -> a, name s b -> t where

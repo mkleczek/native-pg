@@ -15,9 +15,9 @@ misspelt =
   newRecord ["req", "number"] "GET /"
     ^>> adding "size" (arr byRange)
     >>> decide "how big?" (cases "size")
-    >>> ( "small" ?> arr (\r -> r.req <> " small " <> show r.small)
-            ||| "big" ?> arr (\r -> r.req <> " big " <> show r.big)
-            ||| "hugee" ?> arr (\r -> r.req <> " huge " <> show r.hugee)
+    >>> ( "small" =: "small" ?> arr (\r -> r.req <> " small " <> show r.small)
+            ||| "big" =: "big" ?> arr (\r -> r.req <> " big " <> show r.big)
+            ||| "hugee" =: "hugee" ?> arr (\r -> r.req <> " huge " <> show r.hugee)
         )
   where
     byRange r

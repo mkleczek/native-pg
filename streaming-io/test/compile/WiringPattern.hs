@@ -57,8 +57,8 @@ picking =
           <: choice
             "how big?"
             "size"
-            ( "small" ?> sumOf -< ["i" =: "small", "j" =: "q"]
-                ||| "big" ?> sumOf -< ["i" =: "big", "j" =: "r"]
+            ( "small" =: "small" ?> sumOf -< ["i" =: "small", "j" =: "q"]
+                ||| "big" =: "big" ?> sumOf -< ["i" =: "big", "j" =: "r"]
             )
     )
 

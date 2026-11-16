@@ -266,7 +266,8 @@ type family NoField (entry :: Entry) :: Constraint where
 
 -- | A choice that is a line of the flow: it decides on the sum that the flow has under the name of the field, as
 -- @decide question (cases field)@ does, and runs the branch of the case that it is. A branch is a step of its own,
--- @"case" ?> p -< bindings@, which reads the names of the flow and the value of its case under the name of the case.
+-- @"case" ?> p -< bindings@, which reads the names of the flow, and the names that the pattern of its case gives, if it
+-- has one: @"case" =: pattern ?> p -< bindings@.
 choice ::
   forall t arr x s d o.
   String ->

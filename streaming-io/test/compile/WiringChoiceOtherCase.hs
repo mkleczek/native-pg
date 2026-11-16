@@ -18,7 +18,8 @@ same = now (\r -> pure r.i)
 sized :: (Steps arr, HasField "i" r Int) => arr r (Either ("small" := Int) ("big" := Int))
 sized = now (\r -> pure (if r.i < 10 then inj "small" r.i else inj "big" r.i))
 
--- | A branch that binds the value of another case: a branch has the value of its own case only.
+-- | A branch that binds the value of another case: a branch has the value of the case that its pattern takes apart, and of
+-- no other.
 picked :: (Steps arr) => arr ("i" := Int, "j" := Int) Int
 picked =
   result
@@ -28,7 +29,7 @@ picked =
           <: choice
             "how big?"
             "size"
-            ( "small" ?> same -< ["i" =: "small"]
+            ( "small" =: "small" ?> same -< ["i" =: "small"]
                 ||| "big" ?> sumOf -< ["i" =: "small", "j"]
             )
     )

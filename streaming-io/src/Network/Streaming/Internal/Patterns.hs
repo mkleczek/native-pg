@@ -52,9 +52,9 @@ module Network.Streaming.Internal.Patterns
   )
 where
 
-import Control.Arrow (Arrow)
-import Control.Exception (throw)
+import Control.Arrow (Arrow, (^>>))
 import Data.Kind (Constraint, Type)
+import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
 import GHC.TypeLits
   ( AppendSymbol,
@@ -64,9 +64,9 @@ import GHC.TypeLits
     Symbol,
     TypeError,
     UnconsSymbol,
+    symbolVal,
   )
-import Network.Streaming.Annotate (Annotate)
-import Network.Streaming.NotImplemented (NotImplemented (..))
+import Network.Streaming.Annotate (Annotate, (|-))
 
 -- * Fields
 
@@ -596,12 +596,12 @@ infixr 6 ?>
 
 -- | The branch for the case that the label is for. It takes the value of its case apart by the pattern of the label, if it
 -- has one, and its names join the record, in front of it. The wire into it has the name of the case in diagrams. A chain of
--- them takes apart what 'Network.Streaming.Named.cases' gives. For now it is a stub.
+-- them takes apart what 'Network.Streaming.Named.cases' gives.
 (?>) ::
   forall (label :: Symbol) ->
   forall arr v r y b.
   (Arrow arr, Annotate arr, KnownSymbol (CaseOf label), Branch label v r y) =>
   arr y b ->
   arr (CaseOf label := (CaseOf label := v, r)) b
-(?>) _ _ = throw (NotImplemented "?> with a pattern")
+(?>) label p = (\(Is (Is v, r)) -> branch @label v r) ^>> (symbolVal (Proxy @(CaseOf label)) |- p)
 {-# INLINE (?>) #-}

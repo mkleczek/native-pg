@@ -40,8 +40,8 @@ picking =
           <: choice
             "how big?"
             "size"
-            ( "small" ?> same -< ["i" =: "small"]
-                ||| "big" ?> sumOf -< ["i" =: "big", "j" =: "twice"]
+            ( "small" =: "small" ?> same -< ["i" =: "small"]
+                ||| "big" =: "big" ?> sumOf -< ["i" =: "big", "j" =: "twice"]
                 ||| "huge" ?> zero -< []
             )
     )
@@ -54,8 +54,8 @@ passing =
         >>> choice
           "how big?"
           "size"
-          ( "small" ?> same -< ["i" =: "small"]
-              ||| "big" ?> sumOf -< ["i" =: "big", "j"]
+          ( "small" =: "small" ?> same -< ["i" =: "small"]
+              ||| "big" =: "big" ?> sumOf -< ["i" =: "big", "j"]
               ||| "huge" ?> zero -< []
           )
     )

@@ -13,4 +13,4 @@ import Network.Streaming.Named
 twice :: (Steps arr) => arr ("size" := Either ("small" := Int) ("small" := Bool)) String
 twice =
   decide "how big?" (cases "size")
-    >>> ("small" ?> arr (\r -> show r.small) ||| "small" ?> arr (\r -> show r.small))
+    >>> ("small" =: "small" ?> arr (\r -> show r.small) ||| "small" =: "small" ?> arr (\r -> show r.small))

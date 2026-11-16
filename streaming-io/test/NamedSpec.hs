@@ -3,9 +3,9 @@
 
 -- | Records whose fields are named in their type, and sums whose cases are: a record is made by 'newRecord' or '&&&',
 -- read by name, grown by 'adding' and changed by 'at', and a step that names the fields it reads takes any record that
--- has them. A sum is made by 'inj', taken apart by 'cases' or 'casesBy' and a chain of '?>', and changed in one case by
--- '_Case'. The cases run in each arrow that runs programs. That a name that a record or a choice doesn't have, or has
--- twice, doesn't compile is checked by @test/check-named.sh@.
+-- has them. A sum is made by 'inj', taken apart by 'cases' or 'casesBy' and a chain of '?>', whose patterns take the
+-- value of a case apart, and changed in one case by '_Case'. The cases run in each arrow that runs programs. That a name
+-- that a record or a choice doesn't have, or has twice, doesn't compile is checked by @test/check-named.sh@.
 module NamedSpec (spec) where
 
 import Control.Arrow (arr, (&&&), (>>>), (>>^), (^>>), (|||))
@@ -139,7 +139,7 @@ spec = describe "fields named in their type" $ do
       run (is "size" (arr (const 8)) &&& is "name" (arr (const "tube")) >>> sized) `shouldReturn` "tube8"
       run (newRecord ["size", "name"] <$> arr (const 6) <*> arr (const "bar") >>> sized) `shouldReturn` "bar6"
 
-    it "hands each case of a choice of three to its branch, with its value, the rest of the record and a record" $ do
+    it "hands each case of a choice of three to its branch, which takes the value apart by its pattern, with the rest of the record" $ do
       forM_
         [ (0, "ended GET /", "stream ended"),
           (404, "GET / refused 404", "refused"),
@@ -150,7 +150,7 @@ spec = describe "fields named in their type" $ do
           run (const number ^>> heads noted) `shouldReturn` expected
           readLog noted `shouldReturn` [taken]
 
-    it "hands each case of a choice of four to its branch, with its value and the rest of the record" $ do
+    it "hands each case of a choice of four to its branch, which keeps its value under a name, with the rest of the record" $ do
       forM_
         [ (5, "GET / tiny 5", "tiny"),
           (50, "GET / small 50", "small"),
@@ -162,7 +162,7 @@ spec = describe "fields named in their type" $ do
           run (const number ^>> sizes noted) `shouldReturn` expected
           readLog noted `shouldReturn` [taken]
 
-    it "hands each case of a classification of a field to its branch, with casesBy" $ do
+    it "hands each case of a classification of a field to its branch, which keeps its value under a name, with casesBy" $ do
       forM_
         [ (200, "GET / ok 200", "ok"),
           (404, "GET / missing 404", "missing"),
@@ -256,16 +256,16 @@ noting :: (Effect arr) => Log -> String -> Int -> arr () Int
 noting noted entry number = now (\() -> atomicModifyIORef' noted (\entries -> (entry : entries, ())) >> pure number)
 
 -- | How the head of the request ended, which the producer makes by naming the case, and a chain of branches takes
--- apart. Neither has a signature: the type of the choice comes from the branches. Each branch reads its case, the
--- request and, for the good head, a record.
+-- apart. Neither has a signature: the type of the choice comes from the branches. Each branch reads the request and the
+-- value of its case, by the name of its pattern, and for the good head the parts of a record.
 heads :: (Steps arr) => Log -> arr Int String
 heads noted =
   newRecord ["req", "number"] "GET /"
     ^>> adding "head" (arr ended)
     >>> decide "how did the head end?" (cases "head")
     >>> ( "stream ended" ?> branch noted "stream ended" (\r -> "ended " <> r.req)
-            ||| "refused" ?> branch noted "refused" (\r -> r.req <> " refused " <> show r.refused)
-            ||| "good" ?> branch noted "good" (\r -> r.req <> " good " <> r.good.parsed <> " " <> show r.good.consumed)
+            ||| "refused" =: "refused" ?> branch noted "refused" (\r -> r.req <> " refused " <> show r.refused)
+            ||| "good" =: ["parsed", "consumed"] ?> branch noted "good" (\r -> r.req <> " good " <> r.parsed <> " " <> show r.consumed)
         )
   where
     ended r
@@ -279,10 +279,10 @@ sizes noted =
   newRecord ["req", "number"] "GET /"
     ^>> adding "size" (arr sized')
     >>> decide "how big?" (cases "size")
-    >>> ( "tiny" ?> branch noted "tiny" (\r -> r.req <> " tiny " <> show r.tiny)
-            ||| "small" ?> branch noted "small" (\r -> r.req <> " small " <> show r.small)
-            ||| "medium" ?> branch noted "medium" (\r -> r.req <> " medium " <> show r.medium)
-            ||| "large" ?> branch noted "large" (\r -> r.req <> " large " <> show r.large)
+    >>> ( "tiny" =: "tiny" ?> branch noted "tiny" (\r -> r.req <> " tiny " <> show r.tiny)
+            ||| "small" =: "small" ?> branch noted "small" (\r -> r.req <> " small " <> show r.small)
+            ||| "medium" =: "medium" ?> branch noted "medium" (\r -> r.req <> " medium " <> show r.medium)
+            ||| "large" =: "large" ?> branch noted "large" (\r -> r.req <> " large " <> show r.large)
         )
   where
     sized' r
@@ -296,9 +296,9 @@ classified :: (Steps arr) => Log -> arr Int String
 classified noted =
   newRecord ["req", "status"] "GET /"
     ^>> decide "how did it go?" (casesBy "status" classify)
-    >>> ( "ok" ?> branch noted "ok" (\r -> r.req <> " ok " <> show r.ok)
-            ||| "missing" ?> branch noted "missing" (\r -> r.req <> " missing " <> show r.missing)
-            ||| "broken" ?> branch noted "broken" (\r -> r.req <> " broken " <> show r.broken)
+    >>> ( "ok" =: "ok" ?> branch noted "ok" (\r -> r.req <> " ok " <> show r.ok)
+            ||| "missing" =: "missing" ?> branch noted "missing" (\r -> r.req <> " missing " <> show r.missing)
+            ||| "broken" =: "broken" ?> branch noted "broken" (\r -> r.req <> " broken " <> show r.broken)
         )
   where
     classify status

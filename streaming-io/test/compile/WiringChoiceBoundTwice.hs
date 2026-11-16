@@ -28,7 +28,7 @@ picked =
           <: choice
             "how big?"
             "size"
-            ( "small" ?> same -< ["i" =: "small"]
-                ||| "big" ?> sumOf -< ["i" =: "big", "i" =: "j", "j"]
+            ( "small" =: "small" ?> same -< ["i" =: "small"]
+                ||| "big" =: "big" ?> sumOf -< ["i" =: "big", "i" =: "j", "j"]
             )
     )

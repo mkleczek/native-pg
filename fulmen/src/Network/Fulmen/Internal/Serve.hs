@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
@@ -76,7 +77,7 @@ import Network.Streaming.Combinators
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (group, spawn))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Named (Inj, casesBy, field, inj, is, newRecord, (:=), (?>))
+import Network.Streaming.Named (Inj, casesBy, field, inj, is, newRecord, type (=:), (:=), (?>))
 import Network.Streaming.Pool (checkoutIn, releaseNow, takeNowWith)
 import Network.Streaming.Wiring (choice, result, (-<), (<:))
 
@@ -325,9 +326,9 @@ request settings handler =
           "progress" <: step "copy carry-over" carryOver -< ["loan", "conn"]              >>>
           "head"     <: readHead settings                -< ["conn", "loan", "progress"]  >>>
           "kept"     <: choice "how did the head end?" "head"
-                          (    "stream ended" ?> quit                      -< []
-                           ||| "refused"      ?> refuse                    -< ["refused", "conn"]
-                           ||| "good"         ?> answered settings handler -< ["good", "conn", "loans", "loan", "progress"] )
+                          (    "stream ended"             ?> quit                      -< []
+                           ||| "refused" =: "refused" ?> refuse                    -< ["refused", "conn"]
+                           ||| "good"    =: "good"    ?> answered settings handler -< ["good", "conn", "loans", "loan", "progress"] )
         )
   where
     borrowed = field "loans" >>> borrow
@@ -489,7 +490,7 @@ aftermath :: (Runtime arr, HasField "outcome" r (Either SomeException ()), HasFi
 aftermath =
   named (Label "aftermath" "Decides whether the connection is kept, and answers 500 if nothing was answered.") $
     decide "how did the handler end?" byOutcome
-      >>> ("connection lost" ?> quit ||| "failed" ?> failed ||| "returned" ?> finished)
+      >>> ("connection lost" ?> quit ||| "failed" =: "failed" ?> failed ||| "returned" ?> finished)
   where
     -- Inlined, so that GHC fuses the classification with the branches and builds no sum.
     byOutcome r = casesBy "outcome" classify r

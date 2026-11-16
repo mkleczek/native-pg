@@ -17,7 +17,6 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (decide)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
-import qualified Network.Streaming.Internal.Patterns as Patterns
 import Network.Streaming.Loop (runLoop)
 import Network.Streaming.Named
 import Network.Streaming.Threads
@@ -37,12 +36,6 @@ runners =
     Runner "compiled" (\program -> fst <$> runCompiled program ()),
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
-
--- | The stub of a branch with a pattern fails with 'NotImplemented': the cases that need it are expected to fail, and the
--- marks come off when the code is there. The branch is the one of "Network.Streaming.Internal.Patterns" until it replaces
--- the branch of "Network.Streaming.Named".
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Internal.Patterns has a stub: a branch with a pattern is not written yet"
 
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
@@ -157,14 +150,14 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
   it "reads the names of the parts in the steps after it" $
     run (inputs >>> nestedNames) `shouldReturn` 44
 
-  stubbed $ it "runs the branch of the case that a choice finds, which takes the value of its case apart by its pattern" $ do
+  it "runs the branch of the case that a choice finds, which takes the value of its case apart by its pattern" $ do
     -- A name, a list for a pair, a name that is kept and takes a record apart, and a case with no pattern.
     run (sized 3 >>> branched) `shouldReturn` 7
     run (sized 45 >>> branched) `shouldReturn` 9
     run (sized 123 >>> branched) `shouldReturn` 24
     run (sized 5000 >>> branched) `shouldReturn` 99
 
-  stubbed $ it "takes the value of a case apart by a pattern outside a flow, and a case with no pattern binds nothing" $ do
+  it "takes the value of a case apart by a pattern outside a flow, and a case with no pattern binds nothing" $ do
     run (outside 3) `shouldReturn` 13
     run (outside 45) `shouldReturn` 30
     run (outside 123) `shouldReturn` 34
@@ -342,8 +335,8 @@ picked =
           <: choice
             "how big?"
             "size"
-            ( "small" ?> multiplier -< ["a" =: "small", "b"]
-                ||| "big" ?> adder -< ["a" =: "big", "b" =: "sum"]
+            ( "small" =: "small" ?> multiplier -< ["a" =: "small", "b"]
+                ||| "big" =: "big" ?> adder -< ["a" =: "big", "b" =: "sum"]
                 ||| "huge" ?> constant 99 -< []
             )
     )
@@ -356,9 +349,9 @@ chosen noted =
         >>> choice
           "how big?"
           "size"
-          ( "small" ?> noting noted "small" -< ["v" =: "small"]
-              ||| "big" ?> noting noted "big" -< ["v" =: "big"]
-              ||| "huge" ?> noting noted "huge" -< ["v" =: "huge"]
+          ( "small" =: "small" ?> noting noted "small" -< ["v" =: "small"]
+              ||| "big" =: "big" ?> noting noted "big" -< ["v" =: "big"]
+              ||| "huge" =: "huge" ?> noting noted "huge" -< ["v" =: "huge"]
           )
     )
 
@@ -382,8 +375,8 @@ rounded =
           <: choice
             "how big?"
             "size"
-            ( "small" ?> adder -< ["a" =: "small", "b" =: "q"]
-                ||| "big" ?> adder -< ["a" =: "big", "b" =: "r"]
+            ( "small" =: "small" ?> adder -< ["a" =: "small", "b" =: "q"]
+                ||| "big" =: "big" ?> adder -< ["a" =: "big", "b" =: "r"]
                 ||| "huge" ?> constant 99 -< []
             )
     )
@@ -434,10 +427,10 @@ branched =
           <: choice
             "which bin?"
             "bin"
-            ( "small" =: "s" Patterns.?> adder -< ["a" =: "s", "b"]
-                ||| "big" =: ["x", "y"] Patterns.?> adder -< ["a" =: "x", "b" =: "y"]
-                ||| "huge" =: "h" @: ["lo", "hi"] Patterns.?> adder -< ["a" =: "h.lo", "b" =: "hi"]
-                ||| "none" Patterns.?> constant 99 -< []
+            ( "small" =: "s" ?> adder -< ["a" =: "s", "b"]
+                ||| "big" =: ["x", "y"] ?> adder -< ["a" =: "x", "b" =: "y"]
+                ||| "huge" =: "h" @: ["lo", "hi"] ?> adder -< ["a" =: "h.lo", "b" =: "hi"]
+                ||| "none" ?> constant 99 -< []
             )
     )
 
@@ -446,10 +439,10 @@ outside :: (Steps arr) => Int -> arr () Int
 outside n =
   newRecord ["bin", "extra"] <$> arr (const (binsOf n)) <*> arr (const 10)
     >>> decide "which bin?" (cases "bin")
-    >>> ( "small" =: "s" Patterns.?> arr (\r -> r.s + r.extra)
-            ||| "big" =: ["x", "y"] Patterns.?> arr (\r -> r.x * r.y + r.extra)
-            ||| "huge" =: "h" @: ["lo", "hi"] Patterns.?> arr (\r -> r.h.hi + r.lo + r.extra)
-            ||| "none" Patterns.?> arr (\r -> r.extra)
+    >>> ( "small" =: "s" ?> arr (\r -> r.s + r.extra)
+            ||| "big" =: ["x", "y"] ?> arr (\r -> r.x * r.y + r.extra)
+            ||| "huge" =: "h" @: ["lo", "hi"] ?> arr (\r -> r.h.hi + r.lo + r.extra)
+            ||| "none" ?> arr (\r -> r.extra)
         )
 
 -- | A flow over any record that has the names that its steps read, which is a step of its own.

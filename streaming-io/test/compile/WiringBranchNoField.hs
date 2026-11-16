@@ -6,8 +6,7 @@ module WiringBranchNoField where
 import Control.Arrow ((>>>), (|||))
 import GHC.Records (HasField)
 import Network.Streaming.Classes
-import Network.Streaming.Internal.Patterns ((?>))
-import Network.Streaming.Named hiding ((?>))
+import Network.Streaming.Named
 import Network.Streaming.Wiring
 
 
