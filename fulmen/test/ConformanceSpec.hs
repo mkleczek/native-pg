@@ -57,7 +57,7 @@ import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, 
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> manyWorkers
+spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> manyWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -223,6 +223,77 @@ shutdownSpec = describe "a graceful shutdown" $ forM_ (runners ++ [coresRunner])
         raiseSignal sigTERM
         ended <- timeout 3000000 (readMVar (serverStopped shutting))
         fmap (either (const False) (const True)) ended `shouldBe` Just True
+
+-- | The idle timeout: a connection that waits for its next request for longer than it is closed, and its worker serves the
+-- connection that waits for one, while a connection that is serving a request, or that waits for less, is not closed, and a
+-- shutdown closes an idle connection at once whatever the timeout is.
+idleSpec :: Spec
+idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runner@(Runner runnerName _) ->
+  describe runnerName $ do
+    let request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        withIdle limit workers = withStoppableWith (\settings -> settings {Fulmen.idleTimeout = limit, Fulmen.connectionsPerCore = workers}) runner
+        notYet = xfail "the idle timeout is not there yet"
+    notYet $
+      it "closes a connection that waits for its next request for longer, and its worker serves the connection that waits for one" $
+        withIdle (Just (millis 300)) 1 (handling (Fixed 200 [] "ok")) $ \shutting ->
+          withClient (serverPort shutting) $ \idle -> withClient (serverPort shutting) $ \waiting -> do
+            SocketBytes.sendAll (socket idle) request
+            awaitBytes idle "ok"
+            started <- getMonotonicTimeNSec
+            -- The only worker has the idle connection, so this one waits in the listen backlog.
+            SocketBytes.sendAll (socket waiting) request
+            arrived <- timeout 5000000 (waitUntil (("ok" `B.isInfixOf`) <$> readIORef (received waiting)))
+            arrived `shouldBe` Just ()
+            answered <- getMonotonicTimeNSec
+            -- Not before the connection had waited the timeout.
+            (answered - started >= 250000000) `shouldBe` True
+            closed <- timeout 1000000 (waitUntil (readIORef (ended idle)))
+            closed `shouldBe` Just ()
+    notYet $
+      it "closes a connection that says nothing at all, after the timeout" $
+        withIdle (Just (millis 300)) 4 (handling (Fixed 200 [] "ok")) $ \shutting ->
+          withClient (serverPort shutting) $ \silent -> do
+            threadDelay 100000
+            readIORef (ended silent) `shouldReturn` False
+            closed <- timeout 3000000 (waitUntil (readIORef (ended silent)))
+            closed `shouldBe` Just ()
+    it "does not close a connection whose request is in flight for longer than the timeout" $
+      withIdle (Just (millis 300)) 4 quickOrSlow $ \shutting ->
+        withClient (serverPort shutting) $ \busy -> do
+          SocketBytes.sendAll (socket busy) "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n"
+          threadDelay 1500000
+          readIORef (ended busy) `shouldReturn` False
+          -- The body comes in two chunks, so the response is parsed to see it whole.
+          finished <- timeout 3000000 (waitUntil ((== ["onetwo"]) . map responseBody . parsedResponses . parseResponses [False] True <$> readIORef (received busy)))
+          finished `shouldBe` Just ()
+    it "does not close a connection whose waits for its next request are shorter than the timeout, however long it is kept" $
+      withIdle (Just (millis 400)) 4 (handling (Fixed 200 [] "ok")) $ \shutting ->
+        withClient (serverPort shutting) $ \client -> do
+          forM_ [1 .. 8 :: Int] $ \_ -> do
+            SocketBytes.sendAll (socket client) request
+            threadDelay 150000
+          readIORef (ended client) `shouldReturn` False
+          bytes <- readIORef (received client)
+          length (parsedResponses (parseResponses (replicate 8 False) True bytes)) `shouldBe` 8
+    it "does not close an idle connection when it has no idle timeout" $
+      withIdle Nothing 4 (handling (Fixed 200 [] "ok")) $ \shutting ->
+        withClient (serverPort shutting) $ \client -> do
+          SocketBytes.sendAll (socket client) request
+          awaitBytes client "ok"
+          threadDelay 700000
+          readIORef (ended client) `shouldReturn` False
+          SocketBytes.sendAll (socket client) request
+          timeout 3000000 (waitUntil ((\bytes -> length (parsedResponses (parseResponses [False, False] True bytes)) == 2) <$> readIORef (received client))) `shouldReturn` Just ()
+    it "closes the idle connection at once at a shutdown, whatever the timeout is" $
+      withIdle (Just (secs 60)) 4 (handling (Fixed 200 [] "ok")) $ \shutting ->
+        withClient (serverPort shutting) $ \idle -> do
+          SocketBytes.sendAll (socket idle) request
+          awaitBytes idle "ok"
+          stopServer shutting
+          closed <- timeout 1000000 (waitUntil (readIORef (ended idle)))
+          closed `shouldBe` Just ()
+          stopped <- timeout 3000000 (readMVar (serverStopped shutting))
+          fmap (either (const False) (const True)) stopped `shouldBe` Just True
 
 -- | A server that is running, and what a test needs to stop it and to see how it ended.
 data Stoppable = Stoppable

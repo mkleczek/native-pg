@@ -52,7 +52,7 @@ import Network.Streaming.PositiveInt (positiveInt)
 
 -- | A server of one worker for each core, with a pool of 16 buffers of 16 KiB for requests in flight, 2 of them in
 -- reserve, and 2 for setup, a line limit and a head limit of 50 KiB, which are Warp's default for the whole head, no limit
--- on bodies, and a silent client given 30 seconds.
+-- on bodies, a silent client given 30 seconds, and a connection that waits for its next request 30 seconds, as Warp's timeout is.
 defaultSettings :: Settings
 defaultSettings =
   Settings
@@ -61,6 +61,7 @@ defaultSettings =
     51200
     51200
     Nothing
+    (Just (secs 30))
     (Just (secs 30))
     Nothing
     (Just (secs 30))

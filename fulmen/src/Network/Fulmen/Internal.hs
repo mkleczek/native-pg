@@ -45,6 +45,12 @@ data Settings = Settings
     -- | How long a client may be silent in the middle of a head or a body before
     -- the server closes the connection.
     clientTimeout :: Maybe Duration,
+    -- | How long a connection may wait for its next request, from when it is accepted or when it has served one, before the server
+    -- closes it and its worker offers itself again, so that a connection that waits in the listen backlog is served. It is the wait
+    -- for the first byte of a request, so that a client that is gone without closing the connection, or that connects and says
+    -- nothing, doesn't hold a worker for ever; a connection that is serving a request, the time its handler takes included, is not
+    -- timed. 'Nothing' waits for ever.
+    idleTimeout :: Maybe Duration,
     -- | The event that starts a graceful shutdown, if the server has one: when it fires, the listener closes, a connection
     -- that waits for its next request closes, a request in flight finishes (until the 'drainTimeout' has passed) and says that
     -- its connection ends, and the server returns when none is left.
