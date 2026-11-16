@@ -112,7 +112,7 @@
 # benchmarks. Anywhere else a ticket is made by withTicket, call or concurrently, which abandon it if the wait is
 # cancelled. An inbox is made by withInbox, which closes it when its scope ends, and not by inbox and closeInbox.
 - functions:
-    - name: [ticket, await, abandon, expect, inbox, closeInbox]
+    - name: [ticket, await, abandon, expect, awaitRegistering, willAwait, handWaiting, untilParked, inbox, closeInbox]
       within: [Network.Streaming.*, Network.Streaming.Internal.*, Network.Directions.*, "*Spec", LoansTestSupport, Main.waiter, Main.cancelRun, Main.deadlineRun]
 # The default group is off and its "ignore: {}" ignores this hint too, so it is switched on by name.
 - error: {name: Avoid restricted function}

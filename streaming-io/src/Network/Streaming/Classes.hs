@@ -173,39 +173,60 @@ type Runtime arr =
     Inboxes arr 'Anywhere
   )
 
--- | Values that one direction hands another, once each: the way directions
--- exchange what they know. A ticket has two ends, a 'Future' that the part
--- which needs the value awaits, on the core that made the ticket, and a
--- 'Promise' that fulfils it, which the part that has the value keeps. A ticket
--- is made when the program runs, and its ends are passed through arrows like
--- any value, so a part can make one for each thing it waits for.
+-- | A ticket hands values from one part to another, over and over, and keeps none: a value is its sender's until a receiver takes it, and
+-- then the receiver's, and is never anywhere else. It is a rendezvous. The ticket is the way directions exchange what they know.
 --
--- The ticket's reach @r@ says in its type where the promise can be used. A promise
--- of reach @'Here s@ belongs to the core of the arrow @s@ that made the ticket,
--- as the arrow's own region does: only the parts of that core can fulfil it,
--- and the arrow can keep its slot as plain memory, with no atomic
--- operation, and its parts on its own run list. A promise of reach @'Anywhere@
--- belongs to no core, so that shared structures can hold it, and the parts of
--- any core can fulfil it: it costs what a value that crosses cores costs.
--- An arrow has the instances for the reaches it can keep.
+-- * __Ends.__ A ticket has a receiving end, a 'Future' that the part which takes awaits, on the core that made the ticket, and a handing
+--   end, a 'Promise', a plain value that can be passed to any part and stored. A ticket is made when the program runs, and its ends
+--   are passed through arrows like any value, so a part can make one for each thing it waits for.
+-- * __Reach.__ The ticket's reach @r@ says in its type where the promise can be used. A promise of reach @'Here s@ belongs to the core
+--   of the arrow @s@ that made the ticket, as the arrow's own region does: only the parts of that core can hand a value over, and the
+--   arrow can keep its slot as plain memory, with no atomic operation, and its parts on its own run list. A promise of reach
+--   @'Anywhere@ belongs to no core, so that shared structures can hold it, and the parts of any core can hand a value over: it costs
+--   what a value that crosses cores costs. An arrow has the instances for the reaches it can keep.
+-- * __Take__ ('await'): waits until a sender hands a value over, and returns it.
+-- * __Take, registering__ ('awaitRegistering'): the same, but it runs an action at the moment it parks, in the same atomic step. The
+--   action is given the promise, to put in a structure that senders share, such as the queue of waiters of a pool. It may give a value
+--   at once instead, and then the receiver does not park. This closes the window between registering a promise and waiting.
+--   'willAwait' does the same for registration steps that are arrows, which may wait: the receiver is committed to take from the moment
+--   it says so until its 'await', so that a value handed to it meanwhile is not lost, and 'abandon' gives such a value back.
+-- * __Hand now__ ('fulfil', and 'fulfilNow' as an action): never waits. It gives the value to a receiver that is parked right now, or
+--   committed to take, and says so with 'True'; otherwise it says 'False', and the value is the sender's still. It is for code inside a
+--   step, which must not wait.
+-- * __Hand__ ('handWaiting'): waits until the receiver takes the value. If the ticket is abandoned first, the value comes back to the
+--   sender: the result is 'Nothing' if it was taken, and @'Just' value@ if it is still the sender's. A sender that is cancelled while it
+--   waits keeps its value. A second sender that waits while one waits fails.
+-- * __Watch__ ('untilParked'): waits until the receiver is parked, and takes nothing. One part watches at a time. A watcher is let go
+--   when the ticket is abandoned too, since no receiver will park then: a hand gives its value back.
+-- * __Close__ ('abandon'): done by the receiving side as its scope ends. A sender that waits gets its value back, and a later hand
+--   gives it back at once, as a later 'fulfil' says 'False'. The receiver is given back only the value that was handed to it while it
+--   was committed to take and that it never awaited.
+-- * __Delivery wins over cancellation.__ Once a value has been handed to a parked receiver, the 'await' returns it: the receiver owns it,
+--   and a cancellation reaches it at its next wait, not at this one. A receiver that is cancelled while parked, before any hand, is
+--   unparked atomically, so that a hand that races with it either delivers, and the receiver has the value, or gives it back to the
+--   sender: never both, and never neither.
+-- * __Reusable.__ After each exchange a ticket is as new, and can be awaited again: a hundred thousand exchanges on one leave the live
+--   heap as it was.
+--
+-- Only the arrows wait, as the check that no module but the arrows' implementations waits in IO holds: 'await', 'handWaiting' and
+-- 'untilParked' are arrows, and 'fulfilNow' is the form of 'fulfil' in 'IO'. The ends can be named for diagrams and the lint by 'asking'
+-- and 'answering', which the lint pairs.
 class (Fulfilling r) => Exchange arr (r :: Reach) where
   data Future arr r a
 
   -- | The ends of a new ticket, made on this core.
   ticket :: arr () (Future arr r a, Promise r a)
 
-  -- | Waits until the promise of the ticket is fulfilled, and returns its value. Only on the
-  -- core that made it, which the arrow's type says.
+  -- | Waits until a sender hands a value over, and returns it. Only on the core that made the ticket, which the arrow's type says.
   await :: arr (Future arr r a) a
 
-  -- | Fulfils the promise with the value, and says whether the part that
-  -- awaits the future took it: it didn't if the waiter has gone, and the value is the promise's
-  -- again. A promise is fulfilled once.
+  -- | Hands the value to the receiver, and says whether it took it: it did if it is parked, or committed to take, and it didn't if
+  -- none is, or the ticket was abandoned, and then the value is the sender's. It never waits.
   fulfil :: arr (Promise r a, a) Bool
 
-  -- | The waiter stops wanting the value, before it waits for it: a later
-  -- 'fulfil' says it didn't. If the promise was fulfilled already, the value is the waiter's,
-  -- and this returns it.
+  -- | The receiver closes the ticket, which it does as its scope ends: a later 'fulfil' says it didn't take the value, a sender that
+  -- waits gets its value back, and a part that watches is let go. It returns the value that was handed to the receiver while it was
+  -- committed to take, and that it never awaited, which is the receiver's.
   abandon :: arr (Future arr r a) (Maybe a)
 
   -- | Waits as 'await' does, and runs the action at the moment the receiver parks, in the same atomic step, if no sender waits
@@ -213,9 +234,9 @@ class (Fulfilling r) => Exchange arr (r :: Reach) where
   -- may give a value instead, which the receiver takes at once without parking.
   awaitRegistering :: arr (Future arr r a, Promise r a -> IO (Maybe a)) a
 
-  -- | The receiver is about to hand its promise out, with steps that may wait, and then to await the future: a 'fulfil' in
-  -- between is held for it, as one at its await is. It does not wait.
-  willAwait :: arr (Future arr r a) ()
+  -- | The receiver is about to hand its promise out, with steps that may wait, and then to await the future, which it gives back: a
+  -- 'fulfil' in between is held for it, as one at its await is. It does not wait.
+  willAwait :: arr (Future arr r a) (Future arr r a)
 
   -- | Hands the value over, and waits until the receiver takes it. It returns 'Nothing' if the receiver took it, and @'Just' value@ if
   -- the ticket was abandoned first: the value is the sender's still, as it is when the sender is cancelled. A second sender that

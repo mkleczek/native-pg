@@ -52,15 +52,17 @@ module Network.Streaming.Internal.Scheduler
     stepped,
     counted,
     wakeTicket,
-    RemoteSlot (..),
-    awaitRemote,
-    fulfilRemote,
-    abandonRemote,
     Seat (..),
     hereSeat,
     anywhereSeat,
     collectFrom,
     postTo,
+    awaitFrom,
+    awaitRegisteringFrom,
+    handWaitingTo,
+    untilParkedFrom,
+    commitTo,
+    abandonTicket,
     Mailbox,
     runMailbox,
     post,
@@ -105,7 +107,7 @@ where
 
 import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, yield)
 import Control.Concurrent.STM (atomically, orElse, retry)
-import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, toException, try)
+import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, onException, throwIO, toException, try)
 import Control.Monad (foldM, when)
 import Data.Bits ((.&.), (.|.))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -127,8 +129,9 @@ import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Descriptors (armedBy, newRunNumber)
-import Network.Streaming.Internal.Inboxes (Change, Looked (..), Shelf, changeHere, collectedWrongly, lookOrWait, postNow, postOrQueue, stopWaiting, takeNow, takeWoken, withdraw)
-import Network.Streaming.Internal.Tickets (Slot (..))
+import Network.Streaming.Internal.Atomic (Change, changeHere)
+import Network.Streaming.Internal.Inboxes (Looked (..), Shelf, collectedWrongly, lookOrWait, postNow, postOrQueue, stopWaiting, takeNow, takeWoken, withdraw)
+import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers
 import Network.Streaming.Loop (Report (..))
 import Network.Streaming.Mode (Instrumented (bump, bumpBy, debugging))
@@ -194,7 +197,6 @@ type Members = IntMap.IntMap Part
 -- | Where a part waits, as what takes it off that.
 data Parked
   = NotWaiting
-  | forall a. OnTicket !(IORef (Slot a))
   | -- | A descriptor, the direction and the number of the wait.
     OnFd !Int !Bool !Int
   | -- | A watch, by the number of the wait.
@@ -418,94 +420,25 @@ counted run step = step <$ (counter run 1 >>= setCounter run 1 . (+ 1))
 wakeTicket :: Run -> IO Step -> IO ()
 wakeTicket run part = modifyIORef' (runTickets run) (part :) *> adjust run 5 (-1)
 
--- | What the slot of a ticket of reach @'Anywhere@ holds, and what a thread that fulfils it finds: nothing
--- yet, the value, the part that waits for it, or that the waiter has gone. Several threads read and change it,
--- atomically. The value is evaluated, as a local slot's is. The waiter is what puts the part back among those that
--- can go on, with the action that runs where it waited: the value, or a cancellation to raise.
-data RemoteSlot a = RemoteEmpty | RemoteFulfilled !a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
-
--- | What a fulfil did to the slot.
-data Fulfilment a = Stored | Resume (IO a -> IO Step) | Gone | Twice
-
--- | What a waiter's parking did to the slot.
-data Parking a = Parking | Ready a | Misused
-
--- | What a part does that waits for a ticket of reach @'Anywhere@, for the two arrows that run parts on one
--- thread. If the value is there, the arrow goes on with it. If it isn't, the part says where it waits, so that a
--- cancellation takes it off the slot, and the arrow captures what follows the wait, which it hands to the slot
--- as the waiter. It is the arrow's own to say how it goes on and how it captures.
-awaitRemote :: Run -> Part -> IORef (RemoteSlot a) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
-awaitRemote run part slot fulfilled capture =
-  readIORef slot >>= \case
-    RemoteFulfilled value -> checkpoint part *> fulfilled value
-    RemoteEmpty -> do
-      registering part (Other (stopRemote run slot))
-      capture (parkRemote slot)
-    _ -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
-{-# INLINE awaitRemote #-}
-
--- | Parks the captured part in the slot, which was empty at the look: unless it was fulfilled since, and then
--- the part goes on in its turn.
-parkRemote :: IORef (RemoteSlot a) -> (IO a -> IO Step) -> IO Step
-parkRemote slot resume = do
-  parking <- update slot $ \case
-    RemoteEmpty -> (RemoteWaiter resume, Parking)
-    RemoteFulfilled value -> (RemoteFulfilled value, Ready value)
-    other -> (other, Misused)
-  case parking of
-    Parking -> pure ParkedRemote
-    -- Fulfilled since the look: goes on in its turn.
-    Ready value -> pure (Yielded (resume (pure value)))
-    Misused -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
-
--- | Takes the part off the slot, if it still waits there: not if it was fulfilled since, which has put the
--- part in the mailbox, and which the part finds at its next wait.
-stopRemote :: Run -> IORef (RemoteSlot a) -> Cancelled -> IO (Maybe (IO Step))
-stopRemote run slot cancelled =
-  update slot (\case RemoteWaiter resume -> (RemoteEmpty, Just resume); other -> (other, Nothing)) >>= \case
-    Nothing -> pure Nothing
-    Just resume -> Just (resume (throwIO cancelled)) <$ adjust run 3 (-1)
-
--- | Fulfils the slot with its value, and if a part waits for it, puts the part in the
--- mailbox of the scheduler that owns it. It says whether the waiter takes it. The value is evaluated before
--- the compare-and-swap, not between its read and its swap.
-fulfilRemote :: Mailbox -> IORef (RemoteSlot a) -> a -> IO Bool
-fulfilRemote mailbox slot !value = do
-  fulfilment <- update slot $ \case
-    RemoteEmpty -> (RemoteFulfilled value, Stored)
-    RemoteWaiter resume -> (RemoteFulfilled value, Resume resume)
-    RemoteAbandoned -> (RemoteAbandoned, Gone)
-    fulfilled -> (fulfilled, Twice)
-  case fulfilment of
-    Stored -> pure True
-    Resume resume -> post mailbox (resume (pure value))
-    Gone -> pure False
-    Twice -> ioError (userError "a promise was fulfilled twice")
-
--- | The waiter stops wanting the value, before it waits for it: a later fulfil says it isn't taken. A value fulfilled
--- already is the waiter's, and this returns it.
-abandonRemote :: IORef (RemoteSlot a) -> IO (Maybe a)
-abandonRemote slot =
-  update slot $ \case
-    RemoteFulfilled value -> (RemoteAbandoned, Just value)
-    _ -> (RemoteAbandoned, Nothing)
-
--- | How the parts of a run wait at an inbox, and are woken: how the shelf is changed, how a part is put back among those that
--- can go on, what a part that waits comes to, and the counter of the parts that wait that way.
+-- | How the parts of a run wait at an inbox or a ticket, and are woken: how the slot is changed, how a part is put back among those
+-- that can go on, how a part is given a value, which says whether the part takes it, what a part that waits comes to, and the counter of
+-- the parts that wait that way.
 data Seat = Seat
   { seatChange :: Change,
     seatWake :: Run -> IO Step -> IO (),
+    seatDeliver :: Run -> IO Step -> IO Bool,
     seatParked :: Step,
     seatCounter :: Int
   }
 
--- | The seat of an inbox of this core: plain memory, and the parts that tickets woke.
+-- | The seat of an inbox or a ticket of this core: plain memory, and the parts that tickets woke.
 hereSeat :: Seat
-hereSeat = Seat changeHere wakeTicket Parked 5
+hereSeat = Seat changeHere wakeTicket (\run part -> True <$ wakeTicket run part) Parked 5
 
--- | The seat of an inbox of any core: compare-and-swap, and the mailbox of the part's scheduler.
+-- | The seat of an inbox or a ticket of any core: compare-and-swap, and the mailbox of the part's scheduler, which refuses a part if
+-- the scheduler has ended.
 anywhereSeat :: Seat
-anywhereSeat = Seat update (\run part -> () <$ post (runMailbox run) part) ParkedRemote 3
+anywhereSeat = Seat update (\run part -> () <$ post (runMailbox run) part) (\run part -> post (runMailbox run) part) ParkedRemote 3
 
 -- | What a part does that collects from an inbox, for the two arrows that run every part on one thread: the arrow goes on with the
 -- value, or, if there is none, captures what follows, and the part waits on the shelf until a post wakes it and it takes the value.
@@ -546,6 +479,120 @@ postTo seat run part shelf value posted capture = do
             pure (seatParked seat)
           -- The inbox took the value, or closed, since the look, on another thread.
           Just taken -> pure (Yielded (resume (pure taken)))
+
+-- | The part says where it waits, if it is in a scope, so that a cancellation can take it from there: a part that is in none is not
+-- cancelled, and says nothing.
+waitsAt :: Part -> Parked -> IO ()
+waitsAt part parked =
+  readIORef (partFrames part) >>= \case
+    [] -> pure ()
+    _ -> writeIORef (partWait part) parked
+{-# INLINE waitsAt #-}
+
+-- | What a part does that awaits a ticket, for the two arrows that run every part on one thread: the arrow goes on with the value if a
+-- sender waits, and else captures what follows, and the part parks in the slot until a sender gives it a value. A cancellation that
+-- reaches the part first is raised before it takes a value, which a sender that waits keeps.
+awaitFrom :: Seat -> Run -> Part -> IORef (Slot a) -> (IO r -> IO r) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
+awaitFrom seat run part slot first taken capture = do
+  checkpoint part
+  valueWaits slot >>= \case
+    False -> capture (parkAwaiting seat run part slot)
+    -- The part takes the value, after the step that it may give way at, so that a cancellation that it raises leaves the value with its sender.
+    True ->
+      first $
+        takeWaiting (seatChange seat) slot >>= \case
+          Took value -> taken value
+          Misused -> ioError tookWrongly
+          Parks -> capture (parkAwaiting seat run part slot)
+{-# INLINE awaitFrom #-}
+
+-- | Parks the captured part in the slot, as the receiver: unless a sender came since the look, and then the part goes on in its turn
+-- with the value. The part is given a value by a sender with the value itself: a cancellation reaches it at its next wait.
+parkAwaiting :: Seat -> Run -> Part -> IORef (Slot a) -> (IO a -> IO Step) -> IO Step
+parkAwaiting seat run part slot resume =
+  parkTaker (seatChange seat) slot (\value -> seatDeliver seat run (resume (pure value))) >>= \case
+    Parks -> do
+      -- A cancellation takes the part off the slot, unless a sender has given it a value already.
+      let stop cancelled = stopTaking (seatChange seat) slot >>= \stopped -> if stopped then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+      waitsAt part (Other stop)
+      pure (seatParked seat)
+    Took value -> pure (Yielded (resume (pure value)))
+    Misused -> ioError tookWrongly
+
+-- | What a part does that awaits and registers: if a sender waits, the arrow goes on with its value, and the registration doesn't run.
+-- Else the receiver is committed to take, and the registration runs in the same step, as the part that is about to park: a value that is
+-- handed to the receiver meanwhile is its, and the registration may give a value instead, which the arrow goes on with. If neither, the
+-- part captures what follows and parks.
+awaitRegisteringFrom :: Seat -> Run -> Part -> IORef (Slot a) -> IO (Maybe a) -> (IO r -> IO r) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
+awaitRegisteringFrom seat run part slot register first taken capture = do
+  checkpoint part
+  valueWaits slot >>= \there -> if there then first begin else begin
+  where
+    begin =
+      beginRegistering (seatChange seat) slot >>= \case
+        Took value -> taken value
+        Misused -> ioError tookWrongly
+        Parks ->
+          (register `onException` giveUpRegistering (seatChange seat) slot) >>= \case
+            Just value -> giveUpRegistering (seatChange seat) slot >>= \clean -> if clean then taken value else ioError registeredAndGave
+            Nothing ->
+              endRegistering (seatChange seat) slot >>= \case
+                Took value -> taken value
+                Parks -> capture (parkAwaiting seat run part slot)
+                Misused -> ioError tookWrongly
+{-# INLINE awaitRegisteringFrom #-}
+
+-- | What a part does that hands a value over and waits until it is taken: the arrow goes on with 'Nothing' if the receiver is parked,
+-- and takes it, and with the value if the ticket was abandoned. Else it captures what follows, and the part waits in the slot until
+-- the receiver takes the value or the ticket is abandoned. A cancellation that reaches the part first is raised before the hand, and a
+-- cancellation takes the part out of the slot, unless its value was taken.
+handWaitingTo :: Seat -> Run -> Part -> IORef (Slot a) -> a -> (Maybe a -> IO r) -> (((IO (Maybe a) -> IO Step) -> IO Step) -> IO r) -> IO r
+handWaitingTo seat run part slot value handed capture = do
+  checkpoint part
+  handTry (seatChange seat) slot value >>= \case
+    Passed -> handed Nothing
+    GaveBack -> handed (Just value)
+    SecondSender -> ioError twoSenders
+    _ -> capture $ \resume -> do
+      token <- nextWait run
+      parkSender (seatChange seat) slot value token (\taken -> seatWake seat run (resume (pure (if taken then Nothing else Just value)))) >>= \case
+        LeftWaiting -> do
+          let stop cancelled = withdrawSender (seatChange seat) slot token >>= \withdrawn -> if withdrawn then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+          waitsAt part (Other stop)
+          pure (seatParked seat)
+        -- The receiver took the value, or the ticket was abandoned, since the look, on another thread.
+        Passed -> pure (Yielded (resume (pure Nothing)))
+        GaveBack -> pure (Yielded (resume (pure (Just value))))
+        _ -> ioError twoSenders
+{-# INLINE handWaitingTo #-}
+
+-- | What a part does that waits until the receiver is parked: the arrow goes on if it is, or the ticket was abandoned. Else it captures
+-- what follows, and the part waits in the slot as the watcher, which the receiver's park wakes.
+untilParkedFrom :: Seat -> Run -> Part -> IORef (Slot a) -> IO r -> (((IO () -> IO Step) -> IO Step) -> IO r) -> IO r
+untilParkedFrom seat run part slot goOn capture = do
+  checkpoint part
+  lookAtWatch slot >>= \case
+    WatchDone -> goOn
+    SecondWatcher -> ioError twoWatchers
+    WatchWaits -> capture $ \resume -> do
+      token <- nextWait run
+      parkWatcher (seatChange seat) slot token (seatWake seat run (resume (pure ()))) >>= \case
+        WatchWaits -> do
+          let stop cancelled = unwatch (seatChange seat) slot token >>= \stopped -> if stopped then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+          waitsAt part (Other stop)
+          pure (seatParked seat)
+        WatchDone -> pure (Yielded (resume (pure ())))
+        SecondWatcher -> ioError twoWatchers
+{-# INLINE untilParkedFrom #-}
+
+-- | The receiver is about to hand its promise out, with steps that may wait, and await the future: a value handed to it from now on is
+-- its.
+commitTo :: Seat -> IORef (Slot a) -> IO ()
+commitTo seat slot = commitRegistering (seatChange seat) slot >>= \committed -> if committed then pure () else ioError tookWrongly
+
+-- | Abandons the ticket, and gives the value that was handed to the receiver while it registered and that it never awaited.
+abandonTicket :: Seat -> IORef (Slot a) -> IO (Maybe a)
+abandonTicket seat = closeSlot (seatChange seat)
 
 -- | The first part of a run, in no scope: the run's root scope begins with it.
 newPart :: Run -> IO Part
@@ -692,12 +739,6 @@ cancelScope run scope' = do
 stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))
 stopWait run cancelled = \case
   NotWaiting -> pure Nothing
-  -- The waiter in the slot puts the part back among those that can go on itself, as a fulfil does, with the
-  -- cancellation to raise where it waits.
-  OnTicket slot ->
-    readIORef slot >>= \case
-      Waiter wake -> Nothing <$ (writeIORef slot Empty *> wake (throwIO cancelled))
-      _ -> pure Nothing
   OnFd fd reading ident -> do
     waiters <- readIORef (runWaiters run)
     case IntMap.lookup fd waiters of

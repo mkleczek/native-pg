@@ -29,7 +29,7 @@ import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, rtsSupportsBoundThreads, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (TMVar, TVar, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar)
 import Control.Exception (SomeException, allowInterrupt, finally, mask_, onException, throwIO, toException, try, uninterruptibleMask_)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.Bits ((.&.))
@@ -491,31 +491,103 @@ type instance Local (ThreadsM m) = 'Anywhere
 
 type instance ModeOf (ThreadsM m) = m
 
--- | A ticket is a 'TMVar', which blocks the thread that waits for it, and whether the waiter has gone. The future
--- and the promise are the same 'TMVar'. Every thread can reach both: there is no core to belong to.
+-- | A ticket is a slot that every thread changes atomically, and a part that waits at it blocks its thread on an 'MVar' that the hand
+-- or the abandon that it waits for fills. The threads have no cores, so there is one reach. A ticket keeps no value for a part that is
+-- not parked.
 instance Exchange (ThreadsM m) 'Anywhere where
-  data Future (ThreadsM m) 'Anywhere a = ThreadFuture (TMVar a) (TVar Bool)
-  ticket = Threads $ \_ () -> do
-    var <- newEmptyTMVarIO
-    abandoned <- newTVarIO False
-    pure (ThreadFuture var abandoned, AnywherePromise (fulfilThread var abandoned))
-  await = Threads (\part (ThreadFuture var _) -> waiting part (atomically (readTMVar var)))
-  fulfil = Threads (\_ (AnywherePromise promise, value) -> promise value)
-  abandon = Threads $ \_ (ThreadFuture var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
-  awaitRegistering = error "not yet"
-  willAwait = error "not yet"
-  handWaiting = error "not yet"
-  untilParked = error "not yet"
+  newtype Future (ThreadsM m) 'Anywhere a = ThreadFuture (IORef (Slot a))
+  ticket = Threads (\_ () -> newSlot >>= \slot -> pure (ThreadFuture slot, AnywherePromise slot))
+  await = Threads (\part (ThreadFuture slot) -> awaitThread part slot)
+  fulfil = Threads (\_ (promise, value) -> fulfilNow promise value)
+  abandon = Threads (\_ (ThreadFuture slot) -> closeSlot update slot)
+  awaitRegistering = Threads (\part (ThreadFuture slot, register) -> awaitRegisteringThread part slot (register (AnywherePromise slot)))
+  willAwait = Threads (\_ future@(ThreadFuture slot) -> commitRegistering update slot >>= \committed -> if committed then pure future else ioError tookWrongly)
+  handWaiting = Threads (\part (promise, value) -> anywhereSlot promise >>= \slot -> handThread part slot value)
+  untilParked = Threads (\part promise -> anywhereSlot promise >>= \slot -> untilParkedThread part slot)
 
--- | The promise evaluates the value, before the transaction, as the other arrows' promises do.
-fulfilThread :: TMVar a -> TVar Bool -> a -> IO Bool
-fulfilThread var abandoned !value = atomically $ do
-  gone <- readTVar abandoned
-  if gone
-    then pure False
-    else do
-      fulfilled <- tryPutTMVar var value
-      if fulfilled then pure True else throwSTM (userError "a promise was fulfilled twice")
+-- | An await from a thread: it takes the value of a sender that waits, or parks on an 'MVar' that a hand fills. The value stays in the
+-- 'MVar' until the part has it: a cancellation that comes after the hand reaches the part after the wait, with the value still there.
+awaitThread :: Part -> IORef (Slot a) -> IO a
+awaitThread part slot = do
+  givingWay part
+  valueWaits slot >>= \case
+    False -> parkedThread part slot
+    True ->
+      takeWaiting update slot >>= \case
+        Took value -> pure value
+        Misused -> ioError tookWrongly
+        Parks -> parkedThread part slot
+
+-- | The thread parks as the receiver, unless a sender came since the look. A cancellation takes it off the slot; if a hand has given it a
+-- value already, the value is the receiver's, and the cancellation reaches the part at its next wait.
+parkedThread :: Part -> IORef (Slot a) -> IO a
+parkedThread part slot = do
+  gate <- newEmptyMVar
+  parkTaker update slot (\value -> True <$ putMVar gate value) >>= \case
+    Took value -> pure value
+    Misused -> ioError tookWrongly
+    Parks ->
+      try (waiting part (readMVar gate)) >>= \case
+        Right value -> pure value
+        Left failure -> stopTaking update slot >>= \stopped -> if stopped || isNothing (cancelledBy failure) then throwIO (failure :: SomeException) else readMVar gate
+
+-- | An await that registers, from a thread, as the arrows that run every part on one thread do it.
+awaitRegisteringThread :: Part -> IORef (Slot a) -> IO (Maybe a) -> IO a
+awaitRegisteringThread part slot register = do
+  givingWay part
+  beginRegistering update slot >>= \case
+    Took value -> pure value
+    Misused -> ioError tookWrongly
+    Parks ->
+      (register `onException` giveUpRegistering update slot) >>= \case
+        Just value -> giveUpRegistering update slot >>= \clean -> if clean then pure value else ioError registeredAndGave
+        Nothing ->
+          endRegistering update slot >>= \case
+            Took value -> pure value
+            Misused -> ioError tookWrongly
+            Parks -> parkedThread part slot
+
+-- | A hand from a thread that waits until the value is taken: if the receiver isn't parked, the thread waits on an 'MVar' that the
+-- receiver's take, or the abandon, fills with whether the value was taken. A cancellation takes the hand out of the slot; if the value was
+-- taken already, the hand is done, and the cancellation reaches the part at its next wait.
+handThread :: Part -> IORef (Slot a) -> a -> IO (Maybe a)
+handThread part slot value = do
+  givingWay part
+  handTry update slot value >>= \case
+    Passed -> pure Nothing
+    GaveBack -> pure (Just value)
+    SecondSender -> ioError twoSenders
+    _ -> do
+      gate <- newEmptyMVar
+      token <- nextIdent
+      parkSender update slot value token (putMVar gate) >>= \case
+        Passed -> pure Nothing
+        GaveBack -> pure (Just value)
+        LeftWaiting ->
+          try (waiting part (readMVar gate)) >>= \case
+            Right taken -> pure (outcome taken)
+            Left failure -> withdrawSender update slot token >>= \withdrawn -> if withdrawn || isNothing (cancelledBy failure) then throwIO (failure :: SomeException) else outcome <$> readMVar gate
+        _ -> ioError twoSenders
+  where
+    outcome taken = if taken then Nothing else Just value
+
+-- | A watch from a thread: it waits on an 'MVar' that the receiver's park, or the abandon, fills.
+untilParkedThread :: Part -> IORef (Slot a) -> IO ()
+untilParkedThread part slot = do
+  givingWay part
+  lookAtWatch slot >>= \case
+    WatchDone -> pure ()
+    SecondWatcher -> ioError twoWatchers
+    WatchWaits -> do
+      gate <- newEmptyMVar
+      token <- nextIdent
+      parkWatcher update slot token (() <$ tryPutMVar gate ()) >>= \case
+        WatchDone -> pure ()
+        SecondWatcher -> ioError twoWatchers
+        WatchWaits ->
+          try (waiting part (readMVar gate)) >>= \case
+            Right () -> pure ()
+            Left failure -> unwatch update slot token >>= \stopped -> if stopped || isNothing (cancelledBy failure) then throwIO (failure :: SomeException) else readMVar gate
 
 -- | An inbox is a shelf that every thread changes atomically, and a part that waits at it blocks its thread on an 'MVar' that
 -- the post, the collect or the closing that it waits for fills. The threads have no cores, so there is one reach.

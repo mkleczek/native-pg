@@ -62,6 +62,9 @@ data Loop a b where
   Clock :: Loop () Instant
   Block :: Loop Event ()
   Await :: Loop (IORef (Slot a)) a
+  AwaitRegistering :: Loop (IORef (Slot a), IO (Maybe a)) a
+  HandWaiting :: Loop (IORef (Slot a), a) (Maybe a)
+  UntilParked :: Loop (IORef (Slot a)) ()
   Collect :: Loop (IORef (Shelf a)) a
   Post :: Loop (IORef (Shelf a), a) Bool
   Scope' :: Loop a r -> Loop (r, Exit) () -> Loop (r, a) b -> Loop a b
@@ -148,22 +151,21 @@ type instance ModeOf Loop = 'Release
 -- | The region of the tickets of this arrow: there is one core, the thread that runs it.
 data Core
 
--- | A ticket is a slot on this thread. A part that waits for it is parked in
--- it, with no watch, and goes back among those that can go on when the ticket's
--- promise is fulfilled. Fulfilling a promise and abandoning the ticket never wait, so
--- they are actions.
+-- | A ticket is a slot on this thread. A part that waits for it is parked in it, with no watch, and goes back among those that can go
+-- on when a part hands it a value: a ticket keeps no value for a part that is not parked. Handing a value now, abandoning the ticket and
+-- saying that a part will await it never wait, so they are actions; the await, the hand that waits and the watch are primitives.
 type instance Local Loop = 'Here Core
 
 instance Exchange Loop ('Here Core) where
   newtype Future Loop ('Here Core) a = LoopFuture (IORef (Slot a))
-  ticket = Now (\() -> newIORef Empty >>= \slot -> pure (LoopFuture slot, HerePromise slot))
+  ticket = Now (\() -> newSlot >>= \slot -> pure (LoopFuture slot, HerePromise slot))
   await = Seq (Arr (\(LoopFuture slot) -> slot)) Await
-  fulfil = Now (\(HerePromise slot, value) -> fulfilHere slot value)
-  abandon = Now (\(LoopFuture slot) -> abandonHere slot)
-  awaitRegistering = error "not yet"
-  willAwait = error "not yet"
-  handWaiting = error "not yet"
-  untilParked = error "not yet"
+  fulfil = Now (\(promise, value) -> fulfilNow promise value)
+  abandon = Now (\(LoopFuture slot) -> closeSlot changeHere slot)
+  awaitRegistering = Seq (Arr (\(LoopFuture slot, register) -> (slot, register (HerePromise slot)))) AwaitRegistering
+  willAwait = Now (\future@(LoopFuture slot) -> commitRegistering changeHere slot >>= \committed -> if committed then pure future else ioError tookWrongly)
+  handWaiting = Seq (Arr (\(HerePromise slot, value) -> (slot, value))) HandWaiting
+  untilParked = Seq (Arr (\(HerePromise slot) -> slot)) UntilParked
 
 -- | An inbox is a shelf on this thread, and a part that waits at it is parked there, with no watch, as at a ticket, until a post
 -- or a collect lets it go on. Closing never waits, so it is an action; the collect and the post are primitives, which raise a
@@ -398,11 +400,59 @@ advance env time fuel wake = go 0
                 Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
                 Nothing -> pure (steps + 1, Waits input (Check frames))
             Await ->
-              readIORef input >>= \case
-                Fulfilled value -> go (steps + 1) (Give value frames)
-                Empty -> (steps + 1, Parked) <$ writeIORef input (Waiter (\action -> action >>= \value -> wake (Give value frames)))
-                Waiter _ -> ioError (userError "two parts wait for one ticket")
-                Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
+              valueWaits input >>= \there ->
+                let parking =
+                      -- The part parks, and goes back with the value when a part hands it one.
+                      parkTaker changeHere input (\value -> True <$ wake (Give value frames)) >>= \case
+                        Parks -> pure (steps + 1, Parked)
+                        Took value -> go (steps + 1) (Give value frames)
+                        Misused -> go steps (Fail (toException tookWrongly) frames)
+                 in if there
+                      then
+                        takeWaiting changeHere input >>= \case
+                          Took value -> go (steps + 1) (Give value frames)
+                          Misused -> go steps (Fail (toException tookWrongly) frames)
+                          Parks -> parking
+                      else parking
+            AwaitRegistering -> case input of
+              (slot, register) ->
+                beginRegistering changeHere slot >>= \case
+                  Took value -> go (steps + 1) (Give value frames)
+                  Misused -> go steps (Fail (toException tookWrongly) frames)
+                  Parks ->
+                    try register >>= \case
+                      Left failure -> giveUpRegistering changeHere slot *> go steps (Fail failure frames)
+                      Right (Just value) -> giveUpRegistering changeHere slot >>= \clean -> if clean then go (steps + 1) (Give value frames) else go steps (Fail (toException registeredAndGave) frames)
+                      Right Nothing ->
+                        endRegistering changeHere slot >>= \case
+                          Took value -> go (steps + 1) (Give value frames)
+                          Misused -> go steps (Fail (toException tookWrongly) frames)
+                          Parks ->
+                            parkTaker changeHere slot (\value -> True <$ wake (Give value frames)) >>= \case
+                              Parks -> pure (steps + 1, Parked)
+                              Took value -> go (steps + 1) (Give value frames)
+                              Misused -> go steps (Fail (toException tookWrongly) frames)
+            HandWaiting -> case input of
+              (slot, value) ->
+                handTry changeHere slot value >>= \case
+                  Passed -> go (steps + 1) (Give Nothing frames)
+                  GaveBack -> go (steps + 1) (Give (Just value) frames)
+                  SecondSender -> go steps (Fail (toException twoSenders) frames)
+                  _ ->
+                    parkSender changeHere slot value 0 (\taken -> wake (Give (if taken then Nothing else Just value) frames)) >>= \case
+                      LeftWaiting -> pure (steps + 1, Parked)
+                      Passed -> go (steps + 1) (Give Nothing frames)
+                      GaveBack -> go (steps + 1) (Give (Just value) frames)
+                      _ -> go steps (Fail (toException twoSenders) frames)
+            UntilParked ->
+              lookAtWatch input >>= \case
+                WatchDone -> go (steps + 1) (Give () frames)
+                SecondWatcher -> go steps (Fail (toException twoWatchers) frames)
+                WatchWaits ->
+                  parkWatcher changeHere input 0 (wake (Give () frames)) >>= \case
+                    WatchWaits -> pure (steps + 1, Parked)
+                    WatchDone -> go (steps + 1) (Give () frames)
+                    SecondWatcher -> go steps (Fail (toException twoWatchers) frames)
             Collect ->
               cancelledNow env frames >>= \case
                 Just ident -> go steps (Fail (toException (Cancelled ident)) frames)

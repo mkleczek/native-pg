@@ -10,7 +10,8 @@
 -- and deadlines.
 --
 -- The inboxes are checked across the whole program, by their names: a name that has posts and no collects, or collects and
--- no posts, anywhere, and a name that is opened at two sites.
+-- no posts, anywhere, and a name that is opened at two sites. The exchanges that 'asking' and 'answering' name are checked the same
+-- way: a name that has asking ends and no answering ends, or answering ends and no asking ends.
 --
 -- A part allows a check with 'allowing', for a reason, and a finding inside it is listed apart from the others.
 module Network.Streaming.Lint
@@ -29,7 +30,7 @@ import Data.Function (on)
 import Data.List (intercalate, nub, nubBy)
 import Data.Maybe (isNothing, listToMaybe)
 import GHC.Stack (SrcLoc (..))
-import Network.Streaming.Annotate (Check (..))
+import Network.Streaming.Annotate (Check (..), Side (..))
 import Network.Streaming.Classes (Label (..))
 import Network.Streaming.Diagram (Diagram (..))
 import Network.Streaming.Structure
@@ -74,7 +75,7 @@ lint (Diagram root) = do
   structural <- concat <$> traverse atNode nodes
   loops <- concat <$> traverse atHead heads
   inboxes <- atInboxes nodes
-  pure (settle (structural ++ loops ++ inboxes))
+  pure (settle (structural ++ loops ++ inboxes ++ atExchanges nodes))
   where
     allow = \case
       Allowing check reason _ -> \held -> if (check, reason) `elem` held then held else held ++ [(check, reason)]
@@ -204,6 +205,28 @@ atInboxes nodes = do
           (_, _, met) <- drop 1 (nubBy ((==) `on` stable) [site | site@(other, _, _) <- sites, other == name])
       ]
     stable (_, name, _) = name
+
+-- * Exchanges
+
+-- | The findings about the exchanges that 'asking' and 'answering' name, which are paired by name: the asking ends of a name that
+-- nothing answers, and the answering ends of a name that nothing asks.
+atExchanges :: [Met Allowances] -> [Found]
+atExchanges nodes =
+  [ found met DeadExchange ("asks " ++ name) $
+      "Nothing in the program answers the exchange " ++ show name ++ ", so this part waits for ever: "
+        ++ "answer it, or drop the ask."
+    | (name, met) <- asked,
+      name `notElem` fmap fst answered
+  ]
+    ++ [ found met DeadExchange ("answers " ++ name) $
+           "Nothing in the program asks the exchange " ++ show name ++ ", so what is handed over goes to no one: "
+             ++ "ask it, or drop the answer."
+         | (name, met) <- answered,
+           name `notElem` fmap fst asked
+       ]
+  where
+    asked = [(name, met) | met@(Met (End Asking name _) _ _) <- nodes]
+    answered = [(name, met) | met@(Met (End Answering name _) _ _) <- nodes]
 
 -- * Loops
 

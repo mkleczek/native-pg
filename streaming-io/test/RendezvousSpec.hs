@@ -3,8 +3,7 @@
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | A ticket as a rendezvous, for every arrow that runs programs: a place where one part hands a value to another, over and over,
--- and keeps none. The same programs, written once for any arrow that has what they need, are run by each. The cases are marked as
--- expected to fail until tickets are made so, but for the one that holds before and after.
+-- and keeps none. The same programs, written once for any arrow that has what they need, are run by each.
 module RendezvousSpec (spec) where
 
 import Control.Arrow (ArrowChoice, first, second, (>>>), (^>>))
@@ -56,13 +55,9 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | Marks cases as ones that fail until tickets are rendezvous.
-pending :: Spec -> Spec
-pending = xfail "tickets are not rendezvous yet"
-
 spec :: Spec
 spec = do
-  pending . describe "a ticket as a rendezvous" $ do
+  describe "a ticket as a rendezvous" $ do
     forM_ runners $ \(Runner name run) -> describe name $ do
       it "makes the sender wait until the receiver takes the value" $ do
         noted <- newLog

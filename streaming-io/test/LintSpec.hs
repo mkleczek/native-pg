@@ -260,10 +260,6 @@ inboxes = describe "an inbox" $ do
     report <- lint (allowing InboxOpenedTwice "the sites are in different servers" (owning @"jobs" postAndCollect >>> owning @"jobs" (postAndCollect >>> quick)))
     summary report `shouldBe` ([], [(InboxOpenedTwice, "the sites are in different servers")])
 
--- | Marks a case as one that fails until tickets are rendezvous.
-pending :: Spec -> Spec
-pending = xfail "tickets are not rendezvous yet"
-
 -- | A step that awaits a ticket of any core, which the lint sees as a wait, and one that hands over to it, and one that fulfils it.
 awaitingStep :: Diagram () ()
 awaitingStep = const undefined ^>> await @_ @'Anywhere @() >>> quick
@@ -273,7 +269,7 @@ handingOver = const undefined ^>> handWaiting @_ @'Anywhere @() >>> quick
 
 -- | The checks on exchanges, which look at the whole program by the names that 'asking' and 'answering' give the ends of a ticket.
 exchanges :: Spec
-exchanges = pending $ describe "an exchange" $ do
+exchanges = describe "an exchange" $ do
   it "that has an asking end and an answering end is not found" $ do
     report <- lint (asking "jobs" awaitingStep >>> answering "jobs" handingOver)
     summary report `shouldBe` ([], [])

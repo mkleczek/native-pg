@@ -29,6 +29,7 @@ import qualified Network.Streaming.Classes as Classes (within)
 import Network.Streaming.Combinators
   ( pattern Again,
     pattern Finish,
+    awaitedTicket,
     call,
     concurrently,
     consume,
@@ -334,9 +335,9 @@ scopesSpec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe 
   -- A part of a Loop that waits for a ticket is held by the ticket and is not cancelled there.
   when (name /= "loop") $
     describe "a part that waits for a ticket of the arrow's own core" $ do
-      it "is cancelled where it waits, and a promise fulfilled afterwards is not fulfilled for it, but its value is its waiter's to take back" $ do
+      it "is cancelled where it waits, and a promise fulfilled afterwards is not taken, and there is no value to take back" $ do
         noted <- newLog
-        run (cancelledWaiterLocal noted False) `shouldReturn` Raced "second" True (Just 7)
+        run (cancelledWaiterLocal noted False) `shouldReturn` Raced "second" False Nothing
         readLog noted `shouldReturn` ["acquire", "release: cancelled"]
 
       it "gives up its ticket when it is cancelled, and a promise fulfilled afterwards is told it isn't taken" $ do
@@ -346,9 +347,9 @@ scopesSpec = describe "scopes" $ forM_ runners $ \(Runner name run) -> describe 
 
   when (name `elem` ["threads", "delimited", "compiled"]) $
     describe "a part that waits for a ticket of any core" $ do
-      it "is cancelled where it waits, and a promise fulfilled afterwards is not fulfilled for it, but its value is its waiter's to take back" $ do
+      it "is cancelled where it waits, and a promise fulfilled afterwards is not taken, and there is no value to take back" $ do
         noted <- newLog
-        runAnywhere name (cancelledWaiter @'Anywhere noted False) `shouldReturn` Raced "second" True (Just 7)
+        runAnywhere name (cancelledWaiter @'Anywhere noted False) `shouldReturn` Raced "second" False Nothing
         readLog noted `shouldReturn` ["acquire", "release: cancelled"]
 
       it "gives up its ticket when it is cancelled, and a promise fulfilled afterwards is told it isn't taken" $ do
@@ -751,13 +752,13 @@ fulfilledAtOnce = (\(promise, request) -> ((promise, 7), request)) ^>> consume (
 -- | The hand-out passes the promise to a part that runs with the wait, and that part fulfils it.
 withTicketFulfilled :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () ((String, Int), Bool)
 withTicketFulfilled noted _ =
-  ticket @arr @r >>> concurrently (snd ^>> withTicket passedOn (disposed noted)) (fst ^>> fulfilsSeven)
+  awaitedTicket @arr @r >>> concurrently (snd ^>> withTicket passedOn (disposed noted)) (fst ^>> fulfilsSeven)
 
 -- | The wait is raced against one that ends first, so the part is cancelled where it waits. Then the promise is fulfilled,
 -- which the abandoned ticket refuses.
 withTicketCancelled :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either (String, Int) (), Bool)
 withTicketCancelled noted _ =
-  ticket @arr @r
+  awaitedTicket @arr @r
     >>> ( (,)
             <$> race (snd ^>> withTicket passedOn (disposed noted)) (done >>> slowWait)
             <*> (fst ^>> fulfilsSeven)
@@ -775,7 +776,7 @@ withTicketLate noted _ =
 -- ticket refuses.
 tryTicketDeclined :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either String (String, Int), Bool)
 tryTicketDeclined noted _ =
-  ticket @arr @r
+  awaitedTicket @arr @r
     >>> ( (,)
             <$> (snd ^>> tryTicket declined (disposed noted))
             <*> (fst ^>> fulfilsSeven)
@@ -791,7 +792,7 @@ tryTicketDeclinedLate noted _ =
 -- | The hand-out passes the promise on and gives Right, and a part that runs with the wait fulfils it.
 tryTicketFulfilled :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either String (String, Int), Bool)
 tryTicketFulfilled noted _ =
-  ticket @arr @r >>> concurrently (snd ^>> tryTicket handedOut (disposed noted)) (fst ^>> fulfilsSeven)
+  awaitedTicket @arr @r >>> concurrently (snd ^>> tryTicket handedOut (disposed noted)) (fst ^>> fulfilsSeven)
   where
     handedOut = swap ^>> fulfil >>^ const (Right "passed on")
 
@@ -804,7 +805,7 @@ callToGone noted _ = ticket @arr @r >>> consume (abandon >>> done) >>> call Ask 
 
 -- | The receiver waits for the message, and fulfils the promise that it carries with the answer.
 callAnswered :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Maybe Int)
-callAnswered noted _ = ticket @arr @r >>> concurrently (snd ^>> call Ask (disposed noted)) (fst ^>> answers) >>^ fst
+callAnswered noted _ = awaitedTicket @arr @r >>> concurrently (snd ^>> call Ask (disposed noted)) (fst ^>> answers) >>^ fst
   where
     answers = await >>> (\(Ask promise) -> (promise, 42)) ^>> fulfil >>> done
 
@@ -813,7 +814,7 @@ callAnswered noted _ = ticket @arr @r >>> concurrently (snd ^>> call Ask (dispos
 -- the promise in it with the answer, which says whether the ticket was abandoned.
 callCancelledAtFulfil :: forall r arr. (Ticketed r arr) => Log -> Proxy r -> arr () (Either (Maybe Int) (), Maybe Bool)
 callCancelledAtFulfil noted _ =
-  ticket @arr @r
+  awaitedTicket @arr @r
     >>> ( (,)
             <$> race (tap (shield (done >>> slowWait)) >>> snd ^>> call Ask (disposed noted)) (done >>> giveWayAndEnd)
             <*> (fst ^>> abandon >>> found ^>> (nothing ||| fulfils))

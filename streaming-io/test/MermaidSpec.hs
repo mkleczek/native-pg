@@ -193,11 +193,10 @@ spec = describe "the chart" $ do
         length (filter (gear `isInfixOf`) inside) `shouldBe` 2
       found -> failTest ("the box has " <> show (length found) <> " pages, and not its own and the page that has it")
 
-  pending $
-    it "has a step that watches, drawn as a wait, and a step that hands over, drawn as a handover" $ do
-      chart <- chartOf (watching >>> handing >>> quick :: Diagram () ())
-      any (\line -> "shape: delay" `isInfixOf` line && "\"watch\"" `isInfixOf` line) chart `shouldBe` True
-      any (\line -> "shape: lean-r" `isInfixOf` line && "\"hand\"" `isInfixOf` line) chart `shouldBe` True
+  it "has a step that watches, drawn as a wait, and a step that hands over, drawn as a handover" $ do
+    chart <- chartOf (watching >>> handing >>> quick :: Diagram () ())
+    any (\line -> "shape: delay" `isInfixOf` line && "\"watch\"" `isInfixOf` line) chart `shouldBe` True
+    any (\line -> "shape: lean-r" `isInfixOf` line && "\"hand\"" `isInfixOf` line) chart `shouldBe` True
 
   it "has a box for a group, which has its body" $ do
     chart <- chartOf (group AwaitAll spawnsWorking :: Diagram Int ((), ()))
@@ -223,10 +222,6 @@ watching = const undefined ^>> untilParked @_ @'Anywhere @()
 
 handing :: Diagram () ()
 handing = const undefined ^>> handWaiting @_ @'Anywhere @() >>> quick
-
--- | Marks a case as one that fails until tickets are rendezvous.
-pending :: Spec -> Spec
-pending = xfail "tickets are not rendezvous yet"
 
 -- | A body that collects, and spawns the part that works.
 spawnsWorking :: Diagram (Group Diagram s AwaitAll, Int) ()

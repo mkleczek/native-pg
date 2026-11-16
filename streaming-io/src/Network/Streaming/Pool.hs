@@ -51,7 +51,7 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.Sequence (Seq, ViewL (..), ViewR (..), viewl, viewr, (<|), (|>))
 import qualified Data.Sequence as Seq
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (_2, alongside, boolA, decide, done, keeping, step, through)
+import Network.Streaming.Combinators (_2, alongside, awaitedTicket, boolA, decide, done, keeping, step, through)
 import Network.Streaming.Internal.Atomic (update)
 
 -- | The items that are free, and how many, the number that the next waiter to queue gets, which says which of two
@@ -292,7 +292,7 @@ reserved ref need claim handout =
       >>> step "claim from free items" (const (update ref claim)) -| "item free?"
       >>> ("no" |- queue ||| "yes" |- arr Right)
   where
-    queue = ticket >>> step "queue promise" (\(awaiting, promise) -> update ref (queueOrClaim awaiting promise))
+    queue = awaitedTicket >>> step "queue promise" (\(awaiting, promise) -> update ref (queueOrClaim awaiting promise))
     queueOrClaim awaiting promise state = case claim state of
       (claimed, Right taken) -> (claimed, Right taken)
       (_, Left ()) -> (queued need (handout promise) state, Left awaiting)
@@ -383,7 +383,7 @@ claimAtNow input@(need, Pool ref _) = either (const (Left input)) Right <$> upda
 -- was released between the first look and the queueing is taken at once.
 queueAt :: (ArrowChoice arr, Annotate arr, Effect arr, Exchange arr 'Anywhere, Scope arr) => arr (Int, Pool conn) conn
 queueAt =
-  keeping ticket
+  keeping awaitedTicket
     >>> step "queue promise" queueing -| "item free?"
     >>> ( "no" |- waited (step "return item" (\(pool, item) -> releaseNow pool [item]))
             ||| "yes" |- returnA
@@ -407,7 +407,7 @@ checkoutManyOf need many = giveWay >>> now claim >>> (queue ||| returnA)
   where
     claim pool@(Pool ref _) = either (const (Left pool)) (Right . (pool,)) <$> update ref (claimMany many need)
     queue =
-      keeping ticket
+      keeping awaitedTicket
         >>> now (\((awaiting, promise), pool@(Pool ref _)) -> either (\future -> Left (pool, future)) (Right . (pool,)) <$> update ref (queueOrClaim awaiting promise))
         >>> (waitedIn ||| returnA)
     queueOrClaim awaiting promise state = case claimMany many need state of

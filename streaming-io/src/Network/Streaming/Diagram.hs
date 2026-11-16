@@ -114,17 +114,17 @@ outermost :: CallStack -> Maybe SrcLoc
 outermost = fmap snd . listToMaybe . reverse . getCallStack
 
 -- | The tickets of a diagram are never made: there are two instances, for the two reaches, so that a program that
--- uses either is built.
+-- uses either is built. That the receiver will await draws nothing.
 instance Exchange Diagram ('Here DiagramCore) where
   data Future Diagram ('Here DiagramCore) a
   ticket = leaf "ticket" Round
   await = leaf "await" Wait
   fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
-  awaitRegistering = error "not yet"
-  willAwait = error "not yet"
-  handWaiting = error "not yet"
-  untilParked = error "not yet"
+  awaitRegistering = leaf "await" Wait
+  willAwait = Diagram Pure
+  handWaiting = leaf "hand" Handover
+  untilParked = leaf "watch" Wait
 
 instance Exchange Diagram 'Anywhere where
   data Future Diagram 'Anywhere a
@@ -132,10 +132,10 @@ instance Exchange Diagram 'Anywhere where
   await = leaf "await" Wait
   fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
-  awaitRegistering = error "not yet"
-  willAwait = error "not yet"
-  handWaiting = error "not yet"
-  untilParked = error "not yet"
+  awaitRegistering = leaf "await" Wait
+  willAwait = Diagram Pure
+  handWaiting = leaf "hand" Handover
+  untilParked = leaf "watch" Wait
 
 -- | The inboxes of a diagram are never made either, and have the two reaches for the same reason. Each step is a leaf that
 -- has the inbox's name in its text and in its shape: a post is a handover, and a collect is a wait.

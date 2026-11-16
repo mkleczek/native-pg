@@ -33,11 +33,11 @@ import Data.IORef (IORef, newIORef)
 import Network.Streaming.Buffer (Buffer)
 import Network.Streaming.BufferPool (BufferGrant)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (alongside, decide, keeping, step)
+import Network.Streaming.Combinators (alongside, awaitedTicket, decide, keeping, step)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.BufferPool (BufferPool (..))
 import Network.Streaming.Internal.ListPrefix (ListPrefix (..))
-import Network.Streaming.Internal.Tickets (Promise (..))
+import Network.Streaming.Internal.Tickets (adapting)
 import Network.Streaming.Pool (checkoutAt, checkoutMany, checkoutManyOf, queueNow, releaseNow, takeNow)
 
 -- | What a request borrows buffers with: the pool, its primary buffer, and what is lent of them.
@@ -154,7 +154,7 @@ data Asking arr = Asking
 wait :: (Runtime arr) => arr Loans Loan
 wait =
   named (Label "wait" "Holds the extra place and waits in the pool's queue for a buffer, and gives both up if cancelled.") $
-    keeping ticket >>> scope (step "take extra place" register) giveUp body
+    keeping awaitedTicket >>> scope (step "take extra place" register) giveUp body
   where
     body = decide "primary given back?" registered >>> ("no" |- queueAndAwait ||| "yes" |- returnA)
     registered (registration, ((_, promise), _)) = case registration of
@@ -200,11 +200,11 @@ withdraw (Loans _ _ ref) number = update ref $ \case
 -- so that the buffer is the pool's again. A request that has ended meanwhile has returned the buffer itself, which the
 -- pool must not do again, so then it says that it took it.
 forwarding :: Loans -> Int -> Promise 'Anywhere (Maybe Loan) -> Promise 'Anywhere Buffer
-forwarding loans@(Loans _ _ ref) number (AnywherePromise promise) = AnywherePromise $ \buffer ->
+forwarding loans@(Loans _ _ ref) number promise = adapting $ \buffer ->
   update ref (claim buffer) >>= \case
     Nothing -> pure False
     Just loan@(Loan _ _ lent _) -> do
-      taken <- promise (Just loan)
+      taken <- fulfilNow promise (Just loan)
       if taken then pure True else not <$> update ref (unclaim lent)
   where
     claim buffer = \case

@@ -183,10 +183,14 @@ instance (Arrow arr, Exchange arr reach) => Exchange (With r arr) reach where
   {-# INLINE fulfil #-}
   abandon = With (innerFuture ^>> abandon)
   {-# INLINE abandon #-}
-  awaitRegistering = error "not yet"
-  willAwait = error "not yet"
-  handWaiting = error "not yet"
-  untilParked = error "not yet"
+  awaitRegistering = With ((\(_, (WithFuture future, register)) -> (future, register)) ^>> awaitRegistering)
+  {-# INLINE awaitRegistering #-}
+  willAwait = With (innerFuture ^>> willAwait >>^ WithFuture)
+  {-# INLINE willAwait #-}
+  handWaiting = With (snd ^>> handWaiting)
+  {-# INLINE handWaiting #-}
+  untilParked = With (snd ^>> untilParked)
+  {-# INLINE untilParked #-}
 
 -- | The inbox of the inner arrow, from the input that has it beside the environment.
 innerInbox :: (r, Inbox (With r arr) name reach a) -> Inbox arr name reach a

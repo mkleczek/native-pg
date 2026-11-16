@@ -136,6 +136,7 @@ test-suite streaming-io-spec
                  ScopeCostSpec
                  StepCostSpec
                  StepsSpec
+                 TicketCostSpec
                  TimeSpec
                  UnwindSpec
                  WithSpec

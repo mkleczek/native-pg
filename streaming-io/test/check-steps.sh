@@ -31,5 +31,7 @@ StepGivesWay GiveWay
 CleanupCollects Inboxes
 StepWithin Within
 StepEachAwaits Exchange
+StepHands Exchange
+StepWatches Exchange
 EOF2
 echo "Steps: undoing takes steps and cleanups that can't wait, and each of them; steps that wait are rejected"
