@@ -30,7 +30,7 @@ spec = describe "equalsLower" $ do
     equalsLower "a_b" "A_B" `shouldBe` True
     equalsLower "a_b" "A\DEL" `shouldBe` False
 
-  xfail "a comparison zips the two names into a list, and allocates it" $ it "allocates no more than a few bytes for a comparison" $ do
+  it "allocates no more than a few bytes for a comparison" $ do
     -- The names of a request's headers, in the case that clients use, and the one name that they are compared with.
     let comparisons = 200000 :: Int
     _ <- pure $! compared 1000

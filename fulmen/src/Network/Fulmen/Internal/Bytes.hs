@@ -13,6 +13,7 @@ where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Unsafe as BU
 import Data.Word (Word8)
 
 -- | A character of a token: the name of a method or of a field.
@@ -35,9 +36,15 @@ trim = B.dropWhileEnd blank . B.dropWhile blank
 lowerCase :: ByteString -> ByteString
 lowerCase = B.map lowered
 
--- | Whether the name is the lower-case name, in any case.
+-- | Whether the name is the lower-case name, in any case, comparing the bytes where they are: nothing is allocated.
 equalsLower :: ByteString -> ByteString -> Bool
-equalsLower lower name = B.length lower == B.length name && and (B.zipWith (\expected byte -> expected == lowered byte) lower name)
+equalsLower lower name = size == B.length name && go 0
+  where
+    size = B.length lower
+    go !index
+      | index >= size = True
+      | BU.unsafeIndex lower index == lowered (BU.unsafeIndex name index) = go (index + 1)
+      | otherwise = False
 
 lowered :: Word8 -> Word8
 lowered byte = if byte >= 65 && byte <= 90 then byte + 32 else byte
