@@ -48,6 +48,11 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
+-- | The code that draws a list of names on the left of '<:' is not written yet: the cases that need it are expected to
+-- fail, and the marks come off when the code is there.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: a list of names on the left of <: is not written yet"
+
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -238,6 +243,34 @@ spec = describe "the chart" $ do
           ("tail", "end", "")
         ]
 
+  stubbed $ it "has the names that a list takes a step's output apart into for the title of its box, comma-separated" $ do
+    chart <- chartOf dividing
+    case subgraphTitled "q, r" chart of
+      Just (_, inside) -> length (nodesDeclared (gear ++ "divide") inside) `shouldBe` 1
+      Nothing -> failTest "the chart has no box for the step that gives the names q and r"
+    -- A name that is a field under another name is the name in the flow, and a field that the list leaves out is not one.
+    chart' <- chartOf renaming
+    (subgraphTitled "left, z" chart' == Nothing, subgraphTitled "x, z" chart' == Nothing) `shouldBe` (False, True)
+
+  stubbed $ it "has an edge from the step that gives the names of a list to each step that binds them, with the names of one step on one edge" $ do
+    chart <- chartOf dividing
+    -- "q" and "r" come from "divide": the step "mix" binds both on one edge, and "plus" binds "q" under its port.
+    edgesNamed chart
+      `shouldBe` sort
+        [ ("start", "divide", "i, j"),
+          ("divide", "plus", "q \x2192 n"),
+          ("divide", "mix", "q, r"),
+          ("plus", "mix", "s"),
+          ("mix", "end", "")
+        ]
+    chart' <- chartOf renaming
+    edgesNamed chart'
+      `shouldBe` sort
+        [ ("start", "make", "i, j"),
+          ("make", "use", "left, z"),
+          ("use", "end", "")
+        ]
+
   it "has the same edges for a flow with the plumbing as without it" $ do
     found <- pages fanning
     case found of
@@ -373,6 +406,27 @@ quiet =
     ( "a" <: step "alpha" (\r -> pure (getField @"i" r + 1)) -< ["i"]
         >>> step "note" (\r -> pure (getField @"n" r `seq` ())) -< ["n" =: "a"]
         >>> "b" <: step "beta" (\r -> pure (getField @"j" r + 1)) -< ["j"]
+    )
+
+-- | A flow whose first step gives a pair that a list of names takes apart: the step after it reads one of the names, and
+-- the last reads both and the name of the step between.
+dividing :: Diagram ("i" := Int, "j" := Int) Int
+dividing =
+  result
+    "c"
+    ( ["q", "r"] <: step "divide" (\r -> pure (getField @"i" r `div` getField @"j" r, getField @"i" r `mod` getField @"j" r)) -< ["i", "j"]
+        >>> "s" <: step "plus" (\r -> pure (getField @"n" r + 1)) -< ["n" =: "q"]
+        >>> "c" <: step "mix" (\r -> pure (getField @"q" r + getField @"r" r + getField @"s" r)) -< ["q", "r", "s"]
+    )
+
+-- | A flow whose first step gives a record of three fields, of which a list keeps two, one under another name, and the last
+-- step reads both.
+renaming :: Diagram ("i" := Int, "j" := Int) Int
+renaming =
+  result
+    "c"
+    ( ["x" =: "left", "z"] <: step "make" (\r -> pure (newRecord ["x", "y", "z"] (getField @"i" r) (0 :: Int) (getField @"j" r))) -< ["i", "j"]
+        >>> "c" <: step "use" (\r -> pure (getField @"left" r + getField @"z" r)) -< ["left", "z"]
     )
 
 -- | A flow whose second step is a flow of its own, which reads the port "n" of its step.

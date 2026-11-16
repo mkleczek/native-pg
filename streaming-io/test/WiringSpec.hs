@@ -2,9 +2,10 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 
 -- | Steps wired by name: a flow of lines, each of which makes the input of its step from the names of the flow, runs in
--- each arrow that runs programs and gives what its steps give, and a choice is a line of a flow whose branches are lines.
--- That a name that the flow doesn't have, an output that a step doesn't give, a port that is not bound or is bound twice,
--- and a name that the flow has already don't compile, in a branch of a choice too, is checked by
+-- each arrow that runs programs and gives what its steps give, a choice is a line of a flow whose branches are lines, and
+-- a list of names takes the output of a step apart. That a name that the flow doesn't have, an output that a step doesn't
+-- give, a port that is not bound or is bound twice, and a name that the flow has already don't compile, in a branch of a
+-- choice too, and that a list of names that doesn't fit the output of its step doesn't, is checked by
 -- @test/check-wiring.sh@.
 module WiringSpec (spec) where
 
@@ -34,6 +35,11 @@ runners =
     Runner "compiled" (\program -> fst <$> runCompiled program ()),
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
+
+-- | The stub of a list of names on the left of '<:' fails with 'NotImplemented': the cases that need it are expected to
+-- fail, and the marks come off when the code is there.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: a list of names on the left of <: is not written yet"
 
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
@@ -84,6 +90,30 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
     run (sized 3 >>> chosen noted >>^ \r -> (sizeName r.size, r.a, r.b)) `shouldReturn` ("small", 3, 4)
     readLog noted `shouldReturn` ["small 3"]
 
+  stubbed $ it "takes the record that a step gave apart by the names of its fields, and keeps only the fields that the list names" $ do
+    run (inputs >>> flow (["sum", "prod"] <: splitter -< ["a", "b"]) >>^ \r -> (r.sum, r.prod, r.a, r.b))
+      `shouldReturn` (7, 12, 3, 4)
+
+  stubbed $ it "keeps a field of the record that a step gave under another name, the others of the list under their own" $
+    run (inputs >>> flow (["sum" =: "total", "diff"] <: splitter -< ["a", "b"]) >>^ \r -> (r.total, r.diff))
+      `shouldReturn` (7, -1)
+
+  stubbed $ it "takes a pair apart by position, and pairs that nest to the right, and drops the parts that are named \"_\"" $ do
+    run (sized 17 >>> flow (["q", "r"] <: divider -< ["a", "b"]) >>^ \r -> (r.q, r.r)) `shouldReturn` (4, 1)
+    run (inputs >>> flow (["first", "_", "last"] <: tripler -< ["a", "b"]) >>^ \r -> (r.first, r.last))
+      `shouldReturn` (3, 7)
+
+  stubbed $ it "reads the names that a list gives in the steps after it, and in the branches of a choice" $ do
+    run (sized 17 >>> divided) `shouldReturn` 5
+    run (sized 3 >>> rounded) `shouldReturn` 3
+    run (sized 20 >>> rounded) `shouldReturn` 20
+    run (sized 500 >>> rounded) `shouldReturn` 99
+
+  stubbed $ it "runs a step once for the names that it gives, and goes on with the names in front of the record" $ do
+    noted <- newLog
+    run (inputs >>> tallied noted) `shouldReturn` 7
+    readLog noted `shouldReturn` ["ran"]
+
   it "reads the names of a record that is not known, for a flow that is a step of its own" $ do
     run (inputs >>> anyRecord) `shouldReturn` 14
     run (newRecord ["extra", "b", "a"] <$> arr (const 'x') <*> arr (const 5) <*> arr (const 1) >>> anyRecord)
@@ -108,6 +138,22 @@ pairer = now (\r -> pure (newRecord ["this", "next"] r.n (r.n + 1)))
 -- | A step that reads its port "n", and gives a record that has a record in a field, which has a record in a field.
 nester :: (Effect arr, HasField "n" r Int) => arr r ("inner" := ("leaf" := Int, "twin" := Int), "other" := Int)
 nester = now (\r -> pure (newRecord ["inner", "other"] (newRecord ["leaf", "twin"] (r.n * 10) r.n) 0))
+
+-- | A step that reads its ports "a" and "b", and gives a record of three fields: their sum, difference and product.
+splitter :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => arr r ("sum" := Int, ("diff" := Int, "prod" := Int))
+splitter = now (\r -> pure (newRecord ["sum", "diff", "prod"] (r.a + r.b) (r.a - r.b) (r.a * r.b)))
+
+-- | A step that reads its ports "a" and "b", and gives a pair: the quotient and the remainder.
+divider :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => arr r (Int, Int)
+divider = now (\r -> pure (r.a `div` r.b, r.a `mod` r.b))
+
+-- | A step that reads its ports "a" and "b", and gives pairs that nest to the right: "a", "b" and their sum.
+tripler :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => arr r (Int, (Int, Int))
+tripler = now (\r -> pure (r.a, (r.b, r.a + r.b)))
+
+-- | A step that notes that it ran, reads its ports "a" and "b", and gives them as a pair.
+tallying :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => Log -> arr r (Int, Int)
+tallying noted = now (\r -> atomicModifyIORef' noted (\entries -> ("ran" : entries, ())) >> pure (r.a, r.b))
 
 -- | A step that reads its port "v", and notes it with the label.
 noting :: (Effect arr, HasField "v" r Int) => Log -> String -> arr r ()
@@ -239,6 +285,41 @@ chosen noted =
               ||| "big" ?> noting noted "big" -< ["v" =: "big"]
               ||| "huge" ?> noting noted "huge" -< ["v" =: "huge"]
           )
+    )
+
+-- | The parts of a pair, which a list of names takes apart, read by the step after it.
+divided :: (Steps arr) => arr ("a" := Int, "b" := Int) Int
+divided =
+  result
+    "total"
+    ( ["q", "r"] <: divider -< ["a", "b"]
+        >>> "total" <: adder -< ["a" =: "q", "b" =: "r"]
+    )
+
+-- | The parts of a pair read by the branches of a choice, with a name that the flow has apart from the pattern.
+rounded :: (Steps arr) => arr ("a" := Int, "b" := Int) Int
+rounded =
+  result
+    "rounded"
+    ( ["q", "r"] <: divider -< ["a", "b"]
+        >>> "size" <: sizer -< ["n" =: "a"]
+        >>> "rounded"
+          <: choice
+            "how big?"
+            "size"
+            ( "small" ?> adder -< ["a" =: "small", "b" =: "q"]
+                ||| "big" ?> adder -< ["a" =: "big", "b" =: "r"]
+                ||| "huge" ?> constant 99 -< []
+            )
+    )
+
+-- | A step that gives a pair, which a list of names takes apart: the flow runs it once.
+tallied :: (Steps arr) => Log -> arr ("a" := Int, "b" := Int) Int
+tallied noted =
+  result
+    "total"
+    ( ["x", "y"] <: tallying noted -< ["a", "b"]
+        >>> "total" <: adder -< ["a" =: "x", "b" =: "y"]
     )
 
 -- | A flow over any record that has the names that its steps read, which is a step of its own.

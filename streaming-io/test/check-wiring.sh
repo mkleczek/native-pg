@@ -18,9 +18,15 @@ check() {
 # a step doesn't give, a port that is not bound, a port that is bound twice, and a name that the flow has already are
 # rejected, each with its own message. A choice is checked the same way: the control has a choice of three cases whose
 # branches bind different names, with a name for its result and without, and the errors of a step hold in a branch, which
-# has the value of its own case and no other, and a case that the step doesn't have is rejected.
+# has the value of its own case and no other, and a case that the step doesn't have is rejected. A list of names that
+# takes the output of a step apart is checked the same way: the control takes a record apart partly and with a field
+# under another name, takes pairs apart by position with a part dropped, and reads the names in a branch of a choice and
+# in a flow over a record that is not known; a field that the record doesn't have, a field that the list left out, too
+# few and too many names for a pair, a name that the list has twice or the flow has already, a field named for a pair,
+# and a list for an output that is neither are rejected.
 check WiringFlow
 check WiringChoice
+check WiringPattern
 while read -r fixture message; do
   if check "$fixture" >"$output_dir/$fixture.log" 2>&1; then
     echo "Expected $fixture to fail compilation" >&2
@@ -42,5 +48,13 @@ WiringChoiceNoName The flow has no name "k"
 WiringChoiceBoundTwice Input "i" of the step is bound twice
 WiringChoiceOtherCase The flow has no name "small"
 WiringChoiceNoCase The choice has no case "big"
+WiringPatternNoField The output of the step has no field "w"
+WiringPatternDropped The flow has no name "y"
+WiringPatternTooFew The pattern has too few names for the output of the step
+WiringPatternTooMany The pattern has too many names for the output of the step
+WiringPatternTwice The pattern has the name "z" twice
+WiringPatternField a pair has none
+WiringPatternRepeated The flow already has the name "i"
+WiringPatternWhole neither a record nor a pair
 EOF2
-echo "Wiring: steps and choices are wired by name; a missing or repeated name, a missing output, an unbound port are rejected"
+echo "Wiring: steps, choices and lists of names are wired by name; a missing or repeated name, a missing output, an unbound port are rejected"
