@@ -35,11 +35,6 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The stubs of 'choice' and of a step that is the branch of a choice fail with 'NotImplemented': the cases that need
--- them are expected to fail, and the marks come off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: choice and the branches of a choice are not written yet"
-
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
   it "wires three steps by bare names and by bindings of a port to a name, and gives what the last gave" $
@@ -73,18 +68,18 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
     run (inputs >>> ordered noted) `shouldReturn` 18
     readLog noted `shouldReturn` ["first", "second", "third"]
 
-  stubbed $ it "runs the branch of the case that a choice finds, which binds the names that it reads, and gives what it gave" $ do
+  it "runs the branch of the case that a choice finds, which binds the names that it reads, and gives what it gave" $ do
     -- The value of the case and an input of the flow, the value of the case and a step of the flow, and nothing.
     run (sized 3 >>> picked) `shouldReturn` 12
     run (sized 20 >>> picked) `shouldReturn` 44
     run (sized 500 >>> picked) `shouldReturn` 99
 
-  stubbed $ it "runs the branch of a choice once, and the other branches not at all" $ do
+  it "runs the branch of a choice once, and the other branches not at all" $ do
     noted <- newLog
     run (sized 20 >>> chosen noted >>^ \r -> (r.a, r.b)) `shouldReturn` (20, 4)
     readLog noted `shouldReturn` ["big 20"]
 
-  stubbed $ it "goes on with the record as it was after a choice that has no name" $ do
+  it "goes on with the record as it was after a choice that has no name" $ do
     noted <- newLog
     run (sized 3 >>> chosen noted >>^ \r -> (sizeName r.size, r.a, r.b)) `shouldReturn` ("small", 3, 4)
     readLog noted `shouldReturn` ["small 3"]

@@ -70,7 +70,6 @@ where
 import Control.Arrow (Arrow, (>>>), (>>^))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
-import Control.Exception (throw)
 import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
@@ -85,9 +84,8 @@ import GHC.TypeLits
     UnconsSymbol,
     symbolVal,
   )
-import Network.Streaming.Annotate (Annotate (..))
-import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, (:=) (..))
-import Network.Streaming.NotImplemented (NotImplemented (..))
+import Network.Streaming.Annotate (Annotate (..), (-|))
+import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, (:=) (..), cases)
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -132,7 +130,7 @@ instance {-# INCOHERENT #-} (arr' ~ arr, x' ~ x, o' ~ o) => Lined (Line arr' x' 
 
 -- | A step that is an arrow of its own, as a branch of a choice is: it takes the record that its input is made from.
 instance (Annotate arr, arr' ~ arr, x' ~ x, o' ~ o) => Lined (arr' x' o') arr x o where
-  line _ _ = throw (NotImplemented "-<")
+  line = flowStep Nothing
   {-# INLINE line #-}
 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of
@@ -196,7 +194,8 @@ choice ::
   ) =>
   arr d o ->
   t
-choice _ _ _ = throw (NotImplemented "choice")
+choice question field branches =
+  line [symbolVal (Proxy @field)] (Arrow.arr (cases field :: x -> d) -| question >>> branches)
 {-# INLINE choice #-}
 
 -- * Bindings

@@ -47,11 +47,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The code that draws a choice of a flow is not written yet: the case that needs it is expected to fail, and the mark
--- comes off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: choice is not written yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -175,7 +170,7 @@ spec = describe "the chart" $ do
     -- The step that gives nothing is no box of its own.
     subgraphTitled "note" chart `shouldBe` Nothing
 
-  stubbed $ it "has the question of a choice in the box of its line, and on the edges to its branches their cases and bindings" $ do
+  it "has the question of a choice in the box of its line, and on the edges to its branches their cases and bindings" $ do
     chart <- chartOf choosing
     -- The edge into the choice has the field that it decides on, and the edge to each branch its case and what it reads.
     [wiresNamed label chart | label <- ["size", "small: small \x2192 n", "big: big \x2192 n, j", "huge"]] `shouldBe` [1, 1, 1, 1]

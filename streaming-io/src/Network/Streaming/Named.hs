@@ -284,7 +284,7 @@ infixr 6 ?>
   (Arrow arr, Annotate arr, KnownSymbol name) =>
   arr (name := x, r) b ->
   arr (name := (name := x, r)) b
-(?>) name p = symbolVal (Proxy @name) |- ((\(Is a) -> a) ^>> p)
+(?>) name p = (\(Is a) -> a) ^>> (symbolVal (Proxy @name) |- p)
 {-# INLINE (?>) #-}
 
 -- | Runs an arrow on the case of the name of a choice, with a change of its type if the arrow has one.
