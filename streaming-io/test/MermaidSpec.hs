@@ -147,15 +147,33 @@ spec = describe "the chart" $ do
     chart <- chartOf (working >>> quick)
     length (nodesDeclared (gear ++ "working") chart) `shouldBe` 1
 
-  it "has no gear in front of a block, a wait, a box or a decision" $ do
+  it "has no gear in front of a block, a wait, a box or a decision, nor on the box's own page" $ do
     blocked <- chartOf (block :: Diagram Event ())
     waited <- chartOf (await :: Diagram (Future Diagram 'Anywhere ()) ())
-    boxed <- chartOf (block >>> box "outer" (quick >>> quick) :: Diagram Event ())
+    boxed <- chartsOf (block >>> box "outer" (decide "inside?" Left >>> (returnA ||| returnA)) :: Diagram Event ())
     decided <- chartOf (decide "which?" (\n -> if n > (0 :: Int) then Left () else Right ()) >>> (returnA ||| returnA))
     let drawnAs shape chart = length [line | line <- stripped chart, shape `isInfixOf` line]
-    [drawnAs "hourglass" blocked, drawnAs "delay" waited, drawnAs "[[\"outer\"]]" boxed, drawnAs "{\"which?\"}" decided]
-      `shouldBe` [1, 1, 1, 1]
-    any (gear `isInfixOf`) (concat [blocked, waited, boxed, decided]) `shouldBe` False
+    case boxed of
+      [outside, inside] -> do
+        let drawn =
+              [ drawnAs "hourglass" blocked,
+                drawnAs "delay" waited,
+                drawnAs "[[\"outer\"]]" outside,
+                drawnAs "{\"which?\"}" decided
+              ]
+        drawn `shouldBe` [1, 1, 1, 1]
+        drawnAs "{\"inside?\"}" inside `shouldBe` 1
+      found -> failTest ("the box has " <> show (length found) <> " pages, and not its own and the page that has it")
+    any (gear `isInfixOf`) (concat ([blocked, waited, decided] <> boxed)) `shouldBe` False
+
+  it "has the gears of the steps of a box's body on the box's own page, and none in front of the box" $ do
+    boxed <- chartsOf (block >>> box "outer" (quick >>> quick) :: Diagram Event ())
+    case boxed of
+      [outside, inside] -> do
+        any (gear `isInfixOf`) outside `shouldBe` False
+        length (nodesDeclared (gear ++ "IO") inside) `shouldBe` 2
+        length (filter (gear `isInfixOf`) inside) `shouldBe` 2
+      found -> failTest ("the box has " <> show (length found) <> " pages, and not its own and the page that has it")
 
 -- | The chart of the top page of the program, as lines.
 chartOf :: Diagram a b -> IO [String]
@@ -164,6 +182,10 @@ chartOf program = do
   pure $ case found of
     page : _ -> lines (pageMermaid page)
     [] -> []
+
+-- | The charts of all the pages of the program, as lines: the top page, and then the page of each box.
+chartsOf :: Diagram a b -> IO [[String]]
+chartsOf program = fmap (lines . pageMermaid) <$> pages program
 
 -- | A step that is a node of the chart of its own, of the name.
 working :: Diagram Int ()

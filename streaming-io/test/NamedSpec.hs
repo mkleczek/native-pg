@@ -107,6 +107,15 @@ spec = describe "fields named in their type" $ do
     it "reads the newer of two fields of a name, which shadows the older, of whatever type" $
       run (record >>> adding "size" (field "name") >>^ \r -> (r.size, r.count)) `shouldReturn` ("pipe", 4)
 
+    it "runs an arrow on the newer of two fields of a name and leaves the older as it was" $ do
+      run (record >>> adding "size" (field "name") >>> at "size" (arr length) >>^ \r@(_, older) -> (r.size, older.size))
+        `shouldReturn` (4, 3)
+      run
+        ( record >>> adding "size" (field "name") >>> adding "extra" (arr (const 'e')) >>> at "size" (arr length)
+            >>^ \(_, r@(_, older)) -> (r.size, older.size)
+        )
+        `shouldReturn` (4, 3)
+
     it "runs an arrow on the first field and puts the result in its place, of another type" $
       run (record >>> at "name" (arr length) >>^ \r -> (r.name, r.size, r.kept, r.count)) `shouldReturn` (4, 3, True, 4)
 

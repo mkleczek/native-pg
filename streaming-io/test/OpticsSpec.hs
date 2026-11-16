@@ -62,6 +62,14 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const (Nothing :: Maybe Int) ^>> _Just (seeing passed)) `shouldReturn` Nothing
       readLog passed `shouldReturn` []
 
+    it "_Left, _Right and _Just run an arrow that gives another type, and what passes through keeps its type" $ do
+      run (const (Left 3 :: Either Int Bool) ^>> _Left (arr show)) `shouldReturn` (Left "3" :: Either String Bool)
+      run (const (Right True :: Either Int Bool) ^>> _Left (arr show)) `shouldReturn` (Right True :: Either String Bool)
+      run (const (Right 3 :: Either Bool Int) ^>> _Right (arr show)) `shouldReturn` (Right "3" :: Either Bool String)
+      run (const (Left True :: Either Bool Int) ^>> _Right (arr show)) `shouldReturn` (Left True :: Either Bool String)
+      run (const (Just 3 :: Maybe Int) ^>> _Just (arr show)) `shouldReturn` Just "3"
+      run (const (Nothing :: Maybe Int) ^>> _Just (arr show)) `shouldReturn` (Nothing :: Maybe String)
+
     it "a prism that the test makes runs the arrow on the case that matches, and passes the others through" $ do
       noted <- newLog
       run (const 4 ^>> halved (seeing noted)) `shouldReturn` "even, then 40"
@@ -110,6 +118,9 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       run (const [1, 2, 3, 4, 5] ^>> each (seeing noted)) `shouldReturn` [10, 20, 30, 40, 50]
       readLog noted `shouldReturn` ["saw 1", "saw 2", "saw 3", "saw 4", "saw 5"]
 
+    it "gives results of another type than its elements, in order" $
+      run (const [1, 2, 3 :: Int] ^>> each (arr show)) `shouldReturn` ["1", "2", "3"]
+
     it "runs the arrow on 10,000 elements, once each" $ do
       counted <- newCount
       run (const [1 .. 10000] ^>> each (counting counted)) `shouldReturn` [2 .. 10001]
@@ -141,6 +152,11 @@ spec = describe "optics" $ forM_ runners $ \(Runner name run) -> describe name $
       noted <- newLog
       run (const [(7, 8), (9, 10)] ^>> traversal (traverse . both) (seeing noted)) `shouldReturn` [(70, 80), (90, 100)]
       readLog noted `shouldReturn` ["saw 7", "saw 8", "saw 9", "saw 10"]
+
+    it "gives foci of another type: in a list, in a Maybe, and in a pair that the test's traversal visits" $ do
+      run (const [1, 2, 3 :: Int] ^>> traversal traverse (arr show)) `shouldReturn` ["1", "2", "3"]
+      run (const (Just 4 :: Maybe Int) ^>> traversal traverse (arr show)) `shouldReturn` Just "4"
+      run (const (5 :: Int, 6 :: Int) ^>> traversal both (arr show)) `shouldReturn` ("5", "6")
 
     it "composes with at: at \"rows\" . traversal traverse runs the arrow on each element of a field" $ do
       noted <- newLog

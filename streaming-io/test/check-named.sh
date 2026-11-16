@@ -32,6 +32,7 @@ while read -r fixture message; do
 done <<EOF2
 NamedMisspelt The record has no field "count"
 NamedTwice The record has more than one field named "size"
+NamedTwiceApart The record has more than one field named "a"
 ChoiceMisspelt The choice has no case "smal"
 ChoiceBranchMisspelt The choice has no case "huge"
 ChoiceCaseMisspelt The choice has no case "faild"
