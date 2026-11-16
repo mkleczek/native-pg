@@ -84,9 +84,9 @@ data Tree
     End Side String Tree
   | -- | A whole flow of "Network.Streaming.Wiring": the scope of the names of its steps.
     FlowScope Tree
-  | -- | A step of a flow of "Network.Streaming.Wiring": the name that its output has in the flow, if it has one, what
+  | -- | A step of a flow of "Network.Streaming.Wiring": the names that its output has in the flow, if it has any, what
     -- each of its ports is bound to, and its body.
-    FlowStep (Maybe String) [Binding] Tree
+    FlowStep [String] [Binding] Tree
   | -- | A body where the lint doesn't report a check: which, the reason, and the body.
     Allowing Check String Tree
 

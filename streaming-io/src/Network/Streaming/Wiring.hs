@@ -88,7 +88,6 @@ where
 import Control.Arrow (Arrow, (>>>), (>>^))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
-import Control.Exception (throw)
 import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
@@ -105,7 +104,6 @@ import GHC.TypeLits
   )
 import Network.Streaming.Annotate (Annotate (..), Binding (..), (-|))
 import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, (:=) (..), cases)
-import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -140,7 +138,7 @@ class Lined t arr x o where
 
 -- | A step that gives nothing to keep: the record goes on as it was.
 instance {-# INCOHERENT #-} (Arrow arr, Annotate arr, arr' ~ arr, x' ~ x, y ~ x) => Lined (Flow arr' x' y) arr x o where
-  line texts p = Flow (alongside (flowStep Nothing texts p) >>^ snd)
+  line texts p = Flow (alongside (flowStep [] texts p) >>^ snd)
   {-# INLINE line #-}
 
 -- | A step whose output is to be named.
@@ -150,7 +148,7 @@ instance {-# INCOHERENT #-} (arr' ~ arr, x' ~ x, o' ~ o) => Lined (Line arr' x' 
 
 -- | A step that is an arrow of its own, as a branch of a choice is: it takes the record that its input is made from.
 instance (Annotate arr, arr' ~ arr, x' ~ x, o' ~ o) => Lined (arr' x' o') arr x o where
-  line = flowStep Nothing
+  line = flowStep []
   {-# INLINE line #-}
 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of
@@ -205,15 +203,20 @@ class Outs out x o y | out x o -> y where
 -- | A name: the output is kept as it is.
 instance (KnownSymbol name, Fresh name x, y ~ (name := o, x)) => Outs (name :: Symbol) x o y where
   outcome (Line texts p) =
-    Flow (alongside (flowStep (Just (symbolVal (Proxy @name))) texts p) >>^ \(o, x) -> (Is o, x))
+    Flow (alongside (flowStep [symbolVal (Proxy @name)] texts p) >>^ \(o, x) -> (Is o, x))
   {-# INLINE outcome #-}
 
 -- | A list of names: the output is taken apart, and each name is a part of it.
 instance
-  (Pattern (ShapeOf o) entries o x y, Distinct (Given entries), AllFresh (Given entries) x) =>
+  ( Pattern (ShapeOf o) entries o x y,
+    Names (Given entries),
+    Distinct (Given entries),
+    AllFresh (Given entries) x
+  ) =>
   Outs (entries :: [Symbol]) x o y
   where
-  outcome _ = throw (NotImplemented "<:")
+  outcome (Line texts p) =
+    Flow (alongside (flowStep (names @(Given entries)) texts p) >>^ \(o, x) -> takeApart @(ShapeOf o) @entries o x)
   {-# INLINE outcome #-}
 
 -- | A choice that is a line of the flow: it decides on the sum that the flow has under the name of the field, as
@@ -324,43 +327,67 @@ type family ByPositionOf (split :: (Symbol, Maybe Symbol)) (entry :: Symbol) :: 
 
 -- | The record of the flow after a step whose output is taken apart by a list of entries: in front of it the names that
 -- the entries give, in the order of the list. How the output is taken apart is its shape.
-class Pattern (shape :: Shape) (entries :: [Symbol]) (o :: Type) (x :: Type) (y :: Type) | shape entries o x -> y
+class Pattern (shape :: Shape) (entries :: [Symbol]) (o :: Type) (x :: Type) (y :: Type) | shape entries o x -> y where
+  -- | The record of the flow after the step: the names of the entries in front of the record that it had.
+  takeApart :: o -> x -> y
 
 -- | A record: each entry is a field of it, and the fields that the list doesn't have are not kept.
-instance Pattern 'Fields '[] o x x
+instance Pattern 'Fields '[] o x x where
+  takeApart _ x = x
+  {-# INLINE takeApart #-}
 
 instance
   (Dig 'InPattern (Port entry) '[] o a, Pattern 'Fields entries o x rest, Place (Source entry) a rest y) =>
   Pattern 'Fields (entry ': entries) o x y
+  where
+  takeApart o x = putFirst @(Source entry) (dig @'InPattern @(Port entry) @'[] o) (takeApart @'Fields @entries o x)
+  {-# INLINE takeApart #-}
 
 -- | A pair, or pairs that nest to the right: each entry is a part of it.
-instance (Spread 'True entries o x y) => Pattern 'Positions entries o x y
+instance (Spread 'True entries o x y) => Pattern 'Positions entries o x y where
+  takeApart = spread @'True @entries
+  {-# INLINE takeApart #-}
 
-instance (y ~ TypeError Whole) => Pattern 'Opaque entries o x y
+instance (y ~ TypeError Whole) => Pattern 'Opaque entries o x y where
+  takeApart _ _ = error "Network.Streaming.Wiring: a list of names for an output that has no parts is a type error"
 
 -- | The record of the flow after a value is taken apart by position: a value that is a pair, when the first of its
 -- parts is the first of the entries, and the rest of the value is the rest of them.
-class Spread (pair :: Bool) (entries :: [Symbol]) (o :: Type) (x :: Type) (y :: Type) | pair entries o x -> y
+class Spread (pair :: Bool) (entries :: [Symbol]) (o :: Type) (x :: Type) (y :: Type) | pair entries o x -> y where
+  -- | The record of the flow after the value: the names of the entries in front of the record that it had.
+  spread :: o -> x -> y
 
 -- | The last entry is the last part, which is a value that goes on no further.
-instance (ByPosition entry, Place (Source entry) o x y) => Spread 'False '[entry] o x y
+instance (ByPosition entry, Place (Source entry) o x y) => Spread 'False '[entry] o x y where
+  spread = putFirst @(Source entry)
+  {-# INLINE spread #-}
 
 -- | More entries than parts.
-instance (y ~ TypeError TooMany) => Spread 'False (entry ': next ': entries) o x y
+instance (y ~ TypeError TooMany) => Spread 'False (entry ': next ': entries) o x y where
+  spread _ _ = error "Network.Streaming.Wiring: a list that has too many names is a type error"
 
 -- | A pair whose rest is left without an entry.
-instance (y ~ TypeError TooFew) => Spread 'True '[entry] o x y
+instance (y ~ TypeError TooFew) => Spread 'True '[entry] o x y where
+  spread _ _ = error "Network.Streaming.Wiring: a list that has too few names is a type error"
 
 instance
   (ByPosition entry, Spread (Continues b) (next ': entries) b x rest, Place (Source entry) a rest y) =>
   Spread 'True (entry ': next ': entries) (a, b) x y
+  where
+  spread (a, b) x = putFirst @(Source entry) a (spread @(Continues b) @(next ': entries) b x)
+  {-# INLINE spread #-}
 
 -- | The name of a part, in front of the record of the flow: unless it is @"_"@, which keeps nothing.
-class Place (name :: Symbol) (a :: Type) (rest :: Type) (y :: Type) | name a rest -> y
+class Place (name :: Symbol) (a :: Type) (rest :: Type) (y :: Type) | name a rest -> y where
+  putFirst :: a -> rest -> y
 
-instance {-# OVERLAPPING #-} Place "_" a rest rest
+instance {-# OVERLAPPING #-} Place "_" a rest rest where
+  putFirst _ rest = rest
+  {-# INLINE putFirst #-}
 
-instance (y ~ (name := a, rest)) => Place name a rest y
+instance (y ~ (name := a, rest)) => Place name a rest y where
+  putFirst a rest = (Is a, rest)
+  {-# INLINE putFirst #-}
 
 -- * Bindings
 

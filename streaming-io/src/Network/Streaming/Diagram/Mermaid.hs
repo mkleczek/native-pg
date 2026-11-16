@@ -221,14 +221,15 @@ data Ctx = Ctx
 data FlowEnv = FlowEnv
   { -- | The ways out of the node that the flow is entered at, which gives the names of its input.
     flowInput :: [Outlet],
-    -- | The steps that have names, in the order of the flow, each with its ways out: none for a step that draws no node.
-    flowSteps :: [(String, [Outlet])],
+    -- | The steps that have names, in the order of the flow, each with its names and its ways out: none for a step that
+    -- draws no node.
+    flowSteps :: [([String], [Outlet])],
     -- | The case of the branch that is drawn, whose value is on the edge from its decision.
     flowCase :: Maybe String
   }
 
--- | Where a name of a flow comes from.
-data Origin = FromInput | FromStep String | FromCase
+-- | Where a name of a flow comes from: the step that has it is given by all of its names.
+data Origin = FromInput | FromStep [String] | FromCase
   deriving (Eq)
 
 -- | What the drawing of a chart came to: its text, and how many of its nodes say nothing of what they mean.
@@ -649,31 +650,31 @@ flowLines step = do
     FlowStep {} -> pure [tree]
     _ -> concat <$> traverse flowLines (children tree)
 
--- | A step of a flow, drawn with the names that the flow has before it, which the steps after it have its name among, if it has
--- one. The step before it, which is the one before that if it draws no node, has an edge to it with no label if the step binds
+-- | A step of a flow, drawn with the names that the flow has before it, which the steps after it have its names among, if it
+-- has any. The step before it, which is the one before that if it draws no node, has an edge to it with no label if the step binds
 -- nothing from it.
 flowLine :: Ctx -> Path -> (FlowEnv, (Maybe Origin, [Outlet]), Bool) -> Tree -> IO (FlowEnv, (Maybe Origin, [Outlet]), Bool)
 flowLine ctx path (env, before, drawn) step = case step of
-  FlowStep name bindings _ -> do
+  FlowStep names bindings _ -> do
     Fragment _ core <- render (ctx {ctxFlow = Just env}) path step
     let outlets = case core of
           Nodes _ _ out -> out
           Bare _ -> []
-        later = maybe env (\given -> env {flowSteps = flowSteps env ++ [(given, outlets)]}) name
+        later = if null names then env else env {flowSteps = flowSteps env ++ [(names, outlets)]}
     case core of
       Nodes entry _ _ -> do
         unless (any ((== fst before) . Just . originOf env) bindings) $
           forM_ (snd before) $ \outlet -> edge ctx (outletNode outlet) entry (outletLabel outlet) (outletStyle outlet)
-        pure (later, (FromStep <$> name, outlets), True)
+        pure (later, (if null names then Nothing else Just (FromStep names), outlets), True)
       Bare _ -> pure (later, before, drawn)
   _ -> pure (env, before, drawn)
 
--- | A step of a flow: a box that has the name of the step for its title, if it has one, and an edge into it from each
--- producer of the names that it binds. The wire into it that a branch of a choice was given the case for is the case, which
+-- | A step of a flow: a box that has the names of the step, comma-separated, for its title, if it has any, and an edge into
+-- it from each producer of the names that it binds. The wire into it that a branch of a choice was given the case for is the case, which
 -- the edge from the decision says.
-flowStepped :: Ctx -> Path -> Maybe String -> Maybe String -> [Binding] -> Tree -> IO Fragment
-flowStepped ctx path given name bindings inner = do
-  Fragment input core <- maybe id (grouped ctx) name (render ctx path inner)
+flowStepped :: Ctx -> Path -> Maybe String -> [String] -> [Binding] -> Tree -> IO Fragment
+flowStepped ctx path given names bindings inner = do
+  Fragment input core <- (if null names then id else grouped ctx (intercalate ", " names)) (render ctx path inner)
   case (ctxFlow ctx, core) of
     (Just env, Nodes entry _ _) -> drawBindings ctx (env {flowCase = given}) entry bindings
     _ -> pure ()
@@ -684,7 +685,7 @@ originOf :: FlowEnv -> Binding -> Origin
 originOf env binding = case bindingPath binding of
   name : _
     | Just name == flowCase env -> FromCase
-    | name `elem` fmap fst (flowSteps env) -> FromStep name
+    | (names, _) : _ <- filter ((name `elem`) . fst) (flowSteps env) -> FromStep names
   _ -> FromInput
 
 -- | What an edge says of a binding: the name that it reads, with the port after it if the port is another name. A path into
@@ -704,7 +705,7 @@ saying from (Binding port path)
 -- edge from the decision already.
 drawBindings :: Ctx -> FlowEnv -> Node -> [Binding] -> IO ()
 drawBindings ctx env entry bindings =
-  forM_ ((FromInput, flowInput env) : [(FromStep name, outlets) | (name, outlets) <- flowSteps env]) $ \(from, outlets) ->
+  forM_ ((FromInput, flowInput env) : [(FromStep names, outlets) | (names, outlets) <- flowSteps env]) $ \(from, outlets) ->
     case [saying from binding | binding <- bindings, originOf env binding == from] of
       [] -> pure ()
       texts -> do

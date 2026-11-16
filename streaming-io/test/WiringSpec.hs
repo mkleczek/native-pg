@@ -36,11 +36,6 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The stub of a list of names on the left of '<:' fails with 'NotImplemented': the cases that need it are expected to
--- fail, and the marks come off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: a list of names on the left of <: is not written yet"
-
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
   it "wires three steps by bare names and by bindings of a port to a name, and gives what the last gave" $
@@ -90,26 +85,26 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
     run (sized 3 >>> chosen noted >>^ \r -> (sizeName r.size, r.a, r.b)) `shouldReturn` ("small", 3, 4)
     readLog noted `shouldReturn` ["small 3"]
 
-  stubbed $ it "takes the record that a step gave apart by the names of its fields, and keeps only the fields that the list names" $ do
+  it "takes the record that a step gave apart by the names of its fields, and keeps only the fields that the list names" $ do
     run (inputs >>> flow (["sum", "prod"] <: splitter -< ["a", "b"]) >>^ \r -> (r.sum, r.prod, r.a, r.b))
       `shouldReturn` (7, 12, 3, 4)
 
-  stubbed $ it "keeps a field of the record that a step gave under another name, the others of the list under their own" $
+  it "keeps a field of the record that a step gave under another name, the others of the list under their own" $
     run (inputs >>> flow (["sum" =: "total", "diff"] <: splitter -< ["a", "b"]) >>^ \r -> (r.total, r.diff))
       `shouldReturn` (7, -1)
 
-  stubbed $ it "takes a pair apart by position, and pairs that nest to the right, and drops the parts that are named \"_\"" $ do
+  it "takes a pair apart by position, and pairs that nest to the right, and drops the parts that are named \"_\"" $ do
     run (sized 17 >>> flow (["q", "r"] <: divider -< ["a", "b"]) >>^ \r -> (r.q, r.r)) `shouldReturn` (4, 1)
     run (inputs >>> flow (["first", "_", "last"] <: tripler -< ["a", "b"]) >>^ \r -> (r.first, r.last))
       `shouldReturn` (3, 7)
 
-  stubbed $ it "reads the names that a list gives in the steps after it, and in the branches of a choice" $ do
+  it "reads the names that a list gives in the steps after it, and in the branches of a choice" $ do
     run (sized 17 >>> divided) `shouldReturn` 5
     run (sized 3 >>> rounded) `shouldReturn` 3
     run (sized 20 >>> rounded) `shouldReturn` 20
     run (sized 500 >>> rounded) `shouldReturn` 99
 
-  stubbed $ it "runs a step once for the names that it gives, and goes on with the names in front of the record" $ do
+  it "runs a step once for the names that it gives, and goes on with the names in front of the record" $ do
     noted <- newLog
     run (inputs >>> tallied noted) `shouldReturn` 7
     readLog noted `shouldReturn` ["ran"]

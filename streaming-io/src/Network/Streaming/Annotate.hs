@@ -66,9 +66,9 @@ class Annotate arr where
   exchange _ _ step = step
   {-# INLINE exchange #-}
 
-  -- | The arrow as a step of a flow of "Network.Streaming.Wiring", for diagrams: the name that its output has in the
-  -- flow, if it has one, and what each of its ports is bound to. Every runtime returns the arrow unchanged.
-  flowStep :: Maybe String -> [Binding] -> arr a b -> arr a b
+  -- | The arrow as a step of a flow of "Network.Streaming.Wiring", for diagrams: the names that its output has in the
+  -- flow, if it has any, and what each of its ports is bound to. Every runtime returns the arrow unchanged.
+  flowStep :: [String] -> [Binding] -> arr a b -> arr a b
   flowStep _ _ step = step
   {-# INLINE flowStep #-}
 

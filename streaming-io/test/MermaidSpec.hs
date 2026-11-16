@@ -48,11 +48,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The code that draws a list of names on the left of '<:' is not written yet: the cases that need it are expected to
--- fail, and the marks come off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: a list of names on the left of <: is not written yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -243,7 +238,7 @@ spec = describe "the chart" $ do
           ("tail", "end", "")
         ]
 
-  stubbed $ it "has the names that a list takes a step's output apart into for the title of its box, comma-separated" $ do
+  it "has the names that a list takes a step's output apart into for the title of its box, comma-separated" $ do
     chart <- chartOf dividing
     case subgraphTitled "q, r" chart of
       Just (_, inside) -> length (nodesDeclared (gear ++ "divide") inside) `shouldBe` 1
@@ -252,7 +247,7 @@ spec = describe "the chart" $ do
     chart' <- chartOf renaming
     (subgraphTitled "left, z" chart' == Nothing, subgraphTitled "x, z" chart' == Nothing) `shouldBe` (False, True)
 
-  stubbed $ it "has an edge from the step that gives the names of a list to each step that binds them, with the names of one step on one edge" $ do
+  it "has an edge from the step that gives the names of a list to each step that binds them, with the names of one step on one edge" $ do
     chart <- chartOf dividing
     -- "q" and "r" come from "divide": the step "mix" binds both on one edge, and "plus" binds "q" under its port.
     edgesNamed chart
