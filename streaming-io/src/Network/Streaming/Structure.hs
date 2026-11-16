@@ -28,7 +28,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import GHC.Stack (SrcLoc)
-import Network.Streaming.Annotate (Check, Side)
+import Network.Streaming.Annotate (Binding, Check, Side)
 import Network.Streaming.Classes (Duration (..), Label)
 import System.Mem.StableName (StableName, hashStableName, makeStableName)
 
@@ -82,9 +82,11 @@ data Tree
     Wires (Maybe String) (Maybe String) Tree
   | -- | One end of an exchange of the named value: which end, and the step that is it.
     End Side String Tree
+  | -- | A whole flow of "Network.Streaming.Wiring": the scope of the names of its steps.
+    FlowScope Tree
   | -- | A step of a flow of "Network.Streaming.Wiring": the name that its output has in the flow, if it has one, what
-    -- each of its inputs is bound to, and its body.
-    FlowStep (Maybe String) [String] Tree
+    -- each of its ports is bound to, and its body.
+    FlowStep (Maybe String) [Binding] Tree
   | -- | A body where the lint doesn't report a check: which, the reason, and the body.
     Allowing Check String Tree
 
@@ -127,6 +129,7 @@ opensInbox fuel step
       Second inner -> opensInbox (fuel - 1) inner
       Wires _ _ inner -> opensInbox (fuel - 1) inner
       End _ _ inner -> opensInbox (fuel - 1) inner
+      FlowScope inner -> opensInbox (fuel - 1) inner
       FlowStep _ _ inner -> opensInbox (fuel - 1) inner
       Allowing _ _ inner -> opensInbox (fuel - 1) inner
       _ -> Nothing
@@ -167,6 +170,7 @@ children = \case
   Named _ _ inner -> [inner]
   Wires _ _ inner -> [inner]
   End _ _ inner -> [inner]
+  FlowScope inner -> [inner]
   FlowStep _ _ inner -> [inner]
   Allowing _ _ inner -> [inner]
 

@@ -25,7 +25,7 @@ import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef,
 import Data.List (find, intercalate, nub, partition)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import GHC.Stack (SrcLoc (..))
-import Network.Streaming.Annotate (Side (..))
+import Network.Streaming.Annotate (Binding (..), Side (..))
 import Network.Streaming.Classes (Label (..))
 import Network.Streaming.Diagram
 import Network.Streaming.Structure (children, loopHeads, opensInbox, readable)
@@ -210,8 +210,26 @@ data Ctx = Ctx
     -- | The nodes that have the ends of exchanges.
     ctxPlaced :: IORef [Placed],
     -- | How many pairs of neighbouring steps have been drawn as one.
-    ctxFolds :: IORef Int
+    ctxFolds :: IORef Int,
+    -- | The junctions that flows are entered at.
+    ctxInputs :: IORef [Node],
+    -- | The flow that the step being drawn is a step of, if it is one.
+    ctxFlow :: Maybe FlowEnv
   }
+
+-- | Where the names of a flow come from, where one of its steps is drawn.
+data FlowEnv = FlowEnv
+  { -- | The ways out of the node that the flow is entered at, which gives the names of its input.
+    flowInput :: [Outlet],
+    -- | The steps that have names, in the order of the flow, each with its ways out: none for a step that draws no node.
+    flowSteps :: [(String, [Outlet])],
+    -- | The case of the branch that is drawn, whose value is on the edge from its decision.
+    flowCase :: Maybe String
+  }
+
+-- | Where a name of a flow comes from.
+data Origin = FromInput | FromStep String | FromCase
+  deriving (Eq)
 
 -- | What the drawing of a chart came to: its text, and how many of its nodes say nothing of what they mean.
 data Drawing = Drawing
@@ -330,6 +348,8 @@ drawPage world anchor view subject = do
       <*> newIORef 0
       <*> newIORef []
       <*> newIORef 0
+      <*> newIORef []
+      <*> pure Nothing
   start <- declare ctx (\node -> node ++ "@{ shape: sm-circ }")
   fragment <- render ctx (subjectPath subject) (subjectBody subject)
   bounded ctx start (outputOf (subjectBody subject)) fragment
@@ -357,7 +377,11 @@ bounded ctx start output (Fragment input core) = case core of
     edge ctx start end (input <|> out) Solid
   Nodes entry _ outlets -> do
     wire <- into ctx entry input
-    edge ctx start entry wire Solid
+    inputs <- readIORef (ctxInputs ctx)
+    -- A flow that the chart starts with is entered at the start.
+    if entry `elem` inputs && isNothing wire
+      then modifyIORef' (ctxAliases ctx) ((entry, start) :)
+      else edge ctx start entry wire Solid
     unless (null outlets) $ do
       end <- declare ctx (\node -> node ++ "@{ shape: fr-circ }")
       forM_ outlets $ \outlet -> edge ctx (outletNode outlet) end (exitName outlet) (outletStyle outlet)
@@ -576,6 +600,7 @@ drawStep ctx path = \case
   Wires given output (FlowStep name bindings inner) ->
     wired Nothing output <$> flowStepped ctx path given name bindings inner
   Wires input output inner -> wired input output <$> render ctx path inner
+  FlowScope inner -> flowScoped ctx path inner
   FlowStep name bindings inner -> flowStepped ctx path Nothing name bindings inner
   Allowing _ _ inner -> render ctx path inner
   tree@(Named label location body) -> named ctx path tree label location body
@@ -598,18 +623,98 @@ wired input output (Fragment inner core) = Fragment (inner <|> input) $ case cor
   Bare out -> Bare (out <|> output)
   Nodes entry splits outlets -> Nodes entry splits (labelled output <$> outlets)
 
--- | A step of a flow: a box that has the name of the step for its title, if it has one. The edge into it says what its
--- inputs are bound to, in place of any name that the step's own wire has, and after the name that the wire into it was
--- given, if it was, as the case of a branch is.
-flowStepped :: Ctx -> Path -> Maybe String -> Maybe String -> [String] -> Tree -> IO Fragment
+-- | A whole flow: its steps in order, each with an edge from each producer of the names that it binds, and a step that binds
+-- nothing from the step before it has an edge from it that says only the order. The flow is entered at a junction, which is
+-- the start of the chart if the flow is what the chart starts with, and the one node that the flow follows if that has
+-- nothing else to say, so that it is a junction in the chart only when the flow follows more than that.
+flowScoped :: Ctx -> Path -> Tree -> IO Fragment
+flowScoped ctx path inner = do
+  lined <- flowLines inner
+  known <- readIORef (ctxInputs ctx)
+  let entry = 'i' : show (length known + 1)
+      entered = [plain entry]
+  modifyIORef' (ctxInputs ctx) (entry :)
+  (_, (_, outlets), drawn) <- foldM (flowLine ctx path) (FlowEnv entered [] Nothing, (Just FromInput, entered), False) lined
+  if drawn
+    then do
+      emit ctx (Declare entry (junction entry))
+      pure (Fragment Nothing (Nodes entry True outlets))
+    else pure bare
+
+-- | The steps of a flow, in order: the nodes of its chain that are steps of it, which it doesn't go into.
+flowLines :: Tree -> IO [Tree]
+flowLines step = do
+  tree <- evaluate step
+  case tree of
+    FlowStep {} -> pure [tree]
+    _ -> concat <$> traverse flowLines (children tree)
+
+-- | A step of a flow, drawn with the names that the flow has before it, which the steps after it have its name among, if it has
+-- one. The step before it, which is the one before that if it draws no node, has an edge to it with no label if the step binds
+-- nothing from it.
+flowLine :: Ctx -> Path -> (FlowEnv, (Maybe Origin, [Outlet]), Bool) -> Tree -> IO (FlowEnv, (Maybe Origin, [Outlet]), Bool)
+flowLine ctx path (env, before, drawn) step = case step of
+  FlowStep name bindings _ -> do
+    Fragment _ core <- render (ctx {ctxFlow = Just env}) path step
+    let outlets = case core of
+          Nodes _ _ out -> out
+          Bare _ -> []
+        later = maybe env (\given -> env {flowSteps = flowSteps env ++ [(given, outlets)]}) name
+    case core of
+      Nodes entry _ _ -> do
+        unless (any ((== fst before) . Just . originOf env) bindings) $
+          forM_ (snd before) $ \outlet -> edge ctx (outletNode outlet) entry (outletLabel outlet) (outletStyle outlet)
+        pure (later, (FromStep <$> name, outlets), True)
+      Bare _ -> pure (later, before, drawn)
+  _ -> pure (env, before, drawn)
+
+-- | A step of a flow: a box that has the name of the step for its title, if it has one, and an edge into it from each
+-- producer of the names that it binds. The wire into it that a branch of a choice was given the case for is the case, which
+-- the edge from the decision says.
+flowStepped :: Ctx -> Path -> Maybe String -> Maybe String -> [Binding] -> Tree -> IO Fragment
 flowStepped ctx path given name bindings inner = do
   Fragment input core <- maybe id (grouped ctx) name (render ctx path inner)
-  pure (Fragment (onEdge input) core)
+  case (ctxFlow ctx, core) of
+    (Just env, Nodes entry _ _) -> drawBindings ctx (env {flowCase = given}) entry bindings
+    _ -> pure ()
+  pure (Fragment (given <|> input) core)
+
+-- | Where what a binding reads comes from: the case of the branch, a step of the flow that has the name, or else the input.
+originOf :: FlowEnv -> Binding -> Origin
+originOf env binding = case bindingPath binding of
+  name : _
+    | Just name == flowCase env -> FromCase
+    | name `elem` fmap fst (flowSteps env) -> FromStep name
+  _ -> FromInput
+
+-- | What an edge says of a binding: the name that it reads, with the port after it if the port is another name. A path into
+-- what a step gives says the fields alone.
+saying :: Origin -> Binding -> String
+saying from (Binding port path)
+  | source == port = source
+  | otherwise = source ++ " \x2192 " ++ port
   where
-    bound = if null bindings then Nothing else Just (intercalate ", " bindings)
-    onEdge input = case (given, bound) of
-      (Just caseName, Just inputs) -> Just (caseName ++ ": " ++ inputs)
-      _ -> bound <|> input <|> given
+    source = intercalate "." $ case (from, path) of
+      (FromStep _, _ : fields@(_ : _)) -> fields
+      _ -> path
+
+-- | The edges into the entry of a step of a flow: one from each producer of the names that the step binds, which are the
+-- node that the flow is entered at for the names of its input, and then the steps that give names, in the order of the flow.
+-- An edge says the names of its producer, in the order that they are bound. The value of the case of a branch is on the
+-- edge from the decision already.
+drawBindings :: Ctx -> FlowEnv -> Node -> [Binding] -> IO ()
+drawBindings ctx env entry bindings =
+  forM_ ((FromInput, flowInput env) : [(FromStep name, outlets) | (name, outlets) <- flowSteps env]) $ \(from, outlets) ->
+    case [saying from binding | binding <- bindings, originOf env binding == from] of
+      [] -> pure ()
+      texts -> do
+        said <- into ctx entry (Just (intercalate ", " texts))
+        forM_ outlets $ \outlet ->
+          edge ctx (outletNode outlet) entry (withOwn (outletLabel outlet) said) (outletStyle outlet)
+  where
+    -- The label that a way out has of its own, such as the answer of a decision, is before the names.
+    withOwn (Just own) (Just text) = Just (own ++ ": " ++ text)
+    withOwn own text = own <|> text
 
 -- | One fragment after the other, with the edges labelled by the way out, or else by the input wire of the second.
 sequential :: Ctx -> Fragment -> Fragment -> IO Fragment
@@ -624,23 +729,26 @@ sequential ctx (Fragment input1 core1) (Fragment input2 core2) = case (core1, co
     connect ctx outlets input2 entry2 splits2
     pure (Fragment input1 (Nodes entry splits outlets2))
 
--- | Draws the edges from the ways out to the entry, unless a join and a split that follows it can be one junction.
+-- | Draws the edges from the ways out to the entry, unless a join and a split that follows it can be one junction, or the entry
+-- is where a flow is entered and one node that has nothing else to say is the way out, which the flow is entered at.
 connect :: Ctx -> [Outlet] -> Maybe String -> Node -> Bool -> IO ()
-connect ctx outlets label entry splits = case outlets of
-  [ Outlet
-      { outletNode = joined,
-        outletLabel = Nothing,
-        outletWire = Nothing,
-        outletThen = Nothing,
-        outletStyle = Solid,
-        outletJoins = True
-      }
-    ]
-    | splits && isNothing label -> modifyIORef' (ctxAliases ctx) ((entry, joined) :)
-  _ -> forM_ outlets $ \outlet -> do
-    later <- into ctx entry (outletThen outlet)
-    wire <- into ctx entry (outletWire outlet <|> label)
-    edge ctx (outletNode outlet) entry (outletLabel outlet <|> wire <|> later) (outletStyle outlet)
+connect ctx outlets label entry splits = do
+  inputs <- readIORef (ctxInputs ctx)
+  case outlets of
+    [ Outlet
+        { outletNode = before,
+          outletLabel = Nothing,
+          outletWire = Nothing,
+          outletThen = Nothing,
+          outletStyle = Solid,
+          outletJoins = joins
+        }
+      ]
+      | isNothing label && ((splits && joins) || entry `elem` inputs) -> modifyIORef' (ctxAliases ctx) ((entry, before) :)
+    _ -> forM_ outlets $ \outlet -> do
+      later <- into ctx entry (outletThen outlet)
+      wire <- into ctx entry (outletWire outlet <|> label)
+      edge ctx (outletNode outlet) entry (outletLabel outlet <|> wire <|> later) (outletStyle outlet)
 
 -- | A step on a part of a value: with the plumbing it is a split, the step, and a join, with a dashed edge for the part
 -- that the step leaves, and without it only the step, as what passes by is no flow of the program.

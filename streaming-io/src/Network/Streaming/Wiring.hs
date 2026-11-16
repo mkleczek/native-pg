@@ -49,10 +49,12 @@
 -- These are type errors that say what they are: a name that the flow doesn't have, an output that a step doesn't give,
 -- a port that is not bound, a port that is bound twice, and a step whose name is one that the flow has already.
 --
--- In diagrams the box of a step that has a name has the name for its title, and the edge into a step says what its
--- ports are bound to, as in @a1.x → i@. A name that is also the port is said once. A choice is drawn in the box of its
--- line, with its question, and the edge to a branch says its case and what it is bound to, as in @refused: refused,
--- conn@.
+-- In diagrams the box of a step that has a name has the name for its title, and each name that a step binds is an edge
+-- into it from where the name comes from: the step that gives it, or where the flow is entered for a name of the flow's
+-- input. An edge says the names that it has, as in @x → i@ for the port @i@ bound to the field @x@ of a step, and the
+-- names of one producer that a step binds share one edge. A step that binds nothing from the step before it has an edge
+-- from it that says only the order. A choice is drawn in the box of its line, with its question, and the edge from it to
+-- a branch says its case, which is where the value of the case comes from.
 module Network.Streaming.Wiring
   ( Flow,
     Line,
@@ -84,7 +86,7 @@ import GHC.TypeLits
     UnconsSymbol,
     symbolVal,
   )
-import Network.Streaming.Annotate (Annotate (..), (-|))
+import Network.Streaming.Annotate (Annotate (..), Binding (..), (-|))
 import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, (:=) (..), cases)
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
@@ -102,7 +104,7 @@ instance (Category arr) => Category (Flow arr) where
   {-# INLINE (.) #-}
 
 -- | A step with the input that its bindings make, which is told, by what it is used as, what to do with its output.
-data Line arr x o = Line [String] (arr x o)
+data Line arr x o = Line [Binding] (arr x o)
 
 -- | The record of the flow that a line is a part of. It is a type family, and not only the functional dependency of
 -- 'Lined', because GHC solves equalities before it looks for instances, and the names of the flow are to be looked for
@@ -116,7 +118,7 @@ type family FlowIn (t :: Type) :: Type where
 -- a name by '<:', or a step that is an arrow of its own, as the branch of a choice is. The first two are incoherent so
 -- that an arrow whose type is that of a signature, which GHC cannot tell from a flow, is the third.
 class Lined t arr x o where
-  line :: [String] -> arr x o -> t
+  line :: [Binding] -> arr x o -> t
 
 -- | A step that gives nothing to keep: the record goes on as it was.
 instance {-# INCOHERENT #-} (Arrow arr, Annotate arr, arr' ~ arr, x' ~ x, y ~ x) => Lined (Flow arr' x' y) arr x o where
@@ -135,13 +137,13 @@ instance (Annotate arr, arr' ~ arr, x' ~ x, o' ~ o) => Lined (arr' x' o') arr x 
 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of
 -- the steps that have names in front of it.
-flow :: Flow arr x y -> arr x y
-flow (Flow p) = p
+flow :: (Annotate arr) => Flow arr x y -> arr x y
+flow (Flow p) = flowScope p
 {-# INLINE flow #-}
 
 -- | The flow as an arrow that gives what its step of the name gave.
-result :: forall name -> forall arr x y a. (Arrow arr, HasField name y a) => Flow arr x y -> arr x a
-result name (Flow p) = p >>^ getField @name
+result :: forall name -> forall arr x y a. (Arrow arr, Annotate arr, HasField name y a) => Flow arr x y -> arr x a
+result name (Flow p) = flowScope p >>^ getField @name
 {-# INLINE result #-}
 
 -- * Lines
@@ -195,7 +197,9 @@ choice ::
   arr d o ->
   t
 choice question field branches =
-  line [symbolVal (Proxy @field)] (Arrow.arr (cases field :: x -> d) -| question >>> branches)
+  line [Binding name [name]] (Arrow.arr (cases field :: x -> d) -| question >>> branches)
+  where
+    name = symbolVal (Proxy @field)
 {-# INLINE choice #-}
 
 -- * Bindings
@@ -266,23 +270,29 @@ type family NotIn (port :: Symbol) (ports :: [Symbol]) :: Constraint where
   NotIn port (port ': ports) = TypeError (BoundTwice port)
   NotIn port (other ': ports) = NotIn port ports
 
--- | The text of each binding, for diagrams.
+-- | The bindings, for diagrams: the port of each, and the path that it reads.
 class Describe (bindings :: [Symbol]) where
-  describe :: [String]
+  describe :: [Binding]
 
 instance Describe '[] where
   describe = []
   {-# INLINE describe #-}
 
-instance (KnownSymbol binding, Describe bindings) => Describe (binding ': bindings) where
-  describe = said (symbolVal (Proxy @binding)) : describe @bindings
+instance (KnownSymbol (Port binding), Names (Path (Source binding)), Describe bindings) => Describe (binding ': bindings) where
+  describe = Binding (symbolVal (Proxy @(Port binding))) (names @(Path (Source binding))) : describe @bindings
   {-# INLINE describe #-}
 
--- | What a binding says in a diagram: the name in the flow, and the port if it is another name.
-said :: String -> String
-said binding = case break (== '=') binding of
-  (port, '=' : source) -> source ++ " \x2192 " ++ port
-  (name, _) -> name
+-- | The names of a path, as text.
+class Names (path :: [Symbol]) where
+  names :: [String]
+
+instance Names '[] where
+  names = []
+  {-# INLINE names #-}
+
+instance (KnownSymbol name, Names path) => Names (name ': path) where
+  names = symbolVal (Proxy @name) : names @path
+  {-# INLINE names #-}
 
 -- | The record that a step takes as its input, whose fields are its ports. A port that is not bound is a type error.
 newtype Inputs r = Inputs r

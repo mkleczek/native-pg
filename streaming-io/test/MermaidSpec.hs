@@ -48,11 +48,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The renderer draws each name of a flow from the step that gives it only when it is written: the cases that need it are
--- expected to fail, and the mark comes off when it is there.
-unwritten :: Spec -> Spec
-unwritten = xfail "the edges of a flow are drawn from the step that gives each name only when the renderer is written"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -181,7 +176,7 @@ spec = describe "the chart" $ do
       Just (_, inside) -> any ("{\"how big?\"}" `isInfixOf`) inside `shouldBe` True
       Nothing -> failTest "the chart has no box for the line of the choice"
 
-  unwritten $ it "has an edge into a step of a flow from the step that gives each name that it binds, and from the start for the names of the input, past the steps between" $ do
+  it "has an edge into a step of a flow from the step that gives each name that it binds, and from the start for the names of the input, past the steps between" $ do
     chart <- chartOf fanning
     -- The name "i" is read by the first step and the last, so it leaves the start twice.
     edgesNamed chart
@@ -193,7 +188,7 @@ spec = describe "the chart" $ do
           ("gamma", "end", "")
         ]
 
-  unwritten $ it "has on an edge the names that a step binds from one producer, in the order that they are bound, with the field of a path alone and a port that is another name after the name" $ do
+  it "has on an edge the names that a step binds from one producer, in the order that they are bound, with the field of a path alone and a port that is another name after the name" $ do
     chart <- chartOf ports
     edgesNamed chart
       `shouldBe` sort
@@ -203,7 +198,7 @@ spec = describe "the chart" $ do
           ("sum", "end", "")
         ]
 
-  unwritten $ it "has an edge with no label from the step before to a step that binds nothing from it, and none to a step that does" $ do
+  it "has an edge with no label from the step before to a step that binds nothing from it, and none to a step that does" $ do
     chart <- chartOf quiet
     -- "note" gives nothing, so "beta" cannot read it: its edge says only the order. "note" reads "alpha": its edge says what.
     edgesNamed chart
@@ -215,7 +210,7 @@ spec = describe "the chart" $ do
           ("beta", "end", "")
         ]
 
-  unwritten $ it "has on the edge from a decision to a branch only its case, and the names that the branch binds on the edges from where they come" $ do
+  it "has on the edge from a decision to a branch only its case, and the names that the branch binds on the edges from where they come" $ do
     chart <- chartOf choosing
     edgesNamed chart
       `shouldBe` sort
@@ -231,7 +226,7 @@ spec = describe "the chart" $ do
           ("IO", "end", "")
         ]
 
-  unwritten $ it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
+  it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
     chart <- chartOf nesting
     -- The inner flow reads its own "n", which the outer step binds: it is drawn from the start of the inner flow, a junction
     -- that the edge of the outer step goes to, and not from the step "first" of the outer flow.
@@ -243,13 +238,13 @@ spec = describe "the chart" $ do
           ("tail", "end", "")
         ]
 
-  unwritten $ it "has the same edges for a flow with the plumbing as without it" $ do
+  it "has the same edges for a flow with the plumbing as without it" $ do
     found <- pages fanning
     case found of
       page : _ -> pagePlumbing page `shouldBe` pageMermaid page
       [] -> failTest "the program has no page"
 
-  unwritten $ it "has the edges that a flow has from the start from the step before it instead, when that is the one node that leads into it" $ do
+  it "has the edges that a flow has from the start from the step before it instead, when that is the one node that leads into it" $ do
     chart <- chartOf (tap quick >>> fanning)
     edgesNamed chart
       `shouldBe` sort

@@ -108,6 +108,7 @@ instance Annotate Diagram where
   wires input output (Diagram body) = Diagram (Wires input output body)
   exchange side name (Diagram body) = Diagram (End side name body)
   flowStep name bindings (Diagram body) = Diagram (FlowStep name bindings body)
+  flowScope (Diagram body) = Diagram (FlowScope body)
   allowing check reason (Diagram body) = Diagram (Allowing check reason body)
 
 -- | The place of the outermost call in the stack.

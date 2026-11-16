@@ -7,6 +7,7 @@ module Network.Streaming.Annotate
   ( Label (..),
     Side (..),
     Check (..),
+    Binding (..),
     Annotate (..),
     box,
     taking,
@@ -43,6 +44,10 @@ data Check
     InboxOpenedTwice
   deriving (Eq, Show, Enum, Bounded)
 
+-- | What a port of a step of a flow is bound to: the port, and the path of what it reads, which is the name in the flow
+-- that holds it, then the fields of that name's value.
+data Binding = Binding {bindingPort :: String, bindingPath :: [String]}
+
 -- | Annotations for the diagrams that "Network.Streaming.Diagram" draws of a program, and for its lint. Every other arrow
 -- returns the arrow it is given, so that an annotation costs nothing when the program runs.
 class Annotate arr where
@@ -62,10 +67,16 @@ class Annotate arr where
   {-# INLINE exchange #-}
 
   -- | The arrow as a step of a flow of "Network.Streaming.Wiring", for diagrams: the name that its output has in the
-  -- flow, if it has one, and what each of its inputs is bound to. Every runtime returns the arrow unchanged.
-  flowStep :: Maybe String -> [String] -> arr a b -> arr a b
+  -- flow, if it has one, and what each of its ports is bound to. Every runtime returns the arrow unchanged.
+  flowStep :: Maybe String -> [Binding] -> arr a b -> arr a b
   flowStep _ _ step = step
   {-# INLINE flowStep #-}
+
+  -- | The arrow as a whole flow of "Network.Streaming.Wiring", for diagrams: the names that its steps bind are the names
+  -- of that flow and of no other. Every runtime returns the arrow unchanged.
+  flowScope :: arr a b -> arr a b
+  flowScope step = step
+  {-# INLINE flowScope #-}
 
   -- | The arrow, where the lint doesn't report the check, for the reason given: the part means what the check finds.
   -- Every runtime returns the arrow unchanged.
