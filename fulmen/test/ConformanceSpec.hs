@@ -298,7 +298,7 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
 -- first free worker of the core that has the most of them, and doesn't go through the workers that are free to tell which core that
 -- is. A client connects, asks and is answered, one connection after another, so that every worker but the one that serves is free.
 acceptCost :: Spec
-acceptCost = describe "accepting with many workers free" $ forM_ (runners ++ [coresRunner]) $ \runner@(Runner runnerName _) ->
+acceptCost = describe "accepting with many workers free" $ forM_ measured $ \runner@(Runner runnerName _) ->
   describe runnerName $
     it "allocates for a connection no more with 1,024 workers than with 8" $ do
       few <- perConnection runner 8
@@ -307,6 +307,10 @@ acceptCost = describe "accepting with many workers free" $ forM_ (runners ++ [co
       when (many > few * 1.1 + 4096) $
         failTest ("a connection allocates " <> show (round many :: Int) <> " bytes with 1,024 workers, and " <> show (round few :: Int) <> " with 8")
   where
+    -- The non-threaded run time runs the parts of the other arrows on the one thread that the client has too, and what they allocate
+    -- while a connection waits, in their polls, goes by the time that it takes and not by the workers (millions of bytes for a connection,
+    -- more with more workers): only Threads, whose parts wait in the run time, is measured there.
+    measured = [runner | runner@(Runner runnerName _) <- runners ++ [coresRunner], rtsSupportsBoundThreads || runnerName == "threads"]
     -- The bytes that a connection costs the process, the client's own included, which don't depend on the workers.
     perConnection :: Runner -> Int -> IO Double
     perConnection runner workers =
