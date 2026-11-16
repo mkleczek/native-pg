@@ -8,8 +8,8 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (decide)
 import Network.Streaming.Named
 
--- | A choice of three cases that a chain of branches takes apart, each branch given its case in front of the record, and a
--- producer that puts a value in each of them: neither has a signature, and the type of the choice comes from the branches.
+-- | A choice of three cases that a chain of branches takes apart, and a producer that puts a value in each of them.
+-- Neither has a signature: the type of the choice comes from the branches.
 choice :: (Steps arr) => arr Int String
 choice =
   newRecord ["req", "number"] "GET /"

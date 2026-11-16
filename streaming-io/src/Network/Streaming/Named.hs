@@ -5,36 +5,30 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
--- | Anonymous records and sums for the parts of a program's input: a value that has its name in its type, and the pairs
--- that nest to the right, so that a record is made by its names and its fields are read, put in front and changed by
--- name, and not by position. No record type is declared for it.
+-- | Records and sums whose fields and cases have their names in their types, so that a program makes, reads and changes
+-- them by name and not by position. No record type is declared for them.
 --
--- A record is made by @newRecord ["name", "size"] \<$\> p \<*\> q@, with a step for each name, or by
--- @is "name" p &&& is "size" q@, or from a record that is there, by @adding "kept" r@. A step reads the fields that
--- it needs with 'HasField', and takes any record that has them: @(HasField "size" r Int) => arr r Bool@. A field is
--- read as @r.size@ with @OverloadedRecordDot@, or by @field "size"@. @at "size" p@ runs an arrow on a field and puts
--- the result in its place. A name that the record doesn't have is a type error that says so, and so is a name that
--- 'newRecord' is given twice. A field that is put in front of a record that has a field of its name shadows the older
--- one, as a @let@ does, which is what lets a step that is written for any record add a field.
+-- A record is a pair that nests to the right, a pair for each field. It is made by @newRecord ["name", "size"] \<$\> p
+-- \<*\> q@, or by @is "name" p &&& is "size" q@, or from a record that is there by putting a field in front of it with
+-- @adding "kept" p@. A field is read as @r.size@ with @OverloadedRecordDot@, or by @field "size"@, and @at "size" p@
+-- runs an arrow on the field and puts the result in its place. A step that reads some of the fields takes any record
+-- that has them: @(HasField "size" r Int) => arr r Bool@. A field that is put in front of one of its name shadows it,
+-- as a @let@ does. A name that the record doesn't have, and a name that 'newRecord' is given twice, are type errors
+-- that say so.
 --
--- The labels of the wires in diagrams come from the arrow combinators 'is', 'adding', 'at' and 'field', and from no
--- other: 'newRecord' is applied with @\<$\>@, and the diagram's @fmap@ drops the function, so that it can't label
--- anything.
+-- A sum has the names of its cases in its type, as @Either ("refused" := x) (Either ("good" := y) ("quit" := z))@,
+-- which nests to the right as '|||' takes it apart. @inj "refused" x@ makes it, and its type comes from the branches
+-- that take it apart, so that a producer needs no signature. @decide "how did it end?" (cases "head")@ takes the sum
+-- that is a field of the record apart, and a chain of branches, @"refused" ?> p ||| "good" ?> q ||| "quit" ?> r@, gives
+-- each branch the value of its case, as a field named after the case, in front of the record. @casesBy "status"
+-- classify@ does the same for a value that a function puts in a case. @_Case "refused" p@ runs an arrow on one case of
+-- a plain sum. A name that the choice doesn't have, and a name that two of its cases have, are type errors that say so.
 --
--- A sum is the dual: its cases have their names in its type, as @Either ("refused" := x) (Either ("good" := y) ("quit"
--- := z))@, which nests to the right as '|||' takes it apart. @inj "refused" x@ puts a value in the case of a name, and the
--- type of the sum comes from the branches that take it apart, so that a producer needs no signature. @decide "how did it
--- end?" (cases "head")@ gives each branch its case's value in front of the record that the sum is a field of, and a chain
--- of branches, @"refused" ?> p ||| "good" ?> q ||| "quit" ?> r@, takes the record apart: each branch reads its case as a
--- field named after the case, and the rest of the record by name, and names its wire in diagrams with the case. A
--- classification that is made where the record is read, @casesBy "status" classify@, does the same. @_Case "refused" p@
--- runs an arrow on the one case of a plain sum, which can change its type, and passes the others through. A name that the
--- choice doesn't have is a type error that says so, and so is a name that two of its cases have, where 'cases' or
--- 'casesBy' is applied.
+-- The names of wires in diagrams come from 'is', 'adding', 'at', 'field' and '?>'. 'newRecord' is applied with @\<$\>@,
+-- which a diagram draws without the function, so that it names nothing.
 --
--- A field is read where it is used, inside 'Network.Streaming.Classes.now' or a step that takes the record, so that
--- nothing is built of the field but the read: a record that is projected into a new pair has the thunks of the fields
--- again.
+-- A field is read where it is used, inside 'Network.Streaming.Classes.now' or a step that takes the record. A record
+-- that is projected into a new pair gets a thunk for each field again.
 module Network.Streaming.Named
   ( (:=) (..),
     is,
@@ -66,15 +60,14 @@ import Network.Streaming.Plumbing (alongside)
 -- | A value with its name in its type: one field of an anonymous record.
 newtype (name :: Symbol) := a = Is a
 
--- | The arrow's result, as the field of the name, which the wire out of the arrow is called in diagrams.
+-- | The arrow's result as a field of the name, which also names the wire out of the arrow in diagrams.
 is :: forall name -> forall arr a b. (Arrow arr, Annotate arr, KnownSymbol name) => arr a b -> arr a (name := b)
 is name p = p -| symbolVal (Proxy @name) >>^ Is
 {-# INLINE is #-}
 
 -- * Reading
 
--- | The last field of a record that nests to the right, as '&&&' makes it. What the field is read as is its own type,
--- so that which instance reads a field never depends on the type that it is read at.
+-- | The only field of a record, when it has the name: it is read at its own type.
 instance (b ~ a) => HasField name (name := a) b where
   getField (Is a) = a
   {-# INLINE getField #-}
@@ -132,9 +125,8 @@ type family Absent (name :: Symbol) (names :: [Symbol]) :: Constraint where
   Absent name (name ': names) = TypeError (Twice name)
   Absent name (other ': names) = Absent name names
 
--- | A record of the names, made from one argument for each: the arrows of an applicative style, or the values of a
--- plain function. The names are in the record in the order that they are given, so that @newRecord ["a", "b"] x y@ is
--- the record that @is "a" p &&& is "b" q@ makes, and a name that is given twice is a type error.
+-- | A record with a field for each of the names, in the order given, made from one argument for each: arrows, as in
+-- @newRecord ["a", "b"] \<$\> p \<*\> q@, or plain values. A name that is given twice is a type error.
 newRecord :: forall names -> forall record f. (Distinct names, Build names record record f) => f
 newRecord names = buildRecord @names
 {-# INLINE newRecord #-}
@@ -178,8 +170,8 @@ at name p = (getField @name &&& id) ^>> first (label |- p -| label) >>^ uncurry 
     label = symbolVal (Proxy @name)
 {-# INLINE at #-}
 
--- | The arrow's result, as a field of the name in front of the input, which is the rest of the record. The wire out of
--- the arrow is called the name in diagrams.
+-- | Puts the arrow's result in front of its input as a field of the name. The wire out of the arrow has the name in
+-- diagrams.
 adding :: forall name -> forall arr r b. (Arrow arr, Annotate arr, KnownSymbol name) => arr r b -> arr r (name := b, r)
 adding name p = alongside (is name p)
 {-# INLINE adding #-}
@@ -212,16 +204,14 @@ instance (Inj name a rest) => Inj name a (Either other rest) where
 instance {-# OVERLAPPABLE #-} (TypeError (NoCase name)) => Inj name a (other := b) where
   injWith _ = error "Network.Streaming.Named: a case that the choice doesn't have is a type error"
 
--- | The value in the case of the name. The type of the sum comes from the branches that take it apart, so that a match
--- of @inj "refused" x@ and the like needs no signature, and a name that the choice doesn't have is a type error.
+-- | Puts the value in the case of the name. The type of the sum comes from the branches that take it apart, so that a
+-- producer needs no signature.
 inj :: forall name -> forall a s. (Inj name a s) => a -> s
 inj name = injWith @name
 {-# INLINE inj #-}
 
--- | Puts the case of a choice in front of the record that the choice is a field of, for the branch of the case: the value of
--- the case is a field named after the case, and the rest of the record is as it was. The sum and the choice that it
--- makes determine each other once the record is known, so that the type of a sum flows back from its branches to the
--- code that makes it.
+-- | Puts the value of a case of a sum in front of the record, as a field named after the case, for the branch of that
+-- case. The sum and the result determine each other, so that the type of the sum comes from the branches.
 class Distribute s r d | s r -> d, d r -> s where
   distribute :: s -> r -> d
 
@@ -255,8 +245,8 @@ type family AbsentCase (name :: Symbol) (names :: [Symbol]) :: Constraint where
   AbsentCase name (name ': names) = TypeError (TwiceCase name)
   AbsentCase name (other ': names) = AbsentCase name names
 
--- | The sum that is the field of the name, with each case's value in front of the record, for the branches of a chain of
--- '?>'. A pure function, for 'Network.Streaming.Plumbing.decide', which gives the decision the question that labels it in
+-- | Takes the sum that is the field of the name apart for a chain of '?>': the value of its case goes in front of the
+-- record. It is the function that 'Network.Streaming.Plumbing.decide' takes, so that the decision has its question in
 -- diagrams. Two cases of one name are a type error.
 cases ::
   forall name ->
@@ -267,8 +257,7 @@ cases ::
 cases name r = distribute (getField @name r) r
 {-# INLINE cases #-}
 
--- | The same for a field that holds a value that the function puts in a case: a classification, such as the outcome of a
--- handler.
+-- | The same, with a function that puts the value of the field in a case, as a classification does.
 casesBy ::
   forall name ->
   forall r a s d.
@@ -282,9 +271,8 @@ casesBy name classify r = distribute (classify (getField @name r)) r
 -- '?>' binds tighter than '|||', so that a chain of branches needs no parentheses.
 infixr 6 ?>
 
--- | The branch for the case of the name: it takes the case's value in front of the record, as a field of that name, and
--- the wire into it is called the name in diagrams. A chain of them, @"a" ?> p ||| "b" ?> q ||| "c" ?> r@, takes apart what
--- 'cases' gives.
+-- | The branch for the case of the name: it takes the value of the case in front of the record, as a field of that
+-- name, and the wire into it has the name in diagrams. A chain of them takes apart what 'cases' gives.
 (?>) :: forall name -> forall arr x r b. (Arrow arr, Annotate arr, KnownSymbol name) => arr (name := x, r) b -> arr (name := (name := x, r)) b
 (?>) name p = symbolVal (Proxy @name) |- ((\(Is a) -> a) ^>> p)
 {-# INLINE (?>) #-}
@@ -312,8 +300,8 @@ instance (Case name rest a b rest', t ~ Either other rest') => Case name (Either
 instance {-# OVERLAPPABLE #-} (a ~ TypeError (NoCase name), t ~ TypeError (NoCase name)) => Case name (other := x) a b t where
   caseOf _ = error "Network.Streaming.Named: a case that the choice doesn't have is a type error"
 
--- | The prism of the case of the name: runs the arrow on the case, with a change of its type if the arrow has one, and
--- passes the other cases through without running it. The wire into the arrow is called the name in diagrams.
+-- | The prism of the case of the name: runs the arrow on that case, which the arrow may give another type, and passes
+-- the other cases through. The wire into the arrow has the name in diagrams.
 _Case :: forall name -> forall arr s t a b. (ArrowChoice arr, Annotate arr, KnownSymbol name, Case name s a b t) => arr a b -> arr s t
 _Case name p = caseOf @name (symbolVal (Proxy @name) |- p)
 {-# INLINE _Case #-}

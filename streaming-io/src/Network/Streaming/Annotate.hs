@@ -85,8 +85,9 @@ giving :: (Annotate arr) => arr a b -> String -> arr a b
 giving step output = wires Nothing (Just output) step
 {-# INLINE giving #-}
 
--- '-|' binds as 'giving' does, tighter than the operators of arrows, and '|-' tighter still, so that @"in" |- p -| "out"@
--- names both wires of @p@, and @a -| "x" >>> "y" |- b@ and @("yes" |- p ||| "no" |- q)@ need no parentheses.
+-- '-|' and '|-' bind tighter than the operators of arrows, so that @a -| "x" >>> "y" |- b@ and
+-- @("yes" |- p ||| "no" |- q)@ need no parentheses. '|-' binds tighter than '-|', so that @"in" |- p -| "out"@ names
+-- both wires of @p@.
 infixl 5 -|
 
 infixr 6 |-

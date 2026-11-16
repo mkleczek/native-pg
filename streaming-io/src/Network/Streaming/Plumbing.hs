@@ -176,8 +176,8 @@ folding :: (ArrowChoice arr, Annotate arr, Foldable f, Monoid m) => (s -> f a) -
 folding parts p = (toList . parts) ^>> each p >>^ mconcat
 {-# INLINE folding #-}
 
--- | Takes the results of a traversal from the front of a list, in the order that it asks, in continuation-passing style,
--- so that a traversal of any length is put back in a stack of constant size.
+-- | Hands out the results of a traversal, one for each focus, from the front of a list, in continuation-passing style,
+-- so that a long traversal needs a constant stack.
 newtype Refill b a = Refill (forall r. [b] -> (a -> [b] -> r) -> r)
 
 instance Functor (Refill b) where

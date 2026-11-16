@@ -1,10 +1,9 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 
--- | Prisms, traversals and folds: a prism runs an arrow on one case of a sum and passes the others through without running
--- it, and 'each', 'traversal' and 'folding' run it on every focus, in order, as a loop, in each arrow that runs programs.
--- The same programs, written once for any arrow that has what a step that can't wait has, are run by each. That 'undoing'
--- takes them only of steps that can't wait is checked by @test/check-steps.sh@.
+-- | Prisms, traversals and folds: a prism runs an arrow on one case of a sum and passes the others through, and 'each',
+-- 'traversal' and 'folding' run it on every focus, in order, as a loop. The cases run in each arrow that runs programs.
+-- That 'undoing' takes them only of steps that can't wait is checked by @test/check-steps.sh@.
 module OpticsSpec (spec) where
 
 import Control.Arrow (ArrowChoice, arr, (&&&), (>>>), (>>^), (^>>))

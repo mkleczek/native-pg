@@ -254,8 +254,8 @@ data Progress = Progress
 -- | A request that has a head: what the head parsed to, and where it ends in the buffer.
 type Good = ("parsed" := Parsed, "consumed" := Int)
 
--- | The cases of a sum that the head can come to: the stream ended before the head did, or there was no request ("stream
--- ended"), the request is refused with a status ("refused"), or it has a head ("good").
+-- | The ways that the head can end: the stream ended before it did ("stream ended"), the request is refused with a
+-- status ("refused"), or the request has a head ("good").
 type Ends s = (Inj "stream ended" () s, Inj "refused" Int s, Inj "good" Good s)
 
 -- | What the handler is run with: the call, the request, and the primary loan, if the handler is to have it back.
@@ -408,7 +408,7 @@ aftermath =
     decide "how did the handler end?" byOutcome
       >>> ("connection lost" ?> quit ||| "failed" ?> failed ||| "returned" ?> finished)
   where
-    -- Inlined where it is used, so that the branches take the sum apart where it is made, and it is not built.
+    -- Inlined, so that GHC fuses the classification with the branches and builds no sum.
     byOutcome r = casesBy "outcome" classify r
     {-# INLINE byOutcome #-}
     classify = \case

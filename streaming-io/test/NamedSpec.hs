@@ -1,13 +1,11 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 
--- | Records of fields named in their type: a record that 'newRecord' or '&&&' makes of steps is read by name, grown by
--- 'adding' and changed by 'at', and a step that names the fields it reads takes any record that has them, in each arrow
--- that runs programs. Their dual, a sum of cases named in their type, is made by 'inj', handed to the branches of a chain
--- of '?>' by 'cases' and 'casesBy' with its case in front of the record, and changed in one case by '_Case'. The same
--- programs, written once for any arrow that has what a step that can't wait has, are run by each. That a name that the
--- record doesn't have, that 'newRecord' has twice, that a choice doesn't have, or that two cases of a choice have,
--- doesn't compile is checked by @test/check-named.sh@.
+-- | Records whose fields are named in their type, and sums whose cases are: a record is made by 'newRecord' or '&&&',
+-- read by name, grown by 'adding' and changed by 'at', and a step that names the fields it reads takes any record that
+-- has them. A sum is made by 'inj', taken apart by 'cases' or 'casesBy' and a chain of '?>', and changed in one case by
+-- '_Case'. The cases run in each arrow that runs programs. That a name that a record or a choice doesn't have, or has
+-- twice, doesn't compile is checked by @test/check-named.sh@.
 module NamedSpec (spec) where
 
 import Control.Arrow (arr, (&&&), (>>>), (>>^), (^>>), (|||))
