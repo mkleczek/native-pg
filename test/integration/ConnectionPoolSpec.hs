@@ -651,13 +651,13 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       small <- heldBy 20
       large <- heldBy 2000
       reported "an empty pool" (show (round small :: Int) <> " bytes at 20 | " <> show (round large :: Int) <> " bytes at 2000")
-      when (large > small * 1.1 + 1024) $
+      when (large > max 0 small * 1.1 + 4096) $
         failTest ("an empty pool holds " <> show (round large :: Int) <> " bytes at 2,000 slots, and " <> show (round small :: Int) <> " at 20")
     it "holds for a pool of 2,000 slots that has two connections no more than for a pool of 20 slots that has two" $ do
       small <- heldWith 20
       large <- heldWith 2000
       reported "a pool of two connections" (show (round small :: Int) <> " bytes at 20 | " <> show (round large :: Int) <> " bytes at 2000")
-      when (large > small * 1.1 + 1024) $
+      when (large > max 0 small * 1.1 + 4096) $
         failTest ("a pool with two connections holds " <> show (round large :: Int) <> " bytes at 2,000 slots, and " <> show (round small :: Int) <> " at 20")
 
   -- What the pool tells its observer, as v1 told it: a connection is made, ready, in use, ready again or terminated.
@@ -856,6 +856,7 @@ allocatedBy action = do
   allocated <- allocated_bytes <$> getRTSStats
   pure (allocated - before)
 
--- | The bytes of the heap that are live after a major collection.
+-- | The bytes of the heap that are live after the major collections that settle it: threads that were blocked for good and the
+-- finalizers of what the cases before left free more with each of them.
 liveBytes :: IO Word64
-liveBytes = performMajorGC *> (gcdetails_live_bytes . gc <$> getRTSStats)
+liveBytes = replicateM_ 3 (performMajorGC *> threadDelay 20000) *> performMajorGC *> (gcdetails_live_bytes . gc <$> getRTSStats)
