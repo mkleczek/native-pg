@@ -61,6 +61,12 @@ class Annotate arr where
   exchange _ _ step = step
   {-# INLINE exchange #-}
 
+  -- | The arrow as a step of a flow of "Network.Streaming.Wiring", for diagrams: the name that its output has in the
+  -- flow, if it has one, and what each of its inputs is bound to. Every runtime returns the arrow unchanged.
+  flowStep :: Maybe String -> [String] -> arr a b -> arr a b
+  flowStep _ _ step = step
+  {-# INLINE flowStep #-}
+
   -- | The arrow, where the lint doesn't report the check, for the reason given: the part means what the check finds.
   -- Every runtime returns the arrow unchanged.
   allowing :: Check -> String -> arr a b -> arr a b

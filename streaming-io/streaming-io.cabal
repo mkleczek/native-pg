@@ -10,6 +10,7 @@ extra-source-files: test/check-positive-int.sh
                     test/check-no-io-waits.sh
                     test/check-steps.sh
                     test/check-named.sh
+                    test/check-wiring.sh
                     test/compile/*.hs
 
 -- The executables and test suites are linked with GHC's threaded run time. With -f-threaded they are linked with the
@@ -48,6 +49,7 @@ library
                    Network.Streaming.Loans
                    Network.Streaming.NotImplemented
                    Network.Streaming.Named
+                   Network.Streaming.Wiring
                    Network.Streaming.Diagram
                    Network.Streaming.Diagram.Mermaid
                    Network.Streaming.Structure
@@ -107,6 +109,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Loans
                  Network.Streaming.NotImplemented
                  Network.Streaming.Named
+                 Network.Streaming.Wiring
                  Network.Streaming.Diagram
                  Network.Streaming.Diagram.Mermaid
                  Network.Streaming.Structure
@@ -137,6 +140,7 @@ test-suite streaming-io-spec
                  StepsSpec
                  TimeSpec
                  UnwindSpec
+                 WiringSpec
                  WithSpec
   -- -T counts the live heap that GroupCostSpec reads.
   ghc-options: -Wall -rtsopts "-with-rtsopts=-T" -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor

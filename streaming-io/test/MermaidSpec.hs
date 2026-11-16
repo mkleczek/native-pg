@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ExplicitNamespaces #-}
 
 -- | The charts of "Network.Streaming.Diagram.Mermaid": small programs, built at the diagram arrow, whose charts have what
 -- they should.
@@ -7,13 +8,15 @@ module MermaidSpec (spec) where
 import Control.Arrow ((&&&), (>>>), (>>^), (^>>), (|||), returnA)
 import Data.Char (isAlphaNum)
 import Data.List (isInfixOf, isPrefixOf, nub)
+import GHC.Records (getField)
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (_Just, box, decide, done, step, tap, withInbox)
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (..))
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
-import Network.Streaming.Named (adding, at, cases, field, is, (:=), (?>))
+import Network.Streaming.Named (adding, at, cases, field, is, newRecord, (:=), (?>))
 import Network.Streaming.Plumbing (each, prism)
+import Network.Streaming.Wiring (result, type (=:), (-<), (<:))
 import Skeletest
 
 -- | A step that never waits.
@@ -43,6 +46,11 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 -- emoji (U+FE0E), and a space.
 gear :: String
 gear = "\x2699\xFE0E "
+
+-- | The code that draws the steps of a flow is not written yet: the case that needs it is expected to fail, and the mark
+-- comes off when the code is there.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: -< is not written yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -157,6 +165,16 @@ spec = describe "the chart" $ do
     chart <- chartOf (field "size" >>> quick :: Diagram ("size" := Int, "kept" := Bool) ())
     wiresNamed "size" chart `shouldBe` 1
 
+  stubbed $ it "has the name of a step of a flow for the title of its box, and what its ports are bound to on its edge" $ do
+    chart <- chartOf wired
+    [wiresNamed label chart | label <- ["i", "first.x \x2192 n", "first.x \x2192 n, j"]] `shouldBe` [1, 1, 1]
+    case (subgraphTitled "first" chart, subgraphTitled "last" chart) of
+      (Just (_, before), Just (_, after)) ->
+        (length (nodesDeclared (gear ++ "pair") before), length (nodesDeclared (gear ++ "sum") after)) `shouldBe` (1, 1)
+      found -> failTest ("the chart has the boxes " <> show (fmap fst <$> [fst found, snd found]))
+    -- The step that gives nothing is no box of its own.
+    subgraphTitled "note" chart `shouldBe` Nothing
+
   it "has a gear in front of the label of a step that never waits and has no name" $ do
     chart <- chartOf (quick :: Diagram () ())
     length (nodesDeclared (gear ++ "IO") chart) `shouldBe` 1
@@ -210,6 +228,17 @@ spec = describe "the chart" $ do
             [to | (from, to) <- edgesOf chart, from == part] `shouldBe` []
           found -> failTest ("the chart has the steps " <> show found)
         length (nodesDeclared (gear ++ "working") chart) `shouldBe` 1
+
+-- | A flow of three steps over two inputs: the first and the last have names, and the one between them gives nothing.
+wired :: Diagram ("i" := Int, "j" := Int) ()
+wired =
+  result
+    "last"
+    ( "first" <: step "pair" (\r -> pure (newRecord ["x", "y"] (getField @"i" r + 1) (getField @"j" r))) -< ["i"]
+        >>> step "note" (\r -> pure (getField @"n" r `seq` ())) -< ["n" =: "first.x"]
+        >>> "last" <: step "sum" (\r -> pure (getField @"n" r + getField @"j" r)) -< ["n" =: "first.x", "j"]
+    )
+    >>> quick
 
 -- | A body that collects, and spawns the part that works.
 spawnsWorking :: Diagram (Group Diagram s AwaitAll, Int) ()
