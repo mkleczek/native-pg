@@ -467,8 +467,8 @@ manyWorkers :: Spec
 manyWorkers = describe "a server of thousands of workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
   describe kind $ do
     it "serves that many connections that are open at once" (serveMany kind 2500 False)
-    -- Each connection has a deadline while it waits for its request, and the server finds the nearest of them each time it has nothing
-    -- to run: thousands of connections that are idle for a moment are thousands of deadlines. The clients hold all their sockets open at
+    -- Each connection has a watcher that sleeps on a timer, and the server finds the nearest of them each time it has nothing to run:
+    -- thousands of connections that are idle for a moment are thousands of timers. The clients hold all their sockets open at
     -- once, which the non-threaded run time of the test cannot do past 1,024 descriptors (it waits with select, and fails); the server of
     -- the case is a process of its own, and the threaded run shows what it does.
     when rtsSupportsBoundThreads $

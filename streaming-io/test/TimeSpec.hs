@@ -8,11 +8,14 @@
 module TimeSpec (spec) where
 
 import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (&&&), (>>>), (>>^), (^>>))
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Monad (forM, forM_, replicateM_, void, when)
+import qualified Data.ByteString as B
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Word (Word64)
 import GHC.Stats (allocated_bytes, getRTSStats)
 import qualified Network.Socket as Socket
+import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done, keeping, localTicket, releaseWithin, sleep, tap, times)
 import Network.Streaming.Compiled
@@ -142,6 +145,24 @@ spec = describe "time" $ do
       Instant earlier <- readIORef before
       Instant afterwards <- readIORef later
       (afterwards - earlier >= 5000000) `shouldBe` True
+
+    -- The part that a descriptor woke runs in the round that the scheduler was in before it waited, and with a timer armed each round reads the
+    -- clock: the time of that round is the time that the wait began at, which the clock arrow gives, and a grace, a deadline and a sleep count from.
+    when (name /= "loop") $
+      (if name == "threads" then id else xfail "the part that a descriptor woke is run in the round that the scheduler was in before its wait, with that round's time") $
+        it "gives a part that a descriptor woke the time that it woke at, while a timer is armed" $ do
+          (reader, writer) <- Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol
+          event <- Readable . Fd <$> Socket.unsafeFdSocket reader
+          written <- newIORef (0 :: Word64)
+          void . forkIO $ do
+            threadDelay 50000
+            monotonicNanoseconds >>= atomicWriteIORef written
+            SocketBytes.sendAll writer (B.singleton 120)
+          result <- run (race (sleep (secs 3600)) (const event ^>> block >>> clock))
+          wroteAt <- readIORef written
+          case result of
+            Right (Instant seen) -> (seen >= wroteAt) `shouldBe` True
+            Left () -> failTest "the sleep of an hour ended first"
 
     when (name /= "loop") $ it "stops 100,000 deadlines that were set one after the other, none of which passes" $ do
       result <- withinTime (run (times 100000 (within (secs 10) returnA >>> done) >>^ const 'z'))
