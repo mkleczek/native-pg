@@ -208,13 +208,14 @@ requests settings handler =
   where
     whileKept (keep, conn) = if keep then Again conn else Finish ()
     -- An idle connection waits holding no buffer: a request is admitted once there is input. With an idle timeout, a connection that
-    -- has none by then ends, and its worker is free for the next connection.
+    -- has none by then ends, and its worker is free for the next connection: it gives way as it ends, since the lint can't tell that
+    -- the connections that have bytes in hand are not the ones that end, and so sees a way round the loop that waits nowhere.
     one = case idleTimeout settings of
       Nothing -> tap idle >>> admitted
       Just limit ->
         alongside (idleWithin limit)
           >>> decide "input before the idle timeout?" (\(arrived, conn) -> if arrived then Right conn else Left ())
-          >>> (taking "no" (arr (const False) `giving` "keep alive") ||| taking "yes" admitted)
+          >>> (inout "no" (giveWay >>^ const False) "keep alive" ||| taking "yes" admitted)
     admitted =
       alongside (arr (sharedBuffers . connShared) `giving` "buffer pool")
         >>> withRequestBuffers (request settings handler)
