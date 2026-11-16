@@ -56,7 +56,7 @@ import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, 
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> manyWorkers
+spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> manyConnectionWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -227,7 +227,7 @@ withStoppableOn event (Runner _ runServer) handler use =
     Socket.listen accepting 128
     port <- Socket.socketPort accepting
     closed <- newIORef False
-    -- Several workers, so that a connection that is idle and one that is busy are both served.
+    -- Room for several connections, so that a connection that is idle and one that is busy are both served.
     let settings = Fulmen.defaultSettings {Fulmen.shutdown = Just event, Fulmen.connectionsPerCore = 4}
         listener =
           Listening
@@ -259,17 +259,17 @@ quickOrSlow = Handling program
       (\input@(_, request) -> if target request == "/slow" then Left input else Right input)
         ^>> (streamedWith [pause 1000 >>> writing "one", pause 1000 >>> writing "two"] ||| ((, (Fulmen.Status 200, [], "ok")) . fst ^>> reply))
 
--- | A server of thousands of workers starts and serves that many connections at once, under the small stack that a dev
--- build runs with. Its workers are made at startup, and a loop that is not a tail loop overflows that stack, which the parts
--- that run masked don't report: the server goes on with the workers that it had made, and spins. It is a process of its
--- own, so that its spin doesn't hold up the test: it is the server of @fulmen-bench@.
-manyWorkers :: Spec
-manyWorkers = describe "a server of thousands of workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
+-- | A server with room for thousands of connections serves that many at once, with a connection worker spawned for
+-- each, under the small stack that a dev build runs with. A loop that is not a tail loop overflows that stack, which
+-- the parts that run masked don't report: the server goes on with the connection workers that it had spawned, and
+-- spins. It is a process of its own, so that its spin doesn't hold up the test: it is the server of @fulmen-bench@.
+manyConnectionWorkers :: Spec
+manyConnectionWorkers = describe "a server of thousands of connection workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
   describe kind $
     it "serves that many connections that are open at once" (serveMany kind 2500)
 
--- | A server of this many workers, and the same many clients that connect at once and ask it for the answer of 200: how
--- many got it, within the time that they have.
+-- | A server with room for this many connections, and the same many clients that connect at once and ask it for the
+-- answer of 200: how many got it, within the time that they have.
 serveMany :: String -> Int -> IO ()
 serveMany kind count = do
   -- Both ends of every connection are descriptors of this process.
@@ -381,7 +381,9 @@ coresRunner :: Runner
 coresRunner =
   Runner
     "two cores"
-    ( \settings (Listening listen) (Handling handler) cores ->
+    ( \settings (Listening listen) (Handling handler) _ -> do
+        -- The cores that the case made are for one core: the server of two has its own.
+        cores <- Fulmen.newCores settings 2
         void (runCores 2 (pure cores) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings listen handler))
     )
 

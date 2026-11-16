@@ -10,16 +10,19 @@ module Network.Fulmen.Internal
     Answering (..),
     Cores (..),
     Shared (..),
-    Free (..),
+    Waiting (..),
+    Count (..),
   )
 where
 
+import Data.IORef (IORef)
+import Data.IntMap.Strict (IntMap)
 import Network.Fulmen.Internal.Body (Body (..))
 import Network.Fulmen.Internal.Date (Pulse)
 import Network.Fulmen.Internal.Response (Exchange)
 import Network.Socket (Socket)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings)
-import Network.Streaming.Classes (Address, Duration, Event, Reach (..))
+import Network.Streaming.Classes (Duration, Event, Promise, Reach (..))
 import Network.Streaming.Loans (Loans)
 import Network.Streaming.Pool (Pool)
 
@@ -29,7 +32,7 @@ data Settings = Settings
   { -- | The size of the pool of the buffers that a request in flight reads and writes in, which
     -- 'Network.Fulmen.newCores' makes once for all the cores.
     bufferPool :: BufferPoolSettings,
-    -- | How many workers each core has at startup, which is how many connections
+    -- | How many connection workers each core runs at most, which is how many connections
     -- it serves at once: its share of the connection cap.
     connectionsPerCore :: Int,
     -- | The bytes that a request line or a header line may take. A longer request line is answered with 414, and a longer
@@ -61,16 +64,24 @@ newtype Answering = Answering Exchange
 -- is the one that runs the acceptor, if it is the first.
 data Cores = Cores !Int !Shared
 
--- | What the cores share: the free workers, which the acceptor hands connections to, the date that responses carry and
--- whether the server is shutting down, and the buffers that requests in flight work in.
+-- | What the cores share: the pool of the cores that wait for a connection, which the acceptor delivers connections to,
+-- how many connection workers each core has, the date that responses carry and whether the server is shutting down, and
+-- the buffers that requests in flight work in.
 data Shared = Shared
-  { sharedWorkers :: !(Pool Free),
+  { sharedWaiting :: !(Pool Waiting),
+    -- | The count of each core, by its number.
+    sharedCounts :: !(IntMap (IORef Count)),
     sharedPulse :: !Pulse,
     sharedBuffers :: !BufferPool
   }
 
--- | A free worker: the core that it is on, and the address of the inbox that it collects its connections from.
-data Free = Free
-  { freeCore :: !Int,
-    freeAddress :: !(Address "connections" 'Anywhere Socket)
+-- | A core that waits for a connection: its number, and the promise that the acceptor delivers the connection's socket
+-- with.
+data Waiting = Waiting
+  { waitingCore :: !Int,
+    waitingPromise :: !(Promise 'Anywhere Socket)
   }
+
+-- | What a core has of its connection workers: how many are alive, and the promise of the part that waits for room, if
+-- it does, which the end of a worker fulfils.
+data Count = Count !Int !(Maybe (Promise 'Anywhere ()))

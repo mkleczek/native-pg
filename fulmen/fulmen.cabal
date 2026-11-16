@@ -2,8 +2,8 @@ cabal-version: 3.0
 name: fulmen
 version: 0.1.0.0
 synopsis: An HTTP/1.1 server on the arrow runtime of streaming-io
-description: Serves HTTP/1.1 from a fixed network of parts that are made at startup, per core, with
-             bodies read and written as views of the request's buffers, so that a request in flight
+description: Serves HTTP/1.1 from connection workers that are spawned as connections are accepted, a group for each
+             core, with bodies read and written as views of the request's buffers, so that a request in flight
              works in bounded memory.
 license: AGPL-3.0-or-later
 license-file: LICENSE
@@ -54,7 +54,8 @@ test-suite fulmen-conformance
   ghc-options: -Wall -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   if flag(threaded)
     ghc-options: -threaded
-  -- The server of the bench runs in a process of its own, under a small stack, for the case of a server of thousands of workers.
+  -- The server of the bench runs in a process of its own, under a small stack, for the case of a server of thousands of
+  -- connection workers.
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5, fulmen:fulmen-bench
   build-depends: base, bytestring, directory, fulmen, network, process, streaming-io, skeletest >=0.4.2 && <0.5, unix
 

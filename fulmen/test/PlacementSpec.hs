@@ -1,10 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Where a server that runs on several cores puts its new connections, and how many it serves at once: a client opens
--- connections and keeps them, and each core is to serve as many of them as the other, instead of one core serving them all
--- while the other has workers that are free. A connection goes to the core that has the fewest when it is accepted, not
--- when the core that serves it was picked; past the cap on connections the server accepts none until one closes; and a
--- shutdown that comes while every core is full ends the server.
+-- connections and keeps them, and each core is to serve as many of them as the other, instead of one core serving them
+-- all while the other has room. A connection goes to the core that has the fewest when it is accepted; past the cap on
+-- connections the server accepts none until one closes; and a shutdown that comes while every core is full ends the
+-- server.
 module PlacementSpec (spec) where
 
 import Control.Arrow ((&&&), (>>>), (^>>))
@@ -30,36 +30,36 @@ import System.Timeout (timeout)
 spec :: Spec
 spec = parallelCores "a core's thread is pinned to the capability of its number, and the non-threaded run time has one" $ do
   describe "placement" $ do
-    it "gives new connections that are kept open to the cores in turn, when the workers that are free are all of one core" $
+    it "gives new connections that are kept open to the cores in turn, when the connections that closed were all of one core" $
       withServer Fulmen.defaultSettings {Fulmen.connectionsPerCore = 4} 2 $ \port _ -> do
-        -- The workers of both cores offer themselves at the start, and the connections come when they all have.
+        -- Both cores wait for a connection from the start, and the connections come when they do.
         threadDelay 200000
         placed <- timeout 20000000 $
-          -- Every worker serves a connection, so the acceptor waits for a worker, and has the first that is freed: one
-          -- of core 0. Then the workers of core 1 are freed, and last the others of core 0: they are the free workers that
-          -- the pool gives first, the one that was freed last first.
+          -- Each core serves four connections, so both are full, and the acceptor waits for the first core that has
+          -- room: the one that closes a connection first, which is core 0. Then the connections of core 1 close, and
+          -- last the others of core 0: both cores have none, and the connections that come go to them in turn.
           bracket (replicateM 8 (opened port)) (mapM_ (Socket.close . fst)) $ \held -> do
-            let (firstFreed, lastFreed) = splitAt 1 (on 0 held)
-            forM_ [firstFreed, on 1 held, lastFreed] $ \group -> do
+            let (firstClosed, lastClosed) = splitAt 1 (on 0 held)
+            forM_ [firstClosed, on 1 held, lastClosed] $ \group -> do
               mapM_ (Socket.close . fst) group
               threadDelay 100000
             bracket (replicateM 4 (opened port)) (mapM_ (Socket.close . fst)) (pure . sort . map snd)
         placed `shouldBe` Just [0, 0, 1, 1 :: Int]
 
-    -- The core is picked before the connection comes, from the workers that are free then: the connection that comes after
-    -- the connections of one core were closed goes to the core that was picked, which is the one that has the more.
-    xfail "the core is picked before the connection comes, from the workers that are free then" $
-      it "gives a connection to the core that has the fewest when it comes, after the connections of the other were closed" $
-        withServer Fulmen.defaultSettings {Fulmen.connectionsPerCore = 4} 2 $ \port _ -> do
-          threadDelay 200000
-          placed <- timeout 20000000 $
-            bracket (replicateM 6 (opened port)) (mapM_ (Socket.close . fst)) $ \held -> do
-              -- Three connections on each core, and then none on core 1.
-              sort (map snd held) `shouldBe` [0, 0, 0, 1, 1, 1]
-              mapM_ (Socket.close . fst) (on 1 held)
-              threadDelay 300000
-              bracket (opened port) (Socket.close . fst) (pure . snd)
-          placed `shouldBe` Just 1
+    -- The core is picked when the connection is accepted, from what the cores have then: the connection that comes
+    -- after the connections of core 1 closed goes to core 1, which has the fewest, and not to the core that had more
+    -- room before.
+    it "gives a connection to the core that has the fewest when it comes, after the connections of the other were closed" $
+      withServer Fulmen.defaultSettings {Fulmen.connectionsPerCore = 4} 2 $ \port _ -> do
+        threadDelay 200000
+        placed <- timeout 20000000 $
+          bracket (replicateM 6 (opened port)) (mapM_ (Socket.close . fst)) $ \held -> do
+            -- Three connections on each core, and then none on core 1.
+            sort (map snd held) `shouldBe` [0, 0, 0, 1, 1, 1]
+            mapM_ (Socket.close . fst) (on 1 held)
+            threadDelay 300000
+            bracket (opened port) (Socket.close . fst) (pure . snd)
+        placed `shouldBe` Just 1
 
   describe "the cap on connections" $
     it "accepts no connection past the cap until one that is served has closed" $
