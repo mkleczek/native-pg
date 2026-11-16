@@ -13,6 +13,10 @@
 --
 -- A timer never fires before its time, and fires at the first 'expire' that is at or past it: the millisecond is
 -- where a timer is kept, not how exactly it is timed.
+--
+-- The wheel notes a time at or before its nearest live deadline, so that asking for it costs a read and not a look at the slots: a timer that is
+-- added moves it earlier, and nothing moves it later, so a timer that was cancelled or fired may leave it too early, and it is
+-- forgotten when 'expire' has passed it and found out again by the next ask.
 module Network.Streaming.Internal.Timers
   ( Wheel,
     Timer,
@@ -36,14 +40,16 @@ import GHC.IOArray (IOArray, newIOArray, unsafeReadIOArray, unsafeWriteIOArray)
 data Timer = Timer !(IORef Bool) !Word64 (IO ())
 
 -- | The slots of each level, the timers beyond them by block, the millisecond to expire next, how many timers
--- are live and how many are in the wheel, live or not.
+-- are live and how many are in the wheel, live or not, and a time at or before the nearest live deadline, which is 0 when the wheel
+-- doesn't know one.
 data Wheel = Wheel
   { wheelNear :: !(IOArray Int [Timer]),
     wheelFar :: !(IOArray Int [Timer]),
     wheelBeyond :: !(IORef (IntMap.IntMap [Timer])),
     wheelTick :: !(IORef Int),
     wheelLive :: !(IORef Int),
-    wheelHeld :: !(IORef Int)
+    wheelHeld :: !(IORef Int),
+    wheelNext :: !(IORef Word64)
   }
 
 slots :: Int
@@ -54,7 +60,7 @@ newWheel :: Word64 -> IO Wheel
 newWheel now = do
   near <- newIOArray (0, slots - 1) []
   far <- newIOArray (0, slots - 1) []
-  Wheel near far <$> newIORef IntMap.empty <*> newIORef (millisecondOf now) <*> newIORef 0 <*> newIORef 0
+  Wheel near far <$> newIORef IntMap.empty <*> newIORef (millisecondOf now) <*> newIORef 0 <*> newIORef 0 <*> newIORef 0
 
 -- | The millisecond slot that the time is in.
 millisecondOf :: Word64 -> Int
@@ -75,7 +81,16 @@ addTimer wheel deadline action = do
   writeIORef (wheelLive wheel) $! count + 1
   held <- readIORef (wheelHeld wheel)
   writeIORef (wheelHeld wheel) $! held + 1
+  noteNearest wheel count deadline
   pure timer
+
+-- | The wheel's note of its nearest deadline, when a timer with this deadline is added to this many live ones: the deadline itself when it is
+-- the only timer, the earlier of the two when the nearest was known, and still unknown when it wasn't. A deadline of 0 is noted as 1,
+-- since 0 says that none is known.
+noteNearest :: Wheel -> Int -> Word64 -> IO ()
+noteNearest wheel live deadline = do
+  known <- readIORef (wheelNext wheel)
+  when (live == 0 || (known /= 0 && deadline < known)) $ writeIORef (wheelNext wheel) $! max 1 deadline
 
 -- | Puts the timer in the slot that the millisecond belongs to, from the millisecond that is next.
 place :: Wheel -> Int -> Int -> Timer -> IO ()
@@ -123,8 +138,10 @@ filterLive = go []
 -- | Fires the timers that are due at the time, in the order of their milliseconds, and in the order they were
 -- added within one. A timer that one of them adds is due at the next expiry at the soonest.
 expire :: Wheel -> Word64 -> IO ()
-expire wheel now = loop
+expire wheel now = forgetPassed *> loop
   where
+    -- What is due at the time has fired by the end, so that a nearest deadline that is not after it is the deadline of a timer that is gone.
+    forgetPassed = readIORef (wheelNext wheel) >>= \known -> when (known /= 0 && known <= now) (writeIORef (wheelNext wheel) 0)
     target = millisecondOf now
     loop = do
       tick <- readIORef (wheelTick wheel)
@@ -196,13 +213,24 @@ relocate wheel tick timer@(Timer live deadline _) = do
       held <- readIORef (wheelHeld wheel)
       writeIORef (wheelHeld wheel) $! held - 1
 
--- | When the next live timer is due, if there is one.
+-- | A time at or before when the next live timer is due, if there is one: when it is due if the wheel has looked for it since a
+-- timer was cancelled or fired, and else the deadline of a timer that is gone. The wheel looks again once 'expire' has passed that time.
 nextDeadline :: Wheel -> IO (Maybe Word64)
 nextDeadline wheel = do
   live <- readIORef (wheelLive wheel)
   if live == 0
     then pure Nothing
-    else do
+    else
+      readIORef (wheelNext wheel) >>= \known ->
+        if known /= 0
+          then pure (Just known)
+          else do
+            found <- search
+            forM_ found (\deadline -> writeIORef (wheelNext wheel) $! max 1 deadline)
+            pure found
+  where
+    -- The earliest live deadline, from the near slots, the far ones, and the rest.
+    search = do
       tick <- readIORef (wheelTick wheel)
       nearest <- firstLive (wheelNear wheel) tick
       case nearest of
@@ -212,7 +240,6 @@ nextDeadline wheel = do
           case farther of
             Just deadline -> pure (Just deadline)
             Nothing -> readIORef (wheelBeyond wheel) >>= earliest . concat . IntMap.elems
-  where
     -- The earliest live deadline of the first of the slots that has one, from the slot of the position on: by an index, since a list of
     -- the slots is allocated for each call, and a timer that is far off is as many cells as there are slots before it.
     firstLive array from = go 0

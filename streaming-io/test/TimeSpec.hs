@@ -367,23 +367,22 @@ spec = describe "time" $ do
 
     -- It is called each time a scheduler has nothing to run, which with an idle timeout is each time a connection waits for a request, so
     -- that a timer that is far off costs no more than one that is near.
-    xfail "the search for the next deadline looks at each slot of the near level before it finds a timer that is in the far one" $
-      it "finds the next deadline of a wheel that has a timer far off as fast as one that has a timer near" $ do
-        let oneSecond = 1000000000 :: Word64
-            calls = 20000 :: Int
-            timeOf deadline = do
-              wheel <- newWheel 0
-              void (addTimer wheel deadline (pure ()))
-              replicateM_ 100 (nextDeadline wheel)
-              began <- getMonotonicTimeNSec
-              replicateM_ calls (nextDeadline wheel)
-              ended <- getMonotonicTimeNSec
-              pure (ended - began)
-        -- The least of five runs of each, so that a run that the machine was busy for doesn't count.
-        near <- minimum <$> replicateM 5 (timeOf 1000000)
-        far <- minimum <$> replicateM 5 (timeOf (30 * oneSecond))
-        when (far > 10 * near + 5000000) $
-          failTest ("a call takes " <> show (far `div` fromIntegral calls) <> " ns with a timer 30 seconds off, and " <> show (near `div` fromIntegral calls) <> " with one a millisecond off")
+    it "finds the next deadline of a wheel that has a timer far off as fast as one that has a timer near" $ do
+      let oneSecond = 1000000000 :: Word64
+          calls = 20000 :: Int
+          timeOf deadline = do
+            wheel <- newWheel 0
+            void (addTimer wheel deadline (pure ()))
+            replicateM_ 100 (nextDeadline wheel)
+            began <- getMonotonicTimeNSec
+            replicateM_ calls (nextDeadline wheel)
+            ended <- getMonotonicTimeNSec
+            pure (ended - began)
+      -- The least of five runs of each, so that a run that the machine was busy for doesn't count.
+      near <- minimum <$> replicateM 5 (timeOf 1000000)
+      far <- minimum <$> replicateM 5 (timeOf (30 * oneSecond))
+      when (far > 10 * near + 5000000) $
+        failTest ("a call takes " <> show (far `div` fromIntegral calls) <> " ns with a timer 30 seconds off, and " <> show (near `div` fromIntegral calls) <> " with one a millisecond off")
 
     -- A timer that was cancelled may still be what the wheel remembers as its nearest: the time that it gives is then at or before the
     -- nearest live one, and it is exact again once the clock has passed it.
