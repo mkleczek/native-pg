@@ -6,7 +6,8 @@ module StepEachAwaits where
 
 import Control.Arrow ((^>>))
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (done, each, undoing)
+import Network.Streaming.Combinators (done, undoing)
+import Network.Streaming.Plumbing (each)
 
 -- | A step that awaits a future, which waits.
 awaiting :: (Steps arr, Exchange arr 'Anywhere) => arr () Int

@@ -8,10 +8,11 @@ import Control.Arrow ((&&&), (>>>), (>>^), (^>>), (|||), returnA)
 import Data.Char (isAlphaNum)
 import Data.List (isInfixOf, isPrefixOf, nub)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (_Just, box, decide, done, each, step, withInbox)
+import Network.Streaming.Combinators (_Just, box, decide, done, step, withInbox)
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
 import Network.Streaming.Named (adding, at, cases, field, is, (:=), (?>))
+import Network.Streaming.Plumbing (each)
 import Skeletest
 
 -- | A step that never waits.

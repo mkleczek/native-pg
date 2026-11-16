@@ -109,7 +109,7 @@ import Database.PostgreSQL.Types (FormatCode (..))
 import Network.Socket (PortNumber)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators hiding (each, folding, step)
+import Network.Streaming.Combinators hiding (step)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited (runDelimited)
 import Network.Streaming.Loans (Loans, withRequestBuffers)

@@ -50,7 +50,7 @@ module Network.Streaming.Named
     cases,
     casesBy,
     (?>),
-    Case (..),
+    Case,
     _Case,
   )
 where

@@ -3,7 +3,8 @@ module UndoingEach where
 import Control.Arrow ((>>>))
 import Data.Monoid (Sum (..))
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (done, each, folding, traversal, undoing, _Just)
+import Network.Streaming.Combinators (done, undoing, _Just)
+import Network.Streaming.Plumbing (each, folding, traversal)
 
 -- | The step and the cleanup run an effect that can't wait on each element, which is a loop that can't wait either.
 eachStep :: (Steps arr) => arr [Int] [Int]

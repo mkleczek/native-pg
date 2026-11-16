@@ -13,11 +13,12 @@ import Control.Monad (forM_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Monoid (Sum (..))
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (each, folding, prism, traversal, _1, _2, _Just, _Left, _Right)
+import Network.Streaming.Combinators (_1, _2, _Just, _Left, _Right)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)
 import Network.Streaming.Named
+import Network.Streaming.Plumbing (each, folding, prism, traversal)
 import Network.Streaming.Threads
 import Skeletest
 

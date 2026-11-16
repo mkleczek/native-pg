@@ -1,8 +1,8 @@
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | Helpers that route values through any arrow and need nothing of the capability classes but the annotations of
--- diagrams, so that the classes can use them too. "Network.Streaming.Combinators" re-exports them. All are INLINE, for
--- the reason given there.
+-- diagrams, so that the classes can use them too. "Network.Streaming.Combinators" re-exports them, but for 'each',
+-- 'folding', 'prism' and 'traversal', which are imported from here. All are INLINE, for the reason given there.
 module Network.Streaming.Plumbing
   ( done,
     dup,
