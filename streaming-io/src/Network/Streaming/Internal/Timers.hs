@@ -204,23 +204,25 @@ nextDeadline wheel = do
     then pure Nothing
     else do
       tick <- readIORef (wheelTick wheel)
-      nearest <- firstLive (wheelNear wheel) [tick .. tick + slots - 1]
+      nearest <- firstLive (wheelNear wheel) tick
       case nearest of
         Just deadline -> pure (Just deadline)
         Nothing -> do
-          farther <- firstLive (wheelFar wheel) [(tick `shiftR` 10) .. (tick `shiftR` 10) + slots - 1]
+          farther <- firstLive (wheelFar wheel) (tick `shiftR` 10)
           case farther of
             Just deadline -> pure (Just deadline)
             Nothing -> readIORef (wheelBeyond wheel) >>= earliest . concat . IntMap.elems
   where
-    -- The earliest live deadline of the first of the slots that has one.
-    firstLive array = go
+    -- The earliest live deadline of the first of the slots that has one, from the slot of the position on: by an index, since a list of
+    -- the slots is allocated for each call, and a timer that is far off is as many cells as there are slots before it.
+    firstLive array from = go 0
       where
-        go [] = pure Nothing
-        go (position : others) =
-          unsafeReadIOArray array (position .&. (slots - 1)) >>= earliest >>= \case
-            Just deadline -> pure (Just deadline)
-            Nothing -> go others
+        go !offset
+          | offset >= slots = pure Nothing
+          | otherwise =
+              unsafeReadIOArray array ((from + offset) .&. (slots - 1)) >>= earliest >>= \case
+                Just deadline -> pure (Just deadline)
+                Nothing -> go (offset + 1)
 
 -- | The earliest deadline of the live timers. The deadline that is found is evaluated at each step: left in the 'Just' as a thunk that
 -- refers to the one before, a slot of thousands of live timers is a chain of thousands of thunks, which the first use of the deadline
