@@ -93,7 +93,7 @@ withRequestBuffers body =
     admit =
       fst
         ^>> alongside ((\pool -> (1 + reserveCount pool, requestBuffers pool)) ^>> checkoutAt `giving` "primary buffer")
-        >>> step "open loans" (\(buffer, pool) -> Loans pool buffer <$> newIORef (Open NotLent NoExtra 0))
+        >>> step "open loans" (\(buffer, pool) -> Loans pool buffer <$> (newIORef $! Open NotLent NoExtra 0))
           `giving` "request loans"
 
 -- | The request has ended. What it holds goes back to the pool, once, and a borrow of it that still waits is told.

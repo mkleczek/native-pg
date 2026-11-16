@@ -151,7 +151,7 @@ urgently :: (Runtime arr) => arr a b -> arr a b
 urgently = id
 
 newPool :: [conn] -> IO (Pool conn)
--- The state is evaluated before it is kept: 'update' needs the reference to always hold an evaluated value.
+-- The state is evaluated before it is kept, so that the reference never holds a thunk.
 newPool conns = Pool <$> (newIORef $! State (length conns) conns 0 IntMap.empty) <*> newIORef False
 
 -- | Closes the pool, and gives the items that are free now, for the caller to dispose of: a pool that is closed lends

@@ -78,7 +78,7 @@ gracedFrame = Graced
 -- | A scope with this number, which the arrow takes care that no other scope that its parts can be in has, and
 -- what it keeps of the parts inside it to begin with.
 newCancelScope :: Int -> m -> IO (CancelScope m)
-newCancelScope ident members = CancelScope (ScopeId ident) <$> newIORef NotCancelled <*> newIORef members
+newCancelScope ident members = CancelScope (ScopeId ident) <$> newIORef NotCancelled <*> (newIORef $! members)
 
 -- | Whether the scope was cancelled.
 isCancelled :: CancelScope m -> IO Bool

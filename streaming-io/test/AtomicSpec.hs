@@ -12,7 +12,6 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forM_)
 import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
-import Data.Version (makeVersion)
 import GHC.Exts (noinline)
 import Network.Streaming.Classes (Annotate, Effect)
 import Network.Streaming.Combinators (step)
@@ -22,7 +21,6 @@ import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Threads
 import Skeletest
 import System.IO.Unsafe (unsafeInterleaveIO)
-import System.Info (compilerVersion)
 import System.Timeout (timeout)
 
 -- | A connection's mark, as the idle timeout of a server keeps it.
@@ -78,19 +76,14 @@ withinOnAThread10s action = do
     Just (Left failure) -> throwIO (failure :: SomeException)
     Just (Right result) -> pure result
 
--- | Marks a case that fails on GHC 9.12 and later, whose compare-and-swap does not end on a reference that holds a thunk. The mark
--- comes off when it ends, and a case that then passes unexpectedly fails the suite.
-spinsOn912 :: Spec -> Spec
-spinsOn912 = if compilerVersion >= makeVersion [9, 12] then xfail "the compare-and-swap of 'update' spins on a thunk (GHC 9.12)" else id
-
 spec :: Spec
 spec = describe "update of a reference that holds a thunk" $ do
-  spinsOn912 $ it "takes the mark when the change matches on the value" $ do
+  it "takes the mark when the change matches on the value" $ do
     ref <- holdingThunk (Idle 7)
     within10s (takeIdle ref) `shouldReturn` True
     readIORef ref `shouldReturn` Busy
 
-  spinsOn912 $ it "leaves the value when the change matches on it and keeps it" $ do
+  it "leaves the value when the change matches on it and keeps it" $ do
     ref <- holdingThunk TimedOut
     within10s (takeIdle ref) `shouldReturn` False
     readIORef ref `shouldReturn` TimedOut
@@ -111,7 +104,7 @@ spec = describe "update of a reference that holds a thunk" $ do
     readIORef ref `shouldReturn` TimedOut
 
   forM_ runners $ \(Runner name run) -> describe name $
-    spinsOn912 $ it "takes the mark in a step of a program" $ do
+    it "takes the mark in a step of a program" $ do
       ref <- holdingThunk (Idle 7)
       withinOnAThread10s (run taken ref) `shouldReturn` True
       readIORef ref `shouldReturn` Busy

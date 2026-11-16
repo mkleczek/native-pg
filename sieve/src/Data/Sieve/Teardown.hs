@@ -46,8 +46,7 @@ data Graves v = Graves
 newGraveyard :: IO (Graveyard 'OneCore v)
 newGraveyard = Graveyard False <$> newIORef (Graves Seq.empty Nothing 0)
 
--- | A graveyard that the parts of every core share. The state is evaluated before it is kept: the reference is changed by
--- compare-and-swap, which needs it to be a value.
+-- | A graveyard that the parts of every core share. The state is evaluated before it is kept, so that the reference never holds a thunk.
 newSharedGraveyard :: IO (Graveyard 'AllCores v)
 newSharedGraveyard = Graveyard True <$> (newIORef $! Graves Seq.empty Nothing 0)
 

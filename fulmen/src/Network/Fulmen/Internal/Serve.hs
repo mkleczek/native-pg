@@ -272,7 +272,7 @@ idleWatched =
       step "check carry-over" held `giving` "bytes carried over?"
         >>> (taking "no" (marked >>> tap (connSocket ^>> awaitInput) >>> taken) ||| taking "yes" (arr (const True)))
   where
-    marked = keeping clock >>> tap (step "mark as waiting" (\(at, conn) -> atomicWriteIORef (connWaiting conn) (Idle at))) >>^ snd
+    marked = keeping clock >>> tap (step "mark as waiting" (\(at, conn) -> atomicWriteIORef (connWaiting conn) $! Idle at)) >>^ snd
     taken = step "take the mark" (\conn -> update (connWaiting conn) (\case Idle _ -> (Busy, True); other -> (other, False)))
 
 -- | The connection, unless it has bytes of a request already.
