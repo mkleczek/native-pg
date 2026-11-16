@@ -423,13 +423,19 @@ keptSockets = unsafePerformIO (newIORef [])
 -- own, so that its spin doesn't hold up the test: it is the server of @fulmen-bench@.
 manyWorkers :: Spec
 manyWorkers = describe "a server of thousands of workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
-  describe kind $
-    it "serves that many connections that are open at once" (serveMany kind 2500)
+  describe kind $ do
+    it "serves that many connections that are open at once" (serveMany kind 2500 False)
+    -- Each connection has a deadline while it waits for its request, and the server finds the nearest of them each time it has nothing
+    -- to run: thousands of connections that are idle for a moment are thousands of deadlines.
+    expectedWhere kind $
+      it "keeps that many connections that are open and idle for a moment, and serves them" (serveMany kind 2500 True)
+  where
+    expectedWhere kind = if kind == "delimited" then xfail "the nearest deadline of thousands of timers is found in a stack as deep" else id
 
 -- | A server of this many workers, and the same many clients that connect at once and ask it for the answer of 200: how
--- many got it, within the time that they have.
-serveMany :: String -> Int -> IO ()
-serveMany kind count = do
+-- many got it, within the time that they have. With the clients idle, each waits a second after it has connected before it asks.
+serveMany :: String -> Int -> Bool -> IO ()
+serveMany kind count idling = do
   -- Both ends of every connection are descriptors of this process.
   limit <- getResourceLimit ResourceOpenFiles
   setResourceLimit ResourceOpenFiles limit {softLimit = hardLimit limit}
@@ -450,6 +456,7 @@ serveMany kind count = do
     asking port = (either (const False) id <$>) . try @IOException $
       bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
         Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1)))
+        when idling (threadDelay 1000000)
         SocketBytes.sendAll sock "GET /16k HTTP/1.1\r\nHost: localhost\r\n\r\n"
         ("HTTP/1.1 200" `B.isPrefixOf`) <$> SocketBytes.recv sock 4096
 
