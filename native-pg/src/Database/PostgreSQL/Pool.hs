@@ -97,17 +97,21 @@ data ConnectionPoolSettings = ConnectionPoolSettings
 connectionPoolSettings :: Int -> ConnectSettings -> ConnectionPoolSettings
 connectionPoolSettings size settings = ConnectionPoolSettings size settings Nothing Nothing Nothing Nothing 0 (millis 100) (secs 5)
 
--- | A pool of connections: its slots, which are empty until a request first has them, and the buffers that its
--- connections are set up with.
+-- | A pool of connections: its slots, which a request makes when it finds none free and the pool has fewer than its size, and
+-- which are empty until a request makes their connection, and the buffers that its connections are set up with.
 data ConnectionPool = ConnectionPool
-  { poolSlots :: !(Pool Slot),
+  { -- | The slots of the pool's size that are free, which are those that have been made, and are not had by a request.
+    poolSlots :: !(Pool Slot),
     -- | The slots beyond the pool's size, which a request has only after the overflow delay, and which keep no connection.
     poolOverflow :: !(Pool Slot),
-    -- | Every slot, of the pool and beyond its size, for the counts.
-    poolEvery :: ![Slot],
+    -- | The same slots, for the counts: there are few.
+    poolBeyond :: ![Slot],
+    -- | How many slots of the pool's size have been made.
+    poolMade :: !(IORef Int),
     -- | The slots that hold a connection, by their index, which the maintenance looks at: a look visits no other.
     poolConnected :: !(IORef (IntMap Slot)),
-    poolBuffers :: !BufferPool,
+    -- | The buffers that connections are set up with, for each group of slots, which are made when the first connection of the group is.
+    poolBuffers :: !(IORef (IntMap BufferPool)),
     poolSettings :: !ConnectionPoolSettings,
     -- | The count of the looks that the maintenance has made at the pool's connections, which a request that gives a connection
     -- back stamps it with, if the pool has an idle time.
@@ -177,30 +181,22 @@ data Registered = Registered !Int !Int (Word64 -> IO ())
 newMaintenance :: IO Maintenance
 newMaintenance = Maintenance <$> newIORef [] <*> newIORef 0 <*> (Cancels <$> newPool [] <*> newIORef 0)
 
--- | A pool, made without waiting: its slots are empty until a request first has them, and it is registered with the
--- maintenance if it has a lifetime or an idle time, until it is closed. The maintenance keeps it until then.
+-- | A pool, made without waiting: it has no slot until a request finds none free, and then it makes one, up to its size, and it is
+-- registered with the maintenance if it has a lifetime or an idle time, until it is closed. The maintenance keeps it until then.
+-- What the pool holds goes by the slots that it has made, and not by its size, which is only how many it may make.
 --
 -- A connection is made under the arrow of the request that first has its slot, and is set up with the buffers of a pool
--- of the pool's own, which needn't be the request's: for each slot an ordinary buffer, so that every connection can be
--- made at once, and a setup buffer, and one buffer that is kept in reserve, as a request's pool does. They are the size
--- of a connection's read buffer, 16 KiB with the usual settings, so a pool of 10 connections has 21 of them, which is
--- 336 KiB.
+-- of the pool's own, which needn't be the request's, for the group of 16 slots that its slot is in, which are made when the first
+-- connection of the group is: for each slot of the group an ordinary buffer, so that every connection can be made at once, and a
+-- setup buffer, and one buffer that is kept in reserve, as a request's pool does. They are the size of a connection's read buffer,
+-- 16 KiB with the usual settings, so a pool of 10 connections has 21 of them, which is 336 KiB, and a group of 16 has 33.
 newConnectionPool :: Maintenance -> ConnectionPoolSettings -> IO ConnectionPool
 newConnectionPool maintenance settings = do
-  buffers <-
-    newBufferPool
-      BufferPoolSettings
-        { bufferSize = positive (connectReadSize (poolConnect settings)),
-          ordinaryBufferCount = positive (size + overflow),
-          reserveBufferCount = positive 1,
-          setupBufferCount = positive (size + overflow)
-        }
-  -- The slots know the pool that they are of, so the pool is made by the knot: nothing looks at it until it is made.
+  -- The slots beyond the size know the pool that they are of, so the pool is made by the knot: nothing looks at it until it is made.
   pool <-
     fixIO $ \self -> do
-      slots <- traverse (slotOf self False) [0 .. size - 1]
-      extra <- traverse (slotOf self True) [size .. size + overflow - 1]
-      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> newIORef IntMap.empty <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing <*> newIORef 0 <*> pure (maintenanceCancels maintenance)
+      extra <- traverse (newSlot self True) [size .. size + overflow - 1]
+      ConnectionPool <$> newPool [] <*> newPool extra <*> pure extra <*> newIORef 0 <*> newIORef IntMap.empty <*> newIORef IntMap.empty <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing <*> newIORef 0 <*> pure (maintenanceCancels maintenance)
   case maintenancePeriod settings of
     Nothing -> pure ()
     Just period -> register maintenance period (lookAt pool) >>= \place -> writeIORef (poolRegistration pool) (Just (maintenance, place))
@@ -208,7 +204,48 @@ newConnectionPool maintenance settings = do
   where
     size = max 1 (poolSize settings)
     overflow = max 0 (poolMaxOverflow settings)
-    slotOf self beyond index = Slot self beyond index <$> newIORef Nothing <*> newIORef UUID.nil <*> newIORef 0 <*> newIORef 0
+
+-- | An empty slot of the pool, of this index.
+newSlot :: ConnectionPool -> Bool -> Int -> IO Slot
+newSlot pool beyond index = Slot pool beyond index <$> newIORef Nothing <*> newIORef UUID.nil <*> newIORef 0 <*> newIORef 0
+
+-- | A slot of the pool's size that the pool did not have, if it has fewer than that: a pool makes a slot when a request finds none free, and
+-- not before.
+grown :: ConnectionPool -> IO (Maybe Slot)
+grown pool = do
+  made <- readIORef (poolMade pool)
+  if made >= size
+    then pure Nothing
+    else atomicModifyIORef' (poolMade pool) (\count -> if count < size then (count + 1, Just count) else (count, Nothing)) >>= traverse (newSlot pool False)
+  where
+    size = max 1 (poolSize (poolSettings pool))
+
+-- | How many slots share the buffers that their connections are set up with.
+groupSize :: Int
+groupSize = 16
+
+-- | The buffers that the connection of the slot is set up with, which are those of its group of slots, made when the first connection
+-- of the group is.
+buffersFor :: Slot -> IO BufferPool
+buffersFor slot =
+  readIORef (poolBuffers pool) >>= \groups -> case IntMap.lookup group groups of
+    Just buffers -> pure buffers
+    Nothing -> do
+      buffers <-
+        newBufferPool
+          BufferPoolSettings
+            { bufferSize = positive (connectReadSize (poolConnect settings)),
+              ordinaryBufferCount = positive members,
+              reserveBufferCount = positive 1,
+              setupBufferCount = positive members
+            }
+      -- Another request may have made them meanwhile: they are the ones that the group has.
+      atomicModifyIORef' (poolBuffers pool) (\groups' -> case IntMap.lookup group groups' of Just made -> (groups', made); Nothing -> (IntMap.insert group buffers groups', buffers))
+  where
+    pool = slotOwner slot
+    settings = poolSettings pool
+    group = slotIndex slot `div` groupSize
+    members = min groupSize (max 1 (poolSize settings) + max 0 (poolMaxOverflow settings) - group * groupSize)
     positive :: Int -> PositiveInt
     positive number = fromMaybe (positiveInt @1) (mkPositiveInt (toInteger number))
 
@@ -364,14 +401,16 @@ loaned body = scope acquire returning run
     withInput (acquired, (_, input)) = fmap (,input) acquired
 
 -- | The request has to wait for a slot: until the pool's checkout timeout, if it has one, with its place given up if the wait
--- ends any other way. A pool that is closed has none to give.
+-- ends any other way. A pool that is closed has none to give, and one that has fewer slots than its size makes one, so that the
+-- request needn't wait.
 --
 -- A pool that has overflow also waits, after the overflow delay, for a slot of the overflow, and has the first slot that is
 -- free of the two: its place for a slot of the pool is kept meanwhile, so that a connection that comes back goes to the
 -- oldest request that waits.
 waiting :: (Runtime arr) => arr ConnectionPool (Either PoolError Slot)
-waiting = now (\pool -> (\closed -> if closed then Left PoolClosed else Right pool) <$> isClosed (poolSlots pool)) >>> (arr Left ||| queueing)
+waiting = now opening >>> (arr Left ||| (arr Right ||| queueing))
   where
+    opening pool = isClosed (poolSlots pool) >>= \closed -> if closed then pure (Left PoolClosed) else Right . maybe (Right pool) Left <$> grown pool
     queueing = limited ^>> ((queue >>^ Right) ||| (timeoutA queue >>^ maybe (Left CheckoutTimedOut) Right))
     limited pool = case poolCheckoutTimeout (poolSettings pool) of
       Nothing -> Left pool
@@ -381,7 +420,7 @@ waiting = now (\pool -> (\closed -> if closed then Left PoolClosed else Right po
     -- The slot of the overflow, once the delay has passed: it is as long as many times as the overflow has connections in use,
     -- and one more.
     beyondTheSize = now delayed >>> first sleepIn >>> (\((), pool) -> (1, poolOverflow pool)) ^>> queueAt
-    delayed pool = (\idle -> (Duration (nanoseconds (poolOverflowDelay (poolSettings pool)) * fromIntegral (length (filter slotBeyond (poolEvery pool)) - length idle + 1)), pool)) <$> free (poolOverflow pool)
+    delayed pool = (\idle -> (Duration (nanoseconds (poolOverflowDelay (poolSettings pool)) * fromIntegral (length (poolBeyond pool) - length idle + 1)), pool)) <$> free (poolOverflow pool)
 
 -- | Waits as long as the duration, which is the input: a wait of the arrow, so that a cancellation reaches it.
 sleepIn :: (Runtime arr) => arr Duration ()
@@ -408,7 +447,7 @@ using body = scope acquire release run
     connectingSlot = iterateA (alongside (now pausedFor) >>> (\(pause, slot) -> maybe (Right slot) (Left . (,slot)) pause) ^>> (waited ||| attempt))
     waited = first sleepIn >>^ \((), slot) -> Again slot
     attempt = alongside connectionFor >>> now concluded
-    connectionFor = (\slot -> (poolBuffers (slotOwner slot), poolConnect (poolSettings (slotOwner slot)))) ^>> withRequestBuffers (swap ^>> connect)
+    connectionFor = now (\slot -> (,poolConnect (poolSettings (slotOwner slot))) <$> buffersFor slot) >>> withRequestBuffers (swap ^>> connect)
     -- A refusal is counted whether the pool has overflow or not; only a pool that has overflow backs off and tries again.
     concluded (result, slot) = case result of
       Left failure | refusal failure -> do
@@ -456,7 +495,8 @@ connectionPoolStats pool = do
   free' <- (++) <$> free (poolSlots pool) <*> free (poolOverflow pool)
   idle <- connected free'
   have <- IntMap.size <$> readIORef (poolConnected pool)
-  let held = length (poolEvery pool) - length free'
+  made <- readIORef (poolMade pool)
+  let held = made + length (poolBeyond pool) - length free'
   soft <- softLimit pool
   refused <- readIORef (poolRefused pool)
   pure (PoolStats idle (have - idle) (held - (have - idle)) soft refused)

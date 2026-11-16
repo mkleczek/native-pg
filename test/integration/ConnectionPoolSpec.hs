@@ -625,19 +625,40 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
           holding <- liveBytes
           mapM_ closeConnectionPool pools
           pure (fromIntegral holding / 500 - fromIntegral without / 500)
+        -- What a pool of this size holds with two connections, in bytes: the same, of ten pools that have two connections each, which are made
+        -- by requests and are idle.
+        heldWith :: Int -> IO Double
+        heldWith size = do
+          buffers <- newPool (BufferPoolSettings (positiveInt @1024) (positiveInt @4) (positiveInt @2) (positiveInt @2))
+          maintenance <- newMaintenance
+          without <- liveBytes
+          pools <- replicateM 10 (newConnectionPool maintenance ((connectionPoolSettings size settings) {poolLifetime = Just (secs 1800)}))
+          forM_ pools $ \pool -> do
+            one <- startHolding (Env runner buffers pool)
+            two <- startHolding (Env runner buffers pool)
+            finishHolding one
+            finishHolding two
+          holding <- liveBytes
+          mapM_ closeConnectionPool pools
+          pure (fromIntegral holding / 10 - fromIntegral without / 10)
     it "allocates for a pool of 2,000 slots no more than for a pool of 20 slots, with two connections in each" $ do
       (smallBytes, smallMicros) <- lookCost 20
       (largeBytes, largeMicros) <- lookCost 2000
       reported "a look" (show (round smallBytes :: Int) <> " bytes, " <> show (round smallMicros :: Int) <> " us at 20 | " <> show (round largeBytes :: Int) <> " bytes, " <> show (round largeMicros :: Int) <> " us at 2000")
       when (largeBytes > smallBytes * 1.05 + 64) $
         failTest ("a look allocates " <> show (round largeBytes :: Int) <> " bytes at 2,000 slots, and " <> show (round smallBytes :: Int) <> " at 20")
-    needs "a pool whose memory goes by its connections" $
-      it "holds for a pool of 2,000 slots, before it has a connection, no more than for a pool of 20 slots" $ do
-        small <- heldBy 20
-        large <- heldBy 2000
-        reported "an empty pool" (show (round small :: Int) <> " bytes at 20 | " <> show (round large :: Int) <> " bytes at 2000")
-        when (large > small * 1.1 + 1024) $
-          failTest ("an empty pool holds " <> show (round large :: Int) <> " bytes at 2,000 slots, and " <> show (round small :: Int) <> " at 20")
+    it "holds for a pool of 2,000 slots, before it has a connection, no more than for a pool of 20 slots" $ do
+      small <- heldBy 20
+      large <- heldBy 2000
+      reported "an empty pool" (show (round small :: Int) <> " bytes at 20 | " <> show (round large :: Int) <> " bytes at 2000")
+      when (large > small * 1.1 + 1024) $
+        failTest ("an empty pool holds " <> show (round large :: Int) <> " bytes at 2,000 slots, and " <> show (round small :: Int) <> " at 20")
+    it "holds for a pool of 2,000 slots that has two connections no more than for a pool of 20 slots that has two" $ do
+      small <- heldWith 20
+      large <- heldWith 2000
+      reported "a pool of two connections" (show (round small :: Int) <> " bytes at 20 | " <> show (round large :: Int) <> " bytes at 2000")
+      when (large > small * 1.1 + 1024) $
+        failTest ("a pool with two connections holds " <> show (round large :: Int) <> " bytes at 2,000 slots, and " <> show (round small :: Int) <> " at 20")
 
   -- What the pool tells its observer, as v1 told it: a connection is made, ready, in use, ready again or terminated.
   describe "the observer" $ do
