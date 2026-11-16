@@ -31,6 +31,8 @@
 -- that is projected into a new pair gets a thunk for each field again.
 module Network.Streaming.Named
   ( (:=) (..),
+    type (=:),
+    type (@:),
     is,
     Build,
     newRecord,
@@ -57,10 +59,8 @@ import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
 import GHC.TypeLits (ErrorMessage (..), KnownSymbol, Symbol, TypeError, symbolVal)
 import Network.Streaming.Annotate (Annotate, (-|), (|-))
+import Network.Streaming.Internal.Patterns ((:=) (..), type (=:), type (@:))
 import Network.Streaming.Plumbing (alongside)
-
--- | A value with its name in its type: one field of an anonymous record.
-newtype (name :: Symbol) := a = Is a
 
 -- | The arrow's result as a field of the name, which also names the wire out of the arrow in diagrams.
 is :: forall name -> forall arr a b. (Arrow arr, Annotate arr, KnownSymbol name) => arr a b -> arr a (name := b)
@@ -68,28 +68,6 @@ is name p = p -| symbolVal (Proxy @name) >>^ Is
 {-# INLINE is #-}
 
 -- * Reading
-
--- | The only field of a record, when it has the name: it is read at its own type.
-instance (b ~ a) => HasField name (name := a) b where
-  getField (Is a) = a
-  {-# INLINE getField #-}
-
--- | The first field, when it has the name: a newer field shadows the older ones of its name.
-instance {-# OVERLAPPING #-} (b ~ a) => HasField name (name := a, rest) b where
-  getField (Is a, _) = a
-  {-# INLINE getField #-}
-
--- | A later field, found in the rest.
-instance (HasField name rest b) => HasField name (other := a, rest) b where
-  getField (_, rest) = getField @name rest
-  {-# INLINE getField #-}
-
--- | The last field, when it has another name: the record has no field of the name.
-instance {-# OVERLAPPABLE #-} (b ~ TypeError (Missing name)) => HasField name (other := a) b where
-  getField _ = error "Network.Streaming.Named: a field that the record doesn't have is a type error"
-
--- | What is said of a name that no field of the record has.
-type Missing name = 'Text "The record has no field " ':<>: 'ShowType name
 
 -- | What is said of a name that two fields have.
 type Twice name = 'Text "The record has more than one field named " ':<>: 'ShowType name

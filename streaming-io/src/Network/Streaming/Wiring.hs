@@ -37,32 +37,44 @@
 -- A choice is a line of a flow too:
 --
 -- > "kept" <: choice "how did the head end?" "head"
--- >   (    "stream ended" ?> quit    -< []
--- >    ||| "refused"      ?> refuse  -< ["refused", "conn"]
--- >    ||| "good"         ?> answered -< ["good", "conn", "loans", "loan", "progress"] )
+-- >   (    "stream ended"                   ?> quit    -< []
+-- >    ||| "refused" =: "status"            ?> refuse  -< ["status", "conn"]
+-- >    ||| "good" =: ["parsed", "consumed"] ?> answered -< ["parsed", "consumed", "conn", "loans", "loan", "progress"] )
 --
--- It decides on the sum that the flow has under the name @"head"@, and runs the branch of the case that it is. A branch,
--- @"case" ?> p -< bindings@, binds the names of the flow, and the value of its case under the name of the case, and the
--- input of its step has only the ports that it binds. The branches give the same type, which is what @"kept"@ has. The
--- errors of '-<' are those of a branch, and a case that the sum doesn't have is the error of "Network.Streaming.Named".
+-- It decides on the sum that the flow has under the name @"head"@, and runs the branch of the case that it is. A branch
+-- is @"case" ?> p -< bindings@, which selects the case and binds nothing from its value, or @"case" =: pattern ?> p -<
+-- bindings@, which takes the value of the case apart by the pattern, as is told below, and the names of the pattern join
+-- the names of the flow that the branch sees, in front of them. The input of the step of a branch has only the ports that
+-- it binds. The branches give the same type, which is what @"kept"@ has. The errors of '-<' are those of a branch, and a
+-- case that the sum doesn't have is the error of "Network.Streaming.Named".
 --
--- A list of names on the left of '<:' takes the output of the step apart, as a pattern does:
+-- The left of '<:' is a pattern for the output of the step, as @R { socket = S { fd, addr }, peer }@ is in Haskell:
 --
--- > ["socket", "peer"]             <: acceptFrom -< ["listener"]
--- > ["socket" =: "client", "peer"] <: acceptFrom -< ["listener"]
--- > ["kept", "joined"]             <: group AwaitAll workers -< ["cores"]
+-- > "socket"                                  <: accept         -< ["listener"]
+-- > "conn" @: ["socket", "peer"]              <: acceptFrom     -< ["listener"]
+-- > ["socket", "peer"]                        <: acceptFrom     -< ["listener"]
+-- > ["socket" =: ["fd", "addr"], "peer"]      <: acceptFrom     -< ["listener"]
+-- > ["socket" =: "s" @: ["fd", "addr"], "peer"] <: acceptFrom   -< ["listener"]
+-- > ["kept", "joined"]                        <: group AwaitAll workers -< ["cores"]
 --
--- A record, whose fields are @name := a@, is taken apart by the names of its fields: the list may name some of them, the
--- others are not kept, and @"field" =: "name"@ keeps a field under another name. A pair, or pairs that nest to the right,
--- is taken apart by position: the list has a name for each part, and @"_"@ keeps none. A record is told from a pair by
--- its first part, which is a field. Each name of the list joins the flow as the name of a step does, in front of the
--- record, in the order of the list, and it is the name of an earlier step to the lines after it. There are no nested
--- patterns: a path, @"out.x"@, reaches deeper.
+-- A name keeps the output as it is. @"name" \@: [patterns]@ keeps it whole under @name@ and takes it apart, and @"_" \@:
+-- [patterns]@ takes it apart and keeps nothing whole. A list takes the output apart: a record, whose fields are @name := a@,
+-- by the names of its fields, and a pair, or pairs that nest to the right, by position. A record is told from a pair by
+-- its first part, which is a field. In a list for a record, @"field"@ is the field of that name, which is kept under it,
+-- and @"field" =: pattern@ is the field, taken by the pattern: a name keeps it under that name, a list takes it apart, and
+-- @name \@: [patterns]@ does both. The fields that the list doesn't name are not kept. In a list for a pair, each pattern
+-- is for a part, @"_"@ keeps none, and the last pattern is for what is left, whole: on @(a, (b, c))@, @["a", "bc"]@ gives
+-- @bc = (b, c)@, and @["a", "b", "c"]@ takes it apart. Patterns nest to any depth. Each name of a pattern joins the flow
+-- as the name of a step does, in front of the record, the whole before its parts, and it is the name of an earlier step
+-- to the lines after it. A pattern is not for the right of '-<', whose bindings read the names of the flow: a path,
+-- @"out.x"@, reaches into the output of a step there.
 --
 -- These are type errors that say what they are: a name that the flow doesn't have, an output that a step doesn't give,
--- a port that is not bound, a port that is bound twice, a step whose name is one that the flow has already, and, for a
--- list of names, a field that the output doesn't have, too few or too many names for a pair, a name that the list has
--- twice, a field that is named for a pair, and an output that is neither a record nor a pair.
+-- a port that is not bound, a port that is bound twice, a step whose name is one that the flow has already, a binding that
+-- is a pattern, and, for a pattern, a field that the output doesn't have, too many names for a pair, a name that the
+-- pattern has twice, a field that is named for a pair, a field for the output of a step, and a value that is neither a
+-- record nor a pair that a list takes apart. An error in a nested pattern says where it is, as in @in "socket": the
+-- output of the step has no field "w"@.
 --
 -- In diagrams the box of a step that has names has them for its title, comma-separated, and each name that a step binds
 -- is an edge into it from where the name comes from: the step that gives it, or where the flow is entered for a name of
@@ -79,6 +91,7 @@ module Network.Streaming.Wiring
     Outs,
     choice,
     type (=:),
+    type (@:),
     flow,
     result,
     Inputs,
@@ -103,7 +116,24 @@ import GHC.TypeLits
     symbolVal,
   )
 import Network.Streaming.Annotate (Annotate (..), Binding (..), (-|))
-import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, (:=) (..), cases)
+import Network.Streaming.Internal.Patterns
+  ( AllFresh,
+    Dig (..),
+    Distinct,
+    Entry (..),
+    Given,
+    Level (..),
+    Parse,
+    Parses,
+    Root,
+    ShapeOf,
+    Take (..),
+    Where (..),
+    type (=:),
+    type (@:),
+    (:=) (..),
+  )
+import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, cases)
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -175,7 +205,7 @@ infix 7 -<
   (Arrow arr) =>
   arr i o ->
   forall (bindings :: [Symbol]) ->
-  (x ~ FlowIn t, Lined t arr x o, Unique (Ports bindings), Describe bindings, Bind bindings x i) =>
+  (x ~ FlowIn t, Lined t arr x o, Unique (Ports bindings), Plain bindings, Describe bindings, Bind bindings x i) =>
   t
 (-<) p bindings = line (describe @bindings) (Arrow.arr (bind @bindings @x) >>> p)
 {-# INLINE (-<) #-}
@@ -200,24 +230,39 @@ class Outs out x o y | out x o -> y where
   -- | The flow that runs the step, with the names of what it gave in front of the record.
   outcome :: (Arrow arr, Annotate arr) => Line arr x o -> Flow arr x y
 
--- | A name: the output is kept as it is.
-instance (KnownSymbol name, Fresh name x, y ~ (name := o, x)) => Outs (name :: Symbol) x o y where
+-- | A name, or a name that is kept and taken apart: the output is kept as it is, and its parts too if the pattern has
+-- them.
+instance
+  ( NoField (Parse out),
+    Names (Given '[Parse out]),
+    Distinct (Given '[Parse out]),
+    AllFresh (Given '[Parse out]) x,
+    Take Root (Parse out) o x y
+  ) =>
+  Outs (out :: Symbol) x o y
+  where
   outcome (Line texts p) =
-    Flow (alongside (flowStep [symbolVal (Proxy @name)] texts p) >>^ \(o, x) -> (Is o, x))
+    Flow (alongside (flowStep (names @(Given '[Parse out])) texts p) >>^ \(o, x) -> takeEntry @Root @(Parse out) o x)
   {-# INLINE outcome #-}
 
--- | A list of names: the output is taken apart, and each name is a part of it.
+-- | A list of patterns: the output is taken apart, and each name is a part of it.
 instance
-  ( Pattern (ShapeOf o) entries o x y,
-    Names (Given entries),
-    Distinct (Given entries),
-    AllFresh (Given entries) x
+  ( Level (ShapeOf o) Root (Parses entries) o x y,
+    Names (Given (Parses entries)),
+    Distinct (Given (Parses entries)),
+    AllFresh (Given (Parses entries)) x
   ) =>
   Outs (entries :: [Symbol]) x o y
   where
   outcome (Line texts p) =
-    Flow (alongside (flowStep (names @(Given entries)) texts p) >>^ \(o, x) -> takeApart @(ShapeOf o) @entries o x)
+    Flow (alongside (flowStep (names @(Given (Parses entries))) texts p) >>^ \(o, x) -> level @(ShapeOf o) @Root @(Parses entries) o x)
   {-# INLINE outcome #-}
+
+-- | The pattern on the left of '<:' is not for a field: it is the output of the step that is taken.
+type family NoField (entry :: Entry) :: Constraint where
+  NoField ('Entry 'Nothing name parts) = ()
+  NoField ('Entry ('Just field) name parts) =
+    TypeError ('Text "The output of a step is not a field: " ':<>: 'ShowType field ':<>: 'Text " =: has nothing to take a field of")
 
 -- | A choice that is a line of the flow: it decides on the sum that the flow has under the name of the field, as
 -- @decide question (cases field)@ does, and runs the branch of the case that it is. A branch is a step of its own,
@@ -243,157 +288,7 @@ choice question field branches =
     name = symbolVal (Proxy @field)
 {-# INLINE choice #-}
 
--- * Patterns
-
--- | How an output is taken apart by a list of names.
-data Shape
-  = -- | By the names of its fields: a record, which is a pair of fields that nests to the right.
-    Fields
-  | -- | By position: a pair, or pairs that nest to the right.
-    Positions
-  | -- | Not at all.
-    Opaque
-
--- | How the output is taken apart: a record is told from a pair by its first part, which is a field.
-type family ShapeOf (o :: Type) :: Shape where
-  ShapeOf (name := a, rest) = 'Fields
-  ShapeOf (name := a) = 'Fields
-  ShapeOf (a, b) = 'Positions
-  ShapeOf o = 'Opaque
-
--- | Whether a value that is a part of a pair is a pair that goes on.
-type family Continues (o :: Type) :: Bool where
-  Continues o = ContinuesAs (ShapeOf o)
-
--- | Whether a value that is taken apart by position goes on.
-type family ContinuesAs (shape :: Shape) :: Bool where
-  ContinuesAs 'Positions = 'True
-  ContinuesAs shape = 'False
-
--- | The names in the flow that a list of entries gives, in order: the entries that are not @"_"@.
-type family Given (entries :: [Symbol]) :: [Symbol] where
-  Given '[] = '[]
-  Given (entry ': entries) = Keep (Source entry) (Given entries)
-
--- | The name in front of the others, unless it is @"_"@.
-type family Keep (name :: Symbol) (more :: [Symbol]) :: [Symbol] where
-  Keep "_" more = more
-  Keep name more = name ': more
-
--- | What is said of a name that a list has twice.
-type Twice name = 'Text "The pattern has the name " ':<>: 'ShowType name ':<>: 'Text " twice"
-
--- | No name is twice in the list.
-type family Distinct (more :: [Symbol]) :: Constraint where
-  Distinct '[] = ()
-  Distinct (name ': rest) = (NotTwice name rest, Distinct rest)
-
--- | The name is not one of the names.
-type family NotTwice (name :: Symbol) (more :: [Symbol]) :: Constraint where
-  NotTwice name '[] = ()
-  NotTwice name (name ': rest) = TypeError (Twice name)
-  NotTwice name (other ': rest) = NotTwice name rest
-
--- | The flow doesn't have any of the names.
-type family AllFresh (more :: [Symbol]) (r :: Type) :: Constraint where
-  AllFresh '[] r = ()
-  AllFresh (name ': rest) r = (Fresh name r, AllFresh rest r)
-
--- | What is said of an output that a list of names can't take apart.
-type Whole = 'Text "The output of the step is neither a record nor a pair, so a list of names can't take it apart"
-
--- | What is said of a list that has fewer names than the parts of a pair.
-type TooFew = 'Text "The pattern has too few names for the output of the step"
-
--- | What is said of a list that has more names than the parts of a pair.
-type TooMany = 'Text "The pattern has too many names for the output of the step"
-
--- | What is said of a field that is named for a pair, which has none.
-type NotFields entry =
-  'Text "The output of the step is a pair, taken apart by position: "
-    ':<>: 'ShowType (Port entry)
-    ':<>: 'Text " =: "
-    ':<>: 'ShowType (Source entry)
-    ':<>: 'Text " names a field, and a pair has none"
-
--- | An entry for a pair is a name, and not a field and a name.
-type family ByPosition (entry :: Symbol) :: Constraint where
-  ByPosition entry = ByPositionOf (Break '=' entry) entry
-
--- | The entry, from a split at its first @=@.
-type family ByPositionOf (split :: (Symbol, Maybe Symbol)) (entry :: Symbol) :: Constraint where
-  ByPositionOf '(before, 'Nothing) entry = ()
-  ByPositionOf '(before, 'Just after) entry = TypeError (NotFields entry)
-
--- | The record of the flow after a step whose output is taken apart by a list of entries: in front of it the names that
--- the entries give, in the order of the list. How the output is taken apart is its shape.
-class Pattern (shape :: Shape) (entries :: [Symbol]) (o :: Type) (x :: Type) (y :: Type) | shape entries o x -> y where
-  -- | The record of the flow after the step: the names of the entries in front of the record that it had.
-  takeApart :: o -> x -> y
-
--- | A record: each entry is a field of it, and the fields that the list doesn't have are not kept.
-instance Pattern 'Fields '[] o x x where
-  takeApart _ x = x
-  {-# INLINE takeApart #-}
-
-instance
-  (Dig 'InPattern (Port entry) '[] o a, Pattern 'Fields entries o x rest, Place (Source entry) a rest y) =>
-  Pattern 'Fields (entry ': entries) o x y
-  where
-  takeApart o x = putFirst @(Source entry) (dig @'InPattern @(Port entry) @'[] o) (takeApart @'Fields @entries o x)
-  {-# INLINE takeApart #-}
-
--- | A pair, or pairs that nest to the right: each entry is a part of it.
-instance (Spread 'True entries o x y) => Pattern 'Positions entries o x y where
-  takeApart = spread @'True @entries
-  {-# INLINE takeApart #-}
-
-instance (y ~ TypeError Whole) => Pattern 'Opaque entries o x y where
-  takeApart _ _ = error "Network.Streaming.Wiring: a list of names for an output that has no parts is a type error"
-
--- | The record of the flow after a value is taken apart by position: a value that is a pair, when the first of its
--- parts is the first of the entries, and the rest of the value is the rest of them.
-class Spread (pair :: Bool) (entries :: [Symbol]) (o :: Type) (x :: Type) (y :: Type) | pair entries o x -> y where
-  -- | The record of the flow after the value: the names of the entries in front of the record that it had.
-  spread :: o -> x -> y
-
--- | The last entry is the last part, which is a value that goes on no further.
-instance (ByPosition entry, Place (Source entry) o x y) => Spread 'False '[entry] o x y where
-  spread = putFirst @(Source entry)
-  {-# INLINE spread #-}
-
--- | More entries than parts.
-instance (y ~ TypeError TooMany) => Spread 'False (entry ': next ': entries) o x y where
-  spread _ _ = error "Network.Streaming.Wiring: a list that has too many names is a type error"
-
--- | A pair whose rest is left without an entry.
-instance (y ~ TypeError TooFew) => Spread 'True '[entry] o x y where
-  spread _ _ = error "Network.Streaming.Wiring: a list that has too few names is a type error"
-
-instance
-  (ByPosition entry, Spread (Continues b) (next ': entries) b x rest, Place (Source entry) a rest y) =>
-  Spread 'True (entry ': next ': entries) (a, b) x y
-  where
-  spread (a, b) x = putFirst @(Source entry) a (spread @(Continues b) @(next ': entries) b x)
-  {-# INLINE spread #-}
-
--- | The name of a part, in front of the record of the flow: unless it is @"_"@, which keeps nothing.
-class Place (name :: Symbol) (a :: Type) (rest :: Type) (y :: Type) | name a rest -> y where
-  putFirst :: a -> rest -> y
-
-instance {-# OVERLAPPING #-} Place "_" a rest rest where
-  putFirst _ rest = rest
-  {-# INLINE putFirst #-}
-
-instance (y ~ (name := a, rest)) => Place name a rest y where
-  putFirst a rest = (Is a, rest)
-  {-# INLINE putFirst #-}
-
 -- * Bindings
-
--- | What a binding is written as when it has both sides: the port, and the name in the flow.
-type family (port :: Symbol) =: (name :: Symbol) :: Symbol where
-  port =: name = AppendSymbol port (AppendSymbol "=" name)
 
 -- | A split of a symbol at the first of a character: what comes before it, and what comes after, if it was there.
 type family Break (c :: Char) (s :: Symbol) :: (Symbol, Maybe Symbol) where
@@ -442,6 +337,23 @@ type family PathOf (split :: (Symbol, Maybe Symbol)) :: [Symbol] where
 type family Ports (bindings :: [Symbol]) :: [Symbol] where
   Ports '[] = '[]
   Ports (binding ': bindings) = Port binding ': Ports bindings
+
+-- | What is said of a binding that is a pattern: a list of names, and @\@:@, take a value apart, which is for the left of
+-- '<:'.
+type Pattern_ binding =
+  'Text "A binding reads a name of the flow, and not a pattern: "
+    ':<>: 'ShowType binding
+    ':<>: 'Text " takes a value apart, which is for the left of <:"
+
+-- | No binding is a pattern: a list of names, and @\@:@, are for the left of '<:'.
+type family Plain (bindings :: [Symbol]) :: Constraint where
+  Plain '[] = ()
+  Plain (binding ': bindings) = (Reads (Break '(' binding) binding, Plain bindings)
+
+-- | The binding, from a split at its first parenthesis, which every list of names and every @\@:@ has.
+type family Reads (split :: (Symbol, Maybe Symbol)) (binding :: Symbol) :: Constraint where
+  Reads '(before, 'Nothing) binding = ()
+  Reads '(before, 'Just after) binding = TypeError (Pattern_ binding)
 
 -- | What is said of a port that two bindings have.
 type BoundTwice port = 'Text "Input " ':<>: 'ShowType port ':<>: 'Text " of the step is bound twice"
@@ -524,97 +436,3 @@ class Fetch (path :: [Symbol]) x a | path x -> a where
 instance (Dig 'InFlow name fields x a) => Fetch (name ': fields) x a where
   fetch = dig @'InFlow @name @fields
   {-# INLINE fetch #-}
-
--- * Names
-
--- | Where a name is looked for, which says what is said when it is not there.
-data Where
-  = -- | In the record of the flow.
-    InFlow
-  | -- | In the output of the step that has the name.
-    InOutput Symbol
-  | -- | Among the ports of the input of a step.
-    Unbound
-  | -- | Among the fields of the output of a step that a list of names takes apart.
-    InPattern
-
--- | What is said of a name that isn't there.
-type family Absence (place :: Where) (name :: Symbol) :: ErrorMessage where
-  Absence 'InFlow name = 'Text "The flow has no name " ':<>: 'ShowType name
-  Absence ('InOutput step) name =
-    'Text "The step " ':<>: 'ShowType step ':<>: 'Text " has no output " ':<>: 'ShowType name
-  Absence 'Unbound name = 'Text "Input " ':<>: 'ShowType name ':<>: 'Text " of the step isn't bound"
-  Absence 'InPattern name = 'Text "The output of the step has no field " ':<>: 'ShowType name
-
--- | Where the fields of the value that has the name are looked for: in the output of the step of that name.
-type family Below (place :: Where) (name :: Symbol) :: Where where
-  Below 'InFlow name = 'InOutput name
-  Below ('InOutput step) name = 'InOutput (AppendSymbol step (AppendSymbol "." name))
-
--- | The value of the field of the name in a record that nests to the right, as 'getField' reads it, and then of the
--- fields of the path that are left, in that value. A record that has no field of the name is the error that the place
--- says. The instance that finds the field gives the type of its value, so that what is left is looked for in a type
--- that is known.
-class Dig (place :: Where) (name :: Symbol) (fields :: [Symbol]) r a | place name fields r -> a where
-  dig :: r -> a
-
--- | The first field, when it has the name: the newest field of a name is the one that is read.
-instance {-# OVERLAPPING #-} (Onward place name fields v a) => Dig place name fields (name := v, rest) a where
-  dig (Is v, _) = onward @place @name @fields v
-  {-# INLINE dig #-}
-
--- | A later field, found in the rest.
-instance (Dig place name fields rest a) => Dig place name fields (other := b, rest) a where
-  dig (_, rest) = dig @place @name @fields rest
-  {-# INLINE dig #-}
-
--- | The last field, when it has the name.
-instance {-# OVERLAPPING #-} (Onward place name fields v a) => Dig place name fields (name := v) a where
-  dig (Is v) = onward @place @name @fields v
-  {-# INLINE dig #-}
-
--- | The last field, when it has another name: the record has no field of the name.
-instance
-  {-# OVERLAPPABLE #-}
-  (a ~ TypeError (Absence place name)) =>
-  Dig place name fields (other := b) a
-  where
-  dig _ = error "Network.Streaming.Wiring: a name that the flow doesn't have is a type error"
-
--- | A record that is not made of the fields of this module: the record that a flow is run on, which is any record that
--- has the names that the steps read, or a value of a type of its own that a step gave. A field of it is read by its own
--- 'HasField'. The instance is chosen at once for a record that is not known yet, which is read all the same, but a
--- name that it doesn't have is then not said as it is here.
-instance {-# INCOHERENT #-} (HasField name r v, Onward place name fields v a) => Dig place name fields r a where
-  dig r = onward @place @name @fields (getField @name r)
-  {-# INLINE dig #-}
-
--- | What is left of a path, from the value of the name that was found: the value itself if nothing is left, and else
--- the next field of that value.
-class Onward (place :: Where) (name :: Symbol) (fields :: [Symbol]) v a | place name fields v -> a where
-  onward :: v -> a
-
-instance (a ~ v) => Onward place name '[] v a where
-  onward v = v
-  {-# INLINE onward #-}
-
-instance (Dig (Below place name) field fields v a) => Onward place name (field ': fields) v a where
-  onward = dig @(Below place name) @field @fields
-  {-# INLINE onward #-}
-
--- | What is said of a step whose name the flow has already.
-type Repeated name = 'Text "The flow already has the name " ':<>: 'ShowType name
-
--- | The record of the flow doesn't have the name yet.
-class Fresh (name :: Symbol) (r :: Type)
-
-instance {-# OVERLAPPING #-} (TypeError (Repeated name)) => Fresh name (name := a, rest)
-
-instance (Fresh name rest) => Fresh name (other := a, rest)
-
-instance {-# OVERLAPPING #-} (TypeError (Repeated name)) => Fresh name (name := a)
-
-instance {-# OVERLAPPABLE #-} Fresh name (other := a)
-
--- | A record that isn't made of fields of this module: its fields aren't known.
-instance {-# INCOHERENT #-} Fresh name r

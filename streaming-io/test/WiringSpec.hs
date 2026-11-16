@@ -3,10 +3,10 @@
 
 -- | Steps wired by name: a flow of lines, each of which makes the input of its step from the names of the flow, runs in
 -- each arrow that runs programs and gives what its steps give, a choice is a line of a flow whose branches are lines, and
--- a list of names takes the output of a step apart. That a name that the flow doesn't have, an output that a step doesn't
--- give, a port that is not bound or is bound twice, and a name that the flow has already don't compile, in a branch of a
--- choice too, and that a list of names that doesn't fit the output of its step doesn't, is checked by
--- @test/check-wiring.sh@.
+-- a pattern takes the output of a step apart, and the value of a case: a list of names, a name that is kept whole and
+-- taken apart, and patterns that nest. That a name that the flow doesn't have, an output that a step doesn't give, a port
+-- that is not bound or is bound twice, and a name that the flow has already don't compile, in a branch of a choice too,
+-- and that a pattern that doesn't fit the output of its step doesn't, is checked by @test/check-wiring.sh@.
 module WiringSpec (spec) where
 
 import Control.Arrow (arr, (>>>), (>>^), (|||))
@@ -14,8 +14,10 @@ import Control.Monad (forM_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import GHC.Records (HasField)
 import Network.Streaming.Classes
+import Network.Streaming.Combinators (decide)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
+import qualified Network.Streaming.Internal.Patterns as Patterns
 import Network.Streaming.Loop (runLoop)
 import Network.Streaming.Named
 import Network.Streaming.Threads
@@ -35,6 +37,13 @@ runners =
     Runner "compiled" (\program -> fst <$> runCompiled program ()),
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
+
+-- | The stubs of a name that is kept whole and taken apart, of patterns that nest, of the last name that takes what is left
+-- of a pair, and of a branch with a pattern fail with 'NotImplemented': the cases that need them are expected to fail, and
+-- the marks come off when the code is there. The branch is the one of "Network.Streaming.Internal.Patterns" until it
+-- replaces the branch of "Network.Streaming.Named".
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: as-patterns, nested patterns and branch patterns are not written yet"
 
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
@@ -109,6 +118,59 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
     run (inputs >>> tallied noted) `shouldReturn` 7
     readLog noted `shouldReturn` ["ran"]
 
+  stubbed $ it "keeps the output whole under a name and takes it apart too, a pair by position and a record by its fields" $ do
+    run (sized 17 >>> flow ("qr" @: ["q", "r"] <: divider -< ["a", "b"]) >>^ \r -> (r.qr, r.q, r.r))
+      `shouldReturn` ((4, 1), 4, 1)
+    run (inputs >>> flow ("parts" @: ["sum", "prod"] <: splitter -< ["a", "b"]) >>^ \r -> (r.parts.sum, r.sum, r.prod))
+      `shouldReturn` (7, 7, 12)
+
+  stubbed $ it "takes a field of a record apart by a list, and a field of that, to any depth, and keeps only the names of the parts" $ do
+    run (inputs >>> flow (["inner" =: ["leaf", "twin"], "other"] <: nester -< ["n" =: "b"]) >>^ \r -> (r.leaf, r.twin, r.other))
+      `shouldReturn` (40, 4, 0)
+    run
+      ( inputs
+          >>> flow (["outer" =: ["middle" =: ["core"], "side"], "top"] <: deeper -< ["n" =: "b"])
+          >>^ \r -> (r.core, r.side, r.top)
+      )
+      `shouldReturn` (4, 6, 7)
+
+  stubbed $ it "keeps a part under a name and takes it apart too, and keeps a part under another name" $
+    run
+      ( inputs
+          >>> flow (["inner" =: "i" @: ["leaf", "twin"], "other" =: "o"] <: nester -< ["n" =: "b"])
+          >>^ \r -> (r.i.leaf, r.leaf, r.twin, r.o)
+      )
+      `shouldReturn` (40, 40, 4, 0)
+
+  stubbed $ it "takes a part of a pair apart by position, whatever the part is, and a pair's last name takes what is left" $ do
+    run
+      ( inputs
+          >>> flow (["_" @: ["x", "y"], "both" @: ["sum", "prod"]] <: mixed -< ["a", "b"])
+          >>^ \r -> (r.x, r.y, r.sum, r.prod, r.both.sum)
+      )
+      `shouldReturn` (3, 4, 7, 12, 7)
+    run (inputs >>> flow (["first", "rest"] <: tripler -< ["a", "b"]) >>^ \r -> (r.first, r.rest))
+      `shouldReturn` (3, (4, 7))
+    run (inputs >>> flow (["first", "second", "last"] <: tripler -< ["a", "b"]) >>^ \r -> (r.first, r.second, r.last))
+      `shouldReturn` (3, 4, 7)
+    run (sized 17 >>> flow (["only"] <: divider -< ["a", "b"]) >>^ \r -> r.only) `shouldReturn` (4, 1)
+
+  stubbed $ it "reads the names of the parts in the steps after it" $
+    run (inputs >>> nestedNames) `shouldReturn` 44
+
+  stubbed $ it "runs the branch of the case that a choice finds, which takes the value of its case apart by its pattern" $ do
+    -- A name, a list for a pair, a name that is kept and takes a record apart, and a case with no pattern.
+    run (sized 3 >>> branched) `shouldReturn` 7
+    run (sized 45 >>> branched) `shouldReturn` 9
+    run (sized 123 >>> branched) `shouldReturn` 24
+    run (sized 5000 >>> branched) `shouldReturn` 99
+
+  stubbed $ it "takes the value of a case apart by a pattern outside a flow, and a case with no pattern binds nothing" $ do
+    run (outside 3) `shouldReturn` 13
+    run (outside 45) `shouldReturn` 30
+    run (outside 123) `shouldReturn` 34
+    run (outside 5000) `shouldReturn` 10
+
   it "reads the names of a record that is not known, for a flow that is a step of its own" $ do
     run (inputs >>> anyRecord) `shouldReturn` 14
     run (newRecord ["extra", "b", "a"] <$> arr (const 'x') <*> arr (const 5) <*> arr (const 1) >>> anyRecord)
@@ -145,6 +207,25 @@ divider = now (\r -> pure (r.a `div` r.b, r.a `mod` r.b))
 -- | A step that reads its ports "a" and "b", and gives pairs that nest to the right: "a", "b" and their sum.
 tripler :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => arr r (Int, (Int, Int))
 tripler = now (\r -> pure (r.a, (r.b, r.a + r.b)))
+
+-- | A step that reads its port "n", and gives records in records, three deep.
+deeper ::
+  (Effect arr, HasField "n" r Int) =>
+  arr r ("outer" := ("middle" := ("core" := Int, "rim" := Int), "side" := Int), "top" := Int)
+deeper =
+  now
+    ( \r ->
+        pure
+          ( newRecord
+              ["outer", "top"]
+              (newRecord ["middle", "side"] (newRecord ["core", "rim"] r.n (r.n + 1)) (r.n + 2))
+              (r.n + 3)
+          )
+    )
+
+-- | A step that reads its ports "a" and "b", and gives a pair whose first part is a pair and whose second is a record.
+mixed :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => arr r ((Int, Int), ("sum" := Int, "prod" := Int))
+mixed = now (\r -> pure ((r.a, r.b), newRecord ["sum", "prod"] (r.a + r.b) (r.a * r.b)))
 
 -- | A step that notes that it ran, reads its ports "a" and "b", and gives them as a pair.
 tallying :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => Log -> arr r (Int, Int)
@@ -316,6 +397,61 @@ tallied noted =
     ( ["x", "y"] <: tallying noted -< ["a", "b"]
         >>> "total" <: adder -< ["a" =: "x", "b" =: "y"]
     )
+
+-- | A whole that is kept and taken apart by a pattern that nests, which later steps read the names of.
+nestedNames :: (Steps arr) => arr ("a" := Int, "b" := Int) Int
+nestedNames =
+  result
+    "total"
+    ( "whole" @: ["inner" =: ["leaf", "twin"], "other"] <: nester -< ["n" =: "b"]
+        >>> "leaves" <: adder -< ["a" =: "leaf", "b" =: "twin"]
+        >>> "total" <: adder -< ["a" =: "leaves", "b" =: "other"]
+    )
+
+-- | The sum that 'binner' gives, which has a number, a pair, a record and nothing in its cases.
+type Bins =
+  Either ("small" := Int) (Either ("big" := (Int, Int)) (Either ("huge" := ("lo" := Int, "hi" := Int)) ("none" := ())))
+
+-- | A step that reads its port "n", and gives the bin that it is in.
+binner :: (Effect arr, HasField "n" r Int) => arr r Bins
+binner = now (\r -> pure (binsOf r.n))
+
+-- | The bin of a number.
+binsOf :: Int -> Bins
+binsOf n
+  | n < 10 = inj "small" n
+  | n < 100 = inj "big" (n `div` 10, n `mod` 10)
+  | n < 1000 = inj "huge" (newRecord ["lo", "hi"] (n `div` 100) (n `mod` 100))
+  | otherwise = inj "none" ()
+
+-- | A choice whose branches take their case apart by a name, by a list for a pair, by a name that takes a record apart
+-- too, and not at all.
+branched :: (Steps arr) => arr ("a" := Int, "b" := Int) Int
+branched =
+  result
+    "picked"
+    ( "bin" <: binner -< ["n" =: "a"]
+        >>> "picked"
+          <: choice
+            "which bin?"
+            "bin"
+            ( "small" =: "s" Patterns.?> adder -< ["a" =: "s", "b"]
+                ||| "big" =: ["x", "y"] Patterns.?> adder -< ["a" =: "x", "b" =: "y"]
+                ||| "huge" =: "h" @: ["lo", "hi"] Patterns.?> adder -< ["a" =: "h.lo", "b" =: "hi"]
+                ||| "none" Patterns.?> constant 99 -< []
+            )
+    )
+
+-- | The same bins taken apart by branches outside a flow, which add a field of the record that was decided on.
+outside :: (Steps arr) => Int -> arr () Int
+outside n =
+  newRecord ["bin", "extra"] <$> arr (const (binsOf n)) <*> arr (const 10)
+    >>> decide "which bin?" (cases "bin")
+    >>> ( "small" =: "s" Patterns.?> arr (\r -> r.s + r.extra)
+            ||| "big" =: ["x", "y"] Patterns.?> arr (\r -> r.x * r.y + r.extra)
+            ||| "huge" =: "h" @: ["lo", "hi"] Patterns.?> arr (\r -> r.h.hi + r.lo + r.extra)
+            ||| "none" Patterns.?> arr (\r -> r.extra)
+        )
 
 -- | A flow over any record that has the names that its steps read, which is a step of its own.
 anyRecord :: (Steps arr, HasField "a" r Int, HasField "b" r Int) => arr r Int

@@ -15,9 +15,10 @@ import Network.Streaming.Combinators (_Just, box, decide, done, step, tap, withI
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (..))
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
+import qualified Network.Streaming.Internal.Patterns as Patterns
 import Network.Streaming.Named (adding, at, cases, field, inj, is, newRecord, (:=), (?>))
 import Network.Streaming.Plumbing (each, prism)
-import Network.Streaming.Wiring (choice, result, type (=:), (-<), (<:))
+import Network.Streaming.Wiring (choice, result, type (=:), type (@:), (-<), (<:))
 import Skeletest
 
 -- | A step that never waits.
@@ -47,6 +48,17 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 -- emoji (U+FE0E), and a space.
 gear :: String
 gear = "\x2699\xFE0E "
+
+-- | The stubs of a name that is kept whole and taken apart, of patterns that nest, and of a branch with a pattern fail with
+-- 'NotImplemented': the cases that need only them are expected to fail, and the marks come off when the code is there.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: as-patterns, nested patterns and branch patterns are not written yet"
+
+-- | The code that draws the names of a pattern as boxes, nested as the pattern nests, each with the edges that leave it, and
+-- the edges that say only the order as dotted ones, is not written yet: the cases that need it are expected to fail, and
+-- the marks come off when the code is there.
+unwritten :: Spec -> Spec
+unwritten = xfail "Network.Streaming.Diagram.Mermaid draws no boxes for the names of a pattern yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -170,99 +182,150 @@ spec = describe "the chart" $ do
     -- The step that gives nothing is no box of its own.
     subgraphTitled "note" chart `shouldBe` Nothing
 
-  it "has the question of a choice in the box of its line" $ do
+  stubbed $ it "has the question of a choice in the box of its line" $ do
     chart <- chartOf choosing
     case subgraphTitled "picked" chart of
       Just (_, inside) -> any ("{\"how big?\"}" `isInfixOf`) inside `shouldBe` True
       Nothing -> failTest "the chart has no box for the line of the choice"
 
-  it "has an edge into a step of a flow from the step that gives each name that it binds, and from the start for the names of the input, past the steps between" $ do
+  unwritten $ it "has an edge into a step of a flow from the box of each name that it binds, and from the start for the names of the input, past the steps between" $ do
     chart <- chartOf fanning
     -- The name "i" is read by the first step and the last, so it leaves the start twice.
     edgesNamed chart
       `shouldBe` sort
         [ ("start", "alpha", "i"),
           ("start", "gamma", "i"),
-          ("alpha", "beta", "a"),
-          ("beta", "gamma", "b"),
+          ("a", "beta", ""),
+          ("b", "gamma", ""),
           ("gamma", "end", "")
         ]
 
-  it "has on an edge the names that a step binds from one producer, in the order that they are bound, with the field of a path alone and a port that is another name after the name" $ do
+  unwritten $ it "has on an edge from a box that is a whole the field of a path alone and a port that is another name after it, and the names of one producer on one edge" $ do
     chart <- chartOf ports
     edgesNamed chart
       `shouldBe` sort
         [ ("start", "pair", "i"),
           ("start", "sum", "j \x2192 k, j"),
-          ("pair", "sum", "x \x2192 n, y \x2192 m"),
+          ("first", "sum", "x \x2192 n, y \x2192 m"),
           ("sum", "end", "")
         ]
 
-  it "has an edge with no label from the step before to a step that binds nothing from it, and none to a step that does" $ do
+  unwritten $ it "has an edge that is dotted from the step before to a step that binds nothing from it, and none to a step that does" $ do
     chart <- chartOf quiet
-    -- "note" gives nothing, so "beta" cannot read it: its edge says only the order. "note" reads "alpha": its edge says what.
+    -- "note" gives nothing, so "beta" cannot read it: its edge says only the order. "note" reads "alpha": its edge is of the name.
     edgesNamed chart
       `shouldBe` sort
         [ ("start", "alpha", "i"),
           ("start", "beta", "j"),
-          ("alpha", "note", "a \x2192 n"),
-          ("note", "beta", ""),
+          ("a", "note", "\x2192 n"),
           ("beta", "end", "")
         ]
+    orderEdges chart `shouldBe` [("note", "beta")]
+    -- The order edge has a style of its own: it is dotted and drawn in grey, as a data edge never is.
+    any (\line -> "linkStyle" `isPrefixOf` line && "stroke:#8c959f" `isInfixOf` line) (stripped chart) `shouldBe` True
 
-  it "has on the edge from a decision to a branch only its case, and the names that the branch binds on the edges from where they come" $ do
+  unwritten $ it "has a box for each name of a pattern of a choice's branch beside its step, and an edge to the step from the exact box that it reads, with the case on the edge from the decision" $ do
     chart <- chartOf choosing
+    case subgraphTitled "picked" chart of
+      Just (_, inside) -> do
+        [length (boxesDeclared name inside) | name <- ["s", "x", "y", "lo", "hi"]] `shouldBe` [1, 1, 1, 1, 1]
+        -- A name that is kept and taken apart is a box of its own, which has the names of its parts.
+        case subgraphTitled "h" inside of
+          Just (_, parts) -> [length (boxesDeclared name parts) | name <- ["lo", "hi", "s"]] `shouldBe` [1, 1, 0]
+          Nothing -> failTest "the choice has no box for the name that is kept and taken apart"
+        -- A case that has no pattern has no box.
+        subgraphTitled "none" inside `shouldBe` Nothing
+      Nothing -> failTest "the chart has no box for the line of the choice"
     edgesNamed chart
       `shouldBe` sort
         [ ("start", "size up", "i"),
-          ("size up", "how big?", "size"),
+          ("size", "how big?", ""),
           ("how big?", "take", "small"),
           ("how big?", "add", "big"),
-          ("how big?", "zero", "huge"),
-          ("start", "add", "j"),
+          ("how big?", "span", "huge"),
+          ("how big?", "zero", "none"),
+          ("s", "take", "\x2192 n"),
+          ("x", "add", "\x2192 n"),
+          ("y", "add", "\x2192 m"),
+          ("lo", "span", "\x2192 n"),
+          ("h", "span", "hi \x2192 m"),
+          ("start", "span", "j"),
           ("take", "IO", ""),
           ("add", "IO", ""),
+          ("span", "IO", ""),
           ("zero", "IO", ""),
           ("IO", "end", "")
         ]
 
-  it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
+  unwritten $ it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
     chart <- chartOf nesting
-    -- The inner flow reads its own "n", which the outer step binds: it is drawn from the start of the inner flow, a junction
-    -- that the edge of the outer step goes to, and not from the step "first" of the outer flow.
+    -- The inner flow reads its own "n", which the outer step binds: it is drawn from the box of "n" to the start of the inner
+    -- flow, a junction, and not from the step "first" of the outer flow.
     edgesNamed chart
       `shouldBe` sort
         [ ("start", "first", "i"),
-          ("first", "junction", "n"),
+          ("n", "junction", ""),
           ("junction", "tail", "n"),
           ("tail", "end", "")
         ]
 
-  it "has the names that a list takes a step's output apart into for the title of its box, comma-separated" $ do
-    chart <- chartOf dividing
-    case subgraphTitled "q, r" chart of
-      Just (_, inside) -> length (nodesDeclared (gear ++ "divide") inside) `shouldBe` 1
-      Nothing -> failTest "the chart has no box for the step that gives the names q and r"
-    -- A name that is a field under another name is the name in the flow, and a field that the list leaves out is not one.
-    chart' <- chartOf renaming
-    (subgraphTitled "left, z" chart' == Nothing, subgraphTitled "x, z" chart' == Nothing) `shouldBe` (False, True)
+  unwritten $ it "has a box for each name of a pattern, nested as the pattern nests, with the step in the box of its whole" $ do
+    chart <- chartOf nestedNames
+    case subgraphTitled "conn" chart of
+      Nothing -> failTest "the chart has no box for the whole"
+      Just (_, inside) -> do
+        length (nodesDeclared (gear ++ "accept") inside) `shouldBe` 1
+        -- "socket" is taken apart and not kept: a box with the titles of its parts, which are small nodes.
+        case subgraphTitled "socket" inside of
+          Just (_, parts) -> ([length (boxesDeclared name parts) | name <- ["fd", "addr", "peer"]]) `shouldBe` [1, 1, 0]
+          Nothing -> failTest "the whole has no box for the field that is taken apart"
+        length (boxesDeclared "peer" inside) `shouldBe` 1
+    -- A step that gives a name of its own is a box beside it, and not in the box of the whole.
+    (subgraphTitled "tuned" chart == Nothing, subgraphTitled "c" chart == Nothing) `shouldBe` (False, False)
 
-  it "has an edge from the step that gives the names of a list to each step that binds them, with the names of one step on one edge" $ do
+  unwritten $ it "has an edge from the box of the exact name that a step reads: a part, a whole, and a part of a whole by a path, with the port that is another name" $ do
+    chart <- chartOf nestedNames
+    edgesNamed chart
+      `shouldBe` sort
+        [ ("start", "accept", "i, j"),
+          ("fd", "tune", "\x2192 n"),
+          ("conn", "serve", "peer \x2192 a"),
+          ("peer", "serve", "\x2192 b"),
+          ("addr", "serve", "\x2192 c"),
+          ("tuned", "serve", "\x2192 d"),
+          ("serve", "end", "")
+        ]
+    orderEdges chart `shouldBe` []
+
+  unwritten $ it "has a box that has no title for the step and the names of a list, and no box for a field that the list leaves out" $ do
     chart <- chartOf dividing
-    -- "q" and "r" come from "divide": the step "mix" binds both on one edge, and "plus" binds "q" under its port.
+    case subgraphTitled " " chart of
+      Just (_, inside) -> do
+        length (nodesDeclared (gear ++ "divide") inside) `shouldBe` 1
+        [length (boxesDeclared name inside) | name <- ["q", "r"]] `shouldBe` [1, 1]
+      Nothing -> failTest "the chart has no box for the step that gives the names q and r"
+    -- A field under another name is a box of that name, and a field that the list leaves out has none.
+    chart' <- chartOf renaming
+    ([length (boxesDeclared name chart') | name <- ["left", "z", "x", "y"]]) `shouldBe` [1, 1, 0, 0]
+
+  unwritten $ it "has an edge from the box of each name of a list to each step that reads it" $ do
+    chart <- chartOf dividing
+    -- "q" and "r" are boxes beside "divide": "mix" reads both, and "plus" reads "q" under its port.
     edgesNamed chart
       `shouldBe` sort
         [ ("start", "divide", "i, j"),
-          ("divide", "plus", "q \x2192 n"),
-          ("divide", "mix", "q, r"),
-          ("plus", "mix", "s"),
+          ("q", "plus", "\x2192 n"),
+          ("q", "mix", ""),
+          ("r", "mix", ""),
+          ("s", "mix", ""),
           ("mix", "end", "")
         ]
     chart' <- chartOf renaming
     edgesNamed chart'
       `shouldBe` sort
         [ ("start", "make", "i, j"),
-          ("make", "use", "left, z"),
+          ("left", "use", ""),
+          ("z", "use", ""),
           ("use", "end", "")
         ]
 
@@ -272,15 +335,15 @@ spec = describe "the chart" $ do
       page : _ -> pagePlumbing page `shouldBe` pageMermaid page
       [] -> failTest "the program has no page"
 
-  it "has the edges that a flow has from the start from the step before it instead, when that is the one node that leads into it" $ do
+  unwritten $ it "has the edges that a flow has from the start from the step before it instead, when that is the one node that leads into it" $ do
     chart <- chartOf (tap quick >>> fanning)
     edgesNamed chart
       `shouldBe` sort
         [ ("start", "IO", ""),
           ("IO", "alpha", "i"),
           ("IO", "gamma", "i"),
-          ("alpha", "beta", "a"),
-          ("beta", "gamma", "b"),
+          ("a", "beta", ""),
+          ("b", "gamma", ""),
           ("gamma", "end", "")
         ]
 
@@ -349,8 +412,8 @@ wired =
     )
     >>> quick
 
--- | A flow whose last line is a choice of three cases, which has a name: the branches bind the value of their case and an
--- input of the flow, and nothing.
+-- | A flow whose last line is a choice of four cases, which has a name: the branches take the value of their case apart by a
+-- name, by a list for a pair, by a name that is kept and takes a record apart, and not at all.
 choosing :: Diagram ("i" := Int, "j" := Int) ()
 choosing =
   result
@@ -360,15 +423,22 @@ choosing =
           <: choice
             "how big?"
             "size"
-            ( "small" ?> step "take" (\r -> pure (getField @"n" r)) -< ["n" =: "small"]
-                ||| "big" ?> step "add" (\r -> pure (getField @"n" r + getField @"j" r)) -< ["n" =: "big", "j"]
-                ||| "huge" ?> step "zero" (const (pure 0)) -< []
+            ( "small" =: "s" Patterns.?> step "take" (\r -> pure (getField @"n" r)) -< ["n" =: "s"]
+                ||| "big" =: ["x", "y"] Patterns.?> step "add" (\r -> pure (getField @"n" r + getField @"m" r)) -< ["n" =: "x", "m" =: "y"]
+                ||| "huge" =: "h" @: ["lo", "hi"]
+                  Patterns.?> step "span" (\r -> pure (getField @"n" r + getField @"m" r + getField @"j" r))
+                  -< ["n" =: "lo", "m" =: "h.hi", "j"]
+                ||| "none" Patterns.?> step "zero" (const (pure 0)) -< []
             )
     )
     >>> quick
   where
-    sizeOf :: Int -> Either ("small" := Int) (Either ("big" := Int) ("huge" := Int))
-    sizeOf n = if n < 10 then inj "small" n else if n < 100 then inj "big" n else inj "huge" n
+    sizeOf :: Int -> Either ("small" := Int) (Either ("big" := (Int, Int)) (Either ("huge" := ("lo" := Int, "hi" := Int)) ("none" := ())))
+    sizeOf n
+      | n < 10 = inj "small" n
+      | n < 100 = inj "big" (n `div` 10, n `mod` 10)
+      | n < 1000 = inj "huge" (newRecord ["lo", "hi"] (n `div` 100) (n `mod` 100))
+      | otherwise = inj "none" ()
 
 -- | A flow of three steps over two inputs, where the first and the last read the same name of the input, and the one between
 -- them reads the first.
@@ -422,6 +492,20 @@ renaming =
     "c"
     ( ["x" =: "left", "z"] <: step "make" (\r -> pure (newRecord ["x", "y", "z"] (getField @"i" r) (0 :: Int) (getField @"j" r))) -< ["i", "j"]
         >>> "c" <: step "use" (\r -> pure (getField @"left" r + getField @"z" r)) -< ["left", "z"]
+    )
+
+-- | A flow whose first step gives a record that a name keeps whole and takes apart, a field of it apart again, and the steps
+-- after it read a part, a whole by a path, and a name of a step.
+nestedNames :: Diagram ("i" := Int, "j" := Int) Int
+nestedNames =
+  result
+    "c"
+    ( "conn" @: ["socket" =: ["fd", "addr"], "peer"]
+        <: step "accept" (\r -> pure (newRecord ["socket", "peer"] (newRecord ["fd", "addr"] (getField @"i" r) (0 :: Int)) (getField @"j" r))) -< ["i", "j"]
+        >>> "tuned" <: step "tune" (\r -> pure (getField @"n" r + 1)) -< ["n" =: "fd"]
+        >>> "c"
+          <: step "serve" (\r -> pure (getField @"a" r + getField @"b" r + getField @"c" r + getField @"d" r))
+          -< ["a" =: "conn.peer", "b" =: "peer", "c" =: "addr", "d" =: "tuned"]
     )
 
 -- | A flow whose second step is a flow of its own, which reads the port "n" of its step.
@@ -513,6 +597,14 @@ wiresNamed name = length . filter (("|\"" ++ name ++ "\"|") `isInfixOf`) . strip
 edgesNamed :: [String] -> [(String, String, String)]
 edgesNamed chart = sort [(nameOf chart from, nameOf chart to, label) | line <- stripped chart, Just (from, to, label) <- [edgeOf line]]
 
+-- | The edges of the chart that say only the order, each as the names of its two nodes: the dotted ones that have no label.
+orderEdges :: [String] -> [(String, String)]
+orderEdges chart = sort [(nameOf chart from, nameOf chart to) | [from, "-.->", to] <- words <$> stripped chart]
+
+-- | The nodes that are declared as a box that has only a name, a small node, which is a stadium.
+boxesDeclared :: String -> [String] -> [String]
+boxesDeclared name chart = [takeWhile isAlphaNum line | line <- stripped chart, ("([\"" ++ name ++ "\"])") `isInfixOf` line]
+
 -- | The nodes and the label of a line that is an edge, with a solid arrow.
 edgeOf :: String -> Maybe (String, String, String)
 edgeOf line = case break (== ' ') line of
@@ -534,8 +626,8 @@ breakText marker text = go [] text
           [] -> (reverse before, [])
           c : more -> go (c : before) more
 
--- | What a node of the chart is called: "start" and "end" for the circles, "junction" for a junction, and else the text of
--- its box, without the gear and without the comment under it.
+-- | What a node of the chart is called: "start" and "end" for the circles, "junction" for a junction, the title of a box that
+-- is a subgraph, and else the text of its box, without the gear and without the comment under it.
 nameOf :: [String] -> String -> String
 nameOf chart node = case [line | line <- stripped chart, takeWhile isAlphaNum line == node, not (any (`isInfixOf` line) ["-->", "subgraph"])] of
   line : _
@@ -543,7 +635,9 @@ nameOf chart node = case [line | line <- stripped chart, takeWhile isAlphaNum li
     | "fr-circ" `isInfixOf` line -> "end"
     | "f-circ" `isInfixOf` line -> "junction"
     | otherwise -> withoutGear (fst (breakText "<br/>" (fst (breakText "\"" (drop 1 (dropWhile (/= '"') line))))))
-  [] -> node
+  [] -> case [line | line <- stripped chart, ("subgraph " ++ node ++ " ") `isPrefixOf` line] of
+    line : _ -> fst (breakText "\"" (drop 1 (dropWhile (/= '"') line)))
+    [] -> node
   where
     withoutGear text = fromMaybe text (stripPrefix gear text)
 
