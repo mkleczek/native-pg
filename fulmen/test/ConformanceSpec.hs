@@ -426,8 +426,11 @@ manyWorkers = describe "a server of thousands of workers, under a small stack" $
   describe kind $ do
     it "serves that many connections that are open at once" (serveMany kind 2500 False)
     -- Each connection has a deadline while it waits for its request, and the server finds the nearest of them each time it has nothing
-    -- to run: thousands of connections that are idle for a moment are thousands of deadlines.
-    it "keeps that many connections that are open and idle for a moment, and serves them" (serveMany kind 2500 True)
+    -- to run: thousands of connections that are idle for a moment are thousands of deadlines. The clients hold all their sockets open at
+    -- once, which the non-threaded run time of the test cannot do past 1,024 descriptors (it waits with select, and fails); the server of
+    -- the case is a process of its own, and the threaded run shows what it does.
+    when rtsSupportsBoundThreads $
+      it "keeps that many connections that are open and idle for a moment, and serves them" (serveMany kind 2500 True)
 
 -- | A server of this many workers, and the same many clients that connect at once and ask it for the answer of 200: how
 -- many got it, within the time that they have. With the clients idle, each waits a second after it has connected before it asks.
@@ -446,14 +449,18 @@ serveMany kind count idling = do
       port <- maybe (failTest "no output of the server") (fmap (fromIntegral . (read :: String -> Int) . drop 5 . filter (/= '\r') . takeWhile (/= '\n')) . hGetLine) out
       -- Loops that keep no stack of their own: the stack of the test is small, too, as the stack of a dev build is.
       answers <- foldM (\collected _ -> (: collected) <$> newEmptyMVar) [] [1 .. count]
-      forM_ answers $ \answer -> forkIO (asking port >>= putMVar answer)
+      -- The idle clients wait for one gate, which opens a second after they were started: a thread that sleeps costs the non-threaded
+      -- run time a timer each, which thousands of them don't survive.
+      gate <- newEmptyMVar
+      forM_ answers $ \answer -> forkIO (asking port gate >>= putMVar answer)
+      when idling (threadDelay 1000000 *> putMVar gate ())
       answered <- timeout 30000000 (foldM (\total answer -> (\got -> if got then total + 1 else total) <$> readMVar answer) (0 :: Int) answers)
       answered `shouldBe` Just count
   where
-    asking port = (either (const False) id <$>) . try @IOException $
+    asking port gate = (either (const False) id <$>) . try @IOException $
       bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
         Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1)))
-        when idling (threadDelay 1000000)
+        when idling (readMVar gate)
         SocketBytes.sendAll sock "GET /16k HTTP/1.1\r\nHost: localhost\r\n\r\n"
         ("HTTP/1.1 200" `B.isPrefixOf`) <$> SocketBytes.recv sock 4096
 
