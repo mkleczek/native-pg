@@ -47,11 +47,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The code that draws the steps of a flow is not written yet: the case that needs it is expected to fail, and the mark
--- comes off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: -< is not written yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -165,7 +160,7 @@ spec = describe "the chart" $ do
     chart <- chartOf (field "size" >>> quick :: Diagram ("size" := Int, "kept" := Bool) ())
     wiresNamed "size" chart `shouldBe` 1
 
-  stubbed $ it "has the name of a step of a flow for the title of its box, and what its ports are bound to on its edge" $ do
+  it "has the name of a step of a flow for the title of its box, and what its ports are bound to on its edge" $ do
     chart <- chartOf wired
     [wiresNamed label chart | label <- ["i", "first.x \x2192 n", "first.x \x2192 n, j"]] `shouldBe` [1, 1, 1]
     case (subgraphTitled "first" chart, subgraphTitled "last" chart) of

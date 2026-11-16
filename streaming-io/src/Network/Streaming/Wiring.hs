@@ -55,7 +55,6 @@ where
 import Control.Arrow (Arrow, (>>>), (>>^))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
-import Control.Exception (throw)
 import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
@@ -72,7 +71,6 @@ import GHC.TypeLits
   )
 import Network.Streaming.Annotate (Annotate (..))
 import Network.Streaming.Named ((:=) (..))
-import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -105,12 +103,12 @@ class Lined t arr x o | t -> arr x where
 
 -- | A step that gives nothing to keep: the record goes on as it was.
 instance (Arrow arr, Annotate arr, y ~ x) => Lined (Flow arr x y) arr x o where
-  line _ _ = throw (NotImplemented "-<")
+  line texts p = Flow (alongside (flowStep Nothing texts p) >>^ snd)
   {-# INLINE line #-}
 
 -- | A step whose output is to be named.
 instance (o' ~ o) => Lined (Line arr x o) arr x o' where
-  line _ _ = throw (NotImplemented "-<")
+  line = Line
   {-# INLINE line #-}
 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of

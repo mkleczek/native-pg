@@ -574,6 +574,7 @@ drawStep ctx path = \case
   Within duration inner -> grouped ctx ("within " ++ readable duration) (render ctx path inner)
   TimeoutA inner -> grouped ctx "within the duration of the input" (render ctx path inner)
   Wires input output inner -> wired input output <$> render ctx path inner
+  FlowStep name bindings inner -> flowStepped ctx path name bindings inner
   Allowing _ _ inner -> render ctx path inner
   tree@(Named label location body) -> named ctx path tree label location body
   tree@(End Asking exchanged body) -> awaiting ctx tree exchanged body
@@ -594,6 +595,15 @@ wired :: Maybe String -> Maybe String -> Fragment -> Fragment
 wired input output (Fragment inner core) = Fragment (inner <|> input) $ case core of
   Bare out -> Bare (out <|> output)
   Nodes entry splits outlets -> Nodes entry splits (labelled output <$> outlets)
+
+-- | A step of a flow: a box that has the name of the step for its title, if it has one. The edge into it says what its
+-- inputs are bound to, in place of any name that the step's own wire has.
+flowStepped :: Ctx -> Path -> Maybe String -> [String] -> Tree -> IO Fragment
+flowStepped ctx path name bindings inner = do
+  Fragment input core <- maybe id (grouped ctx) name (render ctx path inner)
+  pure (Fragment (bound <|> input) core)
+  where
+    bound = if null bindings then Nothing else Just (intercalate ", " bindings)
 
 -- | One fragment after the other, with the edges labelled by the way out, or else by the input wire of the second.
 sequential :: Ctx -> Fragment -> Fragment -> IO Fragment

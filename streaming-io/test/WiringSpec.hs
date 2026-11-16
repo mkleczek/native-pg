@@ -34,17 +34,12 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The stub of '-<' fails with 'NotImplemented': every case that needs it is expected to fail, and the mark comes off
--- when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: -< is not written yet"
-
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
-  stubbed $ it "wires three steps by bare names and by bindings of a port to a name, and gives what the last gave" $
+  it "wires three steps by bare names and by bindings of a port to a name, and gives what the last gave" $
     run (inputs >>> threeSteps) `shouldReturn` 18
 
-  stubbed $ it "gives the record of the flow, with a field in front of it for each step that has a name" $
+  it "gives the record of the flow, with a field in front of it for each step that has a name" $
     run
       ( inputs
           >>> flow ("sum" <: adder -< ["a", "b"] >>> "double" <: adder -< ["a" =: "sum", "b" =: "sum"])
@@ -52,27 +47,27 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
       )
       `shouldReturn` (14, 7, 3, 4)
 
-  stubbed $ it "binds one name to several ports of a step, and to the ports of several steps" $
+  it "binds one name to several ports of a step, and to the ports of several steps" $
     run (inputs >>> fanOut) `shouldReturn` 42
 
-  stubbed $ it "feeds the ports of a step from several producers" $
+  it "feeds the ports of a step from several producers" $
     run (inputs >>> fanIn) `shouldReturn` 19
 
-  stubbed $ it "reads a field of the record that a step gave, by a path, and a field of a field, by a longer one" $ do
+  it "reads a field of the record that a step gave, by a path, and a field of a field, by a longer one" $ do
     run (inputs >>> fromRecord) `shouldReturn` 7
     run (inputs >>> fromNested) `shouldReturn` (44, 0)
 
-  stubbed $ it "goes on with the record as it was after a step that gives nothing, which runs once, in its place" $ do
+  it "goes on with the record as it was after a step that gives nothing, which runs once, in its place" $ do
     noted <- newLog
     run (inputs >>> quiet noted) `shouldReturn` 11
     readLog noted `shouldReturn` ["sum 7", "total 11"]
 
-  stubbed $ it "runs each step once, from the first to the last, as the lines are in order" $ do
+  it "runs each step once, from the first to the last, as the lines are in order" $ do
     noted <- newLog
     run (inputs >>> ordered noted) `shouldReturn` 18
     readLog noted `shouldReturn` ["first", "second", "third"]
 
-  stubbed $ it "reads the names of a record that is not known, for a flow that is a step of its own" $ do
+  it "reads the names of a record that is not known, for a flow that is a step of its own" $ do
     run (inputs >>> anyRecord) `shouldReturn` 14
     run (newRecord ["extra", "b", "a"] <$> arr (const 'x') <*> arr (const 5) <*> arr (const 1) >>> anyRecord)
       `shouldReturn` 12
