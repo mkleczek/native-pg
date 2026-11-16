@@ -8,9 +8,10 @@
 module TimeSpec (spec) where
 
 import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (&&&), (>>>), (>>^), (^>>))
-import Control.Monad (forM, forM_, void, when)
+import Control.Monad (forM, forM_, replicateM_, void, when)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Word (Word64)
+import GHC.Stats (allocated_bytes, getRTSStats)
 import qualified Network.Socket as Socket
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done, keeping, localTicket, releaseWithin, sleep, tap, times)
@@ -22,6 +23,7 @@ import Network.Streaming.Pool
 import Network.Streaming.Threads
 import Skeletest
 import System.IO.Unsafe (unsafePerformIO)
+import System.Mem (performMinorGC)
 import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
@@ -323,6 +325,25 @@ spec = describe "time" $ do
       pending wheel `shouldReturn` 0
       nextDeadline wheel `shouldReturn` Nothing
       expire wheel (10000 * ms)
+
+    -- The scheduler asks for the next deadline each time it has nothing to run, so that a timer that is far off, as an idle timeout is,
+    -- is in every idle step of a program that has one. Finding it allocates what the answer is, and not a cell for each slot that is
+    -- looked at on the way.
+    xfail "the search for the next deadline allocates a list cell and an Int for each slot of the wheel that it looks at" $
+      it "finds the next deadline of a wheel that has a timer far off without allocating for it" $ do
+        let oneSecond = 1000000000 :: Word64
+            calls = 1000 :: Int
+        wheel <- newWheel 0
+        void (addTimer wheel (30 * oneSecond) (pure ()))
+        replicateM_ 10 (nextDeadline wheel)
+        performMinorGC
+        before <- allocated_bytes <$> getRTSStats
+        replicateM_ calls (nextDeadline wheel)
+        performMinorGC
+        after <- allocated_bytes <$> getRTSStats
+        let each = fromIntegral (after - before) / fromIntegral calls :: Double
+        when (each > 128) $ failTest ("a call allocates " <> show (round each :: Int) <> " bytes")
+        nextDeadline wheel `shouldReturn` Just (30 * oneSecond)
 
     it "fires a timer that a timer adds at the next expiry at the soonest" $ do
       wheel <- newWheel 0
