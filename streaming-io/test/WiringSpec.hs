@@ -38,12 +38,11 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The stubs of a name that is kept whole and taken apart, of patterns that nest, of the last name that takes what is left
--- of a pair, and of a branch with a pattern fail with 'NotImplemented': the cases that need them are expected to fail, and
--- the marks come off when the code is there. The branch is the one of "Network.Streaming.Internal.Patterns" until it
--- replaces the branch of "Network.Streaming.Named".
+-- | The stub of a branch with a pattern fails with 'NotImplemented': the cases that need it are expected to fail, and the
+-- marks come off when the code is there. The branch is the one of "Network.Streaming.Internal.Patterns" until it replaces
+-- the branch of "Network.Streaming.Named".
 stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: as-patterns, nested patterns and branch patterns are not written yet"
+stubbed = xfail "Network.Streaming.Internal.Patterns has a stub: a branch with a pattern is not written yet"
 
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
@@ -118,13 +117,13 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
     run (inputs >>> tallied noted) `shouldReturn` 7
     readLog noted `shouldReturn` ["ran"]
 
-  stubbed $ it "keeps the output whole under a name and takes it apart too, a pair by position and a record by its fields" $ do
+  it "keeps the output whole under a name and takes it apart too, a pair by position and a record by its fields" $ do
     run (sized 17 >>> flow ("qr" @: ["q", "r"] <: divider -< ["a", "b"]) >>^ \r -> (r.qr, r.q, r.r))
       `shouldReturn` ((4, 1), 4, 1)
     run (inputs >>> flow ("parts" @: ["sum", "prod"] <: splitter -< ["a", "b"]) >>^ \r -> (r.parts.sum, r.sum, r.prod))
       `shouldReturn` (7, 7, 12)
 
-  stubbed $ it "takes a field of a record apart by a list, and a field of that, to any depth, and keeps only the names of the parts" $ do
+  it "takes a field of a record apart by a list, and a field of that, to any depth, and keeps only the names of the parts" $ do
     run (inputs >>> flow (["inner" =: ["leaf", "twin"], "other"] <: nester -< ["n" =: "b"]) >>^ \r -> (r.leaf, r.twin, r.other))
       `shouldReturn` (40, 4, 0)
     run
@@ -134,7 +133,7 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
       )
       `shouldReturn` (4, 6, 7)
 
-  stubbed $ it "keeps a part under a name and takes it apart too, and keeps a part under another name" $
+  it "keeps a part under a name and takes it apart too, and keeps a part under another name" $
     run
       ( inputs
           >>> flow (["inner" =: "i" @: ["leaf", "twin"], "other" =: "o"] <: nester -< ["n" =: "b"])
@@ -142,7 +141,7 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
       )
       `shouldReturn` (40, 40, 4, 0)
 
-  stubbed $ it "takes a part of a pair apart by position, whatever the part is, and a pair's last name takes what is left" $ do
+  it "takes a part of a pair apart by position, whatever the part is, and a pair's last name takes what is left" $ do
     run
       ( inputs
           >>> flow (["_" @: ["x", "y"], "both" @: ["sum", "prod"]] <: mixed -< ["a", "b"])
@@ -155,7 +154,7 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
       `shouldReturn` (3, 4, 7)
     run (sized 17 >>> flow (["only"] <: divider -< ["a", "b"]) >>^ \r -> r.only) `shouldReturn` (4, 1)
 
-  stubbed $ it "reads the names of the parts in the steps after it" $
+  it "reads the names of the parts in the steps after it" $
     run (inputs >>> nestedNames) `shouldReturn` 44
 
   stubbed $ it "runs the branch of the case that a choice finds, which takes the value of its case apart by its pattern" $ do

@@ -502,14 +502,9 @@ instance Spread pair site '[] o x x where
   spread _ x = x
   {-# INLINE spread #-}
 
--- | The last pattern is for the last part, which is a value that goes on no further.
-instance (ByPosition site entry, Take site entry o x y) => Spread 'False site '[entry] o x y where
+-- | The last pattern is for the last part, which is a value that goes on no further, or for what is left of a pair, whole.
+instance (ByPosition site entry, Take site entry o x y) => Spread pair site '[entry] o x y where
   spread = takeEntry @site @entry
-  {-# INLINE spread #-}
-
--- | The last pattern is for what is left of a pair, whole.
-instance (ByPosition site entry, Take site entry o x y) => Spread 'True site '[entry] o x y where
-  spread = throw (NotImplemented "a last name that takes what is left of a pair")
   {-# INLINE spread #-}
 
 -- | More patterns than parts.
@@ -539,7 +534,7 @@ instance
   (Level (ShapeOf v) (Deeper site ('Entry field name ('Just entries))) entries v rest inner, Place name v inner y) =>
   Take site ('Entry field name ('Just entries)) v rest y
   where
-  takeEntry = throw (NotImplemented "a pattern that takes a value apart")
+  takeEntry v rest = putFirst @name v (level @(ShapeOf v) @(Deeper site ('Entry field name ('Just entries))) @entries v rest)
   {-# INLINE takeEntry #-}
 
 -- | The name of a part, in front of the record of the flow: unless it is @"_"@, which keeps nothing.

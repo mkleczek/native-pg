@@ -49,10 +49,10 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The stubs of a name that is kept whole and taken apart, of patterns that nest, and of a branch with a pattern fail with
--- 'NotImplemented': the cases that need only them are expected to fail, and the marks come off when the code is there.
+-- | The stub of a branch with a pattern fails with 'NotImplemented': the cases that need only it are expected to fail, and
+-- the marks come off when the code is there.
 stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: as-patterns, nested patterns and branch patterns are not written yet"
+stubbed = xfail "Network.Streaming.Internal.Patterns has a stub: a branch with a pattern is not written yet"
 
 -- | The code that draws the names of a pattern as boxes, nested as the pattern nests, each with the edges that leave it, and
 -- the edges that say only the order as dotted ones, is not written yet: the cases that need it are expected to fail, and
