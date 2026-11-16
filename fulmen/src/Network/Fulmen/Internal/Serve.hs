@@ -326,9 +326,9 @@ request settings handler =
           "progress" <: step "copy carry-over" carryOver -< ["loan", "conn"]              >>>
           "head"     <: readHead settings                -< ["conn", "loan", "progress"]  >>>
           "kept"     <: choice "how did the head end?" "head"
-                          (    "stream ended"             ?> quit                      -< []
-                           ||| "refused" =: "refused" ?> refuse                    -< ["refused", "conn"]
-                           ||| "good"    =: "good"    ?> answered settings handler -< ["good", "conn", "loans", "loan", "progress"] )
+                          (    "stream ended"                   ?> quit                      -< []
+                           ||| "refused" =: "status"            ?> refuse                    -< ["status", "conn"]
+                           ||| "good" =: ["parsed", "consumed"] ?> answered settings handler -< ["parsed", "consumed", "conn", "loans", "loan", "progress"] )
         )
   where
     borrowed = field "loans" >>> borrow
@@ -336,7 +336,7 @@ request settings handler =
       step
         "render refusal"
         ( \r ->
-            (,) r.conn.connSocket <$> refusal (sharedPulse r.conn.connShared) r.refused
+            (,) r.conn.connSocket <$> refusal (sharedPulse r.conn.connShared) r.status
         )
         >>> sendAll
         >>> quit
@@ -415,7 +415,8 @@ answered ::
     HasField "loans" r Loans,
     HasField "loan" r Loan,
     HasField "progress" r (IORef Progress),
-    HasField "good" r Good
+    HasField "parsed" r Parsed,
+    HasField "consumed" r Int
   ) =>
   Settings ->
   arr (Call, Request) () ->
@@ -443,7 +444,8 @@ prepare ::
     HasField "loans" r Loans,
     HasField "loan" r Loan,
     HasField "progress" r (IORef Progress),
-    HasField "good" r Good
+    HasField "parsed" r Parsed,
+    HasField "consumed" r Int
   ) =>
   Settings ->
   r ->
@@ -452,8 +454,8 @@ prepare settings r = do
   let !Conn {..} = r.conn
       !loans = r.loans
       !loan = r.loan
-      !(Parsed request' framing keep) = r.good.parsed
-      !consumed = r.good.consumed
+      !(Parsed request' framing keep) = r.parsed
+      !consumed = r.consumed
   Progress {progressEnd = end} <- readIORef r.progress
   let buffer = loanBuffer loan
       Method name = method request'
@@ -490,7 +492,7 @@ aftermath :: (Runtime arr, HasField "outcome" r (Either SomeException ()), HasFi
 aftermath =
   named (Label "aftermath" "Decides whether the connection is kept, and answers 500 if nothing was answered.") $
     decide "how did the handler end?" byOutcome
-      >>> ("connection lost" ?> quit ||| "failed" =: "failed" ?> failed ||| "returned" ?> finished)
+      >>> ("connection lost" ?> quit ||| "failed" =: "status" ?> failed ||| "returned" ?> finished)
   where
     -- Inlined, so that GHC fuses the classification with the branches and builds no sum.
     byOutcome r = casesBy "outcome" classify r
@@ -504,7 +506,7 @@ aftermath =
     failed =
       step
         "check if answered"
-        (\r -> case r.call of Call _ _ exchange -> (,) r.failed <$> unanswered exchange)
+        (\r -> case r.call of Call _ _ exchange -> (,) r.status <$> unanswered exchange)
         >>> internalError
     finished =
       step
