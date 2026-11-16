@@ -41,6 +41,8 @@ module Network.Streaming.Named
     Inj,
     inj,
     Distribute,
+    CaseNames,
+    DistinctCases,
     cases,
     casesBy,
     (?>),

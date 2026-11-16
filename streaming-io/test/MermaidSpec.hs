@@ -14,9 +14,9 @@ import Network.Streaming.Combinators (_Just, box, decide, done, step, tap, withI
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (..))
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
-import Network.Streaming.Named (adding, at, cases, field, is, newRecord, (:=), (?>))
+import Network.Streaming.Named (adding, at, cases, field, inj, is, newRecord, (:=), (?>))
 import Network.Streaming.Plumbing (each, prism)
-import Network.Streaming.Wiring (result, type (=:), (-<), (<:))
+import Network.Streaming.Wiring (choice, result, type (=:), (-<), (<:))
 import Skeletest
 
 -- | A step that never waits.
@@ -46,6 +46,11 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 -- emoji (U+FE0E), and a space.
 gear :: String
 gear = "\x2699\xFE0E "
+
+-- | The code that draws a choice of a flow is not written yet: the case that needs it is expected to fail, and the mark
+-- comes off when the code is there.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: choice is not written yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -170,6 +175,14 @@ spec = describe "the chart" $ do
     -- The step that gives nothing is no box of its own.
     subgraphTitled "note" chart `shouldBe` Nothing
 
+  stubbed $ it "has the question of a choice in the box of its line, and on the edges to its branches their cases and bindings" $ do
+    chart <- chartOf choosing
+    -- The edge into the choice has the field that it decides on, and the edge to each branch its case and what it reads.
+    [wiresNamed label chart | label <- ["size", "small: small \x2192 n", "big: big \x2192 n, j", "huge"]] `shouldBe` [1, 1, 1, 1]
+    case subgraphTitled "picked" chart of
+      Just (_, inside) -> any ("{\"how big?\"}" `isInfixOf`) inside `shouldBe` True
+      Nothing -> failTest "the chart has no box for the line of the choice"
+
   it "has a gear in front of the label of a step that never waits and has no name" $ do
     chart <- chartOf (quick :: Diagram () ())
     length (nodesDeclared (gear ++ "IO") chart) `shouldBe` 1
@@ -234,6 +247,27 @@ wired =
         >>> "last" <: step "sum" (\r -> pure (getField @"n" r + getField @"j" r)) -< ["n" =: "first.x", "j"]
     )
     >>> quick
+
+-- | A flow whose last line is a choice of three cases, which has a name: the branches bind the value of their case and an
+-- input of the flow, and nothing.
+choosing :: Diagram ("i" := Int, "j" := Int) ()
+choosing =
+  result
+    "picked"
+    ( "size" <: step "size up" (\r -> pure (sizeOf (getField @"i" r))) -< ["i"]
+        >>> "picked"
+          <: choice
+            "how big?"
+            "size"
+            ( "small" ?> step "take" (\r -> pure (getField @"n" r)) -< ["n" =: "small"]
+                ||| "big" ?> step "add" (\r -> pure (getField @"n" r + getField @"j" r)) -< ["n" =: "big", "j"]
+                ||| "huge" ?> step "zero" (const (pure 0)) -< []
+            )
+    )
+    >>> quick
+  where
+    sizeOf :: Int -> Either ("small" := Int) (Either ("big" := Int) ("huge" := Int))
+    sizeOf n = if n < 10 then inj "small" n else if n < 100 then inj "big" n else inj "huge" n
 
 -- | A body that collects, and spawns the part that works.
 spawnsWorking :: Diagram (Group Diagram s AwaitAll, Int) ()

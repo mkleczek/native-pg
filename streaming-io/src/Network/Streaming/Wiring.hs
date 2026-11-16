@@ -34,17 +34,32 @@
 -- A step that takes a plain value for its input, and not a record, reads it from a port when it is made one that does:
 -- @field "loans" >>> borrow@ takes the port @"loans"@.
 --
+-- A choice is a line of a flow too:
+--
+-- > "kept" <: choice "how did the head end?" "head"
+-- >   (    "stream ended" ?> quit    -< []
+-- >    ||| "refused"      ?> refuse  -< ["refused", "conn"]
+-- >    ||| "good"         ?> answered -< ["good", "conn", "loans", "loan", "progress"] )
+--
+-- It decides on the sum that the flow has under the name @"head"@, and runs the branch of the case that it is. A branch,
+-- @"case" ?> p -< bindings@, binds the names of the flow, and the value of its case under the name of the case, and the
+-- input of its step has only the ports that it binds. The branches give the same type, which is what @"kept"@ has. The
+-- errors of '-<' are those of a branch, and a case that the sum doesn't have is the error of "Network.Streaming.Named".
+--
 -- These are type errors that say what they are: a name that the flow doesn't have, an output that a step doesn't give,
 -- a port that is not bound, a port that is bound twice, and a step whose name is one that the flow has already.
 --
 -- In diagrams the box of a step that has a name has the name for its title, and the edge into a step says what its
--- ports are bound to, as in @a1.x → i@. A name that is also the port is said once.
+-- ports are bound to, as in @a1.x → i@. A name that is also the port is said once. A choice is drawn in the box of its
+-- line, with its question, and the edge to a branch says its case and what it is bound to, as in @refused: refused,
+-- conn@.
 module Network.Streaming.Wiring
   ( Flow,
     Line,
     Lined,
     (-<),
     (<:),
+    choice,
     type (=:),
     flow,
     result,
@@ -55,6 +70,7 @@ where
 import Control.Arrow (Arrow, (>>>), (>>^))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
+import Control.Exception (throw)
 import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
@@ -70,7 +86,8 @@ import GHC.TypeLits
     symbolVal,
   )
 import Network.Streaming.Annotate (Annotate (..))
-import Network.Streaming.Named ((:=) (..))
+import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, (:=) (..))
+import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -95,20 +112,27 @@ data Line arr x o = Line [String] (arr x o)
 type family FlowIn (t :: Type) :: Type where
   FlowIn (Flow arr x y) = x
   FlowIn (Line arr x o) = x
+  FlowIn (arr x o) = x
 
--- | What a line can be: a step that keeps nothing, which is a flow whose record goes on as it was, or a step that is
--- given a name by '<:'.
-class Lined t arr x o | t -> arr x where
+-- | What a line can be: a step that keeps nothing, which is a flow whose record goes on as it was, a step that is given
+-- a name by '<:', or a step that is an arrow of its own, as the branch of a choice is. The first two are incoherent so
+-- that an arrow whose type is that of a signature, which GHC cannot tell from a flow, is the third.
+class Lined t arr x o where
   line :: [String] -> arr x o -> t
 
 -- | A step that gives nothing to keep: the record goes on as it was.
-instance (Arrow arr, Annotate arr, y ~ x) => Lined (Flow arr x y) arr x o where
+instance {-# INCOHERENT #-} (Arrow arr, Annotate arr, arr' ~ arr, x' ~ x, y ~ x) => Lined (Flow arr' x' y) arr x o where
   line texts p = Flow (alongside (flowStep Nothing texts p) >>^ snd)
   {-# INLINE line #-}
 
 -- | A step whose output is to be named.
-instance (o' ~ o) => Lined (Line arr x o) arr x o' where
+instance {-# INCOHERENT #-} (arr' ~ arr, x' ~ x, o' ~ o) => Lined (Line arr' x' o') arr x o where
   line = Line
+  {-# INLINE line #-}
+
+-- | A step that is an arrow of its own, as a branch of a choice is: it takes the record that its input is made from.
+instance (Annotate arr, arr' ~ arr, x' ~ x, o' ~ o) => Lined (arr' x' o') arr x o where
+  line _ _ = throw (NotImplemented "-<")
   {-# INLINE line #-}
 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of
@@ -124,11 +148,12 @@ result name (Flow p) = p >>^ getField @name
 
 -- * Lines
 
--- '-<' binds tighter than '<:' and '>>>', so that a line needs no parentheses.
-infix 4 -<
+-- '-<' binds tighter than '<:', '>>>' and '?>', so that a line, and a branch of a choice, need no parentheses.
+infix 7 -<
 
 -- | The step, with its input made from the flow's record by the bindings. What it is used as says what it does with its
--- output: it keeps none if it is a line of the flow, and names it if it is the operand of '<:'.
+-- output: it keeps none if it is a line of the flow, names it if it is the operand of '<:', and gives it if it is the
+-- operand of '?>'.
 (-<) ::
   forall arr i o x t.
   (Arrow arr) =>
@@ -136,7 +161,7 @@ infix 4 -<
   forall (bindings :: [Symbol]) ->
   (x ~ FlowIn t, Lined t arr x o, Unique (Ports bindings), Describe bindings, Bind bindings x i) =>
   t
-(-<) p bindings = line (describe @bindings) (Arrow.arr (bind @bindings) >>> p)
+(-<) p bindings = line (describe @bindings) (Arrow.arr (bind @bindings @x) >>> p)
 {-# INLINE (-<) #-}
 
 infixr 2 <:
@@ -152,6 +177,27 @@ infixr 2 <:
 (<:) name (Line texts p) =
   Flow (alongside (flowStep (Just (symbolVal (Proxy @name))) texts p) >>^ \(o, x) -> (Is o, x))
 {-# INLINE (<:) #-}
+
+-- | A choice that is a line of the flow: it decides on the sum that the flow has under the name of the field, as
+-- @decide question (cases field)@ does, and runs the branch of the case that it is. A branch is a step of its own,
+-- @"case" ?> p -< bindings@, which reads the names of the flow and the value of its case under the name of the case.
+choice ::
+  forall t arr x s d o.
+  String ->
+  forall field ->
+  ( Arrow arr,
+    Annotate arr,
+    KnownSymbol field,
+    x ~ FlowIn t,
+    Lined t arr x o,
+    HasField field x s,
+    Distribute s x d,
+    DistinctCases (CaseNames s)
+  ) =>
+  arr d o ->
+  t
+choice _ _ _ = throw (NotImplemented "choice")
+{-# INLINE choice #-}
 
 -- * Bindings
 

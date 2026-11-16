@@ -16,8 +16,11 @@ check() {
 # port to a name, a name that is bound to two ports, a step that two producers feed, a path into the output of a step, a
 # step that gives nothing, and a flow over a record that is not known. A name that the flow doesn't have, an output that
 # a step doesn't give, a port that is not bound, a port that is bound twice, and a name that the flow has already are
-# rejected, each with its own message.
+# rejected, each with its own message. A choice is checked the same way: the control has a choice of three cases whose
+# branches bind different names, with a name for its result and without, and the errors of a step hold in a branch, which
+# has the value of its own case and no other, and a case that the step doesn't have is rejected.
 check WiringFlow
+check WiringChoice
 while read -r fixture message; do
   if check "$fixture" >"$output_dir/$fixture.log" 2>&1; then
     echo "Expected $fixture to fail compilation" >&2
@@ -34,5 +37,10 @@ WiringUnbound Input "j" of the step isn't bound
 WiringBoundTwice Input "i" of the step is bound twice
 WiringRepeated The flow already has the name "a1"
 WiringRepeatedInput The flow already has the name "i"
+WiringChoiceUnbound Input "j" of the step isn't bound
+WiringChoiceNoName The flow has no name "k"
+WiringChoiceBoundTwice Input "i" of the step is bound twice
+WiringChoiceOtherCase The flow has no name "small"
+WiringChoiceNoCase The choice has no case "big"
 EOF2
-echo "Wiring: steps are wired by name; a missing or repeated name, a missing output, an unbound port are rejected"
+echo "Wiring: steps and choices are wired by name; a missing or repeated name, a missing output, an unbound port are rejected"
