@@ -9,10 +9,11 @@ module TimeSpec (spec) where
 
 import Control.Arrow (Arrow, ArrowChoice, arr, returnA, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Monad (forM, forM_, replicateM_, void, when)
+import Control.Monad (forM, forM_, replicateM, replicateM_, void, when)
 import qualified Data.ByteString as B
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Word (Word64)
+import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stats (allocated_bytes, getRTSStats)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
@@ -363,6 +364,42 @@ spec = describe "time" $ do
       let each = fromIntegral (after - before) / fromIntegral calls :: Double
       when (each > 128) $ failTest ("a call allocates " <> show (round each :: Int) <> " bytes")
       nextDeadline wheel `shouldReturn` Just (30 * oneSecond)
+
+    -- It is called each time a scheduler has nothing to run, which with an idle timeout is each time a connection waits for a request, so
+    -- that a timer that is far off costs no more than one that is near.
+    xfail "the search for the next deadline looks at each slot of the near level before it finds a timer that is in the far one" $
+      it "finds the next deadline of a wheel that has a timer far off as fast as one that has a timer near" $ do
+        let oneSecond = 1000000000 :: Word64
+            calls = 20000 :: Int
+            timeOf deadline = do
+              wheel <- newWheel 0
+              void (addTimer wheel deadline (pure ()))
+              replicateM_ 100 (nextDeadline wheel)
+              began <- getMonotonicTimeNSec
+              replicateM_ calls (nextDeadline wheel)
+              ended <- getMonotonicTimeNSec
+              pure (ended - began)
+        -- The least of five runs of each, so that a run that the machine was busy for doesn't count.
+        near <- minimum <$> replicateM 5 (timeOf 1000000)
+        far <- minimum <$> replicateM 5 (timeOf (30 * oneSecond))
+        when (far > 10 * near + 5000000) $
+          failTest ("a call takes " <> show (far `div` fromIntegral calls) <> " ns with a timer 30 seconds off, and " <> show (near `div` fromIntegral calls) <> " with one a millisecond off")
+
+    -- A timer that was cancelled may still be what the wheel remembers as its nearest: the time that it gives is then at or before the
+    -- nearest live one, and it is exact again once the clock has passed it.
+    it "gives a time at or before the nearest live deadline after the nearest timer was cancelled, and the exact one once that time has passed" $ do
+      let ms = 1000000 :: Word64
+      wheel <- newWheel 0
+      near <- addTimer wheel (5 * ms) (pure ())
+      void (addTimer wheel (20 * ms) (pure ()))
+      nextDeadline wheel `shouldReturn` Just (5 * ms)
+      void (cancelTimer wheel near)
+      Just remembered <- nextDeadline wheel
+      (remembered <= 20 * ms) `shouldBe` True
+      expire wheel (6 * ms)
+      nextDeadline wheel `shouldReturn` Just (20 * ms)
+      expire wheel (20 * ms)
+      nextDeadline wheel `shouldReturn` Nothing
 
     it "fires a timer that a timer adds at the next expiry at the soonest" $ do
       wheel <- newWheel 0
