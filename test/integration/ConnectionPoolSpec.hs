@@ -453,6 +453,11 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
         "threads" -> 2376
         "delimited" -> 1980
         _ -> 3140
+    it "allocates no more when the pool has 2,000 slots, which a checkout doesn't go through" $
+      costs "withConnection, 2,000 slots" (\s -> s {poolSize = 2000}) $ case name of
+        "threads" -> 2376
+        "delimited" -> 1965
+        _ -> 3140
     it "allocates no more than it did when the pool has an observer" $
       costs "withConnection, observed" (\s -> s {poolObserver = Just (const (pure ()))}) $ case name of
         "threads" -> 2464
@@ -653,6 +658,19 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
       reported "an empty pool" (show (round small :: Int) <> " bytes at 20 | " <> show (round large :: Int) <> " bytes at 2000")
       when (large > max 0 small * 1.1 + 4096) $
         failTest ("an empty pool holds " <> show (round large :: Int) <> " bytes at 2,000 slots, and " <> show (round small :: Int) <> " at 20")
+    -- A server makes a pool for each tenant and looks at it once a second: with no connection, neither the making of a pool of 200 slots nor
+    -- eighty looks at it (a minute and a quarter) may allocate more than a few kilobytes, where they allocated 55 KB and 52 KB for each look.
+    it "allocates no more than 64 KiB to make a pool of 200 slots and look at it 80 times, while it has no connection" $ do
+      maintenance <- newMaintenance
+      bytes <- allocatedBy $ do
+        pool <- newConnectionPool maintenance ((connectionPoolSettings 200 settings) {poolLifetime = Just (secs 1800)})
+        instant <- monotonicNanoseconds
+        replicateM_ 80 (lookAt pool instant)
+        closeConnectionPool pool
+      reported "a pool made and looked at" (show bytes <> " bytes for a pool of 200 slots and 80 looks")
+      when (bytes > 65536) $
+        failTest ("a pool of 200 slots allocates " <> show bytes <> " bytes to be made and looked at 80 times")
+
     it "allocates to make a pool of 2,000 slots that has two connections no more than to make one of 20 slots that has two" $ do
       small <- allocatedWith 20
       large <- allocatedWith 2000
