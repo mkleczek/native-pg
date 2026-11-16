@@ -232,31 +232,27 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
   describe runnerName $ do
     let request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
         withIdle limit workers = withStoppableWith (\settings -> settings {Fulmen.idleTimeout = limit, Fulmen.connectionsPerCore = workers}) runner
-        notYet = xfail "the idle timeout is not there yet"
-    notYet $
-      it "closes a connection that waits for its next request for longer, and its worker serves the connection that waits for one" $
-        withIdle (Just (millis 300)) 1 (handling (Fixed 200 [] "ok")) $ \shutting ->
-          withClient (serverPort shutting) $ \idle -> withClient (serverPort shutting) $ \waiting -> do
-            SocketBytes.sendAll (socket idle) request
-            awaitBytes idle "ok"
-            started <- getMonotonicTimeNSec
-            -- The only worker has the idle connection, so this one waits in the listen backlog.
-            SocketBytes.sendAll (socket waiting) request
-            arrived <- timeout 5000000 (waitUntil (("ok" `B.isInfixOf`) <$> readIORef (received waiting)))
-            arrived `shouldBe` Just ()
-            answered <- getMonotonicTimeNSec
-            -- Not before the connection had waited the timeout.
-            (answered - started >= 250000000) `shouldBe` True
-            closed <- timeout 1000000 (waitUntil (readIORef (ended idle)))
-            closed `shouldBe` Just ()
-    notYet $
-      it "closes a connection that says nothing at all, after the timeout" $
-        withIdle (Just (millis 300)) 4 (handling (Fixed 200 [] "ok")) $ \shutting ->
-          withClient (serverPort shutting) $ \silent -> do
-            threadDelay 100000
-            readIORef (ended silent) `shouldReturn` False
-            closed <- timeout 3000000 (waitUntil (readIORef (ended silent)))
-            closed `shouldBe` Just ()
+    it "closes a connection that waits for its next request for longer, and its worker serves the connection that waits for one" $
+      -- Each core has one worker, and every worker has a connection that is idle, so that the next connection waits in the listen backlog.
+      withIdle (Just (millis 300)) 1 (handling (Fixed 200 [] "ok")) $ \shutting ->
+        withClients (serverPort shutting) (if runnerName == "two cores" then 2 else 1) $ \idles -> withClient (serverPort shutting) $ \waiting -> do
+          forM_ idles $ \idle -> SocketBytes.sendAll (socket idle) request *> awaitBytes idle "ok"
+          started <- getMonotonicTimeNSec
+          SocketBytes.sendAll (socket waiting) request
+          arrived <- timeout 5000000 (waitUntil (("ok" `B.isInfixOf`) <$> readIORef (received waiting)))
+          arrived `shouldBe` Just ()
+          answered <- getMonotonicTimeNSec
+          -- Not before the connections had waited the timeout.
+          (answered - started >= 250000000) `shouldBe` True
+          closed <- timeout 1000000 (waitUntil (and <$> traverse (readIORef . ended) idles))
+          closed `shouldBe` Just ()
+    it "closes a connection that says nothing at all, after the timeout" $
+      withIdle (Just (millis 300)) 4 (handling (Fixed 200 [] "ok")) $ \shutting ->
+        withClient (serverPort shutting) $ \silent -> do
+          threadDelay 100000
+          readIORef (ended silent) `shouldReturn` False
+          closed <- timeout 3000000 (waitUntil (readIORef (ended silent)))
+          closed `shouldBe` Just ()
     it "does not close a connection whose request is in flight for longer than the timeout" $
       withIdle (Just (millis 300)) 4 quickOrSlow $ \shutting ->
         withClient (serverPort shutting) $ \busy -> do
@@ -656,6 +652,12 @@ data Client = Client
     reading :: IORef Bool,
     grew :: IORef Word64
   }
+
+-- | This many clients, connected one after another.
+withClients :: Socket.PortNumber -> Int -> ([Client] -> IO a) -> IO a
+withClients port count use
+  | count <= 0 = use []
+  | otherwise = withClient port $ \client -> withClients port (count - 1) (use . (client :))
 
 withClient :: Socket.PortNumber -> (Client -> IO a) -> IO a
 withClient port use = bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do

@@ -12,7 +12,8 @@
 -- that the acceptor posts to it; then it serves the connection, request after request, until it ends, and offers itself
 -- again. The acceptor takes a free worker of the core that has the most free workers, so that the connections are shared
 -- out between the cores, and waits for one when there is none, so that past the cap on connections they wait in the
--- listen backlog.
+-- listen backlog. A connection that waits for its next request for longer than the idle timeout is closed, so that the connections
+-- that wait in the backlog are served though the ones that have a worker are idle.
 --
 -- A request is read into the primary buffer that it was admitted with. The bytes that follow it in the buffer, which
 -- belong to the next request on the connection, are copied out before the buffer is used for anything else, and
@@ -206,10 +207,16 @@ requests settings handler =
       iterateA ((alongside one >>^ whileKept) `giving` "connection kept?")
   where
     whileKept (keep, conn) = if keep then Again conn else Finish ()
-    -- An idle connection waits holding no buffer: a request is admitted once there is input.
-    one =
-      tap idle
-        >>> alongside (arr (sharedBuffers . connShared) `giving` "buffer pool")
+    -- An idle connection waits holding no buffer: a request is admitted once there is input. With an idle timeout, a connection that
+    -- has none by then ends, and its worker is free for the next connection.
+    one = case idleTimeout settings of
+      Nothing -> tap idle >>> admitted
+      Just limit ->
+        alongside (idleWithin limit)
+          >>> decide "input before the idle timeout?" (\(arrived, conn) -> if arrived then Right conn else Left ())
+          >>> (taking "no" (arr (const False) `giving` "keep alive") ||| taking "yes" admitted)
+    admitted =
+      alongside (arr (sharedBuffers . connShared) `giving` "buffer pool")
         >>> withRequestBuffers (request settings handler)
 
 -- | Waits until the connection has input, which may be its end, unless it has bytes of a request already.
@@ -219,9 +226,20 @@ idle =
     typed @Conn @() $
       step "check carry-over" ready `giving` "bytes carried over?"
         >>> (taking "no" awaitInput ||| taking "yes" returnA)
-  where
-    ready Conn {connSocket, connCarry} =
-      (\carried -> if B.null carried then Left connSocket else Right ()) <$> readIORef connCarry
+
+-- | The same, for at most this long, and says whether the connection has input: a connection that waits for the whole time has none.
+-- The deadline is armed only if the connection has to wait, and is gone when its input comes.
+idleWithin :: (Runtime arr) => Duration -> arr Conn Bool
+idleWithin limit =
+  named (Label "idle within" "Waits until the connection has input, which may be its end, unless it has bytes in hand, for as long as the idle timeout.") $
+    typed @Conn @Bool $
+      step "check carry-over" ready `giving` "bytes carried over?"
+        >>> (taking "no" (within limit awaitInput >>^ isJust) ||| taking "yes" (arr (const True)))
+
+-- | The socket to wait for input on, unless the connection has bytes of a request already.
+ready :: Conn -> IO (Either Socket ())
+ready Conn {connSocket, connCarry} =
+  (\carried -> if B.null carried then Left connSocket else Right ()) <$> readIORef connCarry
 
 -- * A request
 
