@@ -12,7 +12,7 @@ import Network.Streaming.Combinators (_Just, box, decide, done, step, withInbox)
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
 import Network.Streaming.Named (adding, at, cases, field, is, (:=), (?>))
-import Network.Streaming.Plumbing (each)
+import Network.Streaming.Plumbing (each, prism)
 import Skeletest
 
 -- | A step that never waits.
@@ -92,11 +92,22 @@ spec = describe "the chart" $ do
     [from | (from, _) <- edgesOf chart, from `elem` worked, reaches chart from from] `shouldBe` worked
 
   it "has the branches of a prism: the arrow is on the branch of the focus, and the other case goes past it" $ do
-    chart <- chartOf (_Just working >>> afterwards :: Diagram (Maybe Int) ())
+    chart <- chartOf (prism Just (maybe (Left Nothing) Right) working >>> afterwards :: Diagram (Maybe Int) ())
     case (nodesDeclared (gear ++ "working") chart, nodesDeclared (gear ++ "afterwards") chart) of
       ([inside], [after]) -> do
         targetsOf "Right" chart `shouldBe` [inside]
         targetsOf "Left" chart `shouldBe` [after]
+        ((inside, after) `elem` edgesOf chart) `shouldBe` True
+      found -> failTest ("the chart has the steps " <> show found)
+
+  it "has the branches of _Just named Just and Nothing, with the arrow on the branch of Just" $ do
+    chart <- chartOf (_Just working >>> afterwards :: Diagram (Maybe Int) ())
+    (wiresNamed "Just" chart, wiresNamed "Nothing" chart) `shouldBe` (1, 1)
+    (wiresNamed "Left" chart, wiresNamed "Right" chart) `shouldBe` (0, 0)
+    case (nodesDeclared (gear ++ "working") chart, nodesDeclared (gear ++ "afterwards") chart) of
+      ([inside], [after]) -> do
+        targetsOf "Just" chart `shouldBe` [inside]
+        targetsOf "Nothing" chart `shouldBe` [after]
         ((inside, after) `elem` edgesOf chart) `shouldBe` True
       found -> failTest ("the chart has the steps " <> show found)
 

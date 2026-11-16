@@ -141,9 +141,10 @@ _Right :: (ArrowChoice arr) => arr a b -> arr (Either c a) (Either c b)
 _Right = right
 {-# INLINE _Right #-}
 
--- | The 'Just' of a 'Maybe', as a prism: runs the arrow on the value and passes 'Nothing' through.
-_Just :: (ArrowChoice arr) => arr a b -> arr (Maybe a) (Maybe b)
-_Just = prism Just (maybe (Left Nothing) Right)
+-- | The 'Just' of a 'Maybe', as a prism: runs the arrow on the value and passes 'Nothing' through. In diagrams the
+-- branches are named "Just" and "Nothing".
+_Just :: (ArrowChoice arr, Annotate arr) => arr a b -> arr (Maybe a) (Maybe b)
+_Just p = maybe (Left Nothing) Right ^>> ("Nothing" |- returnA ||| "Just" |- (p >>^ Just))
 {-# INLINE _Just #-}
 
 -- | A prism from how a case is built and how it is matched: the arrow runs on the focus of a 'Right', and a 'Left' is
