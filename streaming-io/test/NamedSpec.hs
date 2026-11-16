@@ -6,8 +6,8 @@
 -- that runs programs. Their dual, a sum of cases named in their type, is made by 'inj', handed to the branches of a chain
 -- of '?>' by 'cases' and 'casesBy' with its case in front of the record, and changed in one case by '_Case'. The same
 -- programs, written once for any arrow that has what a step that can't wait has, are run by each. That a name that the
--- record doesn't have, that 'newRecord' has twice, or that a choice doesn't have, doesn't compile is checked by
--- @test/check-named.sh@.
+-- record doesn't have, that 'newRecord' has twice, that a choice doesn't have, or that two cases of a choice have,
+-- doesn't compile is checked by @test/check-named.sh@.
 module NamedSpec (spec) where
 
 import Control.Arrow (arr, (&&&), (>>>), (>>^), (^>>), (|||))

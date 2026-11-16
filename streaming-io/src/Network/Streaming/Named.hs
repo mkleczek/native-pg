@@ -29,7 +29,8 @@
 -- field named after the case, and the rest of the record by name, and names its wire in diagrams with the case. A
 -- classification that is made where the record is read, @casesBy "status" classify@, does the same. @_Case "refused" p@
 -- runs an arrow on the one case of a plain sum, which can change its type, and passes the others through. A name that the
--- choice doesn't have is a type error that says so.
+-- choice doesn't have is a type error that says so, and so is a name that two of its cases have, where 'cases' or
+-- 'casesBy' is applied.
 --
 -- A field is read where it is used, inside 'Network.Streaming.Classes.now' or a step that takes the record, so that
 -- nothing is built of the field but the read: a record that is projected into a new pair has the thunks of the fields
@@ -235,16 +236,46 @@ instance (r' ~ r, Distribute rest r drest) => Distribute (Either (name := x) res
   distribute (Right rest) r = Right (distribute rest r)
   {-# INLINE distribute #-}
 
+-- | What is said of a name that two cases of a choice have.
+type TwiceCase name = 'Text "The choice has more than one case named " ':<>: 'ShowType name
+
+-- | The names of the cases of a sum that nests to the right, as '|||' takes it apart.
+type family CaseNames s :: [Symbol] where
+  CaseNames (Either (name := x) rest) = name ': CaseNames rest
+  CaseNames (name := x) = '[name]
+
+-- | The names are all different.
+type family DistinctCases (names :: [Symbol]) :: Constraint where
+  DistinctCases '[] = ()
+  DistinctCases (name ': names) = (AbsentCase name names, DistinctCases names)
+
+-- | The name is not one of the names.
+type family AbsentCase (name :: Symbol) (names :: [Symbol]) :: Constraint where
+  AbsentCase name '[] = ()
+  AbsentCase name (name ': names) = TypeError (TwiceCase name)
+  AbsentCase name (other ': names) = AbsentCase name names
+
 -- | The sum that is the field of the name, with each case's value in front of the record, for the branches of a chain of
 -- '?>'. A pure function, for 'Network.Streaming.Plumbing.decide', which gives the decision the question that labels it in
--- diagrams.
-cases :: forall name -> forall r s d. (HasField name r s, Distribute s r d) => r -> d
+-- diagrams. Two cases of one name are a type error.
+cases ::
+  forall name ->
+  forall r s d.
+  (HasField name r s, Distribute s r d, DistinctCases (CaseNames s)) =>
+  r ->
+  d
 cases name r = distribute (getField @name r) r
 {-# INLINE cases #-}
 
 -- | The same for a field that holds a value that the function puts in a case: a classification, such as the outcome of a
 -- handler.
-casesBy :: forall name -> forall r a s d. (HasField name r a, Distribute s r d) => (a -> s) -> r -> d
+casesBy ::
+  forall name ->
+  forall r a s d.
+  (HasField name r a, Distribute s r d, DistinctCases (CaseNames s)) =>
+  (a -> s) ->
+  r ->
+  d
 casesBy name classify r = distribute (classify (getField @name r)) r
 {-# INLINE casesBy #-}
 
