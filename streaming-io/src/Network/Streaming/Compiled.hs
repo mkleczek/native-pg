@@ -32,6 +32,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Inboxes (Address (..), Shelf, closeShelf, newShelf)
 import Network.Streaming.Internal.Scheduler hiding (post)
@@ -213,6 +214,9 @@ instance Annotate (CompiledM m)
 -- wait, and their scopes are released before the group ends, which fails with the first failure. A later failure is
 -- dropped.
 instance Concurrent (CompiledM m) where
+  data Group (CompiledM m) s j
+  group _ _ = error "not yet"
+  spawn _ = error "not yet"
   together = \case
     [] -> done
     [one] -> one

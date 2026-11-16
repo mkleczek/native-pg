@@ -27,6 +27,7 @@ import Data.Tuple (swap)
 import Network.Streaming.Annotate (Annotate (exchange))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Mode (ModeOf)
 import Prelude hiding (id, (.))
 
@@ -137,6 +138,9 @@ instance (Arrow arr, Scope arr) => Scope (With r arr) where
 
 -- | Every part is given the environment.
 instance (Concurrent arr) => Concurrent (With r arr) where
+  data Group (With r arr) s j
+  group _ _ = error "not yet"
+  spawn _ = error "not yet"
   together parts = With (together [part | With part <- parts])
   {-# INLINE together #-}
 

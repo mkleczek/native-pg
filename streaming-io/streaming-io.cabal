@@ -32,6 +32,7 @@ library
                    Network.Streaming.Watch
                    Network.Streaming.Mode
                    Network.Streaming.Annotate
+                   Network.Streaming.Concurrent
                    Network.Streaming.Classes
                    Network.Streaming.Combinators
                    Network.Streaming.Plumbing
@@ -72,6 +73,7 @@ test-suite streaming-io-spec
   other-modules: ListPrefixSpec
                  DescriptorsSpec
                  GroupCostSpec
+                 GroupSpec
                  LoansSpec
                  LoansTestSupport
                  PoolSpec
@@ -89,6 +91,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Watch
                  Network.Streaming.Mode
                  Network.Streaming.Annotate
+                 Network.Streaming.Concurrent
                  Network.Streaming.Classes
                  Network.Streaming.Combinators
                  Network.Streaming.Plumbing

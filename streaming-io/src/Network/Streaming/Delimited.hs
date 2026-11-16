@@ -60,6 +60,7 @@ import GHC.Exts (PromptTag#, control0#, newPromptTag#, prompt#)
 import GHC.IO (IO (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Inboxes (Address (..), Shelf, closeShelf, newShelf)
 import Network.Streaming.Internal.Scheduler hiding (post)
@@ -299,6 +300,9 @@ instance Annotate (DelimitedM m s)
 -- cancelled where they wait, and their scopes are released before the group ends, which rethrows the first
 -- failure. A later failure is dropped.
 instance Concurrent (DelimitedM m s) where
+  data Group (DelimitedM m s) t j
+  group _ _ = error "not yet"
+  spawn _ = error "not yet"
   together = \case
     [] -> done
     [one] -> one

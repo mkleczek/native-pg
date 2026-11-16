@@ -38,7 +38,9 @@ module Network.Streaming.Classes
     Steps,
     Runtime,
     ArrowApplicative,
-    Concurrent (..),
+    -- The methods 'group' and 'spawn' are left out, as their names are common ones: programs import them, and the joiners,
+    -- from "Network.Streaming.Concurrent".
+    Concurrent (together),
     Exit (..),
     ScopeId (..),
     Cancelled (..),
@@ -102,6 +104,7 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Annotate (Annotate (..), Check (..), Label (..), box, giving, taking, (-|), (|-))
 import Network.Streaming.Buffer (Buffer (..))
+import Network.Streaming.Concurrent (Concurrent (together))
 import Network.Streaming.Internal.Inboxes (Address)
 import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
 import Network.Streaming.Mode (Instrumented, ModeOf)
@@ -234,14 +237,6 @@ class Inboxes arr (r :: Reach) where
   -- | Closes the inbox, which the part that owns it does as its scope ends: it returns the value left in it, and every
   -- post that waits, or comes later, returns 'False'.
   closeInbox :: (KnownSymbol name) => arr (Inbox arr name r a) (Maybe a)
-
--- | Arrows that run at once on the same input, as '&&&' runs two of them one after the other.
-class Concurrent arr where
-  -- | Runs the parts, each on the input, as the parts of one cancel scope of their own, and ends when all have ended.
-  -- The first failure cancels the others where they wait, and is rethrown once they have ended; a later failure is
-  -- dropped. No part is made while it runs: the parts are known when the program is built. @together []@ ends at
-  -- once, and one part may run as it is.
-  together :: [arr a ()] -> arr a ()
 
 -- | How the body of a 'scope' ended.
 data Exit = Done | Failed SomeException | Cancelled'

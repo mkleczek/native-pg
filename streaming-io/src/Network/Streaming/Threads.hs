@@ -49,6 +49,7 @@ import GHC.IORef (IORef (..), atomicSwapIORef)
 import GHC.STRef (STRef (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
 import Network.Streaming.Internal.Atomic (update)
@@ -265,8 +266,8 @@ instance Scope (ThreadsM m) where
 
 -- | A part that runs in the scope as well as in those of the part that made it, on a thread of its own, and what
 -- it came to once it ended: the scopes are left before the pair's policy is told.
-spawn :: Part -> CancelScope Members -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO (MVar (Either SomeException a))
-spawn (Part _ _ parent _ parentFlag) scope' run ended = do
+forkPart :: Part -> CancelScope Members -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO (MVar (Either SomeException a))
+forkPart (Part _ _ parent _ parentFlag) scope' run ended = do
   finished <- newEmptyMVar
   -- Forked masked, as its part is.
   _ <- forkIO $ do
@@ -318,6 +319,9 @@ instance Annotate (ThreadsM m)
 -- their waits, and waited for, and the first failure is rethrown. When several fail, the later are dropped. A part is
 -- entered into the scope of the group and the scopes that enclose it: a group of many parts doesn't make them deeper.
 instance Concurrent (ThreadsM m) where
+  data Group (ThreadsM m) s j
+  group _ _ = error "not yet"
+  spawn _ = error "not yet"
   together = \case
     [] -> done
     [one] -> one
@@ -325,7 +329,7 @@ instance Concurrent (ThreadsM m) where
       scope' <- newScope
       failure <- newIORef Nothing
       -- Started and awaited in loops that keep no stack of their own: a group of thousands of parts starts under a small stack limit.
-      dones <- reverse <$> foldM (\started (Threads body) -> (: started) <$> spawn part scope' (`body` input) (failing failure scope')) [] parts
+      dones <- reverse <$> foldM (\started (Threads body) -> (: started) <$> forkPart part scope' (`body` input) (failing failure scope')) [] parts
       awaitAll scope' dones
       readIORef failure >>= maybe (pure ()) throwIO
 
@@ -338,8 +342,8 @@ instance Race (ThreadsM m) where
     let ended outcome = do
           first' <- update winner (\known -> (known <|> Just outcome, isNothing known))
           when first' (cancelScope scope')
-    first' <- spawn part scope' (\child -> Left <$> one child input) ended
-    second' <- spawn part scope' (\child -> Right <$> two child input) ended
+    first' <- forkPart part scope' (\child -> Left <$> one child input) ended
+    second' <- forkPart part scope' (\child -> Right <$> two child input) ended
     (b, d) <- awaitBoth scope' first' second'
     readIORef winner >>= \case
       Just (Left failed) -> throwIO failed

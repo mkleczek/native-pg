@@ -11,7 +11,8 @@ import Data.List (isSuffixOf)
 import GHC.Stack (SrcLoc (..))
 import GHC.TypeLits (KnownSymbol)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, box, done, foreverA, iterateWith, withInbox)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, box, done, foreverA, iterateWith, tap, withInbox)
+import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (..))
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Lint
 import Skeletest
@@ -43,6 +44,7 @@ spec :: Spec
 spec = do
   acquires
   loops
+  spawns
   deadlines
   shields
   allowances
@@ -118,6 +120,30 @@ loops = describe "a loop" $ do
     report <- lint (iterateWith countDown (box "inner" (iterateWith countDown (arr id)) >>^ const 3))
     (summary report, findingPath <$> reportFindings report)
       `shouldBe` (([LoopWithoutWait, LoopWithoutWait], []), [["inner"], []])
+
+-- | Loops that spawn parts, which is no wait: the part that is spawned runs on its own.
+spawns :: Spec
+spawns = describe "a loop that spawns" $ do
+  pending $
+    it "only is found, and one that waits for something and spawns is not" $ do
+      only <- lint (group AwaitAll (foreverA (tap (spawn quick))) :: Diagram () ((), ()))
+      waiting <- lint (group AwaitAll (foreverA (tap (snd ^>> block) >>> tap (spawn quick))) :: Diagram Event ((), ()))
+      (summary only, summary waiting) `shouldBe` (([LoopWithoutWait], []), ([], []))
+
+  pending $
+    it "is found whatever the part that is spawned waits for, which is not a wait of the loop" $ do
+      report <- lint (group AwaitAll (foreverA (tap (spawn giveWay))) :: Diagram () ((), ()))
+      summary report `shouldBe` ([LoopWithoutWait], [])
+
+  pending $
+    it "has a loop in the part that is spawned judged by itself, as the parts that run together are" $ do
+      spinning <- lint (group AwaitAll (tap (snd ^>> block) >>> tap (spawn (foreverA (arr id))) >>> done) >>> done :: Diagram Event ())
+      waiting <- lint (group AwaitAll (tap (snd ^>> block) >>> tap (spawn (foreverA giveWay)) >>> done) >>> done :: Diagram Event ())
+      (summary spinning, summary waiting) `shouldBe` (([LoopWithoutWait], []), ([], []))
+
+-- | Marks a case as one that fails until group and spawn are made.
+pending :: Spec -> Spec
+pending = xfail "group and spawn are not made yet"
 
 -- | A loop that gives way only on the way out.
 waitsOnlyWhenDone :: (Program arr) => arr Int ()

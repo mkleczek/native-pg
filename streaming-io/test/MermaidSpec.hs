@@ -8,7 +8,8 @@ import Control.Arrow ((&&&), (>>>), (>>^), (^>>), (|||), returnA)
 import Data.Char (isAlphaNum)
 import Data.List (isInfixOf, isPrefixOf, nub)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (_Just, box, decide, done, step, withInbox)
+import Network.Streaming.Combinators (_Just, box, decide, done, step, tap, withInbox)
+import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (..))
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
 import Network.Streaming.Named (adding, at, cases, field, is, (:=), (?>))
@@ -191,6 +192,44 @@ spec = describe "the chart" $ do
         length (nodesDeclared (gear ++ "IO") inside) `shouldBe` 2
         length (filter (gear `isInfixOf`) inside) `shouldBe` 2
       found -> failTest ("the box has " <> show (length found) <> " pages, and not its own and the page that has it")
+
+  pending $
+    it "has a box for a group, which has its body" $ do
+      chart <- chartOf (group AwaitAll spawnsWorking :: Diagram Int ((), ()))
+      case subgraphTitled "group" chart of
+        Nothing -> failTest "the chart has no box for the group"
+        Just (_, inside) -> length (nodesDeclared (gear ++ "collected") inside) `shouldBe` 1
+
+  pending $
+    it "has a box labelled spawn for a spawn, which holds the part, has an edge into it from the step before, and has no edge out of the part" $ do
+      chart <- chartOf (group AwaitAll spawnsWorking :: Diagram Int ((), ()))
+      case subgraphTitled "spawn" chart of
+        Nothing -> failTest "the chart has no box for the spawn"
+        Just (spawned, inside) -> do
+          case (nodesDeclared (gear ++ "working") inside, nodesDeclared (gear ++ "collected") chart) of
+            ([part], [collected]) -> do
+              ((collected, spawned) `elem` edgesOf chart) `shouldBe` True
+              [to | (from, to) <- edgesOf chart, from == part] `shouldBe` []
+            found -> failTest ("the chart has the steps " <> show found)
+          length (nodesDeclared (gear ++ "working") chart) `shouldBe` 1
+
+-- | Marks a case as one that fails until group and spawn are made.
+pending :: Spec -> Spec
+pending = xfail "group and spawn are not made yet"
+
+-- | A body that collects, and spawns the part that works.
+spawnsWorking :: Diagram (Group Diagram s AwaitAll, Int) ()
+spawnsWorking = tap (snd ^>> step "collected" (const (pure ()))) >>> spawn working
+
+-- | The node and the lines inside the subgraph of the title, if the chart has one: the lines that are indented further
+-- than its first line, up to its end.
+subgraphTitled :: String -> [String] -> Maybe (String, [String])
+subgraphTitled title chart = case break opens chart of
+  (_, []) -> Nothing
+  (_, opening : rest) -> Just (words opening !! 1, takeWhile (\line -> indentOf line > indentOf opening) rest)
+  where
+    opens line = "subgraph " `isPrefixOf` dropWhile (== ' ') line && ("[\"" ++ title ++ "\"]") `isInfixOf` line
+    indentOf = length . takeWhile (== ' ')
 
 -- | The chart of the top page of the program, as lines.
 chartOf :: Diagram a b -> IO [String]

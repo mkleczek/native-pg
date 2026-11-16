@@ -28,6 +28,7 @@ import GHC.Stack (CallStack, SrcLoc, callStack, getCallStack)
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Network.Streaming.Annotate (Annotate (..))
 import Network.Streaming.Classes
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Mode (Mode (..), ModeOf)
 import Network.Streaming.Structure (Shape (..), Tree (..), unnamedAction)
 import Prelude hiding (id, (.))
@@ -95,6 +96,9 @@ instance Within Diagram where
   timeoutA (Diagram body) = Diagram (TimeoutA body)
 
 instance Concurrent Diagram where
+  data Group Diagram s j
+  group _ _ = error "not yet"
+  spawn _ = error "not yet"
   together parts = Diagram (Together [part | Diagram part <- parts])
 
 -- | The box records where the code asked for it: the outermost call of the stack, which is the one in the program, and

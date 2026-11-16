@@ -41,6 +41,7 @@ import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, changeHere, closeShelf, collectedWrongly, lookOrWait, newShelf, postNow, postOrQueue, takeNow)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
@@ -91,6 +92,9 @@ instance ArrowChoice Loop where
 instance Annotate Loop
 
 instance Concurrent Loop where
+  data Group Loop s j
+  group _ _ = error "not yet"
+  spawn _ = error "not yet"
   together = \case
     [] -> done
     [one] -> one
@@ -207,7 +211,7 @@ data Frames b r where
   Then :: Loop b c -> Frames c r -> Frames b r
   Beside :: c -> Frames (b, c) r -> Frames b r
   OnLeft :: Frames (Either b c) r -> Frames b r
-  Joining :: Group -> Frames () r -> Frames () r
+  Joining :: Bunch -> Frames () r -> Frames () r
   RaceFirst :: Contest b d -> Frames (Either b d) r -> Frames b r
   RaceSecond :: Contest b d -> Frames (Either b d) r -> Frames d r
   -- | What was acquired is there: the body goes on with it.
@@ -219,8 +223,8 @@ data Frames b r where
   Trying :: Frames (Either SomeException b) r -> Frames b r
   Shielding :: Frames b r -> Frames b r
 
--- | A group of concurrent parts: the cancel scope of its parts, how many there are, and what it has of how they ended.
-data Group = Group !LoopScope !Int !(IORef Joined)
+-- | The parts of a 'together': the cancel scope of its parts, how many there are, and what it has of how they ended.
+data Bunch = Bunch !LoopScope !Int !(IORef Joined)
 
 -- | What a group has of its first failure, and how many of its parts have ended.
 data Joined = Joined !(Maybe SomeException) !Int
@@ -239,7 +243,7 @@ cancelledSTM = go Nothing
       Then _ rest -> go found rest
       Beside _ rest -> go found rest
       OnLeft rest -> go found rest
-      Joining (Group scope' _ _) rest -> inside scope' found rest
+      Joining (Bunch scope' _ _) rest -> inside scope' found rest
       RaceFirst (Contest scope' _) rest -> inside scope' found rest
       RaceSecond (Contest scope' _) rest -> inside scope' found rest
       Acquired _ _ _ rest -> go found rest
@@ -271,8 +275,8 @@ data Advanced r
 
 -- | A part of a group has ended, with a failure or without: the first failure cancels the others, and the part that
 -- ends last goes on with the parent, with the failure if there was one.
-joinPart :: Group -> Frames () r -> Maybe SomeException -> IO (Maybe (Process r))
-joinPart (Group scope' size ref) rest failure = do
+joinPart :: Bunch -> Frames () r -> Maybe SomeException -> IO (Maybe (Process r))
+joinPart (Bunch scope' size ref) rest failure = do
   Joined failed count <- readIORef ref
   failed' <- case failure of
     Just thrown | isNothing failed -> cancelLoopScope scope' $> Just thrown
@@ -311,8 +315,8 @@ advance env time fuel wake = go 0
               Right c -> go steps (Give (Right c) frames)
             Together parts -> do
               scope' <- newLoopScope env
-              group <- Group scope' (length parts) <$> newIORef (Joined Nothing 0)
-              pure (steps, Forked [Run part input (Joining group frames) | part <- parts])
+              bunch <- Bunch scope' (length parts) <$> newIORef (Joined Nothing 0)
+              pure (steps, Forked [Run part input (Joining bunch frames) | part <- parts])
             Race' one two -> do
               scope' <- newLoopScope env
               contest <- Contest scope' <$> newIORef Nothing
@@ -360,7 +364,7 @@ advance env time fuel wake = go 0
             Then next rest -> go steps (Run next value rest)
             Beside c rest -> go steps (Give (value, c) rest)
             OnLeft rest -> go steps (Give (Left value) rest)
-            Joining group rest -> joinPart group rest Nothing >>= endHalf steps
+            Joining bunch rest -> joinPart bunch rest Nothing >>= endHalf steps
             RaceFirst contest rest -> raceHalf contest rest (Right (Left value)) >>= endHalf steps
             RaceSecond contest rest -> raceHalf contest rest (Right (Right value)) >>= endHalf steps
             Acquired release body input rest -> go steps (Run body (value, input) (Guarded value release rest))
@@ -373,7 +377,7 @@ advance env time fuel wake = go 0
             Then _ rest -> go steps (Fail failure rest)
             Beside _ rest -> go steps (Fail failure rest)
             OnLeft rest -> go steps (Fail failure rest)
-            Joining group rest -> joinPart group rest (Just failure) >>= endHalf steps
+            Joining bunch rest -> joinPart bunch rest (Just failure) >>= endHalf steps
             RaceFirst contest rest -> raceHalf contest rest (Left failure) >>= endHalf steps
             RaceSecond contest rest -> raceHalf contest rest (Left failure) >>= endHalf steps
             Acquired _ _ _ rest -> go steps (Fail failure rest)
