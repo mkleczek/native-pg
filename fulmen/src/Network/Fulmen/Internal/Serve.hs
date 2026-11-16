@@ -76,9 +76,9 @@ import Network.Streaming.Combinators
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (group, spawn))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Named (Inj, cases, casesBy, field, inj, is, newRecord, (:=), (?>))
+import Network.Streaming.Named (Inj, casesBy, field, inj, is, newRecord, (:=), (?>))
 import Network.Streaming.Pool (checkoutIn, releaseNow, takeNowWith)
-import Network.Streaming.Wiring (result, (-<), (<:))
+import Network.Streaming.Wiring (choice, result, (-<), (<:))
 
 -- | The server: for each core, its connection workers, and for the first, the acceptor, which opens the listener.
 serve :: (Runtime arr) => Settings -> Listen arr -> arr (Call, Request) () -> arr Cores ()
@@ -324,13 +324,13 @@ request settings handler =
         ( "loan"     <: borrowed                         -< ["loans"]                     >>>
           "progress" <: step "copy carry-over" carryOver -< ["loan", "conn"]              >>>
           "head"     <: readHead settings                -< ["conn", "loan", "progress"]  >>>
-          "kept"     <: afterHead                        -< ["head", "conn", "loans", "loan", "progress"]
+          "kept"     <: choice "how did the head end?" "head"
+                          (    "stream ended" ?> quit                      -< []
+                           ||| "refused"      ?> refuse                    -< ["refused", "conn"]
+                           ||| "good"         ?> answered settings handler -< ["good", "conn", "loans", "loan", "progress"] )
         )
   where
     borrowed = field "loans" >>> borrow
-    afterHead =
-      decide "how did the head end?" (cases "head")
-        >>> ("stream ended" ?> quit ||| "refused" ?> refuse ||| "good" ?> answered settings handler)
     refuse =
       step
         "render refusal"
