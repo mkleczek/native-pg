@@ -1,14 +1,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | Where a server that runs on several cores puts its new connections: a client opens connections and keeps them, and
--- each core is to serve as many of them as the other, instead of one core serving them all while the other has workers
--- that are free.
+-- | Where a server that runs on several cores puts its new connections, and how many it serves at once: a client opens
+-- connections and keeps them, and each core is to serve as many of them as the other, instead of one core serving them all
+-- while the other has workers that are free. A connection goes to the core that has the fewest when it is accepted, not
+-- when the core that serves it was picked; past the cap on connections the server accepts none until one closes; and a
+-- shutdown that comes while every core is full ends the server.
 module PlacementSpec (spec) where
 
 import Control.Arrow ((&&&), (>>>), (^>>))
 import Control.Concurrent (forkFinally, getNumCapabilities, killThread, myThreadId, rtsSupportsBoundThreads, setNumCapabilities, threadCapability, threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar)
-import Control.Exception (bracket)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
+import Control.Exception (SomeException, bracket)
 import Control.Monad (forM_, replicateM, void, when)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
@@ -22,23 +24,14 @@ import Network.Streaming.Classes
 import Network.Streaming.Combinators (consume, keeping)
 import Network.Streaming.Delimited (runCores)
 import Skeletest
+import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = parallelCores "a core's thread is pinned to the capability of its number, and the non-threaded run time has one" $ describe "placement" $
-  it "gives new connections that are kept open to the cores in turn, when the workers that are free are all of one core" $ do
-    -- Each core runs on the capability of its number.
-    getNumCapabilities >>= \capabilities -> when (capabilities < 2) (setNumCapabilities 2)
-    bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
-      Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
-      Socket.listen accepting 128
-      port <- Socket.socketPort accepting
-      let settings = Fulmen.defaultSettings {Fulmen.connectionsPerCore = 4}
-          serving cores =
-            runCores 2 (pure cores) (\shared core -> const (Fulmen.onCore shared core) ^>> Fulmen.serve settings (Fulmen.borrowed accepting) answerWithCore)
-      cores <- Fulmen.newCores settings 2
-      stopped <- newEmptyMVar
-      bracket (forkFinally (void (serving cores)) (putMVar stopped)) killThread $ \_ -> do
+spec = parallelCores "a core's thread is pinned to the capability of its number, and the non-threaded run time has one" $ do
+  describe "placement" $ do
+    it "gives new connections that are kept open to the cores in turn, when the workers that are free are all of one core" $
+      withServer Fulmen.defaultSettings {Fulmen.connectionsPerCore = 4} 2 $ \port _ -> do
         -- The workers of both cores offer themselves at the start, and the connections come when they all have.
         threadDelay 200000
         placed <- timeout 20000000 $
@@ -52,6 +45,72 @@ spec = parallelCores "a core's thread is pinned to the capability of its number,
               threadDelay 100000
             bracket (replicateM 4 (opened port)) (mapM_ (Socket.close . fst)) (pure . sort . map snd)
         placed `shouldBe` Just [0, 0, 1, 1 :: Int]
+
+    -- The core is picked before the connection comes, from the workers that are free then: the connection that comes after
+    -- the connections of one core were closed goes to the core that was picked, which is the one that has the more.
+    xfail "the core is picked before the connection comes, from the workers that are free then" $
+      it "gives a connection to the core that has the fewest when it comes, after the connections of the other were closed" $
+        withServer Fulmen.defaultSettings {Fulmen.connectionsPerCore = 4} 2 $ \port _ -> do
+          threadDelay 200000
+          placed <- timeout 20000000 $
+            bracket (replicateM 6 (opened port)) (mapM_ (Socket.close . fst)) $ \held -> do
+              -- Three connections on each core, and then none on core 1.
+              sort (map snd held) `shouldBe` [0, 0, 0, 1, 1, 1]
+              mapM_ (Socket.close . fst) (on 1 held)
+              threadDelay 300000
+              bracket (opened port) (Socket.close . fst) (pure . snd)
+          placed `shouldBe` Just 1
+
+  describe "the cap on connections" $
+    it "accepts no connection past the cap until one that is served has closed" $
+      -- One core, with room for two connections.
+      withServer Fulmen.defaultSettings {Fulmen.connectionsPerCore = 2} 1 $ \port _ -> do
+        threadDelay 200000
+        served <- timeout 20000000 $
+          bracket (replicateM 2 (opened port)) (mapM_ (Socket.close . fst)) $ \held ->
+            bracket (connected port) Socket.close $ \waiting -> do
+              sendRequest waiting
+              -- The third waits in the listen backlog, and is not served while the two are open.
+              early <- timeout 400000 (answerOf waiting)
+              mapM_ (Socket.close . fst) (take 1 held)
+              late <- timeout 10000000 (answerOf waiting)
+              pure (early, late)
+        served `shouldBe` Just (Nothing, Just 0)
+
+  describe "a shutdown that comes while every core is full" $
+    it "ends the server, closes the connection that is idle, and serves none that waits in the backlog" $
+      bracket (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) (\(reader, writer) -> Socket.close reader *> Socket.close writer) $ \(reader, writer) -> do
+        fd <- Socket.unsafeFdSocket reader
+        let settings = Fulmen.defaultSettings {Fulmen.connectionsPerCore = 1, Fulmen.shutdown = Just (Readable (Fd fd))}
+        withServer settings 1 $ \port stopped -> do
+          threadDelay 200000
+          bracket (opened port) (Socket.close . fst) $ \(idle, _) ->
+            -- The only core is full, so a second connection waits in the backlog, where the acceptor doesn't take it.
+            bracket (connected port) Socket.close $ \waiting -> do
+              sendRequest waiting
+              threadDelay 200000
+              SocketBytes.sendAll writer "x"
+              ended <- timeout 5000000 (readMVar stopped)
+              fmap (either (const False) (const True)) ended `shouldBe` Just True
+              closed <- timeout 3000000 (SocketBytes.recv idle 1)
+              closed `shouldBe` Just B.empty
+              answered <- timeout 500000 (answerOf waiting)
+              answered `shouldBe` Nothing
+
+-- | A server on this many cores that runs for as long as the action does, on a listening socket of its own, which the action
+-- is given the port of, and the box that says how the server ended. Each core runs on the capability of its number.
+withServer :: Fulmen.Settings -> Int -> (Socket.PortNumber -> MVar (Either SomeException ()) -> IO a) -> IO a
+withServer settings cores use = do
+  getNumCapabilities >>= \capabilities -> when (capabilities < cores) (setNumCapabilities cores)
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+    Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen accepting 128
+    port <- Socket.socketPort accepting
+    let serving shared =
+          runCores cores (pure shared) (\made core -> const (Fulmen.onCore made core) ^>> Fulmen.serve settings (Fulmen.borrowed accepting) answerWithCore)
+    shared <- Fulmen.newCores settings cores
+    stopped <- newEmptyMVar
+    bracket (forkFinally (void (serving shared)) (putMVar stopped)) killThread $ \_ -> use port stopped
 
 -- | Answers with the number of the core that runs the handler, as a digit: a core's thread is pinned to the capability
 -- of its number.
@@ -74,14 +133,24 @@ on core = filter ((== core) . snd)
 -- | A new connection to the server, and the number of the core that answers a request on it.
 opened :: Socket.PortNumber -> IO (Socket, Int)
 opened port = do
+  sock <- connected port
+  sendRequest sock
+  (,) sock <$> answerOf sock
+
+-- | A new connection to the server, with nothing sent on it.
+connected :: Socket.PortNumber -> IO Socket
+connected port = do
   sock <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
   Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1)))
-  (,) sock <$> askCore sock
+  pure sock
 
--- | Sends a request on the connection, and gives the number of the core that answered it.
-askCore :: Socket -> IO Int
-askCore sock = do
-  SocketBytes.sendAll sock "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+-- | Sends a request on the connection.
+sendRequest :: Socket -> IO ()
+sendRequest sock = SocketBytes.sendAll sock "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+
+-- | The number of the core that answered the request that was sent on the connection.
+answerOf :: Socket -> IO Int
+answerOf sock = do
   answer <- readAnswer B.empty
   pure (read (C.unpack (B.takeEnd 1 answer)))
   where
