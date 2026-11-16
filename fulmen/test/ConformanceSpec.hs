@@ -20,7 +20,7 @@ import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkFinally, forkIO, killThread, rtsSupportsBoundThreads, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Exception (IOException, SomeException, bracket, displayException, fromException, throwIO, try)
-import Control.Monad (foldM, forM_, void, when)
+import Control.Monad (foldM, forM, forM_, void, when)
 import ConformanceCases
 import ConformanceWire
 import Data.ByteString (ByteString)
@@ -60,7 +60,7 @@ import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, 
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> acceptCost *> manyWorkers
+spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> idleCost *> acceptCost *> manyWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -293,6 +293,48 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
           closed `shouldBe` Just ()
           stopped <- timeout 3000000 (readMVar (serverStopped shutting))
           fmap (either (const False) (const True)) stopped `shouldBe` Just True
+
+-- | What the idle timeout costs a request: a client keeps one connection and asks over and over, and a request allocates, with the
+-- idle timeout of 30 seconds, no more than the allowance more than it does with none. The client's own bytes are in both numbers, and the
+-- two are measured one after the other, three times each, so that the load of the machine is in both.
+idleCost :: Spec
+idleCost = describe "the cost of the idle timeout" $ forM_ measured $ \runner@(Runner runnerName _) ->
+  describe runnerName $
+    (if runnerName `elem` ["threads", "delimited", "compiled"] then xfail "the idle timeout costs a request more than the allowance" else id) $
+      it "is no more than the allowance for a request" $ do
+        pairs <- forM [1 .. 3 :: Int] $ \_ -> (,) <$> perRequest runner (Just (secs 30)) <*> perRequest runner Nothing
+        let with = mean (map fst pairs)
+            without = mean (map snd pairs)
+        lookupEnv "IDLE_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("idle | " <> runnerName <> " | " <> show (round with :: Int) <> " bytes with | " <> show (round without :: Int) <> " bytes without"))
+        when (with - without > allowance) $
+          failTest ("a request allocates " <> show (round with :: Int) <> " bytes with the idle timeout, and " <> show (round without :: Int) <> " without")
+  where
+    -- The non-threaded run time runs the parts of the other arrows on the one thread that the client has too, and what they allocate
+    -- while a request waits goes by the time that it takes: only Threads is measured there, as in 'acceptCost'.
+    measured = [runner | runner@(Runner runnerName _) <- runners, rtsSupportsBoundThreads || runnerName == "threads"]
+    -- What the idle timeout may add to a request, in bytes.
+    allowance = 512
+    mean values = sum values / fromIntegral (length values)
+    -- The bytes that a request costs the process, on a connection that is kept: the request is sent, and its answer is read.
+    perRequest :: Runner -> Maybe Duration -> IO Double
+    perRequest runner limit =
+      withStoppableWith (\settings -> settings {Fulmen.idleTimeout = limit}) runner (handling (Fixed 200 [] "ok")) $ \shutting ->
+        bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \sock -> do
+          Socket.connect sock (Socket.SockAddrInet (serverPort shutting) (Socket.tupleToHostAddress (127, 0, 0, 1)))
+          let requests = 2000 :: Int
+              answered = SocketBytes.recv sock 512 >>= \bytes -> if "ok" `B.isSuffixOf` bytes then pure () else answered
+              once = SocketBytes.sendAll sock "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" *> answered
+              repeated :: Int -> IO ()
+              repeated count = forM_ [1 .. count] (const once)
+          -- The first requests load the code, and the server has had a moment to start.
+          threadDelay 100000
+          repeated 200
+          performMinorGC
+          before <- allocated_bytes <$> getRTSStats
+          repeated requests
+          performMinorGC
+          after <- allocated_bytes <$> getRTSStats
+          pure (fromIntegral (after - before) / fromIntegral requests)
 
 -- | What the acceptor allocates for a connection that it takes: the same with a thousand free workers as with a few, since it takes the
 -- first free worker of the core that has the most of them, and doesn't go through the workers that are free to tell which core that

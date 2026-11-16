@@ -7,7 +7,7 @@
 --
 -- It has two modes, which are run as two processes:
 --
--- > fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] +RTS -T -N2
+-- > fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] [no-idle-timeout] +RTS -T -N2
 -- > fulmen-bench client PORT CONNECTIONS SECONDS /16k|/1m [fresh]
 --
 -- The server prints the port it listens on, and serves until it is killed. The client asks the server to note its
@@ -53,11 +53,11 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
-    ["server", kind, cores, connections] -> server False kind (read cores) (read connections)
-    ["server", kind, cores, connections, "graceful"] -> server True kind (read cores) (read connections)
+    "server" : kind : cores : connections : options
+      | all (`elem` ["graceful", "no-idle-timeout"]) options -> server ("graceful" `elem` options) ("no-idle-timeout" `elem` options) kind (read cores) (read connections)
     ["client", port, connections, seconds, path] -> client False (read port) (read connections) (read seconds) (C.pack path)
     ["client", port, connections, seconds, path, "fresh"] -> client True (read port) (read connections) (read seconds) (C.pack path)
-    _ -> die "usage: fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] | client PORT CONNECTIONS SECONDS /16k|/1m [fresh]"
+    _ -> die "usage: fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] [no-idle-timeout] | client PORT CONNECTIONS SECONDS /16k|/1m [fresh]"
 
 -- * The server
 
@@ -70,9 +70,10 @@ data Counters = Counters
   }
 
 -- | The server. With @graceful@ it has an event to shut down on, which nothing fires, so that the cost of a shutdown that is
--- possible is measured.
-server :: Bool -> String -> Int -> Int -> IO ()
-server graceful kind cores connections = do
+-- possible is measured. With @no-idle-timeout@ it has no idle timeout, which the default settings have, so that the cost of one is
+-- measured.
+server :: Bool -> Bool -> String -> Int -> Int -> IO ()
+server graceful noIdleTimeout kind cores connections = do
   hSetBuffering stdout LineBuffering
   listening <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
   Socket.setSocketOption listening Socket.ReuseAddr 1
@@ -94,6 +95,7 @@ server graceful kind cores connections = do
           { Fulmen.bufferPool = BufferPoolSettings size ordinary reserve setup,
             Fulmen.connectionsPerCore = connections,
             Fulmen.clientTimeout = Nothing,
+            Fulmen.idleTimeout = if noIdleTimeout then Nothing else Fulmen.idleTimeout Fulmen.defaultSettings,
             Fulmen.shutdown = if graceful then Just event else Nothing
           }
   shared <- Fulmen.newCores settings cores
