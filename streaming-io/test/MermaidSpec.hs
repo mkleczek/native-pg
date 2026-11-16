@@ -48,12 +48,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The code that draws the names of a pattern as boxes, nested as the pattern nests, each with the edges that leave it, and
--- the edges that say only the order as dotted ones, is not written yet: the cases that need it are expected to fail, and
--- the marks come off when the code is there.
-unwritten :: Spec -> Spec
-unwritten = xfail "Network.Streaming.Diagram.Mermaid draws no boxes for the names of a pattern yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -182,7 +176,7 @@ spec = describe "the chart" $ do
       Just (_, inside) -> any ("{\"how big?\"}" `isInfixOf`) inside `shouldBe` True
       Nothing -> failTest "the chart has no box for the line of the choice"
 
-  unwritten $ it "has an edge into a step of a flow from the box of each name that it binds, and from the start for the names of the input, past the steps between" $ do
+  it "has an edge into a step of a flow from the box of each name that it binds, and from the start for the names of the input, past the steps between" $ do
     chart <- chartOf fanning
     -- The name "i" is read by the first step and the last, so it leaves the start twice.
     edgesNamed chart
@@ -194,7 +188,7 @@ spec = describe "the chart" $ do
           ("gamma", "end", "")
         ]
 
-  unwritten $ it "has on an edge from a box that is a whole the field of a path alone and a port that is another name after it, and the names of one producer on one edge" $ do
+  it "has on an edge from a box that is a whole the field of a path alone and a port that is another name after it, and the names of one producer on one edge" $ do
     chart <- chartOf ports
     edgesNamed chart
       `shouldBe` sort
@@ -204,7 +198,7 @@ spec = describe "the chart" $ do
           ("sum", "end", "")
         ]
 
-  unwritten $ it "has an edge that is dotted from the step before to a step that binds nothing from it, and none to a step that does" $ do
+  it "has an edge that is dotted from the step before to a step that binds nothing from it, and none to a step that does" $ do
     chart <- chartOf quiet
     -- "note" gives nothing, so "beta" cannot read it: its edge says only the order. "note" reads "alpha": its edge is of the name.
     edgesNamed chart
@@ -218,7 +212,7 @@ spec = describe "the chart" $ do
     -- The order edge has a style of its own: it is dotted and drawn in grey, as a data edge never is.
     any (\line -> "linkStyle" `isPrefixOf` line && "stroke:#8c959f" `isInfixOf` line) (stripped chart) `shouldBe` True
 
-  unwritten $ it "has a box for each name of a pattern of a choice's branch beside its step, and an edge to the step from the exact box that it reads, with the case on the edge from the decision" $ do
+  it "has a box for each name of a pattern of a choice's branch beside its step, and an edge to the step from the exact box that it reads, with the case on the edge from the decision" $ do
     chart <- chartOf choosing
     case subgraphTitled "picked" chart of
       Just (_, inside) -> do
@@ -251,7 +245,7 @@ spec = describe "the chart" $ do
           ("IO", "end", "")
         ]
 
-  unwritten $ it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
+  it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
     chart <- chartOf nesting
     -- The inner flow reads its own "n", which the outer step binds: it is drawn from the box of "n" to the start of the inner
     -- flow, a junction, and not from the step "first" of the outer flow.
@@ -263,7 +257,7 @@ spec = describe "the chart" $ do
           ("tail", "end", "")
         ]
 
-  unwritten $ it "has a box for each name of a pattern, nested as the pattern nests, with the step in the box of its whole" $ do
+  it "has a box for each name of a pattern, nested as the pattern nests, with the step in the box of its whole" $ do
     chart <- chartOf nestedNames
     case subgraphTitled "conn" chart of
       Nothing -> failTest "the chart has no box for the whole"
@@ -277,7 +271,7 @@ spec = describe "the chart" $ do
     -- A step that gives a name of its own is a box beside it, and not in the box of the whole.
     (subgraphTitled "tuned" chart == Nothing, subgraphTitled "c" chart == Nothing) `shouldBe` (False, False)
 
-  unwritten $ it "has an edge from the box of the exact name that a step reads: a part, a whole, and a part of a whole by a path, with the port that is another name" $ do
+  it "has an edge from the box of the exact name that a step reads: a part, a whole, and a part of a whole by a path, with the port that is another name" $ do
     chart <- chartOf nestedNames
     edgesNamed chart
       `shouldBe` sort
@@ -291,7 +285,7 @@ spec = describe "the chart" $ do
         ]
     orderEdges chart `shouldBe` []
 
-  unwritten $ it "has a box that has no title for the step and the names of a list, and no box for a field that the list leaves out" $ do
+  it "has a box that has no title for the step and the names of a list, and no box for a field that the list leaves out" $ do
     chart <- chartOf dividing
     case subgraphTitled " " chart of
       Just (_, inside) -> do
@@ -302,7 +296,7 @@ spec = describe "the chart" $ do
     chart' <- chartOf renaming
     ([length (boxesDeclared name chart') | name <- ["left", "z", "x", "y"]]) `shouldBe` [1, 1, 0, 0]
 
-  unwritten $ it "has an edge from the box of each name of a list to each step that reads it" $ do
+  it "has an edge from the box of each name of a list to each step that reads it" $ do
     chart <- chartOf dividing
     -- "q" and "r" are boxes beside "divide": "mix" reads both, and "plus" reads "q" under its port.
     edgesNamed chart
@@ -329,7 +323,7 @@ spec = describe "the chart" $ do
       page : _ -> pagePlumbing page `shouldBe` pageMermaid page
       [] -> failTest "the program has no page"
 
-  unwritten $ it "has the edges that a flow has from the start from the step before it instead, when that is the one node that leads into it" $ do
+  it "has the edges that a flow has from the start from the step before it instead, when that is the one node that leads into it" $ do
     chart <- chartOf (tap quick >>> fanning)
     edgesNamed chart
       `shouldBe` sort

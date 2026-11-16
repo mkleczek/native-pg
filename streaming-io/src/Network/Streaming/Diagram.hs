@@ -107,7 +107,8 @@ instance Annotate Diagram where
   named label (Diagram body) = Diagram (Named label (outermost callStack) body)
   wires input output (Diagram body) = Diagram (Wires input output body)
   exchange side name (Diagram body) = Diagram (End side name body)
-  flowStep name bindings (Diagram body) = Diagram (FlowStep name bindings body)
+  flowStep names bindings (Diagram body) = Diagram (FlowStep names bindings body)
+  flowCase names (Diagram body) = Diagram (FlowCase names body)
   flowScope (Diagram body) = Diagram (FlowScope body)
   allowing check reason (Diagram body) = Diagram (Allowing check reason body)
 

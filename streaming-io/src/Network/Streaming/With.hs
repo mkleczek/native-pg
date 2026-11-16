@@ -24,7 +24,7 @@ where
 import Control.Arrow (Arrow (..), ArrowChoice (..), (>>>), (>>^), (^>>))
 import Control.Category (Category (..))
 import Data.Tuple (swap)
-import Network.Streaming.Annotate (Annotate (exchange, flowScope, flowStep))
+import Network.Streaming.Annotate (Annotate (exchange, flowCase, flowScope, flowStep))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
@@ -159,8 +159,10 @@ instance (Annotate arr) => Annotate (With r arr) where
   {-# INLINE wires #-}
   exchange side name (With inner) = With (exchange side name inner)
   {-# INLINE exchange #-}
-  flowStep name bindings (With inner) = With (flowStep name bindings inner)
+  flowStep names bindings (With inner) = With (flowStep names bindings inner)
   {-# INLINE flowStep #-}
+  flowCase names (With inner) = With (flowCase names inner)
+  {-# INLINE flowCase #-}
   flowScope (With inner) = With (flowScope inner)
   {-# INLINE flowScope #-}
   allowing check reason (With inner) = With (allowing check reason inner)

@@ -76,12 +76,14 @@
 -- record nor a pair that a list takes apart. An error in a nested pattern says where it is, as in @in "socket": the
 -- output of the step has no field "w"@.
 --
--- In diagrams the box of a step that has names has them for its title, comma-separated, and each name that a step binds
--- is an edge into it from where the name comes from: the step that gives it, or where the flow is entered for a name of
--- the flow's input. An edge says the names that it has, as in @x → i@ for the port @i@ bound to the field @x@ of a step, and the
--- names of one producer that a step binds share one edge. A step that binds nothing from the step before it has an edge
--- from it that says only the order. A choice is drawn in the box of its line, with its question, and the edge from it to
--- a branch says its case, which is where the value of the case comes from.
+-- In diagrams each name is a box, nested as its pattern nests. The box of a step is titled with the name that keeps its output
+-- whole, if it has one, and holds the step and a box for each name of its pattern: a small node for a name, and a box titled
+-- with its name, or else its field, for a part that is taken apart. A branch's pattern gives boxes beside the branch's step, in
+-- the box of the choice. An edge into a step starts at the exact box of each name that it binds, and says nothing of the name,
+-- which the box says, but the port if it is another name, as @→ i@, and the field of a path into a whole, as @x → i@. A name
+-- of the flow's input is an edge from where the flow is entered, which says the names, and the names of one producer that a
+-- step binds share one edge. A step that binds nothing from the step before it has a dotted edge from it, which says only the
+-- order, in grey. A choice is drawn in the box of its line, with its question, and the edge from it to a branch says its case.
 module Network.Streaming.Wiring
   ( Flow,
     Line,
@@ -115,9 +117,11 @@ import GHC.TypeLits
     UnconsSymbol,
     symbolVal,
   )
-import Network.Streaming.Annotate (Annotate (..), Binding (..), (-|))
+import Network.Streaming.Annotate (Annotate (..), Binding (..), Part (..), (-|))
 import Network.Streaming.Internal.Patterns
   ( AllFresh,
+    Described (..),
+    DescribedList (..),
     Dig (..),
     Distinct,
     Entry (..),
@@ -168,7 +172,7 @@ class Lined t arr x o where
 
 -- | A step that gives nothing to keep: the record goes on as it was.
 instance {-# INCOHERENT #-} (Arrow arr, Annotate arr, arr' ~ arr, x' ~ x, y ~ x) => Lined (Flow arr' x' y) arr x o where
-  line texts p = Flow (alongside (flowStep [] texts p) >>^ snd)
+  line texts p = Flow (alongside (flowStep Nothing texts p) >>^ snd)
   {-# INLINE line #-}
 
 -- | A step whose output is to be named.
@@ -178,7 +182,7 @@ instance {-# INCOHERENT #-} (arr' ~ arr, x' ~ x, o' ~ o) => Lined (Line arr' x' 
 
 -- | A step that is an arrow of its own, as a branch of a choice is: it takes the record that its input is made from.
 instance (Annotate arr, arr' ~ arr, x' ~ x, o' ~ o) => Lined (arr' x' o') arr x o where
-  line = flowStep []
+  line = flowStep Nothing
   {-# INLINE line #-}
 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of
@@ -234,7 +238,7 @@ class Outs out x o y | out x o -> y where
 -- them.
 instance
   ( NoField (Parse out),
-    Names (Given '[Parse out]),
+    Described (Parse out),
     Distinct (Given '[Parse out]),
     AllFresh (Given '[Parse out]) x,
     Take Root (Parse out) o x y
@@ -242,20 +246,23 @@ instance
   Outs (out :: Symbol) x o y
   where
   outcome (Line texts p) =
-    Flow (alongside (flowStep (names @(Given '[Parse out])) texts p) >>^ \(o, x) -> takeEntry @Root @(Parse out) o x)
+    Flow (alongside (flowStep (Just (describeEntry @(Parse out))) texts p) >>^ \(o, x) -> takeEntry @Root @(Parse out) o x)
   {-# INLINE outcome #-}
 
 -- | A list of patterns: the output is taken apart, and each name is a part of it.
 instance
   ( Level (ShapeOf o) Root (Parses entries) o x y,
-    Names (Given (Parses entries)),
+    DescribedList (Parses entries),
     Distinct (Given (Parses entries)),
     AllFresh (Given (Parses entries)) x
   ) =>
   Outs (entries :: [Symbol]) x o y
   where
   outcome (Line texts p) =
-    Flow (alongside (flowStep (names @(Given (Parses entries))) texts p) >>^ \(o, x) -> level @(ShapeOf o) @Root @(Parses entries) o x)
+    Flow
+      ( alongside (flowStep (Just (Part Nothing Nothing (Just (listOf @(Parses entries))))) texts p)
+          >>^ \(o, x) -> level @(ShapeOf o) @Root @(Parses entries) o x
+      )
   {-# INLINE outcome #-}
 
 -- | The pattern on the left of '<:' is not for a field: it is the output of the step that is taken.

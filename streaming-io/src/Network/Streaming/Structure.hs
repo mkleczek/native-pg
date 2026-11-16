@@ -28,7 +28,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import GHC.Stack (SrcLoc)
-import Network.Streaming.Annotate (Binding, Check, Side)
+import Network.Streaming.Annotate (Binding, Check, Part, Side)
 import Network.Streaming.Classes (Duration (..), Label)
 import System.Mem.StableName (StableName, hashStableName, makeStableName)
 
@@ -84,9 +84,11 @@ data Tree
     End Side String Tree
   | -- | A whole flow of "Network.Streaming.Wiring": the scope of the names of its steps.
     FlowScope Tree
-  | -- | A step of a flow of "Network.Streaming.Wiring": the names that its output has in the flow, if it has any, what
-    -- each of its ports is bound to, and its body.
-    FlowStep [String] [Binding] Tree
+  | -- | A step of a flow of "Network.Streaming.Wiring": the pattern that gives its output names in the flow, if it has
+    -- one, what each of its ports is bound to, and its body.
+    FlowStep (Maybe Part) [Binding] Tree
+  | -- | A branch of a choice of a flow whose case is taken apart by a pattern: the pattern, and the branch.
+    FlowCase Part Tree
   | -- | A body where the lint doesn't report a check: which, the reason, and the body.
     Allowing Check String Tree
 
@@ -131,6 +133,7 @@ opensInbox fuel step
       End _ _ inner -> opensInbox (fuel - 1) inner
       FlowScope inner -> opensInbox (fuel - 1) inner
       FlowStep _ _ inner -> opensInbox (fuel - 1) inner
+      FlowCase _ inner -> opensInbox (fuel - 1) inner
       Allowing _ _ inner -> opensInbox (fuel - 1) inner
       _ -> Nothing
 
@@ -172,6 +175,7 @@ children = \case
   End _ _ inner -> [inner]
   FlowScope inner -> [inner]
   FlowStep _ _ inner -> [inner]
+  FlowCase _ inner -> [inner]
   Allowing _ _ inner -> [inner]
 
 -- | The node evaluated, and its stable name: a node is evaluated before its name is made, so that the thunk of a node and

@@ -48,6 +48,8 @@ module Network.Streaming.Internal.Patterns
     AllFresh,
     CaseOf,
     Branch (..),
+    Described (..),
+    DescribedList (..),
     (?>),
   )
 where
@@ -66,7 +68,7 @@ import GHC.TypeLits
     UnconsSymbol,
     symbolVal,
   )
-import Network.Streaming.Annotate (Annotate, (|-))
+import Network.Streaming.Annotate (Annotate (..), Part (..), (|-))
 
 -- * Fields
 
@@ -549,6 +551,57 @@ instance (y ~ (name := a, rest)) => Place name a rest y where
   putFirst a rest = (Is a, rest)
   {-# INLINE putFirst #-}
 
+-- * For diagrams
+
+-- | A pattern as the diagrams are given it.
+class Described (entry :: Entry) where
+  -- | The pattern as a part that is a box of the diagram.
+  describeEntry :: Part
+
+instance (MaybeSymbol field, KnownSymbol name, DescribedParts parts) => Described ('Entry field name parts) where
+  describeEntry = Part (maybeSymbol @field) (if symbolVal (Proxy @name) == "_" then Nothing else Just (symbolVal (Proxy @name))) (partsOf @parts)
+
+-- | A symbol that a field may not have.
+class MaybeSymbol (field :: Maybe Symbol) where
+  maybeSymbol :: Maybe String
+
+instance MaybeSymbol 'Nothing where
+  maybeSymbol = Nothing
+
+instance (KnownSymbol field) => MaybeSymbol ('Just field) where
+  maybeSymbol = Just (symbolVal (Proxy @field))
+
+-- | The parts that a pattern may take its value apart into.
+class DescribedParts (parts :: Maybe [Entry]) where
+  partsOf :: Maybe [Part]
+
+instance DescribedParts 'Nothing where
+  partsOf = Nothing
+
+instance (DescribedList entries) => DescribedParts ('Just entries) where
+  partsOf = Just (listOf @entries)
+
+-- | A list of patterns as the diagrams are given it.
+class DescribedList (entries :: [Entry]) where
+  -- | The patterns as parts that are boxes of the diagram.
+  listOf :: [Part]
+
+instance DescribedList '[] where
+  listOf = []
+
+instance (Described entry, DescribedList entries) => DescribedList (entry ': entries) where
+  listOf = describeEntry @entry : listOf @entries
+
+-- | The pattern of a branch, which the diagrams draw the names of: there is none for a case alone.
+class CasePart (entry :: Entry) where
+  casePart :: Maybe Part
+
+instance CasePart ('Entry 'Nothing name 'Nothing) where
+  casePart = Nothing
+
+instance (Described ('Entry ('Just case_) name parts)) => CasePart ('Entry ('Just case_) name parts) where
+  casePart = Just (describeEntry @('Entry ('Just case_) name parts))
+
 -- * Branches
 
 -- | The case that a branch is for: the case that its pattern is for, and else its name.
@@ -600,8 +653,9 @@ infixr 6 ?>
 (?>) ::
   forall (label :: Symbol) ->
   forall arr v r y b.
-  (Arrow arr, Annotate arr, KnownSymbol (CaseOf label), Branch label v r y) =>
+  (Arrow arr, Annotate arr, KnownSymbol (CaseOf label), CasePart (Parse label), Branch label v r y) =>
   arr y b ->
   arr (CaseOf label := (CaseOf label := v, r)) b
-(?>) label p = (\(Is (Is v, r)) -> branch @label v r) ^>> (symbolVal (Proxy @(CaseOf label)) |- p)
+(?>) label p =
+  (\(Is (Is v, r)) -> branch @label v r) ^>> (symbolVal (Proxy @(CaseOf label)) |- maybe id flowCase (casePart @(Parse label)) p)
 {-# INLINE (?>) #-}

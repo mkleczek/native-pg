@@ -279,6 +279,7 @@ combine tree inner = case tree of
   End {} -> inOrder inner
   FlowScope {} -> inOrder inner
   FlowStep {} -> inOrder inner
+  FlowCase {} -> inOrder inner
   Allowing {} -> inOrder inner
   Named (Label title _) _ _ -> case inner of
     [only] -> Ways ((title :) <$> wayBack only) ((title :) <$> wayOut only)
