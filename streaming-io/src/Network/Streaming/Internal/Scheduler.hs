@@ -912,6 +912,9 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
                   until' <- untilNextTimer
                   polled <- pollWait (maybe (-1) (fromIntegral . min 2000000000 . (`div` 1000000) . (+ 999999)) until')
                   given <- afterSleep run >>= arrivals run
+                  -- The time of the round was read before the wait, if a timer made the round expire its timers: the parts that the wait ended
+                  -- read it again, as a round's first part does.
+                  setCounter run 8 0
                   go (polled <> given) []
                 else go early []
           | otherwise -> do
@@ -935,6 +938,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
               writeIORef (runWatching run) (map fst still)
               armed <- counter run 10
               polled <- if descriptors + armed > 0 then pollNow else pure []
+              setCounter run 8 0
               go (polled <> map (\(Watching _ _ resume, _) -> resume (pure ())) fired) []
     countWait = counter run 2 >>= setCounter run 2 . (+ 1)
     -- How long until the next timer is due, in nanoseconds.
