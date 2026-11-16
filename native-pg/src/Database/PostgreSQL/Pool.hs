@@ -39,12 +39,15 @@ where
 
 import Control.Arrow (arr, first, (***), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (ErrorCall (..), SomeException, finally, throwIO, toException, try)
-import Control.Monad (replicateM, void, when)
+import Control.Monad (filterM, unless, void, when)
 import System.IO (fixIO)
 import Data.Tuple (swap)
 import qualified Data.ByteString.Char8 as BC
 import Data.Foldable (find, traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
+import qualified Data.IntSet as IntSet
 import Data.Maybe (catMaybes, fromMaybe, isJust)
 import qualified Data.Text as Text
 import Data.UUID (UUID)
@@ -102,6 +105,8 @@ data ConnectionPool = ConnectionPool
     poolOverflow :: !(Pool Slot),
     -- | Every slot, of the pool and beyond its size, for the counts.
     poolEvery :: ![Slot],
+    -- | The slots that hold a connection, by their index, which the maintenance looks at: a look visits no other.
+    poolConnected :: !(IORef (IntMap Slot)),
     poolBuffers :: !BufferPool,
     poolSettings :: !ConnectionPoolSettings,
     -- | The count of the looks that the maintenance has made at the pool's connections, which a request that gives a connection
@@ -130,6 +135,8 @@ data Slot = Slot
   { slotOwner :: ConnectionPool,
     -- | Whether the slot is beyond the pool's size: its connection is closed when its request ends.
     slotBeyond :: !Bool,
+    -- | Which slot of the pool it is, from zero, those beyond the pool's size after the others.
+    slotIndex :: !Int,
     slotConnection :: !(IORef (Maybe Connection)),
     slotIdentifier :: !(IORef UUID),
     -- | When the connection was made, on the monotonic clock, in nanoseconds.
@@ -191,9 +198,9 @@ newConnectionPool maintenance settings = do
   -- The slots know the pool that they are of, so the pool is made by the knot: nothing looks at it until it is made.
   pool <-
     fixIO $ \self -> do
-      slots <- replicateM size (slotOf self False)
-      extra <- replicateM overflow (slotOf self True)
-      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing <*> newIORef 0 <*> pure (maintenanceCancels maintenance)
+      slots <- traverse (slotOf self False) [0 .. size - 1]
+      extra <- traverse (slotOf self True) [size .. size + overflow - 1]
+      ConnectionPool <$> newPool slots <*> newPool extra <*> pure (slots ++ extra) <*> newIORef IntMap.empty <*> pure buffers <*> pure settings <*> newIORef 0 <*> newIORef size <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef Nothing <*> newIORef 0 <*> pure (maintenanceCancels maintenance)
   case maintenancePeriod settings of
     Nothing -> pure ()
     Just period -> register maintenance period (lookAt pool) >>= \place -> writeIORef (poolRegistration pool) (Just (maintenance, place))
@@ -201,7 +208,7 @@ newConnectionPool maintenance settings = do
   where
     size = max 1 (poolSize settings)
     overflow = max 0 (poolMaxOverflow settings)
-    slotOf self beyond = Slot self beyond <$> newIORef Nothing <*> newIORef UUID.nil <*> newIORef 0 <*> newIORef 0
+    slotOf self beyond index = Slot self beyond index <$> newIORef Nothing <*> newIORef UUID.nil <*> newIORef 0 <*> newIORef 0
     positive :: Int -> PositiveInt
     positive number = fromMaybe (positiveInt @1) (mkPositiveInt (toInteger number))
 
@@ -245,6 +252,18 @@ maintain = together [sweeping, cancelling]
     taken (job, Maintenance _ _ (Cancels _ pending)) = job <$ atomicModifyIORef' pending (\count -> (count - 1, ()))
     sending = (\(Cancellation settings key limit) -> (limit, (settings, key))) ^>> timeoutA (tryA cancel) >>> done
 
+-- | Puts the connection in the slot, which the pool then knows holds one.
+fillSlot :: Slot -> Connection -> IO ()
+fillSlot slot connection = do
+  writeIORef (slotConnection slot) (Just connection)
+  atomicModifyIORef' (poolConnected (slotOwner slot)) (\held -> (IntMap.insert (slotIndex slot) slot held, ()))
+
+-- | Empties the slot, which the pool then knows holds no connection. Only the part that has the slot calls it.
+emptySlot :: Slot -> IO ()
+emptySlot slot = do
+  writeIORef (slotConnection slot) Nothing
+  atomicModifyIORef' (poolConnected (slotOwner slot)) (\held -> (IntMap.delete (slotIndex slot) held, ()))
+
 -- | Closes the connection that the slot holds, if it has one, for the reason, which is then told to the observer. The slot is
 -- empty.
 closeSlot :: ConnectionPoolSettings -> ConnectionTerminationReason -> String -> Slot -> IO ()
@@ -253,7 +272,7 @@ closeSlot settings reason because slot =
     >>= traverse_
       ( \connection -> do
           breakSession (connectionSession connection) because
-          writeIORef (slotConnection slot) Nothing
+          emptySlot slot
           identifier <- readIORef (slotIdentifier slot)
           observe settings (ConnectionObservation identifier (TerminatedConnectionStatus reason))
       )
@@ -268,12 +287,13 @@ maintenancePeriod settings = case catMaybes [poolLifetime settings, poolIdleTime
 nanoseconds :: Duration -> Word64
 nanoseconds (Duration count) = count
 
--- | One look at the connections that are free, at the time: those that are older than the lifetime, or that were given back more
--- than the idle time ago, are closed. A slot is taken from the pool for the look, and is the looker's alone while it is, so
--- that no request has the connection that is closed; they are given back in the order that they were taken in, so that the
--- pool lends them as it did. The idle time is told in looks, which the pool counts once for each of its own periods, and not
--- more often, though the maintenance looks as often as the shortest period of its pools asks. It is what 'maintain' makes at each
--- of its pools, and is exported so that a test can make one look.
+-- | One look at the connections that the pool has, at the time: those that are free and older than the lifetime, or were given back
+-- more than the idle time ago, are closed. The pool knows the slots that hold a connection, and the look visits those, whatever the
+-- pool's size is, and no others. The free slots up to the last of those that are to be closed are taken from the pool for the look,
+-- and are the looker's alone while they are, so that no request has the connection that is closed; they are given back in the order
+-- that they were taken in, so that the pool lends them as it did. The idle time is told in looks, which the pool counts once for each
+-- of its own periods, and not more often, though the maintenance looks as often as the shortest period of its pools asks. It is what
+-- 'maintain' makes at each of its pools, and is exported so that a test can make one look.
 lookAt :: ConnectionPool -> Word64 -> IO ()
 lookAt pool now' = do
   lastLook <- readIORef (poolLastLook pool)
@@ -281,22 +301,37 @@ lookAt pool now' = do
   when due (writeIORef (poolLastLook pool) now')
   when (due || isJust (poolLifetime settings)) $ do
     epoch <- if due then atomicModifyIORef' (poolEpoch pool) (\count -> (count + 1, count + 1)) else readIORef (poolEpoch pool)
-    taken <- takeAll []
-    traverse_ (expire epoch) taken `finally` traverse_ (\slot -> releaseNow (poolSlots pool) [slot]) (reverse taken)
+    connected <- IntMap.elems <$> readIORef (poolConnected pool)
+    expired <- filterM (fmap isJust . expiry epoch) (filter (not . slotBeyond) connected)
+    unless (null expired) $ do
+      slots <- free (poolSlots pool)
+      taken <- takeFirst (through (IntSet.fromList (map slotIndex expired)) slots) []
+      traverse_ (expire epoch) taken `finally` traverse_ (\slot -> releaseNow (poolSlots pool) [slot]) (reverse taken)
   where
     settings = poolSettings pool
     period = maybe 0 ((* 1000) . fromIntegral) (maintenancePeriod settings)
-    takeAll taken = takeNow (poolSlots pool) 1 >>= maybe (pure (reverse taken)) (\slot -> takeAll (slot : taken))
-    expire epoch slot = do
+    -- How many of the free slots there are up to the last of those that are wanted, which is none if none of them is free.
+    through wanted = go 0 (0 :: Int)
+      where
+        go !position !found = \case
+          [] -> found
+          slot : others -> go (position + 1) (if IntSet.member (slotIndex slot) wanted then position + 1 else found) others
+    takeFirst count taken
+      | count <= 0 = pure (reverse taken)
+      | otherwise = takeNow (poolSlots pool) 1 >>= maybe (pure (reverse taken)) (\slot -> takeFirst (count - 1) (slot : taken))
+    expire epoch slot = expiry epoch slot >>= traverse_ (\(reason, because) -> closeSlot settings reason because slot)
+    -- Why the connection of the slot is to be closed, if it is: it is older than the lifetime, or it was given back more than the idle
+    -- time ago.
+    expiry epoch slot = do
       opened <- readIORef (slotOpened slot)
       used <- readIORef (slotUsed slot)
-      case () of
+      pure $ case () of
         _
           | maybe False (\lifetime -> now' - opened > nanoseconds lifetime) (poolLifetime settings) ->
-              closeSlot settings AgingConnectionTerminationReason "the connection reached the pool's lifetime" slot
+              Just (AgingConnectionTerminationReason, "the connection reached the pool's lifetime")
           | maybe False (\idle -> epoch - used > idleEpochs idle) (poolIdleTime settings) ->
-              closeSlot settings IdlenessConnectionTerminationReason "the connection was idle for the pool's idle time" slot
-          | otherwise -> pure ()
+              Just (IdlenessConnectionTerminationReason, "the connection was idle for the pool's idle time")
+          | otherwise -> Nothing
     -- How many looks make the idle time, rounded up.
     idleEpochs idle = maybe 0 (\period' -> fromIntegral ((nanoseconds idle + period' * 1000 - 1) `div` (period' * 1000))) (fromIntegral <$> maintenancePeriod settings)
 
@@ -385,7 +420,7 @@ using body = scope acquire release run
     made result slot = case result of
       Left failure -> observeNow slot (TerminatedConnectionStatus (NetworkErrorConnectionTerminationReason (Just (Text.pack (show failure))))) *> throwIO failure
       Right connection -> do
-        writeIORef (slotConnection slot) (Just connection)
+        fillSlot slot connection
         monotonicNanoseconds >>= writeIORef (slotOpened slot)
         readIORef (poolEpoch (slotOwner slot)) >>= writeIORef (slotUsed slot)
         observeNow slot (ReadyForUseConnectionStatus EstablishedConnectionReadyForUseReason)
@@ -420,7 +455,7 @@ connectionPoolStats :: ConnectionPool -> IO PoolStats
 connectionPoolStats pool = do
   free' <- (++) <$> free (poolSlots pool) <*> free (poolOverflow pool)
   idle <- connected free'
-  have <- connected (poolEvery pool)
+  have <- IntMap.size <$> readIORef (poolConnected pool)
   let held = length (poolEvery pool) - length free'
   soft <- softLimit pool
   refused <- readIORef (poolRefused pool)
@@ -434,7 +469,7 @@ beyondTheLimit :: Slot -> IO Bool
 beyondTheLimit slot
   | slotBeyond slot = pure True
   | poolMaxOverflow (poolSettings pool) <= 0 = pure False
-  | otherwise = softLimit pool >>= \soft -> if soft >= size then pure False else (> soft) . length . filter isJust <$> traverse (readIORef . slotConnection) (poolEvery pool)
+  | otherwise = softLimit pool >>= \soft -> if soft >= size then pure False else (> soft) . IntMap.size <$> readIORef (poolConnected pool)
   where
     pool = slotOwner slot
     size = max 1 (poolSize (poolSettings pool))
@@ -503,11 +538,11 @@ giveBack slot connection = do
     Busy -> do
       let reason = "the connection was still in use when its request ended"
       breakSession (connectionSession connection) reason
-      writeIORef (slotConnection slot) Nothing
+      emptySlot slot
       requestCancel (slotOwner slot) connection
       pure (Closed reason)
     Broken reason -> do
-      writeIORef (slotConnection slot) Nothing
+      emptySlot slot
       requestCancel (slotOwner slot) connection
       pure (Closed reason)
 
@@ -551,6 +586,6 @@ existing settings slot =
         else do
           let reason = "the connection was not as it was left"
           breakSession (connectionSession connection) reason
-          writeIORef (slotConnection slot) Nothing
+          emptySlot slot
           readIORef (slotIdentifier slot) >>= \identifier -> observe settings (ConnectionObservation identifier (TerminatedConnectionStatus (NetworkErrorConnectionTerminationReason (Just (Text.pack reason)))))
           pure (Left ())

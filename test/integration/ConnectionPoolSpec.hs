@@ -625,13 +625,12 @@ spec socketPath _port = describe "the connection pool" $ forM_ runners $ \runner
           holding <- liveBytes
           mapM_ closeConnectionPool pools
           pure (fromIntegral holding / 500 - fromIntegral without / 500)
-    needs "a look that visits the connections that a pool has" $
-      it "allocates for a pool of 2,000 slots no more than for a pool of 20 slots, with two connections in each" $ do
-        (smallBytes, smallMicros) <- lookCost 20
-        (largeBytes, largeMicros) <- lookCost 2000
-        reported "a look" (show (round smallBytes :: Int) <> " bytes, " <> show (round smallMicros :: Int) <> " us at 20 | " <> show (round largeBytes :: Int) <> " bytes, " <> show (round largeMicros :: Int) <> " us at 2000")
-        when (largeBytes > smallBytes * 1.05 + 64) $
-          failTest ("a look allocates " <> show (round largeBytes :: Int) <> " bytes at 2,000 slots, and " <> show (round smallBytes :: Int) <> " at 20")
+    it "allocates for a pool of 2,000 slots no more than for a pool of 20 slots, with two connections in each" $ do
+      (smallBytes, smallMicros) <- lookCost 20
+      (largeBytes, largeMicros) <- lookCost 2000
+      reported "a look" (show (round smallBytes :: Int) <> " bytes, " <> show (round smallMicros :: Int) <> " us at 20 | " <> show (round largeBytes :: Int) <> " bytes, " <> show (round largeMicros :: Int) <> " us at 2000")
+      when (largeBytes > smallBytes * 1.05 + 64) $
+        failTest ("a look allocates " <> show (round largeBytes :: Int) <> " bytes at 2,000 slots, and " <> show (round smallBytes :: Int) <> " at 20")
     needs "a pool whose memory goes by its connections" $
       it "holds for a pool of 2,000 slots, before it has a connection, no more than for a pool of 20 slots" $ do
         small <- heldBy 20
