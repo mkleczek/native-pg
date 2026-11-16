@@ -459,9 +459,9 @@ using body = scope acquire release run
     made result slot = case result of
       Left failure -> observeNow slot (TerminatedConnectionStatus (NetworkErrorConnectionTerminationReason (Just (Text.pack (show failure))))) *> throwIO failure
       Right connection -> do
-        fillSlot slot connection
         monotonicNanoseconds >>= writeIORef (slotOpened slot)
         readIORef (poolEpoch (slotOwner slot)) >>= writeIORef (slotUsed slot)
+        fillSlot slot connection
         observeNow slot (ReadyForUseConnectionStatus EstablishedConnectionReadyForUseReason)
         pure (slot, connection)
     lending (slot, connection) = do
