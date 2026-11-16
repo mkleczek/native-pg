@@ -427,10 +427,7 @@ manyWorkers = describe "a server of thousands of workers, under a small stack" $
     it "serves that many connections that are open at once" (serveMany kind 2500 False)
     -- Each connection has a deadline while it waits for its request, and the server finds the nearest of them each time it has nothing
     -- to run: thousands of connections that are idle for a moment are thousands of deadlines.
-    expectedWhere kind $
-      it "keeps that many connections that are open and idle for a moment, and serves them" (serveMany kind 2500 True)
-  where
-    expectedWhere kind = if kind == "delimited" then xfail "the nearest deadline of thousands of timers is found in a stack as deep" else id
+    it "keeps that many connections that are open and idle for a moment, and serves them" (serveMany kind 2500 True)
 
 -- | A server of this many workers, and the same many clients that connect at once and ask it for the answer of 200: how
 -- many got it, within the time that they have. With the clients idle, each waits a second after it has connected before it asks.

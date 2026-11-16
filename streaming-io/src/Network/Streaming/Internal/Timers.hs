@@ -222,10 +222,12 @@ nextDeadline wheel = do
             Just deadline -> pure (Just deadline)
             Nothing -> go others
 
--- | The earliest deadline of the live timers.
+-- | The earliest deadline of the live timers. The deadline that is found is evaluated at each step: left in the 'Just' as a thunk that
+-- refers to the one before, a slot of thousands of live timers is a chain of thousands of thunks, which the first use of the deadline
+-- evaluates in a stack that deep, and overflows the small stack of a dev build.
 earliest :: [Timer] -> IO (Maybe Word64)
 earliest = go Nothing
   where
     go !found [] = pure found
     go !found (Timer alive deadline _ : others) =
-      readIORef alive >>= \isLive -> go (if isLive then Just (maybe deadline (min deadline) found) else found) others
+      readIORef alive >>= \isLive -> go (if isLive then (Just $! maybe deadline (min deadline) found) else found) others
