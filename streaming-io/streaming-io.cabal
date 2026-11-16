@@ -67,7 +67,8 @@ test-suite streaming-io-spec
   default-language: GHC2021
   hs-source-dirs: test src
   main-is: Main.hs
-  other-modules: ListPrefixSpec
+  other-modules: AtomicSpec
+                 ListPrefixSpec
                  DescriptorsSpec
                  GroupCostSpec
                  LoansSpec
