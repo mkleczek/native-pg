@@ -32,6 +32,7 @@ import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Tuple (swap)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
+import GHC.Stats (allocated_bytes, getRTSStats)
 import Network.Fulmen (Call, Cores, Request (..))
 import qualified Network.Fulmen as Fulmen
 import Network.Socket (Socket)
@@ -45,9 +46,11 @@ import Network.Streaming.Delimited (runCores, runDelimited, runDelimitedM)
 import Network.Streaming.Mode (Mode (..))
 import Network.Streaming.Threads (runThreads, runThreadsM)
 import Skeletest
+import System.Environment (lookupEnv)
 import System.Info (os)
 import System.Directory (findExecutable)
-import System.IO (hGetLine)
+import System.IO (hGetLine, hPutStrLn, stderr)
+import System.Mem (performMinorGC)
 import System.Posix.Resource (Resource (..), ResourceLimits (..), getResourceLimit, setResourceLimit)
 import System.Posix.Signals (raiseSignal, sigTERM)
 import System.Posix.Types (Fd (..))
@@ -57,7 +60,7 @@ import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, 
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> manyWorkers
+spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> acceptCost *> manyWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -290,6 +293,39 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
           closed `shouldBe` Just ()
           stopped <- timeout 3000000 (readMVar (serverStopped shutting))
           fmap (either (const False) (const True)) stopped `shouldBe` Just True
+
+-- | What the acceptor allocates for a connection that it takes: the same with a thousand free workers as with a few, since it takes the
+-- first free worker of the core that has the most of them, and doesn't go through the workers that are free to tell which core that
+-- is. A client connects, asks and is answered, one connection after another, so that every worker but the one that serves is free.
+acceptCost :: Spec
+acceptCost = describe "accepting with many workers free" $ forM_ (runners ++ [coresRunner]) $ \runner@(Runner runnerName _) ->
+  describe runnerName $
+    xfail "the acceptor goes through the free workers to count them by core" $
+      it "allocates for a connection no more with 1,024 workers than with 8" $ do
+        few <- perConnection runner 8
+        many <- perConnection runner 1024
+        lookupEnv "ACCEPT_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("accept | " <> runnerName <> " | " <> show (round few :: Int) <> " bytes at 8 workers | " <> show (round many :: Int) <> " bytes at 1024"))
+        when (many > few * 1.1 + 4096) $
+          failTest ("a connection allocates " <> show (round many :: Int) <> " bytes with 1,024 workers, and " <> show (round few :: Int) <> " with 8")
+  where
+    -- The bytes that a connection costs the process, the client's own included, which don't depend on the workers.
+    perConnection :: Runner -> Int -> IO Double
+    perConnection runner workers =
+      withStoppableWith (\settings -> settings {Fulmen.connectionsPerCore = workers}) runner (handling (Fixed 200 [] "ok")) $ \shutting -> do
+        let connections = 300 :: Int
+            once = withClient (serverPort shutting) $ \client -> do
+              SocketBytes.sendAll (socket client) "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+              timeout 5000000 (waitUntil (readIORef (ended client))) `shouldReturn` Just ()
+        -- The workers are all there once the server has had a moment, and the first connections load the code.
+        threadDelay 300000
+        replicateM_' 50 once
+        performMinorGC
+        before <- allocated_bytes <$> getRTSStats
+        replicateM_' connections once
+        performMinorGC
+        after <- allocated_bytes <$> getRTSStats
+        pure (fromIntegral (after - before) / fromIntegral connections)
+    replicateM_' count action = forM_ [1 .. count :: Int] (const action)
 
 -- | A server that is running, and what a test needs to stop it and to see how it ended.
 data Stoppable = Stoppable

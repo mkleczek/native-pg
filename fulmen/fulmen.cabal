@@ -51,12 +51,28 @@ test-suite fulmen-conformance
                  ConformanceSpec
                  ConformanceWire
                  PlacementSpec
-  ghc-options: -Wall -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
+  -- With -T, the cases that count what the server allocates can read the run time's statistics.
+  ghc-options: -Wall -fspecialise-aggressively "-with-rtsopts=-T" -F -pgmF=skeletest-preprocessor
   if flag(threaded)
     ghc-options: -threaded
   -- The server of the bench runs in a process of its own, under a small stack, for the case of a server of thousands of workers.
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5, fulmen:fulmen-bench
   build-depends: base, bytestring, directory, fulmen, network, process, streaming-io, skeletest >=0.4.2 && <0.5, unix
+
+-- The bytes that the head of a request is compared with, whose module the library doesn't expose: the suite compiles it from the
+-- sources, and nothing else of the library, so that what a comparison allocates can be measured.
+test-suite fulmen-bytes
+  type: exitcode-stdio-1.0
+  default-language: GHC2021
+  hs-source-dirs: test-bytes src
+  main-is: Main.hs
+  other-modules: BytesSpec
+                 Network.Fulmen.Internal.Bytes
+  ghc-options: -Wall "-with-rtsopts=-T" -F -pgmF=skeletest-preprocessor
+  if flag(threaded)
+    ghc-options: -threaded
+  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
+  build-depends: base, bytestring, skeletest >=0.4.2 && <0.5
 
 -- A quick measurement: a client of C keep-alive connections and a server that answers with a static body, run as two
 -- processes of this one program. Its numbers are for looking at, and nothing checks them.
