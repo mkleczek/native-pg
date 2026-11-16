@@ -33,7 +33,9 @@
 -- did. A scope holds only the parts it began with, and a part that is suspended
 -- at a group of parts or a race says so: cancelling a scope finds the others through those, so that
 -- a part enters and leaves a scope without anything but its own frames
--- changing, however many parts there are. The scheduler runs masked, and an
+-- changing, however many parts there are. The scope of the parts that a group spawns while it runs
+-- holds the body and the parts that are spawned into it, each added as it is spawned and taken out as it
+-- ends, so that a part that has ended leaves nothing in it. The scheduler runs masked, and an
 -- asynchronous exception reaches it where it waits for a descriptor, and once
 -- in a while otherwise: it cancels every part that is in a scope, waits until
 -- they have ended, and then fails the run with the exception.
