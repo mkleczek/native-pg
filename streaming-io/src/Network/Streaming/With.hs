@@ -24,7 +24,7 @@ where
 import Control.Arrow (Arrow (..), ArrowChoice (..), (>>>), (>>^), (^>>))
 import Control.Category (Category (..))
 import Data.Tuple (swap)
-import Network.Streaming.Annotate (Annotate (exchange))
+import Network.Streaming.Annotate (Annotate (exchange, flowCase, flowScope, flowStep))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
 import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
@@ -152,8 +152,8 @@ instance (Race arr) => Race (With r arr) where
   race (With one) (With two) = With (race one two)
   {-# INLINE race #-}
 
--- | The box, the names of the wires, the ends of exchanges and the allowed checks are the arrow's: the body is given the
--- environment as it is.
+-- | The box, the names of the wires, the ends of exchanges, the flows and their steps and the allowed checks are the arrow's:
+-- the body is given the environment as it is.
 instance (Annotate arr) => Annotate (With r arr) where
   named label (With inner) = With (named label inner)
   {-# INLINE named #-}
@@ -161,6 +161,12 @@ instance (Annotate arr) => Annotate (With r arr) where
   {-# INLINE wires #-}
   exchange side name (With inner) = With (exchange side name inner)
   {-# INLINE exchange #-}
+  flowStep names bindings (With inner) = With (flowStep names bindings inner)
+  {-# INLINE flowStep #-}
+  flowCase names (With inner) = With (flowCase names inner)
+  {-# INLINE flowCase #-}
+  flowScope name (With inner) = With (flowScope name inner)
+  {-# INLINE flowScope #-}
   allowing check reason (With inner) = With (allowing check reason inner)
   {-# INLINE allowing #-}
 

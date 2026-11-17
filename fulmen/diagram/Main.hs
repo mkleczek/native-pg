@@ -1,8 +1,9 @@
--- | Draws the server's program, built at the 'Diagram' arrow, which runs nothing: it writes @fulmen-server.html@ and one
--- @ANCHOR.mmd@ for each page into the directory that is its argument, which has to exist. It then says, for each page,
--- how many actions have no name, which are drawn as "IO", and how many decisions have no question, which are drawn as
--- "choose". It ends with how many pairs of steps were drawn as one, and a line for each exchange, which says what the
--- ends of it are in. The pages are written without the plumbing as @ANCHOR.mmd@ and with it as @ANCHOR.plumbing.mmd@.
+-- | Draws the server's program, built at the 'Diagram' arrow, which runs nothing: it writes @fulmen-server.html@, which draws
+-- the pages with Graphviz in the browser, and the Mermaid and the Graphviz source of each page into the directory that is its
+-- argument, which has to exist. It then says, for each page, how many actions have no name, which are drawn as "IO", and how
+-- many decisions have no question, which are drawn as "choose". It ends with how many pairs of steps were drawn as one, and a
+-- line for each exchange, which says what the ends of it are in. The pages are written without the plumbing as @ANCHOR.mmd@
+-- and @ANCHOR.dot@, and with it as @ANCHOR.plumbing.mmd@ and @ANCHOR.plumbing.dot@.
 --
 -- > fulmen-diagram DIRECTORY
 --
@@ -45,6 +46,8 @@ draw directory = do
   forM_ found $ \page -> do
     write (directory ++ "/" ++ pageAnchor page ++ ".mmd") (pageMermaid page)
     write (directory ++ "/" ++ pageAnchor page ++ ".plumbing.mmd") (pagePlumbing page)
+    write (directory ++ "/" ++ pageAnchor page ++ ".dot") (pageDot page)
+    write (directory ++ "/" ++ pageAnchor page ++ ".plumbing.dot") (pageDotPlumbing page)
   putStrLn ("wrote " ++ show (length found) ++ " pages into " ++ directory)
   report found
   putStrLn ("folds: " ++ show (sum (pageFolds <$> found)) ++ " pairs of steps drawn as one")

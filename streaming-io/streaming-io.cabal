@@ -10,6 +10,7 @@ extra-source-files: test/check-positive-int.sh
                     test/check-no-io-waits.sh
                     test/check-steps.sh
                     test/check-named.sh
+                    test/check-wiring.sh
                     test/compile/*.hs
 
 -- The executables and test suites are linked with GHC's threaded run time. With -f-threaded they are linked with the
@@ -48,7 +49,10 @@ library
                    Network.Streaming.Loans
                    Network.Streaming.NotImplemented
                    Network.Streaming.Named
+                   Network.Streaming.Wiring
                    Network.Streaming.Diagram
+                   Network.Streaming.Diagram.Graph
+                   Network.Streaming.Diagram.Graphviz
                    Network.Streaming.Diagram.Mermaid
                    Network.Streaming.Structure
                    Network.Streaming.Lint
@@ -60,6 +64,7 @@ library
   other-modules: Network.Streaming.Internal.BufferPool
                  Network.Streaming.Internal.Inboxes
                  Network.Streaming.Internal.ListPrefix
+                 Network.Streaming.Internal.Patterns
                  Network.Streaming.Internal.Socket
                  Network.Streaming.Internal.Tickets
   c-sources: cbits/poller.c
@@ -110,7 +115,10 @@ test-suite streaming-io-spec
                  Network.Streaming.Loans
                  Network.Streaming.NotImplemented
                  Network.Streaming.Named
+                 Network.Streaming.Wiring
                  Network.Streaming.Diagram
+                 Network.Streaming.Diagram.Graph
+                 Network.Streaming.Diagram.Graphviz
                  Network.Streaming.Diagram.Mermaid
                  Network.Streaming.Structure
                  Network.Streaming.Lint
@@ -121,11 +129,13 @@ test-suite streaming-io-spec
                  Network.Streaming.Internal.BufferPool
                  Network.Streaming.Internal.Descriptors
                  Network.Streaming.Internal.Inboxes
+                 Network.Streaming.Internal.Patterns
                  Network.Streaming.Internal.Socket
                  Network.Streaming.Internal.Tickets
                  EmptyPoolSpec
                  InboxSpec
                  MermaidSpec
+                 GraphvizSpec
                  NamedSpec
                  OpticsSpec
                  PositiveIntSpec
@@ -141,6 +151,7 @@ test-suite streaming-io-spec
                  TicketCostSpec
                  TimeSpec
                  UnwindSpec
+                 WiringSpec
                  WithSpec
   -- -T counts the live heap that GroupCostSpec reads.
   ghc-options: -Wall -rtsopts "-with-rtsopts=-T" -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor

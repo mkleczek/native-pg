@@ -7,6 +7,8 @@ module Network.Streaming.Annotate
   ( Label (..),
     Side (..),
     Check (..),
+    Binding (..),
+    Part (..),
     Annotate (..),
     box,
     taking,
@@ -45,6 +47,15 @@ data Check
     DeadExchange
   deriving (Eq, Show, Enum, Bounded)
 
+-- | What a port of a step of a flow is bound to: the port, and the path of what it reads, which is the name in the flow
+-- that holds it, then the fields of that name's value.
+data Binding = Binding {bindingPort :: String, bindingPath :: [String]}
+
+-- | A name that a pattern gives, or a part that it takes apart, as the diagrams draw it, a box nested as the pattern nests:
+-- the field or case that it is for, if it has one, the name that keeps it whole, if it has one, and the parts that it is
+-- taken apart into, if it is.
+data Part = Part {partField :: Maybe String, partName :: Maybe String, partParts :: Maybe [Part]}
+
 -- | Annotations for the diagrams that "Network.Streaming.Diagram" draws of a program, and for its lint. Every other arrow
 -- returns the arrow it is given, so that an annotation costs nothing when the program runs.
 class Annotate arr where
@@ -62,6 +73,25 @@ class Annotate arr where
   exchange :: Side -> String -> arr a b -> arr a b
   exchange _ _ step = step
   {-# INLINE exchange #-}
+
+  -- | The arrow as a step of a flow of "Network.Streaming.Wiring", for diagrams: the pattern that gives its output names
+  -- in the flow, if it has one, and what each of its ports is bound to. Every runtime returns the arrow unchanged.
+  flowStep :: Maybe Part -> [Binding] -> arr a b -> arr a b
+  flowStep _ _ step = step
+  {-# INLINE flowStep #-}
+
+  -- | The arrow as the branch of a choice whose case is taken apart by the pattern, for diagrams: the names that the
+  -- pattern gives are the names of the flow in the branch. Every runtime returns the arrow unchanged.
+  flowCase :: Part -> arr a b -> arr a b
+  flowCase _ step = step
+  {-# INLINE flowCase #-}
+
+  -- | The arrow as a whole flow of "Network.Streaming.Wiring", for diagrams: the names that its steps bind are the names
+  -- of that flow and of no other, and the flow gives the name that it is a result of, if it is. Every runtime returns the
+  -- arrow unchanged.
+  flowScope :: Maybe String -> arr a b -> arr a b
+  flowScope _ step = step
+  {-# INLINE flowScope #-}
 
   -- | The arrow, where the lint doesn't report the check, for the reason given: the part means what the check finds.
   -- Every runtime returns the arrow unchanged.

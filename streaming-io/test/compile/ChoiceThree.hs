@@ -15,9 +15,9 @@ choice =
   newRecord ["req", "number"] "GET /"
     ^>> adding "size" (arr byRange)
     >>> decide "how big?" (cases "size")
-    >>> ( "small" ?> arr (\r -> r.req <> " small " <> show r.small)
-            ||| "big" ?> arr (\r -> r.req <> " big " <> show r.big)
-            ||| "huge" ?> arr (\r -> r.req <> " huge " <> show r.huge)
+    >>> ( "small" =: "small" ?> arr (\r -> r.req <> " small " <> show r.small)
+            ||| "big" =: "big" ?> arr (\r -> r.req <> " big " <> show r.big)
+            ||| "huge" =: "huge" ?> arr (\r -> r.req <> " huge " <> show r.huge)
         )
   where
     byRange r

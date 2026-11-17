@@ -1,7 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 
--- | What a program built at "Network.Streaming.Diagram" is made of, and the walks over it that the charts of
--- "Network.Streaming.Diagram.Mermaid" and the lint of "Network.Streaming.Lint" share.
+-- | What a program built at "Network.Streaming.Diagram" is made of, and the walks over it that the graphs of
+-- "Network.Streaming.Diagram.Graph" and the lint of "Network.Streaming.Lint" share.
 --
 -- The tree is cyclic: a loop is a tree that contains itself. A walk remembers the nodes on its way down by their stable
 -- names, and a node that it meets again on its own way down is a back edge, whose target is a loop head. A node that is
@@ -28,7 +28,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import GHC.Stack (SrcLoc)
-import Network.Streaming.Annotate (Check, Side)
+import Network.Streaming.Annotate (Binding, Check, Part, Side)
 import Network.Streaming.Classes (Duration (..), Label)
 import System.Mem.StableName (StableName, hashStableName, makeStableName)
 
@@ -84,6 +84,14 @@ data Tree
     Wires (Maybe String) (Maybe String) Tree
   | -- | One end of an exchange of the named value: which end, and the step that is it.
     End Side String Tree
+  | -- | A whole flow of "Network.Streaming.Wiring": the scope of the names of its steps, and the name that it gives, if it is
+    -- a result.
+    FlowScope (Maybe String) Tree
+  | -- | A step of a flow of "Network.Streaming.Wiring": the pattern that gives its output names in the flow, if it has
+    -- one, what each of its ports is bound to, and its body.
+    FlowStep (Maybe Part) [Binding] Tree
+  | -- | A branch of a choice of a flow whose case is taken apart by a pattern: the pattern, and the branch.
+    FlowCase Part Tree
   | -- | A body where the lint doesn't report a check: which, the reason, and the body.
     Allowing Check String Tree
 
@@ -126,6 +134,9 @@ opensInbox fuel step
       Second inner -> opensInbox (fuel - 1) inner
       Wires _ _ inner -> opensInbox (fuel - 1) inner
       End _ _ inner -> opensInbox (fuel - 1) inner
+      FlowScope _ inner -> opensInbox (fuel - 1) inner
+      FlowStep _ _ inner -> opensInbox (fuel - 1) inner
+      FlowCase _ inner -> opensInbox (fuel - 1) inner
       Allowing _ _ inner -> opensInbox (fuel - 1) inner
       _ -> Nothing
 
@@ -166,6 +177,9 @@ children = \case
   Named _ _ inner -> [inner]
   Wires _ _ inner -> [inner]
   End _ _ inner -> [inner]
+  FlowScope _ inner -> [inner]
+  FlowStep _ _ inner -> [inner]
+  FlowCase _ inner -> [inner]
   Allowing _ _ inner -> [inner]
 
 -- | The node evaluated, and its stable name: a node is evaluated before its name is made, so that the thunk of a node and
