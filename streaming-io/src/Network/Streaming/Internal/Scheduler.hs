@@ -1305,32 +1305,42 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
       | otherwise = do
           setCounter run 10 0
           clock >>= setCounter run 12
-          readied <-
-            unsafeWithForeignPtr (runReady run) $ \fds ->
-              unsafeWithForeignPtr (runKinds run) $ \kinds ->
-                traverse (\index -> (,) <$> peekElemOff fds index <*> peekElemOff kinds index) [0 .. fromIntegral count - 1]
-          waiters <- readIORef (runWaiters run)
-          (woken, waiters') <- foldM wake ([], waiters) readied
-          writeIORef (runWaiters run) waiters'
-          adjust run 4 (negate (length woken))
-          lanes <- counter run 15
-          if lanes == 0
-            then pure (map (\entry -> resumeOf entry (pure ())) woken)
+          if count == 0
+            then pure []
             else do
-              -- The parts of the fast lane that the poll woke go among those that can go on there.
-              let (wokenFast, wokenNormal) = partition isSuspendedFast woken
-              modifyIORef' (runFastReady run) (\queued -> foldl (\newest entry -> resumeOf entry (pure ()) : newest) queued wokenFast)
-              pure (map (\entry -> resumeOf entry (pure ())) wokenNormal)
-    -- Takes the parts that wait for what was reported off the descriptor, and arms it again for the others: a report
-    -- may have used up the arming of a kind that nothing waits for any more, or, on epoll, the arming of both.
-    wake (woken, waiters) (fd, kind) = do
-      let key = fromIntegral fd
-          Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
-          (fromReaders, readers') = if kind .&. kindReadable /= 0 then (readers, []) else ([], readers)
-          (fromWriters, writers') = if kind .&. kindWritable /= 0 then (writers, []) else ([], writers)
-          waiting = Waiters readers' writers'
-      when (kindsOf waiting /= 0) (arm fd 0 waiting)
-      pure (woken <> reverse fromReaders <> reverse fromWriters, settle key waiting waiters)
+              waiters <- readIORef (runWaiters run)
+              unsafeWithForeignPtr (runReady run) $ \fds ->
+                unsafeWithForeignPtr (runKinds run) $ \kinds -> do
+                  (waiters', normal, fast, woken) <- collectReady fds kinds (fromIntegral count) 0 waiters
+                  writeIORef (runWaiters run) waiters'
+                  when (woken /= 0) (adjust run 4 (negate woken))
+                  queueFastReady fast
+                  pure normal
+    queueFastReady [] = pure ()
+    queueFastReady fast = modifyIORef' (runFastReady run) (\queued -> List.foldl' (flip (:)) queued fast)
+    -- Read and rearm in poll order, using the updated waiters when the poll reports the same descriptor again.
+    -- On the way back, prepend each report's waiters, newest first within each direction, to get FIFO ready lists.
+    collectReady fds kinds count !index !waiters
+      | index == count = pure (waiters, [], [], 0)
+      | otherwise = do
+          fd <- peekElemOff fds index
+          kind <- peekElemOff kinds index
+          let key = fromIntegral fd
+              Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
+              (fromReaders, readers') = if kind .&. kindReadable /= 0 then (readers, []) else ([], readers)
+              (fromWriters, writers') = if kind .&. kindWritable /= 0 then (writers, []) else ([], writers)
+              waiting = Waiters readers' writers'
+          -- On epoll, a report may have used up the arming of both directions.
+          when (kindsOf waiting /= 0) (arm fd 0 waiting)
+          (waiters', normal, fast, woken) <- collectReady fds kinds count (index + 1) (settle key waiting waiters)
+          routeReady waiters' fromWriters fromReaders normal fast woken
+    routeReady waiters [] [] normal fast !woken = pure (waiters, normal, fast, woken)
+    routeReady waiters [] readers normal fast woken = routeReady waiters readers [] normal fast woken
+    routeReady waiters (entry : entries) readers normal fast !woken
+      | isSuspendedFast entry = routeReady waiters entries readers normal (resume : fast) (woken + 1)
+      | otherwise = routeReady waiters entries readers (resume : normal) fast (woken + 1)
+      where
+        resume = resumeOf entry (pure ())
 
 -- | How long the scheduler waits in its poller on the non-threaded run time, in milliseconds: the first wait that ends with
 -- nothing, the longest, and while other threads need the OS thread. That run time has one OS thread, which a blocking
