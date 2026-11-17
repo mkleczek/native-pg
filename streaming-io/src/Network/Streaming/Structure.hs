@@ -82,8 +82,9 @@ data Tree
     Wires (Maybe String) (Maybe String) Tree
   | -- | One end of an exchange of the named value: which end, and the step that is it.
     End Side String Tree
-  | -- | A whole flow of "Network.Streaming.Wiring": the scope of the names of its steps.
-    FlowScope Tree
+  | -- | A whole flow of "Network.Streaming.Wiring": the scope of the names of its steps, and the name that it gives, if it is
+    -- a result.
+    FlowScope (Maybe String) Tree
   | -- | A step of a flow of "Network.Streaming.Wiring": the pattern that gives its output names in the flow, if it has
     -- one, what each of its ports is bound to, and its body.
     FlowStep (Maybe Part) [Binding] Tree
@@ -131,7 +132,7 @@ opensInbox fuel step
       Second inner -> opensInbox (fuel - 1) inner
       Wires _ _ inner -> opensInbox (fuel - 1) inner
       End _ _ inner -> opensInbox (fuel - 1) inner
-      FlowScope inner -> opensInbox (fuel - 1) inner
+      FlowScope _ inner -> opensInbox (fuel - 1) inner
       FlowStep _ _ inner -> opensInbox (fuel - 1) inner
       FlowCase _ inner -> opensInbox (fuel - 1) inner
       Allowing _ _ inner -> opensInbox (fuel - 1) inner
@@ -173,7 +174,7 @@ children = \case
   Named _ _ inner -> [inner]
   Wires _ _ inner -> [inner]
   End _ _ inner -> [inner]
-  FlowScope inner -> [inner]
+  FlowScope _ inner -> [inner]
   FlowStep _ _ inner -> [inner]
   FlowCase _ inner -> [inner]
   Allowing _ _ inner -> [inner]

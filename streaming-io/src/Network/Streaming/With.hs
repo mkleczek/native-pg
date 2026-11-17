@@ -163,7 +163,7 @@ instance (Annotate arr) => Annotate (With r arr) where
   {-# INLINE flowStep #-}
   flowCase names (With inner) = With (flowCase names inner)
   {-# INLINE flowCase #-}
-  flowScope (With inner) = With (flowScope inner)
+  flowScope name (With inner) = With (flowScope name inner)
   {-# INLINE flowScope #-}
   allowing check reason (With inner) = With (allowing check reason inner)
   {-# INLINE allowing #-}

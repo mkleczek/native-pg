@@ -609,7 +609,7 @@ drawStep ctx path = \case
     wired Nothing output <$> flowStepped ctx path given part bindings inner
   Wires given output (FlowCase part inner) -> wired Nothing output <$> flowCased ctx path given part inner
   Wires input output inner -> wired input output <$> render ctx path inner
-  FlowScope inner -> flowScoped ctx path inner
+  FlowScope _ inner -> flowScoped ctx path inner
   FlowStep part bindings inner -> flowStepped ctx path Nothing part bindings inner
   FlowCase part inner -> flowCased ctx path Nothing part inner
   Allowing _ _ inner -> render ctx path inner

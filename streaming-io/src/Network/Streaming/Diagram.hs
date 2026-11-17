@@ -109,7 +109,7 @@ instance Annotate Diagram where
   exchange side name (Diagram body) = Diagram (End side name body)
   flowStep names bindings (Diagram body) = Diagram (FlowStep names bindings body)
   flowCase names (Diagram body) = Diagram (FlowCase names body)
-  flowScope (Diagram body) = Diagram (FlowScope body)
+  flowScope name (Diagram body) = Diagram (FlowScope name body)
   allowing check reason (Diagram body) = Diagram (Allowing check reason body)
 
 -- | The place of the outermost call in the stack.

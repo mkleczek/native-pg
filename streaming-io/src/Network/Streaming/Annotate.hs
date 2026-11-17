@@ -85,9 +85,10 @@ class Annotate arr where
   {-# INLINE flowCase #-}
 
   -- | The arrow as a whole flow of "Network.Streaming.Wiring", for diagrams: the names that its steps bind are the names
-  -- of that flow and of no other. Every runtime returns the arrow unchanged.
-  flowScope :: arr a b -> arr a b
-  flowScope step = step
+  -- of that flow and of no other, and the flow gives the name that it is a result of, if it is. Every runtime returns the
+  -- arrow unchanged.
+  flowScope :: Maybe String -> arr a b -> arr a b
+  flowScope _ step = step
   {-# INLINE flowScope #-}
 
   -- | The arrow, where the lint doesn't report the check, for the reason given: the part means what the check finds.

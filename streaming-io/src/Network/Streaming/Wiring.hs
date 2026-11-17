@@ -188,12 +188,12 @@ instance (Annotate arr, arr' ~ arr, x' ~ x, o' ~ o) => Lined (arr' x' o') arr x 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of
 -- the steps that have names in front of it.
 flow :: (Annotate arr) => Flow arr x y -> arr x y
-flow (Flow p) = flowScope p
+flow (Flow p) = flowScope Nothing p
 {-# INLINE flow #-}
 
 -- | The flow as an arrow that gives what its step of the name gave.
-result :: forall name -> forall arr x y a. (Arrow arr, Annotate arr, HasField name y a) => Flow arr x y -> arr x a
-result name (Flow p) = flowScope p >>^ getField @name
+result :: forall name -> forall arr x y a. (Arrow arr, Annotate arr, KnownSymbol name, HasField name y a) => Flow arr x y -> arr x a
+result name (Flow p) = flowScope (Just (symbolVal (Proxy @name))) p >>^ getField @name
 {-# INLINE result #-}
 
 -- * Lines
