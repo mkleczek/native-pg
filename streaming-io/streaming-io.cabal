@@ -51,6 +51,7 @@ library
                    Network.Streaming.Named
                    Network.Streaming.Wiring
                    Network.Streaming.Diagram
+                   Network.Streaming.Diagram.Graph
                    Network.Streaming.Diagram.Mermaid
                    Network.Streaming.Structure
                    Network.Streaming.Lint
@@ -112,6 +113,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Named
                  Network.Streaming.Wiring
                  Network.Streaming.Diagram
+                 Network.Streaming.Diagram.Graph
                  Network.Streaming.Diagram.Mermaid
                  Network.Streaming.Structure
                  Network.Streaming.Lint

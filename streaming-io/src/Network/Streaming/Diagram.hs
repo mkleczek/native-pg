@@ -3,7 +3,7 @@
 {-# LANGUAGE TypeFamilies #-}
 
 -- | An arrow that runs nothing: a program built at 'Diagram' is a description of its own structure, which
--- "Network.Streaming.Diagram.Mermaid" draws as flowcharts. A step that is an action, a wait or a ticket is a leaf, and
+-- "Network.Streaming.Diagram.Graph" makes graphs of, which are drawn as flowcharts and as Graphviz graphs. A step that is an action, a wait or a ticket is a leaf, and
 -- the combinators of the program, the 'Control.Arrow' ones and the capabilities of the classes, are the nodes above it.
 -- The annotations of 'Annotate' are nodes too. The tree and the walks over it are in "Network.Streaming.Structure",
 -- which the lint of "Network.Streaming.Lint" uses as well.

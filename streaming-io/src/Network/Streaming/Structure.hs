@@ -1,7 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 
--- | What a program built at "Network.Streaming.Diagram" is made of, and the walks over it that the charts of
--- "Network.Streaming.Diagram.Mermaid" and the lint of "Network.Streaming.Lint" share.
+-- | What a program built at "Network.Streaming.Diagram" is made of, and the walks over it that the graphs of
+-- "Network.Streaming.Diagram.Graph" and the lint of "Network.Streaming.Lint" share.
 --
 -- The tree is cyclic: a loop is a tree that contains itself. A walk remembers the nodes on its way down by their stable
 -- names, and a node that it meets again on its own way down is a back edge, whose target is a loop head. A node that is
