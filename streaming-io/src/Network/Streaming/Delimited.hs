@@ -174,7 +174,12 @@ instance Block (DelimitedM m s) where
 waitFor :: Run -> PromptTag Step -> Part -> Int -> Event -> IO ()
 waitFor run tag part ident event = case event of
   Until instant -> control0 tag (sleepUntil run part instant)
-  _ -> markFast run *> control0 tag (counted run . Suspended event ident)
+  _
+    | runInFast run -> capture SuspendedFast
+    | otherwise -> capture Suspended
+  where
+    capture suspend = control0 tag (counted run . suspend event ident)
+    {-# INLINE capture #-}
 {-# INLINE waitFor #-}
 
 -- | The time of the round of the scheduler.
@@ -450,7 +455,12 @@ instance Inboxes (DelimitedM m s) 'Anywhere where
 -- follows and gives it back to the scheduler. When the part goes on, it
 -- raises the cancellation that came meanwhile, if it is in a scope.
 step :: Context -> IO ()
-step (Context run tag part) = spent run >>= \yields -> when yields (markFast run *> control0 tag (\resume -> pure (Yielded (resume (checkpoint part)))))
+step (Context run tag part) =
+  spent run >>= \yields -> when yields $
+    if runInFast run then capture YieldedFast else capture Yielded
+  where
+    capture yield = control0 tag (\resume -> pure (yield (resume (checkpoint part))))
+    {-# INLINE capture #-}
 {-# INLINE step #-}
 
 -- | Runs the program and all of its concurrent parts on this thread: each part

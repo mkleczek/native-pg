@@ -76,7 +76,7 @@ module Network.Streaming.Internal.Scheduler
     fastened,
     plainRun,
     runInFast,
-    markFast,
+    yieldStep,
     Part (..),
     PartScope,
     Members,
@@ -158,8 +158,7 @@ data Step
     -- wait is called by when it is in a scope, and 0 otherwise. The action is what runs where the part
     -- waits: nothing, or the cancellation to raise.
     Suspended !Event !Int (IO () -> IO Step)
-  | -- | The same, for a part of the fast lane, which the scheduler makes of a 'Suspended' step that 'markFast' said was one: it goes on in that
-    -- lane.
+  | -- | It waits for the event and goes on in the fast lane.
     SuspendedFast !Event !Int (IO () -> IO Step)
   | -- | Parts that go on at once: the halves of a race, or the parts of a group.
     Forked [IO Step]
@@ -168,8 +167,10 @@ data Step
   | -- | It waits for a ticket that another core fulfils, whose slot holds it; the
     -- promise puts it in the mailbox.
     ParkedRemote
-  | -- | It ran for its turn, and can go on, in the lane that 'markFast' said, if it did.
+  | -- | It ran for its turn and can go on in the normal lane.
     Yielded (IO Step)
+  | -- | It ran for its turn and can go on in the fast lane.
+    YieldedFast (IO Step)
   | -- | It waits until an instant, and a timer holds it.
     Timed
 
@@ -313,8 +314,8 @@ pendingArmings = 64
 -- parts run for turns of that length.
 newRun :: Turn -> IO Run
 newRun (Turn turn) = do
-  counters <- mallocForeignPtrArray 17
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 16]
+  counters <- mallocForeignPtrArray 16
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 15]
   number <- newRunNumber
   unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
@@ -442,12 +443,12 @@ readyIn :: Run -> IO Step -> IO ()
 readyIn run part = modifyIORef' (runLaneReady run) (part :)
 {-# INLINE readyIn #-}
 
--- | The part is about to give the scheduler a 'Yielded' or a 'Suspended' step: if it is in the fast lane it says so before, in counter 16,
--- which the scheduler reads when it gets the step. The step doesn't say it, so that what a part keeps when it yields or waits is the same
--- in both lanes.
-markFast :: Run -> IO ()
-markFast run = when (runInFast run) (setCounter run 16 1)
-{-# INLINE markFast #-}
+-- | A yielded part goes on in the lane of its current context.
+yieldStep :: Run -> IO Step -> Step
+yieldStep run resume
+  | runInFast run = YieldedFast resume
+  | otherwise = Yielded resume
+{-# INLINE yieldStep #-}
 
 -- | What a cancellation gives of a part that it took off what it waited at: the part, to go on in the normal lane. A part of the fast lane is
 -- put back in that lane, which has it, and nothing is given.
@@ -497,7 +498,7 @@ clock = fromIntegral <$> monotonicNanoseconds
 
 -- | Counts a step, and goes on, or yields once the part has run for its turn.
 stepped :: Run -> IO Step -> IO Step
-stepped run continue = spent run >>= \yields -> if yields then markFast run *> pure (Yielded continue) else continue
+stepped run continue = spent run >>= \yields -> if yields then pure $! yieldStep run continue else continue
 {-# INLINE stepped #-}
 
 -- | Counts a step that suspends its part.
@@ -553,7 +554,7 @@ collectFrom seat run part shelf taken capture = do
           writeIORef (partWait part) (Other stop)
           pure (seatParked seat)
         -- A value came since the look, from another thread.
-        Found -> markFast run *> pure (Yielded (resume again))
+        Found -> pure $! yieldStep run (resume again)
         Unusable -> collectedWrongly
 
 -- | What a part does that posts to an inbox, for the two arrows that run every part on one thread: the arrow goes on with whether
@@ -574,7 +575,7 @@ postTo seat run part shelf value posted capture = do
             writeIORef (partWait part) (Other stop)
             pure (seatParked seat)
           -- The inbox took the value, or closed, since the look, on another thread.
-          Just taken -> markFast run *> pure (Yielded (resume (pure taken)))
+          Just taken -> pure $! yieldStep run (resume (pure taken))
 
 -- | The part says where it waits, if it is in a scope, so that a cancellation can take it from there: a part that is in none is not
 -- cancelled, and says nothing.
@@ -629,7 +630,7 @@ parkAwaitingWith change deliver parked waitingCounter run part slot resume =
                 else pure Nothing
       waitsAt part (Other stop)
       pure parked
-    Took value -> markFast run *> pure (Yielded (resume (pure value)))
+    Took value -> pure $! yieldStep run (resume (pure value))
     Misused -> ioError tookWrongly
 {-# INLINE parkAwaitingWith #-}
 
@@ -675,8 +676,8 @@ handWaitingTo seat run part slot value handed capture = do
           waitsAt part (Other stop)
           pure (seatParked seat)
         -- The receiver took the value, or the ticket was abandoned, since the look, on another thread.
-        Passed -> markFast run *> pure (Yielded (resume (pure Nothing)))
-        GaveBack -> markFast run *> pure (Yielded (resume (pure (Just value))))
+        Passed -> pure $! yieldStep run (resume (pure Nothing))
+        GaveBack -> pure $! yieldStep run (resume (pure (Just value)))
         _ -> ioError twoSenders
 {-# INLINE handWaitingTo #-}
 
@@ -695,7 +696,7 @@ untilParkedFrom seat run part slot goOn capture = do
           let stop cancelled = unwatch (seatChange seat) slot token >>= \stopped -> if stopped then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
           waitsAt part (Other stop)
           pure (seatParked seat)
-        WatchDone -> markFast run *> pure (Yielded (resume (pure ())))
+        WatchDone -> pure $! yieldStep run (resume (pure ()))
         SecondWatcher -> ioError twoWatchers
 {-# INLINE untilParkedFrom #-}
 
@@ -1128,17 +1129,10 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
           Timed -> go ready later fast (not fromFast)
           Parked -> adjust run 5 1 *> go ready later fast (not fromFast)
           ParkedRemote -> adjust run 3 1 *> go ready later fast (not fromFast)
-          Yielded part' ->
-            counter run 16 >>= \inFast ->
-              if inFast == 0
-                then go ready (part' : later) fast (not fromFast)
-                else setCounter run 16 0 *> modifyIORef' (runFastReady run) (part' :) *> go ready later fast (not fromFast)
+          Yielded part' -> go ready (part' : later) fast (not fromFast)
+          YieldedFast part' -> modifyIORef' (runFastReady run) (part' :) *> go ready later fast (not fromFast)
           Forked parts -> go ready (foldl (flip (:)) later parts) fast (not fromFast)
-          Suspended event ident resume ->
-            counter run 16 >>= \inFast ->
-              if inFast == 0
-                then suspended False fromFast step event ident resume ready later fast
-                else setCounter run 16 0 *> suspended True fromFast (SuspendedFast event ident resume) event ident resume ready later fast
+          Suspended event ident resume -> suspended False fromFast step event ident resume ready later fast
           SuspendedFast event ident resume -> suspended True fromFast step event ident resume ready later fast
     -- A part that waits for the event, and the turn after it.
     suspended !inFast !fromFast step event !ident resume ready later fast = case event of

@@ -107,7 +107,7 @@ steppedIn context@(Context run _ _) continue = spent run >>= \yields -> if yield
 -- scope, when it goes on. Not inlined, so that what it builds is built only when the part yields, and not at
 -- every step.
 yielded :: Context -> IO Step -> IO Step
-yielded context@(Context run part _) continue = markFast run *> pure (Yielded (resumed context (checkpoint part *> continue)))
+yielded context@(Context run part _) continue = pure $! yieldStep run (resumed context (checkpoint part *> continue))
 {-# NOINLINE yielded #-}
 
 -- | Counts a step, and once the part has run for its turn, lets the others go
@@ -143,7 +143,11 @@ instance Block (CompiledM m) where
 waitFor :: Context -> Int -> Event -> (() -> IO Step) -> IO Step
 waitFor context@(Context run part _) ident event next = case event of
   Until instant -> sleepUntil run part instant (\action -> resumed context (action *> next ()))
-  _ -> markFast run *> counted run (Suspended event ident (\action -> resumed context (action *> next ())))
+  _
+    | runInFast run -> counted run (SuspendedFast event ident resume)
+    | otherwise -> counted run (Suspended event ident resume)
+  where
+    resume action = resumed context (action *> next ())
 {-# INLINE waitFor #-}
 
 -- | The time of the round of the scheduler.

@@ -11,8 +11,12 @@ module FastLaneSpec (spec) where
 
 import Control.Arrow (first, (&&&), (>>>), (^>>))
 import Control.Concurrent (forkIO, getNumCapabilities, setNumCapabilities, threadDelay)
+import Control.Exception (bracket)
 import Control.Monad (forM, forM_, unless, when)
+import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import qualified Network.Socket as Socket
+import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done, keeping, localTicket, tap, untilJust)
 import Network.Streaming.Compiled
@@ -22,6 +26,7 @@ import Network.Streaming.Internal.Scheduler (Turn (..))
 import Network.Streaming.Mode (Mode (..))
 import Network.Streaming.Threads (runThreads)
 import Skeletest
+import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
 -- | What a case's program needs of the arrow it runs in.
@@ -71,6 +76,16 @@ spec = describe "the fast lane" $ forM_ runners $ \(Runner name run) -> describe
         run (handedOverFromAnotherCore events finished)
         turnsBetween <$> readIORef events
       when (maximum counts > 1) $ failTest ("normal parts ran between the hand-over and the part that waits for it, as many as " <> show counts)
+
+    it "wakes a descriptor waiter in the fast lane it entered in the same turn" $
+      bracket
+        (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol)
+        (\(reader, writer) -> Socket.close reader *> Socket.close writer)
+        (\(reader, writer) -> do
+           fd <- Socket.unsafeFdSocket reader
+           order <- newIORef []
+           timeout 2000000 (run (descriptorArrivals (Fd fd) writer order) *> (reverse <$> readIORef order))
+             `shouldReturn` Just ["fast", "normal 1", "normal 2"])
 
   describe "mailbox order" $ forM_ [("normal", False), ("fast", True)] $ \(lane, fast) ->
     it ("drains remote arrivals in FIFO order before local work in the " <> lane <> " lane") $ do
@@ -160,6 +175,14 @@ handedOverFromAnotherCore events finished =
       threadDelay 1000
       _ <- runThreads fulfil (promise, 1 :: Int)
       noting events HandedOver
+
+-- | Park the waiters before a normal part makes the descriptor readable.
+descriptorArrivals :: forall arr. (Runtime arr) => Fd -> Socket.Socket -> IORef [String] -> arr () ()
+descriptorArrivals fd writer order =
+  together [waiting "normal 1", waiting "normal 2", fastLane (waiting "fast"), now (const (SocketBytes.sendAll writer (BS.singleton 0)))]
+  where
+    waiting :: String -> arr () ()
+    waiting name = const (Readable fd) ^>> block >>> now (const (modifyIORef' order (name :)))
 
 -- | Park all four receivers, then wake them in one turn, interleaving the
 -- local ready list and the mailbox. Anywhere tickets post even on their own core.
