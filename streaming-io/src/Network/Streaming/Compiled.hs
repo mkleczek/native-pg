@@ -312,6 +312,8 @@ type instance ModeOf (CompiledM m) = m
 instance Exchange (CompiledM m) ('Here Core) where
   newtype Future (CompiledM m) ('Here Core) a = CompiledFuture (IORef (Slot a))
   ticket = Compiled (\_ () next -> newSlot >>= \slot -> next (CompiledFuture slot, HerePromise slot))
+  ticketAwaited = Compiled (\_ () next -> newAwaitedSlot >>= \slot -> next (CompiledFuture slot, HerePromise slot))
+  {-# INLINE ticketAwaited #-}
   await = Compiled $ \context@(Context run part _) (CompiledFuture slot) next ->
     awaitFrom hereSeat run part slot (steppedIn context) next (\park -> park (\action -> resumed context (action >>= next)))
   fulfil = Compiled (\context (promise, value) next -> fulfilNow promise value >>= \taken -> steppedIn context (next taken))
@@ -331,6 +333,8 @@ instance Exchange (CompiledM m) ('Here Core) where
 instance Exchange (CompiledM m) 'Anywhere where
   newtype Future (CompiledM m) 'Anywhere a = CompiledRemoteFuture (IORef (Slot a))
   ticket = Compiled (\_ () next -> newSlot >>= \slot -> next (CompiledRemoteFuture slot, AnywherePromise slot))
+  ticketAwaited = Compiled (\_ () next -> newAwaitedSlot >>= \slot -> next (CompiledRemoteFuture slot, AnywherePromise slot))
+  {-# INLINE ticketAwaited #-}
   await = Compiled $ \context@(Context run part _) (CompiledRemoteFuture slot) next ->
     awaitFrom anywhereSeat run part slot (steppedIn context) next (\park -> park (\action -> resumed context (action >>= next)))
   fulfil = Compiled (\context (promise, value) next -> fulfilNow promise value >>= \taken -> steppedIn context (next taken))

@@ -91,8 +91,9 @@ module Network.Streaming.Classes
   )
 where
 
-import Control.Arrow (ArrowChoice, second, (>>>), (^>>))
+import Control.Arrow (Arrow, ArrowChoice, first, second, (>>>), (^>>))
 import Control.Exception (Exception, SomeException, fromException)
+import qualified Control.Arrow as Arrow
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
@@ -218,6 +219,11 @@ class (Fulfilling r) => Exchange arr (r :: Reach) where
 
   -- | The ends of a new ticket, made on this core.
   ticket :: arr () (Future arr r a, Promise r a)
+
+  -- | A new ticket whose receiver is already committed to await. A value fulfilled before the await is held for it.
+  ticketAwaited :: Arrow arr => arr () (Future arr r a, Promise r a)
+  ticketAwaited = ticket >>> first willAwait
+  {-# INLINE ticketAwaited #-}
 
   -- | Waits until a sender hands a value over, and returns it. Only on the core that made the ticket, which the arrow's type says.
   await :: arr (Future arr r a) a
@@ -472,26 +478,42 @@ receiveWith try readyToReceive =
         Nothing -> (\event -> Again (event, (link, room))) <$> readyToReceive link
 {-# INLINE receiveWith #-}
 
--- | A send over a link's tries, which an instance supplies: a point to give
--- way at, then it sends what the link takes of the pieces, at most 16 at a
--- time, and writes it, and while some is left, blocks until the event fires,
--- and goes on. The send gives how many bytes the link took, without waiting;
--- the flush writes what it took and hasn't written yet, without waiting, and
--- says whether nothing is left.
+-- | Sends and flushes the pieces using the link's non-blocking tries. A send
+-- offers at most 16 pieces. If it takes the whole offer and more pieces
+-- remain, the next offer has a point to give way at. A short send or a flush
+-- that has output left waits for the link's writable event before retrying.
 sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => (link -> [ByteString] -> IO Int) -> (link -> IO Bool) -> (link -> IO Event) -> arr (link, [ByteString]) ()
 sendAllWith send flush readyToSend =
   giveWay
     >>> second (filter (not . BS.null))
-    ^>> iterateWith (box "try send" (now attempt) -| "all sent?") ("socket full" |- consume block)
+    ^>> iterateWith
+      (box "try send" (now attempt) -| "all sent?")
+      (("socket full" |- consume block) Arrow.||| ("more pieces" |- giveWay))
   where
-    attempt (link, pieces) = case pieces of
-      [] -> flush link >>= \flushed -> if flushed then pure (Finish ()) else blocked link []
-      _ -> do
-        sent <- send link (take 16 pieces)
-        case dropSent sent pieces of
-          [] -> attempt (link, [])
-          rest -> blocked link rest
-    blocked link rest = (\event -> Again (event, (link, rest))) <$> readyToSend link
+    offerLimit :: Int
+    offerLimit = 16
+
+    attempt (link, []) = finish link
+    attempt (link, pieces) = do
+      let offered = case pieces of
+            [_] -> pieces
+            _ -> take offerLimit pieces
+      sent <- send link offered
+      sentFrom link offerLimit sent pieces
+
+    -- Walk the accepted prefix once. Reaching the offer limit with pieces
+    -- left means the link took the entire offer and can be tried again.
+    sentFrom link _ _ [] = finish link
+    sentFrom link 0 _ rest = pure (Again (Right (link, rest)))
+    sentFrom link left sent rest@(piece : others)
+      | sent <= 0 = blocked link rest
+      | sent >= size = sentFrom link (left - 1) (sent - size) others
+      | otherwise = blocked link (BS.drop sent piece : others)
+      where
+        size = BS.length piece
+
+    finish link = flush link >>= \flushed -> if flushed then pure (Finish ()) else blocked link []
+    blocked link rest = (\event -> Again (Left (event, (link, rest)))) <$> readyToSend link
 {-# INLINE sendAllWith #-}
 
 -- | Memory to receive into: a view of a buffer, from an offset and up to a
@@ -505,10 +527,3 @@ roomOf buffer = Room buffer 0 (bufferCapacity buffer)
 -- | The buffer's first bytes, without a copy: valid until it receives again.
 view :: Buffer -> Int -> ByteString
 view (Buffer memory _) = BSI.BS memory
-
--- | What a send of the pieces left, as the pieces that remain.
-dropSent :: Int -> [ByteString] -> [ByteString]
-dropSent _ [] = []
-dropSent sent (piece : others)
-  | sent >= BS.length piece = dropSent (sent - BS.length piece) others
-  | otherwise = BS.drop sent piece : others

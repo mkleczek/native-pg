@@ -20,6 +20,7 @@ module Network.Streaming.Internal.Tickets
     Promise (..),
     Slot,
     newSlot,
+    newAwaitedSlot,
     Fulfilling (..),
     Taking (..),
     valueWaits,
@@ -107,6 +108,11 @@ data Slot a
 -- | A new ticket's slot: nothing waits.
 newSlot :: IO (IORef (Slot a))
 newSlot = newIORef Idle
+
+-- | The receiver is committed before either end of the ticket is published.
+newAwaitedSlot :: IO (IORef (Slot a))
+newAwaitedSlot = newIORef Registering
+{-# INLINE newAwaitedSlot #-}
 
 -- | Promises that an action fulfils, as the arrow's own 'Network.Streaming.Classes.fulfil' does but without its point to give
 -- way at, so that it is a step of an arrow that can't wait: for what hands a value over together with what must not be left
