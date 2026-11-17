@@ -232,15 +232,13 @@ spawning settings handler =
   named (Label "spawning" "Waits for room and for a batch of connections, counts the batch, and spawns a connection worker for each socket.") $
     (\(!workers, !cores) -> newRecord ["group", "cores"] workers cores)
       ^>> flow
-        ( roomed              -< ["cores"]                  >>>
-          "sockets" <: pulled -< ["cores"]                  >>>
+        ( untilRoom settings  -< "cores"                    >>>
+          "sockets" <: pull   -< "cores"                    >>>
           counting            -< ["sockets", "cores"]       >>>
           started             -< ["group", "sockets", "cores"]
         )
       >>> done
   where
-    roomed = field "cores" >>> untilRoom settings
-    pulled = field "cores" >>> pull
     counting = step "count the connection workers" counted
     started = starting settings handler
     counted r = case r.cores of
@@ -471,7 +469,7 @@ request settings handler =
     uncurry (newRecord ["loans", "conn"])
       ^>> result
         "kept"
-        ( "loan"     <: borrowed                         -< ["loans"]                     >>>
+        ( "loan"     <: borrow                           -< "loans"                       >>>
           "progress" <: step "copy carry-over" carryOver -< ["loan", "conn"]              >>>
           "head"     <: readHead settings                -< ["conn", "loan", "progress"]  >>>
           "kept"     <: choice "how did the head end?" "head"
@@ -480,7 +478,6 @@ request settings handler =
                            ||| "good" =: ["parsed", "consumed"] ?> answered settings handler -< ["parsed", "consumed", "conn", "loans", "loan", "progress"] )
         )
   where
-    borrowed = field "loans" >>> borrow
     refuse =
       step
         "render refusal"
