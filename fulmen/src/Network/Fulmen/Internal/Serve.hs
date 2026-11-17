@@ -13,16 +13,17 @@
 -- a group of connection workers. A core that has room for another connection, which is to have fewer connection workers
 -- than its share of the cap, puts itself in the pool of the cores that wait, with the promise of a batch of sockets, and
 -- waits. In each round the acceptor waits until some core waits, takes all the cores that wait, accepts as many
--- connections as they have room for, in one step that never waits, and shares them out between the cores by how many
--- connection workers each has then, so that they have as many as one another afterwards, as far as their room allows. It
--- gives each core its batch in one hand-over, and puts back the cores that have none: connections are shared out by what
--- is true when they are accepted, and nothing is made for a connection before it is there. The core counts its batch, and
--- spawns a connection worker for each socket, giving way between them, and a connection worker serves its connection,
--- request after request, until it ends, and tells the core that it has room again. While every core is full the acceptor
--- accepts nothing, so that past the cap on connections they wait in the listen backlog. A connection that waits for its
--- next request for longer than the idle timeout is closed, so that the connections that wait in the backlog are served
--- though the ones that have a connection worker are idle: the connection has a watcher beside the part that serves its
--- requests, which sleeps until the connection can have waited that long, and ends it if it has.
+-- connections as they have room for, but no more than 'acceptCap', in one step that never waits, and shares them out
+-- between the cores by how many connection workers each has then, so that they have as many as one another afterwards, as
+-- far as their room allows. It gives each core its batch in one hand-over, and puts back the cores that have none:
+-- connections are shared out by what is true when they are accepted, and nothing is made for a connection before it is
+-- there. The core counts its batch, and spawns a connection worker for each socket, giving way between them, and a
+-- connection worker serves its connection, request after request, until it ends, and tells the core that it has room
+-- again. While every core is full the acceptor accepts nothing, so that past the cap on connections they wait in the
+-- listen backlog. A connection that waits for its next request for longer than the idle timeout is closed, so that the
+-- connections that wait in the backlog are served though the ones that have a connection worker are idle: the connection
+-- has a watcher beside the part that serves its requests, which sleeps until the connection can have waited that long,
+-- and ends it if it has.
 --
 -- A request is read into the primary buffer that it was admitted with. The bytes that follow it in the buffer, which
 -- belong to the next request on the connection, are copied out before the buffer is used for anything else, and
@@ -120,7 +121,7 @@ beginning event =
 -- * The acceptor
 
 -- | Opens the listener, and then, round after round for ever, takes the cores that wait for connections, accepts as many as
--- they have room for, and gives each core its share. The listener is closed when the acceptor ends, however it ends.
+-- they have room for, but no more than 'acceptCap', and gives each core its share. The listener is closed when the acceptor ends, however it ends.
 acceptance :: (Runtime arr) => Settings -> Listen arr -> arr Cores ()
 acceptance settings Listen {openListener, closeListener} =
   named (Label "acceptance" "Opens the listener, and for ever takes the cores that wait for connections, accepts as many as they have room for, and gives each core its share.") $
@@ -128,7 +129,8 @@ acceptance settings Listen {openListener, closeListener} =
       tap (step "make listener non-blocking" (listening . fst)) >>> foreverA (tap (acceptRound settings))
 
 -- | A round of the acceptor: it waits until some core waits for connections and takes all that wait, accepts as many connections
--- as they have room for, which is none until one comes, shares them out between the cores, and hands each core its batch.
+-- as they have room for, in one step that takes none until one comes and no more than 'acceptCap', shares them out between the
+-- cores, and hands each core its batch.
 acceptRound :: (Runtime arr) => Settings -> arr (Socket, Cores) ()
 acceptRound settings =
   named (Label "round" "Takes the cores that wait for connections, accepts as many connections as they have room for, and hands each core its share.") $
@@ -144,7 +146,7 @@ acceptRound settings =
         )
       >>> done
   where
-    adding = step "add up the room of the cores" (capacityOf settings)
+    adding = step "add up the room of the cores, up to the cap" (capacityOf settings)
     accept = named (Label "accept" "Accepts the connections that wait, as many as the capacity, and blocks while none is waiting.") acceptor
     sharing' = step "share the sockets out between the cores" (sharing settings)
     putting = step "put back the cores that have no share" putBack
@@ -160,12 +162,13 @@ untilWanted =
   where
     takeWaiting pool taken = takeNow pool 1 >>= maybe (pure (reverse taken)) (\waiting -> takeWaiting pool (waiting : taken))
 
--- | How many connections the cores that wait have room for: their share of the cap, less the connection workers that they have.
+-- | How many connections the cores that wait have room for: their share of the connection cap, 'connectionsPerCore', less the
+-- connection workers that they have, but no more than 'acceptCap', the most that one accept step takes.
 capacityOf :: (HasField "waiting" r [Waiting], HasField "cores" r Cores) => Settings -> r -> IO Int
 capacityOf settings r = case r.cores of
   Cores _ shared -> do
     counts <- readCounts shared
-    pure $! sum [connectionsPerCore settings - liveOf counts core | Waiting core _ <- r.waiting]
+    pure $! min acceptCap (sum [connectionsPerCore settings - liveOf counts core | Waiting core _ <- r.waiting])
 
 -- | The most connections that one accept step takes, so that the step is short for the other parts of its core.
 acceptCap :: Int

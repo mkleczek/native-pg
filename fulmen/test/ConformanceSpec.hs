@@ -87,8 +87,7 @@ counted = describe "accepting" $ forM_ debugRunners $ \runner@(Runner runnerName
 acceptBatches :: Spec
 acceptBatches = describe "accepting a queue of connections" $ forM_ debugRunners $ \runner@(Runner runnerName _) ->
   describe runnerName $
-    xfail "one accept step takes the room of all the cores that wait, and not at most acceptCap connections" $
-      it "takes them all, in rounds of at most acceptCap connections" (queuedConnections runner)
+    it "takes them all, in rounds of at most acceptCap connections" (queuedConnections runner)
 
 -- | Connections that wait in the queue of a listener before the server starts, as many as a queue holds on every system: the
 -- queue of a listener of backlog 128 holds 129 on Linux, and about 192 on macOS, whose limit on the backlog is 128. The server has
