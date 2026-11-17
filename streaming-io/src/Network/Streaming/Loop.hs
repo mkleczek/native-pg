@@ -172,6 +172,10 @@ instance Within Loop where
 instance GiveWay Loop where
   giveWay = returnA
 
+-- | Nothing yet: its scheduler has no lanes.
+instance FastLane Loop where
+  fastLane = id
+
 -- | Suspends the part: the scheduler goes on with it once the watch fires.
 instance Block Loop where
   block = Block

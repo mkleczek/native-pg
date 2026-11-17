@@ -158,6 +158,11 @@ instance GiveWay (ThreadsM m) where
   giveWay = Threads (\part value -> value <$ givingWay part)
   {-# INLINE giveWay #-}
 
+-- | Nothing: GHC's scheduler has no lanes.
+instance FastLane (ThreadsM m) where
+  fastLane = id
+  {-# INLINE fastLane #-}
+
 -- | The point itself, which what the part has in hand doesn't go through: the call is not given it, so that a caller
 -- doesn't have to build it, as a link's input is a pair of the link and where it receives, for the call to give it back.
 givingWay :: Part -> IO ()

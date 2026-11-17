@@ -69,6 +69,7 @@ module Network.Streaming.Classes
     (|-),
     Effect (..),
     GiveWay (..),
+    FastLane (..),
     Block (..),
     Event (..),
     Reach (..),
@@ -164,6 +165,7 @@ type Runtime arr =
   ( Steps arr,
     Block arr,
     GiveWay arr,
+    FastLane arr,
     Race arr,
     Within arr,
     Concurrent arr,
@@ -397,6 +399,21 @@ class Effect arr where
 -- the arrow that does nothing.
 class GiveWay arr where
   giveWay :: arr a a
+
+-- | Parts that the scheduler serves ahead of the others. Each core has two lanes of parts, a normal one and a fast one, and its scheduler
+-- takes a part from each in turn, skipping a lane that has none ready: so a part in the fast lane, whenever it is ready, runs after at most
+-- one part of the normal lane, and the normal lane is never starved, as it gets every other turn at least.
+--
+-- * __The lane is a region of a part.__ The part is in the fast lane from when it enters the arrow until the arrow ends, however it ends:
+--   by its result, by a failure, or by a cancellation.
+-- * __Parts it starts begin in the normal lane.__ Those that 'together', 'race' and @spawn@ start inside the arrow are not in the fast
+--   lane, whatever the part that starts them is in.
+-- * __Under the Threads arrow the arrow runs as it is,__ because GHC's scheduler has no lanes.
+--
+-- An arrow that has no lanes makes it the arrow that does nothing.
+class FastLane arr where
+  -- | Runs the arrow with its part in the fast lane, so that each time the part is ready it runs after at most one part of the normal lane.
+  fastLane :: arr a b -> arr a b
 
 -- | Waiting until an event fires.
 class Block arr where

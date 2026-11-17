@@ -116,6 +116,11 @@ instance GiveWay (CompiledM m) where
   giveWay = Compiled (\context value next -> steppedIn context (next value))
   {-# INLINE giveWay #-}
 
+-- | Nothing yet: its scheduler has no lanes.
+instance FastLane (CompiledM m) where
+  fastLane = id
+  {-# INLINE fastLane #-}
+
 instance Block (CompiledM m) where
   block = Compiled $ \context@(Context run part _) event next ->
     readIORef (partFrames part) >>= \case

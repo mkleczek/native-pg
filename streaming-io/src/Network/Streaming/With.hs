@@ -107,6 +107,11 @@ instance (Arrow arr, GiveWay arr) => GiveWay (With r arr) where
   giveWay = With (snd ^>> giveWay)
   {-# INLINE giveWay #-}
 
+-- | The lane is the arrow's: the body is given the environment as it is.
+instance (FastLane arr) => FastLane (With r arr) where
+  fastLane (With inner) = With (fastLane inner)
+  {-# INLINE fastLane #-}
+
 instance (Arrow arr, Block arr) => Block (With r arr) where
   block = With (snd ^>> block)
   {-# INLINE block #-}

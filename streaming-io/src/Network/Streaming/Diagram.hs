@@ -80,6 +80,10 @@ instance Block Diagram where
 instance GiveWay Diagram where
   giveWay = leaf "give way" Yielding
 
+-- | Draws nothing yet.
+instance FastLane Diagram where
+  fastLane = id
+
 instance Time Diagram where
   clock = leaf "clock" Round
 

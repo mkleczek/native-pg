@@ -147,6 +147,11 @@ instance GiveWay (DelimitedM m s) where
   giveWay = Delimited (\context value -> value <$ step context)
   {-# INLINE giveWay #-}
 
+-- | Nothing yet: its scheduler has no lanes.
+instance FastLane (DelimitedM m s) where
+  fastLane = id
+  {-# INLINE fastLane #-}
+
 instance Block (DelimitedM m s) where
   block = Delimited $ \(Context run tag part) event ->
     readIORef (partFrames part) >>= \case
