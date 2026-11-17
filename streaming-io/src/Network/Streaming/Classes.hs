@@ -410,6 +410,9 @@ class GiveWay arr where
 --   lane, whatever the part that starts them is in.
 -- * __Under the Threads arrow the arrow runs as it is,__ because GHC's scheduler has no lanes.
 --
+-- A part is ready when its scheduler knows that it can go on: a part that waits for a descriptor or a deadline is ready when the
+-- scheduler looks at them, at the start of a round of the normal lane, as it does for every part.
+--
 -- An arrow that has no lanes makes it the arrow that does nothing.
 class FastLane arr where
   -- | Runs the arrow with its part in the fast lane, so that each time the part is ready it runs after at most one part of the normal lane.

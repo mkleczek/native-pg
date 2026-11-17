@@ -147,9 +147,10 @@ instance GiveWay (DelimitedM m s) where
   giveWay = Delimited (\context value -> value <$ step context)
   {-# INLINE giveWay #-}
 
--- | Nothing yet: its scheduler has no lanes.
+-- | The arrow runs with a view of the run that puts the part back among those that can go on in the fast lane. The parts that it starts
+-- are given the run as it is for the normal lane.
 instance FastLane (DelimitedM m s) where
-  fastLane = id
+  fastLane (Delimited inner) = Delimited (\(Context run tag part) value -> fastened run >>= \fast -> inner (Context fast tag part) value)
   {-# INLINE fastLane #-}
 
 instance Block (DelimitedM m s) where
@@ -173,7 +174,7 @@ instance Block (DelimitedM m s) where
 waitFor :: Run -> PromptTag Step -> Part -> Int -> Event -> IO ()
 waitFor run tag part ident event = case event of
   Until instant -> control0 tag (sleepUntil run part instant)
-  _ -> control0 tag (counted run . Suspended event ident)
+  _ -> markFast run *> control0 tag (counted run . Suspended event ident)
 {-# INLINE waitFor #-}
 
 -- | The time of the round of the scheduler.
@@ -328,11 +329,13 @@ instance Concurrent (DelimitedM m s) where
   group joiner (Delimited body) = Delimited $ \(Context run tag part) input ->
     control0 tag $ \resume -> do
       (gang, first') <- newGang run part joiner
+      -- The parts of the group are in the normal lane, whichever lane the part that makes the group is in.
+      let !plain = plainRun run
       pure $
         Forked
-          [ pushFrame run first' Marked
-              *> catch (Right <$> body (Context run tag first') (DelimitedGroup gang, input)) (unwinding run first')
-              >>= bodyEnded run gang first' (resume . throwIO) (resume . pure)
+          [ pushFrame plain first' Marked
+              *> catch (Right <$> body (Context plain tag first') (DelimitedGroup gang, input)) (unwinding plain first')
+              >>= bodyEnded plain gang first' (resume . throwIO) (resume . pure)
           ]
   {-# INLINE group #-}
 
@@ -341,10 +344,11 @@ instance Concurrent (DelimitedM m s) where
     spawnedPart run gang >>= \case
       Nothing -> pure ()
       Just (number, child) ->
-        enqueue run $
-          pushFrame run child Marked
-            *> catch (Right <$> program (Context run tag child) input) (unwinding run child)
-            >>= partEnded run gang child number
+        let !plain = plainRun run
+         in enqueue plain $
+              pushFrame plain child Marked
+                *> catch (Right <$> program (Context plain tag child) input) (unwinding plain child)
+                >>= partEnded plain gang child number
   {-# INLINE spawn #-}
 
   together = \case
@@ -356,11 +360,12 @@ instance Concurrent (DelimitedM m s) where
         scope' <- newScope run
         children <- childParts run part scope' size
         joined <- newIORef (Joined Nothing 0)
+        let !plain = plainRun run
         pure $
           Forked
-            [ pushFrame run child Marked
-                *> catch (Right <$> body (Context run tag child) value) (unwinding run child)
-                >>= groupEnded run scope' size joined (resume . throwIO) (resume . pure) child
+            [ pushFrame plain child Marked
+                *> catch (Right <$> body (Context plain tag child) value) (unwinding plain child)
+                >>= groupEnded plain scope' size joined (resume . throwIO) (resume . pure) child
               | (Delimited body, child) <- zip parts children
             ]
 
@@ -374,14 +379,15 @@ instance Race (DelimitedM m s) where
       first' <- childPart run part scope'
       second' <- childPart run part scope'
       winner <- newIORef Nothing
+      let !plain = plainRun run
       pure $
         Forked
-          [ pushFrame run first' Marked
-              *> catch (Right . Left <$> one (Context run tag first') value) (unwinding run first')
-              >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) first',
-            pushFrame run second' Marked
-              *> catch (Right . Right <$> two (Context run tag second') value) (unwinding run second')
-              >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) second'
+          [ pushFrame plain first' Marked
+              *> catch (Right . Left <$> one (Context plain tag first') value) (unwinding plain first')
+              >>= raceEnded plain scope' winner (resume . throwIO) (resume . pure) first',
+            pushFrame plain second' Marked
+              *> catch (Right . Right <$> two (Context plain tag second') value) (unwinding plain second')
+              >>= raceEnded plain scope' winner (resume . throwIO) (resume . pure) second'
           ]
 
 -- | The tickets that belong to this core: a slot, which the parts of this core read and write as plain memory. A part that waits for
@@ -444,7 +450,7 @@ instance Inboxes (DelimitedM m s) 'Anywhere where
 -- follows and gives it back to the scheduler. When the part goes on, it
 -- raises the cancellation that came meanwhile, if it is in a scope.
 step :: Context -> IO ()
-step (Context run tag part) = spent run >>= \yields -> when yields (control0 tag (\resume -> pure (Yielded (resume (checkpoint part)))))
+step (Context run tag part) = spent run >>= \yields -> when yields (markFast run *> control0 tag (\resume -> pure (Yielded (resume (checkpoint part)))))
 {-# INLINE step #-}
 
 -- | Runs the program and all of its concurrent parts on this thread: each part

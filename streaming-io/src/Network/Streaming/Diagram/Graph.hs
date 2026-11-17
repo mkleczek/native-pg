@@ -710,6 +710,7 @@ drawStep ctx path = \case
   Try inner -> grouped ctx "try" (render ctx path inner)
   Shield inner -> grouped ctx "shield" (render ctx path inner)
   Grace duration inner -> grouped ctx ("grace " ++ readable duration) (render ctx path inner)
+  FastLane inner -> grouped ctx "fast lane" (render ctx path inner)
   Within duration inner -> grouped ctx ("within " ++ readable duration) (render ctx path inner)
   TimeoutA inner -> grouped ctx "within the duration of the input" (render ctx path inner)
   Wires given output (FlowStep part bindings inner) ->

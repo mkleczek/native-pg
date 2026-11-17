@@ -35,10 +35,6 @@ runners =
     Runner "compiled" (\program -> fst <$> runCompiledTurnM @'Debug (Turn 0) program ())
   ]
 
--- | The cases are marked until the schedulers have lanes.
-unfinished :: Spec -> Spec
-unfinished = xfail "the schedulers have no fast lane yet"
-
 -- | How many parts spin in the normal lane.
 spinning :: Int
 spinning = 400
@@ -46,7 +42,7 @@ spinning = 400
 spec :: Spec
 spec = describe "the fast lane" $ forM_ runners $ \(Runner name run) -> describe name $ do
   describe "a part in it" $ do
-    unfinished $ it "gets about half of the turns, and the normal parts get the rest" $ do
+    it "gets about half of the turns, and the normal parts get the rest" $ do
       total <- newIORef 0
       fast <- newIORef 0
       normal <- newIORef 0
@@ -56,7 +52,7 @@ spec = describe "the fast lane" $ forM_ runners $ \(Runner name run) -> describe
       when (f * 10 < turns * 4) $ failTest ("the part in the fast lane had " <> show f <> " of " <> show turns <> " turns, which is under 40%")
       when (n * 2 < turns) $ failTest ("the normal parts had " <> show n <> " of " <> show turns <> " turns, which is under half")
 
-    unfinished $ it "runs after at most one normal part when a part on its core hands it the value that it waits for" $ do
+    it "runs after at most one normal part when a part on its core hands it the value that it waits for" $ do
       events <- newIORef []
       finished <- newIORef False
       waited <- newIORef 0
@@ -64,7 +60,7 @@ spec = describe "the fast lane" $ forM_ runners $ \(Runner name run) -> describe
       between <- turnsBetween <$> readIORef events
       when (between > 1) $ failTest (show between <> " normal parts ran between the hand-over and the part that waits for it")
 
-    unfinished $ it "runs after at most one normal part when a part on another core hands it the value that it waits for" $ do
+    it "runs after at most one normal part when a part on another core hands it the value that it waits for" $ do
       cores <- getNumCapabilities
       when (cores < 2) (setNumCapabilities 2)
       -- The value arrives at a point of the round that the thread's delay makes arbitrary, so that each case is run again.
@@ -76,7 +72,7 @@ spec = describe "the fast lane" $ forM_ runners $ \(Runner name run) -> describe
       when (maximum counts > 1) $ failTest ("normal parts ran between the hand-over and the part that waits for it, as many as " <> show counts)
 
   describe "the region of a part" $ forM_ [Normally, ByFailure, ByCancellation] $ \ending ->
-    unfinished $ it ("ends with the arrow, " <> describeEnding ending) $ do
+    it ("ends with the arrow, " <> describeEnding ending) $ do
       tallies <- newTallies
       run (leaving ending tallies)
       (within', total', after) <- (,,) <$> readIORef (inside tallies) <*> readIORef (leftAt tallies) <*> readIORef (afterwards tallies)
@@ -85,7 +81,7 @@ spec = describe "the fast lane" $ forM_ runners $ \(Runner name run) -> describe
       when (after * 10 >= later) $ failTest ("the part had " <> show after <> " of " <> show later <> " turns after the region, which is 10% or more")
 
   describe "the parts that a part starts in the region" $ forM_ [Together, Racing, Spawning] $ \how ->
-    unfinished $ it ("begin in the normal lane, when it starts them with " <> describeFork how) $ do
+    it ("begin in the normal lane, when it starts them with " <> describeFork how) $ do
       tallies <- newForkTallies
       run (forking how tallies)
       (within', began, child) <- (,,) <$> readIORef (ownTurns tallies) <*> readIORef (beganAt tallies) <*> readIORef (childTurns tallies)
@@ -104,9 +100,10 @@ counting mine total over = over >>= \ended -> if ended then pure (Just ()) else 
 takingTurns :: (Runtime arr) => IORef Int -> IORef Int -> IO Bool -> arr () ()
 takingTurns mine total over = untilJust (counting mine total over) >>> done
 
--- | One part in the fast lane and the others in the normal lane, which take turns until the total has this many.
+-- | One part in the fast lane and the others in the normal lane, which take turns until the total has this many. The turn in which
+-- the first part enters the region is in the normal lane, and it counts none.
 alternating :: (Runtime arr) => IORef Int -> IORef Int -> IORef Int -> arr () ()
-alternating total fast normal = together (fastLane (part fast) : replicate spinning (part normal))
+alternating total fast normal = together (fastLane (giveWay >>> part fast) : replicate spinning (part normal))
   where
     part mine = takingTurns mine total ((>= 4000) <$> readIORef total)
 

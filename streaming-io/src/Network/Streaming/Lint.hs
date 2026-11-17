@@ -297,6 +297,7 @@ combine tree inner = case tree of
   Try {} -> inOrder inner
   Shield {} -> inOrder inner
   Grace {} -> inOrder inner
+  FastLane {} -> inOrder inner
   Within {} -> inOrder inner
   TimeoutA {} -> inOrder inner
   Wires {} -> inOrder inner

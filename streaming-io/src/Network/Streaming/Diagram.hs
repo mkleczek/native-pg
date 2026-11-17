@@ -80,9 +80,9 @@ instance Block Diagram where
 instance GiveWay Diagram where
   giveWay = leaf "give way" Yielding
 
--- | Draws nothing yet.
+-- | Draws a group around the arrow, which says it is in the fast lane.
 instance FastLane Diagram where
-  fastLane = id
+  fastLane (Diagram body) = Diagram (FastLane body)
 
 instance Time Diagram where
   clock = leaf "clock" Round

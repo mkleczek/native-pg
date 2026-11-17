@@ -172,7 +172,7 @@ instance Within Loop where
 instance GiveWay Loop where
   giveWay = returnA
 
--- | Nothing yet: its scheduler has no lanes.
+-- | Nothing: its interpreter runs the parts round-robin, or picks one at random in a simulation, so that no lane means anything there.
 instance FastLane Loop where
   fastLane = id
 

@@ -83,10 +83,9 @@ spec = describe "the chart" $ do
     chart <- chartOf (grace (secs 30) (quick >>> quick) :: Diagram () ())
     any ("grace 30 s" `isInfixOf`) chart `shouldBe` True
 
-  xfail "the diagram has no node for the fast lane yet" $
-    it "has a group for a fast lane, which says so" $ do
-      chart <- chartOf (fastLane (quick >>> quick) :: Diagram () ())
-      any ("fast lane" `isInfixOf`) chart `shouldBe` True
+  it "has a group for a fast lane, which says so" $ do
+    chart <- chartOf (fastLane (quick >>> quick) :: Diagram () ())
+    any ("fast lane" `isInfixOf`) chart `shouldBe` True
 
   it "has no store, and no edge of a message, for a program with no inbox" $ do
     chart <- chartOf (quick >>> quick :: Diagram () ())

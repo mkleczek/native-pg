@@ -20,6 +20,12 @@
 -- A part runs for a turn, a length of time: at a point to give way at, once it
 -- has run longer than that, it lets the others go on before it.
 --
+-- The parts that can go on are in two lanes, a normal one and a fast one, and the scheduler takes a part from each in turn, and
+-- from the other if one has none. A part is in the fast lane for as long as it is in the region of 'fastened': the run that it
+-- sees says so, and whatever puts it back among the parts that can go on, a yield, a ticket, a timer, a cancellation or a
+-- part of another core, puts it in that lane. The parts that it starts are given the run as it is for the normal lane. The scheduler
+-- looks at nothing of the lanes until a part has entered the fast lane.
+--
 -- Each scheduler also has a mailbox that other threads, the schedulers of other
 -- cores, put parts in: a part that waited for a ticket that another core fulfils
 -- is put there by the promise, which wakes the poller if the scheduler waits in
@@ -67,6 +73,10 @@ module Network.Streaming.Internal.Scheduler
     runMailbox,
     post,
     schedule,
+    fastened,
+    plainRun,
+    runInFast,
+    markFast,
     Part (..),
     PartScope,
     Members,
@@ -147,6 +157,9 @@ data Step
     -- wait is called by when it is in a scope, and 0 otherwise. The action is what runs where the part
     -- waits: nothing, or the cancellation to raise.
     Suspended !Event !Int (IO () -> IO Step)
+  | -- | The same, for a part of the fast lane, which the scheduler makes of a 'Suspended' step that 'markFast' said was one: it goes on in that
+    -- lane.
+    SuspendedFast !Event !Int (IO () -> IO Step)
   | -- | Parts that go on at once: the halves of a race, or the parts of a group.
     Forked [IO Step]
   | -- | It waits for a ticket, whose slot holds it.
@@ -154,7 +167,7 @@ data Step
   | -- | It waits for a ticket that another core fulfils, whose slot holds it; the
     -- promise puts it in the mailbox.
     ParkedRemote
-  | -- | It ran for its turn, and can go on.
+  | -- | It ran for its turn, and can go on, in the lane that 'markFast' said, if it did.
     Yielded (IO Step)
   | -- | It waits until an instant, and a timer holds it.
     Timed
@@ -247,22 +260,30 @@ data Run = Run
     -- | The timers of the parts: deadlines, and those that sleep.
     runWheel :: !Wheel,
     -- | Whether the run is in a build that observes, and asserts what it can (see 'observing').
-    runObserved :: !(IORef Bool)
+    runObserved :: !(IORef Bool),
+    -- | The parts of the fast lane that can go on, newest first, which the scheduler takes in its turns for that lane.
+    runFastReady :: !(IORef [IO Step]),
+    -- | Whether the part that has this view of the run is in the fast lane: what it puts back among the parts that can go on goes
+    -- to that lane. The view is the run itself with this said, so that everything else is shared.
+    runInFast :: !Bool,
+    -- | Where the part that has this view of the run puts itself back among those that can go on: 'runTickets' in the normal lane, and
+    -- 'runFastReady' in the fast lane.
+    runLaneReady :: !(IORef [IO Step])
   }
 
 -- | The parts that wait on a descriptor, as the 'Suspended' steps they gave the scheduler.
 data Waiters = Waiters [Step] [Step]
 
--- | A part that waits on a watch.
-data Watching = Watching !Int !Watch (IO () -> IO Step)
+-- | A part that waits on a watch, by the number of the wait, and whether it is in the fast lane.
+data Watching = Watching !Int !Bool !Watch (IO () -> IO Step)
 
 -- | A poller: the C struct that is the kqueue or epoll and its wake handle.
 data Poller
 
--- | The parts that other threads gave the scheduler, newest first, and whether
+-- | The parts that other threads gave the scheduler, newest first, those for the normal lane and those for the fast lane, and whether
 -- the scheduler sleeps in its poller, which the next one to give a part wakes;
 -- or that the scheduler has ended and takes no more.
-data Inbox = Open [IO Step] !Bool | Closed
+data Inbox = Open [IO Step] [IO Step] !Bool | Closed
 
 -- | An inbox, and the poller of the scheduler that owns it.
 data Mailbox = Mailbox !(IORef Inbox) !(Ptr Poller)
@@ -291,13 +312,14 @@ pendingArmings = 64
 -- parts run for turns of that length.
 newRun :: Turn -> IO Run
 newRun (Turn turn) = do
-  counters <- mallocForeignPtrArray 15
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 14]
+  counters <- mallocForeignPtrArray 17
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 16]
   number <- newRunNumber
   unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
-  inbox <- newIORef (Open [] False)
-  Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 IntMap.empty <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False
+  inbox <- newIORef (Open [] [] False)
+  tickets <- newIORef []
+  Run <$> pure tickets <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 IntMap.empty <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False <*> newIORef [] <*> pure False <*> pure tickets
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
@@ -311,22 +333,38 @@ withRun turn = bracket (newRun turn) freeRun
 post :: Mailbox -> IO Step -> IO Bool
 post (Mailbox inbox poller) part = do
   posting <- update inbox $ \case
-    Open parts sleeping -> (Open (part : parts) False, if sleeping then Wake else Posted)
+    Open parts fast sleeping -> (Open (part : parts) fast False, if sleeping then Wake else Posted)
     Closed -> (Closed, Refused)
   case posting of
     Posted -> pure True
     Wake -> True <$ c_pollerWake poller
     Refused -> pure False
 
+-- | 'post', for a part of the fast lane: the scheduler takes it for its next turn for that lane.
+postFast :: Mailbox -> IO Step -> IO Bool
+postFast (Mailbox inbox poller) part = do
+  posting <- update inbox $ \case
+    Open parts fast sleeping -> (Open parts (part : fast) False, if sleeping then Wake else Posted)
+    Closed -> (Closed, Refused)
+  case posting of
+    Posted -> pure True
+    Wake -> True <$ c_pollerWake poller
+    Refused -> pure False
+
+-- | The inbox with nothing in it, which the scheduler finds without a part to take, and the one of a scheduler that sleeps in its poller.
+awake, asleep :: Inbox
+awake = Open [] [] False
+asleep = Open [] [] True
+
 -- | The parts that were given the scheduler since it last looked, in the order
--- they were given. Looking costs a read while there are none.
+-- they were given. Looking costs a read while there are none. The parts for the fast lane stay in the mailbox, for the lane to take.
 takeInbox :: Run -> IO [IO Step]
 takeInbox run = case runMailbox run of
   Mailbox inbox _ ->
     readIORef inbox >>= \case
-      Open [] _ -> pure []
+      Open [] _ _ -> pure []
       Closed -> pure []
-      Open _ _ -> reverse <$> update inbox (\case Open parts _ -> (Open [] False, parts); Closed -> (Closed, []))
+      Open _ _ _ -> reverse <$> update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
 
 -- | Before the scheduler waits in its poller: the parts that were given it
 -- already, in which case it doesn't wait; or none, and the next to give one
@@ -334,13 +372,30 @@ takeInbox run = case runMailbox run of
 beforeSleep :: Run -> IO [IO Step]
 beforeSleep run = case runMailbox run of
   Mailbox inbox _ ->
-    reverse <$> update inbox (\case Open [] _ -> (Open [] True, []); Open parts _ -> (Open [] False, parts); Closed -> (Closed, []))
+    reverse <$> update inbox (\case Open [] [] _ -> (asleep, []); Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
 
 -- | After the scheduler's wait in its poller: the parts that were given it.
 afterSleep :: Run -> IO [IO Step]
 afterSleep run = case runMailbox run of
   Mailbox inbox _ ->
-    reverse <$> update inbox (\case Open parts _ -> (Open [] False, parts); Closed -> (Closed, []))
+    reverse <$> update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
+
+-- | Whether a part of the fast lane can go on that the scheduler has not taken yet: one that was put back, or one that another core gave.
+fastWaiting :: Run -> IO Bool
+fastWaiting run =
+  readIORef (runFastReady run) >>= \case
+    _ : _ -> pure True
+    [] -> case runMailbox run of
+      Mailbox inbox _ -> readIORef inbox >>= \case Open _ (_ : _) _ -> pure True; _ -> pure False
+
+-- | Takes the parts of the fast lane from the mailbox, which a part of another core may have given since the scheduler looked.
+takeFastInbox :: Run -> IO ()
+takeFastInbox run = case runMailbox run of
+  Mailbox inbox _ ->
+    readIORef inbox >>= \case
+      Open _ [] _ -> pure ()
+      Closed -> pure ()
+      Open _ _ _ -> update inbox (\case Open parts fast sleeping -> (Open parts [] sleeping, fast); Closed -> (Closed, [])) >>= \fast -> adjust run 3 (negate (length fast)) *> modifyIORef' (runFastReady run) (<> fast)
 
 -- | Takes the parts that were given the scheduler back from those that wait for
 -- them.
@@ -367,6 +422,36 @@ adjust :: Run -> Int -> Int -> IO ()
 adjust run index delta = counter run index >>= setCounter run index . (+ delta)
 {-# INLINE adjust #-}
 
+-- | The part enters the fast lane: the run as the part sees it from now on has the lane. The run keeps whether any part has entered it,
+-- which the scheduler looks at to take the parts of the lane in their turns, and costs nothing until one has.
+fastened :: Run -> IO Run
+fastened run
+  | runInFast run = pure run
+  | otherwise = run {runInFast = True, runLaneReady = runFastReady run} <$ setCounter run 15 1
+
+-- | The run as a part sees it that is in the normal lane, which the parts that another part starts are given, whichever lane that part is in.
+plainRun :: Run -> Run
+plainRun run = if runInFast run then run {runInFast = False, runLaneReady = runTickets run} else run
+{-# NOINLINE plainRun #-}
+
+-- | Puts a part among those that can go on, in the lane that the run's view says.
+readyIn :: Run -> IO Step -> IO ()
+readyIn run part = modifyIORef' (runLaneReady run) (part :)
+{-# INLINE readyIn #-}
+
+-- | The part is about to give the scheduler a 'Yielded' or a 'Suspended' step: if it is in the fast lane it says so before, in counter 16,
+-- which the scheduler reads when it gets the step. The step doesn't say it, so that what a part keeps when it yields or waits is the same
+-- in both lanes.
+markFast :: Run -> IO ()
+markFast run = when (runInFast run) (setCounter run 16 1)
+{-# INLINE markFast #-}
+
+-- | What a cancellation gives of a part that it took off what it waited at: the part, to go on in the normal lane. A part of the fast lane is
+-- put back in that lane, which has it, and nothing is given.
+backIn :: Run -> IO Step -> IO (Maybe (IO Step))
+backIn run = inLane run (runInFast run)
+{-# INLINE backIn #-}
+
 -- | The time of this round of the scheduler, in nanoseconds: it reads the clock the first time it is asked in a
 -- round, and not at all in one where nothing is.
 roundNow :: Run -> IO Word64
@@ -381,10 +466,10 @@ roundNow run =
 -- go on. A part that is in a scope says how it can be taken off the timer.
 sleepUntil :: Run -> Part -> Instant -> (IO () -> IO Step) -> IO Step
 sleepUntil run part (Instant at) resume = do
-  timer <- addTimer (runWheel run) at (modifyIORef' (runTickets run) (resume (pure ()) :))
+  timer <- addTimer (runWheel run) at (modifyIORef' (runLaneReady run) (resume (pure ()) :))
   readIORef (partFrames part) >>= \case
     [] -> pure ()
-    _ -> writeIORef (partWait part) (Other (\cancelled -> cancelTimer (runWheel run) timer >>= \wasLive -> pure (if wasLive then Just (resume (throwIO cancelled)) else Nothing)))
+    _ -> writeIORef (partWait part) (Other (\cancelled -> cancelTimer (runWheel run) timer >>= \wasLive -> if wasLive then backIn run (resume (throwIO cancelled)) else pure Nothing))
   counted run Timed
 
 -- | The number of a part, of a wait of a part that is in a scope, or of a scope: none is 0, and the run's own
@@ -409,7 +494,7 @@ clock = fromIntegral <$> monotonicNanoseconds
 
 -- | Counts a step, and goes on, or yields once the part has run for its turn.
 stepped :: Run -> IO Step -> IO Step
-stepped run continue = spent run >>= \yields -> if yields then pure (Yielded continue) else continue
+stepped run continue = spent run >>= \yields -> if yields then markFast run *> pure (Yielded continue) else continue
 {-# INLINE stepped #-}
 
 -- | Counts a step that suspends its part.
@@ -419,7 +504,7 @@ counted run step = step <$ (counter run 1 >>= setCounter run 1 . (+ 1))
 
 -- | Puts a part that a ticket woke back among those that can go on.
 wakeTicket :: Run -> IO Step -> IO ()
-wakeTicket run part = modifyIORef' (runTickets run) (part :) *> adjust run 5 (-1)
+wakeTicket run part = readyIn run part *> adjust run 5 (-1)
 
 -- | How the parts of a run wait at an inbox or a ticket, and are woken: how the slot is changed, how a part is put back among those
 -- that can go on, how a part is given a value, which says whether the part takes it, what a part that waits comes to, and the counter of
@@ -439,7 +524,9 @@ hereSeat = Seat changeHere wakeTicket (\run part -> True <$ wakeTicket run part)
 -- | The seat of an inbox or a ticket of any core: compare-and-swap, and the mailbox of the part's scheduler, which refuses a part if
 -- the scheduler has ended.
 anywhereSeat :: Seat
-anywhereSeat = Seat update (\run part -> () <$ post (runMailbox run) part) (\run part -> post (runMailbox run) part) ParkedRemote 3
+anywhereSeat = Seat update (\run part -> () <$ postIn run part) postIn ParkedRemote 3
+  where
+    postIn run = if runInFast run then postFast (runMailbox run) else post (runMailbox run)
 
 -- | What a part does that collects from an inbox, for the two arrows that run every part on one thread: the arrow goes on with the
 -- value, or, if there is none, captures what follows, and the part waits on the shelf until a post wakes it and it takes the value.
@@ -454,11 +541,11 @@ collectFrom seat run part shelf taken capture = do
       lookOrWait (seatChange seat) shelf (seatWake seat run (resume again)) >>= \case
         Registered -> do
           -- A cancellation takes the part off the shelf, unless a post has woken it already.
-          let stop cancelled = stopWaiting (seatChange seat) shelf >>= \stopped -> if stopped then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+          let stop cancelled = stopWaiting (seatChange seat) shelf >>= \stopped -> if stopped then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
           writeIORef (partWait part) (Other stop)
           pure (seatParked seat)
         -- A value came since the look, from another thread.
-        Found -> pure (Yielded (resume again))
+        Found -> markFast run *> pure (Yielded (resume again))
         Unusable -> collectedWrongly
 
 -- | What a part does that posts to an inbox, for the two arrows that run every part on one thread: the arrow goes on with whether
@@ -475,11 +562,11 @@ postTo seat run part shelf value posted capture = do
       capture $ \resume ->
         postOrQueue (seatChange seat) shelf token value (\outcome -> seatWake seat run (resume (pure outcome))) >>= \case
           Nothing -> do
-            let stop cancelled = withdraw (seatChange seat) shelf token >>= \withdrawn -> if withdrawn then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+            let stop cancelled = withdraw (seatChange seat) shelf token >>= \withdrawn -> if withdrawn then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
             writeIORef (partWait part) (Other stop)
             pure (seatParked seat)
           -- The inbox took the value, or closed, since the look, on another thread.
-          Just taken -> pure (Yielded (resume (pure taken)))
+          Just taken -> markFast run *> pure (Yielded (resume (pure taken)))
 
 -- | The part says where it waits, if it is in a scope, so that a cancellation can take it from there: a part that is in none is not
 -- cancelled, and says nothing.
@@ -514,10 +601,10 @@ parkAwaiting seat run part slot resume =
   parkTaker (seatChange seat) slot (\value -> seatDeliver seat run (resume (pure value))) >>= \case
     Parks -> do
       -- A cancellation takes the part off the slot, unless a sender has given it a value already.
-      let stop cancelled = stopTaking (seatChange seat) slot >>= \stopped -> if stopped then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+      let stop cancelled = stopTaking (seatChange seat) slot >>= \stopped -> if stopped then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
       waitsAt part (Other stop)
       pure (seatParked seat)
-    Took value -> pure (Yielded (resume (pure value)))
+    Took value -> markFast run *> pure (Yielded (resume (pure value)))
     Misused -> ioError tookWrongly
 
 -- | What a part does that awaits and registers: if a sender waits, the arrow goes on with its value, and the registration doesn't run.
@@ -558,12 +645,12 @@ handWaitingTo seat run part slot value handed capture = do
       token <- nextWait run
       parkSender (seatChange seat) slot value token (\taken -> seatWake seat run (resume (pure (if taken then Nothing else Just value)))) >>= \case
         LeftWaiting -> do
-          let stop cancelled = withdrawSender (seatChange seat) slot token >>= \withdrawn -> if withdrawn then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+          let stop cancelled = withdrawSender (seatChange seat) slot token >>= \withdrawn -> if withdrawn then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
           waitsAt part (Other stop)
           pure (seatParked seat)
         -- The receiver took the value, or the ticket was abandoned, since the look, on another thread.
-        Passed -> pure (Yielded (resume (pure Nothing)))
-        GaveBack -> pure (Yielded (resume (pure (Just value))))
+        Passed -> markFast run *> pure (Yielded (resume (pure Nothing)))
+        GaveBack -> markFast run *> pure (Yielded (resume (pure (Just value))))
         _ -> ioError twoSenders
 {-# INLINE handWaitingTo #-}
 
@@ -579,10 +666,10 @@ untilParkedFrom seat run part slot goOn capture = do
       token <- nextWait run
       parkWatcher (seatChange seat) slot token (seatWake seat run (resume (pure ()))) >>= \case
         WatchWaits -> do
-          let stop cancelled = unwatch (seatChange seat) slot token >>= \stopped -> if stopped then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+          let stop cancelled = unwatch (seatChange seat) slot token >>= \stopped -> if stopped then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
           waitsAt part (Other stop)
           pure (seatParked seat)
-        WatchDone -> pure (Yielded (resume (pure ())))
+        WatchDone -> markFast run *> pure (Yielded (resume (pure ())))
         SecondWatcher -> ioError twoWatchers
 {-# INLINE untilParkedFrom #-}
 
@@ -768,7 +855,8 @@ armHeld run part period = do
   forM_ [s | (s, longest) <- held, longest == period] (\s -> laterIn run s period)
 {-# NOINLINE armHeld #-}
 
--- | Takes the part off what it waits at, if it still does: what goes on with the part.
+-- | Takes the part off what it waits at, if it still does: what goes on with the part, if it is in the normal lane. A part of the fast
+-- lane is put back in that lane, which has it, with the cancellation to raise where it waited.
 stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))
 stopWait run cancelled = \case
   NotWaiting -> pure Nothing
@@ -780,17 +868,26 @@ stopWait run cancelled = \case
         let (found, rest) = takeEntry ident (if reading then readers else writers)
          in case found of
               Nothing -> pure Nothing
-              Just resume -> do
+              Just entry -> do
                 writeIORef (runWaiters run) (settle fd (if reading then Waiters rest writers else Waiters readers rest) waiters)
                 adjust run 4 (-1)
-                pure (Just (resume (throwIO cancelled)))
+                inLane run (isSuspendedFast entry) (resumeOf entry (throwIO cancelled))
   OnWatch ident -> do
     watching <- readIORef (runWatching run)
-    case partition (\(Watching other _ _) -> other == ident) watching of
-      ([Watching _ watch resume], rest) -> Just (resume (throwIO cancelled)) <$ (writeIORef (runWatching run) rest *> watchCancel watch)
+    case partition (\(Watching other _ _ _) -> other == ident) watching of
+      ([Watching _ fast watch resume], rest) -> writeIORef (runWatching run) rest *> watchCancel watch *> inLane run fast (resume (throwIO cancelled))
       _ -> pure Nothing
   Other stop -> stop cancelled
   InGroup _ -> pure Nothing
+
+-- | What goes on with a part that a cancellation took off what it waited at: the part, in the normal lane, and nothing in the fast lane,
+-- where it is put back.
+inLane :: Run -> Bool -> IO Step -> IO (Maybe (IO Step))
+inLane run fast part = if fast then Nothing <$ modifyIORef' (runFastReady run) (part :) else pure (Just part)
+
+-- | Whether the step is of a part in the fast lane.
+isSuspendedFast :: Step -> Bool
+isSuspendedFast = \case SuspendedFast {} -> True; _ -> False
 
 -- | A failure that nothing in the part handles: it leaves the run.
 newtype Escaped = Escaped SomeException
@@ -946,16 +1043,20 @@ enqueue run part = modifyIORef' (runTickets run) (part :)
 -- | What goes on with a part that waits, from its step.
 resumeOf :: Step -> IO () -> IO Step
 resumeOf (Suspended _ _ resume) = resume
+resumeOf (SuspendedFast _ _ resume) = resume
 resumeOf _ = const (pure Ended)
 
 -- | The step of the wait, and the others.
-takeEntry :: Int -> [Step] -> (Maybe (IO () -> IO Step), [Step])
+takeEntry :: Int -> [Step] -> (Maybe Step, [Step])
 takeEntry ident = go []
   where
     go before = \case
       [] -> (Nothing, reverse before)
-      entry@(Suspended _ other resume) : after
-        | other == ident -> (Just resume, reverse before <> after)
+      entry@(Suspended _ other _) : after
+        | other == ident -> (Just entry, reverse before <> after)
+        | otherwise -> go (entry : before) after
+      entry@(SuspendedFast _ other _) : after
+        | other == ident -> (Just entry, reverse before <> after)
         | otherwise -> go (entry : before) after
       entry : after -> go (entry : before) after
 
@@ -972,31 +1073,65 @@ takeEntry ident = go []
 -- fails with the exception. The exception of a part that no scope holds fails
 -- the run at once.
 schedule :: forall m b. (Instrumented m) => Run -> (IO Step -> IO Step) -> IORef (Maybe b) -> IO Step -> IO (b, Report)
-schedule run enterPart result start = (observing @m run *> go [start] [] `catch` failed) `finally` closeInbox run
+schedule run enterPart result start = (observing @m run *> go [start] [] [] True `catch` failed) `finally` closeInbox run
   where
     -- A shutdown fails the run with its exception, whatever the parts failed with, which is their cancellation.
     failed :: SomeException -> IO a
     failed failure = readIORef (runShutdown run) >>= throwIO . fromMaybe (unescaped failure)
     unescaped failure = maybe failure (\(Escaped inner) -> inner) (fromException failure)
-    -- The parts that can go on in this round, and in the next.
-    go ready later = case ready of
-      part : others -> do
-        clock >>= setCounter run 0
-        step <- enterPart part
-        readIORef result >>= \case
-          Just value -> (\steps waits -> (value, Report steps waits)) <$> counter run 1 <*> counter run 2
-          Nothing -> case step of
-            Ended -> go others later
-            Timed -> go others later
-            Parked -> adjust run 5 1 *> go others later
-            ParkedRemote -> adjust run 3 1 *> go others later
-            Yielded part' -> go others (part' : later)
-            Forked parts -> go others (foldl (flip (:)) later parts)
-            Suspended (Readable fd) _ _ -> waitOn fd True step *> adjust run 4 1 *> go others later
-            Suspended (Writable fd) _ _ -> waitOn fd False step *> adjust run 4 1 *> go others later
-            Suspended (Until (Instant at)) _ resume -> addTimer (runWheel run) at (modifyIORef' (runTickets run) (resume (pure ()) :)) *> go others later
-            Suspended (Watched register) ident resume -> register >>= \watch -> modifyIORef' (runWatching run) (Watching ident watch resume :) *> go others later
+    -- The parts that can go on in this round, in the next and in the fast lane, and whether it is the fast lane's turn. The lanes
+    -- take turns, one part of each, and a lane that has none lets the other go on. The fast lane is looked at only when a part has
+    -- entered it, and the parts that other cores gave it are taken at its turns, so that a part that is woken is served after at most
+    -- one part of the normal lane, not at the end of the round.
+    go !ready later !fast !fastTurn = do
+      lanes <- counter run 15
+      fast' <- if lanes /= 0 && fastTurn then fastReady fast else pure fast
+      case fast' of
+        part : others | fastTurn -> turn True part ready later others
+        _ -> case ready of
+          part : others -> turn False part others later fast'
+          [] -> boundary later fast' fastTurn
+    -- A turn of the part, after which it is the other lane's turn.
+    turn !fromFast part ready later fast = do
+      clock >>= setCounter run 0
+      step <- enterPart part
+      readIORef result >>= \case
+        Just value -> (\steps waits -> (value, Report steps waits)) <$> counter run 1 <*> counter run 2
+        Nothing -> case step of
+          Ended -> go ready later fast (not fromFast)
+          Timed -> go ready later fast (not fromFast)
+          Parked -> adjust run 5 1 *> go ready later fast (not fromFast)
+          ParkedRemote -> adjust run 3 1 *> go ready later fast (not fromFast)
+          Yielded part' ->
+            counter run 16 >>= \inFast ->
+              if inFast == 0
+                then go ready (part' : later) fast (not fromFast)
+                else setCounter run 16 0 *> modifyIORef' (runFastReady run) (part' :) *> go ready later fast (not fromFast)
+          Forked parts -> go ready (foldl (flip (:)) later parts) fast (not fromFast)
+          Suspended event ident resume ->
+            counter run 16 >>= \inFast ->
+              if inFast == 0
+                then suspended False fromFast step event ident resume ready later fast
+                else setCounter run 16 0 *> suspended True fromFast (SuspendedFast event ident resume) event ident resume ready later fast
+          SuspendedFast event ident resume -> suspended True fromFast step event ident resume ready later fast
+    -- A part that waits for the event, and the turn after it.
+    suspended !inFast !fromFast step event !ident resume ready later fast = case event of
+      Readable fd -> waitOn fd True step *> adjust run 4 1 *> go ready later fast (not fromFast)
+      Writable fd -> waitOn fd False step *> adjust run 4 1 *> go ready later fast (not fromFast)
+      Until (Instant at) -> addTimer (runWheel run) at (modifyIORef' (if inFast then runFastReady run else runTickets run) (resume (pure ()) :)) *> go ready later fast (not fromFast)
+      Watched register -> register >>= \watch -> modifyIORef' (runWatching run) (Watching ident inFast watch resume :) *> go ready later fast (not fromFast)
+    -- The parts of the fast lane that can go on, in the order they came: those it has, those that were put back among the parts that can go
+    -- on since, and those that another core gave.
+    fastReady = \case
+      fast@(_ : _) -> pure fast
       [] -> do
+        takeFastInbox run
+        queued <- readIORef (runFastReady run)
+        case queued of
+          [] -> pure []
+          _ -> reverse queued <$ writeIORef (runFastReady run) []
+    -- The normal lane has none left in this round.
+    boundary later fast !fastTurn = do
         -- Each round, the parts that descriptors became ready for, that other
         -- cores gave, and that tickets or timers woke, or a cancellation took
         -- off what they waited at, go before those that yielded: a part that
@@ -1013,9 +1148,12 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
         writeIORef (runTickets run) []
         given <- takeInbox run >>= arrivals run
         case given <> reverse tickets <> reverse later of
-          -- No part can go on: the blocking poll in 'idle' returns at once if a descriptor is ready.
-          [] -> idle
-          others -> looking >>= \polled -> go (polled <> others) []
+          -- No part of the normal lane can go on: the fast lane goes on, if it has a part, and else the blocking poll in 'idle' returns
+          -- at once if a descriptor is ready.
+          [] -> fastReady fast >>= \case
+            [] -> idle
+            fast' -> go [] [] fast' True
+          others -> looking >>= \polled -> go (polled <> others) [] fast fastTurn
     -- Polls without waiting, if 'pollTurns' turns have passed since the last poll or enough armings are waiting for one, and
     -- gives the parts it woke. The armings are those of waits that were cancelled: they stay armed until a poll, and on kqueue
     -- they are changes that the poll submits.
@@ -1049,7 +1187,9 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
               -- Unless a part was given since the round began: the next to give
               -- one wakes the poller.
               early <- beforeSleep run >>= arrivals run
-              if null early
+              -- Or a part of the fast lane, which the mailbox gave.
+              fastGiven <- fastWaiting run
+              if null early && not fastGiven
                 then do
                   countWait
                   until' <- untilNextTimer
@@ -1058,8 +1198,8 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
                   -- The time of the round was read before the wait, if a timer made the round expire its timers: the parts that the wait ended
                   -- read it again, as a round's first part does.
                   setCounter run 8 0
-                  go (polled <> given) []
-                else go early []
+                  go (polled <> given) [] [] True
+                else go early [] [] True
           | otherwise -> do
               countWait
               -- Watches, and descriptors too, and the mailbox: the watches for a
@@ -1072,17 +1212,19 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
                     (False, Just nanos) -> Just (fromIntegral (nanos `div` 1000))
                     (False, Nothing) -> Nothing
               delay <- maybe (pure Nothing) (fmap Just . delayWatch) micros
-              interruptedBy . atomically $ maybe retry watchReady delay `orElse` foldr (orElse . (\(Watching _ watch _) -> watchReady watch)) retry watching
+              interruptedBy . atomically $ maybe retry watchReady delay `orElse` foldr (orElse . (\(Watching _ _ watch _) -> watchReady watch)) retry watching
               mapM_ watchCancel delay
               watched <- readIORef (runWatching run)
-              checked <- traverse (\entry@(Watching _ watch _) -> (,) entry <$> hasFired watch) watched
+              checked <- traverse (\entry@(Watching _ _ watch _) -> (,) entry <$> hasFired watch) watched
               let (fired, still) = partition snd checked
-              mapM_ (\(Watching _ watch _, _) -> watchCancel watch) fired
+              mapM_ (\(Watching _ _ watch _, _) -> watchCancel watch) fired
               writeIORef (runWatching run) (map fst still)
               armed <- counter run 10
               polled <- if descriptors + armed > 0 then pollNow else pure []
               setCounter run 8 0
-              go (polled <> map (\(Watching _ _ resume, _) -> resume (pure ())) fired) []
+              let (firedFast, firedNormal) = partition (\(Watching _ inFast _ _, _) -> inFast) fired
+              modifyIORef' (runFastReady run) (\queued -> foldl (\newest (Watching _ _ _ resume, _) -> resume (pure ()) : newest) queued firedFast)
+              go (polled <> map (\(Watching _ _ _ resume, _) -> resume (pure ())) firedNormal) [] [] True
     countWait = counter run 2 >>= setCounter run 2 . (+ 1)
     -- How long until the next timer is due, in nanoseconds.
     untilNextTimer =
@@ -1164,7 +1306,14 @@ schedule run enterPart result start = (observing @m run *> go [start] [] `catch`
           (woken, waiters') <- foldM wake ([], waiters) readied
           writeIORef (runWaiters run) waiters'
           adjust run 4 (negate (length woken))
-          pure (map (\entry -> resumeOf entry (pure ())) woken)
+          lanes <- counter run 15
+          if lanes == 0
+            then pure (map (\entry -> resumeOf entry (pure ())) woken)
+            else do
+              -- The parts of the fast lane that the poll woke go among those that can go on there.
+              let (wokenFast, wokenNormal) = partition isSuspendedFast woken
+              modifyIORef' (runFastReady run) (\queued -> foldl (\newest entry -> resumeOf entry (pure ()) : newest) queued wokenFast)
+              pure (map (\entry -> resumeOf entry (pure ())) wokenNormal)
     -- Takes the parts that wait for what was reported off the descriptor, and arms it again for the others: a report
     -- may have used up the arming of a kind that nothing waits for any more, or, on epoll, the arming of both.
     wake (woken, waiters) (fd, kind) = do

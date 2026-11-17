@@ -107,7 +107,7 @@ steppedIn context@(Context run _ _) continue = spent run >>= \yields -> if yield
 -- scope, when it goes on. Not inlined, so that what it builds is built only when the part yields, and not at
 -- every step.
 yielded :: Context -> IO Step -> IO Step
-yielded context@(Context _ part _) continue = pure (Yielded (resumed context (checkpoint part *> continue)))
+yielded context@(Context run part _) continue = markFast run *> pure (Yielded (resumed context (checkpoint part *> continue)))
 {-# NOINLINE yielded #-}
 
 -- | Counts a step, and once the part has run for its turn, lets the others go
@@ -116,9 +116,10 @@ instance GiveWay (CompiledM m) where
   giveWay = Compiled (\context value next -> steppedIn context (next value))
   {-# INLINE giveWay #-}
 
--- | Nothing yet: its scheduler has no lanes.
+-- | The arrow runs with a view of the run that puts the part back among those that can go on in the fast lane. The parts that it starts
+-- are given the run as it is for the normal lane.
 instance FastLane (CompiledM m) where
-  fastLane = id
+  fastLane (Compiled inner) = Compiled (\(Context run part failure) value next -> fastened run >>= \fast -> inner (Context fast part failure) value next)
   {-# INLINE fastLane #-}
 
 instance Block (CompiledM m) where
@@ -142,7 +143,7 @@ instance Block (CompiledM m) where
 waitFor :: Context -> Int -> Event -> (() -> IO Step) -> IO Step
 waitFor context@(Context run part _) ident event next = case event of
   Until instant -> sleepUntil run part instant (\action -> resumed context (action *> next ()))
-  _ -> counted run (Suspended event ident (\action -> resumed context (action *> next ())))
+  _ -> markFast run *> counted run (Suspended event ident (\action -> resumed context (action *> next ())))
 {-# INLINE waitFor #-}
 
 -- | The time of the round of the scheduler.
@@ -238,10 +239,12 @@ instance Concurrent (CompiledM m) where
   -- runs as a part of its own, which is not in the scope of the parts.
   group joiner (Compiled body) = Compiled $ \(Context run part outer) input next -> do
     (gang, first') <- newGang run part joiner
-    let failure thrown = writeIORef (runFailure run) outer *> outer thrown
+    -- The parts of the group are in the normal lane, whichever lane the part that makes the group is in.
+    let !plain = plainRun run
+        failure thrown = writeIORef (runFailure run) outer *> outer thrown
         success result = writeIORef (runFailure run) outer *> next result
         ended = bodyEnded run gang first' failure success
-        failing = Context run first' (ended . Left)
+        failing = Context plain first' (ended . Left)
     pure (Forked [resumed failing (body failing (CompiledGroup gang, input) (ended . Right))])
   {-# INLINE group #-}
 
@@ -250,8 +253,9 @@ instance Concurrent (CompiledM m) where
     spawnedPart run gang >>= \case
       Nothing -> next ()
       Just (number, child) -> do
-        let ended = partEnded run gang child number
-            failing = Context run child (ended . Left)
+        let !plain = plainRun run
+            ended = partEnded run gang child number
+            failing = Context plain child (ended . Left)
         enqueue run (resumed failing (program failing input (ended . Right)))
         next ()
   {-# INLINE spawn #-}
@@ -264,11 +268,12 @@ instance Concurrent (CompiledM m) where
       scope' <- newScope run
       children <- childParts run part scope' size
       joined <- newIORef (Joined Nothing 0)
-      let failure thrown = writeIORef (runFailure run) outer *> outer thrown
+      let !plain = plainRun run
+          failure thrown = writeIORef (runFailure run) outer *> outer thrown
           success () = writeIORef (runFailure run) outer *> next ()
           started (Compiled body) child =
             let ended = groupEnded run scope' size joined failure success child
-                failing = Context run child (ended . Left)
+                failing = Context plain child (ended . Left)
              in resumed failing (body failing value (ended . Right))
       pure (Forked (zipWith started parts children))
 
@@ -281,12 +286,13 @@ instance Race (CompiledM m) where
     first' <- childPart run part scope'
     second' <- childPart run part scope'
     winner <- newIORef Nothing
-    let failure thrown = writeIORef (runFailure run) outer *> outer thrown
+    let !plain = plainRun run
+        failure thrown = writeIORef (runFailure run) outer *> outer thrown
         success result = writeIORef (runFailure run) outer *> next result
         ended1 = raceEnded run scope' winner failure success first'
         ended2 = raceEnded run scope' winner failure success second'
-        failing1 = Context run first' (ended1 . Left)
-        failing2 = Context run second' (ended2 . Left)
+        failing1 = Context plain first' (ended1 . Left)
+        failing2 = Context plain second' (ended2 . Left)
     pure (Forked [resumed failing1 (one failing1 value (ended1 . Right . Left)), resumed failing2 (two failing2 value (ended2 . Right . Right))])
 
 -- | The region of the tickets of this arrow: there is one core, the thread that runs it.

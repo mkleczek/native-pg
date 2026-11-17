@@ -48,6 +48,7 @@ spec = do
   deadlines
   shields
   graces
+  fastLanes
   allowances
   inboxes
   exchanges
@@ -213,6 +214,19 @@ graces = describe "a grace" $ do
   it "has a loop through it that never waits found, as through any other step" $ do
     report <- lint (iterateWith countDown (grace (secs 5) (arr id)))
     summary report `shouldBe` ([LoopWithoutWait], [])
+
+-- | The fast lane, which the lint looks through: a part in it waits and loops as it does outside it.
+fastLanes :: Spec
+fastLanes = describe "a fast lane" $ do
+  it "has a loop through it that never waits found, and one that waits not, as through any other step" $ do
+    spinning <- lint (iterateWith countDown (fastLane (arr id)))
+    waiting <- lint (iterateWith countDown (fastLane giveWay))
+    (summary spinning, summary waiting) `shouldBe` (([LoopWithoutWait], []), ([], []))
+
+  it "around a wait that a shield holds is found, and around one that nothing holds is not" $ do
+    held <- lint (fastLane (shield (giveWay >>> quick)) :: Diagram () ())
+    free <- lint (fastLane (giveWay >>> quick) :: Diagram () ())
+    (summary held, summary free) `shouldBe` (([ShieldAroundWait], []), ([], []))
 
 -- | A scope that opens the inbox of the name, for a body that is given the inbox and its address.
 owning :: forall name. (KnownSymbol name) => Diagram ((Inbox Diagram name 'Anywhere (), Address name 'Anywhere ()), ()) () -> Diagram () ()

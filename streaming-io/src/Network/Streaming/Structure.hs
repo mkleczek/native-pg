@@ -72,6 +72,8 @@ data Tree
     Shield Tree
   | -- | A body that cancellations from outside reach only after a period.
     Grace Duration Tree
+  | -- | A body whose part is in the fast lane of its core.
+    FastLane Tree
   | -- | Two steps that run until the first ends.
     Race Tree Tree
   | -- | A body with a deadline.
@@ -171,6 +173,7 @@ children = \case
   Try inner -> [inner]
   Shield inner -> [inner]
   Grace _ inner -> [inner]
+  FastLane inner -> [inner]
   Race one two -> [one, two]
   Within _ inner -> [inner]
   TimeoutA inner -> [inner]
