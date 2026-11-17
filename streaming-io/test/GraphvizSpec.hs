@@ -187,6 +187,13 @@ spec = describe "the DOT of a graph" $ do
         any ("working" `isInfixOf`) spawned `shouldBe` True
       found -> failTest ("the graph has the clusters " <> show (fmap length <$> [fst found, snd found]))
 
+  xfail "the diagram has no node for the fast lane yet" $
+    it "has a cluster for a fast lane, which holds its steps" $ do
+      found <- dotOf (fastLane (box "working" quick) :: Diagram () ())
+      case clusterTitled "fast lane" found of
+        Nothing -> failTest "the graph has no cluster for the fast lane"
+        Just inside -> any ("working" `isInfixOf`) inside `shouldBe` True
+
   it "has the edges of the messages of an inbox in the style of a message, from the post to the store and from the store to the collect" $ do
     found <- dotOf (owning (beside (poster, collector)))
     messagesOf found `shouldBe` sort [("post \x2709 jobs", "jobs"), ("jobs", "collect \x2709 jobs")]
