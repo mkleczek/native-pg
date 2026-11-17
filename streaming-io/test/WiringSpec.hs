@@ -4,9 +4,11 @@
 -- | Steps wired by name: a flow of lines, each of which makes the input of its step from the names of the flow, runs in
 -- each arrow that runs programs and gives what its steps give, a choice is a line of a flow whose branches are lines, and
 -- a pattern takes the output of a step apart, and the value of a case: a list of names, a name that is kept whole and
--- taken apart, and patterns that nest. That a name that the flow doesn't have, an output that a step doesn't give, a port
--- that is not bound or is bound twice, and a name that the flow has already don't compile, in a branch of a choice too,
--- and that a pattern that doesn't fit the output of its step doesn't, is checked by @test/check-wiring.sh@.
+-- taken apart, and patterns that nest, and the input of a step is made by a list of bindings, which is a record, or whole
+-- by a name or a tuple of names. That a name that the flow doesn't have, an output that a step doesn't give, a port that
+-- is not bound or is bound twice, and a name that the flow has already don't compile, in a branch of a choice too, and
+-- that a pattern that doesn't fit the output of its step doesn't, nor does a port in a name or a tuple, is checked by
+-- @test/check-wiring.sh@.
 module WiringSpec (spec) where
 
 import Control.Arrow (arr, (>>>), (>>^), (|||))
@@ -36,6 +38,11 @@ runners =
     Runner "compiled" (\program -> fst <$> runCompiled program ()),
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
+
+-- | The stubs of a name and a tuple on the right of '-<' fail with 'NotImplemented': the cases that need them are expected to
+-- fail, and the marks come off when the code is there.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: a name or a tuple on the right of -< is not written yet"
 
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
@@ -163,6 +170,34 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
     run (outside 123) `shouldReturn` 34
     run (outside 5000) `shouldReturn` 10
 
+  stubbed $ it "gives a step that takes a plain value the value of a bare name, whole, whether the step keeps its output or not" $ do
+    run (inputs >>> flow ("twice" <: doubler -< "a") >>^ \r -> (r.twice, r.a, r.b)) `shouldReturn` (6, 3, 4)
+    noted <- newLog
+    run (inputs >>> flow (writing noted -< "b") >>^ \r -> (r.a, r.b)) `shouldReturn` (3, 4)
+    readLog noted `shouldReturn` ["4"]
+
+  stubbed $ it "gives the value that a bare path reaches: a field of what a step gave, and a field of a field" $
+    run (inputs >>> fromPaths) `shouldReturn` 88
+
+  it "makes a record of the ports from a list of names, and nothing from the empty list, as it always did" $
+    run (inputs >>> fromList) `shouldReturn` 4
+
+  stubbed $ it "gives a step that takes a pair the values of two names, and a step that takes pairs that nest to the right the values of three" $ do
+    run (inputs >>> flow ("pair" <: tens -< ("a", "b") >>> "triple" <: hundreds -< ("a", "b", "pair")) >>^ \r -> (r.pair, r.triple))
+      `shouldReturn` (34, 374)
+    run (inputs >>> fromPathPair) `shouldReturn` 43
+
+  stubbed $ it "gives the values of three names in pairs that nest to the right, which the left of <: takes apart by position" $
+    run (inputs >>> flow (["x", "y", "z"] <: passing -< ("a", "b", "a")) >>^ \r -> (r.x, r.y, r.z)) `shouldReturn` (3, 4, 3)
+
+  stubbed $ it "runs the branch of a choice whose step takes the value of its case whole, and the branch whose step takes it in a pair" $ do
+    run (sized 3 >>> wholes) `shouldReturn` 6
+    run (sized 20 >>> wholes) `shouldReturn` 204
+    run (sized 500 >>> wholes) `shouldReturn` 540
+
+  stubbed $ it "reads a name and a tuple of the names of a record that is not known, for a flow that is a step of its own" $
+    run (inputs >>> anyWhole) `shouldReturn` 68
+
   it "reads the names of a record that is not known, for a flow that is a step of its own" $ do
     run (inputs >>> anyRecord) `shouldReturn` 14
     run (newRecord ["extra", "b", "a"] <$> arr (const 'x') <*> arr (const 5) <*> arr (const 1) >>> anyRecord)
@@ -222,6 +257,34 @@ mixed = now (\r -> pure ((r.a, r.b), newRecord ["sum", "prod"] (r.a + r.b) (r.a 
 -- | A step that notes that it ran, reads its ports "a" and "b", and gives them as a pair.
 tallying :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => Log -> arr r (Int, Int)
 tallying noted = now (\r -> atomicModifyIORef' noted (\entries -> ("ran" : entries, ())) >> pure (r.a, r.b))
+
+-- | A step that takes a number, and gives it doubled.
+doubler :: (Effect arr) => arr Int Int
+doubler = now (\n -> pure (n * 2))
+
+-- | A step that takes a number, and notes it.
+writing :: (Effect arr) => Log -> arr Int ()
+writing noted = now (\n -> atomicModifyIORef' noted (\entries -> (show n : entries, ())))
+
+-- | A step that takes a pair, and gives its first part in tens and its second in ones.
+tens :: (Effect arr) => arr (Int, Int) Int
+tens = now (\(a, b) -> pure (a * 10 + b))
+
+-- | A step that takes pairs that nest to the right, and gives the first part in hundreds, the second in tens and the third in ones.
+hundreds :: (Effect arr) => arr (Int, (Int, Int)) Int
+hundreds = now (\(a, (b, c)) -> pure (a * 100 + b * 10 + c))
+
+-- | A step that takes pairs that nest to the right, and gives them as they are.
+passing :: (Effect arr) => arr (Int, (Int, Int)) (Int, (Int, Int))
+passing = now pure
+
+-- | A step that reads its port "a", and gives it.
+reader :: (Effect arr, HasField "a" r Int) => arr r Int
+reader = now (\r -> pure r.a)
+
+-- | A step that takes nothing, and gives a number.
+nothing :: (Effect arr) => Int -> arr () Int
+nothing n = now (\() -> pure n)
 
 -- | A step that reads its port "v", and notes it with the label.
 noting :: (Effect arr, HasField "v" r Int) => Log -> String -> arr r ()
@@ -444,6 +507,62 @@ outside n =
             ||| "huge" =: "h" @: ["lo", "hi"] ?> arr (\r -> r.h.hi + r.lo + r.extra)
             ||| "none" ?> arr (\r -> r.extra)
         )
+
+-- | Bare paths: a field of the record that a step gave, and a field of a field.
+fromPaths :: (Steps arr) => arr ("a" := Int, "b" := Int) Int
+fromPaths =
+  result
+    "total"
+    ( "parts" <: pairer -< ["n" =: "a"]
+        >>> "nested" <: nester -< ["n" =: "b"]
+        >>> "next" <: doubler -< "parts.next"
+        >>> "leaf" <: doubler -< "nested.inner.leaf"
+        >>> "total" <: adder -< ["a" =: "next", "b" =: "leaf"]
+    )
+
+-- | The list of no name and the list of one, whose steps take nothing and a record of one port.
+fromList :: (Steps arr) => arr ("a" := Int, "b" := Int) Int
+fromList =
+  result
+    "total"
+    ( "one" <: nothing 1 -< []
+        >>> "same" <: reader -< ["a"]
+        >>> "total" <: adder -< ["a" =: "one", "b" =: "same"]
+    )
+
+-- | A pair of two paths, which a step that takes a pair is given.
+fromPathPair :: (Steps arr) => arr ("a" := Int, "b" := Int) Int
+fromPathPair =
+  result
+    "total"
+    ( "parts" <: pairer -< ["n" =: "a"]
+        >>> "total" <: tens -< ("parts.next", "parts.this")
+    )
+
+-- | A choice whose branches are given the value of their case whole, and in a pair with an input of the flow.
+wholes :: (Steps arr) => arr ("a" := Int, "b" := Int) Int
+wholes =
+  result
+    "picked"
+    ( "size" <: sizer -< ["n" =: "a"]
+        >>> "picked"
+          <: choice
+            "how big?"
+            "size"
+            ( "small" =: "small" ?> doubler -< "small"
+                ||| "big" =: "big" ?> tens -< ("big", "b")
+                ||| "huge" =: "huge" ?> tens -< ("b", "huge")
+            )
+    )
+
+-- | A flow over any record that has the names that its steps read, whose steps are given a name and a pair of names.
+anyWhole :: (Steps arr, HasField "a" r Int, HasField "b" r Int) => arr r Int
+anyWhole =
+  result
+    "total"
+    ( "sum" <: tens -< ("a", "b")
+        >>> "total" <: doubler -< "sum"
+    )
 
 -- | A flow over any record that has the names that its steps read, which is a step of its own.
 anyRecord :: (Steps arr, HasField "a" r Int, HasField "b" r Int) => arr r Int

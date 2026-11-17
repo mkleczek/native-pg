@@ -30,11 +30,16 @@ check() {
 # pattern has no name from it, and a pattern with a field that a part doesn't have, a list for a part that is neither a record
 # nor a pair, a name that the pattern has twice or the flow has already, a field named in a list for a pair, too many names for
 # a pair that is a part, a pattern for a binding or for the output of a step as a field are rejected, and each error says where
-# in the pattern it is.
+# in the pattern it is. A step that takes its input whole is checked the same way: the control has a name for a step that takes a
+# plain value, with a name for its output and without, a path, a pair of names and a triple of names, some of them paths, the
+# empty list and a list of one name, names and a pair in the branches of a choice, and a flow over a record that is not known; a
+# port in a name and in a tuple, a name that the flow doesn't have in a name and in a tuple, and a pattern in a tuple are
+# rejected.
 check WiringFlow
 check WiringChoice
 check WiringPattern
 check WiringNested
+check WiringWhole
 while read -r fixture message; do
   if check "$fixture" >"$output_dir/$fixture.log" 2>&1; then
     echo "Expected $fixture to fail compilation" >&2
@@ -77,5 +82,10 @@ WiringBranchNoField in "huge": The value of the case has no field "up"
 WiringBranchWhole in "small": The value of the case is neither a record nor a pair
 WiringBranchTwice The pattern has the name "x" twice
 WiringBranchRepeated The flow already has the name "i"
+WiringWholePort A step that takes its input whole has no port
+WiringTuplePort A step that takes its input whole has no port
+WiringWholeNoName The flow has no name "k"
+WiringTupleNoName The flow has no name "k"
+WiringTuplePattern takes a value apart, which is for the left of <:
 EOF2
-echo "Wiring: steps, choices and lists of names are wired by name; a missing or repeated name, a missing output, an unbound port are rejected"
+echo "Wiring: steps, choices, lists of names and names taken whole are wired by name; a missing or repeated name, a missing output, an unbound port, a port in a name or a tuple are rejected"

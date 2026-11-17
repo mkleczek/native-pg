@@ -26,6 +26,11 @@ import Skeletest
 quick :: (Effect arr) => arr a ()
 quick = now (const (pure ()))
 
+-- | The code that draws a name or a tuple on the right of '-<' is not written yet: the cases that need it are expected to
+-- fail, and the marks come off when the code is there.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: a name or a tuple on the right of -< is not written yet"
+
 spec :: Spec
 spec = describe "the DOT of a graph" $ do
   it "has a node for a step, with a pin for each port that reads a name and one for each name that it gives, and an edge from each name to the ports that read it" $ do
@@ -56,6 +61,12 @@ spec = describe "the DOT of a graph" $ do
           ("gamma", "c", "flow result", "c", ""),
           ("flow result", "", "end", "", "")
         ]
+
+  stubbed $ it "has the graph of a step that takes a name whole, and of a step that takes a tuple of names, as of the same steps that bind the names in lists" $ do
+    listedDot <- dotOf listed
+    pinsOf "gamma" listedDot `shouldBe` ["i_i", "i_a", "i_b", "o_c"]
+    found <- dotOf wholes
+    found `shouldBe` listedDot
 
   it "has the output pins of a name that is kept and taken apart nested as its pattern nests, each part with the field it is for, and no pin for a part that is dropped" $ do
     found <- dotOf nestedNames
@@ -224,6 +235,26 @@ fanning =
     ( "a" <: step "alpha" (\r -> pure (getField @"i" r + 1)) -< ["i"]
         >>> "b" <: step "beta" (\r -> pure (getField @"a" r + 1)) -< ["a"]
         >>> "c" <: step "gamma" (\r -> pure (getField @"i" r + getField @"b" r)) -< ["i", "b"]
+    )
+
+-- | A flow whose steps take a name whole, a pair of names and a triple of names.
+wholes :: Diagram ("i" := Int, "j" := Int) Int
+wholes =
+  result
+    "c"
+    ( "a" <: step "alpha" (\n -> pure (n + 1)) -< "i"
+        >>> "b" <: step "beta" (\(n, m) -> pure (n + m)) -< ("a", "j")
+        >>> "c" <: step "gamma" (\(n, (m, k)) -> pure (n + m + k)) -< ("i", "a", "b")
+    )
+
+-- | The same flow with the names in lists, whose steps read the ports.
+listed :: Diagram ("i" := Int, "j" := Int) Int
+listed =
+  result
+    "c"
+    ( "a" <: step "alpha" (\r -> pure (getField @"i" r + 1)) -< ["i"]
+        >>> "b" <: step "beta" (\r -> pure (getField @"a" r + getField @"j" r)) -< ["a", "j"]
+        >>> "c" <: step "gamma" (\r -> pure (getField @"i" r + getField @"a" r + getField @"b" r)) -< ["i", "a", "b"]
     )
 
 -- | A flow whose last step binds the fields of the output of the first by a path, an input under another port, and the

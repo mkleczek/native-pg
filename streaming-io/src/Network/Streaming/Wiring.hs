@@ -103,6 +103,7 @@ where
 import Control.Arrow (Arrow, (>>>), (>>^))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
+import Control.Exception (throw)
 import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
@@ -138,6 +139,7 @@ import Network.Streaming.Internal.Patterns
     (:=) (..),
   )
 import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, cases)
+import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -208,8 +210,9 @@ infix 7 -<
   forall arr i o x t.
   (Arrow arr) =>
   arr i o ->
-  forall (bindings :: [Symbol]) ->
-  (x ~ FlowIn t, Lined t arr x o, Unique (Ports bindings), Plain bindings, Describe bindings, Bind bindings x i) =>
+  forall k.
+  forall (bindings :: k) ->
+  (x ~ FlowIn t, Lined t arr x o, Describe bindings, Bind bindings x i) =>
   t
 (-<) p bindings = line (describe @bindings) (Arrow.arr (bind @bindings @x) >>> p)
 {-# INLINE (-<) #-}
@@ -378,16 +381,30 @@ type family NotIn (port :: Symbol) (ports :: [Symbol]) :: Constraint where
   NotIn port (other ': ports) = NotIn port ports
 
 -- | The bindings, for diagrams: the port of each, and the path that it reads.
-class Describe (bindings :: [Symbol]) where
+class Describe bindings where
   describe :: [Binding]
 
-instance Describe '[] where
+instance Describe ('[] :: [k]) where
   describe = []
   {-# INLINE describe #-}
 
-instance (KnownSymbol (Port binding), Names (Path (Source binding)), Describe bindings) => Describe (binding ': bindings) where
+instance
+  (KnownSymbol (Port binding), Names (Path (Source binding)), Describe bindings) =>
+  Describe ((binding :: Symbol) ': bindings)
+  where
   describe = Binding (symbolVal (Proxy @(Port binding))) (names @(Path (Source binding))) : describe @bindings
   {-# INLINE describe #-}
+
+-- | A name has the binding that it has in a list of that name.
+instance Describe (name :: Symbol) where
+  describe = throw (NotImplemented "the bindings of a name")
+
+-- | Each name of a tuple has the binding that it has in a list.
+instance Describe ('(first, second) :: (Symbol, Symbol)) where
+  describe = throw (NotImplemented "the bindings of a tuple")
+
+instance Describe ('(first, second, third) :: (Symbol, Symbol, Symbol)) where
+  describe = throw (NotImplemented "the bindings of a tuple")
 
 -- | The names of a path, as text.
 class Names (path :: [Symbol]) where
@@ -409,18 +426,49 @@ instance (Dig 'Unbound name '[] r a) => HasField name (Inputs r) a where
   getField (Inputs r) = dig @'Unbound @name @'[] r
   {-# INLINE getField #-}
 
--- | The input of a step made from the bindings, by the record of the flow that the bindings are read from.
-class Bind (bindings :: [Symbol]) x i | bindings x -> i where
+-- | The input of a step made from the bindings, by the record of the flow that the bindings are read from: the bindings
+-- are a name, a list of bindings or a tuple of names.
+class Bind bindings x i | bindings x -> i where
   bind :: x -> i
 
 -- | A step that has no bindings takes nothing.
-instance Bind '[] x () where
+instance Bind ('[] :: [k]) x () where
   bind _ = ()
   {-# INLINE bind #-}
 
-instance (Record (binding ': bindings) x r) => Bind (binding ': bindings) x (Inputs r) where
+-- | A list of bindings: the step takes a record that has a field for each.
+instance
+  (Unique (Ports (binding ': bindings)), Plain (binding ': bindings), Record (binding ': bindings) x r) =>
+  Bind ((binding :: Symbol) ': bindings) x (Inputs r)
+  where
   bind = Inputs . record @(binding ': bindings)
   {-# INLINE bind #-}
+
+-- | A name: the step takes the value that the name has in the flow, whole.
+instance (Plain '[name], NoPort (Break '=' name), Fetch (Path name) x i) => Bind (name :: Symbol) x i where
+  bind _ = throw (NotImplemented "-< a name")
+
+-- | A tuple of names: the step takes the pair of their values, and pairs that nest to the right for three.
+instance (Bind first x a, Bind second x b) => Bind ('(first, second) :: (Symbol, Symbol)) x (a, b) where
+  bind _ = throw (NotImplemented "-< a tuple")
+
+instance
+  (Bind first x a, Bind second x b, Bind third x c) =>
+  Bind ('(first, second, third) :: (Symbol, Symbol, Symbol)) x (a, (b, c))
+  where
+  bind _ = throw (NotImplemented "-< a tuple")
+
+-- | What is said of a name that has a port, which a step that takes its input whole has none of.
+type family NoPort (split :: (Symbol, Maybe Symbol)) :: Constraint where
+  NoPort '(before, 'Nothing) = ()
+  NoPort '(before, 'Just after) =
+    TypeError
+      ( 'Text "A step that takes its input whole has no port: "
+          ':<>: 'ShowType before
+          ':<>: 'Text " =: "
+          ':<>: 'ShowType after
+          ':<>: 'Text " binds a port, which a list of bindings has"
+      )
 
 -- | The fields of the input of a step: a pair for each binding but the last, which is a field alone.
 class Record (bindings :: [Symbol]) x r | bindings x -> r where

@@ -48,6 +48,11 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
+-- | The code that draws a name or a tuple on the right of '-<' is not written yet: the cases that need it are expected to
+-- fail, and the marks come off when the code is there.
+stubbed :: Spec -> Spec
+stubbed = xfail "Network.Streaming.Wiring has a stub: a name or a tuple on the right of -< is not written yet"
+
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -321,6 +326,22 @@ spec = describe "the chart" $ do
           ("use", "end", "")
         ]
 
+  stubbed $ it "has the chart of a step that takes a name whole, and of a step that takes a tuple of names, as of the same steps that bind the names in lists" $ do
+    listedChart <- chartOf listed
+    -- "gamma" reads "i" from the start, and "a" and "b" from their boxes.
+    edgesNamed listedChart
+      `shouldBe` sort
+        [ ("start", "alpha", "i"),
+          ("start", "beta", "j"),
+          ("start", "gamma", "i"),
+          ("a", "beta", ""),
+          ("a", "gamma", ""),
+          ("b", "gamma", ""),
+          ("gamma", "end", "")
+        ]
+    chart <- chartOf wholes
+    chart `shouldBe` listedChart
+
   it "has the same edges for a flow with the plumbing as without it" $ do
     found <- pages fanning
     case found of
@@ -510,6 +531,26 @@ nestedNames =
         >>> "c"
           <: step "serve" (\r -> pure (getField @"a" r + getField @"b" r + getField @"c" r + getField @"d" r))
           -< ["a" =: "conn.peer", "b" =: "peer", "c" =: "addr", "d" =: "tuned"]
+    )
+
+-- | A flow whose steps take a name whole, a pair of names and a triple of names.
+wholes :: Diagram ("i" := Int, "j" := Int) Int
+wholes =
+  result
+    "c"
+    ( "a" <: step "alpha" (\n -> pure (n + 1)) -< "i"
+        >>> "b" <: step "beta" (\(n, m) -> pure (n + m)) -< ("a", "j")
+        >>> "c" <: step "gamma" (\(n, (m, k)) -> pure (n + m + k)) -< ("i", "a", "b")
+    )
+
+-- | The same flow with the names in lists, whose steps read the ports.
+listed :: Diagram ("i" := Int, "j" := Int) Int
+listed =
+  result
+    "c"
+    ( "a" <: step "alpha" (\r -> pure (getField @"i" r + 1)) -< ["i"]
+        >>> "b" <: step "beta" (\r -> pure (getField @"a" r + getField @"j" r)) -< ["a", "j"]
+        >>> "c" <: step "gamma" (\r -> pure (getField @"i" r + getField @"a" r + getField @"b" r)) -< ["i", "a", "b"]
     )
 
 -- | A flow whose second step is a flow of its own, which reads the port "n" of its step.
