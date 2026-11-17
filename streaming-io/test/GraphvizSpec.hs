@@ -2,13 +2,15 @@
 {-# LANGUAGE ExplicitNamespaces #-}
 
 -- | The DOT of "Network.Streaming.Diagram.Graphviz": small programs, built at the diagram arrow, whose graphs have the clusters,
--- the pins and the edges between pins that they should. A step is a cluster that holds its body and a node for each of its
--- pins, and a name that is taken apart is a cluster in it, so a graph is read from the lines of its nodes, which have their
--- class, and from the lines of its clusters, which have what is inside them indented.
+-- the pins and the edges between pins that they should. A step is a faint wrapper cluster that holds its body, which is the box
+-- of the step, and a node for each of its pins outside the box, and a name that is taken apart is a cluster in it, so a graph is
+-- read from the lines of its nodes, which have their class, and from the lines of its clusters, which have what is inside them
+-- indented.
 module GraphvizSpec (spec) where
 
 import Control.Arrow ((&&&), (>>>), (^>>), (|||))
 import Data.Char (isSpace)
+import Data.Foldable (for_)
 import Data.List (isInfixOf, isPrefixOf, sort, stripPrefix, tails)
 import Data.Maybe (fromMaybe)
 import GHC.Records (HasField, getField)
@@ -26,6 +28,10 @@ import Skeletest
 -- | A step that never waits.
 quick :: (Effect arr) => arr a ()
 quick = now (const (pure ()))
+
+-- | A case that the printer fails as long as it draws the body of a step as the text in the cluster of the step.
+unwritten :: Spec -> Spec
+unwritten = xfail "the DOT of a graph has the body of a step as its box, and its cluster as a wrapper, only when the printer draws it so"
 
 spec :: Spec
 spec = describe "the DOT of a graph" $ do
@@ -162,22 +168,57 @@ spec = describe "the DOT of a graph" $ do
           ("IO", "", "end", "", "")
         ]
 
-  it "has the box of a name that has a page of its own link to the page, and a border that a step that is an action has not, as a node or as a cluster" $ do
+  unwritten $ it "has the box of a name that has a page of its own link to the page, and a border that a step that is an action has not, as a node, or as the box in a wrapper that links to the page too" $ do
     found <- dotOf (quick >>> box "outer" (quick >>> quick) :: Diagram () ())
     let outer = [line | line <- found, "class=\"box\"" `isInfixOf` line]
     length outer `shouldBe` 1
     any ("href=\"#outer\"" `isInfixOf`) outer `shouldBe` True
     any ("penwidth=2" `isInfixOf`) outer `shouldBe` True
-    -- A box that has pins is a cluster, with the link and the heavy border, and the action beside it has the thin border.
+    -- A box that has pins is a heavy box that links, in a wrapper that is as faint as that of an action and links too.
     boxed' <- dotOf boxed
-    case [attrs | (_, attrs, _) <- clusterLines boxed', "class=\"box\"" `isInfixOf` attrs] of
-      [attrs] -> do
-        "href=\"#outer\"" `isInfixOf` attrs `shouldBe` True
-        "penwidth=2" `isInfixOf` attrs `shouldBe` True
-      other -> failTest ("the graph has the box clusters " <> show other)
-    case [attrs | (_, attrs, _) <- clusterLines boxed', "class=\"step\"" `isInfixOf` attrs] of
-      [attrs] -> "penwidth=1" `isInfixOf` attrs `shouldBe` True
-      other -> failTest ("the graph has the step clusters " <> show other)
+    isBox "#dde3ea" "#24292f" 2 (bodyOf "outer" boxed') `shouldBe` True
+    ("href=\"#outer\"" `isInfixOf` bodyOf "outer" boxed') `shouldBe` True
+    isWrapper "#f6f8fa" "#d8dee4" (wrapperOf "outer" boxed') `shouldBe` True
+    ("href=\"#outer\"" `isInfixOf` wrapperOf "outer" boxed') `shouldBe` True
+    -- The action beside it has the thin border and no link.
+    isBox "#dde3ea" "#57606a" 1 (bodyOf "after" boxed') `shouldBe` True
+    ("href=" `isInfixOf` bodyOf "after" boxed') `shouldBe` False
+
+  unwritten $ it "has the body of a step that has pins as a filled rounded box in the colours of a step, in a cluster that is a faint wrapper around the box and its pins, for an action, the input of a flow and its result" $ do
+    found <- dotOf fanning
+    isBox "#dde3ea" "#57606a" 1 (bodyOf "alpha" found) `shouldBe` True
+    isWrapper "#f6f8fa" "#d8dee4" (wrapperOf "alpha" found) `shouldBe` True
+    isBox "#dde3ea" "#57606a" 1 (bodyOf "flow input" found) `shouldBe` True
+    isWrapper "#f6f8fa" "#d8dee4" (wrapperOf "flow input" found) `shouldBe` True
+    isBox "#dde3ea" "#57606a" 1 (bodyOf "flow result" found) `shouldBe` True
+    isWrapper "#f6f8fa" "#d8dee4" (wrapperOf "flow result" found) `shouldBe` True
+    -- The pins are nodes of the wrapper that are not the box, so they sit outside it: the box is the node of the body only.
+    pinsOf "in" "alpha" found `shouldBe` ["i"]
+    ("class=\"in\"" `isInfixOf` bodyOf "alpha" found) `shouldBe` False
+
+  unwritten $ it "has the body of a decision as a yellow box in a wrapper of a paler yellow, which are not the colours of a step" $ do
+    found <- dotOf choosing
+    isBox "#fff1a8" "#9a6700" 1 (bodyOf "how big?" found) `shouldBe` True
+    isWrapper "#fffbea" "#f0e2a8" (wrapperOf "how big?" found) `shouldBe` True
+
+  unwritten $ it "has an edge into or out of a step that ends at a pin or at its box, and none at its wrapper, in a flow whose edges say only the order, whose cases have no pin that is read, and whose result leaves" $ do
+    for_ [("quiet", dotOf quiet), ("choosing", dotOf choosing), ("fanning", dotOf fanning), ("boxed", dotOf boxed), ("nesting", dotOf nesting)] $ \(name, drawn) -> do
+      found <- drawn
+      let nodes = fmap fst (nodeLines found)
+          wrappers = [node | (node, attrs, _) <- clusterLines found, clusterClassOf attrs `elem` ["step", "box", "decision", "input", "result"]]
+      -- Every edge is drawn between nodes, which are pins or bodies: the box of a step, not a cluster that wraps it.
+      [(name, end') | Seen from to _ <- edgesSeen found, end' <- [from, to], end' `notElem` nodes] `shouldBe` []
+      -- No edge is clipped at the cluster of a step, which would end it at the wrapper, outside the pins.
+      [(name, wrapper) | line <- stripped found, " -> " `isInfixOf` line, wrapper <- wrappers, ("\"cluster_" ++ wrapper ++ "\"") `isInfixOf` line] `shouldBe` []
+
+  it "has a step that has no pins as a rounded box of its own, with no wrapper" $ do
+    found <- dotOf (each working :: Diagram [Int] [()])
+    case [(node, line) | (node, line) <- nodeLines found, nameOfNode line == "working"] of
+      [(node, line)] -> do
+        isBox "#dde3ea" "#57606a" 1 line `shouldBe` True
+        ("margin=\"0.12,0.07\"" `isInfixOf` line) `shouldBe` True
+        [node' | (node', _, _) <- clusterLines found, node' == node] `shouldBe` []
+      other -> failTest ("the graph has the steps " <> show other)
 
   it "has a back edge for a loop, which goes round to a junction" $ do
     found <- dotOf (each working :: Diagram [Int] [()])
@@ -430,6 +471,10 @@ nodeLines found = [(node, line) | line <- stripped found, let node = takeWhile (
 classOf :: String -> String
 classOf line = maybe "" (fst . breakText "\"") (breakAfter "[class=\"" line)
 
+-- | The class of a cluster, from the line of its attributes.
+clusterClassOf :: String -> String
+clusterClassOf = maybe "" (fst . breakText "\"") . breakAfter "class=\""
+
 -- | Whether the line is of a pin: a node of the class of an input pin, or of an output pin.
 isPin :: String -> Bool
 isPin line = classOf line `elem` ["in", "out"]
@@ -476,6 +521,29 @@ stepLines :: String -> [String] -> [String]
 stepLines name found = case [node | (node, line) <- nodeLines found, not (isPin line), nameOfNode line == name] of
   node : _ -> concat (take 1 [inside | (node', _, inside) <- clusterLines found, node' == node])
   [] -> []
+
+-- | The line of the body of a step, which is the node of the name that is not a pin, or nothing if there is none.
+bodyOf :: String -> [String] -> String
+bodyOf name found = concat (take 1 [line | (_, line) <- nodeLines found, not (isPin line), nameOfNode line == name])
+
+-- | The line of the attributes of the cluster of a step, which is the cluster of its body, or nothing if it has none.
+wrapperOf :: String -> [String] -> String
+wrapperOf name found = case [node | (node, line) <- nodeLines found, not (isPin line), nameOfNode line == name] of
+  node : _ -> concat (take 1 [attrs | (node', attrs, _) <- clusterLines found, node' == node])
+  [] -> ""
+
+-- | Whether the line of a body is a filled rounded box with the fill, the colour of the border and the width of it.
+isBox :: String -> String -> Int -> String -> Bool
+isBox fill line' width body =
+  all
+    (`isInfixOf` body)
+    ["shape=box", "style=\"rounded,filled\"", ", fillcolor=\"" ++ fill ++ "\"", ", color=\"" ++ line' ++ "\"", ", penwidth=" ++ show width ++ ","]
+
+-- | Whether the line of the attributes of a cluster is a wrapper with the fill and the colour of the border: a thin border, and a
+-- margin that is close to what is in it.
+isWrapper :: String -> String -> String -> Bool
+isWrapper fill line' attrs =
+  all (`isInfixOf` attrs) ["; fillcolor=\"" ++ fill ++ "\"", "; color=\"" ++ line' ++ "\"", "; penwidth=1;", "; margin=6;"]
 
 -- | The labels of the pins of a step that are of the class, in the order that they are written.
 pinsOf :: String -> String -> [String] -> [String]
