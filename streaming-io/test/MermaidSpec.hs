@@ -17,7 +17,7 @@ import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
 import Network.Streaming.Named (adding, at, cases, field, inj, is, newRecord, (:=), (?>))
 import Network.Streaming.Plumbing (each, prism)
-import Network.Streaming.Wiring (choice, result, type (=:), type (@:), (-<), (<:))
+import Network.Streaming.Wiring (choice, onExit, releasedBy, result, type (=:), type (@:), (-<), (<:))
 import Skeletest
 
 -- | A step that never waits.
@@ -47,6 +47,11 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 -- emoji (U+FE0E), and a space.
 gear :: String
 gear = "\x2699\xFE0E "
+
+-- | The stubs of the lines that release and wrap fail with 'NotImplemented': the cases that need them are expected to fail, and
+-- the marks come off when the code is there.
+unwritten :: Spec -> Spec
+unwritten = xfail "Network.Streaming.Wiring has a stub: a line that is released, or that wraps the rest of the flow, is not written yet"
 
 spec :: Spec
 spec = describe "the chart" $ do
@@ -248,6 +253,29 @@ spec = describe "the chart" $ do
           ("zero", "IO", ""),
           ("IO", "end", "")
         ]
+
+  unwritten $ it "has a box titled scope for a line that is released, which holds the lines after it and its release, with a dashed edge named on exit from the line to the release" $ do
+    chart <- chartOf bracketed
+    case subgraphTitled "scope" chart of
+      Nothing -> failTest "the chart has no box for the scope"
+      Just (_, inside) -> [length (nodesDeclared (gear ++ name) inside) | name <- ["open", "use", "close"]] `shouldBe` [1, 1, 1]
+    -- The release reads the name that the line gave from its box, and the exit from the edge on exit, which is dashed.
+    edgesNamed chart
+      `shouldBe` sort
+        [ ("start", "open", "i"),
+          ("start", "use", "j"),
+          ("kept", "use", ""),
+          ("kept", "close", ""),
+          ("use", "end", "")
+        ]
+    exitEdges chart `shouldBe` [("open", "close")]
+
+  unwritten $ it "has the edge on exit of a release that has no line to acquire from the flow's start, with the lines after it in a box titled scope" $ do
+    chart <- chartOf onExiting
+    case subgraphTitled "scope" chart of
+      Nothing -> failTest "the chart has no box for the scope"
+      Just (_, inside) -> [length (nodesDeclared (gear ++ name) inside) | name <- ["use", "close"]] `shouldBe` [1, 1]
+    exitEdges chart `shouldBe` [("start", "close")]
 
   it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
     chart <- chartOf nesting
@@ -548,6 +576,28 @@ listed =
         >>> "c" <: step "gamma" (\r -> pure (getField @"i" r + getField @"a" r + getField @"b" r)) -< ["i", "a", "b"]
     )
 
+-- | A flow whose first line acquires, and is released after the lines that follow it by a step that reads what it gave, and the
+-- exit.
+bracketed :: Diagram ("i" := Int, "j" := Int) ()
+bracketed =
+  result
+    "last"
+    ( "kept" <: step "open" (\r -> pure (getField @"i" r + 1)) -< ["i"]
+        `releasedBy` step "close" (\r -> pure (getField @"kept" r `seq` getField @"exit" r `seq` ())) -< ["kept", "exit"]
+        >>> "last" <: step "use" (\r -> pure (getField @"kept" r + getField @"j" r)) -< ["kept", "j"]
+    )
+    >>> done
+
+-- | A flow whose first line is a release only, which reads the port "j" and the exit.
+onExiting :: Diagram ("i" := Int, "j" := Int) ()
+onExiting =
+  result
+    "last"
+    ( onExit (step "close" (\r -> pure (getField @"j" r `seq` getField @"exit" r `seq` ())) -< ["j", "exit"])
+        >>> "last" <: step "use" (\r -> pure (getField @"i" r + getField @"j" r)) -< ["i", "j"]
+    )
+    >>> done
+
 -- | A flow whose second step is a flow of its own, which reads the port "n" of its step.
 nesting :: Diagram ("i" := Int, "j" := Int) Int
 nesting =
@@ -636,6 +686,15 @@ wiresNamed name = length . filter (("|\"" ++ name ++ "\"|") `isInfixOf`) . strip
 -- | The edges of the chart, each as the names of its two nodes and its label, which is empty if it has none.
 edgesNamed :: [String] -> [(String, String, String)]
 edgesNamed chart = sort [(nameOf chart from, nameOf chart to, label) | line <- stripped chart, Just (from, to, label) <- [edgeOf line]]
+
+-- | The edges of the chart that are named on exit, each as the names of its two nodes.
+exitEdges :: [String] -> [(String, String)]
+exitEdges chart =
+  sort
+    [ (nameOf chart (takeWhile isAlphaNum line), nameOf chart (last (words line)))
+      | line <- stripped chart,
+        " -.->|\"on exit\"| " `isInfixOf` line
+    ]
 
 -- | The edges of the chart that say only the order, each as the names of its two nodes: the dotted ones that have no label.
 orderEdges :: [String] -> [(String, String)]

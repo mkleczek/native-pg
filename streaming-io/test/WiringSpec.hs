@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 
 -- | Steps wired by name: a flow of lines, each of which makes the input of its step from the names of the flow, runs in
@@ -8,15 +9,17 @@
 -- by a name or a tuple of names. That a name that the flow doesn't have, an output that a step doesn't give, a port that
 -- is not bound or is bound twice, and a name that the flow has already don't compile, in a branch of a choice too, and
 -- that a pattern that doesn't fit the output of its step doesn't, nor does a port in a name or a tuple, is checked by
--- @test/check-wiring.sh@.
+-- @test/check-wiring.sh@. A line can also acquire something that is released after the rest of the flow however that ends, or
+-- be a wrapper that takes the rest of the flow as its body.
 module WiringSpec (spec) where
 
-import Control.Arrow (arr, (>>>), (>>^), (|||))
+import Control.Arrow (arr, (>>>), (>>^), (^>>), (|||))
+import Control.Exception (throwIO)
 import Control.Monad (forM_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import GHC.Records (HasField)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (decide)
+import Network.Streaming.Combinators (decide, foreverA, tap)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)
@@ -25,8 +28,11 @@ import Network.Streaming.Threads
 import Network.Streaming.Wiring
 import Skeletest
 
--- | The arrow of a step that can't wait.
-type Program a = forall arr. (Steps arr) => arr () a
+-- | What a program that may wait where it gives way, and be cancelled, needs of its arrow.
+type Cancellable arr = (Steps arr, GiveWay arr, Race arr)
+
+-- | The arrow of a program.
+type Program a = forall arr. (Cancellable arr) => arr () a
 
 -- | A way to run a program: an arrow's.
 data Runner = Runner String (forall a. Program a -> IO a)
@@ -38,6 +44,11 @@ runners =
     Runner "compiled" (\program -> fst <$> runCompiled program ()),
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
+
+-- | The stubs of the lines that release and wrap fail with 'NotImplemented': the cases that need them are expected to fail,
+-- and the marks come off when the code is there.
+unwritten :: Spec -> Spec
+unwritten = xfail "Network.Streaming.Wiring has a stub: a line that is released, or that wraps the rest of the flow, is not written yet"
 
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
@@ -197,6 +208,69 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
     run (inputs >>> anyRecord) `shouldReturn` 14
     run (newRecord ["extra", "b", "a"] <$> arr (const 'x') <*> arr (const 5) <*> arr (const 1) >>> anyRecord)
       `shouldReturn` 12
+
+  describe "a line that is released after the rest of the flow" $ do
+    unwritten $ it "releases after the rest of the flow when it finishes, and when it fails, which fails the flow, and when it is cancelled" $ do
+      forM_ [Finishes, Fails, Waits] $ \ending -> do
+        noted <- newLog
+        ended run ending (inputs >>> bracketed noted ending) `shouldReturn` outcomeOf ending
+        readLog noted `shouldReturn` ["acquire 3", "body", "release res 30: " <> releasedAs ending]
+
+    unwritten $ it "reads a name of the flow, and the names that its line gives, which are a pattern too, and the exit, in its release" $ do
+      forM_ [Finishes, Fails, Waits] $ \ending -> do
+        noted <- newLog
+        ended run ending (inputs >>> readsAll noted ending) `shouldReturn` outcomeOf ending
+        readLog noted `shouldReturn` ["acquire", "body", "release (3,7,4): " <> releasedAs ending]
+
+    unwritten $ it "is released after the lines that follow it, and the one before it is released after it" $ do
+      forM_ [Finishes, Fails, Waits] $ \ending -> do
+        noted <- newLog
+        ended run ending (inputs >>> twoBrackets noted ending) `shouldReturn` outcomeOf ending
+        readLog noted
+          `shouldReturn` [ "acquire one",
+                           "acquire two",
+                           "body",
+                           "release two 40: " <> releasedAs ending,
+                           "release one 30: " <> releasedAs ending
+                         ]
+
+    unwritten $ it "is a release only for onExit, which reads a name of the flow and the exit" $ do
+      forM_ [Finishes, Fails, Waits] $ \ending -> do
+        noted <- newLog
+        ended run ending (inputs >>> onExiting noted ending) `shouldReturn` outcomeOf ending
+        readLog noted `shouldReturn` ["body", "release 4: " <> releasedAs ending]
+
+    unwritten $ it "keeps nothing when it has no name for what it acquires, and its release reads the names of the flow and the exit" $ do
+      noted <- newLog
+      run (inputs >>> unnamedBracket noted) `shouldReturn` 7
+      readLog noted `shouldReturn` ["acquire", "body", "release 4: done"]
+
+    unwritten $ it "is released when a flow that is a step of another ends, and not when the other does" $ do
+      noted <- newLog
+      run (inputs >>> nestedBracket noted) `shouldReturn` 34
+      readLog noted `shouldReturn` ["acquire", "inner body", "release res 30: done", "after"]
+
+    unwritten $ it "is released when the branch of a choice that has it ends, and the other branches have none" $ do
+      noted <- newLog
+      run (sized 3 >>> branchBracket noted) `shouldReturn` 33
+      readLog noted `shouldReturn` ["acquire 3", "branch body", "release res 30: done"]
+      other <- newLog
+      run (sized 20 >>> branchBracket other) `shouldReturn` 99
+      readLog other `shouldReturn` []
+
+  describe "a line that takes the rest of the flow as the body of a wrapper" $ do
+    unwritten $ it "gives the body what the wrapper gives it, under the names of the line, and the wrapper is made the input that the bindings make" $ do
+      noted <- newLog
+      run (inputs >>> wrapped noted) `shouldReturn` 34
+      readLog noted `shouldReturn` ["open 3", "body 30", "close: done"]
+      failed <- newLog
+      ended run Fails (inputs >>> wrappedFailing failed) `shouldReturn` outcomeOf Fails
+      readLog failed `shouldReturn` ["open 3", "close: failed user error (boom)"]
+
+    unwritten $ it "takes the rest of the flow as the body of a wrapper that has no resource, and the flow goes on with its own record" $ do
+      noted <- newLog
+      run (inputs >>> wrappedPlain noted) `shouldReturn` 7
+      readLog noted `shouldReturn` ["enter", "body", "leave"]
 
 -- | The record that the flows are run on.
 inputs :: (Steps arr) => arr () ("a" := Int, "b" := Int)
@@ -566,6 +640,223 @@ anyRecord =
     "twice"
     ( "sum" <: adder -< ["a", "b"]
         >>> "twice" <: adder -< ["a" =: "sum", "b" =: "sum"]
+    )
+
+-- | How a program that has a line that is released ends.
+data Ending = Finishes | Fails | Waits
+  deriving (Eq, Show)
+
+-- | How the release is told that it ended, as the text that it notes.
+releasedAs :: Ending -> String
+releasedAs = \case
+  Finishes -> "done"
+  Fails -> "failed user error (boom)"
+  Waits -> "cancelled"
+
+-- | What running a program that ends so gives: the result if it finishes, the failure, and the cancellation of a program that
+-- waits for ever, which the race with a part that gives way ends.
+outcomeOf :: Ending -> String
+outcomeOf = \case
+  Finishes -> "finished 7"
+  Fails -> "failed user error (boom)"
+  Waits -> "cancelled"
+
+-- | Runs the program, which is told how to end, and says what became of it: the result of one that finishes, the failure of one
+-- that fails, and "cancelled" for one that waits for ever, which is raced with a part that ends at once.
+ended :: (forall a. Program a -> IO a) -> Ending -> Program Int -> IO String
+ended run ending program = case ending of
+  Finishes -> ("finished " <>) . show <$> run program
+  Fails -> either (\failure -> "failed " <> show failure) (("finished " <>) . show) <$> run (tryA program)
+  Waits -> either (const "finished") (const "cancelled") <$> run (race program giveWay)
+
+-- | A step that ends as it is told: it gives nothing, fails, or waits for ever, where a cancellation reaches it.
+endingAs :: (Cancellable arr) => Ending -> arr r ()
+endingAs = \case
+  Finishes -> arr (const ())
+  Fails -> now (const (throwIO (userError "boom")))
+  Waits -> arr (const ()) >>> foreverA giveWay
+
+-- | Adds to the log.
+note :: Log -> String -> IO ()
+note noted entry = atomicModifyIORef' noted (\entries -> (entry : entries, ()))
+
+-- | How a scope ended, as the text of what a release notes.
+describeExit :: Exit -> String
+describeExit = \case
+  Done -> "done"
+  Failed failure -> "failed " <> show failure
+  Cancelled' -> "cancelled"
+
+-- | A step that notes the label.
+bodying :: (Effect arr) => Log -> String -> arr r ()
+bodying noted label = now (const (note noted label))
+
+-- | A step that notes the label and its port "a", and gives it times ten.
+acquiring :: (Effect arr, HasField "a" r Int) => Log -> String -> arr r Int
+acquiring noted label = now (\r -> note noted label >> pure (r.a * 10))
+
+-- | A release that notes the label, its port "res", and how the flow ended, from its port "exit".
+releasing :: (Effect arr, HasField "res" r Int, HasField "exit" r Exit) => Log -> String -> arr r ()
+releasing noted label = now (\r -> note noted ("release " <> label <> " " <> show r.res <> ": " <> describeExit r.exit))
+
+-- | A release that notes its port "b", and how the flow ended.
+releasingB :: (Effect arr, HasField "b" r Int, HasField "exit" r Exit) => Log -> arr r ()
+releasingB noted = now (\r -> note noted ("release " <> show r.b <> ": " <> describeExit r.exit))
+
+-- | A flow with a line that acquires "res" from the port "a", and is released after the rest of the flow, which ends as told.
+bracketed :: (Cancellable arr) => Log -> Ending -> arr ("a" := Int, "b" := Int) Int
+bracketed noted ending =
+  result
+    "total"
+    ( "res" <: acquiring noted "acquire 3" -< ["a"] `releasedBy` releasing noted "res" -< ["res", "exit"]
+        >>> bodying noted "body" -< []
+        >>> endingAs ending -< []
+        >>> "total" <: adder -< ["a", "b"]
+    )
+
+-- | A step that notes that it acquires, and gives a pair that a pattern takes apart: its port "a", and their sum.
+acquiringPair :: (Effect arr, HasField "a" r Int, HasField "b" r Int) => Log -> arr r (Int, Int)
+acquiringPair noted = now (\r -> note noted "acquire" >> pure (r.a, r.a + r.b))
+
+-- | A release that notes its ports "x", "y" and "b", and how the flow ended.
+releasingAll :: (Effect arr, HasField "x" r Int, HasField "y" r Int, HasField "b" r Int, HasField "exit" r Exit) => Log -> arr r ()
+releasingAll noted = now (\r -> note noted ("release " <> show (r.x, r.y, r.b) <> ": " <> describeExit r.exit))
+
+-- | A line whose names are a pattern, and whose release reads them, and a name of the flow, and the exit.
+readsAll :: (Cancellable arr) => Log -> Ending -> arr ("a" := Int, "b" := Int) Int
+readsAll noted ending =
+  result
+    "total"
+    ( ["x", "y"] <: acquiringPair noted -< ["a", "b"] `releasedBy` releasingAll noted -< ["x", "y", "b", "exit"]
+        >>> bodying noted "body" -< []
+        >>> endingAs ending -< []
+        >>> "total" <: adder -< ["a", "b"]
+    )
+
+-- | Two lines that acquire, which the rest of the flow follows.
+twoBrackets :: (Cancellable arr) => Log -> Ending -> arr ("a" := Int, "b" := Int) Int
+twoBrackets noted ending =
+  result
+    "total"
+    ( "one" <: acquiring noted "acquire one" -< ["a"] `releasedBy` releasing noted "one" -< ["res" =: "one", "exit"]
+        >>> "two" <: acquiring noted "acquire two" -< ["a" =: "b"] `releasedBy` releasing noted "two" -< ["res" =: "two", "exit"]
+        >>> bodying noted "body" -< []
+        >>> endingAs ending -< []
+        >>> "total" <: adder -< ["a", "b"]
+    )
+
+-- | A release only, which reads the port "b" of the flow, and the exit.
+onExiting :: (Cancellable arr) => Log -> Ending -> arr ("a" := Int, "b" := Int) Int
+onExiting noted ending =
+  result
+    "total"
+    ( onExit (releasingB noted -< ["b", "exit"])
+        >>> bodying noted "body" -< []
+        >>> endingAs ending -< []
+        >>> "total" <: adder -< ["a", "b"]
+    )
+
+-- | A line that acquires, and has no name for it.
+unnamedBracket :: (Cancellable arr) => Log -> arr ("a" := Int, "b" := Int) Int
+unnamedBracket noted =
+  result
+    "total"
+    ( acquiring noted "acquire" -< ["a"] `releasedBy` releasingB noted -< ["b", "exit"]
+        >>> bodying noted "body" -< []
+        >>> "total" <: adder -< ["a", "b"]
+    )
+
+-- | A flow over any record that has the port "a", whose line that acquires is released at the end of it.
+innerBracket :: (Cancellable arr, HasField "a" r Int) => Log -> arr r Int
+innerBracket noted =
+  result
+    "inner"
+    ( "res" <: acquiring noted "acquire" -< ["a"] `releasedBy` releasing noted "res" -< ["res", "exit"]
+        >>> bodying noted "inner body" -< []
+        >>> "inner" <: acquirer -< ["a"]
+    )
+  where
+    acquirer = now (\r -> pure (r.a * 10))
+
+-- | A flow that has a flow with a line that acquires for a step: the line is released before the steps that follow the step.
+nestedBracket :: (Cancellable arr) => Log -> arr ("a" := Int, "b" := Int) Int
+nestedBracket noted =
+  result
+    "total"
+    ( "inner" <: innerBracket noted -< ["a"]
+        >>> bodying noted "after" -< []
+        >>> "total" <: adder -< ["a" =: "inner", "b"]
+    )
+
+-- | A flow over any record that has the port "n", whose line that acquires is released at the end of it.
+branchFlow :: (Cancellable arr, HasField "n" r Int) => Log -> arr r Int
+branchFlow noted =
+  result
+    "branch"
+    ( "res" <: counting' -< ["n"] `releasedBy` releasing noted "res" -< ["res", "exit"]
+        >>> bodying noted "branch body" -< []
+        >>> "branch" <: sum' -< ["n"]
+    )
+  where
+    counting' = now (\r -> note noted ("acquire " <> show r.n) >> pure (r.n * 10))
+    sum' = now (\r -> pure (r.n * 11))
+
+-- | A choice by the size of "a", whose branch for the small has a flow with a line that acquires.
+branchBracket :: (Cancellable arr) => Log -> arr ("a" := Int, "b" := Int) Int
+branchBracket noted =
+  result
+    "picked"
+    ( "size" <: sizer -< ["n" =: "a"]
+        >>> "picked"
+          <: choice
+            "how big?"
+            "size"
+            ( "small" =: "small" ?> branchFlow noted -< ["n" =: "small"]
+                ||| "big" =: "big" ?> constant 99 -< []
+                ||| "huge" ?> constant 99 -< []
+            )
+    )
+
+-- | A wrapper that notes that it opens, and gives the body its input times ten, and notes how the body ended.
+opening :: (Cancellable arr) => Log -> arr (Int, a) z -> arr (Int, a) z
+opening noted body =
+  scope
+    (now (\(i, _) -> note noted ("open " <> show i) >> pure (i * 10)))
+    (now (\(_, exit) -> note noted ("close: " <> describeExit exit)))
+    ((\(o, (_, x)) -> (o, x)) ^>> body)
+
+-- | A line that is a wrapper, whose input is the port "a", and which gives the body "n".
+wrapped :: (Cancellable arr) => Log -> arr ("a" := Int, "b" := Int) Int
+wrapped noted =
+  result
+    "total"
+    ( "n" <: inside (opening noted) "a"
+        >>> noting noted "body" -< ["v" =: "n"]
+        >>> "total" <: adder -< ["a" =: "n", "b"]
+    )
+
+-- | The same, whose body fails.
+wrappedFailing :: (Cancellable arr) => Log -> arr ("a" := Int, "b" := Int) Int
+wrappedFailing noted =
+  result
+    "total"
+    ( "n" <: inside (opening noted) "a"
+        >>> endingAs Fails -< []
+        >>> "total" <: adder -< ["a" =: "n", "b"]
+    )
+
+-- | A wrapper that has no resource: it notes that the body is entered and left.
+around :: (Cancellable arr) => Log -> arr x z -> arr x z
+around noted body = tap (now (const (note noted "enter"))) >>> body >>> tap (now (const (note noted "leave")))
+
+-- | A line that wraps the rest of the flow, and takes nothing.
+wrappedPlain :: (Cancellable arr) => Log -> arr ("a" := Int, "b" := Int) Int
+wrappedPlain noted =
+  result
+    "total"
+    ( inside_ (around noted)
+        >>> bodying noted "body" -< []
+        >>> "total" <: adder -< ["a", "b"]
     )
 
 type Log = IORef [String]

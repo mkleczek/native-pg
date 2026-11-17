@@ -19,12 +19,17 @@ import Network.Streaming.Diagram.Graph (Sheet (..), sheets)
 import Network.Streaming.Diagram.Graphviz (dot)
 import Network.Streaming.Named (inj, newRecord, (:=), (?>))
 import Network.Streaming.Plumbing (each)
-import Network.Streaming.Wiring (choice, result, type (=:), type (@:), (-<), (<:))
+import Network.Streaming.Wiring (choice, releasedBy, result, type (=:), type (@:), (-<), (<:))
 import Skeletest
 
 -- | A step that never waits.
 quick :: (Effect arr) => arr a ()
 quick = now (const (pure ()))
+
+-- | The stubs of the lines that release and wrap fail with 'NotImplemented': the cases that need them are expected to fail, and
+-- the marks come off when the code is there.
+unwritten :: Spec -> Spec
+unwritten = xfail "Network.Streaming.Wiring has a stub: a line that is released, or that wraps the rest of the flow, is not written yet"
 
 spec :: Spec
 spec = describe "the DOT of a graph" $ do
@@ -207,6 +212,26 @@ spec = describe "the DOT of a graph" $ do
       sheet : _ -> dot (sheetPlumbing sheet) `shouldBe` dot (sheetFlow sheet)
       [] -> failTest "the program has no page"
 
+  unwritten $ it "has a cluster titled scope for a line that is released, which holds the lines after it and its release, and a dashed edge named on exit from the line to the release" $ do
+    found <- dotOf bracketed
+    case clusterTitled "scope" found of
+      Nothing -> failTest "the graph has no cluster for the scope"
+      Just inside -> do
+        [any (name `isInfixOf`) inside | name <- ["open", "use", "close"]] `shouldBe` [True, True, True]
+        [any (name `isInfixOf`) inside | name <- ["flow input", "flow result"]] `shouldBe` [False, False]
+    -- The release reads the name that the line gave from its pin, and the exit from the dashed edge.
+    edgesNamed found
+      `shouldBe` sort
+        [ ("flow input", "i", "open", "i", ""),
+          ("flow input", "j", "use", "j", ""),
+          ("open", "kept", "use", "kept", ""),
+          ("open", "kept", "close", "kept", ""),
+          ("open", "", "close", "", "on exit"),
+          ("use", "last", "flow result", "last", ""),
+          ("flow result", "", "end", "", "")
+        ]
+    dashedEdges found `shouldBe` [("open", "close")]
+
   it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
     found <- dotOf nesting
     -- The inner flow reads its own "n", which the outer step binds: it is read from the pin of "first" by the input of the inner
@@ -251,6 +276,18 @@ listed =
         >>> "b" <: step "beta" (\r -> pure (getField @"a" r + getField @"j" r)) -< ["a", "j"]
         >>> "c" <: step "gamma" (\r -> pure (getField @"i" r + getField @"a" r + getField @"b" r)) -< ["i", "a", "b"]
     )
+
+-- | A flow whose first line acquires, and is released after the lines that follow it by a step that reads what it gave, and the
+-- exit.
+bracketed :: Diagram ("i" := Int, "j" := Int) ()
+bracketed =
+  result
+    "last"
+    ( "kept" <: step "open" (\r -> pure (getField @"i" r + 1)) -< ["i"]
+        `releasedBy` step "close" (\r -> pure (getField @"kept" r `seq` getField @"exit" r `seq` ())) -< ["kept", "exit"]
+        >>> "last" <: step "use" (\r -> pure (getField @"kept" r + getField @"j" r)) -< ["kept", "j"]
+    )
+    >>> done
 
 -- | A flow whose last step binds the fields of the output of the first by a path, an input under another port, and the
 -- same input under its own.
@@ -469,6 +506,19 @@ edgesNamed found =
     nameOf node = fromMaybe node (lookup node names)
     pin mark port = fromMaybe port (stripPrefix mark port)
     labelOf attrs = maybe "" (fst . breakText "\"") (breakAfter "label=\"" attrs)
+
+-- | The edges that are dashed and not in the style of a message, each as the names of its two nodes.
+dashedEdges :: [String] -> [(String, String)]
+dashedEdges found =
+  sort
+    [ (nameOf from, nameOf to)
+      | Seen from _ to _ attrs <- edgesSeen found,
+        "style=dashed" `isInfixOf` attrs,
+        not ("color=" `isInfixOf` attrs)
+    ]
+  where
+    names = nodesNamed found
+    nameOf node = fromMaybe node (lookup node names)
 
 -- | The edges that are dotted, each as the names of its two nodes.
 orderEdges :: [String] -> [(String, String)]

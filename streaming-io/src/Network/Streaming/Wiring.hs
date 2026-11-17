@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE RequiredTypeArguments #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -97,6 +98,10 @@ module Network.Streaming.Wiring
     (-<),
     (<:),
     Outs,
+    releasedBy,
+    onExit,
+    inside,
+    inside_,
     choice,
     type (=:),
     type (@:),
@@ -109,6 +114,7 @@ where
 import Control.Arrow (Arrow, (>>>), (>>^))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
+import Control.Exception (throw)
 import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
@@ -124,6 +130,7 @@ import GHC.TypeLits
     symbolVal,
   )
 import Network.Streaming.Annotate (Annotate (..), Binding (..), Part (..), (-|))
+import Network.Streaming.Classes (Exit, Scope)
 import Network.Streaming.Internal.Patterns
   ( AllFresh,
     Described (..),
@@ -131,6 +138,7 @@ import Network.Streaming.Internal.Patterns
     Dig (..),
     Distinct,
     Entry (..),
+    Fresh,
     Given,
     Level (..),
     Parse,
@@ -144,6 +152,7 @@ import Network.Streaming.Internal.Patterns
     (:=) (..),
   )
 import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, cases)
+import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -159,15 +168,24 @@ instance Category (Flow arr) where
   Flow after . Flow before = Flow (\rest -> before (after rest))
   {-# INLINE (.) #-}
 
--- | A step with the input that its bindings make, which is told, by what it is used as, what to do with its output.
-data Line arr x o = Line [Binding] (arr x o)
+-- | What a line is besides its step: a step that is only run, a step that is released when the rest of the flow is done, which
+-- has the type of the record that its release reads, and a wrapper that the rest of the flow is the body of.
+data How = Plainly | Releasing Type | Wrapped
+
+-- | A step with the input that its bindings make, which is told, by what it is used as, what to do with its output. A line
+-- that is released after the rest of the flow has the step that releases it, with the input that its own bindings make, and
+-- a line that is a wrapper has the function that wraps the rest of the flow.
+data Line arr x o (how :: How) where
+  Line :: [Binding] -> arr x o -> Line arr x o 'Plainly
+  Held :: (Scope arr) => [Binding] -> arr x o -> [Binding] -> arr w () -> Line arr x o ('Releasing w)
+  Inside :: [Binding] -> (x -> i) -> (forall z. arr (o, x) z -> arr (i, x) z) -> Line arr x o 'Wrapped
 
 -- | The record of the flow that a line is a part of. It is a type family, and not only the functional dependency of
 -- 'Lined', because GHC solves equalities before it looks for instances, and the names of the flow are to be looked for
 -- in a record that is known.
 type family FlowIn (t :: Type) :: Type where
   FlowIn (Flow arr x y) = x
-  FlowIn (Line arr x o) = x
+  FlowIn (Line arr x o how) = x
   FlowIn (arr x o) = x
 
 -- | What a line can be: a step that keeps nothing, which is a flow whose record goes on as it was, a step that is given
@@ -182,7 +200,7 @@ instance {-# INCOHERENT #-} (Arrow arr, Annotate arr, arr' ~ arr, x' ~ x, y ~ x)
   {-# INLINE line #-}
 
 -- | A step whose output is to be named.
-instance {-# INCOHERENT #-} (arr' ~ arr, x' ~ x, o' ~ o) => Lined (Line arr' x' o') arr x o where
+instance {-# INCOHERENT #-} (arr' ~ arr, x' ~ x, o' ~ o, how ~ 'Plainly) => Lined (Line arr' x' o' how) arr x o where
   line = Line
   {-# INLINE line #-}
 
@@ -226,20 +244,29 @@ infixr 2 <:
 -- | The line, whose output is kept in the record of the flow under the name, or taken apart into the names of a list, in
 -- front of the rest. The flow doesn't have the names already.
 (<:) ::
-  forall k.
+  forall arr x o how y k.
   forall (out :: k) ->
-  forall arr x o y.
-  (Arrow arr, Annotate arr, Outs out x o y) =>
-  Line arr x o ->
+  (Arrow arr, Annotate arr, Outs out x o y, Closing how y) =>
+  Line arr x o how ->
   Flow arr x y
-(<:) out bound = outcome @out bound
+(<:) out bound = case bound of
+  Line {} -> outcome @out bound
+  Held {} -> unwritten "a line that is released"
+  Inside {} -> unwritten "inside"
 {-# INLINE (<:) #-}
+
+-- | What a line that is not a plain step needs of the record of the flow after it: a release reads that record, and the exit,
+-- which the flow doesn't have already.
+type family Closing (how :: How) (y :: Type) :: Constraint where
+  Closing 'Plainly y = ()
+  Closing ('Releasing w) y = (w ~ ("exit" := Exit, y), Fresh "exit" y)
+  Closing 'Wrapped y = ()
 
 -- | What a step gives the flow under what is on the left of '<:': a name keeps the whole output, and a list of names
 -- takes it apart.
 class Outs out x o y | out x o -> y where
   -- | The flow that runs the step, with the names of what it gave in front of the record.
-  outcome :: (Arrow arr, Annotate arr) => Line arr x o -> Flow arr x y
+  outcome :: (Arrow arr, Annotate arr) => Line arr x o 'Plainly -> Flow arr x y
 
 -- | A name, or a name that is kept and taken apart: the output is kept as it is, and its parts too if the pattern has
 -- them.
@@ -283,6 +310,52 @@ type family NoField (entry :: Entry) :: Constraint where
   NoField ('Entry 'Nothing name parts) = ()
   NoField ('Entry ('Just field) name parts) =
     TypeError ('Text "The output of a step is not a field: " ':<>: 'ShowType field ':<>: 'Text " =: has nothing to take a field of")
+
+infix 6 `releasedBy`
+
+-- | What an acquire and its release can be: a line that '<:' names, or a line of the flow that keeps nothing.
+class Released t arr x r w where
+  -- | The step that acquires, which the rest of the flow follows, and the step that releases it however that ends, which
+  -- reads the record of the flow after the line, and the exit.
+  releasedBy :: Line arr x r 'Plainly -> Line arr w () 'Plainly -> t
+
+-- | A line that '<:' names: the acquire, and the release, which reads what the record has when the line is done.
+instance (Scope arr, arr' ~ arr, x' ~ x, r' ~ r, how ~ 'Releasing w) => Released (Line arr' x' r' how) arr x r w where
+  releasedBy _ _ = Held [] (unwritten "releasedBy") [] (unwritten "releasedBy")
+
+-- | A line that keeps nothing: the release reads the record of the flow, and the exit.
+instance
+  (Arrow arr, Annotate arr, Scope arr, arr' ~ arr, x' ~ x, y ~ x, w ~ ("exit" := Exit, x), Fresh "exit" x) =>
+  Released (Flow arr' x' y) arr x r w
+  where
+  releasedBy acquire release = (<:) "_" (releasedBy acquire release :: Line arr x r ('Releasing w))
+  {-# INLINE releasedBy #-}
+
+-- | A line that is a release only, for what the flow has already: the rest of the flow is its body, and the release reads
+-- the record of the flow, and the exit.
+onExit :: (Arrow arr, Annotate arr, Scope arr, w ~ ("exit" := Exit, x), Fresh "exit" x) => Line arr w () 'Plainly -> Flow arr x x
+onExit = releasedBy (Line [] (Arrow.arr (const ())))
+{-# INLINE onExit #-}
+
+-- | A line that has a combinator for a bracket take the rest of the flow as its body: the bindings make the input of the
+-- wrapper, and the rest of the flow sees what the wrapper gives the body under the names of the line.
+inside ::
+  forall arr x i o.
+  (forall z. arr (o, x) z -> arr (i, x) z) ->
+  forall k.
+  forall (bindings :: k) ->
+  (Describe bindings, Bind bindings x i) =>
+  Line arr x o 'Wrapped
+inside _ _ = Inside [] (unwritten "inside") (unwritten "inside")
+
+-- | A line that has a combinator that wraps a step take the rest of the flow as its body, when the combinator gives the body
+-- what it takes, as @shield@ does.
+inside_ :: (forall z. arr x z -> arr x z) -> Flow arr x x
+inside_ _ = unwritten "inside_"
+
+-- | What the stubs of the lines that release and wrap fail with, until the code is there.
+unwritten :: String -> a
+unwritten operation = throw (NotImplemented operation)
 
 -- | A choice that is a line of the flow: it decides on the sum that the flow has under the name of the field, as
 -- @decide question (cases field)@ does, and runs the branch of the case that it is. A branch is a step of its own,
