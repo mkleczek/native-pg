@@ -19,17 +19,20 @@ import Control.Monad (forM_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import GHC.Records (HasField)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (decide, foreverA, tap)
+import Network.Streaming.Combinators (decide, tap)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (runLoop)
 import Network.Streaming.Named
 import Network.Streaming.Threads
 import Network.Streaming.Wiring
+import qualified Network.Socket as Socket
 import Skeletest
+import System.IO.Unsafe (unsafePerformIO)
+import System.Posix.Types (Fd (..))
 
 -- | What a program that may wait where it gives way, and be cancelled, needs of its arrow.
-type Cancellable arr = (Steps arr, GiveWay arr, Race arr)
+type Cancellable arr = (Steps arr, Block arr, GiveWay arr, Race arr)
 
 -- | The arrow of a program.
 type Program a = forall arr. (Cancellable arr) => arr () a
@@ -44,11 +47,6 @@ runners =
     Runner "compiled" (\program -> fst <$> runCompiled program ()),
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
-
--- | The stubs of the lines that release and wrap fail with 'NotImplemented': the cases that need them are expected to fail,
--- and the marks come off when the code is there.
-unwritten :: Spec -> Spec
-unwritten = xfail "Network.Streaming.Wiring has a stub: a line that is released, or that wraps the rest of the flow, is not written yet"
 
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
@@ -210,19 +208,19 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
       `shouldReturn` 12
 
   describe "a line that is released after the rest of the flow" $ do
-    unwritten $ it "releases after the rest of the flow when it finishes, and when it fails, which fails the flow, and when it is cancelled" $ do
+    it "releases after the rest of the flow when it finishes, and when it fails, which fails the flow, and when it is cancelled" $ do
       forM_ [Finishes, Fails, Waits] $ \ending -> do
         noted <- newLog
         ended run ending (inputs >>> bracketed noted ending) `shouldReturn` outcomeOf ending
         readLog noted `shouldReturn` ["acquire 3", "body", "release res 30: " <> releasedAs ending]
 
-    unwritten $ it "reads a name of the flow, and the names that its line gives, which are a pattern too, and the exit, in its release" $ do
+    it "reads a name of the flow, and the names that its line gives, which are a pattern too, and the exit, in its release" $ do
       forM_ [Finishes, Fails, Waits] $ \ending -> do
         noted <- newLog
         ended run ending (inputs >>> readsAll noted ending) `shouldReturn` outcomeOf ending
         readLog noted `shouldReturn` ["acquire", "body", "release (3,7,4): " <> releasedAs ending]
 
-    unwritten $ it "is released after the lines that follow it, and the one before it is released after it" $ do
+    it "is released after the lines that follow it, and the one before it is released after it" $ do
       forM_ [Finishes, Fails, Waits] $ \ending -> do
         noted <- newLog
         ended run ending (inputs >>> twoBrackets noted ending) `shouldReturn` outcomeOf ending
@@ -234,23 +232,23 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
                            "release one 30: " <> releasedAs ending
                          ]
 
-    unwritten $ it "is a release only for onExit, which reads a name of the flow and the exit" $ do
+    it "is a release only for onExit, which reads a name of the flow and the exit" $ do
       forM_ [Finishes, Fails, Waits] $ \ending -> do
         noted <- newLog
         ended run ending (inputs >>> onExiting noted ending) `shouldReturn` outcomeOf ending
         readLog noted `shouldReturn` ["body", "release 4: " <> releasedAs ending]
 
-    unwritten $ it "keeps nothing when it has no name for what it acquires, and its release reads the names of the flow and the exit" $ do
+    it "keeps nothing when it has no name for what it acquires, and its release reads the names of the flow and the exit" $ do
       noted <- newLog
       run (inputs >>> unnamedBracket noted) `shouldReturn` 7
       readLog noted `shouldReturn` ["acquire", "body", "release 4: done"]
 
-    unwritten $ it "is released when a flow that is a step of another ends, and not when the other does" $ do
+    it "is released when a flow that is a step of another ends, and not when the other does" $ do
       noted <- newLog
       run (inputs >>> nestedBracket noted) `shouldReturn` 34
       readLog noted `shouldReturn` ["acquire", "inner body", "release res 30: done", "after"]
 
-    unwritten $ it "is released when the branch of a choice that has it ends, and the other branches have none" $ do
+    it "is released when the branch of a choice that has it ends, and the other branches have none" $ do
       noted <- newLog
       run (sized 3 >>> branchBracket noted) `shouldReturn` 33
       readLog noted `shouldReturn` ["acquire 3", "branch body", "release res 30: done"]
@@ -259,7 +257,7 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
       readLog other `shouldReturn` []
 
   describe "a line that takes the rest of the flow as the body of a wrapper" $ do
-    unwritten $ it "gives the body what the wrapper gives it, under the names of the line, and the wrapper is made the input that the bindings make" $ do
+    it "gives the body what the wrapper gives it, under the names of the line, and the wrapper is made the input that the bindings make" $ do
       noted <- newLog
       run (inputs >>> wrapped noted) `shouldReturn` 34
       readLog noted `shouldReturn` ["open 3", "body 30", "close: done"]
@@ -267,7 +265,7 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
       ended run Fails (inputs >>> wrappedFailing failed) `shouldReturn` outcomeOf Fails
       readLog failed `shouldReturn` ["open 3", "close: failed user error (boom)"]
 
-    unwritten $ it "takes the rest of the flow as the body of a wrapper that has no resource, and the flow goes on with its own record" $ do
+    it "takes the rest of the flow as the body of a wrapper that has no resource, and the flow goes on with its own record" $ do
       noted <- newLog
       run (inputs >>> wrappedPlain noted) `shouldReturn` 7
       readLog noted `shouldReturn` ["enter", "body", "leave"]
@@ -669,12 +667,25 @@ ended run ending program = case ending of
   Fails -> either (\failure -> "failed " <> show failure) (("finished " <>) . show) <$> run (tryA program)
   Waits -> either (const "finished") (const "cancelled") <$> run (race program giveWay)
 
--- | A step that ends as it is told: it gives nothing, fails, or waits for ever, where a cancellation reaches it.
+-- | A step that ends as it is told: it gives nothing, fails, or waits for ever, on a descriptor that never becomes readable,
+-- where a cancellation reaches it.
 endingAs :: (Cancellable arr) => Ending -> arr r ()
 endingAs = \case
   Finishes -> arr (const ())
   Fails -> now (const (throwIO (userError "boom")))
-  Waits -> arr (const ()) >>> foreverA giveWay
+  Waits -> now (const neverReadable) >>> block
+
+-- | A descriptor that never becomes readable, whose far end stays open as long as the tests run.
+neverReadable :: IO Event
+neverReadable = do
+  (one, other) <- Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol
+  atomicModifyIORef' kept (\sockets -> (one : other : sockets, ()))
+  Readable . Fd <$> Socket.unsafeFdSocket one
+
+-- | The sockets of the descriptors that never become readable.
+kept :: IORef [Socket.Socket]
+kept = unsafePerformIO (newIORef [])
+{-# NOINLINE kept #-}
 
 -- | Adds to the log.
 note :: Log -> String -> IO ()

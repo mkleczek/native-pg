@@ -54,6 +54,45 @@
 -- it binds. The branches give the same type, which is what @"kept"@ has. The errors of '-<' are those of a branch, and a
 -- case that the sum doesn't have is the error of "Network.Streaming.Named".
 --
+-- A line can acquire something, and have it released after the rest of the flow, however that ends:
+--
+-- > "listener" <: openListener -< [] `releasedBy` closeListener -< "listener"
+-- >   >>> serving -< "listener"
+--
+-- * @"out" <: acquire -< bindings `releasedBy` release -< bindings'@ runs @acquire@ and keeps what it gives, as @"out" <: p
+--   -< bindings@ does, and runs @release@ after all the lines that follow it, to the end of the flow that the line is in. It
+--   runs however they end: when they are done, when one of them fails, which fails the flow after the release, and when they
+--   are cancelled. A cancellation doesn't reach the release, which may wait. A flow that has several of these lines releases
+--   them in the reverse order.
+-- * The bindings of the release read the names that the flow has at the line, the names that the line gives, and @"exit"@,
+--   which is how the lines after it ended: @Done@, @Failed e@ or @Cancelled'@. They are a name, a list or a tuple, as those of
+--   any step are. A flow that has the name @"exit"@ already is a type error at the release.
+-- * A line that has no @"out" <:@ keeps nothing, and its release reads the names that the flow has and @"exit"@.
+-- * The lines that the release follows are the lines after it in the flow. A shorter extent is a flow that is a step of
+--   another: in @"x" <: result "x" (...) -< bindings@ the release runs when the inner flow ends.
+--
+-- A release that has nothing to acquire is a line of its own, for what the flow has already:
+--
+-- > onExit (close -< "socket") >>> serving -< "socket"
+--
+-- @onExit (release -< bindings)@ is the line that @releasedBy@ makes without an acquire: the release reads the names that
+-- the flow has at the line, and @"exit"@, and runs after the lines that follow it.
+--
+-- A combinator that brackets its body can take the rest of the flow as its body:
+--
+-- > "loans" <: inside withRequestBuffers "buffer pool" >>> serving -< "loans"
+--
+-- * @"out" <: inside wrapper bindings@ gives the wrapper the rest of the flow as its body. The wrapper is a function from
+--   an arrow that takes the resource, beside the record of the flow, to an arrow that takes its input, beside the record, as
+--   @withRequestBuffers :: arr (Loans, a) b -> arr (BufferPool, a) b@ is. The bindings make the input of the wrapper, as they
+--   make that of a step, and the resource that it gives the body is kept under the names of the pattern.
+-- * The line is written @inside wrapper bindings@ and not @inside wrapper -< bindings@, because '-<' takes a step, and a
+--   wrapper is not an arrow.
+-- * A combinator whose result is not its body's, as @loaned@ is, is not a wrapper. It is a step whose body is a flow of its
+--   own.
+-- * @inside_ wrapper@ is a line for a wrapper that gives its body what it was given, as @shield@ and @grace d@ are, and it
+--   has no bindings.
+--
 -- The left of '<:' is a pattern for the output of the step, as @R { socket = S { fd, addr }, peer }@ is in Haskell:
 --
 -- > "socket"                                  <: accept         -< ["listener"]
@@ -80,7 +119,9 @@
 -- is a pattern, a port in a name or a tuple, and, for a pattern, a field that the output doesn't have, too many names for a
 -- pair, a name that the pattern has twice, a field that is named for a pair, a field for the output of a step, and a value
 -- that is neither a record nor a pair that a list takes apart. An error in a nested pattern says where it is, as in
--- @in "socket": the output of the step has no field "w"@.
+-- @in "socket": the output of the step has no field "w"@. A release that binds a name that the flow doesn't have is the error
+-- of any binding, and so is a port in the name that a release takes whole. A flow that has the name @"exit"@ already, for a
+-- line that is released, is the error of a step whose name is one that the flow has already.
 --
 -- In diagrams each name is a box, nested as its pattern nests. The box of a step is titled with the name that keeps its output
 -- whole, if it has one, and holds the step and a box for each name of its pattern: a small node for a name, and a box titled
@@ -90,7 +131,11 @@
 -- of the flow's input is an edge from where the flow is entered, which says the names, and the names of one producer that a
 -- step binds share one edge. A step that binds nothing from the step before it has a dotted edge from it, which says only the
 -- order, in grey. A name that a step takes whole, and the names of a tuple, are drawn as the same names are in a list. A
--- choice is drawn in the box of its line, with its question, and the edge from it to a branch says its case.
+-- choice is drawn in the box of its line, with its question, and the edge from it to a branch says its case. A line that is
+-- released is drawn as a scope is: a box that holds the line, the lines after it and the release, which is the step that the
+-- dashed edge named "on exit" from the line leads to. The release has an edge from the box of each name that it binds, and
+-- none for @"exit"@, which the dashed edge says. A release only has the dashed edge from where the flow was, and a wrapper
+-- draws no node of its own: its lines are drawn as the lines of the flow.
 module Network.Streaming.Wiring
   ( Flow,
     Line,
@@ -111,10 +156,9 @@ module Network.Streaming.Wiring
   )
 where
 
-import Control.Arrow (Arrow, (>>>), (>>^))
+import Control.Arrow (Arrow, (>>>), (>>^), (^>>))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
-import Control.Exception (throw)
 import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
@@ -130,7 +174,7 @@ import GHC.TypeLits
     symbolVal,
   )
 import Network.Streaming.Annotate (Annotate (..), Binding (..), Part (..), (-|))
-import Network.Streaming.Classes (Exit, Scope)
+import Network.Streaming.Classes (Exit, Scope (..))
 import Network.Streaming.Internal.Patterns
   ( AllFresh,
     Described (..),
@@ -152,7 +196,6 @@ import Network.Streaming.Internal.Patterns
     (:=) (..),
   )
 import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, cases)
-import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -251,8 +294,20 @@ infixr 2 <:
   Flow arr x y
 (<:) out bound = case bound of
   Line {} -> outcome @out bound
-  Held {} -> unwritten "a line that is released"
-  Inside {} -> unwritten "inside"
+  Held texts acquire releaseTexts release ->
+    Flow
+      ( \rest ->
+          scope
+            (alongside (flowStep (Just (entryOf @out @x @o @y)) texts acquire))
+            ((\((o, x), exit) -> (Is exit, takeOut @out @x @o @y o x)) ^>> flowStep Nothing releaseTexts release)
+            ((\((o, x), _) -> takeOut @out @x @o @y o x) ^>> rest)
+      )
+  Inside texts input wrapper ->
+    Flow
+      ( \rest ->
+          flowStep (Just (entryOf @out @x @o @y)) texts (Arrow.arr (\x -> (input x, x)))
+            >>> wrapper ((\(o, x) -> takeOut @out @x @o @y o x) ^>> rest)
+      )
 {-# INLINE (<:) #-}
 
 -- | What a line that is not a plain step needs of the record of the flow after it: a release reads that record, and the exit,
@@ -265,6 +320,12 @@ type family Closing (how :: How) (y :: Type) :: Constraint where
 -- | What a step gives the flow under what is on the left of '<:': a name keeps the whole output, and a list of names
 -- takes it apart.
 class Outs out x o y | out x o -> y where
+  -- | The pattern, as the diagrams are given it.
+  entryOf :: Part
+
+  -- | The record of the flow with the names of what a step gave in front of it.
+  takeOut :: o -> x -> y
+
   -- | The flow that runs the step, with the names of what it gave in front of the record.
   outcome :: (Arrow arr, Annotate arr) => Line arr x o 'Plainly -> Flow arr x y
 
@@ -279,6 +340,10 @@ instance
   ) =>
   Outs (out :: Symbol) x o y
   where
+  entryOf = describeEntry @(Parse out)
+  {-# INLINE entryOf #-}
+  takeOut = takeEntry @Root @(Parse out)
+  {-# INLINE takeOut #-}
   outcome (Line texts p) =
     Flow
       ( \rest ->
@@ -295,6 +360,10 @@ instance
   ) =>
   Outs (entries :: [Symbol]) x o y
   where
+  entryOf = Part Nothing Nothing (Just (listOf @(Parses entries)))
+  {-# INLINE entryOf #-}
+  takeOut = level @(ShapeOf o) @Root @(Parses entries)
+  {-# INLINE takeOut #-}
   outcome (Line texts p) =
     Flow
       ( \rest ->
@@ -321,7 +390,8 @@ class Released t arr x r w where
 
 -- | A line that '<:' names: the acquire, and the release, which reads what the record has when the line is done.
 instance (Scope arr, arr' ~ arr, x' ~ x, r' ~ r, how ~ 'Releasing w) => Released (Line arr' x' r' how) arr x r w where
-  releasedBy _ _ = Held [] (unwritten "releasedBy") [] (unwritten "releasedBy")
+  releasedBy (Line texts acquire) (Line releaseTexts release) = Held texts acquire releaseTexts release
+  {-# INLINE releasedBy #-}
 
 -- | A line that keeps nothing: the release reads the record of the flow, and the exit.
 instance
@@ -346,16 +416,14 @@ inside ::
   forall (bindings :: k) ->
   (Describe bindings, Bind bindings x i) =>
   Line arr x o 'Wrapped
-inside _ _ = Inside [] (unwritten "inside") (unwritten "inside")
+inside wrapper bindings = Inside (describe @bindings) (bind @bindings @x) wrapper
+{-# INLINE inside #-}
 
 -- | A line that has a combinator that wraps a step take the rest of the flow as its body, when the combinator gives the body
 -- what it takes, as @shield@ does.
 inside_ :: (forall z. arr x z -> arr x z) -> Flow arr x x
-inside_ _ = unwritten "inside_"
-
--- | What the stubs of the lines that release and wrap fail with, until the code is there.
-unwritten :: String -> a
-unwritten operation = throw (NotImplemented operation)
+inside_ = Flow
+{-# INLINE inside_ #-}
 
 -- | A choice that is a line of the flow: it decides on the sum that the flow has under the name of the field, as
 -- @decide question (cases field)@ does, and runs the branch of the case that it is. A branch is a step of its own,

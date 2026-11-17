@@ -754,8 +754,8 @@ flowScoped ctx path result inner = do
   modifyIORef' (ctxInputs ctx) (entry :)
   -- The names that the step drawn last gave are of this flow: a flow in one of its steps keeps its own.
   saved <- readIORef (ctxGiven ctx)
-  (env, (_, outlets), drawn) <-
-    foldM (flowLine ctx path) (FlowEnv entered [], (Just 0, entered), False) (zip [1 ..] lined)
+  (env, (_, outlets), drawn, _) <-
+    foldM (flowItem ctx path) (FlowEnv entered [], (Just 0, entered), False, 0) lined
   writeIORef (ctxGiven ctx) saved
   if drawn
     then do
@@ -773,13 +773,54 @@ flowScoped ctx path result inner = do
       pure (Fragment Nothing (Nodes entry True [outlet {outletVia = Just exit} | outlet <- outlets]))
     else pure bare
 
--- | The steps of a flow, in order: the nodes of its chain that are steps of it, which it doesn't go into.
-flowLines :: Tree -> IO [Tree]
+-- | A line of a flow: a step of it, or a scope that the rest of the flow is the body of.
+data FlowLine
+  = -- | A step of the flow.
+    OneStep Tree
+  | -- | A scope: the lines of its acquire, of its body, and of its release.
+    InScope [FlowLine] [FlowLine] [FlowLine]
+
+-- | The lines of a flow, in order: the nodes of its chain that are steps of it, which it doesn't go into, and a scope with
+-- the lines of its parts.
+flowLines :: Tree -> IO [FlowLine]
 flowLines step = do
   tree <- evaluate step
   case tree of
-    FlowStep {} -> pure [tree]
+    FlowStep {} -> pure [OneStep tree]
+    Scope acquire release body -> do
+      acquired <- flowLines acquire
+      inner <- flowLines body
+      released <- flowLines release
+      pure [InScope acquired inner released]
     _ -> concat <$> traverse flowLines (children tree)
+
+-- | What a flow has when its lines are drawn: the names that it has, the number of the line before and the ways out of it,
+-- whether a node was drawn, and how many lines there are.
+type FlowState = (FlowEnv, (Maybe Int, [Outlet]), Bool, Int)
+
+-- | A line of a flow, drawn. A scope is a group that has the lines of its acquire, and the lines after them, which are its
+-- body, and the lines of its release, which hang on the dashed edge from the acquire named for the exit. The release reads
+-- the names that the acquire gave, and the exit, which the edge says, so it has no box of its own.
+flowItem :: Ctx -> Path -> FlowState -> FlowLine -> IO FlowState
+flowItem ctx path (env, before, drawn, count) = \case
+  OneStep step -> do
+    (env', before', drawn') <- flowLine ctx path (env, before, drawn) (count + 1, step)
+    pure (env', before', drawn', count + 1)
+  InScope acquires inner releases -> do
+    (state, items) <- collect ctx $ do
+      acquired@(afterAcquire, (_, starts), _, _) <- foldM (flowItem ctx path) (env, before, drawn, count) acquires
+      body <- foldM (flowItem ctx path) acquired inner
+      let reading = afterAcquire {flowBoxes = flowBoxes afterAcquire ++ [Box "exit" Nothing 0 [] [] []]}
+      forM_ [step | OneStep step <- releases] $ \step -> do
+        released <- render (ctx {ctxFlow = Just reading}) path step
+        sequential ctx (Fragment Nothing (Nodes "" False [outlet {outletLabel = Just "on exit", outletStyle = Dashed} | outlet <- starts])) released
+      pure body
+    let (env', before', drawn', count') = state
+        any' = not (null (declared items))
+    when any' $ do
+      node <- fresh ctx
+      emit ctx (Group node Plain "scope" items)
+    pure (env', before', drawn' || any', count')
 
 -- | A step of a flow, drawn with the names that the flow has before it, which the steps after it have its names among, if it
 -- has any. The step before it, which is the one before that if it draws no node, has an edge to it that says only the order if

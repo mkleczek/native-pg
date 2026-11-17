@@ -26,11 +26,6 @@ import Skeletest
 quick :: (Effect arr) => arr a ()
 quick = now (const (pure ()))
 
--- | The stubs of the lines that release and wrap fail with 'NotImplemented': the cases that need them are expected to fail, and
--- the marks come off when the code is there.
-unwritten :: Spec -> Spec
-unwritten = xfail "Network.Streaming.Wiring has a stub: a line that is released, or that wraps the rest of the flow, is not written yet"
-
 spec :: Spec
 spec = describe "the DOT of a graph" $ do
   it "has a node for a step, with a pin for each port that reads a name and one for each name that it gives, and an edge from each name to the ports that read it" $ do
@@ -212,7 +207,7 @@ spec = describe "the DOT of a graph" $ do
       sheet : _ -> dot (sheetPlumbing sheet) `shouldBe` dot (sheetFlow sheet)
       [] -> failTest "the program has no page"
 
-  unwritten $ it "has a cluster titled scope for a line that is released, which holds the lines after it and its release, and a dashed edge named on exit from the line to the release" $ do
+  it "has a cluster titled scope for a line that is released, which holds the lines after it and its release, and a dashed edge named on exit from the line to the release" $ do
     found <- dotOf bracketed
     case clusterTitled "scope" found of
       Nothing -> failTest "the graph has no cluster for the scope"

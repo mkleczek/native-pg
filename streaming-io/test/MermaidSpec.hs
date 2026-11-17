@@ -48,11 +48,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The stubs of the lines that release and wrap fail with 'NotImplemented': the cases that need them are expected to fail, and
--- the marks come off when the code is there.
-unwritten :: Spec -> Spec
-unwritten = xfail "Network.Streaming.Wiring has a stub: a line that is released, or that wraps the rest of the flow, is not written yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -254,7 +249,7 @@ spec = describe "the chart" $ do
           ("IO", "end", "")
         ]
 
-  unwritten $ it "has a box titled scope for a line that is released, which holds the lines after it and its release, with a dashed edge named on exit from the line to the release" $ do
+  it "has a box titled scope for a line that is released, which holds the lines after it and its release, with a dashed edge named on exit from the line to the release" $ do
     chart <- chartOf bracketed
     case subgraphTitled "scope" chart of
       Nothing -> failTest "the chart has no box for the scope"
@@ -270,7 +265,7 @@ spec = describe "the chart" $ do
         ]
     exitEdges chart `shouldBe` [("open", "close")]
 
-  unwritten $ it "has the edge on exit of a release that has no line to acquire from the flow's start, with the lines after it in a box titled scope" $ do
+  it "has the edge on exit of a release that has no line to acquire from the flow's start, with the lines after it in a box titled scope" $ do
     chart <- chartOf onExiting
     case subgraphTitled "scope" chart of
       Nothing -> failTest "the chart has no box for the scope"
