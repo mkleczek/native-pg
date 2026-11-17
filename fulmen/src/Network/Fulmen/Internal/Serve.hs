@@ -91,12 +91,14 @@ import Network.Streaming.Named (Inj, casesBy, field, inj, is, newRecord, type (=
 import Network.Streaming.Pool (checkoutIn, releaseNow, takeNow)
 import Network.Streaming.Wiring (choice, flow, result, (-<), (<:))
 
--- | The server: for each core, its connection workers, and for the first, the acceptor, which opens the listener.
+-- | The server: for each core, its connection workers, and for the first, the acceptor, which opens the listener. The whole acceptance is in
+-- the fast lane, so that its waits, for a core that waits for connections and for the listener to be readable, are inside it, and it comes
+-- back after at most one part of the normal lane.
 serve :: (Runtime arr) => Settings -> Listen arr -> arr (Call, Request) () -> arr Cores ()
 serve !settings listen handler =
   named (Label "serve" "Runs the connection workers of each core, and the acceptor besides on the first core.") $
     decide "first core?" (whether isFirst)
-      >>> ("yes" |- shutting [acceptance settings listen, workers] ||| "no" |- shutting [workers])
+      >>> ("yes" |- shutting [fastLane (acceptance settings listen), workers] ||| "no" |- shutting [workers])
   where
     workers = connectionWorkers settings handler
     isFirst (Cores core _) = core == 0
