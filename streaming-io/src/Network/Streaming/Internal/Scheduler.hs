@@ -406,6 +406,11 @@ drainArrivals run = go 0
     go !count ready [] = ready <$ when (count /= 0) (adjust run 3 (negate count))
     go !count ready (part : rest) = go (count + 1) (part : ready) rest
 
+-- | In an idle scheduler the detached singleton is already in FIFO order.
+drainIdleArrivals :: Run -> [IO Step] -> IO [IO Step]
+drainIdleArrivals run arrivals@[_] = arrivals <$ adjust run 3 (-1)
+drainIdleArrivals run arrivals = drainArrivals run [] arrivals
+
 -- | The scheduler takes no more parts.
 closeInbox :: Run -> IO ()
 closeInbox run = case runMailbox run of
@@ -1193,7 +1198,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
           | null watching -> do
               -- Unless a part was given since the round began: the next to give
               -- one wakes the poller.
-              early <- beforeSleep run >>= drainArrivals run []
+              early <- beforeSleep run >>= drainIdleArrivals run
               -- Or a part of the fast lane, which the mailbox gave.
               fastGiven <- fastWaiting run
               if null early && not fastGiven
@@ -1201,7 +1206,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
                   countWait
                   until' <- untilNextTimer
                   polled <- pollWait (maybe (-1) (fromIntegral . min 2000000000 . (`div` 1000000) . (+ 999999)) until')
-                  given <- afterSleep run >>= drainArrivals run []
+                  given <- afterSleep run >>= drainIdleArrivals run
                   -- The time of the round was read before the wait, if a timer made the round expire its timers: the parts that the wait ended
                   -- read it again, as a round's first part does.
                   setCounter run 8 0
