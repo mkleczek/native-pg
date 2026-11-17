@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CApiFFI #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE LambdaCase #-}
@@ -23,7 +24,8 @@
 -- listen backlog. A connection that waits for its next request for longer than the idle timeout is closed, so that the
 -- connections that wait in the backlog are served though the ones that have a connection worker are idle: the connection
 -- has a watcher beside the part that serves its requests, which sleeps until the connection can have waited that long,
--- and ends it if it has.
+-- and ends it if it has, unless a request is in the connection's socket by then: closing with the request unread would reset the
+-- connection, and the client would lose it.
 --
 -- A request is read into the primary buffer that it was admitted with. The bytes that follow it in the buffer, which
 -- belong to the next request on the connection, are copied out before the buffer is used for anything else, and
@@ -45,9 +47,12 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Word (Word8)
+import qualified Foreign.C.Error as Errno
+import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.ForeignPtr (plusForeignPtr, withForeignPtr)
+import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Marshal.Utils (copyBytes)
-import Foreign.Ptr (castPtr)
+import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (poke)
 import GHC.Records (HasField)
 import Network.Fulmen.Internal
@@ -60,7 +65,7 @@ import Network.Fulmen.Internal.Response (Exchange (..), Phase (..), newExchange,
 import Network.Fulmen.Internal.Split (shares)
 import Network.Fulmen.Listen (Listen (..))
 import Network.Fulmen.Request (Method (..), Request (..), Version (..))
-import Network.Socket (SockAddr (..), Socket, getPeerName)
+import Network.Socket (SockAddr (..), Socket, getPeerName, withFdSocket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes
@@ -90,6 +95,7 @@ import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRe
 import Network.Streaming.Named (Inj, casesBy, field, inj, is, newRecord, type (=:), (:=), (?>))
 import Network.Streaming.Pool (checkoutIn, releaseNow, takeNow)
 import Network.Streaming.Wiring (choice, flow, result, (-<), (<:))
+import System.Posix.Types (CSsize (..))
 
 -- | The server: for each core, its connection workers, and for the first, the acceptor, which opens the listener. The whole acceptance is in
 -- the fast lane, so that its waits, for a core that waits for connections and for the listener to be readable, are inside it, and it comes
@@ -365,9 +371,18 @@ connection settings handler =
     -- With an idle timeout, the connection has a watcher besides the part that serves its requests, which ends the connection once it has
     -- waited for its next request for the timeout. The watcher's wait is a timer for the connection, which is armed again when it fires, and
     -- not a deadline for each wait for input: a request costs a mark of the connection, where a deadline costs a scope and a timer.
+    -- A connection that the watcher has taken is not closed with a request in its socket: closing with input unread resets the connection, and
+    -- the client loses the request, which came as the connection timed out. The request is served, and the connection watched again. A
+    -- connection that ends gives way as it does, since the lint can't tell that the one that ends is not the one that goes round the loop.
     watched = case idleTimeout settings of
       Nothing -> requests settings handler
-      Just limit -> race (watching limit) (requests settings handler) >>> done
+      Just limit ->
+        typed @Conn @() $
+          iterateA
+            ( alongside (race (watching limit) (requests settings handler) >>> done)
+                >>> step "look for a request that came as the connection timed out" arrivedLate -| "request in the socket?"
+                >>> ("no" |- (giveWay >>^ const (Finish ())) -| "connection ends" ||| "yes" |- (alongside (tap idle >>> admitted settings handler) >>^ whileKept))
+            )
 
 -- | The address that the socket's peer has, or a Unix address with no name if the peer has gone already, as a client of
 -- a Unix socket has no other.
@@ -381,19 +396,25 @@ requests settings handler =
     typed @Conn @() $
       iterateA ((alongside one >>^ whileKept) -| "connection kept?")
   where
-    whileKept (keep, conn) = if keep then Again conn else Finish ()
     -- An idle connection waits holding no buffer: a request is admitted once there is input. With an idle timeout, a connection that the
     -- watcher has ended by then ends, and its connection worker ends with it: it gives way as it ends, since the lint can't tell
     -- that the connections that have bytes in hand are not the ones that end, and so sees a way round the loop that waits nowhere.
     one = case idleTimeout settings of
-      Nothing -> tap idle >>> admitted
+      Nothing -> tap idle >>> admitted settings handler
       Just _ ->
         alongside idleWatched
           >>> decide "input before the idle timeout?" (\(arrived, conn) -> if arrived then Right conn else Left ())
-          >>> ("no" |- (giveWay >>^ const False) -| "keep alive" ||| "yes" |- admitted)
-    admitted =
-      alongside (arr (sharedBuffers . connShared) -| "buffer pool")
-        >>> withRequestBuffers (request settings handler)
+          >>> ("no" |- (giveWay >>^ const False) -| "keep alive" ||| "yes" |- admitted settings handler)
+
+-- | Whether the connection is kept after a request: it goes on with the same connection, or ends.
+whileKept :: (Bool, Conn) -> Step Conn ()
+whileKept (keep, conn) = if keep then Again conn else Finish ()
+
+-- | A request that has input: it is admitted with the buffers of the core, read, and answered, and the connection says whether it is kept.
+admitted :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Conn Bool
+admitted settings handler =
+  alongside (arr (sharedBuffers . connShared) -| "buffer pool")
+    >>> withRequestBuffers (request settings handler)
 
 -- | Waits until the connection has input, which may be its end, unless it has bytes of a request already.
 idle :: (Runtime arr) => arr Conn ()
@@ -441,6 +462,31 @@ look limit (now', conn@Conn {connMark}) =
           -- watcher looks again, at once.
           update connMark (\case Idle at | at == since -> (TimedOut, Finish ()); other -> (other, Again (now', conn)))
       | otherwise -> pure (Again (plus since limit, conn))
+
+-- | The connection, if the watcher has taken it while its socket has input, which is then left to be served: the mark goes back to a request
+-- in hand, as the part that serves has ended. It is not looked at otherwise.
+arrivedLate :: ((), Conn) -> IO (Either () Conn)
+arrivedLate ((), conn@Conn {connSocket, connMark}) =
+  readIORef connMark >>= \case
+    TimedOut -> inputWaiting connSocket >>= \input -> if input then Right conn <$ atomicWriteIORef connMark Busy else pure (Left ())
+    _ -> pure (Left ())
+
+-- | Whether the socket has input, which may be the end of the stream or a failure that a receive reports: it is looked at without taking any of
+-- it, and without waiting.
+inputWaiting :: Socket -> IO Bool
+inputWaiting sock =
+  withFdSocket sock $ \fd -> allocaBytes 1 $ \pointer ->
+    let attempt =
+          c_recv fd pointer 1 msgPeek >>= \case
+            -1 -> Errno.getErrno >>= \errno -> if errno == Errno.eINTR then attempt else pure (errno /= Errno.eAGAIN && errno /= Errno.eWOULDBLOCK)
+            _ -> pure True
+     in attempt
+
+foreign import ccall unsafe "recv"
+  c_recv :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CSsize
+
+foreign import capi "sys/socket.h value MSG_PEEK"
+  msgPeek :: CInt
 
 -- | The socket to wait for input on, unless the connection has bytes of a request already.
 ready :: Conn -> IO (Either Socket ())

@@ -55,6 +55,7 @@ data Settings = Settings
     -- request, the time its handler takes included, is not timed. 'Nothing' waits for ever. A connection that has an idle timeout has a watcher, a part of its own that sleeps until the
     -- connection can have waited that long and looks at it then, so that the timeout costs a request a clock read and two changes of a mark,
     -- a few hundred bytes, and a connection a timer for each timeout that it lasts, and not a deadline for each wait for a request.
+    -- A connection that has a request in its socket when the timeout passes is not closed: it serves the request, and waits again.
     idleTimeout :: Maybe Duration,
     -- | The event that starts a graceful shutdown, if the server has one: when it fires, the listener closes, a connection
     -- that waits for its next request closes, a request in flight finishes (until the 'drainTimeout' has passed) and says that

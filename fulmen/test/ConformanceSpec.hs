@@ -341,16 +341,15 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
     -- request, so the bytes are in the socket by then: the watcher can take the connection before the part that serves it has noticed the
     -- input, which the arrows that poll their sockets now and then do in most runs, and not in all: the server is started five times. A close
     -- with the input unread resets the connection, and the client loses its request: it is served instead.
-    xfail "the watcher closes the connection with the request unread, and the client is reset" $
-      it "serves a request whose bytes are in the socket when the idle timeout passes" $
-        forM_ [1 .. 5 :: Int] $ \_ ->
-          withStoppableWithAfter (threadDelay 100000) (\settings -> settings {Fulmen.idleTimeout = Just (millis 0), Fulmen.connectionsPerCore = 4}) runner (handling (Fixed 200 [] "ok")) $ \shutting ->
-            withClient (serverPort shutting) $ \client -> do
-              SocketBytes.sendAll (socket client) request
-              answeredOrEnded <- timeout 3000000 (waitUntil (((||) . ("ok" `B.isInfixOf`) <$> readIORef (received client)) <*> readIORef (ended client)))
-              answeredOrEnded `shouldBe` Just ()
-              bytes <- readIORef (received client)
-              ("ok" `B.isInfixOf` bytes) `shouldBe` True
+    it "serves a request whose bytes are in the socket when the idle timeout passes" $
+      forM_ [1 .. 5 :: Int] $ \_ ->
+        withStoppableWithAfter (threadDelay 100000) (\settings -> settings {Fulmen.idleTimeout = Just (millis 0), Fulmen.connectionsPerCore = 4}) runner (handling (Fixed 200 [] "ok")) $ \shutting ->
+          withClient (serverPort shutting) $ \client -> do
+            SocketBytes.sendAll (socket client) request
+            answeredOrEnded <- timeout 3000000 (waitUntil (((||) . ("ok" `B.isInfixOf`) <$> readIORef (received client)) <*> readIORef (ended client)))
+            answeredOrEnded `shouldBe` Just ()
+            bytes <- readIORef (received client)
+            ("ok" `B.isInfixOf` bytes) `shouldBe` True
     it "does not close a connection whose request is in flight for longer than the timeout" $
       withIdle (Just (millis 300)) 4 quickOrSlow $ \shutting ->
         withClient (serverPort shutting) $ \busy -> do
