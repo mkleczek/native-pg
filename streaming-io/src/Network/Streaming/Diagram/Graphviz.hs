@@ -2,13 +2,15 @@
 
 -- | Prints a graph of "Network.Streaming.Diagram.Graph" as Graphviz DOT.
 --
--- A step is a cluster that holds its body and a node for each of its pins, so that Graphviz orders the pins to cut the crossings
--- of the edges as it orders the steps: the input pins are on a rank above the body, the output pins on a rank below it, each
--- held there by an invisible edge. An output pin that is kept and taken apart is a cluster in the cluster of the step, titled
--- with its name, that holds the pins of its parts. An edge goes from an output pin to the input pins that read it, so most
--- edges say nothing: the pins say it. A decision is a cluster in yellow, with its cases as yellow nodes, or as yellow clusters
--- that hold the pins of their patterns. What Mermaid draws as a node or a box for a name is not drawn: it is a pin. The cluster
--- of a named step, which has a page of its own, links to the page, and has a heavier border than a step that is an action.
+-- A step that has pins is a faint wrapper cluster that holds its body, which is the box of the step, and a node for each of its
+-- pins, so that Graphviz orders the pins to cut the crossings of the edges as it orders the steps: the input pins are on a rank
+-- above the box and the output pins on a rank below it, outside it, each held there by an invisible edge. An output pin that is
+-- kept and taken apart is a cluster in the wrapper, titled with its name, that holds the pins of its parts. An edge goes from an
+-- output pin to the input pins that read it, so most edges say nothing: the pins say it, and an edge that has no pin to be at is
+-- drawn at the box, never at the wrapper. A decision is a box in yellow in a wrapper of a paler yellow, with its cases as yellow
+-- nodes, or as yellow clusters that hold the pins of their patterns. What Mermaid draws as a node or a box for a name is not
+-- drawn: it is a pin. The box of a named step, which has a page of its own, and its wrapper link to the page, and the box has a
+-- heavier border than a step that is an action.
 module Network.Streaming.Diagram.Graphviz (dot) where
 
 import Control.Applicative ((<|>))
@@ -25,6 +27,13 @@ bodyLine = "#57606a"
 boxLine = "#24292f"
 decisionFill = "#fff1a8"
 decisionLine = "#9a6700"
+
+-- | The fill and the border of the wrapper of a step, and of the wrapper of a decision.
+wrapperFill, wrapperLine, decisionWrapperFill, decisionWrapperLine :: String
+wrapperFill = "#f6f8fa"
+wrapperLine = "#d8dee4"
+decisionWrapperFill = "#fffbea"
+decisionWrapperLine = "#f0e2a8"
 
 -- | The fill and the border of an input pin, an output pin, and a case.
 inFill, inLine, outFill, outLine, caseFill, caseLine :: String
@@ -259,11 +268,11 @@ wrapped width = go [] . words
 linkAttr :: String -> Bodied -> String
 linkAttr separator found = maybe "" (\anchor -> separator ++ "href=" ++ quoted ("#" ++ anchor)) (bodiedLink found)
 
--- | The node of a body that has no pins: a rounded box.
-boxNode :: Node -> Bodied -> String
-boxNode node found =
-  node ++ " [class=" ++ quoted (bodiedClass found) ++ ", shape=box, style=\"rounded,filled\", fillcolor=" ++ quoted (bodiedFill found)
-    ++ ", color=" ++ quoted (bodiedLine found) ++ ", penwidth=" ++ show (bodiedWidth found) ++ ", height=0.1, margin=\"0.12,0.07\", label=" ++ bodyLabel found
+-- | The node of a body that is a box: rounded and filled, of the class and with the margin.
+boxNode :: Node -> String -> String -> Bodied -> String
+boxNode node klass margin found =
+  node ++ " [class=" ++ quoted klass ++ ", shape=box, style=\"rounded,filled\", fillcolor=" ++ quoted (bodiedFill found)
+    ++ ", color=" ++ quoted (bodiedLine found) ++ ", penwidth=" ++ show (bodiedWidth found) ++ ", height=0.1, margin=" ++ quoted margin ++ ", label=" ++ bodyLabel found
     ++ linkAttr ", " found ++ "];"
 
 -- * Blocks
@@ -289,23 +298,25 @@ topOf env node = case (lookup node (envElements env), lookup node (envResults en
   (_, Just (Just _)) -> inPinId node [0]
   _ -> node
 
--- | A body with its pins: a cluster, with the input pins above the body and the output pins below it, on ranks of their own, held
--- there by invisible edges. A body that has no pins is a box.
+-- | A body with its pins: a faint wrapper cluster, with the body as a box in it, the input pins above the box and the output pins
+-- below it, outside it, on ranks of their own, held there by invisible edges. A body that has no pins is a box and no cluster.
 blockLines :: Node -> Bodied -> [String] -> [Pin] -> Bool -> [String]
 blockLines node found names pins asCase
-  | null names && null pins = [boxNode node found]
+  | null names && null pins = [boxNode node (bodiedClass found) "0.12,0.07" found]
   | otherwise =
       [ "subgraph cluster_" ++ node ++ " {",
-        "  class=" ++ quoted (bodiedClass found) ++ "; style=\"filled,rounded\"; fillcolor=" ++ quoted (bodiedFill found) ++ "; color=" ++ quoted (bodiedLine found)
-          ++ "; penwidth=" ++ show (bodiedWidth found) ++ "; margin=9; label=\"\"" ++ linkAttr "; " found ++ ";"
+        "  class=" ++ quoted (bodiedClass found) ++ "; style=\"filled,rounded\"; fillcolor=" ++ quoted wrapFill ++ "; color=" ++ quoted wrapLine
+          ++ "; penwidth=1; margin=6; label=\"\"" ++ linkAttr "; " found ++ ";"
       ]
         ++ ["  " ++ pinNode (inPinId node [i]) "in" "filled" inFill inLine name | (i, name) <- zip [0 :: Int ..] names]
-        ++ ["  " ++ node ++ " [class=\"body\", height=0.1, margin=\"0.06,0.02\", label=" ++ bodyLabel found ++ linkAttr ", " found ++ "];"]
+        ++ ["  " ++ boxNode node "body" "0.12,0.06" found]
         ++ concat [fmap ("  " ++) (outPinLines node asCase [k] pin) | (k, pin) <- zip [0 :: Int ..] pins]
         ++ ["  { rank=same; " ++ unwords [inPinId node [i] ++ ";" | i <- [0 .. length names - 1]] ++ " }" | length names > 1]
         ++ ["  " ++ inPinId node [i] ++ " -> " ++ node ++ " [style=invis, weight=100];" | i <- [0 .. length names - 1]]
         ++ ["  " ++ node ++ " -> " ++ outPinId node leaf ++ " [style=invis, weight=100];" | (k, pin) <- zip [0 :: Int ..] pins, leaf <- leavesOf [k] pin]
         ++ ["}"]
+  where
+    (wrapFill, wrapLine) = if asCase then (decisionWrapperFill, decisionWrapperLine) else (wrapperFill, wrapperLine)
 
 -- | The node of a pin, which has the name of the pin for its label.
 pinNode :: Node -> String -> String -> String -> String -> String -> String
@@ -348,18 +359,15 @@ namedPins element = go [] [] (elementOut element)
 
 -- * The edges
 
--- | Where an edge is drawn at: the node, and the cluster if the end is a cluster, which the edge is drawn at a node of.
+-- | Where an edge is drawn at: the node, and the cluster if the end is a cluster that is not the wrapper of a step, which the edge
+-- is drawn at a node of.
 data Place = Place Node (Maybe Node)
-
--- | The place of the body of an element, which has the cluster of its block.
-bodyPlace :: Node -> Element -> Place
-bodyPlace node element = Place node (if blockOf element then Just node else Nothing)
 
 -- | The place of a node that is an element or a result, or else of a cluster, which is at its first node.
 placeOf :: Env -> Bool -> Node -> Maybe Place
 placeOf env leaving node = case (lookup node (envElements env), lookup node (envResults env)) of
-  (Just element, _) -> Just (bodyPlace node element)
-  (_, Just name) -> Just (Place node (if isJust name then Just node else Nothing))
+  (Just _, _) -> Just (Place node Nothing)
+  (_, Just _) -> Just (Place node Nothing)
   _ -> case lookup node (envClusters env) of
     Just (first : _) -> Just (Place (if leaving then first else topOf env first) (Just node))
     _ -> Nothing
@@ -375,11 +383,11 @@ seatPlace env leaving (Seat node path) = case (lookup node (envElements env), pa
           Just (ixs, pin)
             | null (pinParts pin) -> Place (outPinId node ixs) Nothing
             | otherwise -> Place (outPinId node (firstLeaf ixs pin)) (Just (outPinId node ixs))
-          Nothing -> bodyPlace node element
+          Nothing -> Place node Nothing
         else case path of
           [name] | Just i <- lookup name (zip (inNames element) [0 :: Int ..]) -> Place (inPinId node [i]) Nothing
-          _ -> bodyPlace node element
-  (Just element, []) -> Just (bodyPlace node element)
+          _ -> Place node Nothing
+  (Just _, []) -> Just (Place node Nothing)
   (Nothing, _) -> placeOf env leaving node
   where
     -- The pin that has exactly those names, or else the one whose last name is the last of them.

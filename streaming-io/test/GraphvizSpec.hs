@@ -29,10 +29,6 @@ import Skeletest
 quick :: (Effect arr) => arr a ()
 quick = now (const (pure ()))
 
--- | A case that the printer fails as long as it draws the body of a step as the text in the cluster of the step.
-unwritten :: Spec -> Spec
-unwritten = xfail "the DOT of a graph has the body of a step as its box, and its cluster as a wrapper, only when the printer draws it so"
-
 spec :: Spec
 spec = describe "the DOT of a graph" $ do
   it "has a cluster for a step, which holds its body and a node for each port that reads a name and for each name that it gives, and an edge from each name to the ports that read it" $ do
@@ -168,7 +164,7 @@ spec = describe "the DOT of a graph" $ do
           ("IO", "", "end", "", "")
         ]
 
-  unwritten $ it "has the box of a name that has a page of its own link to the page, and a border that a step that is an action has not, as a node, or as the box in a wrapper that links to the page too" $ do
+  it "has the box of a name that has a page of its own link to the page, and a border that a step that is an action has not, as a node, or as the box in a wrapper that links to the page too" $ do
     found <- dotOf (quick >>> box "outer" (quick >>> quick) :: Diagram () ())
     let outer = [line | line <- found, "class=\"box\"" `isInfixOf` line]
     length outer `shouldBe` 1
@@ -184,7 +180,7 @@ spec = describe "the DOT of a graph" $ do
     isBox "#dde3ea" "#57606a" 1 (bodyOf "after" boxed') `shouldBe` True
     ("href=" `isInfixOf` bodyOf "after" boxed') `shouldBe` False
 
-  unwritten $ it "has the body of a step that has pins as a filled rounded box in the colours of a step, in a cluster that is a faint wrapper around the box and its pins, for an action, the input of a flow and its result" $ do
+  it "has the body of a step that has pins as a filled rounded box in the colours of a step, in a cluster that is a faint wrapper around the box and its pins, for an action, the input of a flow and its result" $ do
     found <- dotOf fanning
     isBox "#dde3ea" "#57606a" 1 (bodyOf "alpha" found) `shouldBe` True
     isWrapper "#f6f8fa" "#d8dee4" (wrapperOf "alpha" found) `shouldBe` True
@@ -196,12 +192,12 @@ spec = describe "the DOT of a graph" $ do
     pinsOf "in" "alpha" found `shouldBe` ["i"]
     ("class=\"in\"" `isInfixOf` bodyOf "alpha" found) `shouldBe` False
 
-  unwritten $ it "has the body of a decision as a yellow box in a wrapper of a paler yellow, which are not the colours of a step" $ do
+  it "has the body of a decision as a yellow box in a wrapper of a paler yellow, which are not the colours of a step" $ do
     found <- dotOf choosing
     isBox "#fff1a8" "#9a6700" 1 (bodyOf "how big?" found) `shouldBe` True
     isWrapper "#fffbea" "#f0e2a8" (wrapperOf "how big?" found) `shouldBe` True
 
-  unwritten $ it "has an edge into or out of a step that ends at a pin or at its box, and none at its wrapper, in a flow whose edges say only the order, whose cases have no pin that is read, and whose result leaves" $ do
+  it "has an edge into or out of a step that ends at a pin or at its box, and none at its wrapper, in a flow whose edges say only the order, whose cases have no pin that is read, and whose result leaves" $ do
     for_ [("quiet", dotOf quiet), ("choosing", dotOf choosing), ("fanning", dotOf fanning), ("boxed", dotOf boxed), ("nesting", dotOf nesting)] $ \(name, drawn) -> do
       found <- drawn
       let nodes = fmap fst (nodeLines found)
