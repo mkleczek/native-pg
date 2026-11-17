@@ -40,10 +40,11 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, foreverA, iterateA, iterateWith, keeping, sleep, tap)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, foreverA, iterateA, iterateWith, keeping, sleep, tap, untilJust)
 import Network.Streaming.Counters (Counter (..), countOf, since, snapshot)
-import Network.Streaming.Compiled (runCompiled, runCompiledM)
-import Network.Streaming.Delimited (runCores, runDelimited, runDelimitedM)
+import Network.Streaming.Compiled (runCompiled, runCompiledM, runCompiledTurnM)
+import Network.Streaming.Delimited (runCores, runDelimited, runDelimitedM, runDelimitedTurnM)
+import Network.Streaming.Internal.Scheduler (Turn (..))
 import Network.Streaming.Mode (Mode (..))
 import Network.Streaming.Threads (runThreads, runThreadsM)
 import Skeletest
@@ -61,7 +62,7 @@ import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, 
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> acceptBatches *> listenerFailure *> peerAddress *> shutdownSpec *> shutdownInBatch *> idleSpec *> idleCost *> acceptCost *> manyConnectionWorkers
+spec = conformance *> counted *> acceptBatches *> acceptBeside *> listenerFailure *> peerAddress *> shutdownSpec *> shutdownInBatch *> idleSpec *> idleCost *> acceptCost *> manyConnectionWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -120,6 +121,74 @@ queuedConnections (Runner _ runServer) =
   where
     waiting = 128 :: Int
     rounds = (waiting + acceptCap - 1) `div` acceptCap
+    connected port = do
+      sock <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
+      Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1))) `onException` Socket.close sock
+      pure sock
+
+-- | The rounds of the acceptor that follow the first don't wait for the parts that spin beside it on its core: a core that has taken
+-- its batch is waiting for the next one again within a few turns, and not after a round of the spinning parts. The runs take a turn of no
+-- length, so that every point to give way at ends a turn, and count turns, not time: the spinners count their own turns, up to the
+-- moment that the last of the queued connections is taken.
+acceptBeside :: Spec
+acceptBeside = describe "accepting a queue of connections beside parts that spin" $ forM_ turnRunners $ \(Turned runnerName run) ->
+  describe runnerName $
+    xfail "the core's loop waits for a round of the spinning parts between the rounds of the acceptor" $
+      it "takes the rounds after the first within a few turns of the spinning parts" (spinningBeside run)
+
+-- | A way to run a program of one core, in 'Debug' with turns of no length: an arrow's runner, given the program and the cores.
+data Turned = Turned String ((forall arr. (Runtime arr) => arr Cores ()) -> Cores -> IO ())
+
+turnRunners :: [Turned]
+turnRunners =
+  [ Turned "delimited" (\program cores -> void (runDelimitedTurnM @'Debug (Turn 0) program cores)),
+    Turned "compiled" (\program cores -> void (runCompiledTurnM @'Debug (Turn 0) program cores))
+  ]
+
+-- | The queue of 'queuedConnections', with the server's one core having room for all of it, and spinning parts beside the server that
+-- each count a turn and give way until the last of the queue is taken. The cap of the accept step makes the acceptor go through four
+-- rounds, each of which needs the core's loop to be waiting for a batch again, and that is what the count tells apart: the turns of
+-- the spinners are those that the other parts of the core let go by. Every part begins in the normal lane, which takes one round of the
+-- spinners before the first round of the acceptor, and a loop that waits for a round of the spinners to be back in the pool takes
+-- one more for each round after the first, so that waiting makes at least four rounds of the spinners, and not waiting about two. For 50
+-- spinners that is at least 200 turns against 110 measured, and 5,201 measured where the loop is in the normal lane and its starts
+-- give way to the spinners.
+spinningBeside :: ((forall arr. (Runtime arr) => arr Cores ()) -> Cores -> IO ()) -> IO ()
+spinningBeside run =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+    Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen accepting waiting
+    port <- Socket.socketPort accepting
+    bracket (replicateM waiting (connected port)) (mapM_ Socket.close) $ \_ -> do
+      let settings = Fulmen.defaultSettings {Fulmen.connectionsPerCore = waiting}
+      cores <- Fulmen.newCores settings 1
+      turns <- newIORef (0 :: Int)
+      ended <- newIORef (0 :: Int)
+      before <- snapshot
+      let taken = (>= waiting) . countOf Accepts . (`since` before) <$> snapshot
+          turn = taken >>= \all' -> if all' then pure (Just ()) else Nothing <$ modifyIORef' turns (+ 1)
+      stopped <- newEmptyMVar
+      case handling (Fixed 200 [] "ok") of
+        Handling handler -> do
+          let spinner :: (Runtime arr) => arr Cores ()
+              spinner = const () ^>> untilJust turn >>> now (\_ -> modifyIORef' ended (+ 1))
+              program :: (Runtime arr) => arr Cores ()
+              program = together (Fulmen.serve settings (Fulmen.borrowed accepting) handler : replicate spinners spinner)
+          bracket (forkFinally (run program cores) (putMVar stopped)) killThread $ \_ -> do
+            finished <- timeout 10000000 (waitUntil ((>= spinners) <$> readIORef ended))
+            counts <- (`since` before) <$> snapshot
+            finished `shouldBe` Just ()
+            countOf Accepts counts `shouldBe` waiting
+            spun <- readIORef turns
+            lookupEnv "ACCEPT_TURNS_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("accept beside spinners | " <> show spun <> " turns of " <> show spinners <> " spinners"))
+            when (spun > bound) $
+              failTest ("the " <> show spinners <> " spinning parts took " <> show spun <> " turns while the acceptor took " <> show waiting <> " connections in rounds of " <> show acceptCap <> ", and at most " <> show bound <> " were allowed")
+  where
+    waiting = 128 :: Int
+    spinners = 50 :: Int
+    -- The turns of the spinners that the rounds may take between them: three rounds of the spinners, between the two of a loop that
+    -- doesn't wait for them and the four or more of one that does.
+    bound = 3 * spinners
     connected port = do
       sock <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
       Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1))) `onException` Socket.close sock
