@@ -14,7 +14,7 @@ module Network.Fulmen.Internal.Accept
   )
 where
 
-import Control.Arrow (ArrowChoice, (>>>))
+import Control.Arrow (Arrow, ArrowChoice, (>>>))
 import Control.Exception (SomeException, try)
 #if !defined(linux_HOST_OS)
 import Control.Monad (when)
@@ -31,7 +31,7 @@ import Foreign.Ptr (Ptr, nullPtr)
 import Network.Socket (Socket, SocketOption (NoDelay), mkSocket, setSocketOption, withFdSocket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Classes (Annotate, Block (..), Effect, Event (..), GiveWay (..), (-|), (|-))
-import Network.Streaming.Combinators (pattern Again, pattern Finish, consume, iterateWith, step)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, consume, iterateWith, step, tap)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Descriptors (fresh)
 import Network.Streaming.Mode (Instrumented (bump), ModeOf)
@@ -108,12 +108,16 @@ foreign import ccall unsafe "accept"
   c_accept :: CInt -> Ptr () -> Ptr () -> IO CInt
 #endif
 
--- | The next connection of the listening socket: it tries, and while there is none, blocks until the socket is
--- readable and tries again. The part gives way before it tries, as a receive does, so that a listener that always has
--- a connection doesn't keep the others of its core from running.
+-- | Gives way, as a receive does, so that a listener that always has a connection doesn't keep the others of its core from
+-- running, and counts the give-way.
+beginBatch :: forall arr a. (Arrow arr, Annotate arr, Effect arr, GiveWay arr, Instrumented (ModeOf arr)) => arr a a
+beginBatch = giveWay >>> tap (step "count the give way" (const (bump @(ModeOf arr) AcceptBatches)))
+
+-- | The next connection of the listening socket: it gives way and tries, and while there is none, blocks until the socket is
+-- readable and tries again.
 acceptor :: forall arr. (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr Socket Socket
 acceptor =
-  giveWay >>> iterateWith (step "try accept" attempt -| "accepted?") ("none waiting" |- consume block)
+  beginBatch >>> iterateWith (step "try accept" attempt -| "accepted?") ("none waiting" |- consume block)
   where
     attempt listener =
       tryAccept @(ModeOf arr) listener >>= \case

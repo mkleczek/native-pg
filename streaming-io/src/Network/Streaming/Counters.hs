@@ -48,6 +48,8 @@ data Counter
     Accepts
   | -- | @accept@ calls that found no connection.
     AcceptsEmpty
+  | -- | Times that the acceptor gave way to the other parts of its core before it took connections.
+    AcceptBatches
   | -- | @fcntl@ calls that accepting a connection made.
     Fcntls
   | -- | @recv@ calls with @MSG_PEEK@ that a pool made at a checkout.
@@ -72,6 +74,7 @@ counterName counter = case counter of
   Sends -> "sends"
   Accepts -> "accepts"
   AcceptsEmpty -> "accepts_empty"
+  AcceptBatches -> "accept_batches"
   Fcntls -> "fcntls"
   Probes -> "probes"
   Captures -> "captures"
