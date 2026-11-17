@@ -71,7 +71,7 @@ test-suite fulmen-conformance
   -- The server of the bench runs in a process of its own, under a small stack, for the case of a server of thousands of
   -- connection workers.
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5, fulmen:fulmen-bench
-  build-depends: base, bytestring, directory, fulmen, network, process, streaming-io, skeletest >=0.4.2 && <0.5, unix
+  build-depends: base, bytestring, directory, fulmen, fulmen:internal, network, process, streaming-io, skeletest >=0.4.2 && <0.5, unix
 
 -- The bytes that the head of a request is compared with, whose module the library doesn't expose: the suite compiles it from the
 -- sources, and nothing else of the library, so that what a comparison allocates can be measured.

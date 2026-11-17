@@ -28,7 +28,8 @@
 -- belong to the next request on the connection, are copied out before the buffer is used for anything else, and
 -- the next request begins with them: pipelining costs a copy of the bytes that came early, and nothing otherwise.
 module Network.Fulmen.Internal.Serve
-  ( serve,
+  ( acceptCap,
+    serve,
   )
 where
 
@@ -165,6 +166,10 @@ capacityOf settings r = case r.cores of
   Cores _ shared -> do
     counts <- readCounts shared
     pure $! sum [connectionsPerCore settings - liveOf counts core | Waiting core _ <- r.waiting]
+
+-- | The most connections that one accept step takes, so that the step is short for the other parts of its core.
+acceptCap :: Int
+acceptCap = 32
 
 -- | The batch of each core that is given sockets, and the cores that are given none, from how many connection workers each core has now.
 sharing ::

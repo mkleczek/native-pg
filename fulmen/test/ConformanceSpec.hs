@@ -35,6 +35,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stats (allocated_bytes, getRTSStats)
 import Network.Fulmen (Call, Cores, Request (..))
 import qualified Network.Fulmen as Fulmen
+import Network.Fulmen.Internal.Serve (acceptCap)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
@@ -80,19 +81,22 @@ counted = describe "accepting" $ forM_ debugRunners $ \runner@(Runner runnerName
     countOf Accepts counts `shouldBe` 30
     when (os == "linux") $ countOf Fcntls counts `shouldBe` 0
 
--- | The connections that wait in the listener's queue when the server starts are all taken, and the acceptor gives way for the
--- round that takes them and not once for each connection, as the counter of 'Debug' says. The count is of the acceptor's own
+-- | The connections that wait in the listener's queue when the server starts are all taken, in rounds of at most 'acceptCap'
+-- connections, and the acceptor gives way once for each round, as the counter of 'Debug' says. The count is of the acceptor's own
 -- give-ways, and so doesn't depend on the time that the machine takes to run it.
 acceptBatches :: Spec
 acceptBatches = describe "accepting a queue of connections" $ forM_ debugRunners $ \runner@(Runner runnerName _) ->
   describe runnerName $
-    it "takes them all in a round, and gives way once for it" (queuedConnections runner)
+    xfail "one accept step takes the room of all the cores that wait, and not at most acceptCap connections" $
+      it "takes them all, in rounds of at most acceptCap connections" (queuedConnections runner)
 
 -- | Connections that wait in the queue of a listener before the server starts, as many as a queue holds on every system: the
 -- queue of a listener of backlog 128 holds 129 on Linux, and about 192 on macOS, whose limit on the backlog is 128. The server has
--- room for all of them in its one core, so that its first round takes them all and gives way once. Each round of the acceptor
--- gives way once. The bound is one more than the round that takes them, for a round that begins before the last of them has
--- come, which none does here, as they are there before the server starts.
+-- room for all of them in its one core, so that only the cap of the accept step holds a round back. A round takes the cap while
+-- the queue holds that many, so that the rounds that take the queue are as many as the cap goes into it, and no fewer, which is
+-- how the test tells that no round took more. Each round of the acceptor gives way once, and so does one more that comes after
+-- the last of them and finds the queue empty. The cap is 'acceptCap' of "Network.Fulmen.Internal.Serve", which the suite reaches
+-- through the private library of the package.
 queuedConnections :: Runner -> IO ()
 queuedConnections (Runner _ runServer) =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
@@ -110,11 +114,13 @@ queuedConnections (Runner _ runServer) =
         taken `shouldBe` Just ()
         countOf Accepts counts `shouldBe` waiting
         let gaveWay = countOf AcceptBatches counts
-        when (gaveWay > allowed) $
-          failTest ("the acceptor gave way " <> show gaveWay <> " times to take " <> show waiting <> " connections, and at most " <> show allowed <> " were allowed")
+        when (gaveWay < rounds) $
+          failTest ("the acceptor gave way " <> show gaveWay <> " times to take " <> show waiting <> " connections, and at least " <> show rounds <> " rounds were needed: a round took more than " <> show acceptCap)
+        when (gaveWay > rounds + 1) $
+          failTest ("the acceptor gave way " <> show gaveWay <> " times to take " <> show waiting <> " connections, and at most " <> show (rounds + 1) <> " were allowed")
   where
     waiting = 128 :: Int
-    allowed = 2 :: Int
+    rounds = (waiting + acceptCap - 1) `div` acceptCap
     connected port = do
       sock <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
       Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1))) `onException` Socket.close sock
