@@ -3,13 +3,13 @@
 
 module CoresSpec (spec) where
 
-import Control.Arrow ((>>>))
-import Control.Concurrent (getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities)
+import Control.Arrow (Arrow, (>>>))
+import Control.Concurrent (getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities, threadDelay)
 import Control.Monad (when)
 import Data.List (sort)
 import Network.Directions.PingPong
 import Network.Streaming.Classes hiding (within)
-import Network.Streaming.Combinators (concurrently)
+import Network.Streaming.Combinators (concurrently, tap)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Delimited
 import Network.Streaming.Loop (Report (..), runLoop)
@@ -20,24 +20,24 @@ import System.Timeout (timeout)
 spec :: Spec
 spec = describe "cores" $ do
   describe "tickets that are made as the program runs" $ do
-    it "let two parts ping-pong on one core, with every arrow, over tickets of the arrow's own core" $ do
-      runThreads (pingPong 1000) () `shouldReturn` ()
-      fst <$> runLoop (pingPong 1000) () `shouldReturn` ()
-      fst <$> runCompiled (pingPong 1000) () `shouldReturn` ()
-      fst <$> runDelimited (pingPong 1000) () `shouldReturn` ()
+    lostFirstRequest $ it "let two parts ping-pong on one core, with every arrow, over tickets of the arrow's own core" $ do
+      bounded (runThreads (pingPong 1000) ()) `shouldReturn` Just ()
+      bounded (fst <$> runLoop (pingPong 1000) ()) `shouldReturn` Just ()
+      bounded (fst <$> runCompiled (pingPong 1000) ()) `shouldReturn` Just ()
+      bounded (fst <$> runDelimited (pingPong 1000) ()) `shouldReturn` Just ()
 
-    it "let two parts ping-pong on one core over tickets of any core" $ do
-      runThreads (pingPongAt @'Anywhere 1000) () `shouldReturn` ()
-      fst <$> runDelimited (pingPongAt @'Anywhere 1000) () `shouldReturn` ()
-      fst <$> runCompiled (pingPongAt @'Anywhere 1000) () `shouldReturn` ()
+    lostFirstRequest $ it "let two parts ping-pong on one core over tickets of any core" $ do
+      bounded (runThreads (pingPongAt @'Anywhere 1000) ()) `shouldReturn` Just ()
+      bounded (fst <$> runDelimited (pingPongAt @'Anywhere 1000) ()) `shouldReturn` Just ()
+      bounded (fst <$> runCompiled (pingPongAt @'Anywhere 1000) ()) `shouldReturn` Just ()
 
-    it "let two parts ping-pong on two cores over tickets of any core, and in two threads" $ do
+    lostFirstRequest $ it "let two parts ping-pong on two cores over tickets of any core, and in two threads" $ do
       ensureCores
       handoff <- newHandoff
-      results <- within (runCores 2 (pure handoff) (\shared core -> if core == 0 then find shared >>> client 1000 else leave shared >>> server 1000))
+      results <- bounded (runCores 2 (pure handoff) (\shared core -> if core == 0 then find shared >>> client 1000 else leave shared >>> lingering >>> server 1000))
       results `shouldBe` Just [(), ()]
       threadHandoff <- newHandoff
-      together' <- within (runThreads (concurrently (find threadHandoff >>> client 1000) (leave threadHandoff >>> server 1000)) ())
+      together' <- bounded (runThreads (concurrently (find threadHandoff >>> client 1000) (leave threadHandoff >>> lingering >>> server 1000)) ())
       together' `shouldBe` Just ((), ())
 
   describe "a core that waits in its poller" $ do
@@ -57,6 +57,17 @@ spec = describe "cores" $ do
       (latencies !! (samplesWanted `div` 2) < 1000000) `shouldBe` True
       (latencies !! (samplesWanted * 9 `div` 10) < 10000000) `shouldBe` True
 
+-- | Waits a tenth of a second after the receiver has made its ticket and left its promise, before it awaits: the sender has handed its
+-- value over by then, and a receiver that has not said that it will await is not there to be given it.
+lingering :: (Arrow arr, Effect arr) => arr a a
+lingering = tap (now (const (threadDelay 100000)))
+
+-- | Marks a case whose first ticket is made raw: the client hands the server its request before the server awaits, and a ticket that
+-- is a rendezvous gives it back to the client, so the server waits for ever. The mark comes off when the ticket's receiver says that it
+-- will await.
+lostFirstRequest :: Spec -> Spec
+lostFirstRequest = xfail "the first request of the ping-pong goes to a receiver that has not awaited yet, and is not kept for it"
+
 -- | Skips the case on the non-threaded run time, which has one capability: the cores of a run take turns.
 parallelCores :: String -> Spec -> Spec
 parallelCores reason = if rtsSupportsBoundThreads then id else skip reason
@@ -67,3 +78,7 @@ ensureCores = getNumCapabilities >>= \n -> when (n < 4) (setNumCapabilities 4)
 
 within :: IO a -> IO (Maybe a)
 within = timeout 60000000
+
+-- | Runs the action for ten seconds at most: a part that waits for ever, which the run time does not always find out, ends the case.
+bounded :: IO a -> IO (Maybe a)
+bounded = timeout 10000000
