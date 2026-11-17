@@ -20,18 +20,18 @@ import System.Timeout (timeout)
 spec :: Spec
 spec = describe "cores" $ do
   describe "tickets that are made as the program runs" $ do
-    lostFirstRequest $ it "let two parts ping-pong on one core, with every arrow, over tickets of the arrow's own core" $ do
+    it "let two parts ping-pong on one core, with every arrow, over tickets of the arrow's own core" $ do
       bounded (runThreads (pingPong 1000) ()) `shouldReturn` Just ()
       bounded (fst <$> runLoop (pingPong 1000) ()) `shouldReturn` Just ()
       bounded (fst <$> runCompiled (pingPong 1000) ()) `shouldReturn` Just ()
       bounded (fst <$> runDelimited (pingPong 1000) ()) `shouldReturn` Just ()
 
-    lostFirstRequest $ it "let two parts ping-pong on one core over tickets of any core" $ do
+    it "let two parts ping-pong on one core over tickets of any core" $ do
       bounded (runThreads (pingPongAt @'Anywhere 1000) ()) `shouldReturn` Just ()
       bounded (fst <$> runDelimited (pingPongAt @'Anywhere 1000) ()) `shouldReturn` Just ()
       bounded (fst <$> runCompiled (pingPongAt @'Anywhere 1000) ()) `shouldReturn` Just ()
 
-    lostFirstRequest $ it "let two parts ping-pong on two cores over tickets of any core, and in two threads" $ do
+    it "let two parts ping-pong on two cores over tickets of any core, and in two threads" $ do
       ensureCores
       handoff <- newHandoff
       results <- bounded (runCores 2 (pure handoff) (\shared core -> if core == 0 then find shared >>> client 1000 else leave shared >>> lingering >>> server 1000))
@@ -61,12 +61,6 @@ spec = describe "cores" $ do
 -- value over by then, and a receiver that has not said that it will await is not there to be given it.
 lingering :: (Arrow arr, Effect arr) => arr a a
 lingering = tap (now (const (threadDelay 100000)))
-
--- | Marks a case whose first ticket is made raw: the client hands the server its request before the server awaits, and a ticket that
--- is a rendezvous gives it back to the client, so the server waits for ever. The mark comes off when the ticket's receiver says that it
--- will await.
-lostFirstRequest :: Spec -> Spec
-lostFirstRequest = xfail "the first request of the ping-pong goes to a receiver that has not awaited yet, and is not kept for it"
 
 -- | Skips the case on the non-threaded run time, which has one capability: the cores of a run take turns.
 parallelCores :: String -> Spec -> Spec

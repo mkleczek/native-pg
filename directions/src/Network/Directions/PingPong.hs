@@ -48,11 +48,12 @@ server :: (ArrowChoice arr, Annotate arr, Exchange arr r) => Int -> arr (Future 
 server rounds = timesWith rounds (await >>> (\(Ping answer) -> answer) ^>> expect Pong) >>> done
 
 -- | A client and a server, at once, that make this many round trips, over tickets of this reach. They get the two
--- ends of the first ticket. Each round trip makes two tickets, fulfils two and awaits two, and a part waits twice,
--- as parts on one core do when each has to wait for the other. With the reach of the arrow's own core, the
--- parts are on one core; with 'Anywhere' they could be on two, and this runs them on one.
+-- ends of the first ticket, whose receiver, the server, awaits it after the client may have fulfilled it. Each round trip
+-- makes two tickets, fulfils two and awaits two, and a part waits twice, as parts on one core do when each has to wait for
+-- the other. With the reach of the arrow's own core, the parts are on one core; with 'Anywhere' they could be on two, and
+-- this runs them on one.
 pingPongAt :: forall r arr. (ArrowChoice arr, Annotate arr, Concurrent arr, Exchange arr r) => Int -> arr () ()
-pingPongAt rounds = ticket @arr @r >>> together [snd ^>> client rounds, fst ^>> server rounds]
+pingPongAt rounds = awaitedTicket @arr @r >>> together [snd ^>> client rounds, fst ^>> server rounds]
 
 -- | 'pingPongAt' with the reach that costs the least: that of the arrow's own core.
 pingPong :: forall arr. (ArrowChoice arr, Annotate arr, Concurrent arr, Exchange arr (Local arr)) => Int -> arr () ()
@@ -65,9 +66,9 @@ newtype Handoff a = Handoff (IORef (Maybe (Promise 'Anywhere a)))
 newHandoff :: IO (Handoff a)
 newHandoff = Handoff <$> newIORef Nothing
 
--- | Makes a ticket, leaves its promise in the handoff, and keeps the future.
+-- | Makes a ticket whose receiver will await, leaves its promise in the handoff, and keeps the future.
 leave :: (Arrow arr, Effect arr, Exchange arr 'Anywhere) => Handoff a -> arr () (Future arr 'Anywhere a)
-leave (Handoff box) = ticket >>> now (\(end, promise) -> end <$ atomicWriteIORef box (Just promise))
+leave (Handoff box) = awaitedTicket >>> now (\(end, promise) -> end <$ atomicWriteIORef box (Just promise))
 
 -- | Waits, giving way, until a promise is left in the handoff, and returns it.
 find :: (ArrowChoice arr, Effect arr, GiveWay arr, Annotate arr) => Handoff a -> arr () (Promise 'Anywhere a)
