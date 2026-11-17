@@ -7,7 +7,7 @@
 --
 -- It has two modes, which are run as two processes:
 --
--- > fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] [no-idle-timeout] +RTS -T -N2
+-- > fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] [no-idle-timeout] [idle-timeout=MILLISECONDS] +RTS -T -N2
 -- > fulmen-bench client PORT CONNECTIONS SECONDS /16k|/1m [fresh]
 --
 -- The server prints the port it listens on, and serves until it is killed. The client asks the server to note its
@@ -30,6 +30,8 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.Char (toLower)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
+import Data.List (stripPrefix)
+import Data.Maybe (isJust, listToMaybe)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stats (RTSStats (..), getRTSStats)
@@ -38,7 +40,7 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
-import Network.Streaming.Classes (Effect (..), Event (..), Runtime)
+import Network.Streaming.Classes (Effect (..), Event (..), Runtime, millis)
 import Network.Streaming.Combinators (consume)
 import Network.Streaming.Counters (Counter (Captures), Counts, countOf, since, snapshot)
 import Network.Streaming.Delimited (runCores, runCoresM)
@@ -55,10 +57,11 @@ main = do
   args <- getArgs
   case args of
     "server" : kind : cores : connections : options
-      | all (`elem` ["graceful", "no-idle-timeout"]) options -> server ("graceful" `elem` options) ("no-idle-timeout" `elem` options) kind (read cores) (read connections)
+      | all (\option -> option `elem` ["graceful", "no-idle-timeout"] || isJust (stripPrefix "idle-timeout=" option)) options ->
+          server ("graceful" `elem` options) ("no-idle-timeout" `elem` options) (listToMaybe [read milliseconds | Just milliseconds <- map (stripPrefix "idle-timeout=") options]) kind (read cores) (read connections)
     ["client", port, connections, seconds, path] -> client False (read port) (read connections) (read seconds) (C.pack path)
     ["client", port, connections, seconds, path, "fresh"] -> client True (read port) (read connections) (read seconds) (C.pack path)
-    _ -> die "usage: fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] [no-idle-timeout] | client PORT CONNECTIONS SECONDS /16k|/1m [fresh]"
+    _ -> die "usage: fulmen-bench server delimited|delimited-debug|threads CORES CONNECTIONS [graceful] [no-idle-timeout] [idle-timeout=MILLISECONDS] | client PORT CONNECTIONS SECONDS /16k|/1m [fresh]"
 
 -- * The server
 
@@ -72,9 +75,9 @@ data Counters = Counters
 
 -- | The server. With @graceful@ it has an event to shut down on, which nothing fires, so that the cost of a shutdown that is
 -- possible is measured. With @no-idle-timeout@ it has no idle timeout, which the default settings have, so that the cost of one is
--- measured.
-server :: Bool -> Bool -> String -> Int -> Int -> IO ()
-server graceful noIdleTimeout kind cores connections = do
+-- measured. With @idle-timeout=MILLISECONDS@ the idle timeout is that long and not the default's.
+server :: Bool -> Bool -> Maybe Word64 -> String -> Int -> Int -> IO ()
+server graceful noIdleTimeout idleMilliseconds kind cores connections = do
   hSetBuffering stdout LineBuffering
   listening <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
   Socket.setSocketOption listening Socket.ReuseAddr 1
@@ -96,7 +99,7 @@ server graceful noIdleTimeout kind cores connections = do
           { Fulmen.bufferPool = BufferPoolSettings size ordinary reserve setup,
             Fulmen.connectionsPerCore = connections,
             Fulmen.clientTimeout = Nothing,
-            Fulmen.idleTimeout = if noIdleTimeout then Nothing else Fulmen.idleTimeout Fulmen.defaultSettings,
+            Fulmen.idleTimeout = if noIdleTimeout then Nothing else maybe (Fulmen.idleTimeout Fulmen.defaultSettings) (Just . millis) idleMilliseconds,
             Fulmen.shutdown = if graceful then Just event else Nothing
           }
   shared <- Fulmen.newCores settings cores
