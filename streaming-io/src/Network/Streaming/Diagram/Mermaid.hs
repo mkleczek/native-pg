@@ -1,10 +1,10 @@
 {-# LANGUAGE LambdaCase #-}
 
--- | Draws a program of the "Network.Streaming.Diagram" arrow as Mermaid flowcharts: one chart for each named box. A
--- named box is a single node in the chart of the box it is in, which links to the chart of its own. The charts are
--- printed from the graphs of "Network.Streaming.Diagram.Graph", which has the walk of the tree: Mermaid has no pins, so a
--- name that Graphviz draws as a pin is a node here, or a box that holds the nodes of its parts, and the text of an edge is
--- its label.
+-- | Draws a program of the "Network.Streaming.Diagram" arrow as one chart for each named box: a page. A named box is a single
+-- node in the chart of the box it is in, which links to the chart of its own. The charts are printed from the graphs of
+-- "Network.Streaming.Diagram.Graph", which has the walk of the tree, as Mermaid flowcharts, which Mermaid has no pins for, so
+-- that a name that Graphviz draws as a pin is a node here, or a box that holds the nodes of its parts, and the text of an edge
+-- is its label, and as Graphviz DOT, which the document of the pages is drawn from.
 module Network.Streaming.Diagram.Mermaid
   ( Page (..),
     pages,
@@ -25,6 +25,7 @@ import Network.Streaming.Annotate (Side (..))
 import Network.Streaming.Classes (Label (..))
 import Network.Streaming.Diagram
 import Network.Streaming.Diagram.Graph
+import Network.Streaming.Diagram.Graphviz (dot)
 import Network.Streaming.Structure (children)
 import System.Mem.StableName (makeStableName)
 
@@ -42,6 +43,10 @@ data Page = Page
     pageMermaid :: String,
     -- | The chart with the plumbing: a step on a part of a value has a split, a join, and an edge past it.
     pagePlumbing :: String,
+    -- | The graph of the chart, in Graphviz's DOT, without the plumbing.
+    pageDot :: String,
+    -- | The graph of the chart with the plumbing, in DOT.
+    pageDotPlumbing :: String,
     -- | How many actions in the chart have no name, and are drawn as "IO".
     pageUnnamed :: Int,
     -- | How many decisions in the chart have no question, and are drawn as "choose".
@@ -104,6 +109,8 @@ pages program = fmap page <$> sheets program
         (sheetParent sheet)
         (chart (sheetFlow sheet))
         (chart (sheetPlumbing sheet))
+        (dot (sheetFlow sheet))
+        (dot (sheetPlumbing sheet))
         (sheetUnnamed sheet)
         (sheetUnquestioned sheet)
         (sheetFolds sheet)
@@ -235,9 +242,9 @@ groupsOf kind items = concat [[node | found == kind] ++ groupsOf kind inner | Gr
 
 -- * The document
 
--- | A document of one section for each page, with a tree of the pages to find them in, and Mermaid to draw them. Each
--- page has its chart without the plumbing and with it, and a switch at the top shows one or the other. The title is the
--- document's.
+-- | A document of one section for each page, with a tree of the pages to find them in, and Graphviz, in the browser, to draw
+-- them from their DOT, each on a card of its own that is light in the dark mode too. Each page has its graph without the
+-- plumbing and with it, and a switch at the top shows one or the other. The title is the document's.
 html :: String -> [Page] -> String
 html title docPages =
   unlines
@@ -260,16 +267,22 @@ html title docPages =
       "<main>",
       concatMap section docPages,
       "</main>",
-      "<script src=\"https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js\"></script>",
+      "<script src=\"https://cdn.jsdelivr.net/npm/@viz-js/viz@3.31.0/dist/viz-global.js\"></script>",
       "<script>",
-      "mermaid.initialize({ startOnLoad: false, securityLevel: 'loose',",
-      "  theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default' });",
-      "// The charts are drawn while all are visible, as Mermaid draws a chart of no size in a box that is hidden.",
       "const plumbing = document.getElementById('plumbing');",
       "const show = () => document.body.classList.toggle('plumbing', plumbing.checked);",
       "plumbing.addEventListener('change', show);",
-      "mermaid.run({ querySelector: '.mermaid', suppressErrors: true })",
-      "  .then(() => { document.body.classList.add('ready'); show(); });",
+      "// Each DOT is drawn in a card that takes its place and has its views.",
+      "Viz.instance().then((viz) => {",
+      "  for (const source of document.querySelectorAll('pre.dot')) {",
+      "    const card = document.createElement('div');",
+      "    card.className = 'diagram ' + source.className.replace('dot', '').trim();",
+      "    card.appendChild(viz.renderSVGElement(source.textContent));",
+      "    source.replaceWith(card);",
+      "  }",
+      "  document.body.classList.add('ready');",
+      "  show();",
+      "}).catch((error) => { console.error(error); });",
       "</script>",
       "</body>",
       "</html>"
@@ -289,13 +302,14 @@ section page =
       "</section>"
     ]
 
--- | The charts of the page: the one that has no plumbing, and the one that has it, which is left out if it is the same.
+-- | The graphs of the page, as the DOT that the script draws: the one that has no plumbing, and the one that has it, which is
+-- left out if it is the same.
 charts :: Page -> String
 charts page
-  | pageMermaid page == pagePlumbing page = chartOf "" (pageMermaid page)
-  | otherwise = chartOf "view-default" (pageMermaid page) ++ chartOf "view-plumbing" (pagePlumbing page)
+  | pageDot page == pageDotPlumbing page = chartOf "" (pageDot page)
+  | otherwise = chartOf "view-default" (pageDot page) ++ chartOf "view-plumbing" (pageDotPlumbing page)
   where
-    chartOf kind text = "<pre class=\"mermaid " ++ kind ++ "\">\n" ++ htmlText text ++ "</pre>\n"
+    chartOf kind text = "<pre class=\"dot " ++ kind ++ "\">\n" ++ htmlText text ++ "</pre>\n"
 
 -- | A paragraph of the text, of a kind of the style's, which is nothing for no text.
 paragraph :: String -> String -> String
@@ -346,7 +360,9 @@ stylesheet =
       "a { color: #0969da; }",
       ".comment { margin: 0.25rem 0; }",
       ".source, .up { margin: 0.25rem 0; font-size: 0.85em; color: #57606a; }",
-      "pre.mermaid { overflow-x: auto; }",
+      "pre.dot { display: none; }",
+      ".diagram { background: #ffffff; border: 1px solid #d0d7de; border-radius: 6px; padding: 0.75rem; overflow-x: auto; }",
+      ".diagram svg { max-width: 100%; height: auto; }",
       ".switch { display: block; margin-bottom: 0.75rem; }",
       "body.ready .view-plumbing, body.ready.plumbing .view-default { display: none; }",
       "body.ready.plumbing .view-plumbing { display: block; }",
