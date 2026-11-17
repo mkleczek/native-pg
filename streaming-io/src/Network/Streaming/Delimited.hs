@@ -401,6 +401,8 @@ type instance ModeOf (DelimitedM m s) = m
 instance Exchange (DelimitedM m s) ('Here s) where
   newtype Future (DelimitedM m s) ('Here s) a = HereFuture (IORef (Slot a))
   ticket = Delimited (\_ () -> newSlot >>= \slot -> pure (HereFuture slot, HerePromise slot))
+  ticketAwaited = Delimited (\_ () -> newAwaitedSlot >>= \slot -> pure (HereFuture slot, HerePromise slot))
+  {-# INLINE ticketAwaited #-}
   await = Delimited $ \context@(Context run tag part) (HereFuture slot) -> awaitFrom hereSeat run part slot (step context *>) pure (control0 tag)
   fulfil = Delimited (\context (promise, value) -> fulfilNow promise value <* step context)
   abandon = Delimited (\_ (HereFuture slot) -> abandonTicket hereSeat slot)
@@ -416,6 +418,8 @@ instance Exchange (DelimitedM m s) ('Here s) where
 instance Exchange (DelimitedM m s) 'Anywhere where
   newtype Future (DelimitedM m s) 'Anywhere a = AnywhereFuture (IORef (Slot a))
   ticket = Delimited (\_ () -> newSlot >>= \slot -> pure (AnywhereFuture slot, AnywherePromise slot))
+  ticketAwaited = Delimited (\_ () -> newAwaitedSlot >>= \slot -> pure (AnywhereFuture slot, AnywherePromise slot))
+  {-# INLINE ticketAwaited #-}
   await = Delimited $ \context@(Context run tag part) (AnywhereFuture slot) -> awaitFrom anywhereSeat run part slot (step context *>) pure (control0 tag)
   fulfil = Delimited (\context (promise, value) -> fulfilNow promise value <* step context)
   abandon = Delimited (\_ (AnywhereFuture slot) -> abandonTicket anywhereSeat slot)

@@ -91,7 +91,7 @@ module Network.Streaming.Classes
   )
 where
 
-import Control.Arrow (ArrowChoice, second, (>>>), (^>>))
+import Control.Arrow (Arrow, ArrowChoice, first, second, (>>>), (^>>))
 import Control.Exception (Exception, SomeException, fromException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -218,6 +218,11 @@ class (Fulfilling r) => Exchange arr (r :: Reach) where
 
   -- | The ends of a new ticket, made on this core.
   ticket :: arr () (Future arr r a, Promise r a)
+
+  -- | A new ticket whose receiver is already committed to await. A value fulfilled before the await is held for it.
+  ticketAwaited :: Arrow arr => arr () (Future arr r a, Promise r a)
+  ticketAwaited = ticket >>> first willAwait
+  {-# INLINE ticketAwaited #-}
 
   -- | Waits until a sender hands a value over, and returns it. Only on the core that made the ticket, which the arrow's type says.
   await :: arr (Future arr r a) a
