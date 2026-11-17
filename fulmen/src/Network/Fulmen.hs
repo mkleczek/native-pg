@@ -1,9 +1,10 @@
 {-# LANGUAGE DataKinds #-}
 
 -- | An HTTP/1.1 server whose connections are served by parts that are spawned as the connections are accepted: each
--- core spawns a connection worker for each connection that the acceptor delivers to it, up to its share of the
--- connection cap, and the acceptor, which waits until some core has room, delivers each connection that it accepts to
--- the core that has the fewest. A connection worker serves its connection with a request direction, which parses the
+-- core spawns a connection worker for each connection that the acceptor gives it, up to its share of the connection cap,
+-- and the acceptor, which waits until some core has room, accepts as many connections as the cores that wait have room
+-- for, in one step that never waits, and gives each core its share, so that the cores have as many connections as one
+-- another. A connection worker serves its connection with a request direction, which parses the
 -- head and hands the body on piece by piece, and an answer direction, which runs the handler; a connection that waits
 -- for its next request holds no buffer.
 --

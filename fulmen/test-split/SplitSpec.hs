@@ -18,31 +18,30 @@ spec = describe "sharing a batch of connections between the cores" $ do
     shares 7 [(3, 1), (0, 4)] `shouldBe` [1, 4]
     shares 5 [(0, 1), (0, 4)] `shouldBe` [1, 4]
 
-  xfail "the first version fills the cores in order" $ do
-    it "gives a connection to the core that has the fewest" $ do
-      shares 1 [(3, 4), (0, 4)] `shouldBe` [0, 1]
-      shares 1 [(0, 4), (3, 4)] `shouldBe` [1, 0]
+  it "gives a connection to the core that has the fewest" $ do
+    shares 1 [(3, 4), (0, 4)] `shouldBe` [0, 1]
+    shares 1 [(0, 4), (3, 4)] `shouldBe` [1, 0]
 
-    it "gives the connections of a batch to the cores so that they have as many as one another afterwards" $ do
-      shares 4 [(0, 4), (0, 4)] `shouldBe` [2, 2]
-      shares 6 [(0, 4), (2, 4)] `shouldBe` [4, 2]
-      shares 3 [(2, 4), (0, 4)] `shouldBe` [0, 3]
+  it "gives the connections of a batch to the cores so that they have as many as one another afterwards" $ do
+    shares 4 [(0, 4), (0, 4)] `shouldBe` [2, 2]
+    shares 6 [(0, 4), (2, 4)] `shouldBe` [4, 2]
+    shares 3 [(2, 4), (0, 4)] `shouldBe` [0, 3]
 
-    it "gives the connection to the core that has waited longest, the last of the cores, when they have as many" $ do
-      shares 1 [(1, 3), (1, 3)] `shouldBe` [0, 1]
-      shares 2 [(1, 3), (1, 3), (1, 3)] `shouldBe` [0, 1, 1]
+  it "gives the connection to the core that has waited longest, the last of the cores, when they have as many" $ do
+    shares 1 [(1, 3), (1, 3)] `shouldBe` [0, 1]
+    shares 2 [(1, 3), (1, 3), (1, 3)] `shouldBe` [0, 1, 1]
 
-    it "gives all that the room allows, within the room of each core, and as evenly as the room allows, for every small case" $
-      forM_ cases $ \(sockets, cores) -> do
-        let given = shares sockets cores
-            rooms = map snd cores
-            after = zipWith (\(have, _) more -> have + more) cores given
-        length given `shouldBe` length cores
-        sum given `shouldBe` min sockets (sum rooms)
-        forM_ (zip given rooms) $ \(more, room) -> (more >= 0 && more <= room) `shouldBe` True
-        -- No socket could be moved from a core that was given one to a core that has room, and leave them more even.
-        forM_ [(giving, receiving) | giving <- zip3 given after rooms, receiving <- zip3 given after rooms] $ \((more, mine, _), (taken, theirs, room)) ->
-          (more == 0 || taken == room || mine <= theirs + 1) `shouldBe` True
+  it "gives all that the room allows, within the room of each core, and as evenly as the room allows, for every small case" $
+    forM_ cases $ \(sockets, cores) -> do
+      let given = shares sockets cores
+          rooms = map snd cores
+          after = zipWith (\(have, _) more -> have + more) cores given
+      length given `shouldBe` length cores
+      sum given `shouldBe` min sockets (sum rooms)
+      forM_ (zip given rooms) $ \(more, room) -> (more >= 0 && more <= room) `shouldBe` True
+      -- No socket could be moved from a core that was given one to a core that has room, and leave them more even.
+      forM_ [(giving, receiving) | giving <- zip3 given after rooms, receiving <- zip3 given after rooms] $ \((more, mine, _), (taken, theirs, room)) ->
+        (more == 0 || taken == room || mine <= theirs + 1) `shouldBe` True
   where
     -- One to three cores, with up to three connection workers and room for up to three more, and up to eight sockets.
     cases = [(sockets, cores) | cores <- coresOf 3, sockets <- [0 .. 8]]

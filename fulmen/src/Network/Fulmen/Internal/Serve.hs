@@ -11,16 +11,18 @@
 -- | The server as a network of parts whose connection workers are spawned as the connections are accepted. The first
 -- core has the acceptor, which opens the listener when the server starts and closes it when it ends, and each core has
 -- a group of connection workers. A core that has room for another connection, which is to have fewer connection workers
--- than its share of the cap, puts itself in the pool of the cores that wait, with the promise of a socket, and waits.
--- The acceptor waits until some core waits, accepts a connection, and delivers its socket to the waiting core that has
--- the fewest connection workers then, the one that has waited longest if several have as few: the connections are
--- shared out between the cores by what is true when they are accepted, and nothing is made for a connection before it
--- is there. The core spawns a connection worker for the socket, which serves the connection, request after request,
--- until it ends, and tells the core that it has room again. While every core is full the acceptor accepts nothing, so
--- that past the cap on connections they wait in the listen backlog. A connection that waits for its next request for
--- longer than the idle timeout is closed, so that the connections that wait in the backlog are served though the ones
--- that have a connection worker are idle: the connection has a watcher beside the part that serves its requests, which
--- sleeps until the connection can have waited that long, and ends it if it has.
+-- than its share of the cap, puts itself in the pool of the cores that wait, with the promise of a batch of sockets, and
+-- waits. In each round the acceptor waits until some core waits, takes all the cores that wait, accepts as many
+-- connections as they have room for, in one step that never waits, and shares them out between the cores by how many
+-- connection workers each has then, so that they have as many as one another afterwards, as far as their room allows. It
+-- gives each core its batch in one hand-over, and puts back the cores that have none: connections are shared out by what
+-- is true when they are accepted, and nothing is made for a connection before it is there. The core counts its batch, and
+-- spawns a connection worker for each socket, giving way between them, and a connection worker serves its connection,
+-- request after request, until it ends, and tells the core that it has room again. While every core is full the acceptor
+-- accepts nothing, so that past the cap on connections they wait in the listen backlog. A connection that waits for its
+-- next request for longer than the idle timeout is closed, so that the connections that wait in the backlog are served
+-- though the ones that have a connection worker are idle: the connection has a watcher beside the part that serves its
+-- requests, which sleeps until the connection can have waited that long, and ends it if it has.
 --
 -- A request is read into the primary buffer that it was admitted with. The bytes that follow it in the buffer, which
 -- belong to the next request on the connection, are copied out before the buffer is used for anything else, and
@@ -30,7 +32,7 @@ module Network.Fulmen.Internal.Serve
   )
 where
 
-import Control.Arrow (arr, first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
+import Control.Arrow (arr, first, returnA, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Exception (SomeException, fromException, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
@@ -38,7 +40,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BU
 import qualified Data.IntMap.Strict as IntMap
-import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (plusForeignPtr, withForeignPtr)
@@ -53,9 +55,11 @@ import Network.Fulmen.Internal.Bytes (equalsLower)
 import Network.Fulmen.Internal.Date (beginDraining)
 import Network.Fulmen.Internal.Head (Framing (..), Parsed (..), Scan (..), Spill (..), joined, notYet, parseHead, scanHead, startScan)
 import Network.Fulmen.Internal.Response (Exchange (..), Phase (..), newExchange, refusal)
+import Network.Fulmen.Internal.Split (shares)
 import Network.Fulmen.Listen (Listen (..))
 import Network.Fulmen.Request (Method (..), Request (..), Version (..))
 import Network.Socket (SockAddr (..), Socket, getPeerName)
+import qualified Network.Socket as Socket
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators
@@ -78,19 +82,19 @@ import Network.Streaming.Combinators
     whether,
     withTicket,
   )
-import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (group, spawn))
+import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (Group, group, spawn))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
 import Network.Streaming.Named (Inj, casesBy, field, inj, is, newRecord, type (=:), (:=), (?>))
-import Network.Streaming.Pool (checkoutIn, releaseNow, takeNowWith)
-import Network.Streaming.Wiring (choice, result, (-<), (<:))
+import Network.Streaming.Pool (checkoutIn, releaseNow, takeNow)
+import Network.Streaming.Wiring (choice, flow, result, (-<), (<:))
 
 -- | The server: for each core, its connection workers, and for the first, the acceptor, which opens the listener.
 serve :: (Runtime arr) => Settings -> Listen arr -> arr (Call, Request) () -> arr Cores ()
 serve !settings listen handler =
   named (Label "serve" "Runs the connection workers of each core, and the acceptor besides on the first core.") $
     decide "first core?" (whether isFirst)
-      >>> ("yes" |- shutting [acceptance listen, workers] ||| "no" |- shutting [workers])
+      >>> ("yes" |- shutting [acceptance settings listen, workers] ||| "no" |- shutting [workers])
   where
     workers = connectionWorkers settings handler
     isFirst (Cores core _) = core == 0
@@ -114,61 +118,93 @@ beginning event =
 
 -- * The acceptor
 
--- | Opens the listener, and then waits until some core waits for a connection, accepts one, and delivers its socket to
--- the waiting core that has the fewest connection workers, for ever. The listener is closed when the acceptor ends,
--- however it ends.
-acceptance :: (Runtime arr) => Listen arr -> arr Cores ()
-acceptance Listen {openListener, closeListener} =
-  named (Label "acceptance" "Opens the listener, waits until a core waits for a connection, accepts one, and delivers it to the waiting core that has the fewest connection workers.") $
+-- | Opens the listener, and then, round after round for ever, takes the cores that wait for connections, accepts as many as
+-- they have room for, and gives each core its share. The listener is closed when the acceptor ends, however it ends.
+acceptance :: (Runtime arr) => Settings -> Listen arr -> arr Cores ()
+acceptance settings Listen {openListener, closeListener} =
+  named (Label "acceptance" "Opens the listener, and for ever takes the cores that wait for connections, accepts as many as they have room for, and gives each core its share.") $
     scope (done >>> openListener -| "listener") (fst ^>> closeListener) $
-      tap (step "make listener non-blocking" (listening . fst)) >>> foreverA (tap place)
-  where
-    place =
-      tap (snd ^>> untilWanted)
-        >>> (is "socket" (fst ^>> accept) &&& is "cores" (arr snd))
-        >>> deliver
-    accept =
-      named (Label "accept" "Accepts the next connection of the listening socket, and blocks while none is waiting.") acceptor
+      tap (step "make listener non-blocking" (listening . fst)) >>> foreverA (tap (acceptRound settings))
 
--- | Waits until some core waits for a connection, and takes none: the core that the pool gives is put back.
-untilWanted :: (Runtime arr) => arr Cores ()
+-- | A round of the acceptor: it waits until some core waits for connections and takes all that wait, accepts as many connections
+-- as they have room for, which is none until one comes, shares them out between the cores, and hands each core its batch.
+acceptRound :: (Runtime arr) => Settings -> arr (Socket, Cores) ()
+acceptRound settings =
+  named (Label "round" "Takes the cores that wait for connections, accepts as many connections as they have room for, and hands each core its share.") $
+    uncurry (newRecord ["listener", "cores"])
+      ^>> flow
+        ( "waiting"  <: untilWanted -< ["cores"]                           >>>
+          "capacity" <: adding      -< ["waiting", "cores"]                >>>
+          "sockets"  <: accept      -< ["capacity", "listener"]            >>>
+          ["batches", "idle"]
+                     <: sharing'    -< ["waiting", "sockets", "cores"]     >>>
+          putting                   -< ["idle", "cores"]                   >>>
+          handing                   -< ["batches"]
+        )
+      >>> done
+  where
+    adding = step "add up the room of the cores" (capacityOf settings)
+    accept = named (Label "accept" "Accepts the connections that wait, as many as the capacity, and blocks while none is waiting.") acceptor
+    sharing' = step "share the sockets out between the cores" (sharing settings)
+    putting = step "put back the cores that have no share" putBack
+    handing = answering "connection" (step "hand over the batches" handOver)
+
+-- | Waits until some core waits for connections, and takes all the cores that wait, the one that waited longest last.
+untilWanted :: (Runtime arr, HasField "cores" r Cores) => arr r [Waiting]
 untilWanted =
-  named (Label "until wanted" "Waits until some core waits for a connection, and takes none: the core that the pool gives is put back.") $
-    (\(Cores _ shared) -> sharedWaiting shared)
+  named (Label "until wanted" "Waits until some core waits for connections, and takes all the cores that wait.") $
+    (\r -> case r.cores of Cores _ shared -> sharedWaiting shared)
       ^>> alongside checkoutIn
-      >>> step "put the core back" (\(waiting, pool) -> releaseNow pool [waiting])
-
--- | Gives the socket to the waiting core that has the fewest connection workers now, the next if that core has stopped
--- waiting, and closes the socket if no core waits, which is so when the server is shutting down.
-deliver :: (Runtime arr, HasField "socket" r Socket, HasField "cores" r Cores) => arr r ()
-deliver =
-  named (Label "deliver" "Gives the socket to the waiting core that has the fewest connection workers, the next if that one has stopped waiting, and closes it if none waits.") loop
+      >>> step "take the other waiting cores" (\(waiting, pool) -> (waiting :) <$> takeWaiting pool [])
   where
-    loop =
-      alongside (step "take the least busy waiting core" takeLeastBusy)
-        >>> decide "core waiting?" (\(taken, r) -> maybe (Left r.socket) (Right . (,r)) taken)
-        >>> ("no" |- close ||| "yes" |- (delivering -| "taken?" >>> ("stopped waiting" |- loop ||| "taken" |- returnA)))
-    delivering =
-      (\(waiting, r) -> ((waitingPromise waiting, r.socket), r))
-        ^>> first (answering "connection" fulfil)
-        >>^ \(taken, r) -> if taken then Right () else Left r
-    takeLeastBusy r = case r.cores of
-      Cores _ shared -> readCounts shared >>= \counts -> takeNowWith (leastBusy counts) (sharedWaiting shared)
+    takeWaiting pool taken = takeNow pool 1 >>= maybe (pure (reverse taken)) (\waiting -> takeWaiting pool (waiting : taken))
+
+-- | How many connections the cores that wait have room for: their share of the cap, less the connection workers that they have.
+capacityOf :: (HasField "waiting" r [Waiting], HasField "cores" r Cores) => Settings -> r -> IO Int
+capacityOf settings r = case r.cores of
+  Cores _ shared -> (\counts -> sum [connectionsPerCore settings - liveOf counts core | Waiting core _ <- r.waiting]) <$> readCounts shared
+
+-- | The batch of each core that is given sockets, and the cores that are given none, from how many connection workers each core has now.
+sharing ::
+  (HasField "waiting" r [Waiting], HasField "sockets" r [Socket], HasField "cores" r Cores) =>
+  Settings ->
+  r ->
+  IO ([(Waiting, [Socket])], [Waiting])
+sharing settings r = case r.cores of
+  Cores _ shared -> do
+    counts <- readCounts shared
+    let loads = [(live, connectionsPerCore settings - live) | Waiting core _ <- r.waiting, let live = liveOf counts core]
+    pure (parcel [] [] r.waiting (shares (length r.sockets) loads) r.sockets)
+  where
+    parcel batches spare cores given sockets = case (cores, given) of
+      (core : others, count : counts)
+        | count <= 0 -> parcel batches (core : spare) others counts sockets
+        | otherwise -> case splitAt count sockets of (mine, rest) -> parcel ((core, mine) : batches) spare others counts rest
+      _ -> (reverse batches, reverse spare)
+
+-- | Puts the cores that were given no sockets back in the pool of the cores that wait, as they were.
+putBack :: (HasField "idle" r [Waiting], HasField "cores" r Cores) => r -> IO ()
+putBack r = case r.cores of
+  Cores _ shared -> unless (null r.idle) (releaseNow (sharedWaiting shared) r.idle)
+
+-- | Gives each core its batch, in one action that never waits, so that no socket is lost to a cancellation between two cores. A batch
+-- whose core has stopped waiting is closed, which is so when the server is shutting down.
+handOver :: (HasField "batches" r [(Waiting, [Socket])]) => r -> IO ()
+handOver r =
+  forM_ r.batches $ \(Waiting _ promise, sockets) ->
+    fulfilNow promise sockets >>= \taken -> unless taken (closeAll sockets)
+
+-- | Closes the sockets.
+closeAll :: [Socket] -> IO ()
+closeAll = mapM_ Socket.close
 
 -- | How many connection workers each core has, by the core's number.
 readCounts :: Shared -> IO (IntMap.IntMap Int)
 readCounts shared = traverse (fmap (\(Count live _) -> live) . readIORef) (sharedCounts shared)
 
--- | The position of the core that has the fewest connection workers, in the order that the pool gives the waiting cores
--- in: the one that waited least comes first, so the one that has waited longest of those that tie is the last of them.
-leastBusy :: IntMap.IntMap Int -> [Waiting] -> Maybe Int
-leastBusy counts waiting = snd <$> foldl' pick Nothing (zip [0 :: Int ..] waiting)
-  where
-    pick best (position, Waiting core _) = case best of
-      Just (fewest, _) | live > fewest -> best
-      _ -> Just (live, position)
-      where
-        live = IntMap.findWithDefault 0 core counts
+-- | How many connection workers the core has, by the counts of the cores.
+liveOf :: IntMap.IntMap Int -> Int -> Int
+liveOf counts core = IntMap.findWithDefault 0 core counts
 
 -- * The connection workers
 
@@ -176,22 +212,61 @@ leastBusy counts waiting = snd <$> foldl' pick Nothing (zip [0 :: Int ..] waitin
 countOf :: Shared -> Int -> IORef Count
 countOf shared core = sharedCounts shared IntMap.! core
 
--- | The connection workers of the core: while the core has room, it waits for the next connection, and spawns a
--- connection worker for it, for ever. When it is cancelled it waits for its connection workers to end.
+-- | The connection workers of the core: while the core has room, it waits for a batch of connections, and spawns a
+-- connection worker for each, for ever. When it is cancelled it waits for its connection workers to end.
 connectionWorkers :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
 connectionWorkers settings handler =
-  named (Label "connection workers" "Waits for the core to have room and then for a connection, and spawns a connection worker for it, for ever.") $
-    group
-      AwaitAll
-      ( foreverA
-          ( tap (snd ^>> untilRoom settings)
-              >>> tap (second pulled >>> spawn (connectionWorker settings handler))
-          )
-      )
+  named (Label "connection workers" "Waits for the core to have room and then for a batch of connections, and spawns a connection worker for each, for ever.") $
+    group AwaitAll (foreverA (tap (spawning settings handler))) >>> done
+
+-- | A round of the core: it waits until it has room, waits for a batch of connections, counts the connection workers that the batch
+-- will make, and spawns them.
+spawning ::
+  (Runtime arr) =>
+  Settings ->
+  arr (Call, Request) () ->
+  arr (Group arr s AwaitAll, Cores) ()
+spawning settings handler =
+  named (Label "spawning" "Waits for room and for a batch of connections, counts the batch, and spawns a connection worker for each socket.") $
+    uncurry (newRecord ["group", "cores"])
+      ^>> flow
+        ( roomed              -< ["cores"]                  >>>
+          "sockets" <: pulled -< ["cores"]                  >>>
+          counting            -< ["sockets", "cores"]       >>>
+          started             -< ["group", "sockets", "cores"]
+        )
       >>> done
   where
-    pulled = pull >>> tap (step "count the connection worker" counted)
-    counted r = update (countOf r.shared r.core) (\(Count live waiter) -> (Count (live + 1) waiter, ()))
+    roomed = field "cores" >>> untilRoom settings
+    pulled = field "cores" >>> pull
+    counting = step "count the connection workers" counted
+    started = starting settings handler
+    counted r = case r.cores of
+      Cores core shared -> update (countOf shared core) (\(Count live waiter) -> (Count (live + length r.sockets) waiter, ()))
+
+-- | Spawns a connection worker for each socket of the batch, one at a time, giving way before each, so that the other parts of the core
+-- run between them when the batch is large. The sockets that have no connection worker when this ends, which it does as it is cancelled,
+-- are closed and taken off the count.
+starting ::
+  forall arr s r.
+  (Runtime arr, HasField "group" r (Group arr s AwaitAll), HasField "sockets" r [Socket], HasField "cores" r Cores) =>
+  Settings ->
+  arr (Call, Request) () ->
+  arr r ()
+starting settings handler =
+  named (Label "start workers" "Spawns a connection worker for each socket of the batch, giving way before each, and closes the sockets that were not given one if it is cancelled.") $
+    scope
+      (step "keep the sockets" (\r -> (,) <$> newIORef r.sockets <*> pure r.cores))
+      (step "close the sockets that have no connection worker" unstarted)
+      (iterateWith (giveWay >>> step "take the next socket" takeNext -| "socket left?") (consume (spawn (connectionWorker settings handler))))
+  where
+    takeNext ((kept, cores@(Cores core shared)), r) =
+      atomicModifyIORef' kept (\sockets -> case sockets of [] -> ([], Nothing); socket : others -> (others, Just socket)) >>= \case
+        Nothing -> pure (Finish ())
+        Just socket -> pure (Again ((r.group, newRecord ["socket", "shared", "core"] socket shared core), ((kept, cores), r)))
+    unstarted ((kept, Cores core shared), _) = do
+      left <- readIORef kept
+      unless (null left) (closeAll left *> leaving (length left) shared core)
 
 -- | Waits until the core has room for another connection worker: fewer than its share of the cap. If it has none, the
 -- part leaves the promise of a ticket in the count of the core, which the end of one of its connection workers fulfils,
@@ -212,14 +287,12 @@ untilRoom settings =
         if live < connectionsPerCore settings then (count, True) else (Count live (Just promise), False)
       when room (void (fulfilNow promise ()))
 
--- | Puts the core in the pool of the cores that wait for a connection, with the promise of the socket, and waits for
--- the acceptor to deliver one: the socket, with what the connection worker is given. A socket that is delivered when
--- the wait was cancelled is closed.
-pull :: (Runtime arr) => arr Cores ("socket" := Socket, ("shared" := Shared, "core" := Int))
+-- | Puts the core in the pool of the cores that wait for connections, with the promise of a batch of sockets, and waits for the
+-- acceptor to give one. A batch that is given when the wait was cancelled is closed.
+pull :: (Runtime arr) => arr Cores [Socket]
 pull =
-  named (Label "pull" "Puts the core in the pool of the cores that wait for a connection, and waits for the acceptor to deliver one.") $
-    alongside (asking "connection" (withTicket (step "wait in the pool of cores" waiting) (fst ^>> close)))
-      >>^ \(((), socket), Cores core shared) -> newRecord ["socket", "shared", "core"] socket shared core
+  named (Label "pull" "Puts the core in the pool of the cores that wait for connections, and waits for the acceptor to give it a batch.") $
+    asking "connection" (withTicket (step "wait in the pool of cores" waiting) (fst ^>> step "close the sockets" closeAll)) >>^ snd
   where
     waiting (promise, Cores core shared) = releaseNow (sharedWaiting shared) [Waiting core promise]
 
@@ -231,11 +304,13 @@ connectionWorker ::
   arr r ()
 connectionWorker settings handler =
   named (Label "connection worker" "Serves one connection, and when it ends, however it ends, tells its core that it has room for another.") $
-    scope returnA (fst ^>> step "tell the core that it has room" leaving) (snd ^>> connection settings handler)
-  where
-    leaving r = do
-      waiter <- update (countOf r.shared r.core) (\(Count live waiting) -> (Count (live - 1) Nothing, waiting))
-      forM_ waiter (\promise -> void (fulfilNow promise ()))
+    scope returnA (fst ^>> step "tell the core that it has room" (\r -> leaving 1 r.shared r.core)) (snd ^>> connection settings handler)
+
+-- | Takes this many connection workers off the count of the core, and tells the part that waits for room, if one does.
+leaving :: Int -> Shared -> Int -> IO ()
+leaving workers shared core = do
+  waiter <- update (countOf shared core) (\(Count live waiting) -> (Count (live - workers) Nothing, waiting))
+  forM_ waiter (\promise -> void (fulfilNow promise ()))
 
 -- | What a connection is: its socket, the bytes of the next request that came early, which a request copies out of
 -- its buffer, what the cores share, and the address that it came from.

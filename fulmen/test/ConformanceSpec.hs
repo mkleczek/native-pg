@@ -39,7 +39,7 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateA, iterateWith, keeping, sleep, tap)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, done, foreverA, iterateA, iterateWith, keeping, sleep, tap)
 import Network.Streaming.Counters (Counter (..), countOf, since, snapshot)
 import Network.Streaming.Compiled (runCompiled, runCompiledM)
 import Network.Streaming.Delimited (runCores, runDelimited, runDelimitedM)
@@ -60,7 +60,7 @@ import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, 
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> acceptBatches *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> idleCost *> acceptCost *> manyConnectionWorkers
+spec = conformance *> counted *> acceptBatches *> listenerFailure *> peerAddress *> shutdownSpec *> shutdownInBatch *> idleSpec *> idleCost *> acceptCost *> manyConnectionWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -86,8 +86,7 @@ counted = describe "accepting" $ forM_ debugRunners $ \runner@(Runner runnerName
 acceptBatches :: Spec
 acceptBatches = describe "accepting a queue of connections" $ forM_ debugRunners $ \runner@(Runner runnerName _) ->
   describe runnerName $
-    xfail "the acceptor takes one connection in each round, and gives way in each" $
-      it "takes them all in a round, and gives way once for it" (queuedConnections runner)
+    it "takes them all in a round, and gives way once for it" (queuedConnections runner)
 
 -- | Connections that wait in the queue of a listener before the server starts, as many as a queue holds on every system: the
 -- queue of a listener of backlog 128 holds 129 on Linux, and about 192 on macOS, whose limit on the backlog is 128. The server has
@@ -267,6 +266,42 @@ shutdownSpec = describe "a graceful shutdown" $ forM_ (runners ++ [coresRunner])
         raiseSignal sigTERM
         ended <- timeout 3000000 (readMVar (serverStopped shutting))
         fmap (either (const False) (const True)) ended `shouldBe` Just True
+
+-- | A shutdown that comes while the connection workers of a batch are being started: the connections that waited in the listener's
+-- queue when the server started are all taken in one round, and the core spawns a connection worker for each, giving way between
+-- them. Parts that spin on the core make a round of it long, so that the spawning takes a few rounds, and the shutdown, which is
+-- a time after the start, comes between two spawns for some of the delays. Whenever it comes, the server ends and every connection
+-- of the batch is closed: the ones that have a connection worker, and the ones that have none yet. A socket that no part closed is
+-- closed by its finalizer at the next collection, so the test can't tell the server's close from the run time's.
+shutdownInBatch :: Spec
+shutdownInBatch = describe "a shutdown while the connection workers of a batch are being started" $
+  it "closes every connection of the batch, those that have a connection worker and those that have none" $
+    forM_ [0, 2 .. 30 :: Word64] $ \delay ->
+      bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+        Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+        Socket.listen accepting waiting
+        port <- Socket.socketPort accepting
+        bracket (replicateM waiting (connected port)) (mapM_ Socket.close) $ \clients -> do
+          started <- monotonicNanoseconds
+          let settings = Fulmen.defaultSettings {Fulmen.connectionsPerCore = waiting, Fulmen.shutdown = Just (Until (Instant (started + delay * 1000000)))}
+          cores <- Fulmen.newCores settings 1
+          ended' <- timeout 10000000 (void (runDelimited (spinning settings accepting) cores))
+          ended' `shouldBe` Just ()
+          -- A connection that the server closed ends with no byte, or with a reset.
+          closed <- forM clients $ \client -> timeout 1000000 (try @IOException (SocketBytes.recv client 1))
+          [place | (place, Nothing) <- zip [0 :: Int ..] closed] `shouldBe` []
+  where
+    waiting = 128 :: Int
+    connected port = do
+      sock <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
+      Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1))) `onException` Socket.close sock
+      pure sock
+    -- The server, which closes its listener as it ends, and three hundred parts that spin on its core until it ends.
+    spinning :: (Runtime arr) => Fulmen.Settings -> Socket -> arr Cores ()
+    spinning settings accepting = case handling (Fixed 200 [] "ok") of
+      Handling handler ->
+        race (Fulmen.serve settings (Fulmen.Listen {Fulmen.openListener = now (const (pure accepting)), Fulmen.closeListener = now Socket.close}) handler) (together (replicate 300 (foreverA giveWay)))
+          >>> done
 
 -- | The idle timeout: a connection that waits for its next request for longer than it is closed, and its core serves the
 -- connection that waits for one, while a connection that is serving a request, or that waits for less, is not closed, and a

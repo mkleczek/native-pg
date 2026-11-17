@@ -76,7 +76,7 @@ newtype Answering = Answering Exchange
 -- is the one that runs the acceptor, if it is the first.
 data Cores = Cores !Int !Shared
 
--- | What the cores share: the pool of the cores that wait for a connection, which the acceptor delivers connections to,
+-- | What the cores share: the pool of the cores that wait for connections, which the acceptor gives batches of connections to,
 -- how many connection workers each core has, the date that responses carry and whether the server is shutting down, and
 -- the pools of the buffers that requests in flight work in, of which a value of one core has its own.
 data Shared = Shared
@@ -92,11 +92,11 @@ data Shared = Shared
     sharedCorePools :: !(IntMap BufferPool)
   }
 
--- | A core that waits for a connection: its number, and the promise that the acceptor delivers the connection's socket
--- with.
+-- | A core that waits for connections: its number, and the promise that the acceptor gives the sockets of its batch of
+-- connections with.
 data Waiting = Waiting
   { waitingCore :: !Int,
-    waitingPromise :: !(Promise 'Anywhere Socket)
+    waitingPromise :: !(Promise 'Anywhere [Socket])
   }
 
 -- | What a core has of its connection workers: how many are alive, and the promise of the part that waits for room, if

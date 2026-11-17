@@ -1,8 +1,10 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE CApiFFI #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | Accepting without waiting: the listening socket's own calls, which never wait. The acceptor blocks on the
@@ -28,6 +30,7 @@ import Data.Bits
 import qualified Foreign.C.Error as Errno
 import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr, nullPtr)
+import GHC.Records (HasField)
 import Network.Socket (Socket, SocketOption (NoDelay), mkSocket, setSocketOption, withFdSocket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Classes (Annotate, Block (..), Effect, Event (..), GiveWay (..), (-|), (|-))
@@ -113,13 +116,26 @@ foreign import ccall unsafe "accept"
 beginBatch :: forall arr a. (Arrow arr, Annotate arr, Effect arr, GiveWay arr, Instrumented (ModeOf arr)) => arr a a
 beginBatch = giveWay >>> tap (step "count the give way" (const (bump @(ModeOf arr) AcceptBatches)))
 
--- | The next connection of the listening socket: it gives way and tries, and while there is none, blocks until the socket is
--- readable and tries again.
-acceptor :: forall arr. (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr Socket Socket
+-- | The connections that wait in the listener's queue, as many as this limit, which is at least one, and none if none waits. It takes
+-- them in one action that never waits, and stops at the limit, or at the first call that finds none.
+tryAcceptBatch :: forall m. (Instrumented m) => Int -> Socket -> IO [Socket]
+tryAcceptBatch limit listener = go limit []
+  where
+    go left taken
+      | left <= 0 = pure (reverse taken)
+      | otherwise = tryAccept @m listener >>= maybe (pure (reverse taken)) (\accepted -> go (left - 1) (accepted : taken))
+
+-- | The connections of the listening socket, as many as the capacity of the input, which is at least one, and at least one: it gives
+-- way once, takes the connections that wait in one step that never waits, and while none waits, blocks until the socket is readable
+-- and tries again.
+acceptor ::
+  forall arr r.
+  (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr), HasField "capacity" r Int, HasField "listener" r Socket) =>
+  arr r [Socket]
 acceptor =
   beginBatch >>> iterateWith (step "try accept" attempt -| "accepted?") ("none waiting" |- consume block)
   where
-    attempt listener =
-      tryAccept @(ModeOf arr) listener >>= \case
-        Just accepted -> pure (Finish accepted)
-        Nothing -> (\fd -> Again (Readable (Fd fd), listener)) <$> Socket.unsafeFdSocket listener
+    attempt r =
+      tryAcceptBatch @(ModeOf arr) r.capacity r.listener >>= \case
+        [] -> (\fd -> Again (Readable (Fd fd), r)) <$> Socket.unsafeFdSocket r.listener
+        accepted -> pure (Finish accepted)

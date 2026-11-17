@@ -87,7 +87,7 @@ test-suite fulmen-split
                  Network.Fulmen.Internal.Split
   ghc-options: -Wall -F -pgmF=skeletest-preprocessor
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, skeletest >=0.4.2 && <0.5
+  build-depends: base, containers, skeletest >=0.4.2 && <0.5
 
 -- A quick measurement: a client of C keep-alive connections and a server that answers with a static body, run as two
 -- processes of this one program. Its numbers are for looking at, and nothing checks them.
