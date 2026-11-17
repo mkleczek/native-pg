@@ -1,4 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | The reader of one direction: the link it receives from, a buffer of fixed
@@ -41,12 +43,17 @@ import Control.Monad (when)
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Internal as BSI
-import Data.Word (Word8)
+import Data.Word (Word8, byteSwap16, byteSwap32, byteSwap64)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray, plusForeignPtr)
 import Foreign.Marshal.Utils (copyBytes, moveBytes)
-import Foreign.Ptr (Ptr, plusPtr)
+import Foreign.Ptr (plusPtr)
 import Foreign.Storable (peekByteOff, peekElemOff, pokeElemOff)
+import GHC.ByteOrder (ByteOrder (..), targetByteOrder)
+import GHC.Exts (Int (I#), readWord8OffAddrAsWord16#, readWord8OffAddrAsWord32#, readWord8OffAddrAsWord64#)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
+import GHC.IO (IO (..))
+import GHC.Ptr (Ptr (Ptr))
+import GHC.Word (Word16 (W16#), Word32 (W32#), Word64 (W64#))
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, iterateA, iterateWith)
@@ -133,7 +140,13 @@ word32 = (,4) ^>> atom (\reader from _ -> scalar reader from 4)
 
 -- | The big-endian number of the bytes from the offset in the buffer.
 scalar :: Reader link -> Int -> Int -> IO Int
-scalar reader from size = unsafeWithForeignPtr (readerMemory reader) (\memory -> go memory 0 0)
+scalar reader from size =
+  unsafeWithForeignPtr (readerMemory reader) $ \memory -> case size of
+    1 -> fromIntegral <$> (peekByteOff memory from :: IO Word8)
+    2 -> peekWord16BE memory from
+    4 -> peekWord32BE memory from
+    8 -> peekWord64BE memory from
+    _ -> go memory 0 0
   where
     -- The number is built as a word and converted at the end, which lets GHC
     -- keep it unboxed through the loop.
@@ -143,27 +156,52 @@ scalar reader from size = unsafeWithForeignPtr (readerMemory reader) (\memory ->
       | otherwise = peekByteOff memory (from + index) >>= \byte -> go memory (index + 1) (value `shiftL` 8 .|. fromIntegral (byte :: Word8))
 {-# INLINE scalar #-}
 
--- | An atom of the size it is given: it takes the bytes in hand, which is one
--- 'now', and only if there are too few, it receives the rest, and takes them
--- then. The taking is given the reader and where the bytes start, and its
--- result is evaluated before the bytes are given up. The steps take the reader
--- from the environment, and the sum between them has nothing in it, so that
--- nothing is built for the choice: the size is kept where the receive keeps it.
+-- The offset is in bytes. In particular, a length after a message tag
+-- need not be aligned even when the beginning of the buffer is.
+peekWord16BE :: Ptr Word8 -> Int -> IO Int
+peekWord16BE (Ptr addr) (I# offset) = IO $ \state ->
+  case readWord8OffAddrAsWord16# addr offset state of
+    (# state', value #) -> (# state', fromIntegral (fromBigEndian byteSwap16 (W16# value)) #)
+{-# INLINE peekWord16BE #-}
+
+peekWord32BE :: Ptr Word8 -> Int -> IO Int
+peekWord32BE (Ptr addr) (I# offset) = IO $ \state ->
+  case readWord8OffAddrAsWord32# addr offset state of
+    (# state', value #) -> (# state', fromIntegral (fromBigEndian byteSwap32 (W32# value)) #)
+{-# INLINE peekWord32BE #-}
+
+peekWord64BE :: Ptr Word8 -> Int -> IO Int
+peekWord64BE (Ptr addr) (I# offset) = IO $ \state ->
+  case readWord8OffAddrAsWord64# addr offset state of
+    (# state', value #) -> (# state', fromIntegral (fromBigEndian byteSwap64 (W64# value)) #)
+{-# INLINE peekWord64BE #-}
+
+fromBigEndian :: (a -> a) -> a -> a
+fromBigEndian swap value = case targetByteOrder of
+  LittleEndian -> swap value
+  BigEndian -> value
+{-# INLINE fromBigEndian #-}
+
+-- | When the bytes are in hand, an atom takes them and advances the start in
+-- the same 'now'. Only the refill path stores the wanted size across receives.
 atom :: (ArrowChoice arr, Effect arr, Annotate arr, Link arr link) => (Reader link -> Int -> Int -> IO a) -> arr (Reader link, Int) a
-atom take' = with (With (now ready) >>> (With refill ||| returnA) >>> asks (now taken))
+atom take' = with (With (now ready) >>> ((With refill >>> asks (now refilled)) ||| returnA))
   where
-    ready (reader, size) = do
-      from <- mark reader markStart
-      end <- mark reader markEnd
-      if size >= 0 && end - from >= size
-        then Right () <$ setMark reader markWanted size
-        else pure (Left size)
-    -- The bytes are in hand, either way: the size is what the atom wanted.
-    taken reader = do
-      from <- mark reader markStart
-      size <- mark reader markWanted
+    ready (reader, size) =
+      unsafeWithForeignPtr (readerMarks reader) $ \marks -> do
+        from <- peekElemOff marks markStart
+        end <- peekElemOff marks markEnd
+        if size >= 0 && end - from >= size
+          then Right <$> takeBytes marks reader from size
+          else pure (Left size)
+    refilled reader =
+      unsafeWithForeignPtr (readerMarks reader) $ \marks -> do
+        from <- peekElemOff marks markStart
+        size <- peekElemOff marks markWanted
+        takeBytes marks reader from size
+    takeBytes marks reader from size = do
       value <- take' reader from size
-      value `seq` setMark reader markStart (from + size)
+      value `seq` pokeElemOff marks markStart (from + size)
       pure value
 {-# INLINE atom #-}
 
