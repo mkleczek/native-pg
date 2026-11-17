@@ -195,20 +195,20 @@ smallBatch = 4
 
 -- | The batch of each core that is given sockets, and the cores that are given none, from how many connection workers each core has now.
 sharing ::
-  (HasField "waiting" r [Waiting], HasField "sockets" r [Socket], HasField "cores" r Cores) =>
+  (HasField "waiting" r [Waiting], HasField "sockets" r Batch, HasField "cores" r Cores) =>
   Settings ->
   r ->
-  IO ([(Waiting, [Socket])], [Waiting])
-sharing settings r = case r.cores of
-  Cores _ shared -> do
+  IO ([(Waiting, Batch)], [Waiting])
+sharing settings r = case (r.cores, r.sockets) of
+  (Cores _ shared, Batch accepted sockets) -> do
     counts <- readCounts shared
     let loads = [(live, room) | Waiting core _ <- r.waiting, let !live = liveOf counts core, let !room = connectionsPerCore settings - live]
-    pure $! parcel [] [] r.waiting (shares (length r.sockets) loads) r.sockets
+    pure $! parcel [] [] r.waiting (shares accepted loads) sockets
   where
     parcel batches spare cores !given sockets = case (cores, given) of
       (core : others, count : counts)
         | count <= 0 -> parcel batches (core : spare) others counts sockets
-        | otherwise -> case splitAt count sockets of (mine, rest) -> parcel ((core, mine) : batches) spare others counts rest
+        | otherwise -> case splitAt count sockets of (mine, rest) -> parcel ((core, Batch count mine) : batches) spare others counts rest
       _ -> (reverse batches, reverse spare)
 
 -- | Puts the cores that were given no sockets back in the pool of the cores that wait, as they were.
@@ -218,10 +218,14 @@ putBack r = case r.cores of
 
 -- | Gives each core its batch, in one action that never waits, so that no socket is lost to a cancellation between two cores. A batch
 -- whose core has stopped waiting is closed, which is so when the server is shutting down.
-handOver :: (HasField "batches" r [(Waiting, [Socket])]) => r -> IO ()
+handOver :: (HasField "batches" r [(Waiting, Batch)]) => r -> IO ()
 handOver r =
-  forM_ r.batches $ \(Waiting _ promise, sockets) ->
-    fulfilNow promise sockets >>= \taken -> unless taken (closeAll sockets)
+  forM_ r.batches $ \(Waiting _ promise, batch) ->
+    fulfilNow promise batch >>= \taken -> unless taken (closeBatch batch)
+
+-- | Closes the sockets of the batch.
+closeBatch :: Batch -> IO ()
+closeBatch (Batch _ sockets) = closeAll sockets
 
 -- | Closes the sockets.
 closeAll :: [Socket] -> IO ()
@@ -272,19 +276,19 @@ spawning settings handler =
     -- One value for both branches: two copies of the connection worker's code keep the compiler from specialising it to the arrow.
     starter = starting settings handler
     started =
-      decide "small batch?" (\r -> if length r.sockets <= smallBatch then Left r else Right (r.group, r))
+      decide "small batch?" (\r -> case r.sockets of Batch size _ -> if size <= smallBatch then Left r else Right (r.group, r))
         >>> ( "yes" |- starter
                 ||| "no" |- named (Label "hand the batch to a starter" "Spawns a starter that gives each socket of the batch a connection worker, so that the core waits for the next batch at once.") (spawn starter)
             )
-    counted r = case r.cores of
-      Cores core shared -> update (countOf shared core) (\(Count live waiter) -> (Count (live + length r.sockets) waiter, ()))
+    counted r = case (r.cores, r.sockets) of
+      (Cores core shared, Batch size _) -> update (countOf shared core) (\(Count live waiter) -> (Count (live + size) waiter, ()))
 
 -- | Spawns a connection worker for each socket of the batch, one at a time, giving way before each, so that the other parts of the core
 -- run between them when the batch is large. The sockets that have no connection worker when this ends, which it does as it is cancelled,
 -- are closed and taken off the count.
 starting ::
   forall arr s r.
-  (Runtime arr, HasField "group" r (Group arr s AwaitAll), HasField "sockets" r [Socket], HasField "cores" r Cores) =>
+  (Runtime arr, HasField "group" r (Group arr s AwaitAll), HasField "sockets" r Batch, HasField "cores" r Cores) =>
   Settings ->
   arr (Call, Request) () ->
   arr r ()
@@ -300,13 +304,13 @@ starting settings handler =
     spawnEach = iterateWith (giveWay >>> step "take the next socket" takeNext -| "socket left?") (consume (spawn (connectionWorker settings handler)))
     takeNext r = case r.cores of
       Cores core shared ->
-        atomicModifyIORef' r.kept (\sockets -> case sockets of [] -> ([], Nothing); socket : others -> (others, Just socket)) >>= \case
+        atomicModifyIORef' r.kept (\batch -> case batch of Batch size (socket : others) -> (Batch (size - 1) others, Just socket); Batch _ [] -> (batch, Nothing)) >>= \case
           Nothing -> pure (Finish ())
           Just socket -> let !workers = r.group in pure (Again ((workers, newRecord ["socket", "shared", "core"] socket shared core), r))
     unstarted r = case r.cores of
       Cores core shared -> do
-        left <- readIORef r.kept
-        unless (null left) (closeAll left *> leaving (length left) shared core)
+        Batch size left <- readIORef r.kept
+        unless (size == 0) (closeAll left *> leaving size shared core)
 
 -- | Waits until the core has room for another connection worker: fewer than its share of the cap. If it has none, the
 -- part leaves the promise of a ticket in the count of the core, which the end of one of its connection workers fulfils,
@@ -329,10 +333,10 @@ untilRoom settings =
 
 -- | Puts the core in the pool of the cores that wait for connections, with the promise of a batch of sockets, and waits for the
 -- acceptor to give one. A batch that is given when the wait was cancelled is closed.
-pull :: (Runtime arr) => arr Cores [Socket]
+pull :: (Runtime arr) => arr Cores Batch
 pull =
   named (Label "pull" "Puts the core in the pool of the cores that wait for connections, and waits for the acceptor to give it a batch.") $
-    asking "connection" (withTicket (step "wait in the pool of cores" waiting) (fst ^>> step "close the sockets" closeAll)) >>^ snd
+    asking "connection" (withTicket (step "wait in the pool of cores" waiting) (fst ^>> step "close the sockets" closeBatch)) >>^ snd
   where
     waiting (promise, Cores core shared) = releaseNow (sharedWaiting shared) [Waiting core promise]
 

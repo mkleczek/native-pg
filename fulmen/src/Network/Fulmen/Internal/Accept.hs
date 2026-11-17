@@ -31,6 +31,7 @@ import qualified Foreign.C.Error as Errno
 import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr, nullPtr)
 import GHC.Records (HasField)
+import Network.Fulmen.Internal (Batch (..))
 import Network.Socket (Socket, SocketOption (NoDelay), mkSocket, setSocketOption, withFdSocket)
 import qualified Network.Socket as Socket
 import Network.Streaming.Classes (Annotate, Block (..), Effect, Event (..), GiveWay (..), (-|), (|-))
@@ -118,12 +119,12 @@ beginBatch = giveWay >>> tap (step "count the give way" (const (bump @(ModeOf ar
 
 -- | The connections that wait in the listener's queue, as many as this limit, which is at least one, and none if none waits. It takes
 -- them in one action that never waits, and stops at the limit, or at the first call that finds none.
-tryAcceptBatch :: forall m. (Instrumented m) => Int -> Socket -> IO [Socket]
+tryAcceptBatch :: forall m. (Instrumented m) => Int -> Socket -> IO Batch
 tryAcceptBatch limit listener = go limit []
   where
     go left taken
-      | left <= 0 = pure (reverse taken)
-      | otherwise = tryAccept @m listener >>= maybe (pure (reverse taken)) (\accepted -> go (left - 1) (accepted : taken))
+      | left <= 0 = pure (Batch (limit - left) (reverse taken))
+      | otherwise = tryAccept @m listener >>= maybe (pure (Batch (limit - left) (reverse taken))) (\accepted -> go (left - 1) (accepted : taken))
 
 -- | The connections of the listening socket, as many as the capacity of the input, which is at least one, and at least one: it gives
 -- way once, takes the connections that wait in one step that never waits, and while none waits, blocks until the socket is readable
@@ -131,11 +132,11 @@ tryAcceptBatch limit listener = go limit []
 acceptor ::
   forall arr r.
   (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr), HasField "capacity" r Int, HasField "listener" r Socket) =>
-  arr r [Socket]
+  arr r Batch
 acceptor =
   beginBatch >>> iterateWith (step "try accept" attempt -| "accepted?") ("none waiting" |- consume block)
   where
     attempt r =
       tryAcceptBatch @(ModeOf arr) r.capacity r.listener >>= \case
-        [] -> (\fd -> Again (Readable (Fd fd), r)) <$> Socket.unsafeFdSocket r.listener
+        Batch 0 _ -> (\fd -> Again (Readable (Fd fd), r)) <$> Socket.unsafeFdSocket r.listener
         accepted -> pure (Finish accepted)

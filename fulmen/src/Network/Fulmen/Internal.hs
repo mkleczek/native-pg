@@ -10,6 +10,7 @@ module Network.Fulmen.Internal
     Answering (..),
     Cores (..),
     Shared (..),
+    Batch (..),
     Waiting (..),
     Count (..),
   )
@@ -93,11 +94,13 @@ data Shared = Shared
     sharedCorePools :: !(IntMap BufferPool)
   }
 
--- | A core that waits for connections: its number, and the promise that the acceptor gives the sockets of its batch of
--- connections with.
+-- | The sockets of a batch of connections, and how many there are, which whoever makes the batch knows, so that nobody counts them again.
+data Batch = Batch {-# UNPACK #-} !Int ![Socket]
+
+-- | A core that waits for connections: its number, and the promise that the acceptor gives its batch of connections with.
 data Waiting = Waiting
   { waitingCore :: !Int,
-    waitingPromise :: !(Promise 'Anywhere [Socket])
+    waitingPromise :: !(Promise 'Anywhere Batch)
   }
 
 -- | What a core has of its connection workers: how many are alive, and the promise of the part that waits for room, if
