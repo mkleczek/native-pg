@@ -337,6 +337,20 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
           readIORef (ended silent) `shouldReturn` False
           closed <- timeout 3000000 (waitUntil (readIORef (ended silent)))
           closed `shouldBe` Just ()
+    -- With no time to wait, the deadline has passed when the connection first waits. The server starts accepting after the client has sent its
+    -- request, so the bytes are in the socket by then: the watcher can take the connection before the part that serves it has noticed the
+    -- input, which the arrows that poll their sockets now and then do in most runs, and not in all: the server is started five times. A close
+    -- with the input unread resets the connection, and the client loses its request: it is served instead.
+    xfail "the watcher closes the connection with the request unread, and the client is reset" $
+      it "serves a request whose bytes are in the socket when the idle timeout passes" $
+        forM_ [1 .. 5 :: Int] $ \_ ->
+          withStoppableWithAfter (threadDelay 100000) (\settings -> settings {Fulmen.idleTimeout = Just (millis 0), Fulmen.connectionsPerCore = 4}) runner (handling (Fixed 200 [] "ok")) $ \shutting ->
+            withClient (serverPort shutting) $ \client -> do
+              SocketBytes.sendAll (socket client) request
+              answeredOrEnded <- timeout 3000000 (waitUntil (((||) . ("ok" `B.isInfixOf`) <$> readIORef (received client)) <*> readIORef (ended client)))
+              answeredOrEnded `shouldBe` Just ()
+              bytes <- readIORef (received client)
+              ("ok" `B.isInfixOf` bytes) `shouldBe` True
     it "does not close a connection whose request is in flight for longer than the timeout" $
       withIdle (Just (millis 300)) 4 quickOrSlow $ \shutting ->
         withClient (serverPort shutting) $ \busy -> do
@@ -467,15 +481,24 @@ withStoppable = withStoppableWith id
 
 -- | The same, with the settings that the function makes of the test's.
 withStoppableWith :: (Fulmen.Settings -> Fulmen.Settings) -> Runner -> Handling -> (Stoppable -> IO a) -> IO a
-withStoppableWith adjust runner handler use =
+withStoppableWith = withStoppableWithAfter (pure ())
+
+-- | The same, with an action that the server runs before it accepts its first connection, so that what a client does meanwhile is in the
+-- listen backlog when it starts.
+withStoppableWithAfter :: IO () -> (Fulmen.Settings -> Fulmen.Settings) -> Runner -> Handling -> (Stoppable -> IO a) -> IO a
+withStoppableWithAfter beforeAccepting adjust runner handler use =
   bracket (Socket.socketPair Socket.AF_UNIX Socket.Stream Socket.defaultProtocol) (\(reader, writer) -> Socket.close reader *> Socket.close writer) $ \(reader, writer) -> do
     fd <- Socket.unsafeFdSocket reader
-    withStoppableOn adjust (Readable (Fd fd)) runner handler (\shutting -> use shutting {stopServer = void (try @IOException (SocketBytes.sendAll writer "x"))})
+    withStoppableOnAfter beforeAccepting adjust (Readable (Fd fd)) runner handler (\shutting -> use shutting {stopServer = void (try @IOException (SocketBytes.sendAll writer "x"))})
 
 -- | A server whose shutdown starts when the event fires, with the settings that the function makes of the test's. It listens on a
 -- socket that it closes as it ends, so that the test sees that it did.
 withStoppableOn :: (Fulmen.Settings -> Fulmen.Settings) -> Event -> Runner -> Handling -> (Stoppable -> IO a) -> IO a
-withStoppableOn adjust event (Runner _ runServer) handler use =
+withStoppableOn = withStoppableOnAfter (pure ())
+
+-- | The same, with an action that the server runs when it opens its listener, before it accepts its first connection.
+withStoppableOnAfter :: IO () -> (Fulmen.Settings -> Fulmen.Settings) -> Event -> Runner -> Handling -> (Stoppable -> IO a) -> IO a
+withStoppableOnAfter beforeAccepting adjust event (Runner _ runServer) handler use =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
     Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
     Socket.listen accepting 128
@@ -486,7 +509,7 @@ withStoppableOn adjust event (Runner _ runServer) handler use =
         listener =
           Listening
             Fulmen.Listen
-              { Fulmen.openListener = now (const (pure accepting)),
+              { Fulmen.openListener = now (const (beforeAccepting *> pure accepting)),
                 Fulmen.closeListener = now (\sock -> writeIORef closed True *> Socket.close sock)
               }
     cores <- Fulmen.newCores settings 1
