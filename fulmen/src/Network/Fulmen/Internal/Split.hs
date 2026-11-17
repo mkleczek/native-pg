@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+
 -- | How the connections that the acceptor took in one round are shared out between the cores that wait for them.
 module Network.Fulmen.Internal.Split
   ( shares,
@@ -12,7 +14,7 @@ import qualified Data.Set as Set
 -- cores if they tie, which is the one that has waited longest, until the room of every core is used. The cores have as many connection
 -- workers as one another afterwards, as far as their room allows.
 shares :: Int -> [(Int, Int)] -> [Int]
-shares sockets [(_, room)] = [max 0 (min sockets room)]
+shares !sockets [(_, room)] = let !share = max 0 (min sockets room) in [share]
 shares sockets cores = [IntMap.findWithDefault 0 at given | at <- [0 .. length cores - 1]]
   where
     given = fill sockets open IntMap.empty

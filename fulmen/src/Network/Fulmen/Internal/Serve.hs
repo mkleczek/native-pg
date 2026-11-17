@@ -162,7 +162,9 @@ untilWanted =
 -- | How many connections the cores that wait have room for: their share of the cap, less the connection workers that they have.
 capacityOf :: (HasField "waiting" r [Waiting], HasField "cores" r Cores) => Settings -> r -> IO Int
 capacityOf settings r = case r.cores of
-  Cores _ shared -> (\counts -> sum [connectionsPerCore settings - liveOf counts core | Waiting core _ <- r.waiting]) <$> readCounts shared
+  Cores _ shared -> do
+    counts <- readCounts shared
+    pure $! sum [connectionsPerCore settings - liveOf counts core | Waiting core _ <- r.waiting]
 
 -- | The batch of each core that is given sockets, and the cores that are given none, from how many connection workers each core has now.
 sharing ::
@@ -173,10 +175,10 @@ sharing ::
 sharing settings r = case r.cores of
   Cores _ shared -> do
     counts <- readCounts shared
-    let loads = [(live, connectionsPerCore settings - live) | Waiting core _ <- r.waiting, let live = liveOf counts core]
-    pure (parcel [] [] r.waiting (shares (length r.sockets) loads) r.sockets)
+    let loads = [(live, room) | Waiting core _ <- r.waiting, let !live = liveOf counts core, let !room = connectionsPerCore settings - live]
+    pure $! parcel [] [] r.waiting (shares (length r.sockets) loads) r.sockets
   where
-    parcel batches spare cores given sockets = case (cores, given) of
+    parcel batches spare cores !given sockets = case (cores, given) of
       (core : others, count : counts)
         | count <= 0 -> parcel batches (core : spare) others counts sockets
         | otherwise -> case splitAt count sockets of (mine, rest) -> parcel ((core, mine) : batches) spare others counts rest
@@ -198,9 +200,9 @@ handOver r =
 closeAll :: [Socket] -> IO ()
 closeAll = mapM_ Socket.close
 
--- | How many connection workers each core has, by the core's number.
+-- | How many connection workers each core has, by the core's number, each count read here and not left as a thunk of the read.
 readCounts :: Shared -> IO (IntMap.IntMap Int)
-readCounts shared = traverse (fmap (\(Count live _) -> live) . readIORef) (sharedCounts shared)
+readCounts shared = traverse (\ref -> readIORef ref >>= \(Count live _) -> pure live) (sharedCounts shared)
 
 -- | How many connection workers the core has, by the counts of the cores.
 liveOf :: IntMap.IntMap Int -> Int -> Int
@@ -228,7 +230,7 @@ spawning ::
   arr (Group arr s AwaitAll, Cores) ()
 spawning settings handler =
   named (Label "spawning" "Waits for room and for a batch of connections, counts the batch, and spawns a connection worker for each socket.") $
-    uncurry (newRecord ["group", "cores"])
+    (\(!workers, !cores) -> newRecord ["group", "cores"] workers cores)
       ^>> flow
         ( roomed              -< ["cores"]                  >>>
           "sockets" <: pulled -< ["cores"]                  >>>
@@ -256,14 +258,14 @@ starting ::
 starting settings handler =
   named (Label "start workers" "Spawns a connection worker for each socket of the batch, giving way before each, and closes the sockets that were not given one if it is cancelled.") $
     scope
-      (step "keep the sockets" (\r -> (,) <$> newIORef r.sockets <*> pure r.cores))
+      (step "keep the sockets" (\r -> (,) <$> (newIORef $! r.sockets) <*> pure r.cores))
       (step "close the sockets that have no connection worker" unstarted)
       (iterateWith (giveWay >>> step "take the next socket" takeNext -| "socket left?") (consume (spawn (connectionWorker settings handler))))
   where
     takeNext ((kept, cores@(Cores core shared)), r) =
       atomicModifyIORef' kept (\sockets -> case sockets of [] -> ([], Nothing); socket : others -> (others, Just socket)) >>= \case
         Nothing -> pure (Finish ())
-        Just socket -> pure (Again ((r.group, newRecord ["socket", "shared", "core"] socket shared core), ((kept, cores), r)))
+        Just socket -> let !workers = r.group in pure (Again ((workers, newRecord ["socket", "shared", "core"] socket shared core), ((kept, cores), r)))
     unstarted ((kept, Cores core shared), _) = do
       left <- readIORef kept
       unless (null left) (closeAll left *> leaving (length left) shared core)
