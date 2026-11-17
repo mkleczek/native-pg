@@ -1,10 +1,8 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE CApiFFI #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | Accepting without waiting: the listening socket's own calls, which never wait. The acceptor blocks on the
@@ -30,7 +28,6 @@ import Data.Bits
 import qualified Foreign.C.Error as Errno
 import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr, nullPtr)
-import GHC.Records (HasField)
 import Network.Fulmen.Internal (Batch (..))
 import Network.Socket (Socket, SocketOption (NoDelay), mkSocket, setSocketOption, withFdSocket)
 import qualified Network.Socket as Socket
@@ -130,13 +127,13 @@ tryAcceptBatch limit listener = go limit []
 -- way once, takes the connections that wait in one step that never waits, and while none waits, blocks until the socket is readable
 -- and tries again.
 acceptor ::
-  forall arr r.
-  (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr), HasField "capacity" r Int, HasField "listener" r Socket) =>
-  arr r Batch
+  forall arr.
+  (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) =>
+  arr (Int, Socket) Batch
 acceptor =
   beginBatch >>> iterateWith (step "try accept" attempt -| "accepted?") ("none waiting" |- consume block)
   where
-    attempt r =
-      tryAcceptBatch @(ModeOf arr) r.capacity r.listener >>= \case
-        Batch 0 _ -> (\fd -> Again (Readable (Fd fd), r)) <$> Socket.unsafeFdSocket r.listener
+    attempt input@(capacity, listener) =
+      tryAcceptBatch @(ModeOf arr) capacity listener >>= \case
+        Batch 0 _ -> (\fd -> Again (Readable (Fd fd), input)) <$> Socket.unsafeFdSocket listener
         accepted -> pure (Finish accepted)
