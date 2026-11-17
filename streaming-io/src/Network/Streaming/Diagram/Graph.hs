@@ -1665,7 +1665,8 @@ seated items = fmap fix items
 pinned :: [(Node, [Pin])] -> [Item] -> [Item]
 pinned made items = fmap put items
   where
-    wires = [edge' | Wire edge' <- flat items]
+    -- An edge that leaves a flow is drawn from its result, and has no pin of its own.
+    wires = [edge' | Wire edge' <- flat items, isNothing (edgeVia edge')]
     joins = [join' | edge' <- wires, Joined js <- [edgeSits edge'], join' <- js]
     outSeats = [seat | Join (Just seat) _ _ <- joins] ++ concat [seats | Result _ _ seats <- flat items]
     inSeats = [seat | Join _ (Just seat) _ <- joins]

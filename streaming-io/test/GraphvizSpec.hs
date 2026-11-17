@@ -26,14 +26,9 @@ import Skeletest
 quick :: (Effect arr) => arr a ()
 quick = now (const (pure ()))
 
--- | The printer of the graph is written only when the cases that read what it prints are: they are expected to fail until then,
--- and the mark comes off when it is there.
-unwritten :: Spec -> Spec
-unwritten = xfail "the DOT of a graph is printed only when the printer is written"
-
 spec :: Spec
 spec = describe "the DOT of a graph" $ do
-  unwritten $ it "has a node for a step, with a pin for each port that reads a name and one for each name that it gives, and an edge from each name to the ports that read it" $ do
+  it "has a node for a step, with a pin for each port that reads a name and one for each name that it gives, and an edge from each name to the ports that read it" $ do
     found <- dotOf fanning
     -- The name "i" of the input is read by the first step and by the last, so it leaves the input twice.
     edgesNamed found
@@ -49,7 +44,7 @@ spec = describe "the DOT of a graph" $ do
     pinsOf "flow input" found `shouldBe` ["o_i"]
     pinsOf "flow result" found `shouldBe` ["i_c"]
 
-  unwritten $ it "has the edges of a flow that follows one node from that node, which has the names of the input for its pins" $ do
+  it "has the edges of a flow that follows one node from that node, which has the names of the input for its pins" $ do
     found <- dotOf (tap quick >>> fanning)
     edgesNamed found
       `shouldBe` sort
@@ -62,20 +57,20 @@ spec = describe "the DOT of a graph" $ do
           ("flow result", "", "end", "", "")
         ]
 
-  unwritten $ it "has the output pins of a name that is kept and taken apart nested as its pattern nests, each part with the field it is for, and no pin for a part that is dropped" $ do
+  it "has the output pins of a name that is kept and taken apart nested as its pattern nests, each part with the field it is for, and no pin for a part that is dropped" $ do
     found <- dotOf nestedNames
     pinsOf "accept" found `shouldBe` ["i_i", "i_j", "o_conn", "o_conn_fd", "o_conn_addr", "o_conn_peer"]
     -- A part that is taken apart and not kept is titled with its field, in a cell that holds the pins of its parts.
     any (\line -> "accept" `isInfixOf` line && "POINT-SIZE=\"8\">socket<" `isInfixOf` line) found `shouldBe` True
 
-  unwritten $ it "has the pins of a list of names side by side with no title, a pin for a name under another name, and none for a field that the list leaves out" $ do
+  it "has the pins of a list of names side by side with no title, a pin for a name under another name, and none for a field that the list leaves out" $ do
     found <- dotOf dividing
     pinsOf "divide" found `shouldBe` ["i_i", "i_j", "o_q", "o_r"]
     any (\line -> "divide" `isInfixOf` line && "POINT-SIZE=\"8\"" `isInfixOf` line) found `shouldBe` False
     renamed' <- dotOf renaming
     pinsOf "make" renamed' `shouldBe` ["i_i", "i_j", "o_left", "o_z"]
 
-  unwritten $ it "has the edges from the exact pin that a step reads: a part, a whole, a part of a whole by a path, and the port that is another name is the label of its pin" $ do
+  it "has the edges from the exact pin that a step reads: a part, a whole, a part of a whole by a path, and the port that is another name is the label of its pin" $ do
     found <- dotOf nestedNames
     edgesNamed found
       `shouldBe` sort
@@ -102,7 +97,7 @@ spec = describe "the DOT of a graph" $ do
           ("flow result", "", "end", "", "")
         ]
 
-  unwritten $ it "has a decision with a pin for each case, in yellow, which holds the pins of the pattern of the case: a name, a list, a name that is kept and taken apart, and none" $ do
+  it "has a decision with a pin for each case, in yellow, which holds the pins of the pattern of the case: a name, a list, a name that is kept and taken apart, and none" $ do
     found <- dotOf choosing
     pinsOf "how big?" found
       `shouldBe` [ "i_size",
@@ -138,7 +133,7 @@ spec = describe "the DOT of a graph" $ do
           ("IO", "", "end", "", "")
         ]
 
-  unwritten $ it "has the cases of a decision that no flow makes as pins too, each of the name that the edge to its branch had" $ do
+  it "has the cases of a decision that no flow makes as pins too, each of the name that the edge to its branch had" $ do
     found <- dotOf choosingOut
     pinsOf "choose" found `shouldBe` ["o_yes", "o_no"]
     edgesNamed found
@@ -151,13 +146,13 @@ spec = describe "the DOT of a graph" $ do
           ("IO", "", "end", "", "")
         ]
 
-  unwritten $ it "has a dotted edge from the step before to a step that binds nothing from it, and none to a step that does" $ do
+  it "has a dotted edge from the step before to a step that binds nothing from it, and none to a step that does" $ do
     found <- dotOf quiet
     orderEdges found `shouldBe` [("note", "beta")]
     -- The edge into "note" is of the name that it reads, and has no label.
     ("alpha", "a", "note", "n", "") `elem` edgesNamed found `shouldBe` True
 
-  unwritten $ it "has the name that |- gives the wire into an arrow for an input pin of it, and the name that -| gives its wire out for an output pin" $ do
+  it "has the name that |- gives the wire into an arrow for an input pin of it, and the name that -| gives its wire out for an output pin" $ do
     found <- dotOf (("in" |- step "working" (const (pure ())) -| "out") >>> quick :: Diagram Int ())
     edgesNamed found
       `shouldBe` sort
@@ -166,21 +161,21 @@ spec = describe "the DOT of a graph" $ do
           ("IO", "", "end", "", "")
         ]
 
-  unwritten $ it "has the box of a name that has a page of its own link to the page, and a border that a step that is an action has not" $ do
+  it "has the box of a name that has a page of its own link to the page, and a border that a step that is an action has not" $ do
     found <- dotOf (quick >>> box "outer" (quick >>> quick) :: Diagram () ())
     let outer = [line | line <- found, "class=\"box\"" `isInfixOf` line]
     length outer `shouldBe` 1
     any ("HREF=\"#outer\"" `isInfixOf`) outer `shouldBe` True
     any ("BORDER=\"2\"" `isInfixOf`) outer `shouldBe` True
 
-  unwritten $ it "has a back edge for a loop, which goes round to a junction" $ do
+  it "has a back edge for a loop, which goes round to a junction" $ do
     found <- dotOf (each working :: Diagram [Int] [()])
     let ids = [node | node <- nodeIds found, "working" `elem` [name | (n, name) <- nodesNamed found, n == node]]
     case ids of
       [worked] -> reaches found worked worked `shouldBe` True
       other -> failTest ("the graph has the steps " <> show other)
 
-  unwritten $ it "has a cluster for a scope, which holds its steps and the store of its inbox, and a cluster for a group and one for a spawn" $ do
+  it "has a cluster for a scope, which holds its steps and the store of its inbox, and a cluster for a group and one for a spawn" $ do
     scoped <- dotOf (owning (beside (poster, collector)))
     case clusterTitled "scope" scoped of
       Nothing -> failTest "the graph has no cluster for the scope"
@@ -192,21 +187,21 @@ spec = describe "the DOT of a graph" $ do
         any ("working" `isInfixOf`) spawned `shouldBe` True
       found -> failTest ("the graph has the clusters " <> show (fmap length <$> [fst found, snd found]))
 
-  unwritten $ it "has the edges of the messages of an inbox in the style of a message, from the post to the store and from the store to the collect" $ do
+  it "has the edges of the messages of an inbox in the style of a message, from the post to the store and from the store to the collect" $ do
     found <- dotOf (owning (beside (poster, collector)))
     messagesOf found `shouldBe` sort [("post \x2709 jobs", "jobs"), ("jobs", "collect \x2709 jobs")]
 
-  unwritten $ it "has no node for a name that Mermaid draws as a node, which is a pin" $ do
+  it "has no node for a name that Mermaid draws as a node, which is a pin" $ do
     found <- dotOf nestedNames
     [name | (_, name) <- nodesNamed found, name `elem` ["fd", "addr", "peer", "conn", "socket"]] `shouldBe` []
 
-  unwritten $ it "has the same graph for a flow with the plumbing as without it" $ do
+  it "has the same graph for a flow with the plumbing as without it" $ do
     found <- sheets fanning
     case found of
       sheet : _ -> dot (sheetPlumbing sheet) `shouldBe` dot (sheetFlow sheet)
       [] -> failTest "the program has no page"
 
-  unwritten $ it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
+  it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
     found <- dotOf nesting
     -- The inner flow reads its own "n", which the outer step binds: it is read from the pin of "first" by the input of the inner
     -- flow, which is a node of its own, and the step "tail" reads it from there.
