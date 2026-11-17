@@ -517,19 +517,24 @@ data Seat = Seat
     seatWake :: Run -> IO Step -> IO (),
     seatDeliver :: Run -> IO Step -> IO Bool,
     seatParked :: Step,
-    seatCounter :: Int
+    seatCounter :: Int,
+    seatParkAwaiting :: ParkAwaiting
   }
 
 -- | The seat of an inbox or a ticket of this core: plain memory, and the parts that tickets woke.
 hereSeat :: Seat
-hereSeat = Seat changeHere wakeTicket (\run part -> True <$ wakeTicket run part) Parked 5
+hereSeat = Seat changeHere wakeTicket deliverHere Parked 5 parkAwaitingHere
+
+deliverHere :: Run -> IO Step -> IO Bool
+deliverHere run part = True <$ wakeTicket run part
 
 -- | The seat of an inbox or a ticket of any core: compare-and-swap, and the mailbox of the part's scheduler, which refuses a part if
 -- the scheduler has ended.
 anywhereSeat :: Seat
-anywhereSeat = Seat update (\run part -> () <$ postIn run part) postIn ParkedRemote 3
-  where
-    postIn run = if runInFast run then postFast (runMailbox run) else post (runMailbox run)
+anywhereSeat = Seat update (\run part -> () <$ postIn run part) postIn ParkedRemote 3 parkAwaitingRemote
+
+postIn :: Run -> IO Step -> IO Bool
+postIn run = if runInFast run then postFast (runMailbox run) else post (runMailbox run)
 
 -- | What a part does that collects from an inbox, for the two arrows that run every part on one thread: the arrow goes on with the
 -- value, or, if there is none, captures what follows, and the part waits on the shelf until a post wakes it and it takes the value.
@@ -587,28 +592,46 @@ awaitFrom :: Seat -> Run -> Part -> IORef (Slot a) -> (IO r -> IO r) -> (a -> IO
 awaitFrom seat run part slot first taken capture = do
   checkpoint part
   valueWaits slot >>= \case
-    False -> capture (parkAwaiting seat run part slot)
+    False -> capture (seatParkAwaiting seat run part slot)
     -- The part takes the value, after the step that it may give way at, so that a cancellation that it raises leaves the value with its sender.
     True ->
       first $
         takeWaiting (seatChange seat) slot >>= \case
           Took value -> taken value
           Misused -> ioError tookWrongly
-          Parks -> capture (parkAwaiting seat run part slot)
+          Parks -> capture (seatParkAwaiting seat run part slot)
 {-# INLINE awaitFrom #-}
+
+-- | Parks a captured receiver on a ticket.
+type ParkAwaiting = forall a. Run -> Part -> IORef (Slot a) -> (IO a -> IO Step) -> IO Step
+
+-- Fully apply the shared helper so GHC specializes it here. Keep each worker out of line
+-- so plain awaits and registering awaits share the same parking code.
+parkAwaitingHere :: ParkAwaiting
+parkAwaitingHere run part slot resume = parkAwaitingWith changeHere deliverHere Parked 5 run part slot resume
+{-# NOINLINE parkAwaitingHere #-}
+
+parkAwaitingRemote :: ParkAwaiting
+parkAwaitingRemote run part slot resume = parkAwaitingWith update postIn ParkedRemote 3 run part slot resume
+{-# NOINLINE parkAwaitingRemote #-}
 
 -- | Parks the captured part in the slot, as the receiver: unless a sender came since the look, and then the part goes on in its turn
 -- with the value. The part is given a value by a sender with the value itself: a cancellation reaches it at its next wait.
-parkAwaiting :: Seat -> Run -> Part -> IORef (Slot a) -> (IO a -> IO Step) -> IO Step
-parkAwaiting seat run part slot resume =
-  parkTaker (seatChange seat) slot (\value -> seatDeliver seat run (resume (pure value))) >>= \case
+parkAwaitingWith :: Change -> (Run -> IO Step -> IO Bool) -> Step -> Int -> ParkAwaiting
+parkAwaitingWith change deliver parked waitingCounter run part slot resume =
+  parkTaker change slot (\value -> deliver run (resume (pure value))) >>= \case
     Parks -> do
       -- A cancellation takes the part off the slot, unless a sender has given it a value already.
-      let stop cancelled = stopTaking (seatChange seat) slot >>= \stopped -> if stopped then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
+      let stop cancelled =
+            stopTaking change slot >>= \stopped ->
+              if stopped
+                then adjust run waitingCounter (-1) *> backIn run (resume (throwIO cancelled))
+                else pure Nothing
       waitsAt part (Other stop)
-      pure (seatParked seat)
+      pure parked
     Took value -> markFast run *> pure (Yielded (resume (pure value)))
     Misused -> ioError tookWrongly
+{-# INLINE parkAwaitingWith #-}
 
 -- | What a part does that awaits and registers: if a sender waits, the arrow goes on with its value, and the registration doesn't run.
 -- Else the receiver is committed to take, and the registration runs in the same step, as the part that is about to park: a value that is
@@ -629,7 +652,7 @@ awaitRegisteringFrom seat run part slot register first taken capture = do
             Nothing ->
               endRegistering (seatChange seat) slot >>= \case
                 Took value -> taken value
-                Parks -> capture (parkAwaiting seat run part slot)
+                Parks -> capture (seatParkAwaiting seat run part slot)
                 Misused -> ioError tookWrongly
 {-# INLINE awaitRegisteringFrom #-}
 
