@@ -31,7 +31,7 @@ import Control.Arrow (Arrow (..), ArrowChoice (..), returnA)
 import Control.Category (Category (..))
 import Control.Concurrent.STM (STM, TVar, atomically, check, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (SomeException, bracket, mask, onException, throwIO, toException, try, uninterruptibleMask_)
-import Control.Monad (filterM)
+import Control.Monad (filterM, when)
 import Data.Bits (shiftR, xor)
 import qualified Data.Function as Function
 import Data.Functor (($>))
@@ -41,6 +41,8 @@ import Data.Maybe (isJust, isNothing)
 import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn), Joiner)
+import qualified Network.Streaming.Concurrent as Joiner
 import Network.Streaming.Internal.Inboxes (Address (..), Looked (..), Shelf, changeHere, closeShelf, collectedWrongly, lookOrWait, newShelf, postNow, postOrQueue, takeNow)
 import Network.Streaming.Internal.Tickets
 import Network.Streaming.Mode (Mode (..), ModeOf)
@@ -60,6 +62,9 @@ data Loop a b where
   Clock :: Loop () Instant
   Block :: Loop Event ()
   Await :: Loop (IORef (Slot a)) a
+  AwaitRegistering :: Loop (IORef (Slot a), IO (Maybe a)) a
+  HandWaiting :: Loop (IORef (Slot a), a) (Maybe a)
+  UntilParked :: Loop (IORef (Slot a)) ()
   Collect :: Loop (IORef (Shelf a)) a
   Post :: Loop (IORef (Shelf a), a) Bool
   Scope' :: Loop a r -> Loop (r, Exit) () -> Loop (r, a) b -> Loop a b
@@ -70,6 +75,8 @@ data Loop a b where
   Behind :: Beyond -> Loop () ()
   -- | Raises the cancellation that reaches the part: what a grace does when its period ended and it cut its body.
   Reraise :: Loop () b
+  Group' :: (Joiner j) => j -> Loop (Group Loop s j, a) b -> Loop a (b, Joiner.Joined j)
+  Spawn' :: (Joiner j) => Loop x (Joiner.Part j) -> Loop (Group Loop s j, x) ()
 
 instance Category Loop where
   id = Arr Function.id
@@ -95,6 +102,9 @@ instance ArrowChoice Loop where
 instance Annotate Loop
 
 instance Concurrent Loop where
+  newtype Group Loop s j = LoopGroup (LoopGang j)
+  group joiner body = Group' joiner body
+  spawn = Spawn'
   together = \case
     [] -> done
     [one] -> one
@@ -172,18 +182,21 @@ type instance ModeOf Loop = 'Release
 -- | The region of the tickets of this arrow: there is one core, the thread that runs it.
 data Core
 
--- | A ticket is a slot on this thread. A part that waits for it is parked in
--- it, with no watch, and goes back among those that can go on when the ticket's
--- promise is fulfilled. Fulfilling a promise and abandoning the ticket never wait, so
--- they are actions.
+-- | A ticket is a slot on this thread. A part that waits for it is parked in it, with no watch, and goes back among those that can go
+-- on when a part hands it a value: a ticket keeps no value for a part that is not parked. Handing a value now, abandoning the ticket and
+-- saying that a part will await it never wait, so they are actions; the await, the hand that waits and the watch are primitives.
 type instance Local Loop = 'Here Core
 
 instance Exchange Loop ('Here Core) where
   newtype Future Loop ('Here Core) a = LoopFuture (IORef (Slot a))
-  ticket = Now (\() -> newIORef Empty >>= \slot -> pure (LoopFuture slot, HerePromise slot))
+  ticket = Now (\() -> newSlot >>= \slot -> pure (LoopFuture slot, HerePromise slot))
   await = Seq (Arr (\(LoopFuture slot) -> slot)) Await
-  fulfil = Now (\(HerePromise slot, value) -> fulfilHere slot value)
-  abandon = Now (\(LoopFuture slot) -> abandonHere slot)
+  fulfil = Now (\(promise, value) -> fulfilNow promise value)
+  abandon = Now (\(LoopFuture slot) -> closeSlot changeHere slot)
+  awaitRegistering = Seq (Arr (\(LoopFuture slot, register) -> (slot, register (HerePromise slot)))) AwaitRegistering
+  willAwait = Now (\future@(LoopFuture slot) -> commitRegistering changeHere slot >>= \committed -> if committed then pure future else ioError tookWrongly)
+  handWaiting = Seq (Arr (\(HerePromise slot, value) -> (slot, value))) HandWaiting
+  untilParked = Seq (Arr (\(HerePromise slot) -> slot)) UntilParked
 
 -- | An inbox is a shelf on this thread, and a part that waits at it is parked there, with no watch, as at a ticket, until a post
 -- or a collect lets it go on. Closing never waits, so it is an action; the collect and the post are primitives, which raise a
@@ -238,7 +251,7 @@ data Frames b r where
   Then :: Loop b c -> Frames c r -> Frames b r
   Beside :: c -> Frames (b, c) r -> Frames b r
   OnLeft :: Frames (Either b c) r -> Frames b r
-  Joining :: Group -> Frames () r -> Frames () r
+  Joining :: Bunch -> Frames () r -> Frames () r
   RaceFirst :: Contest b d -> Frames (Either b d) r -> Frames b r
   RaceSecond :: Contest b d -> Frames (Either b d) r -> Frames d r
   -- | What was acquired is there: the body goes on with it.
@@ -249,12 +262,24 @@ data Frames b r where
   Releasing :: Exit -> Either SomeException b -> Frames b r -> Frames () r
   Trying :: Frames (Either SomeException b) r -> Frames b r
   Shielding :: Frames b r -> Frames b r
+  -- | The body of a group: the group, what wakes the part that made it, and what follows the group.
+  Grouped :: (Joiner j) => LoopGang j -> (Process r -> IO ()) -> Frames (b, Joiner.Joined j) r -> Frames b r
+  -- | A part that was spawned into a group, which has nothing after it.
+  Spawned :: (Joiner j, p ~ Joiner.Part j) => LoopGang j -> Int -> Frames p r
 
--- | A group of concurrent parts: the cancel scope of its parts, how many there are, and what it has of how they ended.
-data Group = Group !LoopScope !Int !(IORef Joined)
+-- | The parts of a 'together': the cancel scope of its parts, how many there are, and what it has of how they ended.
+data Bunch = Bunch !LoopScope !Int !(IORef Joined)
 
 -- | What a group has of its first failure, and how many of its parts have ended.
 data Joined = Joined !(Maybe SomeException) !Int
+
+-- | A group that parts are spawned into: the cancel scope of its parts, what it has of them, how a cancellation of the scopes
+-- outside the group is found by a part, given the scope that is found already, and whether any scope outside it is cancelled.
+data LoopGang j = LoopGang !LoopScope !(IORef (Standing j)) (Maybe ScopeId -> STM (Maybe ScopeId)) (STM Bool)
+
+-- | What a group has of its parts: how many were spawned, how many members are yet to end (the body is one), the joiner's tally, and
+-- what wakes the part that made the group, once the body has ended: the last member to end does it.
+data Standing j = Standing !Int !Int !(Joiner.Tally j) (Maybe (Joiner.Tally j -> IO ()))
 
 -- | A race: the cancel scope of its halves, and its winner, once there is one.
 data Contest b d = Contest !LoopScope !(IORef (Maybe (Either SomeException (Either b d))))
@@ -262,23 +287,28 @@ data Contest b d = Contest !LoopScope !(IORef (Maybe (Either SomeException (Eith
 -- | The scope whose cancellation reaches a part with these frames: the outermost cancelled scope above the
 -- innermost shield.
 cancelledSTM :: Frames b r -> STM (Maybe ScopeId)
-cancelledSTM = go Nothing
+cancelledSTM = cancelledFrom Nothing
+
+-- | The same, going on from the scope that is found already.
+cancelledFrom :: Maybe ScopeId -> Frames x y -> STM (Maybe ScopeId)
+cancelledFrom found = \case
+  Return -> pure found
+  Then _ rest -> cancelledFrom found rest
+  Beside _ rest -> cancelledFrom found rest
+  OnLeft rest -> cancelledFrom found rest
+  Joining (Bunch scope' _ _) rest -> inside scope' found rest
+  RaceFirst (Contest scope' _) rest -> inside scope' found rest
+  RaceSecond (Contest scope' _) rest -> inside scope' found rest
+  Acquired _ _ _ rest -> cancelledFrom found rest
+  Guarded _ _ rest -> cancelledFrom found rest
+  Releasing{} -> pure found
+  Trying rest -> cancelledFrom found rest
+  Shielding _ -> pure found
+  -- The body is not in the scope of the parts: the joiner's cancellation doesn't reach it.
+  Grouped _ _ rest -> cancelledFrom found rest
+  Spawned (LoopGang (LoopScope ident flag _) _ outside _) _ -> readTVar flag >>= \cancelled -> outside (if cancelled then Just ident else found)
   where
-    go :: Maybe ScopeId -> Frames x y -> STM (Maybe ScopeId)
-    go found = \case
-      Return -> pure found
-      Then _ rest -> go found rest
-      Beside _ rest -> go found rest
-      OnLeft rest -> go found rest
-      Joining (Group scope' _ _) rest -> inside scope' found rest
-      RaceFirst (Contest scope' _) rest -> inside scope' found rest
-      RaceSecond (Contest scope' _) rest -> inside scope' found rest
-      Acquired _ _ _ rest -> go found rest
-      Guarded _ _ rest -> go found rest
-      Releasing{} -> pure found
-      Trying rest -> go found rest
-      Shielding _ -> pure found
-    inside (LoopScope ident flag _) found rest = readTVar flag >>= \cancelled -> go (if cancelled then Just ident else found) rest
+    inside (LoopScope ident flag _) known rest = readTVar flag >>= \cancelled -> cancelledFrom (if cancelled then Just ident else known) rest
 
 -- | The frames outside the first shield of a part's frames.
 data Outside r = forall y. Outside (Frames y r)
@@ -297,6 +327,8 @@ outsideShield = \case
   Releasing _ _ rest -> outsideShield rest
   Trying rest -> outsideShield rest
   Shielding rest -> Just (Outside rest)
+  Grouped _ _ rest -> outsideShield rest
+  Spawned{} -> Nothing
 
 -- | Whether any scope in the frames, whatever lies between, is cancelled.
 cancelledAnywhereSTM :: Frames b r -> STM Bool
@@ -308,7 +340,7 @@ cancelledAnywhereSTM = go
       Then _ rest -> go rest
       Beside _ rest -> go rest
       OnLeft rest -> go rest
-      Joining (Group scope' _ _) rest -> inside scope' rest
+      Joining (Bunch scope' _ _) rest -> inside scope' rest
       RaceFirst (Contest scope' _) rest -> inside scope' rest
       RaceSecond (Contest scope' _) rest -> inside scope' rest
       Acquired _ _ _ rest -> go rest
@@ -316,6 +348,9 @@ cancelledAnywhereSTM = go
       Releasing _ _ rest -> go rest
       Trying rest -> go rest
       Shielding rest -> go rest
+      -- The body is not in the scope of the parts of its group.
+      Grouped _ _ rest -> go rest
+      Spawned (LoopGang (LoopScope _ flag _) _ _ outside) _ -> readTVar flag >>= \cancelled -> if cancelled then pure True else outside
     inside (LoopScope _ flag _) rest = readTVar flag >>= \cancelled -> if cancelled then pure True else go rest
 
 -- | What a grace's watch waits for, in the frames of the part: retries until it is there.
@@ -349,12 +384,14 @@ data Advanced r
   | -- | It used its steps, and can go on.
     Yielded (Process r)
   | Forked [Process r]
+  | -- | It started a group, whose body goes on, and waits until the group has ended, which wakes it.
+    Grouping (Process r)
   | Waits Event (Process r)
 
 -- | A part of a group has ended, with a failure or without: the first failure cancels the others, and the part that
 -- ends last goes on with the parent, with the failure if there was one.
-joinPart :: Group -> Frames () r -> Maybe SomeException -> IO (Maybe (Process r))
-joinPart (Group scope' size ref) rest failure = do
+joinPart :: Bunch -> Frames () r -> Maybe SomeException -> IO (Maybe (Process r))
+joinPart (Bunch scope' size ref) rest failure = do
   Joined failed count <- readIORef ref
   failed' <- case failure of
     Just thrown | isNothing failed -> cancelLoopScope scope' $> Just thrown
@@ -372,6 +409,40 @@ raceHalf (Contest scope' ref) rest outcome =
       (Left thrown, _) -> Just (Fail thrown rest)
       (Right _, Left thrown) | isNothing (cancelledBy thrown) -> Just (Fail thrown rest)
       (Right result, _) -> Just (Give result rest)
+
+-- | The number of the next spawn into the group, or nothing if the parts of the group were cancelled: the spawn then counts as a
+-- part that ended cancelled, and no part runs.
+spawnNumber :: forall j. (Joiner j) => LoopGang j -> IO (Maybe Int)
+spawnNumber (LoopGang (LoopScope ident flag _) standing _ _) = do
+  Standing number live tally finish <- readIORef standing
+  readTVarIO flag >>= \cancelled ->
+    if cancelled
+      then Nothing <$ (writeIORef standing $! Standing (number + 1) live (fst (Joiner.ended @j number (Left (toException (Cancelled ident))) tally)) finish)
+      else Just number <$ (writeIORef standing $! Standing (number + 1) (live + 1) tally finish)
+
+-- | The body of a group ended: the parts are cancelled if it failed, or was cancelled. If no part is left, the part that made the group
+-- is woken, with the body's failure, or its result and what the joiner made of the parts, or the failure that the joiner gives; if
+-- some are, the one that ends last wakes it.
+groupBodyEnded :: forall j b r. (Joiner j) => LoopGang j -> (Process r -> IO ()) -> Frames (b, Joiner.Joined j) r -> Either SomeException b -> IO ()
+groupBodyEnded (LoopGang scope' standing _ _) wake rest outcome = do
+  either (\_ -> cancelLoopScope scope') (\_ -> pure ()) outcome
+  Standing spawned live tally _ <- readIORef standing
+  let finish tally' =
+        wake $ case outcome of
+          Left thrown -> Fail thrown rest
+          Right result -> either (`Fail` rest) (\extra -> Give (result, extra) rest) (Joiner.joined @j tally')
+  writeIORef standing $! Standing spawned (live - 1) tally (Just finish)
+  when (live == 1) (finish tally)
+
+-- | A part of the group ended in this way, which was spawned as this number: the joiner is told, and the parts are cancelled if it
+-- says so. The part that ends last wakes the part that made the group.
+groupPartEnded :: forall j. (Joiner j) => LoopGang j -> Int -> Either SomeException (Joiner.Part j) -> IO ()
+groupPartEnded (LoopGang scope' standing _ _) number outcome = do
+  Standing spawned live tally finish <- readIORef standing
+  let (tally', cancelling) = Joiner.ended @j number outcome tally
+  when cancelling (cancelLoopScope scope')
+  writeIORef standing $! Standing spawned (live - 1) tally' finish
+  when (live == 1) (maybe (pure ()) ($ tally') finish)
 
 -- | Runs a part until it waits, forks, ends, or has taken this many steps of
 -- its primitives: what it came to, and how many steps it took. A part it parks
@@ -393,8 +464,18 @@ advance env time fuel wake = go 0
               Right c -> go steps (Give (Right c) frames)
             Together parts -> do
               scope' <- newLoopScope env
-              group <- Group scope' (length parts) <$> newIORef (Joined Nothing 0)
-              pure (steps, Forked [Run part input (Joining group frames) | part <- parts])
+              bunch <- Bunch scope' (length parts) <$> newIORef (Joined Nothing 0)
+              pure (steps, Forked [Run part input (Joining bunch frames) | part <- parts])
+            Group' joiner body -> do
+              scope' <- newLoopScope env
+              standing <- newIORef $! Standing 0 1 (Joiner.begin joiner) Nothing
+              let gang = LoopGang scope' standing (\found -> cancelledFrom found frames) (cancelledAnywhereSTM frames)
+              pure (steps, Grouping (Run body (LoopGroup gang, input) (Grouped gang wake frames)))
+            Spawn' part -> case input of
+              (LoopGroup gang, x) ->
+                spawnNumber gang >>= \case
+                  Nothing -> go steps (Give () frames)
+                  Just number -> pure (steps + 1, Forked [Run part x (Spawned gang number), Give () frames])
             Race' one two -> do
               scope' <- newLoopScope env
               contest <- Contest scope' <$> newIORef Nothing
@@ -406,11 +487,59 @@ advance env time fuel wake = go 0
                 Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
                 Nothing -> pure (steps + 1, Waits input (Check frames))
             Await ->
-              readIORef input >>= \case
-                Fulfilled value -> go (steps + 1) (Give value frames)
-                Empty -> (steps + 1, Parked) <$ writeIORef input (Waiter (\action -> action >>= \value -> wake (Give value frames)))
-                Waiter _ -> ioError (userError "two parts wait for one ticket")
-                Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
+              valueWaits input >>= \there ->
+                let parking =
+                      -- The part parks, and goes back with the value when a part hands it one.
+                      parkTaker changeHere input (\value -> True <$ wake (Give value frames)) >>= \case
+                        Parks -> pure (steps + 1, Parked)
+                        Took value -> go (steps + 1) (Give value frames)
+                        Misused -> go steps (Fail (toException tookWrongly) frames)
+                 in if there
+                      then
+                        takeWaiting changeHere input >>= \case
+                          Took value -> go (steps + 1) (Give value frames)
+                          Misused -> go steps (Fail (toException tookWrongly) frames)
+                          Parks -> parking
+                      else parking
+            AwaitRegistering -> case input of
+              (slot, register) ->
+                beginRegistering changeHere slot >>= \case
+                  Took value -> go (steps + 1) (Give value frames)
+                  Misused -> go steps (Fail (toException tookWrongly) frames)
+                  Parks ->
+                    try register >>= \case
+                      Left failure -> giveUpRegistering changeHere slot *> go steps (Fail failure frames)
+                      Right (Just value) -> giveUpRegistering changeHere slot >>= \clean -> if clean then go (steps + 1) (Give value frames) else go steps (Fail (toException registeredAndGave) frames)
+                      Right Nothing ->
+                        endRegistering changeHere slot >>= \case
+                          Took value -> go (steps + 1) (Give value frames)
+                          Misused -> go steps (Fail (toException tookWrongly) frames)
+                          Parks ->
+                            parkTaker changeHere slot (\value -> True <$ wake (Give value frames)) >>= \case
+                              Parks -> pure (steps + 1, Parked)
+                              Took value -> go (steps + 1) (Give value frames)
+                              Misused -> go steps (Fail (toException tookWrongly) frames)
+            HandWaiting -> case input of
+              (slot, value) ->
+                handTry changeHere slot value >>= \case
+                  Passed -> go (steps + 1) (Give Nothing frames)
+                  GaveBack -> go (steps + 1) (Give (Just value) frames)
+                  SecondSender -> go steps (Fail (toException twoSenders) frames)
+                  _ ->
+                    parkSender changeHere slot value 0 (\taken -> wake (Give (if taken then Nothing else Just value) frames)) >>= \case
+                      LeftWaiting -> pure (steps + 1, Parked)
+                      Passed -> go (steps + 1) (Give Nothing frames)
+                      GaveBack -> go (steps + 1) (Give (Just value) frames)
+                      _ -> go steps (Fail (toException twoSenders) frames)
+            UntilParked ->
+              lookAtWatch input >>= \case
+                WatchDone -> go (steps + 1) (Give () frames)
+                SecondWatcher -> go steps (Fail (toException twoWatchers) frames)
+                WatchWaits ->
+                  parkWatcher changeHere input 0 (wake (Give () frames)) >>= \case
+                    WatchWaits -> pure (steps + 1, Parked)
+                    WatchDone -> go (steps + 1) (Give () frames)
+                    SecondWatcher -> go steps (Fail (toException twoWatchers) frames)
             Collect ->
               cancelledNow env frames >>= \case
                 Just ident -> go steps (Fail (toException (Cancelled ident)) frames)
@@ -450,9 +579,11 @@ advance env time fuel wake = go 0
             Then next rest -> go steps (Run next value rest)
             Beside c rest -> go steps (Give (value, c) rest)
             OnLeft rest -> go steps (Give (Left value) rest)
-            Joining group rest -> joinPart group rest Nothing >>= endHalf steps
+            Joining bunch rest -> joinPart bunch rest Nothing >>= endHalf steps
             RaceFirst contest rest -> raceHalf contest rest (Right (Left value)) >>= endHalf steps
             RaceSecond contest rest -> raceHalf contest rest (Right (Right value)) >>= endHalf steps
+            Grouped gang waking rest -> groupBodyEnded gang waking rest (Right value) *> pure (steps, Ended)
+            Spawned gang number -> groupPartEnded gang number (Right value) *> pure (steps, Ended)
             Acquired release body input rest -> go steps (Run body (value, input) (Guarded value release rest))
             Guarded held release rest -> go steps (Run release (held, Done) (Releasing Done (Right value) rest))
             Releasing _ outcome rest -> go steps (either (`Fail` rest) (`Give` rest) outcome)
@@ -463,9 +594,11 @@ advance env time fuel wake = go 0
             Then _ rest -> go steps (Fail failure rest)
             Beside _ rest -> go steps (Fail failure rest)
             OnLeft rest -> go steps (Fail failure rest)
-            Joining group rest -> joinPart group rest (Just failure) >>= endHalf steps
+            Joining bunch rest -> joinPart bunch rest (Just failure) >>= endHalf steps
             RaceFirst contest rest -> raceHalf contest rest (Left failure) >>= endHalf steps
             RaceSecond contest rest -> raceHalf contest rest (Left failure) >>= endHalf steps
+            Grouped gang waking rest -> groupBodyEnded gang waking rest (Left failure) *> pure (steps, Ended)
+            Spawned gang number -> groupPartEnded gang number (Left failure) *> pure (steps, Ended)
             Acquired _ _ _ rest -> go steps (Fail failure rest)
             Guarded held release rest ->
               let exit = exitOf (Left failure)
@@ -523,6 +656,7 @@ runLoop program input = do
           Parked -> go report' (parked + 1) others waiting
           Yielded process' -> go report' parked (others <> [process']) waiting
           Forked parts -> go report' parked (others <> parts) waiting
+          Grouping body -> go report' (parked + 1) (others <> [body]) waiting
           Waits event process' -> go report' parked others ((watchFor env event process', process') : waiting)
       []
         | null waiting && parked > (0 :: Int) -> ioError (userError "runLoop: parts wait for tickets that nothing will fulfil")
@@ -596,6 +730,7 @@ runSimulation seed limit program input = do
             Parked -> go random' next report' trace' (ident : parked) others waiting
             Yielded process' -> go random' next report' trace' parked ((ident, process') : others) waiting
             Forked parts -> go random' (next + length parts) report' trace' parked (zip [next ..] parts <> others) waiting
+            Grouping body -> go random' (next + 1) report' trace' (ident : parked) ((next, body) : others) waiting
             Waits event process' -> go random' next report' trace' parked others ((ident, (event, process')) : waiting)
       where
         finish outcome = pure (Simulated outcome report (reverse trace))

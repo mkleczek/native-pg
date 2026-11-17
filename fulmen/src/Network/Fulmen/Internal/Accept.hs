@@ -30,7 +30,7 @@ import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr, nullPtr)
 import Network.Socket (Socket, SocketOption (NoDelay), mkSocket, setSocketOption, withFdSocket)
 import qualified Network.Socket as Socket
-import Network.Streaming.Classes (Annotate, Block (..), Effect, Event (..), GiveWay (..), giving, taking)
+import Network.Streaming.Classes (Annotate, Block (..), Effect, Event (..), GiveWay (..), (-|), (|-))
 import Network.Streaming.Combinators (pattern Again, pattern Finish, consume, iterateWith, step)
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Descriptors (fresh)
@@ -113,7 +113,7 @@ foreign import ccall unsafe "accept"
 -- a connection doesn't keep the others of its core from running.
 acceptor :: forall arr. (ArrowChoice arr, Annotate arr, Effect arr, GiveWay arr, Block arr, Instrumented (ModeOf arr)) => arr Socket Socket
 acceptor =
-  giveWay >>> iterateWith (step "try accept" attempt `giving` "accepted?") (taking "none waiting" (consume block))
+  giveWay >>> iterateWith (step "try accept" attempt -| "accepted?") ("none waiting" |- consume block)
   where
     attempt listener =
       tryAccept @(ModeOf arr) listener >>= \case

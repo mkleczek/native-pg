@@ -58,6 +58,10 @@ data Tree
     Choice Tree Tree
   | -- | Parts that run at once.
     Together [Tree]
+  | -- | A group: the body, which spawns parts while it runs.
+    Grouped Tree
+  | -- | A part that is started on its own, while the part that spawns it goes on.
+    Spawned Tree
   | -- | A step that is one node: how it is called, and how it is drawn.
     Leaf String Shape
   | -- | A scope: what it acquires, what releases it, and its body.
@@ -149,6 +153,8 @@ children = \case
   Sum one two -> [one, two]
   Choice one two -> [one, two]
   Together parts -> parts
+  Grouped inner -> [inner]
+  Spawned inner -> [inner]
   Leaf _ _ -> []
   Scope acquire release body -> [acquire, release, body]
   Try inner -> [inner]
@@ -232,7 +238,8 @@ walk start enter root = do
         else False <$ modifyIORef' seen (IntMap.insertWith (++) (hashStableName name) [(name, context)])
 
 -- | The way from the tree to the first node below it, or it, that the test holds for: the nodes on it, in order, into the
--- boxes too. Each node is looked at once, so a loop is no trouble.
+-- boxes too, but not into a part that a spawn starts, which runs on its own. Each node is looked at once, so a loop is no
+-- trouble.
 reach :: (Tree -> Bool) -> Tree -> IO (Maybe [Tree])
 reach found root = do
   seen <- newIORef IntMap.empty
@@ -245,7 +252,7 @@ reach found root = do
             modifyIORef' seen (IntMap.insertWith (++) (hashStableName name) [name])
             if found tree
               then pure (Just [tree])
-              else fmap (tree :) <$> firstOf (children tree)
+              else fmap (tree :) <$> firstOf (case tree of Spawned _ -> []; _ -> children tree)
       firstOf = \case
         [] -> pure Nothing
         step : others -> visit step >>= maybe (firstOf others) (pure . Just)

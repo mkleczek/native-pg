@@ -7,8 +7,8 @@ import Network.Streaming.Classes (Annotate (..), Effect (..), Label (..))
 import Network.Streaming.Diagram (Diagram)
 import System.Posix.Types (Fd (..))
 
--- | The server, which listens on a socket that it is started with, and has four workers on each core, so that the pages
--- show a count of them. It is built without a socket and without a pool, and nothing runs.
+-- | The server, which listens on a socket that it is started with, and has room for four connections on each core, so
+-- that the pages show a count of them. It is built without a socket and without a pool, and nothing runs.
 server :: Diagram Fulmen.Cores ()
 server = Fulmen.serve Fulmen.defaultSettings {Fulmen.connectionsPerCore = 4} (Fulmen.inherited (Fd 3)) handler
   where

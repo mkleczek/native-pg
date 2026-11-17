@@ -9,7 +9,7 @@
 -- Each program that doesn't compile has a twin that does, the same with a promise of reach @'Anywhere@.
 module RegionSpec (spec) where
 
-import Control.Arrow (ArrowChoice, second, (>>>), (>>^), (^>>))
+import Control.Arrow (ArrowChoice, first, second, (>>>), (>>^), (^>>))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Exception (TypeError (..), evaluate, try)
 import Control.Monad (void, when)
@@ -85,26 +85,27 @@ hereTicket = ticket
 anywhereTicket :: Delimited s () (Future (Delimited s) 'Anywhere a, Promise 'Anywhere a)
 anywhereTicket = ticket
 
--- | A ticket made, fulfilled, and waited for, on one core.
+-- | A ticket made, fulfilled, and waited for, on one core, by a part that will await it.
 ownTickets :: Delimited s () Int
-ownTickets = hereTicket >>> tap ((,3) . snd ^>> fulfil >>> done) >>> fst ^>> await
+ownTickets = hereTicket >>> first willAwait >>> tap ((,3) . snd ^>> fulfil >>> done) >>> fst ^>> await
 
--- | Core 0 makes a ticket, leaves its promise where core 1 finds it, and waits; core 1 fulfils it.
+-- | Core 0 makes a ticket, leaves its promise where core 1 finds it, and waits; core 1 hands a value over, and waits until it is taken.
 promiseAcrossCores :: IORef (Maybe (Promise 'Anywhere Int)) -> Int -> Delimited s () Int
 promiseAcrossCores box core
   | core == 0 = anywhereTicket >>> second (now (writeIORef box . Just)) >>> fst ^>> await
-  | otherwise = found box >>> (,4) ^>> fulfil >>^ const 1
+  | otherwise = found box >>> (,4) ^>> handWaiting >>^ const 1
 
 -- | The same, which is the program that isn't well-typed with the promise of a ticket of reach @'Here@, with the type
 -- of what the cores share given where it is made.
 promiseInSetup :: IORef (Maybe (Promise 'Anywhere Int)) -> Int -> Delimited s () Int
 promiseInSetup = promiseAcrossCores
 
--- | Each core leaves the promise of its ticket, takes the other's and fulfils it, and waits at its own future:
--- core 0 gets 11 and core 1 gets 10.
+-- | Each core, which will await its own future, leaves the promise of its ticket, takes the other's and fulfils it, and waits at its own
+-- future: core 0 gets 11 and core 1 gets 10.
 crossedPromises :: (IORef (Maybe (Promise 'Anywhere Int)), IORef (Maybe (Promise 'Anywhere Int))) -> Int -> Delimited s () Int
 crossedPromises (box0, box1) core =
   anywhereTicket
+    >>> first willAwait
     >>> second (now (writeIORef mine . Just))
     >>> fst ^>> keeping (found theirs >>> (,core + 10) ^>> fulfil)
     >>> snd ^>> await

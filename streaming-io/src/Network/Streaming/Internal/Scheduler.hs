@@ -33,7 +33,9 @@
 -- did. A scope holds only the parts it began with, and a part that is suspended
 -- at a group of parts or a race says so: cancelling a scope finds the others through those, so that
 -- a part enters and leaves a scope without anything but its own frames
--- changing, however many parts there are. The scheduler runs masked, and an
+-- changing, however many parts there are. The scope of the parts that a group spawns while it runs
+-- holds the body and the parts that are spawned into it, each added as it is spawned and taken out as it
+-- ends, so that a part that has ended leaves nothing in it. The scheduler runs masked, and an
 -- asynchronous exception reaches it where it waits for a descriptor, and once
 -- in a while otherwise: it cancels every part that is in a scope, waits until
 -- they have ended, and then fails the run with the exception.
@@ -50,21 +52,24 @@ module Network.Streaming.Internal.Scheduler
     stepped,
     counted,
     wakeTicket,
-    RemoteSlot (..),
-    awaitRemote,
-    fulfilRemote,
-    abandonRemote,
     Seat (..),
     hereSeat,
     anywhereSeat,
     collectFrom,
     postTo,
+    awaitFrom,
+    awaitRegisteringFrom,
+    handWaitingTo,
+    untilParkedFrom,
+    commitTo,
+    abandonTicket,
     Mailbox,
     runMailbox,
     post,
     schedule,
     Part (..),
     PartScope,
+    Members,
     Parked (..),
     newPart,
     newScope,
@@ -86,6 +91,12 @@ module Network.Streaming.Internal.Scheduler
     Joined (..),
     groupEnded,
     raceEnded,
+    Gang,
+    newGang,
+    spawnedPart,
+    bodyEnded,
+    partEnded,
+    enqueue,
     Escaped (..),
     guardedBy,
     runFailure,
@@ -97,7 +108,7 @@ where
 
 import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, yield)
 import Control.Concurrent.STM (atomically, orElse, retry)
-import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, throwIO, toException, try)
+import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, onException, throwIO, toException, try)
 import Control.Monad (foldM, forM_, void, when)
 import Data.Bits ((.&.), (.|.))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -113,12 +124,15 @@ import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Conc (BlockReason (..), ThreadStatus (..), listThreads, threadStatus)
 import GHC.ForeignPtr (unsafeWithForeignPtr)
 import Network.Streaming.Classes (Cancelled (..), Event (..), Instant (..), ReleaseFailed (..), cancelledBy, exitOf, monotonicNanoseconds)
+import Network.Streaming.Concurrent (Joiner)
+import qualified Network.Streaming.Concurrent as Joiner
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Descriptors (armedBy, newRunNumber)
-import Network.Streaming.Internal.Inboxes (Change, Looked (..), Shelf, changeHere, collectedWrongly, lookOrWait, postNow, postOrQueue, stopWaiting, takeNow, takeWoken, withdraw)
-import Network.Streaming.Internal.Tickets (Slot (..))
+import Network.Streaming.Internal.Atomic (Change, changeHere)
+import Network.Streaming.Internal.Inboxes (Looked (..), Shelf, collectedWrongly, lookOrWait, postNow, postOrQueue, stopWaiting, takeNow, takeWoken, withdraw)
+import Network.Streaming.Internal.Tickets
 import Network.Streaming.Internal.Timers
 import Network.Streaming.Loop (Report (..))
 import Network.Streaming.Mode (Instrumented (bump, bumpBy, debugging))
@@ -168,7 +182,7 @@ defaultTurn = microseconds 10
 -- frames of a child begin with those of its parent, which it shares: its own end at its mark.
 data Part = Part
   { partIdent :: !Int,
-    partFrames :: !(IORef [Frame [Part]]),
+    partFrames :: !(IORef [Frame Members]),
     partWait :: !(IORef Parked),
     partCancelled :: !(IORef Bool)
   }
@@ -176,12 +190,14 @@ data Part = Part
 -- | A scope of a run, with the parts that its body began with: those of a group or the halves of a race, or the part
 -- that entered a deadline. The others inside it are reached through those: a part that is suspended at a group says so
 -- (see 'InGroup'), and its parts are inside what the part is inside.
-type PartScope = CancelScope [Part]
+type PartScope = CancelScope Members
+
+-- | The parts that a scope holds, by their numbers, so that a part that ends is taken out of it.
+type Members = IntMap.IntMap Part
 
 -- | Where a part waits, as what takes it off that.
 data Parked
   = NotWaiting
-  | forall a. OnTicket !(IORef (Slot a))
   | -- | A descriptor, the direction and the number of the wait.
     OnFd !Int !Bool !Int
   | -- | A watch, by the number of the wait.
@@ -281,7 +297,7 @@ newRun (Turn turn) = do
   unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
   inbox <- newIORef (Open [] False)
-  Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 [] <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False
+  Run <$> newIORef [] <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 IntMap.empty <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
@@ -405,94 +421,25 @@ counted run step = step <$ (counter run 1 >>= setCounter run 1 . (+ 1))
 wakeTicket :: Run -> IO Step -> IO ()
 wakeTicket run part = modifyIORef' (runTickets run) (part :) *> adjust run 5 (-1)
 
--- | What the slot of a ticket of reach @'Anywhere@ holds, and what a thread that fulfils it finds: nothing
--- yet, the value, the part that waits for it, or that the waiter has gone. Several threads read and change it,
--- atomically. The value is evaluated, as a local slot's is. The waiter is what puts the part back among those that
--- can go on, with the action that runs where it waited: the value, or a cancellation to raise.
-data RemoteSlot a = RemoteEmpty | RemoteFulfilled !a | RemoteWaiter (IO a -> IO Step) | RemoteAbandoned
-
--- | What a fulfil did to the slot.
-data Fulfilment a = Stored | Resume (IO a -> IO Step) | Gone | Twice
-
--- | What a waiter's parking did to the slot.
-data Parking a = Parking | Ready a | Misused
-
--- | What a part does that waits for a ticket of reach @'Anywhere@, for the two arrows that run parts on one
--- thread. If the value is there, the arrow goes on with it. If it isn't, the part says where it waits, so that a
--- cancellation takes it off the slot, and the arrow captures what follows the wait, which it hands to the slot
--- as the waiter. It is the arrow's own to say how it goes on and how it captures.
-awaitRemote :: Run -> Part -> IORef (RemoteSlot a) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
-awaitRemote run part slot fulfilled capture =
-  readIORef slot >>= \case
-    RemoteFulfilled value -> checkpoint part *> fulfilled value
-    RemoteEmpty -> do
-      registering part (Other (stopRemote run slot))
-      capture (parkRemote slot)
-    _ -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
-{-# INLINE awaitRemote #-}
-
--- | Parks the captured part in the slot, which was empty at the look: unless it was fulfilled since, and then
--- the part goes on in its turn.
-parkRemote :: IORef (RemoteSlot a) -> (IO a -> IO Step) -> IO Step
-parkRemote slot resume = do
-  parking <- update slot $ \case
-    RemoteEmpty -> (RemoteWaiter resume, Parking)
-    RemoteFulfilled value -> (RemoteFulfilled value, Ready value)
-    other -> (other, Misused)
-  case parking of
-    Parking -> pure ParkedRemote
-    -- Fulfilled since the look: goes on in its turn.
-    Ready value -> pure (Yielded (resume (pure value)))
-    Misused -> ioError (userError "a ticket was waited for twice, or after it was abandoned")
-
--- | Takes the part off the slot, if it still waits there: not if it was fulfilled since, which has put the
--- part in the mailbox, and which the part finds at its next wait.
-stopRemote :: Run -> IORef (RemoteSlot a) -> Cancelled -> IO (Maybe (IO Step))
-stopRemote run slot cancelled =
-  update slot (\case RemoteWaiter resume -> (RemoteEmpty, Just resume); other -> (other, Nothing)) >>= \case
-    Nothing -> pure Nothing
-    Just resume -> Just (resume (throwIO cancelled)) <$ adjust run 3 (-1)
-
--- | Fulfils the slot with its value, and if a part waits for it, puts the part in the
--- mailbox of the scheduler that owns it. It says whether the waiter takes it. The value is evaluated before
--- the compare-and-swap, not between its read and its swap.
-fulfilRemote :: Mailbox -> IORef (RemoteSlot a) -> a -> IO Bool
-fulfilRemote mailbox slot !value = do
-  fulfilment <- update slot $ \case
-    RemoteEmpty -> (RemoteFulfilled value, Stored)
-    RemoteWaiter resume -> (RemoteFulfilled value, Resume resume)
-    RemoteAbandoned -> (RemoteAbandoned, Gone)
-    fulfilled -> (fulfilled, Twice)
-  case fulfilment of
-    Stored -> pure True
-    Resume resume -> post mailbox (resume (pure value))
-    Gone -> pure False
-    Twice -> ioError (userError "a promise was fulfilled twice")
-
--- | The waiter stops wanting the value, before it waits for it: a later fulfil says it isn't taken. A value fulfilled
--- already is the waiter's, and this returns it.
-abandonRemote :: IORef (RemoteSlot a) -> IO (Maybe a)
-abandonRemote slot =
-  update slot $ \case
-    RemoteFulfilled value -> (RemoteAbandoned, Just value)
-    _ -> (RemoteAbandoned, Nothing)
-
--- | How the parts of a run wait at an inbox, and are woken: how the shelf is changed, how a part is put back among those that
--- can go on, what a part that waits comes to, and the counter of the parts that wait that way.
+-- | How the parts of a run wait at an inbox or a ticket, and are woken: how the slot is changed, how a part is put back among those
+-- that can go on, how a part is given a value, which says whether the part takes it, what a part that waits comes to, and the counter of
+-- the parts that wait that way.
 data Seat = Seat
   { seatChange :: Change,
     seatWake :: Run -> IO Step -> IO (),
+    seatDeliver :: Run -> IO Step -> IO Bool,
     seatParked :: Step,
     seatCounter :: Int
   }
 
--- | The seat of an inbox of this core: plain memory, and the parts that tickets woke.
+-- | The seat of an inbox or a ticket of this core: plain memory, and the parts that tickets woke.
 hereSeat :: Seat
-hereSeat = Seat changeHere wakeTicket Parked 5
+hereSeat = Seat changeHere wakeTicket (\run part -> True <$ wakeTicket run part) Parked 5
 
--- | The seat of an inbox of any core: compare-and-swap, and the mailbox of the part's scheduler.
+-- | The seat of an inbox or a ticket of any core: compare-and-swap, and the mailbox of the part's scheduler, which refuses a part if
+-- the scheduler has ended.
 anywhereSeat :: Seat
-anywhereSeat = Seat update (\run part -> () <$ post (runMailbox run) part) ParkedRemote 3
+anywhereSeat = Seat update (\run part -> () <$ post (runMailbox run) part) (\run part -> post (runMailbox run) part) ParkedRemote 3
 
 -- | What a part does that collects from an inbox, for the two arrows that run every part on one thread: the arrow goes on with the
 -- value, or, if there is none, captures what follows, and the part waits on the shelf until a post wakes it and it takes the value.
@@ -534,15 +481,129 @@ postTo seat run part shelf value posted capture = do
           -- The inbox took the value, or closed, since the look, on another thread.
           Just taken -> pure (Yielded (resume (pure taken)))
 
+-- | The part says where it waits, if it is in a scope, so that a cancellation can take it from there: a part that is in none is not
+-- cancelled, and says nothing.
+waitsAt :: Part -> Parked -> IO ()
+waitsAt part parked =
+  readIORef (partFrames part) >>= \case
+    [] -> pure ()
+    _ -> writeIORef (partWait part) parked
+{-# INLINE waitsAt #-}
+
+-- | What a part does that awaits a ticket, for the two arrows that run every part on one thread: the arrow goes on with the value if a
+-- sender waits, and else captures what follows, and the part parks in the slot until a sender gives it a value. A cancellation that
+-- reaches the part first is raised before it takes a value, which a sender that waits keeps.
+awaitFrom :: Seat -> Run -> Part -> IORef (Slot a) -> (IO r -> IO r) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
+awaitFrom seat run part slot first taken capture = do
+  checkpoint part
+  valueWaits slot >>= \case
+    False -> capture (parkAwaiting seat run part slot)
+    -- The part takes the value, after the step that it may give way at, so that a cancellation that it raises leaves the value with its sender.
+    True ->
+      first $
+        takeWaiting (seatChange seat) slot >>= \case
+          Took value -> taken value
+          Misused -> ioError tookWrongly
+          Parks -> capture (parkAwaiting seat run part slot)
+{-# INLINE awaitFrom #-}
+
+-- | Parks the captured part in the slot, as the receiver: unless a sender came since the look, and then the part goes on in its turn
+-- with the value. The part is given a value by a sender with the value itself: a cancellation reaches it at its next wait.
+parkAwaiting :: Seat -> Run -> Part -> IORef (Slot a) -> (IO a -> IO Step) -> IO Step
+parkAwaiting seat run part slot resume =
+  parkTaker (seatChange seat) slot (\value -> seatDeliver seat run (resume (pure value))) >>= \case
+    Parks -> do
+      -- A cancellation takes the part off the slot, unless a sender has given it a value already.
+      let stop cancelled = stopTaking (seatChange seat) slot >>= \stopped -> if stopped then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+      waitsAt part (Other stop)
+      pure (seatParked seat)
+    Took value -> pure (Yielded (resume (pure value)))
+    Misused -> ioError tookWrongly
+
+-- | What a part does that awaits and registers: if a sender waits, the arrow goes on with its value, and the registration doesn't run.
+-- Else the receiver is committed to take, and the registration runs in the same step, as the part that is about to park: a value that is
+-- handed to the receiver meanwhile is its, and the registration may give a value instead, which the arrow goes on with. If neither, the
+-- part captures what follows and parks.
+awaitRegisteringFrom :: Seat -> Run -> Part -> IORef (Slot a) -> IO (Maybe a) -> (IO r -> IO r) -> (a -> IO r) -> (((IO a -> IO Step) -> IO Step) -> IO r) -> IO r
+awaitRegisteringFrom seat run part slot register first taken capture = do
+  checkpoint part
+  valueWaits slot >>= \there -> if there then first begin else begin
+  where
+    begin =
+      beginRegistering (seatChange seat) slot >>= \case
+        Took value -> taken value
+        Misused -> ioError tookWrongly
+        Parks ->
+          (register `onException` giveUpRegistering (seatChange seat) slot) >>= \case
+            Just value -> giveUpRegistering (seatChange seat) slot >>= \clean -> if clean then taken value else ioError registeredAndGave
+            Nothing ->
+              endRegistering (seatChange seat) slot >>= \case
+                Took value -> taken value
+                Parks -> capture (parkAwaiting seat run part slot)
+                Misused -> ioError tookWrongly
+{-# INLINE awaitRegisteringFrom #-}
+
+-- | What a part does that hands a value over and waits until it is taken: the arrow goes on with 'Nothing' if the receiver is parked,
+-- and takes it, and with the value if the ticket was abandoned. Else it captures what follows, and the part waits in the slot until
+-- the receiver takes the value or the ticket is abandoned. A cancellation that reaches the part first is raised before the hand, and a
+-- cancellation takes the part out of the slot, unless its value was taken.
+handWaitingTo :: Seat -> Run -> Part -> IORef (Slot a) -> a -> (Maybe a -> IO r) -> (((IO (Maybe a) -> IO Step) -> IO Step) -> IO r) -> IO r
+handWaitingTo seat run part slot value handed capture = do
+  checkpoint part
+  handTry (seatChange seat) slot value >>= \case
+    Passed -> handed Nothing
+    GaveBack -> handed (Just value)
+    SecondSender -> ioError twoSenders
+    _ -> capture $ \resume -> do
+      token <- nextWait run
+      parkSender (seatChange seat) slot value token (\taken -> seatWake seat run (resume (pure (if taken then Nothing else Just value)))) >>= \case
+        LeftWaiting -> do
+          let stop cancelled = withdrawSender (seatChange seat) slot token >>= \withdrawn -> if withdrawn then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+          waitsAt part (Other stop)
+          pure (seatParked seat)
+        -- The receiver took the value, or the ticket was abandoned, since the look, on another thread.
+        Passed -> pure (Yielded (resume (pure Nothing)))
+        GaveBack -> pure (Yielded (resume (pure (Just value))))
+        _ -> ioError twoSenders
+{-# INLINE handWaitingTo #-}
+
+-- | What a part does that waits until the receiver is parked: the arrow goes on if it is, or the ticket was abandoned. Else it captures
+-- what follows, and the part waits in the slot as the watcher, which the receiver's park wakes.
+untilParkedFrom :: Seat -> Run -> Part -> IORef (Slot a) -> IO r -> (((IO () -> IO Step) -> IO Step) -> IO r) -> IO r
+untilParkedFrom seat run part slot goOn capture = do
+  checkpoint part
+  lookAtWatch slot >>= \case
+    WatchDone -> goOn
+    SecondWatcher -> ioError twoWatchers
+    WatchWaits -> capture $ \resume -> do
+      token <- nextWait run
+      parkWatcher (seatChange seat) slot token (seatWake seat run (resume (pure ()))) >>= \case
+        WatchWaits -> do
+          let stop cancelled = unwatch (seatChange seat) slot token >>= \stopped -> if stopped then Just (resume (throwIO cancelled)) <$ adjust run (seatCounter seat) (-1) else pure Nothing
+          waitsAt part (Other stop)
+          pure (seatParked seat)
+        WatchDone -> pure (Yielded (resume (pure ())))
+        SecondWatcher -> ioError twoWatchers
+{-# INLINE untilParkedFrom #-}
+
+-- | The receiver is about to hand its promise out, with steps that may wait, and await the future: a value handed to it from now on is
+-- its.
+commitTo :: Seat -> IORef (Slot a) -> IO ()
+commitTo seat slot = commitRegistering (seatChange seat) slot >>= \committed -> if committed then pure () else ioError tookWrongly
+
+-- | Abandons the ticket, and gives the value that was handed to the receiver while it registered and that it never awaited.
+abandonTicket :: Seat -> IORef (Slot a) -> IO (Maybe a)
+abandonTicket seat = closeSlot (seatChange seat)
+
 -- | The first part of a run, in no scope: the run's root scope begins with it.
 newPart :: Run -> IO Part
 newPart run = do
   part <- Part <$> nextWait run <*> newIORef [] <*> newIORef NotWaiting <*> newIORef False
-  part <$ modifyIORef' (scopeMembers (runRoot run)) (part :)
+  part <$ modifyIORef' (scopeMembers (runRoot run)) (IntMap.insert (partIdent part) part)
 
 -- | A scope for a group, a race or a deadline of the run.
 newScope :: Run -> IO PartScope
-newScope run = nextWait run >>= (`newCancelScope` [])
+newScope run = nextWait run >>= (`newCancelScope` IntMap.empty)
 
 -- | A part for a half of a race, in the scope of the race as well as in those of the part that made it. The
 -- parent, which is suspended until the race has ended, says where its halves are. The part begins with the flag of its
@@ -553,7 +614,7 @@ childPart run parent scope' = do
   flagged <- if null outer then isCancelled (runRoot run) else readIORef (partCancelled parent)
   child <- Part <$> nextWait run <*> newIORef (Inside scope' : if null outer then [Inside (runRoot run)] else outer) <*> newIORef NotWaiting <*> newIORef flagged
   adjust run 9 1
-  modifyIORef' (scopeMembers scope') (<> [child])
+  modifyIORef' (scopeMembers scope') (IntMap.insert (partIdent child) child)
   child <$ writeIORef (partWait parent) (InGroup scope')
 
 -- | The parts of a group of this many, in the scope of the group as well as in those of the part that made it. The
@@ -567,7 +628,7 @@ childParts run parent scope' count = do
   -- Made in a loop that keeps no stack of its own: a group of thousands of parts starts under a small stack limit.
   children <- reverse <$> foldM (\made _ -> (: made) <$> (Part <$> nextWait run <*> newIORef frames <*> newIORef NotWaiting <*> newIORef flagged)) [] [1 .. count]
   adjust run 9 count
-  writeIORef (scopeMembers scope') children
+  writeIORef (scopeMembers scope') (IntMap.fromDistinctAscList [(partIdent child, child) | child <- children])
   children <$ writeIORef (partWait parent) (InGroup scope')
 
 -- | A part that has ended is in no scope any more.
@@ -581,7 +642,7 @@ endPart run part = do
 -- | The part goes in a scope, or behind a shield; a part that was in none goes in the run's root scope too. A
 -- scope that a part goes in this way begins with it. Not inlined, so that the frames of a part that was in none
 -- are built only then, and not at every scope.
-pushFrame :: Run -> Part -> Frame [Part] -> IO ()
+pushFrame :: Run -> Part -> Frame Members -> IO ()
 pushFrame run part frame = do
   frames <- readIORef (partFrames part)
   case frames of
@@ -591,7 +652,7 @@ pushFrame run part frame = do
       -- The root may have been cancelled while the part was in no scope.
       isCancelled (runRoot run) >>= \cancelled -> when cancelled (writeIORef (partCancelled part) True)
     _ -> writeIORef (partFrames part) (frame : frames)
-  case frame of Inside s -> writeIORef (scopeMembers s) [part]; _ -> pure ()
+  case frame of Inside s -> writeIORef (scopeMembers s) (IntMap.singleton (partIdent part) part); _ -> pure ()
 {-# NOINLINE pushFrame #-}
 
 -- | The part leaves the innermost scope or shield, which it went in with 'pushFrame'; the scope holds no part
@@ -604,7 +665,7 @@ popFrame run part = do
     frame : outer -> writeIORef (partFrames part) outer *> forget frame
     [] -> pure ()
   where
-    forget = \case Inside s -> writeIORef (scopeMembers s) []; _ -> pure ()
+    forget = \case Inside s -> writeIORef (scopeMembers s) IntMap.empty; _ -> pure ()
 
 -- | The innermost frame of the part is a shield, whatever it was: a release that is due runs behind one.
 shieldTop :: Part -> IO ()
@@ -663,7 +724,7 @@ cancelScope run scope' = setCancelled scope' *> reach run scope' True
 -- | Tells the parts inside the scope of its cancellation, as 'cancelScope' does, or, if it is not arriving, as the timer of a
 -- period does, which finds that a part is held no longer when the period has passed since the scope was cancelled.
 reach :: Run -> PartScope -> Bool -> IO ()
-reach run scope' arriving = readIORef (scopeMembers scope') >>= inside []
+reach run scope' arriving = readIORef (scopeMembers scope') >>= inside [] . IntMap.elems
   where
     ident = scopeIdent scope'
     -- The periods that graces hold the cancellation from some part for, each once.
@@ -679,7 +740,7 @@ reach run scope' arriving = readIORef (scopeMembers scope') >>= inside []
         -- A grace holds the cancellation from the part, whether a shield does as well or not: a timer lets it in.
         let periods' = if arriving && period > 0 && period `notElem` periods then period : periods else periods
         case waiting of
-          InGroup members -> readIORef (scopeMembers members) >>= \more -> inside periods' (more <> others)
+          InGroup members -> readIORef (scopeMembers members) >>= \more -> inside periods' (IntMap.elems more <> others)
           _ -> inside periods' others
     deliver waiting =
       stopWait run (Cancelled ident) waiting >>= \case
@@ -711,12 +772,6 @@ armHeld run part period = do
 stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))
 stopWait run cancelled = \case
   NotWaiting -> pure Nothing
-  -- The waiter in the slot puts the part back among those that can go on itself, as a fulfil does, with the
-  -- cancellation to raise where it waits.
-  OnTicket slot ->
-    readIORef slot >>= \case
-      Waiter wake -> Nothing <$ (writeIORef slot Empty *> wake (throwIO cancelled))
-      _ -> pure Nothing
   OnFd fd reading ident -> do
     waiters <- readIORef (runWaiters run)
     case IntMap.lookup fd waiters of
@@ -780,7 +835,7 @@ groupEnded run scope' size joined failure success part outcome = do
   writeIORef joined (Joined failed' (count + 1))
   if count + 1 < size
     then pure Ended
-    else writeIORef (scopeMembers scope') [] *> maybe (success ()) failure failed'
+    else writeIORef (scopeMembers scope') IntMap.empty *> maybe (success ()) failure failed'
 
 -- | What a race does when one of its halves has ended: the first to end is the winner, which cancels the other;
 -- the loser, once it has ended, lets the race go on with the parent, with the winner's failure, or the loser's
@@ -794,11 +849,99 @@ raceEnded run scope' winner failure success half outcome = do
       cancelScope run scope'
       pure Ended
     Just won -> do
-      writeIORef (scopeMembers scope') []
+      writeIORef (scopeMembers scope') IntMap.empty
       case (won, outcome) of
         (Left thrown, _) -> failure thrown
         (Right _, Left thrown) | isNothing (cancelledBy thrown) -> failure thrown
         (Right result, _) -> success result
+
+-- | A group that parts are spawned into, for the arrows that run every part on one thread: the cancel scope of its parts, the part
+-- that made it, the scopes that its parts begin in, and what it has of its parts. Its body is a part of its own, which is in
+-- the scope of the part that made the group and not in that of the parts, so that the joiner's cancellation doesn't reach it.
+data Gang j = Gang
+  { gangScope :: !PartScope,
+    gangParent :: !Part,
+    gangFrames :: [Frame Members],
+    gangStanding :: !(IORef (Standing j))
+  }
+
+-- | What a group has of its parts: how many were spawned, how many members are yet to end (the body is one), the joiner's tally,
+-- and what goes on with the part that made the group, which the body gives once it has ended.
+data Standing j = Standing !Int !Int !(Joiner.Tally j) (Maybe (Joiner.Tally j -> IO Step))
+
+-- | A new group of the part, and the part that is its body. The part that made it is suspended until the group has ended, and
+-- says where its members are, so that a cancellation finds them.
+newGang :: (Joiner j) => Run -> Part -> j -> IO (Gang j, Part)
+newGang run parent joiner = do
+  scope' <- newScope run
+  outer <- readIORef (partFrames parent)
+  flagged <- if null outer then isCancelled (runRoot run) else readIORef (partCancelled parent)
+  let below = if null outer then [Inside (runRoot run)] else outer
+  body <- Part <$> nextWait run <*> newIORef below <*> newIORef NotWaiting <*> newIORef flagged
+  adjust run 9 1
+  modifyIORef' (scopeMembers scope') (IntMap.insert (partIdent body) body)
+  standing <- newIORef $! Standing 0 1 (Joiner.begin joiner) Nothing
+  writeIORef (partWait parent) (InGroup scope')
+  pure (Gang scope' parent (Inside scope' : below) standing, body)
+
+-- | The part for the next spawn, with its number, which is in the scope of the group and in those outside it, and is a member of
+-- the group. If the parts of the group were cancelled, there is none: the spawn counts as a part that ended cancelled.
+spawnedPart :: forall j. (Joiner j) => Run -> Gang j -> IO (Maybe (Int, Part))
+spawnedPart run gang = do
+  Standing number live tally finish <- readIORef (gangStanding gang)
+  cancelled <- isCancelled (gangScope gang)
+  if cancelled
+    then do
+      let refused = Left (toException (Cancelled (scopeIdent (gangScope gang))))
+      Nothing <$ (writeIORef (gangStanding gang) $! Standing (number + 1) live (fst (Joiner.ended @j number refused tally)) finish)
+    else do
+      outer <- readIORef (partFrames (gangParent gang))
+      flagged <- if null outer then isCancelled (runRoot run) else readIORef (partCancelled (gangParent gang))
+      child <- Part <$> nextWait run <*> newIORef (gangFrames gang) <*> newIORef NotWaiting <*> newIORef flagged
+      adjust run 9 1
+      modifyIORef' (scopeMembers (gangScope gang)) (IntMap.insert (partIdent child) child)
+      writeIORef (gangStanding gang) $! Standing (number + 1) (live + 1) tally finish
+      pure (Just (number, child))
+{-# INLINE spawnedPart #-}
+
+-- | The body of the group ended: it leaves its frames and the members, and cancels the parts if it failed, or was cancelled. If no part
+-- is left, the part that made the group goes on, with the body's failure, or its result and what the joiner made of the parts, or
+-- the failure that it gives; if some are, the one that ends last does.
+bodyEnded :: forall j b. (Joiner j) => Run -> Gang j -> Part -> (SomeException -> IO Step) -> ((b, Joiner.Joined j) -> IO Step) -> Either SomeException b -> IO Step
+bodyEnded run gang part failure success outcome = do
+  endPart run part
+  modifyIORef' (scopeMembers (gangScope gang)) (IntMap.delete (partIdent part))
+  either (\_ -> cancelScope run (gangScope gang)) (\_ -> pure ()) outcome
+  Standing spawned live tally _ <- readIORef (gangStanding gang)
+  let finish tally' = case outcome of
+        Left thrown -> failure thrown
+        Right result -> either failure (success . (,) result) (Joiner.joined @j tally')
+  writeIORef (gangStanding gang) $! Standing spawned (live - 1) tally (Just finish)
+  groupDone gang (live - 1) tally finish
+{-# INLINE bodyEnded #-}
+
+-- | A part of the group, spawned as this number, ended in this way: it leaves its frames and the members, the joiner is told, and
+-- the parts are cancelled if it says so. The part that ends last goes on with the part that made the group.
+partEnded :: forall j. (Joiner j) => Run -> Gang j -> Part -> Int -> Either SomeException (Joiner.Part j) -> IO Step
+partEnded run gang part number outcome = do
+  endPart run part
+  modifyIORef' (scopeMembers (gangScope gang)) (IntMap.delete (partIdent part))
+  Standing spawned live tally finish <- readIORef (gangStanding gang)
+  let (tally', cancelling) = Joiner.ended @j number outcome tally
+  when cancelling (cancelScope run (gangScope gang))
+  writeIORef (gangStanding gang) $! Standing spawned (live - 1) tally' finish
+  maybe (pure Ended) (groupDone gang (live - 1) tally') finish
+{-# INLINE partEnded #-}
+
+-- | The group has ended if no member is left: its scope holds no part, and the part that made it goes on.
+groupDone :: Gang j -> Int -> Joiner.Tally j -> (Joiner.Tally j -> IO Step) -> IO Step
+groupDone gang live tally finish
+  | live > 0 = pure Ended
+  | otherwise = writeIORef (scopeMembers (gangScope gang)) IntMap.empty *> finish tally
+
+-- | Gives the scheduler a part to go on with, in its next round: the part that a spawn made.
+enqueue :: Run -> IO Step -> IO ()
+enqueue run part = modifyIORef' (runTickets run) (part :)
 
 -- | What goes on with a part that waits, from its step.
 resumeOf :: Step -> IO () -> IO Step

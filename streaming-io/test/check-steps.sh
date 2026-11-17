@@ -14,6 +14,7 @@ check() {
 
 # A successful control proves failures come from the waiting classes, not the environment.
 check UndoingSteps
+check UndoingEach
 while read -r fixture class; do
   if check "$fixture" >"$output_dir/$fixture.log" 2>&1; then
     echo "Expected $fixture to fail compilation" >&2
@@ -29,5 +30,8 @@ StepBlocks Block
 StepGivesWay GiveWay
 CleanupCollects Inboxes
 StepWithin Within
+StepEachAwaits Exchange
+StepHands Exchange
+StepWatches Exchange
 EOF2
-echo "Steps: undoing takes steps and cleanups that can't wait; an await, a block, a give way, a collect and a within are rejected"
+echo "Steps: undoing takes steps and cleanups that can't wait, and each of them; steps that wait are rejected"

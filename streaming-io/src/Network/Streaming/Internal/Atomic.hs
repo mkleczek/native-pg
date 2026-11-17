@@ -1,13 +1,16 @@
 {-# LANGUAGE MagicHash #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE UnboxedTuples #-}
 
 -- | Changing a shared reference from several cores by compare-and-swap against the pointer that was read, whether it is a value or a thunk.
 module Network.Streaming.Internal.Atomic
   ( update,
+    Change,
+    changeHere,
   )
 where
 
-import Data.IORef (IORef)
+import Data.IORef (IORef, readIORef, writeIORef)
 import GHC.Exts (casMutVar#, readMutVar#)
 import GHC.IO (IO (..))
 import GHC.IORef (IORef (..))
@@ -30,3 +33,12 @@ update (IORef (STRef var)) change = IO loop
 copied :: a -> (# a #)
 copied x = (# x #)
 {-# OPAQUE copied #-}
+
+-- | How a reference is changed: by a function that gives the new value and what the change says. 'update' is the change for the parts of
+-- any core, and 'changeHere' for the parts of one core, so that one set of changes serves both reaches.
+type Change = forall x r. IORef x -> (x -> (x, r)) -> IO r
+
+-- | The change by plain reads and writes, for the parts of one core. It evaluates what it installs, as 'update' does.
+changeHere :: Change
+changeHere ref change = readIORef ref >>= \old -> case change old of (!new, !result) -> result <$ writeIORef ref new
+{-# INLINE changeHere #-}

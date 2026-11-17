@@ -3,15 +3,15 @@
 
 module CoresSpec (spec) where
 
-import Control.Arrow (Arrow, ArrowChoice, first, second, (&&&), (>>>), (>>^), (^>>))
+import Control.Arrow (Arrow, ArrowChoice, first, second, (&&&), (***), (>>>), (>>^), (^>>))
 import Control.Concurrent (forkIO, getNumCapabilities, newEmptyMVar, putMVar, setNumCapabilities, takeMVar, threadDelay, yield)
-import Control.Exception (ErrorCall (..), IOException, evaluate, finally, throwIO, try)
+import Control.Exception (ErrorCall (..), evaluate, finally, throwIO, try)
 import Control.Monad (forM_, unless, void, when, (>=>))
 import Data.Bool (bool)
 import Data.Either (fromLeft)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, modifyIORef', newIORef, readIORef)
-import Data.List (isInfixOf, sort)
-import Data.Maybe (fromMaybe)
+import Data.List (sort)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Tuple (swap)
 import Network.Streaming.Classes hiding (within)
 import Network.Streaming.Combinators (concurrently, keeping, tap, times, timesWith, untilJust)
@@ -69,10 +69,19 @@ spec = describe "cores" $ do
       fst <$> runCompiled ticketsOfBothReaches () `shouldReturn` ((42, True), (42, True))
 
   describe "a ticket of either reach" $ do
-    it "fails when a promise is fulfilled twice" $ do
-      forM_ [void (runDelimited fulfilledTwiceLocal ()), void (runCompiled fulfilledTwiceLocal ()), void (runLoop fulfilledTwiceLocal ()), void (runDelimited (fulfilledTwice @'Anywhere) ()), void (runCompiled (fulfilledTwice @'Anywhere) ()), void (runThreads (fulfilledTwice @'Anywhere) ())] $ \run -> do
-        outcome <- try run
-        either (\failure -> "twice" `isInfixOf` show (failure :: IOException)) (const False) outcome `shouldBe` True
+    it "doesn't take a value that is fulfilled twice with no receiver parked, nor keep it for a receiver that comes" $ do
+      fst <$> runDelimited fulfilledTwiceLocal () `shouldReturn` (False, False)
+      fst <$> runCompiled fulfilledTwiceLocal () `shouldReturn` (False, False)
+      fst <$> runLoop fulfilledTwiceLocal () `shouldReturn` (False, False)
+      fst <$> runDelimited (fulfilledTwice @'Anywhere) () `shouldReturn` (False, False)
+      fst <$> runCompiled (fulfilledTwice @'Anywhere) () `shouldReturn` (False, False)
+      runThreads (fulfilledTwice @'Anywhere) () `shouldReturn` (False, False)
+      fst <$> runDelimited fulfilledForNoOneLocal () `shouldReturn` (False, Nothing)
+      fst <$> runCompiled fulfilledForNoOneLocal () `shouldReturn` (False, Nothing)
+      fst <$> runLoop fulfilledForNoOneLocal () `shouldReturn` (False, Nothing)
+      fst <$> runDelimited (fulfilledForNoOne @'Anywhere) () `shouldReturn` (False, Nothing)
+      fst <$> runCompiled (fulfilledForNoOne @'Anywhere) () `shouldReturn` (False, Nothing)
+      runThreads (fulfilledForNoOne @'Anywhere) () `shouldReturn` (False, Nothing)
 
     it "tells the promise that the waiter has gone, and returns to the waiter a value that came before it went" $ do
       fst <$> runDelimited goneLocal () `shouldReturn` (Nothing, False)
@@ -178,20 +187,26 @@ afterwards effect = keeping effect >>^ snd
 waitsForEver :: (Arrow arr, Exchange arr 'Anywhere) => arr () Int
 waitsForEver = ticket @_ @'Anywhere >>> fst ^>> await
 
--- | A ticket whose promise the other half of a pair on its core fulfils, in a part that waits for it.
+-- | A ticket whose promise the other half of a pair on its core hands a value to, in a part that waits for it: whichever half comes
+-- first, the exchange happens, as the sender waits until the receiver takes the value.
 sameCore :: forall r arr. (ArrowChoice arr, Concurrent arr, Exchange arr r, Exchange arr (Local arr)) => arr () (Int, Bool)
-sameCore = ticket @arr @r >>> concurrently (fst ^>> await) ((,42) . snd ^>> fulfil)
+sameCore = ticket @arr @r >>> concurrently (fst ^>> await) ((,42) . snd ^>> handWaiting >>^ isNothing)
 
-fulfilledTwice :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () Bool
-fulfilledTwice = ticket @arr @r >>> ((,1 :: Int) &&& id) . snd ^>> first fulfil >>> (,2) . snd ^>> fulfil
+-- | The promise is fulfilled twice with no receiver parked: neither is taken, and nothing is kept for a receiver that comes.
+fulfilledTwice :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Bool, Bool)
+fulfilledTwice = ticket @arr @r >>> ((,1 :: Int) &&& (,2)) . snd ^>> (fulfil *** fulfil)
 
 -- | The waiter abandons before the promise is fulfilled: nothing for it, and the promise is told.
 gone :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Maybe Int, Bool)
 gone = ticket @arr @r >>> first abandon >>> second (,5) ^>> second fulfil
 
--- | The promise is fulfilled before the waiter abandons: the waiter has the value.
+-- | The promise is fulfilled before the waiter abandons, which will await: the waiter has the value.
 fulfilledFirst :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Bool, Maybe Int)
-fulfilledFirst = ticket @arr @r >>> second (,5) ^>> second fulfil >>> swap ^>> second abandon
+fulfilledFirst = ticket @arr @r >>> first willAwait >>> second (,5) ^>> second fulfil >>> swap ^>> second abandon
+
+-- | The promise is fulfilled before the waiter abandons, and the waiter has not said that it will await: nothing is kept for it.
+fulfilledForNoOne :: forall r arr. (ArrowChoice arr, Exchange arr r) => arr () (Bool, Maybe Int)
+fulfilledForNoOne = ticket @arr @r >>> second (,5) ^>> second fulfil >>> swap ^>> second abandon
 
 -- | A ticket of any core whose promise a thread of its own fulfils after a while, which the part waits for: the
 -- scheduler of an arrow that runs every part on one thread waits in its poller by then, and the fulfil wakes it.
@@ -202,12 +217,14 @@ fulfilledAfterTheWait =
     >>> first await
     >>> now (\(value, taken) -> (,) value <$> takeMVar taken)
 
--- | The same, with the promise fulfilled by a thread before the part waits: it finds the value at its look.
+-- | The same, with a thread that hands the value over and waits before the part awaits: it finds the sender at its look, and takes the
+-- value from it.
 fulfilledBeforeTheWait :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere) => arr () (Int, Bool)
 fulfilledBeforeTheWait =
   ticket @_ @'Anywhere
-    >>> now (\(awaiting, promise) -> newEmptyMVar >>= \taken -> (awaiting,) <$> (forkIO (runThreads fulfil (promise, 7) >>= putMVar taken) *> takeMVar taken))
+    >>> now (\(awaiting, promise) -> newEmptyMVar >>= \taken -> (awaiting, taken) <$ forkIO (runThreads handWaiting (promise, 7) >>= putMVar taken . isNothing) <* threadDelay 20000)
     >>> first await
+    >>> now (\(value, taken) -> (,) value <$> takeMVar taken)
 
 -- | Runs the action with a thread that fulfils every promise that is left on the shelf, as soon as it is
 -- there, and stops the thread afterwards: with a flag, since a thread that spins like this one may never reach a
@@ -220,14 +237,14 @@ withPromiseThread action = do
   _ <- forkIO spin
   action shelf `finally` atomicWriteIORef stopped True
 
--- | Makes a ticket of any core this many times, leaves its promise on the shelf, and waits for it at once, while a
+-- | Makes a ticket of any core this many times, which it will await, leaves its promise on the shelf, and waits for it at once, while a
 -- thread fulfils it the moment it sees the promise: the fulfil comes before the part looks at the ticket, between
 -- its look and its wait, or after, and the part gets every value.
 racing :: (ArrowChoice arr, Effect arr, Exchange arr 'Anywhere, Annotate arr) => IORef (Maybe (Promise 'Anywhere Int)) -> Int -> arr () Int
 racing shelf count = const 0 ^>> timesWith count (keeping ticketOnShelf >>^ uncurry (+))
   where
     -- Makes a ticket, leaves its promise on the shelf, and waits for the ticket.
-    ticketOnShelf = ticket @_ @'Anywhere >>> second (now (atomicWriteIORef shelf . Just)) >>> fst ^>> await
+    ticketOnShelf = ticket @_ @'Anywhere >>> first willAwait >>> second (now (atomicWriteIORef shelf . Just)) >>> fst ^>> await
 
 -- | The programs of the two reaches at once, for any arrow that has what 'Runtime' bundles.
 ticketsOfBothReaches :: (Runtime arr) => arr () ((Int, Bool), (Int, Bool))
@@ -237,7 +254,7 @@ ticketsOfBothReaches = sameCoreLocal &&& sameCore @'Anywhere
 sameCoreLocal :: forall arr. (ArrowChoice arr, Concurrent arr, Exchange arr (Local arr)) => arr () (Int, Bool)
 sameCoreLocal = sameCore @(Local arr)
 
-fulfilledTwiceLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () Bool
+fulfilledTwiceLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () (Bool, Bool)
 fulfilledTwiceLocal = fulfilledTwice @(Local arr)
 
 goneLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () (Maybe Int, Bool)
@@ -246,10 +263,13 @@ goneLocal = gone @(Local arr)
 fulfilledFirstLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () (Bool, Maybe Int)
 fulfilledFirstLocal = fulfilledFirst @(Local arr)
 
+fulfilledForNoOneLocal :: forall arr. (ArrowChoice arr, Exchange arr (Local arr)) => arr () (Bool, Maybe Int)
+fulfilledForNoOneLocal = fulfilledForNoOne @(Local arr)
+
 -- | A part waits at the ticket while another fulfils its promise with an action that never waits: the value is the
 -- waiter's.
 fulfilledNowTo :: forall r arr. (ArrowChoice arr, Concurrent arr, Effect arr, Exchange arr r, Exchange arr (Local arr)) => arr () (Int, Bool)
-fulfilledNowTo = ticket @arr @r >>> concurrently (fst ^>> await) (now (\(_, promise) -> fulfilNow promise 42))
+fulfilledNowTo = ticket @arr @r >>> first willAwait >>> concurrently (fst ^>> await) (now (\(_, promise) -> fulfilNow promise 42))
 
 -- | The waiter abandons before the promise is fulfilled by an action: nothing for it, and the action is told.
 goneNow :: forall r arr. (ArrowChoice arr, Effect arr, Exchange arr r) => arr () (Maybe Int, Bool)

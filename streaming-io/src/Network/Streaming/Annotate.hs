@@ -11,7 +11,8 @@ module Network.Streaming.Annotate
     box,
     taking,
     giving,
-    inout,
+    (-|),
+    (|-),
     asking,
     answering,
   )
@@ -40,6 +41,8 @@ data Check
     DeadInbox
   | -- | The same name is opened at two sites of the program, so that its posts and collects can't be told apart.
     InboxOpenedTwice
+  | -- | An exchange that 'asking' and 'answering' name has ends of only one side anywhere in the program: nothing pairs by its name.
+    DeadExchange
   deriving (Eq, Show, Enum, Bounded)
 
 -- | Annotations for the diagrams that "Network.Streaming.Diagram" draws of a program, and for its lint. Every other arrow
@@ -84,11 +87,22 @@ giving :: (Annotate arr) => arr a b -> String -> arr a b
 giving step output = wires Nothing (Just output) step
 {-# INLINE giving #-}
 
--- | The arrow, with names for its input and output wires in diagrams, written around it:
--- @inout "request" handler "answer"@.
-inout :: (Annotate arr) => String -> arr a b -> String -> arr a b
-inout input step output = wires (Just input) (Just output) step
-{-# INLINE inout #-}
+-- '-|' and '|-' bind tighter than the operators of arrows, so that @a -| "x" >>> "y" |- b@ and
+-- @("yes" |- p ||| "no" |- q)@ need no parentheses. '|-' binds tighter than '-|', so that @"in" |- p -| "out"@ names
+-- both wires of @p@.
+infixl 5 -|
+
+infixr 6 |-
+
+-- | The arrow, with a name for its output wire in diagrams, written after it: @parse -| "request"@. It is 'giving'.
+(-|) :: (Annotate arr) => arr a b -> String -> arr a b
+(-|) = giving
+{-# INLINE (-|) #-}
+
+-- | The arrow, with a name for its input wire in diagrams, written before it: @"request" |- handler@. It is 'taking'.
+(|-) :: (Annotate arr) => String -> arr a b -> arr a b
+(|-) = taking
+{-# INLINE (|-) #-}
 
 -- | The arrow as the asking end of an exchange of the named value in diagrams: the end that makes a ticket and waits.
 asking :: (Annotate arr) => String -> arr a b -> arr a b

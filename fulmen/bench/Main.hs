@@ -12,11 +12,12 @@
 --
 -- The server prints the port it listens on, and serves until it is killed. The client asks the server to note its
 -- allocation (@GET /reset@), runs its connections for the time with the path, and asks for the difference
--- (@GET /report@), over a connection of its own that it keeps all the while: the server needs a worker for it besides
--- the ones for the connections that the client runs. @delimited-debug@ is the server in the debug mode of its arrow, which
--- counts the captures of the stacks of its parts, and the report says how many. A client that is told @fresh@ makes a
--- connection for each request, and closes it after. The server is the arrow runtime's, the client is plain IO: a GHC thread for each connection, which
--- blocks on its socket. The server builds its program where its arrow is known, in 'server', so that GHC specialises it to the arrow.
+-- (@GET /report@), over a connection of its own that it keeps all the while: the server needs room for it besides
+-- the connections that the client runs. @delimited-debug@ is the server in the debug mode of its arrow, which counts
+-- the captures of the stacks of its parts, and the report says how many. A client that is told @fresh@ makes a
+-- connection for each request, and closes it after. The server is the arrow runtime's, the client is plain IO: a GHC
+-- thread for each connection, which blocks on its socket. The server builds its program where its arrow is known, in
+-- 'server', so that GHC specialises it to the arrow.
 module Main (main) where
 
 import Control.Arrow (first, (&&&), (>>>), (^>>))

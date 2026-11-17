@@ -29,8 +29,8 @@ import Control.Arrow (Arrow (..), ArrowChoice (..))
 import Control.Category (Category (..))
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, rtsSupportsBoundThreads, threadDelay, threadWaitRead, threadWaitWrite, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (TMVar, TVar, atomically, newEmptyTMVarIO, newTVarIO, readTMVar, readTVar, throwSTM, tryPutTMVar, tryTakeTMVar, writeTVar)
-import Control.Exception (SomeException, allowInterrupt, mask_, onException, throwIO, try, uninterruptibleMask_)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar)
+import Control.Exception (SomeException, allowInterrupt, finally, mask_, onException, throwIO, toException, try, uninterruptibleMask_)
 import Control.Monad (foldM, forM_, unless, void, when)
 import Data.Bits ((.&.))
 import Data.Foldable (traverse_)
@@ -49,6 +49,8 @@ import GHC.IORef (IORef (..), atomicSwapIORef)
 import GHC.STRef (STRef (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn), Joiner)
+import qualified Network.Streaming.Concurrent as Joiner
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Mode (Instrumented (..), Mode (..), ModeOf)
 import Network.Streaming.Internal.Atomic (update)
@@ -320,14 +322,21 @@ instance Scope (ThreadsM m) where
 
 -- | A part that runs in the scope as well as in those of the part that made it, on a thread of its own, and what
 -- it came to once it ended: the scopes are left before the pair's policy is told.
-spawn :: Part -> CancelScope Members -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO (MVar (Either SomeException a))
-spawn (Part _ _ parent _ parentFlag) scope' run ended = do
+forkPart :: Part -> CancelScope Members -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO (MVar (Either SomeException a))
+forkPart (Part _ _ parent _ parentFlag) scope' run ended = do
   finished <- newEmptyMVar
+  startPart parentFlag ((Inside scope' :) <$> readIORef parent) run (\outcome -> ended outcome *> putMVar finished outcome)
+  pure finished
+
+-- | A part that runs on a thread of its own, in the scopes that the action gives, which it enters and leaves, and tells how it
+-- ended once it has left them.
+startPart :: IORef Bool -> IO [Frame Members] -> (Part -> IO a) -> (Either SomeException a -> IO ()) -> IO ()
+startPart parentFlag framesOf run ended = do
   -- Forked masked, as its part is.
   _ <- forkIO $ do
     thread <- myThreadId
     ident <- nextIdent
-    frames <- (Inside scope' :) <$> readIORef parent
+    frames <- framesOf
     state <- newIORef frames
     phase <- newIORef Running
     -- The part begins with the flag of its parent, which a cancellation that came before it existed has set.
@@ -340,8 +349,7 @@ spawn (Part _ _ parent _ parentFlag) scope' run ended = do
     outcome <- try (run part)
     forM_ frames (outside part)
     ended outcome
-    putMVar finished outcome
-  pure finished
+  pure ()
   where
     inside part = \case Inside s -> enter s part; _ -> pure ()
     outside part = \case Inside s -> leave s part; _ -> pure ()
@@ -373,6 +381,23 @@ instance Annotate (ThreadsM m)
 -- their waits, and waited for, and the first failure is rethrown. When several fail, the later are dropped. A part is
 -- entered into the scope of the group and the scopes that enclose it: a group of many parts doesn't make them deeper.
 instance Concurrent (ThreadsM m) where
+  newtype Group (ThreadsM m) s j = ThreadsGroup (Gang j)
+
+  group joiner (Threads body) = Threads $ \part input -> do
+    outer <- framesIn part
+    scope' <- newScope
+    gang <- Gang scope' (Inside scope' : outer) <$> (newIORef $! Joiner.begin joiner) <*> newIORef 0 <*> newTVarIO 0
+    -- The body runs as the first member of the group, on the thread that runs the group.
+    outcome <- try (body part (ThreadsGroup gang, input))
+    -- A body that failed, or was cancelled, cancels the parts at once.
+    either (\_ -> cancelScope scope') (\_ -> pure ()) outcome
+    awaitParts gang
+    grouped gang outcome
+  {-# INLINE group #-}
+
+  spawn (Threads body) = Threads (\part (ThreadsGroup gang, input) -> spawned gang part (`body` input))
+  {-# INLINE spawn #-}
+
   together = \case
     [] -> done
     [one] -> one
@@ -380,9 +405,58 @@ instance Concurrent (ThreadsM m) where
       scope' <- newScope
       failure <- newIORef Nothing
       -- Started and awaited in loops that keep no stack of their own: a group of thousands of parts starts under a small stack limit.
-      dones <- reverse <$> foldM (\started (Threads body) -> (: started) <$> spawn part scope' (`body` input) (failing failure scope')) [] parts
+      dones <- reverse <$> foldM (\started (Threads body) -> (: started) <$> forkPart part scope' (`body` input) (failing failure scope')) [] parts
       awaitAll scope' dones
       readIORef failure >>= maybe (pure ()) throwIO
+
+-- | The scopes that the part is in, innermost first.
+framesIn :: Part -> IO [Frame Members]
+framesIn (Part _ _ frames _ _) = readIORef frames
+
+-- | A group that parts are spawned into: the cancel scope of its parts, the scopes that its parts begin in, the joiner's tally, how
+-- many parts were spawned, and how many of them are running. Threads change them all atomically.
+data Gang j = Gang
+  { gangScope :: !(CancelScope Members),
+    gangFrames :: [Frame Members],
+    gangTally :: !(IORef (Joiner.Tally j)),
+    gangSpawned :: !(IORef Int),
+    gangRunning :: !(TVar Int)
+  }
+
+-- | Starts the arrow as a part of the group, on a thread of its own, in the scopes of the group and the scopes outside it, and
+-- not in those that the spawning part is in. If the parts of the group were cancelled, it doesn't run, and counts as
+-- cancelled.
+spawned :: forall j. (Joiner j) => Gang j -> Part -> (Part -> IO (Joiner.Part j)) -> IO ()
+spawned gang (Part _ _ _ _ flag) run = do
+  number <- update (gangSpawned gang) (\n -> (n + 1, n))
+  isCancelled (gangScope gang) >>= \cancelled ->
+    if cancelled
+      then partEnded gang number (Left (toException (Cancelled (scopeIdent (gangScope gang)))))
+      else do
+        atomically (modifyTVar' (gangRunning gang) (+ 1))
+        startPart flag (pure (gangFrames gang)) run (\outcome -> partEnded gang number outcome `finally` atomically (modifyTVar' (gangRunning gang) (subtract 1)))
+{-# INLINE spawned #-}
+
+-- | The joiner is told that the part of this number ended in this way, and the parts are cancelled if it says so.
+partEnded :: forall j. (Joiner j) => Gang j -> Int -> Either SomeException (Joiner.Part j) -> IO ()
+partEnded gang number outcome = do
+  cancelling <- update (gangTally gang) (Joiner.ended @j number outcome)
+  when cancelling (cancelScope (gangScope gang))
+{-# INLINE partEnded #-}
+
+-- | Waits until no part of the group is running, and if it is interrupted, cancels them and waits for them still: no part
+-- outlives the group.
+awaitParts :: Gang j -> IO ()
+awaitParts gang = none `onException` (cancelScope (gangScope gang) *> uninterruptibleMask_ none)
+  where
+    none = atomically (readTVar (gangRunning gang) >>= check . (== 0))
+
+-- | What the group gives once all of it ended: the failure of the body, or the result of the body with what the joiner made of the
+-- parts, or the failure that it gives.
+grouped :: forall j b. (Joiner j) => Gang j -> Either SomeException b -> IO (b, Joiner.Joined j)
+grouped gang = \case
+  Left failure -> throwIO failure
+  Right result -> readIORef (gangTally gang) >>= either throwIO (pure . (,) result) . Joiner.joined @j
 
 -- | The first half to end is the result, and the other is cancelled and waited for. The loser's failure is
 -- rethrown too, unless it is a cancellation.
@@ -393,8 +467,8 @@ instance Race (ThreadsM m) where
     let ended outcome = do
           first' <- update winner (\known -> (known <|> Just outcome, isNothing known))
           when first' (cancelScope scope')
-    first' <- spawn part scope' (\child -> Left <$> one child input) ended
-    second' <- spawn part scope' (\child -> Right <$> two child input) ended
+    first' <- forkPart part scope' (\child -> Left <$> one child input) ended
+    second' <- forkPart part scope' (\child -> Right <$> two child input) ended
     (b, d) <- awaitBoth scope' first' second'
     readIORef winner >>= \case
       Just (Left failed) -> throwIO failed
@@ -472,27 +546,103 @@ type instance Local (ThreadsM m) = 'Anywhere
 
 type instance ModeOf (ThreadsM m) = m
 
--- | A ticket is a 'TMVar', which blocks the thread that waits for it, and whether the waiter has gone. The future
--- and the promise are the same 'TMVar'. Every thread can reach both: there is no core to belong to.
+-- | A ticket is a slot that every thread changes atomically, and a part that waits at it blocks its thread on an 'MVar' that the hand
+-- or the abandon that it waits for fills. The threads have no cores, so there is one reach. A ticket keeps no value for a part that is
+-- not parked.
 instance Exchange (ThreadsM m) 'Anywhere where
-  data Future (ThreadsM m) 'Anywhere a = ThreadFuture (TMVar a) (TVar Bool)
-  ticket = Threads $ \_ () -> do
-    var <- newEmptyTMVarIO
-    abandoned <- newTVarIO False
-    pure (ThreadFuture var abandoned, AnywherePromise (fulfilThread var abandoned))
-  await = Threads (\part (ThreadFuture var _) -> waiting part (atomically (readTMVar var)))
-  fulfil = Threads (\_ (AnywherePromise promise, value) -> promise value)
-  abandon = Threads $ \_ (ThreadFuture var abandoned) -> atomically (writeTVar abandoned True *> tryTakeTMVar var)
+  newtype Future (ThreadsM m) 'Anywhere a = ThreadFuture (IORef (Slot a))
+  ticket = Threads (\_ () -> newSlot >>= \slot -> pure (ThreadFuture slot, AnywherePromise slot))
+  await = Threads (\part (ThreadFuture slot) -> awaitThread part slot)
+  fulfil = Threads (\_ (promise, value) -> fulfilNow promise value)
+  abandon = Threads (\_ (ThreadFuture slot) -> closeSlot update slot)
+  awaitRegistering = Threads (\part (ThreadFuture slot, register) -> awaitRegisteringThread part slot (register (AnywherePromise slot)))
+  willAwait = Threads (\_ future@(ThreadFuture slot) -> commitRegistering update slot >>= \committed -> if committed then pure future else ioError tookWrongly)
+  handWaiting = Threads (\part (promise, value) -> anywhereSlot promise >>= \slot -> handThread part slot value)
+  untilParked = Threads (\part promise -> anywhereSlot promise >>= \slot -> untilParkedThread part slot)
 
--- | The promise evaluates the value, before the transaction, as the other arrows' promises do.
-fulfilThread :: TMVar a -> TVar Bool -> a -> IO Bool
-fulfilThread var abandoned !value = atomically $ do
-  gone <- readTVar abandoned
-  if gone
-    then pure False
-    else do
-      fulfilled <- tryPutTMVar var value
-      if fulfilled then pure True else throwSTM (userError "a promise was fulfilled twice")
+-- | An await from a thread: it takes the value of a sender that waits, or parks on an 'MVar' that a hand fills. The value stays in the
+-- 'MVar' until the part has it: a cancellation that comes after the hand reaches the part after the wait, with the value still there.
+awaitThread :: Part -> IORef (Slot a) -> IO a
+awaitThread part slot = do
+  givingWay part
+  valueWaits slot >>= \case
+    False -> parkedThread part slot
+    True ->
+      takeWaiting update slot >>= \case
+        Took value -> pure value
+        Misused -> ioError tookWrongly
+        Parks -> parkedThread part slot
+
+-- | The thread parks as the receiver, unless a sender came since the look. A cancellation takes it off the slot; if a hand has given it a
+-- value already, the value is the receiver's, and the cancellation reaches the part at its next wait.
+parkedThread :: Part -> IORef (Slot a) -> IO a
+parkedThread part slot = do
+  gate <- newEmptyMVar
+  parkTaker update slot (\value -> True <$ putMVar gate value) >>= \case
+    Took value -> pure value
+    Misused -> ioError tookWrongly
+    Parks ->
+      try (waiting part (readMVar gate)) >>= \case
+        Right value -> pure value
+        Left failure -> stopTaking update slot >>= \stopped -> if stopped || isNothing (cancelledBy failure) then throwIO (failure :: SomeException) else readMVar gate
+
+-- | An await that registers, from a thread, as the arrows that run every part on one thread do it.
+awaitRegisteringThread :: Part -> IORef (Slot a) -> IO (Maybe a) -> IO a
+awaitRegisteringThread part slot register = do
+  givingWay part
+  beginRegistering update slot >>= \case
+    Took value -> pure value
+    Misused -> ioError tookWrongly
+    Parks ->
+      (register `onException` giveUpRegistering update slot) >>= \case
+        Just value -> giveUpRegistering update slot >>= \clean -> if clean then pure value else ioError registeredAndGave
+        Nothing ->
+          endRegistering update slot >>= \case
+            Took value -> pure value
+            Misused -> ioError tookWrongly
+            Parks -> parkedThread part slot
+
+-- | A hand from a thread that waits until the value is taken: if the receiver isn't parked, the thread waits on an 'MVar' that the
+-- receiver's take, or the abandon, fills with whether the value was taken. A cancellation takes the hand out of the slot; if the value was
+-- taken already, the hand is done, and the cancellation reaches the part at its next wait.
+handThread :: Part -> IORef (Slot a) -> a -> IO (Maybe a)
+handThread part slot value = do
+  givingWay part
+  handTry update slot value >>= \case
+    Passed -> pure Nothing
+    GaveBack -> pure (Just value)
+    SecondSender -> ioError twoSenders
+    _ -> do
+      gate <- newEmptyMVar
+      token <- nextIdent
+      parkSender update slot value token (putMVar gate) >>= \case
+        Passed -> pure Nothing
+        GaveBack -> pure (Just value)
+        LeftWaiting ->
+          try (waiting part (readMVar gate)) >>= \case
+            Right taken -> pure (outcome taken)
+            Left failure -> withdrawSender update slot token >>= \withdrawn -> if withdrawn || isNothing (cancelledBy failure) then throwIO (failure :: SomeException) else outcome <$> readMVar gate
+        _ -> ioError twoSenders
+  where
+    outcome taken = if taken then Nothing else Just value
+
+-- | A watch from a thread: it waits on an 'MVar' that the receiver's park, or the abandon, fills.
+untilParkedThread :: Part -> IORef (Slot a) -> IO ()
+untilParkedThread part slot = do
+  givingWay part
+  lookAtWatch slot >>= \case
+    WatchDone -> pure ()
+    SecondWatcher -> ioError twoWatchers
+    WatchWaits -> do
+      gate <- newEmptyMVar
+      token <- nextIdent
+      parkWatcher update slot token (() <$ tryPutMVar gate ()) >>= \case
+        WatchDone -> pure ()
+        SecondWatcher -> ioError twoWatchers
+        WatchWaits ->
+          try (waiting part (readMVar gate)) >>= \case
+            Right () -> pure ()
+            Left failure -> unwatch update slot token >>= \stopped -> if stopped || isNothing (cancelledBy failure) then throwIO (failure :: SomeException) else readMVar gate
 
 -- | An inbox is a shelf that every thread changes atomically, and a part that waits at it blocks its thread on an 'MVar' that
 -- the post, the collect or the closing that it waits for fills. The threads have no cores, so there is one reach.

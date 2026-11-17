@@ -1,11 +1,11 @@
 {-# LANGUAGE DataKinds #-}
 
--- | An HTTP/1.1 server that is a fixed network of parts, made at startup, per core:
--- each core has as many workers as its share of the connection cap, and an acceptor
--- hands the connections that it accepts to free workers as remote tickets. A worker
--- serves its connection with a request direction, which parses the head and hands
--- the body on piece by piece, and an answer direction, which runs the handler; a
--- connection that waits for its next request holds no buffer.
+-- | An HTTP/1.1 server whose connections are served by parts that are spawned as the connections are accepted: each
+-- core spawns a connection worker for each connection that the acceptor delivers to it, up to its share of the
+-- connection cap, and the acceptor, which waits until some core has room, delivers each connection that it accepts to
+-- the core that has the fewest. A connection worker serves its connection with a request direction, which parses the
+-- head and hands the body on piece by piece, and an answer direction, which runs the handler; a connection that waits
+-- for its next request holds no buffer.
 --
 -- The handler is a program for any arrow that has what 'Runtime' bundles. It
 -- sends its own answer, so a request is one lexical scope: whatever the handler
@@ -41,7 +41,7 @@ import Control.Monad (replicateM)
 import Data.IORef (newIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe (fromMaybe)
-import Network.Fulmen.Internal (Call (..), Cores (..), Settings (..), Shared (..))
+import Network.Fulmen.Internal (Call (..), Cores (..), Count (..), Settings (..), Shared (..))
 import Network.Fulmen.Internal.Date (newPulse)
 import Network.Fulmen.Internal.Serve (serve)
 import Network.Fulmen.Listen
@@ -54,9 +54,10 @@ import Network.Streaming.Loans (Loans)
 import Network.Streaming.Pool (newPool)
 import Network.Streaming.PositiveInt (mkPositiveInt, positiveInt, positiveIntValue)
 
--- | A server of one worker for each core, with a pool of 16 buffers of 16 KiB for requests in flight, 2 of them in
--- reserve, and 2 for setup, a line limit and a head limit of 50 KiB, which are Warp's default for the whole head, no limit
--- on bodies, a silent client given 30 seconds, and a connection that waits for its next request 30 seconds, as Warp's timeout is.
+-- | A server of one connection worker at a time for each core, with a pool of 16 buffers of 16 KiB for requests in
+-- flight, 2 of them in reserve, and 2 for setup, a line limit and a head limit of 50 KiB, which are Warp's default for
+-- the whole head, no limit on bodies, a silent client given 30 seconds, and a connection that waits for its next request
+-- 30 seconds, as Warp's timeout is.
 defaultSettings :: Settings
 defaultSettings =
   Settings
@@ -70,13 +71,22 @@ defaultSettings =
     Nothing
     (Just (secs 30))
 
--- | The cores that a server runs on, from its settings and how many there are: what they share, a pool of request
--- buffers for each core that has its share of the ordinary buffers that the settings size, and the first core's own value.
+-- | The cores that a server runs on, from its settings and how many there are: what they share, the pool of the cores
+-- that wait for a connection, the count of each core's connection workers, a pool of request buffers for each core that
+-- has its share of the ordinary buffers that the settings size, and the first core's own value. The cores are numbered
+-- from 0, and a core that is not counted here can't run the server.
 newCores :: Settings -> Int -> IO Cores
 newCores settings cores = do
   first <- newBufferPool share
   others <- replicateM (max 1 cores - 1) (newBufferPool share)
-  Cores 0 <$> (Shared <$> newPool [] <*> newIORef IntMap.empty <*> newPulse <*> pure first <*> pure (IntMap.fromList (zip [0 ..] (first : others))))
+  Cores 0
+    <$> ( Shared
+            <$> newPool []
+            <*> (IntMap.fromList <$> traverse (\core -> (core,) <$> newIORef (Count 0 Nothing)) [0 .. max 1 cores - 1])
+            <*> newPulse
+            <*> pure first
+            <*> pure (IntMap.fromList (zip [0 ..] (first : others)))
+        )
   where
     share = coreShare (max 1 cores) (bufferPool settings)
 

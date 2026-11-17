@@ -28,6 +28,7 @@ import GHC.Stack (CallStack, SrcLoc, callStack, getCallStack)
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Network.Streaming.Annotate (Annotate (..))
 import Network.Streaming.Classes
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Mode (Mode (..), ModeOf)
 import Network.Streaming.Structure (Shape (..), Tree (..), unnamedAction)
 import Prelude hiding (id, (.))
@@ -96,7 +97,10 @@ instance Within Diagram where
   timeoutA (Diagram body) = Diagram (TimeoutA body)
 
 instance Concurrent Diagram where
+  data Group Diagram s j
   together parts = Diagram (Together [part | Diagram part <- parts])
+  group _ (Diagram body) = Diagram (Grouped body)
+  spawn (Diagram part) = Diagram (Spawned part)
 
 -- | The box records where the code asked for it: the outermost call of the stack, which is the one in the program, and
 -- not the helpers that the box was called through.
@@ -111,13 +115,17 @@ outermost :: CallStack -> Maybe SrcLoc
 outermost = fmap snd . listToMaybe . reverse . getCallStack
 
 -- | The tickets of a diagram are never made: there are two instances, for the two reaches, so that a program that
--- uses either is built.
+-- uses either is built. That the receiver will await draws nothing.
 instance Exchange Diagram ('Here DiagramCore) where
   data Future Diagram ('Here DiagramCore) a
   ticket = leaf "ticket" Round
   await = leaf "await" Wait
   fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
+  awaitRegistering = leaf "await" Wait
+  willAwait = Diagram Pure
+  handWaiting = leaf "hand" Handover
+  untilParked = leaf "watch" Wait
 
 instance Exchange Diagram 'Anywhere where
   data Future Diagram 'Anywhere a
@@ -125,6 +133,10 @@ instance Exchange Diagram 'Anywhere where
   await = leaf "await" Wait
   fulfil = leaf "fulfil" Handover
   abandon = leaf "abandon" Round
+  awaitRegistering = leaf "await" Wait
+  willAwait = Diagram Pure
+  handWaiting = leaf "hand" Handover
+  untilParked = leaf "watch" Wait
 
 -- | The inboxes of a diagram are never made either, and have the two reaches for the same reason. Each step is a leaf that
 -- has the inbox's name in its text and in its shape: a post is a handover, and a collect is a wait.

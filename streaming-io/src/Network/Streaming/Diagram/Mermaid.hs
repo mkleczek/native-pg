@@ -450,7 +450,7 @@ bar title node = node ++ "@{ shape: fork, label: " ++ labelOf title ++ " }"
 -- | The text of a node that is a leaf.
 leafText :: Shape -> String -> Node -> String
 leafText shape text node = case shape of
-  Action -> node ++ "[" ++ labelOf text ++ "]"
+  Action -> node ++ "[" ++ labelOf (gear ++ text) ++ "]"
   Wait -> node ++ "@{ shape: delay, label: " ++ labelOf text ++ " }"
   Blocking -> node ++ "@{ shape: hourglass }"
   Yielding -> node ++ "@{ shape: flip-tri, label: " ++ labelOf text ++ " }"
@@ -461,6 +461,10 @@ leafText shape text node = case shape of
   CollectFrom _ -> leafText Wait text node
   OpenInbox _ -> leafText Round text node
   CloseInbox _ -> leafText Round text node
+
+-- | The sign of a step that never waits, which is a gear (U+2699) kept a plain glyph by U+FE0E, and a space.
+gear :: String
+gear = "\x2699\xFE0E "
 
 -- | A label as Mermaid reads it: in quotes, with the characters that it takes for markup escaped. The first line is a
 -- title, and the rest a comment, which is drawn on a line of its own, smaller.
@@ -556,6 +560,8 @@ drawStep ctx path = \case
   Sum one two -> chosen ctx path (\case Sum a b -> Just (a, b); _ -> Nothing) one two
   Choice one two -> chosen ctx path (\case Choice a b -> Just (a, b); _ -> Nothing) one two
   Together parts -> laned ctx path parts
+  Grouped inner -> grouped ctx "group" (render ctx path inner)
+  Spawned inner -> spawned ctx path inner
   Race one two -> traverse (render ctx path) [one, two] >>= barred ctx "race"
   Leaf text how -> do
     when (text == unnamedAction) $ modifyIORef' (ctxUnnamed ctx) (+ 1)
@@ -885,6 +891,18 @@ grouped ctx title draw = do
     Nodes {} -> do
       node <- fresh ctx
       fragment <$ emit ctx (Group node Plain title items)
+
+-- | A spawn: the part in a box labelled "spawn", which the input of the spawn goes into and the part that spawns it goes on from,
+-- as it goes on at once. No edge leaves the part: it runs on its own.
+spawned :: Ctx -> Path -> Tree -> IO Fragment
+spawned ctx path inner = do
+  (fragment, items) <- collect ctx (render ctx path inner)
+  case fragmentCore fragment of
+    Bare _ -> single <$> declare ctx (leafText Round "spawn")
+    Nodes {} -> do
+      node <- fresh ctx
+      emit ctx (Group node Plain "spawn" items)
+      pure (Fragment (fragmentInput fragment) (Nodes node False [plain node]))
 
 -- | A scope as a group: the body after the acquire, and the release after it by a dashed edge named for the exit, from a
 -- junction if the acquire has no node.

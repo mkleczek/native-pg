@@ -22,7 +22,8 @@
 -- run on several threads, keeps them in a map that every thread that enters or leaves the scope changes atomically.
 -- The arrows that run every part of a core on one thread ("Network.Streaming.Internal.Scheduler") keep nothing of them
 -- when a part enters or leaves a scope: a scope begins with the parts that made it, and the rest are found
--- through those when it is cancelled.
+-- through those when it is cancelled. The scope of the parts that a group spawns while it runs is the one that
+-- holds them, each added as it is spawned and taken out as it ends.
 module Network.Streaming.Internal.Cancel
   ( CancelScope (..),
     Frame (..),

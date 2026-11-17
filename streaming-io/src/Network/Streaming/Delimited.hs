@@ -60,6 +60,7 @@ import GHC.Exts (PromptTag#, control0#, newPromptTag#, prompt#)
 import GHC.IO (IO (..))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Inboxes (Address (..), Shelf, closeShelf, newShelf)
 import Network.Streaming.Internal.Scheduler hiding (post)
@@ -251,7 +252,7 @@ shielding (Context run _ part) = pushFrame run part Shielded
 
 -- | The part goes behind a grace, which holds the cancellations from outside for its period. If a cancellation is pending already, the
 -- timer that lets it in is armed now. Not inlined, so that the frame that follows the body holds only the context.
-gracing :: Context -> Frame [Part] -> IO ()
+gracing :: Context -> Frame Members -> IO ()
 gracing (Context run _ part) frame = do
   pushFrame run part frame
   flagged <- readIORef (partCancelled part)
@@ -315,6 +316,32 @@ instance Annotate (DelimitedM m s)
 -- cancelled where they wait, and their scopes are released before the group ends, which rethrows the first
 -- failure. A later failure is dropped.
 instance Concurrent (DelimitedM m s) where
+  newtype Group (DelimitedM m s) t j = DelimitedGroup (Gang j)
+
+  -- The part that makes the group hands its continuation to the group, and the member that ends last goes on with it. The body
+  -- runs as a part of its own, which is not in the scope of the parts.
+  group joiner (Delimited body) = Delimited $ \(Context run tag part) input ->
+    control0 tag $ \resume -> do
+      (gang, first') <- newGang run part joiner
+      pure $
+        Forked
+          [ pushFrame run first' Marked
+              *> catch (Right <$> body (Context run tag first') (DelimitedGroup gang, input)) (unwinding run first')
+              >>= bodyEnded run gang first' (resume . throwIO) (resume . pure)
+          ]
+  {-# INLINE group #-}
+
+  -- The part is given the scheduler for its next round, and the one that spawns it goes on. It is not a point to give way at.
+  spawn (Delimited program) = Delimited $ \(Context run tag _) (DelimitedGroup gang, input) ->
+    spawnedPart run gang >>= \case
+      Nothing -> pure ()
+      Just (number, child) ->
+        enqueue run $
+          pushFrame run child Marked
+            *> catch (Right <$> program (Context run tag child) input) (unwinding run child)
+            >>= partEnded run gang child number
+  {-# INLINE spawn #-}
+
   together = \case
     [] -> done
     [one] -> one
@@ -352,41 +379,42 @@ instance Race (DelimitedM m s) where
               >>= raceEnded run scope' winner (resume . throwIO) (resume . pure) second'
           ]
 
--- | The tickets that belong to this core: a slot, which the parts of this core read
--- and write as plain memory. A part that waits for the ticket is parked in the
--- slot, as a closure that puts its captured continuation back among those that
--- can go on, and goes back when the ticket's promise is fulfilled. Fulfilling and
--- awaiting count a step, and can give way: a ticket is where parts coordinate,
--- and none is on a parser's path.
+-- | The tickets that belong to this core: a slot, which the parts of this core read and write as plain memory. A part that waits for
+-- the ticket is parked in the slot, as a closure that puts its captured continuation back among those that can go on, and goes back when
+-- a part hands it a value: a ticket keeps no value for a part that is not parked. Handing and awaiting count a step, and can give way: a
+-- ticket is where parts coordinate, and none is on a parser's path.
 type instance Local (DelimitedM m s) = 'Here s
 
 type instance ModeOf (DelimitedM m s) = m
 
 instance Exchange (DelimitedM m s) ('Here s) where
   newtype Future (DelimitedM m s) ('Here s) a = HereFuture (IORef (Slot a))
-  ticket = Delimited (\_ () -> newIORef Empty >>= \slot -> pure (HereFuture slot, HerePromise slot))
-  await = Delimited $ \context@(Context run tag part) (HereFuture slot) ->
-    readIORef slot >>= \case
-      Fulfilled value -> checkpoint part *> (value <$ step context)
-      Empty -> registering part (OnTicket slot) *> control0 tag (\resume -> Parked <$ writeIORef slot (Waiter (wakeTicket run . resume)))
-      Waiter _ -> ioError (userError "two parts wait for one ticket")
-      Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
-  fulfil = Delimited (\context (HerePromise slot, value) -> fulfilHere slot value <* step context)
-  abandon = Delimited (\_ (HereFuture slot) -> abandonHere slot)
+  ticket = Delimited (\_ () -> newSlot >>= \slot -> pure (HereFuture slot, HerePromise slot))
+  await = Delimited $ \context@(Context run tag part) (HereFuture slot) -> awaitFrom hereSeat run part slot (step context *>) pure (control0 tag)
+  fulfil = Delimited (\context (promise, value) -> fulfilNow promise value <* step context)
+  abandon = Delimited (\_ (HereFuture slot) -> abandonTicket hereSeat slot)
+  awaitRegistering = Delimited $ \context@(Context run tag part) (HereFuture slot, register) ->
+    awaitRegisteringFrom hereSeat run part slot (register (HerePromise slot)) (step context *>) pure (control0 tag)
+  willAwait = Delimited (\_ future@(HereFuture slot) -> future <$ commitTo hereSeat slot)
+  handWaiting = Delimited $ \context@(Context run tag part) (HerePromise slot, value) -> handWaitingTo hereSeat run part slot value (\result -> result <$ step context) (control0 tag)
+  untilParked = Delimited $ \(Context run tag part) (HerePromise slot) -> untilParkedFrom hereSeat run part slot (pure ()) (control0 tag)
 
--- | The waiter of a ticket that any core can fulfil is parked in the slot as a local ticket's is, but the
--- promise, on another core, doesn't run it: it puts it in the mailbox of the
--- scheduler of the waiter's core, which goes on with it in its next round, and
--- wakes that scheduler if it sleeps in its poller.
+-- | The slot of a ticket of any core is changed by compare-and-swap, and the part that gives a part that waits at it a value, or lets it
+-- go on, puts it in the mailbox of its scheduler, which goes on with it in its next round, and wakes that scheduler if it sleeps in its
+-- poller. The mailbox refuses it if the scheduler has ended, and the value is not taken.
 instance Exchange (DelimitedM m s) 'Anywhere where
-  newtype Future (DelimitedM m s) 'Anywhere a = AnywhereFuture (IORef (RemoteSlot a))
-  ticket = Delimited $ \(Context run _ _) () -> do
-    slot <- newIORef RemoteEmpty
-    pure (AnywhereFuture slot, AnywherePromise (fulfilRemote (runMailbox run) slot))
-  await = Delimited $ \context@(Context run tag part) (AnywhereFuture slot) ->
-    awaitRemote run part slot (\value -> value <$ step context) (control0 tag)
-  fulfil = Delimited $ \context (AnywherePromise promise, value) -> promise value <* step context
-  abandon = Delimited $ \_ (AnywhereFuture slot) -> abandonRemote slot
+  newtype Future (DelimitedM m s) 'Anywhere a = AnywhereFuture (IORef (Slot a))
+  ticket = Delimited (\_ () -> newSlot >>= \slot -> pure (AnywhereFuture slot, AnywherePromise slot))
+  await = Delimited $ \context@(Context run tag part) (AnywhereFuture slot) -> awaitFrom anywhereSeat run part slot (step context *>) pure (control0 tag)
+  fulfil = Delimited (\context (promise, value) -> fulfilNow promise value <* step context)
+  abandon = Delimited (\_ (AnywhereFuture slot) -> abandonTicket anywhereSeat slot)
+  awaitRegistering = Delimited $ \context@(Context run tag part) (AnywhereFuture slot, register) ->
+    awaitRegisteringFrom anywhereSeat run part slot (register (AnywherePromise slot)) (step context *>) pure (control0 tag)
+  willAwait = Delimited (\_ future@(AnywhereFuture slot) -> future <$ commitTo anywhereSeat slot)
+  handWaiting = Delimited $ \context@(Context run tag part) (promise, value) ->
+    anywhereSlot promise >>= \slot -> handWaitingTo anywhereSeat run part slot value (\result -> result <$ step context) (control0 tag)
+  untilParked = Delimited $ \(Context run tag part) promise ->
+    anywhereSlot promise >>= \slot -> untilParkedFrom anywhereSeat run part slot (pure ()) (control0 tag)
 
 -- | An inbox of this core is a shelf of plain memory, and a part that waits at it is parked there, as at a ticket, until a post
 -- or a collect lets it go on. Posting and collecting count a step and can give way, as a ticket does, before they act: a

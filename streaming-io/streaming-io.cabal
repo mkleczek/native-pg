@@ -9,6 +9,7 @@ extra-source-files: test/check-positive-int.sh
                     test/check-one-buffer.sh
                     test/check-no-io-waits.sh
                     test/check-steps.sh
+                    test/check-named.sh
                     test/compile/*.hs
 
 -- The executables and test suites are linked with GHC's threaded run time. With -f-threaded they are linked with the
@@ -31,6 +32,7 @@ library
                    Network.Streaming.Watch
                    Network.Streaming.Mode
                    Network.Streaming.Annotate
+                   Network.Streaming.Concurrent
                    Network.Streaming.Classes
                    Network.Streaming.Combinators
                    Network.Streaming.Plumbing
@@ -45,6 +47,7 @@ library
                    Network.Streaming.Pool
                    Network.Streaming.Loans
                    Network.Streaming.NotImplemented
+                   Network.Streaming.Named
                    Network.Streaming.Diagram
                    Network.Streaming.Diagram.Mermaid
                    Network.Streaming.Structure
@@ -71,10 +74,12 @@ test-suite streaming-io-spec
                  ListPrefixSpec
                  DescriptorsSpec
                  GroupCostSpec
+                 GroupSpec
                  LoansSpec
                  LoansTestSupport
                  PoolSpec
                  PoolCostSpec
+                 RendezvousSpec
                  SetupBuffersSpec
                  SignalsSpec
                  SpecialisedSpec
@@ -89,6 +94,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Watch
                  Network.Streaming.Mode
                  Network.Streaming.Annotate
+                 Network.Streaming.Concurrent
                  Network.Streaming.Classes
                  Network.Streaming.Combinators
                  Network.Streaming.Plumbing
@@ -103,6 +109,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Pool
                  Network.Streaming.Loans
                  Network.Streaming.NotImplemented
+                 Network.Streaming.Named
                  Network.Streaming.Diagram
                  Network.Streaming.Diagram.Mermaid
                  Network.Streaming.Structure
@@ -119,6 +126,8 @@ test-suite streaming-io-spec
                  EmptyPoolSpec
                  InboxSpec
                  MermaidSpec
+                 NamedSpec
+                 OpticsSpec
                  PositiveIntSpec
                  ResourcesSpec
                  WatchSpec
@@ -129,6 +138,7 @@ test-suite streaming-io-spec
                  ScopeCostSpec
                  StepCostSpec
                  StepsSpec
+                 TicketCostSpec
                  TimeSpec
                  UnwindSpec
                  WithSpec

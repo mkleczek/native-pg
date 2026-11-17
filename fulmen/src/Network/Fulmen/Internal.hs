@@ -10,7 +10,8 @@ module Network.Fulmen.Internal
     Answering (..),
     Cores (..),
     Shared (..),
-    Free (..),
+    Waiting (..),
+    Count (..),
   )
 where
 
@@ -21,7 +22,7 @@ import Network.Fulmen.Internal.Date (Pulse)
 import Network.Fulmen.Internal.Response (Exchange)
 import Network.Socket (Socket)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings)
-import Network.Streaming.Classes (Address, Duration, Event, Reach (..))
+import Network.Streaming.Classes (Duration, Event, Promise, Reach (..))
 import Network.Streaming.Loans (Loans)
 import Network.Streaming.Pool (Pool)
 
@@ -31,7 +32,7 @@ data Settings = Settings
   { -- | The size of the pool of the buffers that a request in flight reads and writes in, which
     -- 'Network.Fulmen.newCores' makes once for all the cores.
     bufferPool :: BufferPoolSettings,
-    -- | How many workers each core has at startup, which is how many connections
+    -- | How many connection workers each core runs at most, which is how many connections
     -- it serves at once: its share of the connection cap.
     connectionsPerCore :: Int,
     -- | The bytes that a request line or a header line may take. A longer request line is answered with 414, and a longer
@@ -48,10 +49,10 @@ data Settings = Settings
     -- the server closes the connection.
     clientTimeout :: Maybe Duration,
     -- | How long a connection may wait for its next request, from when it is accepted or when it has served one, before the server
-    -- closes it and its worker offers itself again, so that a connection that waits in the listen backlog is served. It is the wait
-    -- for the first byte of a request, so that a client that is gone without closing the connection, or that connects and says
-    -- nothing, doesn't hold a worker for ever; a connection that is serving a request, the time its handler takes included, is not
-    -- timed. 'Nothing' waits for ever. A connection that has an idle timeout has a watcher, a part of its own that sleeps until the
+    -- closes it and its connection worker ends, so that its core has room for another connection and one that waits in the listen
+    -- backlog is served. It is the wait for the first byte of a request, so that a client that is gone without closing the
+    -- connection, or that connects and says nothing, doesn't hold a connection worker for ever; a connection that is serving a
+    -- request, the time its handler takes included, is not timed. 'Nothing' waits for ever. A connection that has an idle timeout has a watcher, a part of its own that sleeps until the
     -- connection can have waited that long and looks at it then, so that the timeout costs a request a clock read and two changes of a mark,
     -- a few hundred bytes, and a connection a timer for each timeout that it lasts, and not a deadline for each wait for a request.
     idleTimeout :: Maybe Duration,
@@ -75,14 +76,13 @@ newtype Answering = Answering Exchange
 -- is the one that runs the acceptor, if it is the first.
 data Cores = Cores !Int !Shared
 
--- | What the cores share: the free workers, which the acceptor hands connections to, the date that responses carry and
--- whether the server is shutting down, and the pools of the buffers that requests in flight work in, of which a value
--- of one core has its own.
+-- | What the cores share: the pool of the cores that wait for a connection, which the acceptor delivers connections to,
+-- how many connection workers each core has, the date that responses carry and whether the server is shutting down, and
+-- the pools of the buffers that requests in flight work in, of which a value of one core has its own.
 data Shared = Shared
-  { sharedWorkers :: !(Pool Free),
-    -- | How many workers of each core are free, which each worker counts for itself before it offers itself and the acceptor
-    -- counts down as it takes one, so that the acceptor tells the core that has the most without going through the free workers.
-    sharedFreeCounts :: !(IORef (IntMap Int)),
+  { sharedWaiting :: !(Pool Waiting),
+    -- | The count of each core, by its number.
+    sharedCounts :: !(IntMap (IORef Count)),
     sharedPulse :: !Pulse,
     -- | The pool of request buffers of the core that the value is for: a request is admitted from its own core's pool, so that
     -- the buffer that a request gives back goes to a request of the same core, and not to one that waits on another core while
@@ -92,8 +92,13 @@ data Shared = Shared
     sharedCorePools :: !(IntMap BufferPool)
   }
 
--- | A free worker: the core that it is on, and the address of the inbox that it collects its connections from.
-data Free = Free
-  { freeCore :: !Int,
-    freeAddress :: !(Address "connections" 'Anywhere Socket)
+-- | A core that waits for a connection: its number, and the promise that the acceptor delivers the connection's socket
+-- with.
+data Waiting = Waiting
+  { waitingCore :: !Int,
+    waitingPromise :: !(Promise 'Anywhere Socket)
   }
+
+-- | What a core has of its connection workers: how many are alive, and the promise of the part that waits for room, if
+-- it does, which the end of a worker fulfils.
+data Count = Count !Int !(Maybe (Promise 'Anywhere ()))

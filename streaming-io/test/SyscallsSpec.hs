@@ -9,7 +9,7 @@
 -- each exchange, and answers in step, so that the counts of a run are the same on every run.
 module SyscallsSpec (spec) where
 
-import Control.Arrow (ArrowChoice, (>>>), (>>^), (^>>))
+import Control.Arrow (ArrowChoice, first, (>>>), (>>^), (^>>))
 import Control.Concurrent (forkIO, getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (finally)
@@ -280,9 +280,9 @@ newtype Ping r = Ping {answer :: Promise r (Pong r)}
 newtype Pong r = Pong {following :: Promise r (Ping r)}
 
 -- | Two parts of one core that give each other a ticket and wait for the answer, this many times: each round is short, and a part
--- that waits for a ticket never yields.
+-- that waits for a ticket never yields. The server will await the first request, which the client may make before it does.
 pingPong :: (Rich arr) => Int -> arr () ()
-pingPong count = localTicket >>> together [snd ^>> client, fst ^>> server]
+pingPong count = localTicket >>> first willAwait >>> together [snd ^>> client, fst ^>> server]
   where
     client = timesWith count (expect Ping >>> await >>^ following) >>> done
     server = timesWith count (await >>> answer ^>> expect Pong) >>> done

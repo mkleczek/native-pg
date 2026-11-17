@@ -11,7 +11,8 @@ import Data.List (isSuffixOf)
 import GHC.Stack (SrcLoc (..))
 import GHC.TypeLits (KnownSymbol)
 import Network.Streaming.Classes
-import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, box, done, foreverA, iterateWith, withInbox)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, Step, answering, asking, box, done, foreverA, iterateWith, tap, withInbox)
+import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (..))
 import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Lint
 import Skeletest
@@ -43,11 +44,13 @@ spec :: Spec
 spec = do
   acquires
   loops
+  spawns
   deadlines
   shields
   graces
   allowances
   inboxes
+  exchanges
   findings
 
 -- | A scope whose acquire waits, or does not.
@@ -119,6 +122,23 @@ loops = describe "a loop" $ do
     report <- lint (iterateWith countDown (box "inner" (iterateWith countDown (arr id)) >>^ const 3))
     (summary report, findingPath <$> reportFindings report)
       `shouldBe` (([LoopWithoutWait, LoopWithoutWait], []), [["inner"], []])
+
+-- | Loops that spawn parts, which is no wait: the part that is spawned runs on its own.
+spawns :: Spec
+spawns = describe "a loop that spawns" $ do
+  it "only is found, and one that waits for something and spawns is not" $ do
+    only <- lint (group AwaitAll (foreverA (tap (spawn quick))) :: Diagram () ((), ()))
+    waiting <- lint (group AwaitAll (foreverA (tap (snd ^>> block) >>> tap (spawn quick))) :: Diagram Event ((), ()))
+    (summary only, summary waiting) `shouldBe` (([LoopWithoutWait], []), ([], []))
+
+  it "is found whatever the part that is spawned waits for, which is not a wait of the loop" $ do
+    report <- lint (group AwaitAll (foreverA (tap (spawn giveWay))) :: Diagram () ((), ()))
+    summary report `shouldBe` ([LoopWithoutWait], [])
+
+  it "has a loop in the part that is spawned judged by itself, as the parts that run together are" $ do
+    spinning <- lint (group AwaitAll (tap (snd ^>> block) >>> tap (spawn (foreverA (arr id))) >>> done) >>> done :: Diagram Event ())
+    waiting <- lint (group AwaitAll (tap (snd ^>> block) >>> tap (spawn (foreverA giveWay)) >>> done) >>> done :: Diagram Event ())
+    (summary spinning, summary waiting) `shouldBe` (([LoopWithoutWait], []), ([], []))
 
 -- | A loop that gives way only on the way out.
 waitsOnlyWhenDone :: (Program arr) => arr Int ()
@@ -255,6 +275,50 @@ inboxes = describe "an inbox" $ do
   it "that is opened at two sites is allowed by a part that says why, with the reason" $ do
     report <- lint (allowing InboxOpenedTwice "the sites are in different servers" (owning @"jobs" postAndCollect >>> owning @"jobs" (postAndCollect >>> quick)))
     summary report `shouldBe` ([], [(InboxOpenedTwice, "the sites are in different servers")])
+
+-- | A step that awaits a ticket of any core, which the lint sees as a wait, and one that hands over to it, and one that fulfils it.
+awaitingStep :: Diagram () ()
+awaitingStep = const undefined ^>> await @_ @'Anywhere @() >>> quick
+
+handingOver :: Diagram () ()
+handingOver = const undefined ^>> handWaiting @_ @'Anywhere @() >>> quick
+
+-- | The checks on exchanges, which look at the whole program by the names that 'asking' and 'answering' give the ends of a ticket.
+exchanges :: Spec
+exchanges = describe "an exchange" $ do
+  it "that has an asking end and an answering end is not found" $ do
+    report <- lint (asking "jobs" awaitingStep >>> answering "jobs" handingOver)
+    summary report `shouldBe` ([], [])
+
+  it "that has an asking end and no answering end is found as dead" $ do
+    report <- lint (asking "jobs" awaitingStep)
+    summary report `shouldBe` ([DeadExchange], [])
+    (findingWhat <$> reportFindings report) `shouldBe` ["asks jobs"]
+
+  it "that has an answering end and no asking end is found as dead, whatever it does: hands over, or fulfils" $ do
+    report <- lint (answering "jobs" handingOver >>> answering "jobs" (const undefined ^>> fulfil @_ @'Anywhere @() >>> quick))
+    summary report `shouldBe` ([DeadExchange], [])
+    (findingWhat <$> reportFindings report) `shouldBe` ["answers jobs"]
+
+  it "is paired by name only: an asking end and an answering end with different names are both dead" $ do
+    report <- lint (asking "jobs" awaitingStep >>> answering "tasks" handingOver)
+    (findingWhat <$> reportFindings report) `shouldBe` ["asks jobs", "answers tasks"]
+
+  it "is paired across the boxes of the program, as the program is walked into them" $ do
+    report <- lint (box "consumer" (asking "jobs" awaitingStep) >>> box "producer" (answering "jobs" handingOver))
+    summary report `shouldBe` ([], [])
+
+  it "that is dead is allowed by a part that says why, with the reason" $ do
+    report <- lint (allowing DeadExchange "what is handed over is awaited by another program" (answering "jobs" handingOver))
+    summary report `shouldBe` ([], [(DeadExchange, "what is handed over is awaited by another program")])
+
+  it "that a loop hands over to, and a loop awaits, is a wait of each loop" $ do
+    report <- lint (together [foreverA (tap (asking "jobs" awaitingStep)), foreverA (tap (answering "jobs" handingOver))])
+    summary report `shouldBe` ([], [])
+
+  it "has the steps that hand over and that watch counted as waits: a loop of them is not found" $ do
+    report <- lint (foreverA (tap (const undefined ^>> untilParked @_ @'Anywhere @() >>> quick)) :: Diagram () ())
+    summary report `shouldBe` ([], [])
 
 -- | What a part allows, and what it doesn't.
 allowances :: Spec

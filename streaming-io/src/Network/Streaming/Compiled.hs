@@ -32,6 +32,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Word (Word64)
 import Network.Streaming.Classes hiding (Stream (..))
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Internal.Cancel
 import Network.Streaming.Internal.Inboxes (Address (..), Shelf, closeShelf, newShelf)
 import Network.Streaming.Internal.Scheduler hiding (post)
@@ -226,6 +227,30 @@ instance Annotate (CompiledM m)
 -- wait, and their scopes are released before the group ends, which fails with the first failure. A later failure is
 -- dropped.
 instance Concurrent (CompiledM m) where
+  newtype Group (CompiledM m) s j = CompiledGroup (Gang j)
+
+  -- The part that makes the group hands what follows it to the group, and the member that ends last goes on with it. The body
+  -- runs as a part of its own, which is not in the scope of the parts.
+  group joiner (Compiled body) = Compiled $ \(Context run part outer) input next -> do
+    (gang, first') <- newGang run part joiner
+    let failure thrown = writeIORef (runFailure run) outer *> outer thrown
+        success result = writeIORef (runFailure run) outer *> next result
+        ended = bodyEnded run gang first' failure success
+        failing = Context run first' (ended . Left)
+    pure (Forked [resumed failing (body failing (CompiledGroup gang, input) (ended . Right))])
+  {-# INLINE group #-}
+
+  -- The part is given the scheduler for its next round, and the one that spawns it goes on. It is not a point to give way at.
+  spawn (Compiled program) = Compiled $ \(Context run _ _) (CompiledGroup gang, input) next ->
+    spawnedPart run gang >>= \case
+      Nothing -> next ()
+      Just (number, child) -> do
+        let ended = partEnded run gang child number
+            failing = Context run child (ended . Left)
+        enqueue run (resumed failing (program failing input (ended . Right)))
+        next ()
+  {-# INLINE spawn #-}
+
   together = \case
     [] -> done
     [one] -> one
@@ -262,40 +287,46 @@ instance Race (CompiledM m) where
 -- | The region of the tickets of this arrow: there is one core, the thread that runs it.
 data Core
 
--- | A ticket is a slot on this thread: a part that waits for it is parked in
--- it, as a closure that puts its continuation back among those that can go on,
--- and goes back when the ticket's promise is fulfilled. Fulfilling and awaiting count a
--- step, and can give way: a ticket is where parts coordinate, and none is on a
--- parser's path.
+-- | A ticket is a slot on this thread: a part that waits for it is parked in it, as a closure that puts its continuation back among
+-- those that can go on, and goes back when a part hands it a value: a ticket keeps no value for a part that is not parked. Handing and
+-- awaiting count a step, and can give way: a ticket is where parts coordinate, and none is on a parser's path.
 type instance Local (CompiledM m) = 'Here Core
 
 type instance ModeOf (CompiledM m) = m
 
 instance Exchange (CompiledM m) ('Here Core) where
   newtype Future (CompiledM m) ('Here Core) a = CompiledFuture (IORef (Slot a))
-  ticket = Compiled (\_ () next -> newIORef Empty >>= \slot -> next (CompiledFuture slot, HerePromise slot))
+  ticket = Compiled (\_ () next -> newSlot >>= \slot -> next (CompiledFuture slot, HerePromise slot))
   await = Compiled $ \context@(Context run part _) (CompiledFuture slot) next ->
-    readIORef slot >>= \case
-      Fulfilled value -> checkpoint part *> steppedIn context (next value)
-      Empty -> registering part (OnTicket slot) *> (Parked <$ writeIORef slot (Waiter (\action -> wakeTicket run (resumed context (action >>= next)))))
-      Waiter _ -> ioError (userError "two parts wait for one ticket")
-      Abandoned -> ioError (userError "a ticket was waited for after it was abandoned")
-  fulfil = Compiled (\context (HerePromise slot, value) next -> fulfilHere slot value >>= \taken -> steppedIn context (next taken))
-  abandon = Compiled (\_ (CompiledFuture slot) next -> abandonHere slot >>= next)
+    awaitFrom hereSeat run part slot (steppedIn context) next (\park -> park (\action -> resumed context (action >>= next)))
+  fulfil = Compiled (\context (promise, value) next -> fulfilNow promise value >>= \taken -> steppedIn context (next taken))
+  abandon = Compiled (\_ (CompiledFuture slot) next -> abandonTicket hereSeat slot >>= next)
+  awaitRegistering = Compiled $ \context@(Context run part _) (CompiledFuture slot, register) next ->
+    awaitRegisteringFrom hereSeat run part slot (register (HerePromise slot)) (steppedIn context) next (\park -> park (\action -> resumed context (action >>= next)))
+  willAwait = Compiled (\_ future@(CompiledFuture slot) next -> commitTo hereSeat slot *> next future)
+  handWaiting = Compiled $ \context@(Context run part _) (HerePromise slot, value) next ->
+    handWaitingTo hereSeat run part slot value (steppedIn context . next) (\park -> park (\action -> resumed context (action >>= next)))
+  untilParked = Compiled $ \context@(Context run part _) (HerePromise slot) next ->
+    untilParkedFrom hereSeat run part slot (next ()) (\park -> park (\action -> resumed context (action >>= next)))
 
--- | The waiter of a ticket that any thread can fulfil is parked in the slot as a local ticket's is, but the
--- promise, on another thread, doesn't run it: it puts it in the mailbox of this scheduler, which goes on with it in
--- its next round, and wakes the scheduler if it sleeps in its poller. There is one core: a program of this arrow
--- makes the ticket and waits at it on this thread, and what fulfils its promise is any thread, or the same.
+-- | The slot of a ticket of any thread is changed by compare-and-swap, and the part that gives a part that waits at it a value, or lets
+-- it go on, puts it in the mailbox of its scheduler, which goes on with it in its next round, and wakes the scheduler if it sleeps in
+-- its poller. There is one core: a program of this arrow makes the ticket and waits at it on this thread, and what hands it a value is
+-- any thread, or the same.
 instance Exchange (CompiledM m) 'Anywhere where
-  newtype Future (CompiledM m) 'Anywhere a = CompiledRemoteFuture (IORef (RemoteSlot a))
-  ticket = Compiled $ \(Context run _ _) () next -> do
-    slot <- newIORef RemoteEmpty
-    next (CompiledRemoteFuture slot, AnywherePromise (fulfilRemote (runMailbox run) slot))
+  newtype Future (CompiledM m) 'Anywhere a = CompiledRemoteFuture (IORef (Slot a))
+  ticket = Compiled (\_ () next -> newSlot >>= \slot -> next (CompiledRemoteFuture slot, AnywherePromise slot))
   await = Compiled $ \context@(Context run part _) (CompiledRemoteFuture slot) next ->
-    awaitRemote run part slot (steppedIn context . next) (\park -> park (\action -> resumed context (action >>= next)))
-  fulfil = Compiled $ \context (AnywherePromise promise, value) next -> promise value >>= \taken -> steppedIn context (next taken)
-  abandon = Compiled $ \_ (CompiledRemoteFuture slot) next -> abandonRemote slot >>= next
+    awaitFrom anywhereSeat run part slot (steppedIn context) next (\park -> park (\action -> resumed context (action >>= next)))
+  fulfil = Compiled (\context (promise, value) next -> fulfilNow promise value >>= \taken -> steppedIn context (next taken))
+  abandon = Compiled (\_ (CompiledRemoteFuture slot) next -> abandonTicket anywhereSeat slot >>= next)
+  awaitRegistering = Compiled $ \context@(Context run part _) (CompiledRemoteFuture slot, register) next ->
+    awaitRegisteringFrom anywhereSeat run part slot (register (AnywherePromise slot)) (steppedIn context) next (\park -> park (\action -> resumed context (action >>= next)))
+  willAwait = Compiled (\_ future@(CompiledRemoteFuture slot) next -> commitTo anywhereSeat slot *> next future)
+  handWaiting = Compiled $ \context@(Context run part _) (promise, value) next ->
+    anywhereSlot promise >>= \slot -> handWaitingTo anywhereSeat run part slot value (steppedIn context . next) (\park -> park (\action -> resumed context (action >>= next)))
+  untilParked = Compiled $ \context@(Context run part _) promise next ->
+    anywhereSlot promise >>= \slot -> untilParkedFrom anywhereSeat run part slot (next ()) (\park -> park (\action -> resumed context (action >>= next)))
 
 -- | An inbox of this core is a shelf of plain memory, and a part that waits at it is parked there, as at a ticket, until a post
 -- or a collect lets it go on. Posting and collecting count a step and can give way, as a ticket does, before they act: a

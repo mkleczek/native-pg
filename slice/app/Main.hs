@@ -1,6 +1,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
@@ -39,17 +40,19 @@ import Data.Maybe (isJust)
 import Database.PostgreSQL.Pool (ConnectionPool, ConnectionPoolSettings (..), Maintenance, closeConnectionPool, connectionPoolSettings, maintain, newConnectionPool, newMaintenance, withConnection)
 import Database.PostgreSQL.Resolver (newResolver)
 import qualified Database.PostgreSQL.Transaction as Tx
+import GHC.Records (HasField)
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
 import Network.Fulmen (Call, Method (..), Request (..))
 import qualified Network.Fulmen as Fulmen
 import qualified Network.Socket as Socket
 import Network.Streaming.BufferPool (BufferPoolSettings (..))
 import Network.Streaming.Classes (Concurrent (..), Effect (..), Runtime, Scope (..), Stream (..))
-import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, consume, iterateWith, keeping)
+import Network.Streaming.Combinators (pattern Again, pattern Finish, consume, done, iterateWith, tap)
 import Network.Streaming.Compiled (runCompiled)
 import Network.Streaming.Counters (Counts, counterName, toList)
 import Network.Streaming.Delimited (runCores)
 import Network.Streaming.Mode (Instrumented (counted), Mode (..))
+import Network.Streaming.Named (adding, field, is, newRecord)
 import Network.Streaming.PositiveInt (PositiveInt, mkPositiveInt)
 import Network.Streaming.Threads (runThreads)
 #if defined(DEBUG_MODE)
@@ -93,12 +96,24 @@ routed = foldr step missing
 -- which fulmen does when a handler gives the head twice.
 rows :: (Runtime arr) => ConnectionPool -> ByteString -> arr Call ()
 rows pool sql =
-  alongside (tryA ((Fulmen.loans &&& arr ((),) >>^ (pool,)) >>> withConnection (Tx.transaction Tx.ReadCommitted Tx.Read (Tx.pipeline Tx.Final (Tx.statement query) reading))))
+  ( is
+      "outcome"
+      ( tryA
+          ( (Fulmen.loans &&& arr ((),) >>^ (pool,))
+              >>> withConnection
+                ( Tx.transaction Tx.ReadCommitted Tx.Read $
+                    Tx.pipeline Tx.Final (Tx.statement query) reading
+                )
+          )
+      )
+      &&& is "call" returnA
+  )
     >>> unlessSucceeded
     ^>> (failed ||| returnA)
   where
-    unlessSucceeded (Right (Right (Right ())), _) = Right ()
-    unlessSucceeded (_, call) = Left call
+    unlessSucceeded r = case r.outcome of
+      Right (Right (Right ())) -> Right ()
+      _ -> Left r.call
     query = Tx.Statement sql (const []) Nothing (Tx.one Tx.field)
     failed = (,(500, "internal error\n")) ^>> plain
 
@@ -106,18 +121,20 @@ rows pool sql =
 -- response.
 reading :: (Runtime arr) => Tx.Result arr Tx.Field -> With Tx.Tx arr Call ()
 reading result =
-  keeping (Tx.single result)
-    >>> withHead
-    ^>> first Fulmen.respond
+  (is "call" returnA &&& is "source" (done >>> Tx.single result))
+    >>> adding "answering" (withHead ^>> Fulmen.respond)
     >>> pieces
   where
-    withHead (field, call) =
-      ((call, (Fulmen.Status 200, [("Content-Type", "application/json; charset=utf-8")], Fulmen.Known (Tx.fieldLength field))), field)
+    withHead r =
+      (r.call, (Fulmen.Status 200, [("Content-Type", "application/json; charset=utf-8")], Fulmen.Known (Tx.fieldLength r.source)))
 
--- | The pieces of the field, one after the other, each sent before the next is taken: they are views, which are valid
--- until the next step on the field. At its end, the response ends.
-pieces :: (Runtime arr, Stream arr s) => arr (Fulmen.Answering, s) ()
-pieces = iterateWith (withSource ^>> first next >>^ chunked) (consume Fulmen.send) >>> Fulmen.finish
+-- | The pieces of the source, one after the other, each sent before the next is taken: they are views, which are valid
+-- until the next step on the source. At its end, the response ends. The input has the answering and the source by name.
+pieces :: (Runtime arr, Stream arr s, HasField "answering" r Fulmen.Answering, HasField "source" r s) => arr r ()
+pieces =
+  (\r -> let !answering = r.answering; !source = r.source in (answering, source))
+    ^>> iterateWith (withSource ^>> first next >>^ chunked) (consume Fulmen.send)
+    >>> Fulmen.finish
   where
     withSource (answering, source) = (source, (answering, source))
     chunked (Nothing, (answering, _)) = Finish answering
@@ -145,15 +162,16 @@ metrics counts = ((,) <$> returnA <*> now (const exposition)) >>> plain
 -- | An answer of one piece of text: the head with its length, the text and the end.
 plain :: (Runtime arr) => arr (Call, (Int, ByteString)) ()
 plain =
-  withHead
-    ^>> first Fulmen.respond
-    >>> withBody
-    ^>> consume Fulmen.send
+  (\(call, (status, text)) -> newRecord ["call", "status", "text"] call status text)
+    ^>> adding "answering" (withHead ^>> Fulmen.respond)
+    >>> tap ((\r -> (r.answering, [r.text])) ^>> Fulmen.send)
+    >>> field "answering"
     >>> Fulmen.finish
   where
-    withHead (call, (status, text)) =
-      ((call, (Fulmen.Status status, [("Content-Type", "text/plain; charset=utf-8")], Fulmen.Known (B.length text))), text)
-    withBody (answering, text) = ((answering, [text]), answering)
+    withHead r =
+      ( r.call,
+        (Fulmen.Status r.status, [("Content-Type", "text/plain; charset=utf-8")], Fulmen.Known (B.length r.text))
+      )
 
 -- * The flags
 

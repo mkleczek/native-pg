@@ -22,6 +22,9 @@ module Network.Streaming.Combinators
     through,
     _1,
     _2,
+    _Left,
+    _Right,
+    _Just,
     on,
     boolA,
     Step,
@@ -32,6 +35,7 @@ module Network.Streaming.Combinators
     foreverA,
     undoing,
     localTicket,
+    awaitedTicket,
     deliver,
     withTicket,
     tryTicket,
@@ -46,9 +50,9 @@ module Network.Streaming.Combinators
     step,
     taking,
     giving,
-    inout,
+    (-|),
+    (|-),
     typed,
-    field,
   )
 where
 
@@ -56,9 +60,8 @@ import Control.Arrow (Arrow, ArrowChoice, arr, first, returnA, second, (&&&), (*
 import Control.Exception (throwIO)
 import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable, typeRep)
-import GHC.Records (HasField (..))
 import GHC.Stack (HasCallStack)
-import GHC.TypeLits (KnownSymbol, symbolVal)
+import GHC.TypeLits (KnownSymbol)
 import Network.Streaming.Annotate (answering, asking, box)
 import Network.Streaming.Classes
 import Network.Streaming.Plumbing
@@ -79,12 +82,13 @@ times = timesWith
 -- and is rethrown once both have stopped.
 concurrently :: (Arrow arr, Concurrent arr, Exchange arr (Local arr)) => arr a b -> arr a c -> arr a (b, c)
 concurrently one two =
-  keeping (localTicket &&& localTicket)
+  keeping (awaiting &&& awaiting)
     >>> tap (together [firstPromise ^>> deliver one, secondPromise ^>> deliver two])
     >>> ends ^>> (await *** await)
   where
+    awaiting = localTicket >>> first willAwait
     -- The group's input is the two tickets and the input. Each arrow fulfils the promise of its own ticket, made before
-    -- the group starts, so the awaits after the group never wait.
+    -- the group starts, and the receiver is committed to take both from the start: the awaits after the group never wait.
     firstPromise = first (snd . fst)
     secondPromise = first (snd . snd)
     ends = (fst *** fst) . fst
@@ -102,13 +106,19 @@ undoing :: (Steps arr) => (forall p. (Steps p) => p a b) -> (forall p. (Steps p)
 undoing body cleanup =
   alongside (tryA body)
     >>> decide "failed?" (\(result, input) -> either (Left . (input,)) Right result)
-    >>> (taking "failed" (consume cleanup >>> now throwIO) ||| taking "done" returnA)
+    >>> ("failed" |- (consume cleanup >>> now throwIO) ||| "done" |- returnA)
 {-# INLINE undoing #-}
 
 -- | A ticket of the arrow's own reach: one that only parts of this core fulfil and await.
 localTicket :: (Exchange arr (Local arr)) => arr () (Future arr (Local arr) a, Promise (Local arr) a)
 localTicket = ticket
 {-# INLINE localTicket #-}
+
+-- | A ticket whose receiver will await its future: a value fulfilled before the await is held for it, as one at the await is. For a
+-- receiver that hands its promise out, in steps that may wait or in a part that runs beside it, before it awaits.
+awaitedTicket :: (Arrow arr, Exchange arr r) => arr () (Future arr r a, Promise r a)
+awaitedTicket = ticket >>> first willAwait
+{-# INLINE awaitedTicket #-}
 
 -- | Runs the arrow on the input and fulfils the promise with its result, without saying whether the waiter took it.
 deliver :: (Arrow arr, Exchange arr r) => arr a b -> arr (Promise r b, a) ()
@@ -125,18 +135,19 @@ handingOut handOut = handing ^>> first handOut
     handing ((future, promise), b) = ((promise, b), future)
 {-# INLINE handingOut #-}
 
--- | Makes a ticket, hands out its promise, and waits for the value: returns what the hand-out returned, and the value. If the
--- hand-out or the wait ends any other way, the ticket is abandoned, and a value fulfilled before that goes to the disposal,
--- with the input. The hand-out may wait, and is cancelled where it does.
+-- | Makes a ticket, hands out its promise, and waits for the value: returns what the hand-out returned, and the value. The receiver
+-- is committed to take from the moment the hand-out begins, so that a value fulfilled while the hand-out runs is not lost. If the
+-- hand-out or the wait ends any other way, the ticket is abandoned, and a value fulfilled before that goes to the disposal, with the
+-- input. The hand-out may wait, and is cancelled where it does.
 withTicket :: (ArrowChoice arr, Annotate arr, Scope arr, Exchange arr r) => arr (Promise r a, b) c -> arr (a, b) () -> arr b (c, a)
 withTicket handOut dispose =
   scope
-    (keeping ticket)
+    (keeping awaitedTicket)
     (decide "awaited?" unawaited >>> abandoning dispose)
     (fst ^>> handingOut handOut >>> second await)
   where
-    -- Only a wait that didn't end in 'Done' is abandoned: after an 'await' the slot stays fulfilled, so an 'abandon' would
-    -- hand the value out again. The release therefore trusts 'Done' to mean that the future was awaited.
+    -- Only a wait that didn't end in 'Done' is abandoned: after an 'await' there is nothing left in the ticket to give back. The
+    -- release therefore trusts 'Done' to mean that the future was awaited.
     unawaited (((future, _), b), exit) = case exit of
       Done -> Left ()
       _ -> Right (future, b)
@@ -152,23 +163,26 @@ withInbox dispose body = scope (keeping (inbox @arr @r @name)) (closing @name @r
 -- the input.
 closing :: forall name r arr a b. (ArrowChoice arr, Annotate arr, Inboxes arr r, KnownSymbol name) => arr (a, b) () -> arr (((Inbox arr name r a, Address name r a), b), Exit) ()
 closing dispose =
-  (\(((opened, _), b), _) -> (opened, b)) ^>> first (closeInbox @arr @r @name) >>> decide "value left?" left >>> (taking "no" returnA ||| taking "yes" dispose)
+  (\(((opened, _), b), _) -> (opened, b))
+    ^>> first (closeInbox @arr @r @name)
+    >>> decide "value left?" left
+    >>> ("no" |- returnA ||| "yes" |- dispose)
   where
     left (leftover, b) = maybe (Left ()) (Right . (,b)) leftover
 {-# INLINE closing #-}
 
--- | Makes a ticket and tries to hand out its promise. Left: the promise wasn't handed out, so the ticket is abandoned at
+-- | Makes a ticket and tries to hand out its promise, committed to take from the moment the hand-out begins. Left: the promise wasn't handed out, so the ticket is abandoned at
 -- once, a value fulfilled before that goes to the disposal, with the input, and the result is Left. Right: it waits for the
 -- value as 'withTicket' does. The hand-out may wait, and is cancelled where it does.
 tryTicket :: (ArrowChoice arr, Annotate arr, Scope arr, Exchange arr r) => arr (Promise r a, b) (Either c d) -> arr (a, b) () -> arr b (Either c (d, a))
 tryTicket handOut dispose =
   scope
-    (keeping ticket)
+    (keeping awaitedTicket)
     (decide "awaited?" unawaited >>> abandoning dispose)
     ( handing . fst
         ^>> first handOut
         >>> decide "handed out?" routed
-        >>> (taking "no" declined ||| taking "yes" accepted)
+        >>> ("no" |- declined ||| "yes" |- accepted)
     )
   where
     -- The input stays with the future, for the disposal of a value that the hand-out fulfilled before it declined.
@@ -186,17 +200,18 @@ tryTicket handOut dispose =
 -- abandons the future, and hands a value that was fulfilled before to the disposal, with the input.
 abandoning :: (ArrowChoice arr, Annotate arr, Exchange arr r) => arr (a, b) () -> arr (Either () (Future arr r a, b)) ()
 abandoning dispose =
-  taking "yes" returnA
-    ||| taking "no" (first abandon >>> decide "value fulfilled already?" late >>> (taking "no" returnA ||| taking "yes" dispose))
+  "yes" |- returnA
+    ||| "no" |- (first abandon >>> decide "value fulfilled already?" late >>> ("no" |- returnA ||| "yes" |- dispose))
   where
     late (fulfilled, b) = maybe (Left ()) (Right . (,b)) fulfilled
 {-# INLINE abandoning #-}
 
--- | Makes a ticket, hands out the message that carries its promise, and keeps the future to await. It doesn't say whether
--- the promise took the message: a caller that needs that fulfils it itself. For any reach: a ticket of the arrow's own
+-- | Makes a ticket, hands out the message that carries its promise, and keeps the future to await, which the receiver is committed to
+-- take from the start: an answer that comes before the await is held for it. It doesn't say whether the promise took the message: a
+-- caller that needs that fulfils it itself. For any reach: a ticket of the arrow's own
 -- core, whose message goes to a part of that core, or a ticket of any core, whose message crosses cores.
 expect :: (Arrow arr, Exchange arr r) => (Promise r a -> b) -> arr (Promise r b) (Future arr r a)
-expect message = keeping ticket >>> handingOut (addressed ^>> fulfil >>> done) >>^ snd
+expect message = keeping awaitedTicket >>> handingOut (addressed ^>> fulfil >>> done) >>^ snd
   where
     -- The promise to fulfil with the message, and the message, which carries the promise of the answer.
     addressed (promise, to) = (to, message promise)
@@ -237,8 +252,3 @@ typed = wires (typeName (Proxy @a)) (typeName (Proxy @b))
       "()" -> Nothing
       name -> Just name
 {-# INLINE typed #-}
-
--- | The field of a record, whose output wire is named after the field in diagrams.
-field :: forall name r a arr. (HasField name r a, KnownSymbol name, Arrow arr, Annotate arr) => arr r a
-field = arr (getField @name) `giving` symbolVal (Proxy @name)
-{-# INLINE field #-}

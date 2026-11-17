@@ -67,7 +67,7 @@ import System.Posix.Temp (mkdtemp)
 import System.Posix.Types (FileMode)
 import DnsServer (DnsServer (..), Reply (..), withDnsServer)
 import TestCluster (certificate)
-import TestPrograms hiding (field)
+import TestPrograms
 import TestServers
 
 spec :: FilePath -> Socket.PortNumber -> Spec

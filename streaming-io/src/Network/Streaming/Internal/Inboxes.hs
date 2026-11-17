@@ -31,10 +31,11 @@ module Network.Streaming.Internal.Inboxes
 where
 
 import Data.Foldable (traverse_)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef)
 import Data.Sequence (Seq, ViewL (..), viewl, (|>))
 import qualified Data.Sequence as Seq
 import GHC.TypeLits (Symbol)
+import Network.Streaming.Internal.Atomic (Change, changeHere)
 import Network.Streaming.Internal.Tickets (Reach (..))
 
 -- | The end of an inbox that others post to, which has the inbox's name. An address of reach @'Here s@ mentions the region
@@ -59,15 +60,6 @@ data Shelf a
 
 -- | A part that waits to post: the token it is known by, its value, and what wakes it with whether the value went in.
 data Poster a = Poster !(IORef ()) !a !(Bool -> IO ())
-
--- | How a shelf is changed: by a function that gives the new shelf and what the change says.
-type Change = forall x r. IORef x -> (x -> (x, r)) -> IO r
-
--- | The change by plain reads and writes, for the parts of one core. It evaluates what it installs, as the compare-and-swap
--- of "Network.Streaming.Internal.Atomic" does.
-changeHere :: Change
-changeHere ref change = readIORef ref >>= \old -> case change old of (!new, !result) -> result <$ writeIORef ref new
-{-# INLINE changeHere #-}
 
 -- | A new inbox's shelf.
 newShelf :: IO (IORef (Shelf a))

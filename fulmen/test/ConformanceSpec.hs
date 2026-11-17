@@ -60,7 +60,7 @@ import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, 
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> idleCost *> acceptCost *> manyWorkers
+spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> idleCost *> acceptCost *> manyConnectionWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -227,7 +227,7 @@ shutdownSpec = describe "a graceful shutdown" $ forM_ (runners ++ [coresRunner])
         ended <- timeout 3000000 (readMVar (serverStopped shutting))
         fmap (either (const False) (const True)) ended `shouldBe` Just True
 
--- | The idle timeout: a connection that waits for its next request for longer than it is closed, and its worker serves the
+-- | The idle timeout: a connection that waits for its next request for longer than it is closed, and its core serves the
 -- connection that waits for one, while a connection that is serving a request, or that waits for less, is not closed, and a
 -- shutdown closes an idle connection at once whatever the timeout is.
 idleSpec :: Spec
@@ -235,8 +235,8 @@ idleSpec = describe "an idle timeout" $ forM_ (runners ++ [coresRunner]) $ \runn
   describe runnerName $ do
     let request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
         withIdle limit workers = withStoppableWith (\settings -> settings {Fulmen.idleTimeout = limit, Fulmen.connectionsPerCore = workers}) runner
-    it "closes a connection that waits for its next request for longer, and its worker serves the connection that waits for one" $
-      -- Each core has one worker, and every worker has a connection that is idle, so that the next connection waits in the listen backlog.
+    it "closes a connection that waits for its next request for longer, and its core serves the connection that waits for one" $
+      -- Each core has room for one connection, and every core has a connection that is idle, so that the next connection waits in the listen backlog.
       withIdle (Just (millis 300)) 1 (handling (Fixed 200 [] "ok")) $ \shutting ->
         withClients (serverPort shutting) (if runnerName == "two cores" then 2 else 1) $ \idles -> withClient (serverPort shutting) $ \waiting -> do
           forM_ idles $ \idle -> SocketBytes.sendAll (socket idle) request *> awaitBytes idle "ok"
@@ -335,13 +335,14 @@ idleCost = describe "the cost of the idle timeout" $ forM_ measured $ \runner@(R
           after <- allocated_bytes <$> getRTSStats
           pure (fromIntegral (after - before) / fromIntegral requests)
 
--- | What the acceptor allocates for a connection that it takes: the same with a thousand free workers as with a few, since it takes the
--- first free worker of the core that has the most of them, and doesn't go through the workers that are free to tell which core that
--- is. A client connects, asks and is answered, one connection after another, so that every worker but the one that serves is free.
+-- | What the acceptor allocates for a connection that it takes: the same with room for a thousand connections on each core as with room
+-- for a few, since it takes the core that waits and has the fewest connection workers from the pool of the cores that wait, which holds
+-- each core once, and a connection worker is spawned for the connection when it comes. A client connects, asks and is answered, one
+-- connection after another, so that every core but the one that serves has all its room.
 acceptCost :: Spec
-acceptCost = describe "accepting with many workers free" $ forM_ measured $ \runner@(Runner runnerName _) ->
+acceptCost = describe "accepting with room for many connections" $ forM_ measured $ \runner@(Runner runnerName _) ->
   describe runnerName $
-    it "allocates for a connection no more with 1,024 workers than with 8" $ do
+    it "allocates for a connection no more with room for 1,024 connections than with room for 8" $ do
       few <- perConnection runner 8
       many <- perConnection runner 1024
       lookupEnv "ACCEPT_COST_REPORT" >>= \asked -> when (asked /= Nothing) (hPutStrLn stderr ("accept | " <> runnerName <> " | " <> show (round few :: Int) <> " bytes at 8 workers | " <> show (round many :: Int) <> " bytes at 1024"))
@@ -360,7 +361,7 @@ acceptCost = describe "accepting with many workers free" $ forM_ measured $ \run
             once = withClient (serverPort shutting) $ \client -> do
               SocketBytes.sendAll (socket client) "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
               timeout 5000000 (waitUntil (readIORef (ended client))) `shouldReturn` Just ()
-        -- The workers are all there once the server has had a moment, and the first connections load the code.
+        -- The server is there once it has had a moment, and the first connections load the code.
         threadDelay 300000
         replicateM_' 50 once
         performMinorGC
@@ -399,7 +400,7 @@ withStoppableOn adjust event (Runner _ runServer) handler use =
     Socket.listen accepting 128
     port <- Socket.socketPort accepting
     closed <- newIORef False
-    -- Several workers, so that a connection that is idle and one that is busy are both served.
+    -- Room for several connections, so that a connection that is idle and one that is busy are both served.
     let settings = adjust Fulmen.defaultSettings {Fulmen.shutdown = Just event, Fulmen.connectionsPerCore = 4}
         listener =
           Listening
@@ -458,12 +459,12 @@ keptSockets :: IORef [Socket]
 keptSockets = unsafePerformIO (newIORef [])
 {-# NOINLINE keptSockets #-}
 
--- | A server of thousands of workers starts and serves that many connections at once, under the small stack that a dev
--- build runs with. Its workers are made at startup, and a loop that is not a tail loop overflows that stack, which the parts
--- that run masked don't report: the server goes on with the workers that it had made, and spins. It is a process of its
--- own, so that its spin doesn't hold up the test: it is the server of @fulmen-bench@.
-manyWorkers :: Spec
-manyWorkers = describe "a server of thousands of workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
+-- | A server with room for thousands of connections serves that many at once, with a connection worker spawned for
+-- each, under the small stack that a dev build runs with. A loop that is not a tail loop overflows that stack, which
+-- the parts that run masked don't report: the server goes on with the connection workers that it had spawned, and
+-- spins. It is a process of its own, so that its spin doesn't hold up the test: it is the server of @fulmen-bench@.
+manyConnectionWorkers :: Spec
+manyConnectionWorkers = describe "a server of thousands of connection workers, under a small stack" $ forM_ ["threads", "delimited"] $ \kind ->
   describe kind $ do
     it "serves that many connections that are open at once" (serveMany kind 2500 False)
     -- Each connection has a watcher that sleeps on a timer, and the server finds the nearest of them each time it has nothing to run:
@@ -473,8 +474,9 @@ manyWorkers = describe "a server of thousands of workers, under a small stack" $
     when rtsSupportsBoundThreads $
       it "keeps that many connections that are open and idle for a moment, and serves them" (serveMany kind 2500 True)
 
--- | A server of this many workers, and the same many clients that connect at once and ask it for the answer of 200: how
--- many got it, within the time that they have. With the clients idle, each waits a second after it has connected before it asks.
+-- | A server with room for this many connections, and the same many clients that connect at once and ask it for the
+-- answer of 200: how many got it, within the time that they have. With the clients idle, each waits a second after it has
+-- connected before it asks.
 serveMany :: String -> Int -> Bool -> IO ()
 serveMany kind count idling = do
   -- Both ends of every connection are descriptors of this process.
@@ -591,7 +593,9 @@ coresRunner :: Runner
 coresRunner =
   Runner
     "two cores"
-    ( \settings (Listening listen) (Handling handler) cores ->
+    ( \settings (Listening listen) (Handling handler) _ -> do
+        -- The cores that the case made are for one core: the server of two has its own.
+        cores <- Fulmen.newCores settings 2
         void (runCores 2 (pure cores) (\cores' core -> const (Fulmen.onCore cores' core) ^>> Fulmen.serve settings listen handler))
     )
 

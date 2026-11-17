@@ -1,4 +1,6 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | A response in the making: the head that waits for the body's first piece, so that the two go out in one write, the
@@ -17,7 +19,7 @@ module Network.Fulmen.Internal.Response
   )
 where
 
-import Control.Arrow (arr, first, (>>>), (|||))
+import Control.Arrow ((>>>), (|||))
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -30,8 +32,9 @@ import Network.Fulmen.Internal.Date (Pulse, currentDate, draining)
 import Network.Socket (Socket)
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Classes (Effect (..), Link (..), Runtime)
-import Network.Streaming.Combinators (consume)
+import Network.Streaming.Combinators (tap)
 import Network.Streaming.Loans (Loans, borrow, loanBuffer, release)
+import Network.Streaming.Named (adding, field, newRecord, (:=))
 import Network.Streaming.Output (Output (..), Uncopied (..), bytes, outputs, word8, writeOutput)
 
 -- | A status code.
@@ -100,14 +103,16 @@ transmit :: (Runtime arr) => arr (Exchange, ([ByteString], Bool)) ()
 transmit = now plan >>> (sendAll ||| rendered)
   where
     rendered =
-      first borrow
-        >>> ((,) <$> now (\(loan, render) -> render (loanBuffer loan)) <*> arr fst)
-        >>> consume sendAll
+      adding "loan" (field "loans" >>> borrow)
+        >>> tap (now (\r -> r.render (loanBuffer r.loan)) >>> sendAll)
+        >>> field "loan"
         >>> release
 
 -- | Decides what goes out: the pieces as they are, or what is rendered into a loan, and the pieces after it. Either way
 -- it is the socket and the pieces to send.
-plan :: (Exchange, ([ByteString], Bool)) -> IO (Either (Socket, [ByteString]) (Loans, Buffer -> IO (Socket, [ByteString])))
+plan ::
+  (Exchange, ([ByteString], Bool)) ->
+  IO (Either (Socket, [ByteString]) ("loans" := Loans, "render" := (Buffer -> IO (Socket, [ByteString]))))
 plan (exchange, (given, final)) =
   readIORef (exPhase exchange) >>= \case
     Unanswered -> ioError (userError "the body of a response is sent before its head")
@@ -129,7 +134,7 @@ plan (exchange, (given, final)) =
       let out = fromMaybe mempty leading <> leadingBody
        in if outputLength out == 0
             then Left (exSocket exchange, pieces)
-            else Right (exLoans exchange, render out pieces)
+            else Right (newRecord ["loans", "render"] (exLoans exchange) (render out pieces))
     render out pieces buffer = do
       when (outputCopied out > bufferCapacity buffer) $ ioError (userError "the head of the response doesn't fit a buffer")
       parts <- writeOutput (bufferMemory buffer) out
@@ -192,14 +197,14 @@ headOutput :: Exchange -> ByteString -> Status -> ResponseHeaders -> Length -> B
 headOutput exchange date (Status code) headers len keep =
   bytes (if exHttp11 exchange then "HTTP/1.1 " else "HTTP/1.0 ")
     <> bytes (statusText code)
-    <> foldMap field headers
+    <> foldMap fieldLine headers
     <> unlessGiven "date" (bytes "Date: " <> bytes date <> bytes "\r\n")
     <> unlessGiven "server" (bytes "Server: fulmen\r\n")
     <> framing
     <> ifNot (keep || closesAfter headers) (bytes "Connection: close\r\n")
     <> bytes "\r\n"
   where
-    field (name, value) = bytes (clean name) <> bytes ": " <> bytes (clean value) <> bytes "\r\n"
+    fieldLine (name, value) = bytes (clean name) <> bytes ": " <> bytes (clean value) <> bytes "\r\n"
     given name = any (equalsLower name . fst) headers
     unlessGiven name = ifNot (given name)
     ifNot condition out = if condition then mempty else out

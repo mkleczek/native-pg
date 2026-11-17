@@ -27,6 +27,7 @@ import Data.Tuple (swap)
 import Network.Streaming.Annotate (Annotate (exchange))
 import Network.Streaming.Classes
 import Network.Streaming.Combinators (done)
+import Network.Streaming.Concurrent (Concurrent (Group, group, spawn))
 import Network.Streaming.Mode (ModeOf)
 import Prelude hiding (id, (.))
 
@@ -138,9 +139,14 @@ instance (Arrow arr, Scope arr) => Scope (With r arr) where
   {-# INLINE grace #-}
 
 -- | Every part is given the environment.
-instance (Concurrent arr) => Concurrent (With r arr) where
+instance (Arrow arr, Concurrent arr) => Concurrent (With r arr) where
+  newtype Group (With r arr) s j = WithGroup (Group arr s j)
   together parts = With (together [part | With part <- parts])
   {-# INLINE together #-}
+  group joiner body = With (group joiner ((\(handle, (r, a)) -> (r, (WithGroup handle, a))) ^>> with body))
+  {-# INLINE group #-}
+  spawn (With part) = With ((\(r, (WithGroup handle, x)) -> (handle, (r, x))) ^>> spawn part)
+  {-# INLINE spawn #-}
 
 instance (Race arr) => Race (With r arr) where
   race (With one) (With two) = With (race one two)
@@ -179,6 +185,14 @@ instance (Arrow arr, Exchange arr reach) => Exchange (With r arr) reach where
   {-# INLINE fulfil #-}
   abandon = With (innerFuture ^>> abandon)
   {-# INLINE abandon #-}
+  awaitRegistering = With ((\(_, (WithFuture future, register)) -> (future, register)) ^>> awaitRegistering)
+  {-# INLINE awaitRegistering #-}
+  willAwait = With (innerFuture ^>> willAwait >>^ WithFuture)
+  {-# INLINE willAwait #-}
+  handWaiting = With (snd ^>> handWaiting)
+  {-# INLINE handWaiting #-}
+  untilParked = With (snd ^>> untilParked)
+  {-# INLINE untilParked #-}
 
 -- | The inbox of the inner arrow, from the input that has it beside the environment.
 innerInbox :: (r, Inbox (With r arr) name reach a) -> Inbox arr name reach a
