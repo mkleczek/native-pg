@@ -190,6 +190,8 @@ instance (Arrow arr, Exchange arr reach) => Exchange (With r arr) reach where
   newtype Future (With r arr) reach a = WithFuture (Future arr reach a)
   ticket = With (done >>> ticket >>^ first WithFuture)
   {-# INLINE ticket #-}
+  ticketAwaited = With (done >>> ticketAwaited >>^ first WithFuture)
+  {-# INLINE ticketAwaited #-}
   await = With (innerFuture ^>> await)
   {-# INLINE await #-}
   fulfil = With (snd ^>> fulfil)

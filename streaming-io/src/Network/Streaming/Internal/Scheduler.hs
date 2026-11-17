@@ -76,7 +76,7 @@ module Network.Streaming.Internal.Scheduler
     fastened,
     plainRun,
     runInFast,
-    markFast,
+    yieldStep,
     Part (..),
     PartScope,
     Members,
@@ -120,10 +120,11 @@ import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, yield)
 import Control.Concurrent.STM (atomically, orElse, retry)
 import Control.Exception (Exception, SomeException, allowInterrupt, bracket, catch, finally, fromException, interruptible, onException, throwIO, toException, try)
 import Control.Monad (foldM, forM_, void, when)
-import Data.Bits ((.&.), (.|.))
+import Data.Bits (complement, (.&.), (.|.))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.List (partition)
+import qualified Data.List as List (foldl')
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word64)
 import Foreign.C.Error (eINTR, getErrno, throwErrno, throwErrnoIfNull)
@@ -139,6 +140,7 @@ import qualified Network.Streaming.Concurrent as Joiner
 import Network.Streaming.Counters (Counter (..))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Cancel
+import Network.Streaming.Internal.DescriptorWaiters
 import Network.Streaming.Internal.Descriptors (armedBy, newRunNumber)
 import Network.Streaming.Internal.Atomic (Change, changeHere)
 import Network.Streaming.Internal.Inboxes (Looked (..), Shelf, collectedWrongly, lookOrWait, postNow, postOrQueue, stopWaiting, takeNow, takeWoken, withdraw)
@@ -157,8 +159,7 @@ data Step
     -- wait is called by when it is in a scope, and 0 otherwise. The action is what runs where the part
     -- waits: nothing, or the cancellation to raise.
     Suspended !Event !Int (IO () -> IO Step)
-  | -- | The same, for a part of the fast lane, which the scheduler makes of a 'Suspended' step that 'markFast' said was one: it goes on in that
-    -- lane.
+  | -- | It waits for the event and goes on in the fast lane.
     SuspendedFast !Event !Int (IO () -> IO Step)
   | -- | Parts that go on at once: the halves of a race, or the parts of a group.
     Forked [IO Step]
@@ -167,8 +168,10 @@ data Step
   | -- | It waits for a ticket that another core fulfils, whose slot holds it; the
     -- promise puts it in the mailbox.
     ParkedRemote
-  | -- | It ran for its turn, and can go on, in the lane that 'markFast' said, if it did.
+  | -- | It ran for its turn and can go on in the normal lane.
     Yielded (IO Step)
+  | -- | It ran for its turn and can go on in the fast lane.
+    YieldedFast (IO Step)
   | -- | It waits until an instant, and a timer holds it.
     Timed
 
@@ -247,7 +250,7 @@ data Run = Run
     runReady :: !(ForeignPtr CInt),
     runKinds :: !(ForeignPtr CInt),
     -- | The parts that wait on each descriptor that some wait on: to read, to write.
-    runWaiters :: !(IORef (IntMap.IntMap Waiters)),
+    runWaiters :: !(WaiterTable Step),
     -- | The parts that wait on watches.
     runWatching :: !(IORef [Watching]),
     -- | The scope that every part in a scope is in, outermost: it begins with the run's first part.
@@ -272,8 +275,6 @@ data Run = Run
   }
 
 -- | The parts that wait on a descriptor, as the 'Suspended' steps they gave the scheduler.
-data Waiters = Waiters [Step] [Step]
-
 -- | A part that waits on a watch, by the number of the wait, and whether it is in the fast lane.
 data Watching = Watching !Int !Bool !Watch (IO () -> IO Step)
 
@@ -312,14 +313,14 @@ pendingArmings = 64
 -- parts run for turns of that length.
 newRun :: Turn -> IO Run
 newRun (Turn turn) = do
-  counters <- mallocForeignPtrArray 17
-  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 16]
+  counters <- mallocForeignPtrArray 16
+  unsafeWithForeignPtr counters $ \pointer -> mapM_ (\index -> pokeElemOff pointer index 0) [0 .. 15]
   number <- newRunNumber
   unsafeWithForeignPtr counters $ \pointer -> pokeElemOff pointer 11 (fromIntegral number)
   poller <- throwErrnoIfNull "streaming_io_poller_new" c_pollerNew
   inbox <- newIORef (Open [] [] False)
   tickets <- newIORef []
-  Run <$> pure tickets <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newIORef IntMap.empty <*> newIORef [] <*> newCancelScope 0 IntMap.empty <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False <*> newIORef [] <*> pure False <*> pure tickets
+  Run <$> pure tickets <*> pure counters <*> pure turn <*> pure poller <*> pure (Mailbox inbox poller) <*> mallocForeignPtrArray batch <*> mallocForeignPtrArray batch <*> newWaiterTable <*> newIORef [] <*> newCancelScope 0 IntMap.empty <*> newIORef Nothing <*> newIORef (throwIO . Escaped) <*> (monotonicNanoseconds >>= newWheel) <*> newIORef False <*> newIORef [] <*> pure False <*> pure tickets
 
 freeRun :: Run -> IO ()
 freeRun = c_pollerFree . runPoller
@@ -356,29 +357,29 @@ awake, asleep :: Inbox
 awake = Open [] [] False
 asleep = Open [] [] True
 
--- | The parts that were given the scheduler since it last looked, in the order
--- they were given. Looking costs a read while there are none. The parts for the fast lane stay in the mailbox, for the lane to take.
+-- | The parts that were given the scheduler since it last looked, newest first.
+-- Looking costs a read while there are none. The parts for the fast lane stay in the mailbox, for the lane to take.
 takeInbox :: Run -> IO [IO Step]
 takeInbox run = case runMailbox run of
   Mailbox inbox _ ->
     readIORef inbox >>= \case
       Open [] _ _ -> pure []
       Closed -> pure []
-      Open _ _ _ -> reverse <$> update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
+      Open _ _ _ -> update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
 
 -- | Before the scheduler waits in its poller: the parts that were given it
--- already, in which case it doesn't wait; or none, and the next to give one
+-- already, newest first, in which case it doesn't wait; or none, and the next to give one
 -- wakes it.
 beforeSleep :: Run -> IO [IO Step]
 beforeSleep run = case runMailbox run of
   Mailbox inbox _ ->
-    reverse <$> update inbox (\case Open [] [] _ -> (asleep, []); Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
+    update inbox (\case Open [] [] _ -> (asleep, []); Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
 
--- | After the scheduler's wait in its poller: the parts that were given it.
+-- | After the scheduler's wait in its poller: the parts that were given it, newest first.
 afterSleep :: Run -> IO [IO Step]
 afterSleep run = case runMailbox run of
   Mailbox inbox _ ->
-    reverse <$> update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
+    update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
 
 -- | Whether a part of the fast lane can go on that the scheduler has not taken yet: one that was put back, or one that another core gave.
 fastWaiting :: Run -> IO Bool
@@ -388,20 +389,27 @@ fastWaiting run =
     [] -> case runMailbox run of
       Mailbox inbox _ -> readIORef inbox >>= \case Open _ (_ : _) _ -> pure True; _ -> pure False
 
--- | Takes the parts of the fast lane from the mailbox, which a part of another core may have given since the scheduler looked.
-takeFastInbox :: Run -> IO ()
+-- | Takes the parts of the fast lane from the mailbox, newest first.
+takeFastInbox :: Run -> IO [IO Step]
 takeFastInbox run = case runMailbox run of
   Mailbox inbox _ ->
     readIORef inbox >>= \case
-      Open _ [] _ -> pure ()
-      Closed -> pure ()
-      Open _ _ _ -> update inbox (\case Open parts fast sleeping -> (Open parts [] sleeping, fast); Closed -> (Closed, [])) >>= \fast -> adjust run 3 (negate (length fast)) *> modifyIORef' (runFastReady run) (<> fast)
+      Open _ [] _ -> pure []
+      Closed -> pure []
+      Open _ _ _ -> update inbox (\case Open parts fast sleeping -> (Open parts [] sleeping, fast); Closed -> (Closed, []))
 
--- | Takes the parts that were given the scheduler back from those that wait for
--- them.
-arrivals :: Run -> [IO Step] -> IO [IO Step]
-arrivals _ [] = pure []
-arrivals run parts = parts <$ adjust run 3 (negate (length parts))
+-- | Puts the detached mailbox batch in FIFO order ahead of the ready parts,
+-- counting the remote arrivals in the same pass.
+drainArrivals :: Run -> [IO Step] -> [IO Step] -> IO [IO Step]
+drainArrivals run = go 0
+  where
+    go !count ready [] = ready <$ when (count /= 0) (adjust run 3 (negate count))
+    go !count ready (part : rest) = go (count + 1) (part : ready) rest
+
+-- | In an idle scheduler the detached singleton is already in FIFO order.
+drainIdleArrivals :: Run -> [IO Step] -> IO [IO Step]
+drainIdleArrivals run arrivals@[_] = arrivals <$ adjust run 3 (-1)
+drainIdleArrivals run arrivals = drainArrivals run [] arrivals
 
 -- | The scheduler takes no more parts.
 closeInbox :: Run -> IO ()
@@ -439,12 +447,12 @@ readyIn :: Run -> IO Step -> IO ()
 readyIn run part = modifyIORef' (runLaneReady run) (part :)
 {-# INLINE readyIn #-}
 
--- | The part is about to give the scheduler a 'Yielded' or a 'Suspended' step: if it is in the fast lane it says so before, in counter 16,
--- which the scheduler reads when it gets the step. The step doesn't say it, so that what a part keeps when it yields or waits is the same
--- in both lanes.
-markFast :: Run -> IO ()
-markFast run = when (runInFast run) (setCounter run 16 1)
-{-# INLINE markFast #-}
+-- | A yielded part goes on in the lane of its current context.
+yieldStep :: Run -> IO Step -> Step
+yieldStep run resume
+  | runInFast run = YieldedFast resume
+  | otherwise = Yielded resume
+{-# INLINE yieldStep #-}
 
 -- | What a cancellation gives of a part that it took off what it waited at: the part, to go on in the normal lane. A part of the fast lane is
 -- put back in that lane, which has it, and nothing is given.
@@ -494,7 +502,7 @@ clock = fromIntegral <$> monotonicNanoseconds
 
 -- | Counts a step, and goes on, or yields once the part has run for its turn.
 stepped :: Run -> IO Step -> IO Step
-stepped run continue = spent run >>= \yields -> if yields then markFast run *> pure (Yielded continue) else continue
+stepped run continue = spent run >>= \yields -> if yields then pure $! yieldStep run continue else continue
 {-# INLINE stepped #-}
 
 -- | Counts a step that suspends its part.
@@ -514,19 +522,24 @@ data Seat = Seat
     seatWake :: Run -> IO Step -> IO (),
     seatDeliver :: Run -> IO Step -> IO Bool,
     seatParked :: Step,
-    seatCounter :: Int
+    seatCounter :: Int,
+    seatParkAwaiting :: ParkAwaiting
   }
 
 -- | The seat of an inbox or a ticket of this core: plain memory, and the parts that tickets woke.
 hereSeat :: Seat
-hereSeat = Seat changeHere wakeTicket (\run part -> True <$ wakeTicket run part) Parked 5
+hereSeat = Seat changeHere wakeTicket deliverHere Parked 5 parkAwaitingHere
+
+deliverHere :: Run -> IO Step -> IO Bool
+deliverHere run part = True <$ wakeTicket run part
 
 -- | The seat of an inbox or a ticket of any core: compare-and-swap, and the mailbox of the part's scheduler, which refuses a part if
 -- the scheduler has ended.
 anywhereSeat :: Seat
-anywhereSeat = Seat update (\run part -> () <$ postIn run part) postIn ParkedRemote 3
-  where
-    postIn run = if runInFast run then postFast (runMailbox run) else post (runMailbox run)
+anywhereSeat = Seat update (\run part -> () <$ postIn run part) postIn ParkedRemote 3 parkAwaitingRemote
+
+postIn :: Run -> IO Step -> IO Bool
+postIn run = if runInFast run then postFast (runMailbox run) else post (runMailbox run)
 
 -- | What a part does that collects from an inbox, for the two arrows that run every part on one thread: the arrow goes on with the
 -- value, or, if there is none, captures what follows, and the part waits on the shelf until a post wakes it and it takes the value.
@@ -545,7 +558,7 @@ collectFrom seat run part shelf taken capture = do
           writeIORef (partWait part) (Other stop)
           pure (seatParked seat)
         -- A value came since the look, from another thread.
-        Found -> markFast run *> pure (Yielded (resume again))
+        Found -> pure $! yieldStep run (resume again)
         Unusable -> collectedWrongly
 
 -- | What a part does that posts to an inbox, for the two arrows that run every part on one thread: the arrow goes on with whether
@@ -566,7 +579,7 @@ postTo seat run part shelf value posted capture = do
             writeIORef (partWait part) (Other stop)
             pure (seatParked seat)
           -- The inbox took the value, or closed, since the look, on another thread.
-          Just taken -> markFast run *> pure (Yielded (resume (pure taken)))
+          Just taken -> pure $! yieldStep run (resume (pure taken))
 
 -- | The part says where it waits, if it is in a scope, so that a cancellation can take it from there: a part that is in none is not
 -- cancelled, and says nothing.
@@ -584,28 +597,46 @@ awaitFrom :: Seat -> Run -> Part -> IORef (Slot a) -> (IO r -> IO r) -> (a -> IO
 awaitFrom seat run part slot first taken capture = do
   checkpoint part
   valueWaits slot >>= \case
-    False -> capture (parkAwaiting seat run part slot)
+    False -> capture (seatParkAwaiting seat run part slot)
     -- The part takes the value, after the step that it may give way at, so that a cancellation that it raises leaves the value with its sender.
     True ->
       first $
         takeWaiting (seatChange seat) slot >>= \case
           Took value -> taken value
           Misused -> ioError tookWrongly
-          Parks -> capture (parkAwaiting seat run part slot)
+          Parks -> capture (seatParkAwaiting seat run part slot)
 {-# INLINE awaitFrom #-}
+
+-- | Parks a captured receiver on a ticket.
+type ParkAwaiting = forall a. Run -> Part -> IORef (Slot a) -> (IO a -> IO Step) -> IO Step
+
+-- Fully apply the shared helper so GHC specializes it here. Keep each worker out of line
+-- so plain awaits and registering awaits share the same parking code.
+parkAwaitingHere :: ParkAwaiting
+parkAwaitingHere run part slot resume = parkAwaitingWith changeHere deliverHere Parked 5 run part slot resume
+{-# NOINLINE parkAwaitingHere #-}
+
+parkAwaitingRemote :: ParkAwaiting
+parkAwaitingRemote run part slot resume = parkAwaitingWith update postIn ParkedRemote 3 run part slot resume
+{-# NOINLINE parkAwaitingRemote #-}
 
 -- | Parks the captured part in the slot, as the receiver: unless a sender came since the look, and then the part goes on in its turn
 -- with the value. The part is given a value by a sender with the value itself: a cancellation reaches it at its next wait.
-parkAwaiting :: Seat -> Run -> Part -> IORef (Slot a) -> (IO a -> IO Step) -> IO Step
-parkAwaiting seat run part slot resume =
-  parkTaker (seatChange seat) slot (\value -> seatDeliver seat run (resume (pure value))) >>= \case
+parkAwaitingWith :: Change -> (Run -> IO Step -> IO Bool) -> Step -> Int -> ParkAwaiting
+parkAwaitingWith change deliver parked waitingCounter run part slot resume =
+  parkTaker change slot (\value -> deliver run (resume (pure value))) >>= \case
     Parks -> do
       -- A cancellation takes the part off the slot, unless a sender has given it a value already.
-      let stop cancelled = stopTaking (seatChange seat) slot >>= \stopped -> if stopped then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
+      let stop cancelled =
+            stopTaking change slot >>= \stopped ->
+              if stopped
+                then adjust run waitingCounter (-1) *> backIn run (resume (throwIO cancelled))
+                else pure Nothing
       waitsAt part (Other stop)
-      pure (seatParked seat)
-    Took value -> markFast run *> pure (Yielded (resume (pure value)))
+      pure parked
+    Took value -> pure $! yieldStep run (resume (pure value))
     Misused -> ioError tookWrongly
+{-# INLINE parkAwaitingWith #-}
 
 -- | What a part does that awaits and registers: if a sender waits, the arrow goes on with its value, and the registration doesn't run.
 -- Else the receiver is committed to take, and the registration runs in the same step, as the part that is about to park: a value that is
@@ -626,7 +657,7 @@ awaitRegisteringFrom seat run part slot register first taken capture = do
             Nothing ->
               endRegistering (seatChange seat) slot >>= \case
                 Took value -> taken value
-                Parks -> capture (parkAwaiting seat run part slot)
+                Parks -> capture (seatParkAwaiting seat run part slot)
                 Misused -> ioError tookWrongly
 {-# INLINE awaitRegisteringFrom #-}
 
@@ -649,8 +680,8 @@ handWaitingTo seat run part slot value handed capture = do
           waitsAt part (Other stop)
           pure (seatParked seat)
         -- The receiver took the value, or the ticket was abandoned, since the look, on another thread.
-        Passed -> markFast run *> pure (Yielded (resume (pure Nothing)))
-        GaveBack -> markFast run *> pure (Yielded (resume (pure (Just value))))
+        Passed -> pure $! yieldStep run (resume (pure Nothing))
+        GaveBack -> pure $! yieldStep run (resume (pure (Just value)))
         _ -> ioError twoSenders
 {-# INLINE handWaitingTo #-}
 
@@ -669,7 +700,7 @@ untilParkedFrom seat run part slot goOn capture = do
           let stop cancelled = unwatch (seatChange seat) slot token >>= \stopped -> if stopped then adjust run (seatCounter seat) (-1) *> backIn run (resume (throwIO cancelled)) else pure Nothing
           waitsAt part (Other stop)
           pure (seatParked seat)
-        WatchDone -> markFast run *> pure (Yielded (resume (pure ())))
+        WatchDone -> pure $! yieldStep run (resume (pure ()))
         SecondWatcher -> ioError twoWatchers
 {-# INLINE untilParkedFrom #-}
 
@@ -861,17 +892,12 @@ stopWait :: Run -> Cancelled -> Parked -> IO (Maybe (IO Step))
 stopWait run cancelled = \case
   NotWaiting -> pure Nothing
   OnFd fd reading ident -> do
-    waiters <- readIORef (runWaiters run)
-    case IntMap.lookup fd waiters of
+    found <- withWaiters (runWaiters run) fd (pure . removeWaiter reading ident)
+    case found of
       Nothing -> pure Nothing
-      Just (Waiters readers writers) ->
-        let (found, rest) = takeEntry ident (if reading then readers else writers)
-         in case found of
-              Nothing -> pure Nothing
-              Just entry -> do
-                writeIORef (runWaiters run) (settle fd (if reading then Waiters rest writers else Waiters readers rest) waiters)
-                adjust run 4 (-1)
-                inLane run (isSuspendedFast entry) (resumeOf entry (throwIO cancelled))
+      Just entry -> do
+        adjust run 4 (-1)
+        inLane run (isSuspendedFast entry) (resumeOf entry (throwIO cancelled))
   OnWatch ident -> do
     watching <- readIORef (runWatching run)
     case partition (\(Watching other _ _ _) -> other == ident) watching of
@@ -1046,19 +1072,36 @@ resumeOf (Suspended _ _ resume) = resume
 resumeOf (SuspendedFast _ _ resume) = resume
 resumeOf _ = const (pure Ended)
 
--- | The step of the wait, and the others.
+-- | Removes a matching wait, keeping the others in their existing order.
+removeWaiter :: Bool -> Int -> Waiters Step -> (Maybe (Waiters Step), Maybe Step)
+removeWaiter reading ident waiters =
+  case waiters of
+    OneReader entry | reading && matchesWait ident entry -> (Just NoWaiters, Just entry)
+    OneWriter entry | not reading && matchesWait ident entry -> (Just NoWaiters, Just entry)
+    Several readers writers ->
+      case takeEntry ident (if reading then readers else writers) of
+        (Nothing, _) -> absent
+        (found, rest) ->
+          let waiting = if reading then packWaiters rest writers else packWaiters readers rest
+           in (Just waiting, found)
+    _ -> absent
+  where
+    absent = (Nothing, Nothing)
+
+matchesWait :: Int -> Step -> Bool
+matchesWait ident (Suspended _ other _) = ident == other
+matchesWait ident (SuspendedFast _ other _) = ident == other
+matchesWait _ _ = False
+{-# INLINE matchesWait #-}
+
 takeEntry :: Int -> [Step] -> (Maybe Step, [Step])
 takeEntry ident = go []
   where
     go before = \case
-      [] -> (Nothing, reverse before)
-      entry@(Suspended _ other _) : after
-        | other == ident -> (Just entry, reverse before <> after)
+      [] -> (Nothing, [])
+      entry : after
+        | matchesWait ident entry -> (Just entry, reverse before <> after)
         | otherwise -> go (entry : before) after
-      entry@(SuspendedFast _ other _) : after
-        | other == ident -> (Just entry, reverse before <> after)
-        | otherwise -> go (entry : before) after
-      entry : after -> go (entry : before) after
 
 -- | Runs the first part, and the parts it forks, until the result is there:
 -- each part that can go on in turn, entered with the given action, until it
@@ -1102,17 +1145,10 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
           Timed -> go ready later fast (not fromFast)
           Parked -> adjust run 5 1 *> go ready later fast (not fromFast)
           ParkedRemote -> adjust run 3 1 *> go ready later fast (not fromFast)
-          Yielded part' ->
-            counter run 16 >>= \inFast ->
-              if inFast == 0
-                then go ready (part' : later) fast (not fromFast)
-                else setCounter run 16 0 *> modifyIORef' (runFastReady run) (part' :) *> go ready later fast (not fromFast)
+          Yielded part' -> go ready (part' : later) fast (not fromFast)
+          YieldedFast part' -> modifyIORef' (runFastReady run) (part' :) *> go ready later fast (not fromFast)
           Forked parts -> go ready (foldl (flip (:)) later parts) fast (not fromFast)
-          Suspended event ident resume ->
-            counter run 16 >>= \inFast ->
-              if inFast == 0
-                then suspended False fromFast step event ident resume ready later fast
-                else setCounter run 16 0 *> suspended True fromFast (SuspendedFast event ident resume) event ident resume ready later fast
+          Suspended event ident resume -> suspended False fromFast step event ident resume ready later fast
           SuspendedFast event ident resume -> suspended True fromFast step event ident resume ready later fast
     -- A part that waits for the event, and the turn after it.
     suspended !inFast !fromFast step event !ident resume ready later fast = case event of
@@ -1120,16 +1156,15 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
       Writable fd -> waitOn fd False step *> adjust run 4 1 *> go ready later fast (not fromFast)
       Until (Instant at) -> addTimer (runWheel run) at (modifyIORef' (if inFast then runFastReady run else runTickets run) (resume (pure ()) :)) *> go ready later fast (not fromFast)
       Watched register -> register >>= \watch -> modifyIORef' (runWatching run) (Watching ident inFast watch resume :) *> go ready later fast (not fromFast)
-    -- The parts of the fast lane that can go on, in the order they came: those it has, those that were put back among the parts that can go
-    -- on since, and those that another core gave.
+    -- Take another batch only after the staged parts have run. In each batch,
+    -- the parts from the mailbox go before the ones put back locally.
     fastReady = \case
       fast@(_ : _) -> pure fast
       [] -> do
-        takeFastInbox run
-        queued <- readIORef (runFastReady run)
-        case queued of
-          [] -> pure []
-          _ -> reverse queued <$ writeIORef (runFastReady run) []
+        remote <- takeFastInbox run
+        local <- readIORef (runFastReady run)
+        when (not (null local)) (writeIORef (runFastReady run) [])
+        drainArrivals run (reverse local) remote
     -- The normal lane has none left in this round.
     boundary later fast !fastTurn = do
         -- Each round, the parts that descriptors became ready for, that other
@@ -1146,8 +1181,13 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
         when (timers > 0) (roundNow run >>= expire (runWheel run))
         tickets <- readIORef (runTickets run)
         writeIORef (runTickets run) []
-        given <- takeInbox run >>= arrivals run
-        case given <> reverse tickets <> reverse later of
+        remote <- takeInbox run
+        let local = List.foldl' (flip (:)) (reverse later) tickets
+        -- Consume the local list directly on empty rounds so it need not be thunked for the drain.
+        ready <- case remote of
+          [] -> pure local
+          _ -> drainArrivals run local remote
+        case ready of
           -- No part of the normal lane can go on: the fast lane goes on, if it has a part, and else the blocking poll in 'idle' returns
           -- at once if a descriptor is ready.
           [] -> fastReady fast >>= \case
@@ -1186,7 +1226,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
           | null watching -> do
               -- Unless a part was given since the round began: the next to give
               -- one wakes the poller.
-              early <- beforeSleep run >>= arrivals run
+              early <- beforeSleep run >>= drainIdleArrivals run
               -- Or a part of the fast lane, which the mailbox gave.
               fastGiven <- fastWaiting run
               if null early && not fastGiven
@@ -1194,7 +1234,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
                   countWait
                   until' <- untilNextTimer
                   polled <- pollWait (maybe (-1) (fromIntegral . min 2000000000 . (`div` 1000000) . (+ 999999)) until')
-                  given <- afterSleep run >>= arrivals run
+                  given <- afterSleep run >>= drainIdleArrivals run
                   -- The time of the round was read before the wait, if a timer made the round expire its timers: the parts that the wait ended
                   -- read it again, as a round's first part does.
                   setCounter run 8 0
@@ -1240,23 +1280,22 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
     interruptedBy wait = try wait >>= either shuttingDown pure
     -- Adds the part to the waiters of the descriptor, and has the poller arm the descriptor for the interest, unless
     -- parts that wait for it have already: it is armed until it reports.
-    waitOn (Fd fd) reading entry = do
-      waiters <- readIORef (runWaiters run)
-      let key = fromIntegral fd
-          Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
-          waiting = if reading then Waiters (entry : readers) writers else Waiters readers (entry : writers)
-      bump @m DescriptorWaits
-      when (null (if reading then readers else writers)) $ do
-        debugging @m $ do
-          number <- counter run 11
-          moved <- armedBy key (fromIntegral number)
-          when moved (bump @m DescriptorMoves)
-        bump @m Armings
-        arm fd (if reading then kindReadable else kindWritable) waiting *> adjust run 10 1
-      writeIORef (runWaiters run) (IntMap.insert key waiting waiters)
+    waitOn (Fd fd) reading entry =
+      withWaiters (runWaiters run) (fromIntegral fd) $ \waiters -> do
+        let kind = if reading then kindReadable else kindWritable
+            waiting = kindsOf waiters
+        bump @m DescriptorWaits
+        when (waiting .&. kind == 0) $ do
+          debugging @m $ do
+            number <- counter run 11
+            moved <- armedBy (fromIntegral fd) (fromIntegral number)
+            when moved (bump @m DescriptorMoves)
+          bump @m Armings
+          arm fd kind (waiting .|. kind) *> adjust run 10 1
+        pure (Just (pushWaiter reading entry waiters), ())
     -- The poller arms the descriptor for the kinds that the waiters wait for, of which added are new.
     arm fd added waiting =
-      c_pollerArm (runPoller run) fd added (kindsOf waiting) >>= \calls ->
+      c_pollerArm (runPoller run) fd added waiting >>= \calls ->
         if calls < 0 then throwErrno "streaming_io_poller_arm" else bumpBy @m ArmCalls (fromIntegral calls)
     -- Asks the poller what became ready, without waiting.
     pollNow = bump @m PollsImmediate *> rawPoll c_pollerPoll 0 >>= afterPoll
@@ -1298,32 +1337,55 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
       | otherwise = do
           setCounter run 10 0
           clock >>= setCounter run 12
-          readied <-
-            unsafeWithForeignPtr (runReady run) $ \fds ->
-              unsafeWithForeignPtr (runKinds run) $ \kinds ->
-                traverse (\index -> (,) <$> peekElemOff fds index <*> peekElemOff kinds index) [0 .. fromIntegral count - 1]
-          waiters <- readIORef (runWaiters run)
-          (woken, waiters') <- foldM wake ([], waiters) readied
-          writeIORef (runWaiters run) waiters'
-          adjust run 4 (negate (length woken))
-          lanes <- counter run 15
-          if lanes == 0
-            then pure (map (\entry -> resumeOf entry (pure ())) woken)
-            else do
-              -- The parts of the fast lane that the poll woke go among those that can go on there.
-              let (wokenFast, wokenNormal) = partition isSuspendedFast woken
-              modifyIORef' (runFastReady run) (\queued -> foldl (\newest entry -> resumeOf entry (pure ()) : newest) queued wokenFast)
-              pure (map (\entry -> resumeOf entry (pure ())) wokenNormal)
-    -- Takes the parts that wait for what was reported off the descriptor, and arms it again for the others: a report
-    -- may have used up the arming of a kind that nothing waits for any more, or, on epoll, the arming of both.
-    wake (woken, waiters) (fd, kind) = do
-      let key = fromIntegral fd
-          Waiters readers writers = IntMap.findWithDefault (Waiters [] []) key waiters
-          (fromReaders, readers') = if kind .&. kindReadable /= 0 then (readers, []) else ([], readers)
-          (fromWriters, writers') = if kind .&. kindWritable /= 0 then (writers, []) else ([], writers)
-          waiting = Waiters readers' writers'
-      when (kindsOf waiting /= 0) (arm fd 0 waiting)
-      pure (woken <> reverse fromReaders <> reverse fromWriters, settle key waiting waiters)
+          if count == 0
+            then pure []
+            else
+              unsafeWithForeignPtr (runReady run) $ \fds ->
+                unsafeWithForeignPtr (runKinds run) $ \kinds -> do
+                  (normal, fast, woken) <- collectReady fds kinds (fromIntegral count) 0
+                  when (woken /= 0) (adjust run 4 (negate woken))
+                  queueFastReady fast
+                  pure normal
+    queueFastReady [] = pure ()
+    queueFastReady fast = modifyIORef' (runFastReady run) (\queued -> List.foldl' (flip (:)) queued fast)
+    -- Detach and rearm in poll order, even if a descriptor is reported twice.
+    -- Prepend its waiters on unwind to preserve poll order and FIFO within a direction.
+    collectReady fds kinds count !index
+      | index == count = pure ([], [], 0)
+      | otherwise = do
+          fd <- peekElemOff fds index
+          kind <- peekElemOff kinds index
+          ready <- withWaiters (runWaiters run) (fromIntegral fd) (takeReady fd kind)
+          (normal, fast, woken) <- collectReady fds kinds count (index + 1)
+          case ready of
+            NoWaiters -> pure (normal, fast, woken)
+            OneReader entry -> routeEntry entry [] [] normal fast woken
+            OneWriter entry -> routeEntry entry [] [] normal fast woken
+            Several readers writers -> routeReady writers readers normal fast woken
+    takeReady fd kind waiters = do
+      let waiting = kindsOf waiters
+          reported = waiting .&. kind
+          -- On epoll, a report may have used up the arming of both directions.
+          remaining = waiting .&. complement kind
+      when (remaining /= 0) (arm fd 0 remaining)
+      pure $
+        if reported == 0
+          then (Nothing, NoWaiters)
+          else if remaining == 0
+            then (Just NoWaiters, waiters)
+            else case waiters of
+              Several readers writers
+                | reported == kindReadable -> (Just (packWaiters [] writers), packWaiters readers [])
+                | otherwise -> (Just (packWaiters readers []), packWaiters [] writers)
+              _ -> (Nothing, NoWaiters)
+    routeReady [] [] normal fast !woken = pure (normal, fast, woken)
+    routeReady [] readers normal fast woken = routeReady readers [] normal fast woken
+    routeReady (entry : entries) readers normal fast woken = routeEntry entry entries readers normal fast woken
+    routeEntry entry entries readers normal fast !woken
+      | isSuspendedFast entry = routeReady entries readers normal (resume : fast) (woken + 1)
+      | otherwise = routeReady entries readers (resume : normal) fast (woken + 1)
+      where
+        resume = resumeOf entry (pure ())
 
 -- | How long the scheduler waits in its poller on the non-threaded run time, in milliseconds: the first wait that ends with
 -- nothing, the longest, and while other threads need the OS thread. That run time has one OS thread, which a blocking
@@ -1364,14 +1426,12 @@ kindReadable = 1
 kindWritable = 2
 
 -- | The kinds that the waiters wait for.
-kindsOf :: Waiters -> CInt
-kindsOf (Waiters readers writers) = (if null readers then 0 else kindReadable) .|. (if null writers then 0 else kindWritable)
-
--- | The waiters of a descriptor in the map, or the map without the descriptor when none are left.
-settle :: Int -> Waiters -> IntMap.IntMap Waiters -> IntMap.IntMap Waiters
-settle key waiting@(Waiters readers writers) waiters
-  | null readers && null writers = IntMap.delete key waiters
-  | otherwise = IntMap.insert key waiting waiters
+kindsOf :: Waiters a -> CInt
+kindsOf NoWaiters = 0
+kindsOf (OneReader _) = kindReadable
+kindsOf (OneWriter _) = kindWritable
+kindsOf (Several readers writers) = (if null readers then 0 else kindReadable) .|. (if null writers then 0 else kindWritable)
+{-# INLINE kindsOf #-}
 
 -- | Whether the watch has fired, without waiting.
 hasFired :: Watch -> IO Bool

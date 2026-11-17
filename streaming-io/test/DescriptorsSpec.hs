@@ -8,9 +8,10 @@ module DescriptorsSpec (spec) where
 
 import Control.Arrow (ArrowChoice, arr, first, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
+import Control.Exception (bracket)
 import Control.Monad (forM_, when)
 import qualified Data.ByteString as BS
-import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef)
+import Data.IORef (IORef, atomicWriteIORef, modifyIORef', newIORef, readIORef)
 import Data.Maybe (isNothing)
 import Data.Tuple (swap)
 import Network.Socket (Socket)
@@ -61,6 +62,15 @@ spec = describe "descriptors" $ do
     it "are waited on for reading and for writing at once, by two parts" $ do
       within (run bothWays) `shouldReturn` Just (1, flood)
 
+    when (name /= "threads") $
+      it "wake all readers of one descriptor in registration order" $
+        bracket newPair closing $ \pair -> do
+          order <- newIORef []
+          within (run (readersInOrder pair order)) `shouldReturn` Just ()
+          events <- reverse <$> readIORef order
+          length events `shouldBe` 4
+          drop 2 events `shouldBe` map negate (take 2 events)
+
     it "are waited on for input that arrived after a wait was cancelled by a deadline" $ do
       within (run cancelledThenArrived) `shouldReturn` Just (True, 1)
 
@@ -109,6 +119,16 @@ receiveByte = now (\(reader, _) -> (\buffer -> (reader, roomOf buffer)) <$> newB
 -- | Sends a byte on the second socket.
 sendByte :: (Rich arr) => arr Pair Pair
 sendByte = tap ((,[BS.singleton 7]) . snd ^>> sendAll)
+
+-- | Both readers park before the writer makes the descriptor readable. Neither consumes its byte.
+readersInOrder :: (Rich arr) => Pair -> IORef [Int] -> arr () ()
+readersInOrder pair order = together [reader 1, reader 2, writer]
+  where
+    note n = now (const (modifyIORef' order (n :)))
+    reader n = note n >>> const (fst pair) ^>> awaitInput >>> note (-n)
+    writer = untilJust (ready <$> readIORef order) >>> sendByte >>> done
+    ready (_ : _ : _) = Just pair
+    ready _ = Nothing
 
 -- | A wait for input with a deadline: whether the deadline passed first.
 timesOut :: (Rich arr) => arr Pair Bool

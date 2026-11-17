@@ -174,7 +174,12 @@ instance Block (DelimitedM m s) where
 waitFor :: Run -> PromptTag Step -> Part -> Int -> Event -> IO ()
 waitFor run tag part ident event = case event of
   Until instant -> control0 tag (sleepUntil run part instant)
-  _ -> markFast run *> control0 tag (counted run . Suspended event ident)
+  _
+    | runInFast run -> capture SuspendedFast
+    | otherwise -> capture Suspended
+  where
+    capture suspend = control0 tag (counted run . suspend event ident)
+    {-# INLINE capture #-}
 {-# INLINE waitFor #-}
 
 -- | The time of the round of the scheduler.
@@ -401,6 +406,8 @@ type instance ModeOf (DelimitedM m s) = m
 instance Exchange (DelimitedM m s) ('Here s) where
   newtype Future (DelimitedM m s) ('Here s) a = HereFuture (IORef (Slot a))
   ticket = Delimited (\_ () -> newSlot >>= \slot -> pure (HereFuture slot, HerePromise slot))
+  ticketAwaited = Delimited (\_ () -> newAwaitedSlot >>= \slot -> pure (HereFuture slot, HerePromise slot))
+  {-# INLINE ticketAwaited #-}
   await = Delimited $ \context@(Context run tag part) (HereFuture slot) -> awaitFrom hereSeat run part slot (step context *>) pure (control0 tag)
   fulfil = Delimited (\context (promise, value) -> fulfilNow promise value <* step context)
   abandon = Delimited (\_ (HereFuture slot) -> abandonTicket hereSeat slot)
@@ -416,6 +423,8 @@ instance Exchange (DelimitedM m s) ('Here s) where
 instance Exchange (DelimitedM m s) 'Anywhere where
   newtype Future (DelimitedM m s) 'Anywhere a = AnywhereFuture (IORef (Slot a))
   ticket = Delimited (\_ () -> newSlot >>= \slot -> pure (AnywhereFuture slot, AnywherePromise slot))
+  ticketAwaited = Delimited (\_ () -> newAwaitedSlot >>= \slot -> pure (AnywhereFuture slot, AnywherePromise slot))
+  {-# INLINE ticketAwaited #-}
   await = Delimited $ \context@(Context run tag part) (AnywhereFuture slot) -> awaitFrom anywhereSeat run part slot (step context *>) pure (control0 tag)
   fulfil = Delimited (\context (promise, value) -> fulfilNow promise value <* step context)
   abandon = Delimited (\_ (AnywhereFuture slot) -> abandonTicket anywhereSeat slot)
@@ -450,7 +459,12 @@ instance Inboxes (DelimitedM m s) 'Anywhere where
 -- follows and gives it back to the scheduler. When the part goes on, it
 -- raises the cancellation that came meanwhile, if it is in a scope.
 step :: Context -> IO ()
-step (Context run tag part) = spent run >>= \yields -> when yields (markFast run *> control0 tag (\resume -> pure (Yielded (resume (checkpoint part)))))
+step (Context run tag part) =
+  spent run >>= \yields -> when yields $
+    if runInFast run then capture YieldedFast else capture Yielded
+  where
+    capture yield = control0 tag (\resume -> pure (yield (resume (checkpoint part))))
+    {-# INLINE capture #-}
 {-# INLINE step #-}
 
 -- | Runs the program and all of its concurrent parts on this thread: each part

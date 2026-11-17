@@ -80,13 +80,13 @@ times = timesWith
 
 -- | Runs both arrows at once on the same input and returns both results. The first failure cancels the other arrow
 -- and is rethrown once both have stopped.
-concurrently :: (Arrow arr, Concurrent arr, Exchange arr (Local arr)) => arr a b -> arr a c -> arr a (b, c)
+concurrently :: forall arr a b c. (Arrow arr, Concurrent arr, Exchange arr (Local arr)) => arr a b -> arr a c -> arr a (b, c)
 concurrently one two =
   keeping (awaiting &&& awaiting)
     >>> tap (together [firstPromise ^>> deliver one, secondPromise ^>> deliver two])
     >>> ends ^>> (await *** await)
   where
-    awaiting = localTicket >>> first willAwait
+    awaiting = awaitedTicket @arr @(Local arr)
     -- The group's input is the two tickets and the input. Each arrow fulfils the promise of its own ticket, made before
     -- the group starts, and the receiver is committed to take both from the start: the awaits after the group never wait.
     firstPromise = first (snd . fst)
@@ -117,7 +117,7 @@ localTicket = ticket
 -- | A ticket whose receiver will await its future: a value fulfilled before the await is held for it, as one at the await is. For a
 -- receiver that hands its promise out, in steps that may wait or in a part that runs beside it, before it awaits.
 awaitedTicket :: (Arrow arr, Exchange arr r) => arr () (Future arr r a, Promise r a)
-awaitedTicket = ticket >>> first willAwait
+awaitedTicket = ticketAwaited
 {-# INLINE awaitedTicket #-}
 
 -- | Runs the arrow on the input and fulfils the promise with its result, without saying whether the waiter took it.
