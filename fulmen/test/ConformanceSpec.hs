@@ -19,8 +19,8 @@ module ConformanceSpec (spec) where
 import Control.Arrow (first, returnA, second, (&&&), (>>>), (>>^), (^>>), (|||))
 import Control.Concurrent (forkFinally, forkIO, killThread, rtsSupportsBoundThreads, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
-import Control.Exception (IOException, SomeException, bracket, displayException, fromException, throwIO, try)
-import Control.Monad (foldM, forM, forM_, void, when)
+import Control.Exception (IOException, SomeException, bracket, displayException, fromException, onException, throwIO, try)
+import Control.Monad (foldM, forM, forM_, replicateM, void, when)
 import ConformanceCases
 import ConformanceWire
 import Data.ByteString (ByteString)
@@ -60,7 +60,7 @@ import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, 
 import System.Timeout (timeout)
 
 spec :: Spec
-spec = conformance *> counted *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> idleCost *> acceptCost *> manyConnectionWorkers
+spec = conformance *> counted *> acceptBatches *> listenerFailure *> peerAddress *> shutdownSpec *> idleSpec *> idleCost *> acceptCost *> manyConnectionWorkers
 
 conformance :: Spec
 conformance = describe "HTTP/1.1 conformance" $ forM_ runners $ \runner@(Runner runnerName _) -> describe runnerName $ do
@@ -79,6 +79,47 @@ counted = describe "accepting" $ forM_ debugRunners $ \runner@(Runner runnerName
     counts <- (`since` before) <$> snapshot
     countOf Accepts counts `shouldBe` 30
     when (os == "linux") $ countOf Fcntls counts `shouldBe` 0
+
+-- | The connections that wait in the listener's queue when the server starts are all taken, and the acceptor gives way for the
+-- round that takes them and not once for each connection, as the counter of 'Debug' says. The count is of the acceptor's own
+-- give-ways, and so doesn't depend on the time that the machine takes to run it.
+acceptBatches :: Spec
+acceptBatches = describe "accepting a queue of connections" $ forM_ debugRunners $ \runner@(Runner runnerName _) ->
+  describe runnerName $
+    xfail "the acceptor takes one connection in each round, and gives way in each" $
+      it "takes them all in a round, and gives way once for it" (queuedConnections runner)
+
+-- | Connections that wait in the queue of a listener before the server starts, as many as a queue holds on every system: the
+-- queue of a listener of backlog 128 holds 129 on Linux, and about 192 on macOS, whose limit on the backlog is 128. The server has
+-- room for all of them in its one core, so that its first round takes them all and gives way once. Each round of the acceptor
+-- gives way once. The bound is one more than the round that takes them, for a round that begins before the last of them has
+-- come, which none does here, as they are there before the server starts.
+queuedConnections :: Runner -> IO ()
+queuedConnections (Runner _ runServer) =
+  bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do
+    Socket.bind accepting (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+    Socket.listen accepting waiting
+    port <- Socket.socketPort accepting
+    bracket (replicateM waiting (connected port)) (mapM_ Socket.close) $ \_ -> do
+      let settings = Fulmen.defaultSettings {Fulmen.connectionsPerCore = waiting}
+      cores <- Fulmen.newCores settings 1
+      stopped <- newEmptyMVar
+      before <- snapshot
+      bracket (forkFinally (runServer settings (Listening (Fulmen.borrowed accepting)) (handling (Fixed 200 [] "ok")) cores) (putMVar stopped)) killThread $ \_ -> do
+        taken <- timeout 10000000 (waitUntil ((>= waiting) . countOf Accepts . (`since` before) <$> snapshot))
+        counts <- (`since` before) <$> snapshot
+        taken `shouldBe` Just ()
+        countOf Accepts counts `shouldBe` waiting
+        let gaveWay = countOf AcceptBatches counts
+        when (gaveWay > allowed) $
+          failTest ("the acceptor gave way " <> show gaveWay <> " times to take " <> show waiting <> " connections, and at most " <> show allowed <> " were allowed")
+  where
+    waiting = 128 :: Int
+    allowed = 2 :: Int
+    connected port = do
+      sock <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
+      Socket.connect sock (Socket.SockAddrInet port (Socket.tupleToHostAddress (127, 0, 0, 1))) `onException` Socket.close sock
+      pure sock
 
 -- | A listener that fails to open ends the server with that failure, and the server doesn't wait for a connection: the
 -- first core runs the acceptor, which opens the listener, and the other parts of the server don't keep it from ending.
