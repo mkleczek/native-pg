@@ -124,6 +124,7 @@ import Data.Bits ((.&.), (.|.))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.List (partition)
+import qualified Data.List as List (foldl')
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word64)
 import Foreign.C.Error (eINTR, getErrno, throwErrno, throwErrnoIfNull)
@@ -356,29 +357,29 @@ awake, asleep :: Inbox
 awake = Open [] [] False
 asleep = Open [] [] True
 
--- | The parts that were given the scheduler since it last looked, in the order
--- they were given. Looking costs a read while there are none. The parts for the fast lane stay in the mailbox, for the lane to take.
+-- | The parts that were given the scheduler since it last looked, newest first.
+-- Looking costs a read while there are none. The parts for the fast lane stay in the mailbox, for the lane to take.
 takeInbox :: Run -> IO [IO Step]
 takeInbox run = case runMailbox run of
   Mailbox inbox _ ->
     readIORef inbox >>= \case
       Open [] _ _ -> pure []
       Closed -> pure []
-      Open _ _ _ -> reverse <$> update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
+      Open _ _ _ -> update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
 
 -- | Before the scheduler waits in its poller: the parts that were given it
--- already, in which case it doesn't wait; or none, and the next to give one
+-- already, newest first, in which case it doesn't wait; or none, and the next to give one
 -- wakes it.
 beforeSleep :: Run -> IO [IO Step]
 beforeSleep run = case runMailbox run of
   Mailbox inbox _ ->
-    reverse <$> update inbox (\case Open [] [] _ -> (asleep, []); Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
+    update inbox (\case Open [] [] _ -> (asleep, []); Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
 
--- | After the scheduler's wait in its poller: the parts that were given it.
+-- | After the scheduler's wait in its poller: the parts that were given it, newest first.
 afterSleep :: Run -> IO [IO Step]
 afterSleep run = case runMailbox run of
   Mailbox inbox _ ->
-    reverse <$> update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
+    update inbox (\case Open parts [] _ -> (awake, parts); Open parts fast _ -> (Open [] fast False, parts); Closed -> (Closed, []))
 
 -- | Whether a part of the fast lane can go on that the scheduler has not taken yet: one that was put back, or one that another core gave.
 fastWaiting :: Run -> IO Bool
@@ -388,20 +389,22 @@ fastWaiting run =
     [] -> case runMailbox run of
       Mailbox inbox _ -> readIORef inbox >>= \case Open _ (_ : _) _ -> pure True; _ -> pure False
 
--- | Takes the parts of the fast lane from the mailbox, which a part of another core may have given since the scheduler looked.
-takeFastInbox :: Run -> IO ()
+-- | Takes the parts of the fast lane from the mailbox, newest first.
+takeFastInbox :: Run -> IO [IO Step]
 takeFastInbox run = case runMailbox run of
   Mailbox inbox _ ->
     readIORef inbox >>= \case
-      Open _ [] _ -> pure ()
-      Closed -> pure ()
-      Open _ _ _ -> update inbox (\case Open parts fast sleeping -> (Open parts [] sleeping, fast); Closed -> (Closed, [])) >>= \fast -> adjust run 3 (negate (length fast)) *> modifyIORef' (runFastReady run) (<> fast)
+      Open _ [] _ -> pure []
+      Closed -> pure []
+      Open _ _ _ -> update inbox (\case Open parts fast sleeping -> (Open parts [] sleeping, fast); Closed -> (Closed, []))
 
--- | Takes the parts that were given the scheduler back from those that wait for
--- them.
-arrivals :: Run -> [IO Step] -> IO [IO Step]
-arrivals _ [] = pure []
-arrivals run parts = parts <$ adjust run 3 (negate (length parts))
+-- | Puts the detached mailbox batch in FIFO order ahead of the ready parts,
+-- counting the remote arrivals in the same pass.
+drainArrivals :: Run -> [IO Step] -> [IO Step] -> IO [IO Step]
+drainArrivals run = go 0
+  where
+    go !count ready [] = ready <$ when (count /= 0) (adjust run 3 (negate count))
+    go !count ready (part : rest) = go (count + 1) (part : ready) rest
 
 -- | The scheduler takes no more parts.
 closeInbox :: Run -> IO ()
@@ -1120,16 +1123,15 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
       Writable fd -> waitOn fd False step *> adjust run 4 1 *> go ready later fast (not fromFast)
       Until (Instant at) -> addTimer (runWheel run) at (modifyIORef' (if inFast then runFastReady run else runTickets run) (resume (pure ()) :)) *> go ready later fast (not fromFast)
       Watched register -> register >>= \watch -> modifyIORef' (runWatching run) (Watching ident inFast watch resume :) *> go ready later fast (not fromFast)
-    -- The parts of the fast lane that can go on, in the order they came: those it has, those that were put back among the parts that can go
-    -- on since, and those that another core gave.
+    -- Take another batch only after the staged parts have run. In each batch,
+    -- the parts from the mailbox go before the ones put back locally.
     fastReady = \case
       fast@(_ : _) -> pure fast
       [] -> do
-        takeFastInbox run
-        queued <- readIORef (runFastReady run)
-        case queued of
-          [] -> pure []
-          _ -> reverse queued <$ writeIORef (runFastReady run) []
+        remote <- takeFastInbox run
+        local <- readIORef (runFastReady run)
+        when (not (null local)) (writeIORef (runFastReady run) [])
+        drainArrivals run (reverse local) remote
     -- The normal lane has none left in this round.
     boundary later fast !fastTurn = do
         -- Each round, the parts that descriptors became ready for, that other
@@ -1146,8 +1148,13 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
         when (timers > 0) (roundNow run >>= expire (runWheel run))
         tickets <- readIORef (runTickets run)
         writeIORef (runTickets run) []
-        given <- takeInbox run >>= arrivals run
-        case given <> reverse tickets <> reverse later of
+        remote <- takeInbox run
+        let local = List.foldl' (flip (:)) (reverse later) tickets
+        -- Consume the local list directly on empty rounds so it need not be thunked for the drain.
+        ready <- case remote of
+          [] -> pure local
+          _ -> drainArrivals run local remote
+        case ready of
           -- No part of the normal lane can go on: the fast lane goes on, if it has a part, and else the blocking poll in 'idle' returns
           -- at once if a descriptor is ready.
           [] -> fastReady fast >>= \case
@@ -1186,7 +1193,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
           | null watching -> do
               -- Unless a part was given since the round began: the next to give
               -- one wakes the poller.
-              early <- beforeSleep run >>= arrivals run
+              early <- beforeSleep run >>= drainArrivals run []
               -- Or a part of the fast lane, which the mailbox gave.
               fastGiven <- fastWaiting run
               if null early && not fastGiven
@@ -1194,7 +1201,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
                   countWait
                   until' <- untilNextTimer
                   polled <- pollWait (maybe (-1) (fromIntegral . min 2000000000 . (`div` 1000000) . (+ 999999)) until')
-                  given <- afterSleep run >>= arrivals run
+                  given <- afterSleep run >>= drainArrivals run []
                   -- The time of the round was read before the wait, if a timer made the round expire its timers: the parts that the wait ended
                   -- read it again, as a round's first part does.
                   setCounter run 8 0
