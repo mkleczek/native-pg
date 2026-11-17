@@ -165,11 +165,11 @@ expire wheel now = forgetPassed *> loop
               here <- unsafeReadIOArray (wheelNear wheel) index
               (due, later) <- split here
               unsafeWriteIOArray (wheelNear wheel) index later
-              fire (reverse due)
-    -- The timers that are due, and the others that are live; the cancelled are dropped.
+              fire due
+    -- Due timers have accumulated in firing order. Keep the later timers in the slot's original order.
     split = go [] []
       where
-        go due later [] = pure (reverse due, reverse later)
+        go due later [] = pure (due, reverse later)
         go due later (timer@(Timer alive deadline _) : others) =
           readIORef alive >>= \isLive ->
             if not isLive
