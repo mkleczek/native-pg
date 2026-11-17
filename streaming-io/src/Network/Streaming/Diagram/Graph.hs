@@ -61,8 +61,9 @@ import System.Mem.StableName (StableName, makeStableName)
 type Node = String
 
 -- | How an edge is drawn: the edge of a message is dashed too, and so is the edge that says only the order of the lines of a
--- flow, and they are the ones that have a style of their own.
-data Style = Solid | Dashed | Message | Order
+-- flow, and they are the ones that have a style of their own. The edge into the entry of a flow from the node that the flow
+-- follows is solid, and Mermaid draws no edge for it: its entry is one with that node.
+data Style = Solid | Dashed | Message | Order | Entry
   deriving (Eq)
 
 -- | How a step that is a leaf is drawn.
@@ -89,7 +90,8 @@ data Form
     Finish
   | -- | A junction, which has no text.
     Junction
-  | -- | The junction that a flow is entered at: the names of its input that the flow reads are its output pins.
+  | -- | The entry of a flow: the names of its input that the flow reads, and the ports that an outer flow binds, are its pins.
+    -- Mermaid draws a junction, unless the node that the flow follows is one with it.
     Entered
   | -- | A bar that forks or joins parts, which the title is said on the edges of.
     Bar String
@@ -154,6 +156,9 @@ data Kind
     Plain
   | -- | The box that Mermaid draws around the nodes of a name, and Graphviz draws no box for: its nodes are pins.
     Naming
+  | -- | The box of a flow, around its steps and its entry and its result. Graphviz draws it as a box that has the ports of the flow,
+    -- and Mermaid draws no box.
+    Flowing
   | -- | The box around the lanes of the parts that run together.
     Container
   | -- | One part, drawn top to bottom, beside the other lanes of its container.
@@ -503,10 +508,8 @@ bounded ctx start output (Fragment input core) = case core of
   Nodes entry _ outlets -> do
     wire <- into ctx entry input
     inputs <- readIORef (ctxInputs ctx)
-    -- A flow that the chart starts with is entered at the start.
-    if entry `elem` inputs && isNothing wire
-      then modifyIORef' (ctxAliases ctx) ((entry, start) :)
-      else edgeAs ctx (if isJust wire then OnIn else Loose) start entry wire Solid
+    -- A flow that the chart starts with is entered at the start, which its edge says.
+    edgeAs ctx (if isJust wire then OnIn else Loose) start entry wire (if entry `elem` inputs && isNothing wire then Entry else Solid)
     unless (null outlets) $ do
       end <- declare ctx Finish
       forM_ outlets $ \outlet -> leaveAs ctx outlet end (exitName outlet) (exitSits outlet)
@@ -740,9 +743,10 @@ wired input output (Fragment inner core) = Fragment (inner <|> input) $ case cor
   Nodes entry splits outlets -> Nodes entry splits (labelled output <$> outlets)
 
 -- | A whole flow: its steps in order, each with an edge from the box of each name that it binds, and a step that binds nothing
--- from the step before it has an edge from it that says only the order. The flow is entered at a junction, which is the
--- start of the chart if the flow is what the chart starts with, and the one node that the flow follows if that has
--- nothing else to say, so that it is a junction in the chart only when the flow follows more than that.
+-- from the step before it has an edge from it that says only the order. The flow is a box that holds its steps, its entry, which
+-- Graphviz draws as the group of its input ports and Mermaid as a junction, and its result. The entry is one with the start of
+-- the chart if the flow is what the chart starts with, and with the one node that the flow follows if that has nothing else to
+-- say, as the edge into it of the style 'Entry' says, so that Mermaid draws a junction only when the flow follows more than that.
 flowScoped :: Ctx -> Path -> Maybe String -> Tree -> IO Fragment
 flowScoped ctx path result inner = do
   lined <- flowLines inner
@@ -753,12 +757,11 @@ flowScoped ctx path result inner = do
   modifyIORef' (ctxInputs ctx) (entry :)
   -- The names that the step drawn last gave are of this flow: a flow in one of its steps keeps its own.
   saved <- readIORef (ctxGiven ctx)
-  (env, (_, outlets), drawn) <-
-    foldM (flowLine ctx path) (FlowEnv entered [], (Just 0, entered), False) (zip [1 ..] lined)
+  ((env, (_, outlets), drawn), items) <-
+    collect ctx (foldM (flowLine ctx path) (FlowEnv entered [], (Just 0, entered), False) (zip [1 ..] lined))
   writeIORef (ctxGiven ctx) saved
   if drawn
     then do
-      emit ctx (Node entry (Element Entered Nothing [] []))
       -- The result is drawn by Graphviz, which draws the edges out of the flow from it, and Mermaid has no node for it.
       let bodies = [Seat (outletNode outlet) [] | outlet <- outlets]
           seats = case result of
@@ -768,9 +771,10 @@ flowScoped ctx path result inner = do
               Just _ -> bodies
               Nothing -> [Seat entry [wanted]]
           exit = 'r' : number
-      emit ctx (Result exit result seats)
+      -- The box of the flow holds its steps, its entry and its result.
+      emit ctx (Group ('f' : number) Flowing "" (items ++ [Node entry (Element Entered Nothing [] []), Result exit result seats]))
       pure (Fragment Nothing (Nodes entry True [outlet {outletVia = Just exit} | outlet <- outlets]))
-    else pure bare
+    else bare <$ traverse_ (emit ctx) items
 
 -- | The steps of a flow, in order: the nodes of its chain that are steps of it, which it doesn't go into.
 flowLines :: Tree -> IO [Tree]
@@ -1009,13 +1013,13 @@ sequential ctx (Fragment input1 core1) (Fragment input2 core2) = case (core1, co
     connect ctx outlets input2 entry2 splits2
     pure (Fragment input1 (Nodes entry splits outlets2))
 
--- | Draws the edges from the ways out to the entry, unless a join and a split that follows it can be one junction, or the entry
--- is where a flow is entered and one node that has nothing else to say is the way out, which the flow is entered at.
+-- | Draws the edges from the ways out to the entry, unless a join and a split that follows it can be one junction. The edge to the
+-- entry of a flow from one node that has nothing else to say is the way out, which the flow is entered at, says so.
 connect :: Ctx -> [Outlet] -> Maybe String -> Node -> Bool -> IO ()
 connect ctx outlets label entry splits = do
   inputs <- readIORef (ctxInputs ctx)
   case outlets of
-    [ Outlet
+    [ outlet@Outlet
         { outletNode = before,
           outletLabel = Nothing,
           outletWire = Nothing,
@@ -1024,7 +1028,8 @@ connect ctx outlets label entry splits = do
           outletJoins = joins
         }
       ]
-      | isNothing label && ((splits && joins) || entry `elem` inputs) -> modifyIORef' (ctxAliases ctx) ((entry, before) :)
+      | isNothing label && entry `elem` inputs -> emit ctx (Wire (Edge before entry Nothing Entry Loose (outletVia outlet)))
+      | isNothing label && splits && joins -> modifyIORef' (ctxAliases ctx) ((entry, before) :)
     _ -> forM_ outlets $ \outlet -> do
       later <- into ctx entry (outletThen outlet)
       wire <- into ctx entry (outletWire outlet <|> label)
@@ -1180,7 +1185,7 @@ alike :: Ctx -> [Item] -> IO ([Laid], [Link])
 alike ctx items = do
   aliases <- readIORef (ctxAliases ctx)
   questions <- readIORef (ctxQuestions ctx)
-  let tidied = tidy aliases questions items
+  let tidied = viewed (tidy aliases questions items)
       numbered = zip (declared tidied) (("m" ++) . show <$> [1 :: Int ..])
   pure (layout (renamed (\node -> fromMaybe node (lookup node numbered)) tidied))
 
@@ -1568,18 +1573,37 @@ declared items =
       | item <- items
     ]
 
+-- | The items as Mermaid draws them: the box of a flow is no box, and the entry of a flow that follows a node is that node, as the
+-- edge into the entry says, which is not drawn.
+viewed :: [Item] -> [Item]
+viewed items = concatMap seen items
+  where
+    entries = [(edgeTo edge', edgeFrom edge') | Wire edge' <- flat items, edgeStyle edge' == Entry]
+    seen = \case
+      Node node _ | node `elem` fmap fst entries -> []
+      Wire edge'
+        | edgeStyle edge' == Entry -> []
+        | otherwise -> [Wire edge' {edgeFrom = followed' entries (edgeFrom edge'), edgeTo = followed' entries (edgeTo edge')}]
+      Group _ Flowing _ inner -> concatMap seen inner
+      Group node kind title inner -> [Group node kind title (concatMap seen inner)]
+      item -> [item]
+
 -- | The items as a chart is written: the nodes and the boxes in order, and the edges among them that are not between nodes
 -- that they declare. A node that an edge names inside a group is a node of the group, so an edge to a node outside it is
 -- written outside.
 layout :: [Item] -> ([Laid], [Link])
-layout items = (concat (fmap fst parts) ++ fmap Linked kept, escapedEdges)
+layout = laidOut . viewed
+
+-- | The items as they are written, which are those that 'viewed' leaves.
+laidOut :: [Item] -> ([Laid], [Link])
+laidOut items = (concat (fmap fst parts) ++ fmap Linked kept, escapedEdges)
   where
     own = declared items
     parts = fmap place items
     place = \case
       Node node element -> ([Declared node (elementForm element)], [])
       Group node kind title inner ->
-        let (inside, up) = layout inner
+        let (inside, up) = laidOut inner
          in ([Boxed node kind title inside], up)
       _ -> ([], [])
     (kept, escapedEdges) = partition (between own) ([Link (edgeFrom e) (edgeTo e) (edgeLabel e) (edgeStyle e) | Wire e <- items] ++ concatMap snd parts)
@@ -1616,7 +1640,6 @@ tidy aliases questions = concatMap $ \case
 -- | Whether an element of the form has output pins that edges leave from.
 hostsOut :: Form -> Bool
 hostsOut = \case
-  Start -> True
   Entered -> True
   Step {} -> True
   Titled _ -> True
@@ -1627,6 +1650,7 @@ hostsOut = \case
 -- | Whether an element of the form has input pins that edges enter at.
 hostsIn :: Form -> Bool
 hostsIn = \case
+  Entered -> True
   Step {} -> True
   Titled _ -> True
   Awaits _ -> True
@@ -1647,6 +1671,8 @@ seated items = fmap fix items
     forms = [(node, elementForm element) | Node node element <- flat items]
     leaves node = maybe False hostsOut (lookup node forms)
     enters node = maybe False hostsIn (lookup node forms)
+    -- The entry of a flow has a port for each name that is bound, and none for a label on an edge.
+    entered node = lookup node forms == Just Entered
     fix = \case
       Wire edge' -> Wire edge' {edgeSits = sitting edge'}
       Group node kind title inner -> Group node kind title (fmap fix inner)
@@ -1654,7 +1680,7 @@ seated items = fmap fix items
       item -> item
     sitting edge' = case (edgeSits edge', edgeLabel edge') of
       (OnOut, Just label) | leaves (edgeFrom edge') -> Joined [Join (Just (Seat (edgeFrom edge') [label])) Nothing Nothing]
-      (OnIn, Just label) | enters (edgeTo edge') -> Joined [Join Nothing (Just (Seat (edgeTo edge') [label])) Nothing]
+      (OnIn, Just label) | enters (edgeTo edge') && not (entered (edgeTo edge')) -> Joined [Join Nothing (Just (Seat (edgeTo edge') [label])) Nothing]
       (Joined joins, _) -> Joined [Join (keep leaves from) (keep enters to) note | Join from to note <- joins]
       _ -> Loose
     keep hosted = \case

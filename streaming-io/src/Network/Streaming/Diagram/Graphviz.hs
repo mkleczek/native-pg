@@ -11,11 +11,17 @@
 -- nodes, or as yellow clusters that hold the pins of their patterns. What Mermaid draws as a node or a box for a name is not
 -- drawn: it is a pin. The box of a named step, which has a page of its own, and its wrapper link to the page, and the box has a
 -- heavier border than a step that is an action.
+--
+-- A flow is a box of the colour of the canvas with a light border, which holds its steps, a group of its input ports at the top
+-- and a group of its output ports at the bottom: each a faint wrapper that holds a pin for each port, side by side. The ports are
+-- the entry and the exit of the flow, so a page that a flow starts has no start circle, and what follows the flow follows its
+-- output port. A diamond is where the branches of a decision that give the same name meet: the edges that end at a pin from two
+-- or more places end at a diamond before the pin instead, which has one edge to the pin.
 module Network.Streaming.Diagram.Graphviz (dot) where
 
 import Control.Applicative ((<|>))
-import Data.List (intercalate, nub)
-import Data.Maybe (fromMaybe, isJust)
+import Data.List (intercalate, isInfixOf, isPrefixOf, nub, partition, sort)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Network.Streaming.Diagram.Graph
 
 -- * The look
@@ -44,6 +50,10 @@ outLine = "#54aeff"
 caseFill = "#fff8c5"
 caseLine = "#d4a72c"
 
+-- | The border of the box of a flow, which has the colour of the canvas for its fill.
+flowBorder :: String
+flowBorder = "#afb8c1"
+
 -- | The colour of the nodes and edges that are only marks.
 markFill, orderLine, messageLine :: String
 markFill = "#57606a"
@@ -66,7 +76,11 @@ data Env = Env
     -- | The results of flows, and the names that they read.
     envResults :: [(Node, Maybe String)],
     -- | The cases of decisions that a step reads a pin of: the decision, the case, and the node of the step.
-    envCovered :: [(Node, String, Node)]
+    envCovered :: [(Node, String, Node)],
+    -- | The starts of the chart that a flow follows, which are not drawn: the ports of the flow are the entry.
+    envStarts :: [Node],
+    -- | The input pins that edges from two or more places end at, each with the node of the diamond that they end at instead.
+    envMerges :: [(Node, Node)]
   }
 
 -- | The DOT of the graph.
@@ -86,13 +100,14 @@ dot (Graph items) =
       "  node [shape=plaintext, fontname=\"Helvetica\"];",
       "  edge [arrowsize=0.6, color=\"" ++ bodyLine ++ "\", fontname=\"Helvetica\", fontsize=10];"
     ]
-      ++ concatMap (itemLines env "  ") items
-      ++ nub (concatMap (edgeLines env) (everything items))
+      ++ concatMap (itemLines env {envMerges = merges} "  ") items
+      ++ fmap arcLine (merged merges arcs)
       ++ ["}"]
   where
+    elements = elementsOf items
     env =
       Env
-        (elementsOf items)
+        elements
         (clustersOf items)
         [(node, name) | Result node name _ <- everything items]
         [ (decision, case', target)
@@ -101,6 +116,15 @@ dot (Graph items) =
             Join (Just (Seat decision (case' : _ : _))) to _ <- joins,
             let target = maybe (edgeTo edge') (\(Seat node _) -> node) to
         ]
+        [ edgeFrom edge'
+          | Wire edge' <- everything items,
+            edgeStyle edge' == Entry,
+            Just element <- [lookup (edgeFrom edge') elements],
+            elementForm element == Start
+        ]
+        []
+    arcs = nub (concatMap (arcsOf env) (everything items))
+    merges = mergesOf arcs
 
 -- | The items, those in groups too, in order.
 everything :: [Item] -> [Item]
@@ -158,11 +182,19 @@ html = concatMap $ \case
 -- | The lines of an item, indented: a node, and a cluster with what is in it. The edges are written after them.
 itemLines :: Env -> String -> Item -> [String]
 itemLines env indent = \case
-  Node node element -> [indent ++ line | line <- elementLines node element]
-  Result node name _ -> [indent ++ line | line <- blockLines node resultBody (maybe [] pure name) [] False]
+  Node node element
+    | node `elem` envStarts env -> []
+    | otherwise -> [indent ++ line | line <- elementLines node element ++ mergeLines env node]
+  Result node name _ -> [indent ++ line | line <- portLines node "out" [fromMaybe " " name] ++ mergeLines env node]
   Wire _ -> []
   Group node kind title inner -> case kind of
     Naming -> concatMap (itemLines env indent) inner
+    Flowing ->
+      [ indent ++ "subgraph cluster_" ++ node ++ " {",
+        indent ++ "  class=\"flow\"; style=\"filled,rounded\"; fillcolor=\"white\"; color=" ++ quoted flowBorder ++ "; penwidth=1; margin=8; label=\"\";"
+      ]
+        ++ concatMap (itemLines env (indent ++ "  ")) (flowOrder inner)
+        ++ [indent ++ "}"]
     Plain -> cluster node title "style=\"rounded\"; color=\"#8c959f\"" False inner
     Container -> cluster node "\x2016 together" "style=\"dashed,rounded\"; color=\"#7c6fd0\"; penwidth=2" True (reverse inner)
     Lane -> cluster node title "style=\"filled,rounded\"; fillcolor=\"#7c6fd01a\"; color=\"#7c6fd066\"" False inner
@@ -176,11 +208,12 @@ itemLines env indent = \case
         -- The lanes of a container are side by side: the first node of each is on the same rank.
         firsts = [first | Group _ _ _ lane <- inner, first : _ <- [nodesIn lane]]
 
--- | The lines of an element: a block, a box, or a mark.
+-- | The lines of an element: a block, a box, a mark, or the group of the input ports of a flow, which is its entry.
 elementLines :: Node -> Element -> [String]
-elementLines node element = case bodied element of
-  Just found -> blockLines node found (inNames element) (elementOut element) (isDecision (elementForm element))
-  Nothing -> maybe [] pure (markLine node element)
+elementLines node element = case (elementForm element, bodied element) of
+  (Entered, _) -> portLines node "in" (inPorts element)
+  (_, Just found) -> blockLines node found (inNames element) (elementOut element) (isDecision (elementForm element))
+  (_, Nothing) -> maybe [] pure (markLine node element)
   where
     isDecision = \case
       Decision _ -> True
@@ -189,7 +222,7 @@ elementLines node element = case bodied element of
 -- | The node of an element that is a mark.
 markLine :: Node -> Element -> Maybe String
 markLine node element = case elementForm element of
-  Start | null (elementOut element) -> Just (mark "start" "shape=circle, width=0.2, fixedsize=true")
+  Start -> Just (mark "start" "shape=circle, width=0.2, fixedsize=true")
   Finish -> Just (mark "end" "shape=circle, peripheries=2, width=0.15, fixedsize=true, penwidth=1.5")
   Junction -> Just (mark "junction" "shape=circle, width=0.12, fixedsize=true")
   Bar _ -> Just (mark "bar" "shape=box, width=0.7, height=0.06, fixedsize=true")
@@ -216,17 +249,11 @@ data Bodied = Bodied
 -- | The body of an element that has one, which is every element that is not a mark.
 bodied :: Element -> Maybe Bodied
 bodied element = case elementForm element of
-  Start | not (null (elementOut element)) -> Just (Bodied "input" bodyFill bodyLine 1 Nothing "flow input" [])
-  Entered -> Just (Bodied "input" bodyFill bodyLine 1 Nothing "flow input" [])
   Step look text -> Just (Bodied "step" bodyFill bodyLine 1 Nothing (stepText look text) (caption look))
   Titled text -> Just (Bodied "box" bodyFill boxLine 2 (elementLink element) text [])
   Awaits text -> Just (Bodied "box" bodyFill boxLine 2 (elementLink element) text [])
   Decision question -> Just (Bodied "decision" decisionFill decisionLine 1 Nothing (fromMaybe "choose" question) [])
   _ -> Nothing
-
--- | The body of the result of a flow.
-resultBody :: Bodied
-resultBody = Bodied "result" bodyFill bodyLine 1 Nothing "flow result" []
 
 -- | The text of a step: a gear in front of what never waits.
 stepText :: Look -> String -> String
@@ -281,6 +308,43 @@ boxNode node klass margin found =
 inNames :: Element -> [String]
 inNames = nub . elementIn
 
+-- | The names of the ports of the entry of a flow, each once, which are the names that its steps read and the names that an outer
+-- flow binds, or a blank one if it has none, so that the entry is a pin. They are in alphabetical order, from which Graphviz orders
+-- the ports side by side as it cuts the crossings.
+inPorts :: Element -> [String]
+inPorts element = case sort (nub (elementIn element ++ [name | Just name <- pinName <$> elementOut element])) of
+  [] -> [" "]
+  names -> names
+
+-- | The group of the ports of a flow, which is a faint wrapper with no title that holds a pin for each port side by side: input
+-- pins for its input ports, which are the entry, and output pins for its output ports, which are the exit.
+portLines :: Node -> String -> [String] -> [String]
+portLines node klass names =
+  [ "subgraph cluster_" ++ node ++ " {",
+    "  class=\"ports\"; style=\"filled,rounded\"; fillcolor=" ++ quoted wrapperFill ++ "; color=" ++ quoted wrapperLine ++ "; penwidth=1; margin=6; label=\"\";"
+  ]
+    ++ ["  " ++ port (inPinId node [i]) name | (i, name) <- zip [0 :: Int ..] names]
+    ++ ["  { rank=same; " ++ unwords [inPinId node [i] ++ ";" | i <- [0 .. length names - 1]] ++ " }" | length names > 1]
+    ++ ["}"]
+  where
+    port = if klass == "in" then \ident -> pinNode ident klass "filled" inFill inLine else \ident -> pinNode ident klass "rounded,filled" outFill outLine
+
+-- | The items of a flow in the order that they are drawn: its entry at the top, its steps, and its result at the bottom.
+flowOrder :: [Item] -> [Item]
+flowOrder inner = entries ++ others ++ results
+  where
+    (entries, rest) = partition (\case Node _ element -> elementForm element == Entered; _ -> False) inner
+    (results, others) = partition (\case Result {} -> True; _ -> False) rest
+
+-- | The diamonds of the pins of a node that edges from two or more places end at, which are declared where the pins are.
+mergeLines :: Env -> Node -> [String]
+mergeLines env node =
+  [ diamond ++ " [class=\"merge\", shape=diamond, style=filled, fillcolor=" ++ quoted caseFill ++ ", color=" ++ quoted caseLine
+      ++ ", penwidth=1, width=0.2, height=0.2, fixedsize=true, label=\"\"];"
+    | (pin, diamond) <- envMerges env,
+      (node ++ "__i_") `isPrefixOf` pin
+  ]
+
 -- | The node of the input pin, and of the output pin, that the indices lead to: the position of the pin among the pins of the
 -- step, and then in the pins that it holds, if it is taken apart.
 inPinId, outPinId :: Node -> [Int] -> Node
@@ -291,11 +355,12 @@ outPinId node ixs = node ++ "__o" ++ concatMap (\i -> "_" ++ show i) ixs
 blockOf :: Element -> Bool
 blockOf element = isJust (bodied element) && not (null (elementIn element) && null (elementOut element))
 
--- | The node that an edge to the top of a node is drawn at: the first input pin of a block, or else the node.
+-- | The node that an edge to the top of a node is drawn at: the first input pin of a block, the first port of the entry of a flow, its
+-- output port if it is the result of one, or else the node.
 topOf :: Env -> Node -> Node
 topOf env node = case (lookup node (envElements env), lookup node (envResults env)) of
-  (Just element, _) | blockOf element, not (null (inNames element)) -> inPinId node [0]
-  (_, Just (Just _)) -> inPinId node [0]
+  (Just element, _) | elementForm element == Entered || (blockOf element && not (null (inNames element))) -> inPinId node [0]
+  (_, Just _) -> inPinId node [0]
   _ -> node
 
 -- | A body with its pins: a faint wrapper cluster, with the body as a box in it, the input pins above the box and the output pins
@@ -362,12 +427,14 @@ namedPins element = go [] [] (elementOut element)
 -- | Where an edge is drawn at: the node, and the cluster if the end is a cluster that is not the wrapper of a step, which the edge
 -- is drawn at a node of.
 data Place = Place Node (Maybe Node)
+  deriving (Eq)
 
 -- | The place of a node that is an element or a result, or else of a cluster, which is at its first node.
 placeOf :: Env -> Bool -> Node -> Maybe Place
 placeOf env leaving node = case (lookup node (envElements env), lookup node (envResults env)) of
+  (Just element, _) | elementForm element == Entered -> Just (Place (inPinId node [0]) Nothing)
   (Just _, _) -> Just (Place node Nothing)
-  (_, Just _) -> Just (Place node Nothing)
+  (_, Just _) -> Just (resultPlace node)
   _ -> case lookup node (envClusters env) of
     Just (first : _) -> Just (Place (if leaving then first else topOf env first) (Just node))
     _ -> Nothing
@@ -376,6 +443,7 @@ placeOf env leaving node = case (lookup node (envElements env), lookup node (env
 -- the body if it has no pin.
 seatPlace :: Env -> Bool -> Seat -> Maybe Place
 seatPlace env leaving (Seat node path) = case (lookup node (envElements env), path) of
+  (Just element, _) | elementForm element == Entered -> Just (Place (inPinId node [portOf element path]) Nothing)
   (Just element, _ : _) ->
     Just $
       if leaving
@@ -401,11 +469,15 @@ seatPlace env leaving (Seat node path) = case (lookup node (envElements env), pa
       [] -> ixs
       part : _ -> firstLeaf (ixs ++ [0]) part
 
--- | The place at the result of a flow, which has an input pin for the name that it reads.
-resultPlace :: Node -> Maybe String -> Place
-resultPlace node name = case name of
-  Just _ -> Place (inPinId node [0]) Nothing
-  Nothing -> Place node Nothing
+-- | The position of the port that the names lead to among the ports of the entry of a flow, which is the first if no name does.
+portOf :: Element -> [String] -> Int
+portOf element path = case path of
+  name : _ -> fromMaybe 0 (lookup name (zip (inPorts element) [0 ..]))
+  [] -> 0
+
+-- | The place at the result of a flow, which is its output port.
+resultPlace :: Node -> Place
+resultPlace node = Place (inPinId node [0]) Nothing
 
 -- | The look of an edge of the style, with its label.
 edgeAttrs :: Style -> Maybe String -> [String] -> String
@@ -417,35 +489,68 @@ edgeAttrs style label extra =
     parts =
       (case style of
           Solid -> []
+          Entry -> []
           Dashed -> ["style=dashed"]
           Message -> ["style=dashed", "color=\"" ++ messageLine ++ "\"", "penwidth=2", "fontcolor=\"#9a6700\""]
           Order -> ["style=dotted", "color=\"" ++ orderLine ++ "\""])
         ++ ["label=" ++ quoted text | Just text <- [label]]
         ++ extra
 
--- | The line of an edge between two places.
-joined :: Style -> Maybe String -> Place -> Place -> String
-joined style label (Place tailNode tailCluster) (Place headNode headCluster) =
+-- | An edge as it is drawn: its style and its label, the places that it joins, how many ranks it spans, and whether it holds its ends
+-- together, as the edge from a diamond to its pin does.
+data Arc = Arc Style (Maybe String) Place Place Int Bool
+  deriving (Eq)
+
+-- | An edge between two places, which spans as many ranks as the others do.
+joined :: Style -> Maybe String -> Place -> Place -> Arc
+joined style label from to = Arc style label from to edgeRanks False
+
+-- | The line of an edge.
+arcLine :: Arc -> String
+arcLine (Arc style label (Place tailNode tailCluster) (Place headNode headCluster) ranks heavy) =
   "  " ++ tailNode ++ " -> " ++ headNode
     ++ edgeAttrs
       style
       label
-      ( ["minlen=" ++ show edgeRanks]
+      ( ["minlen=" ++ show ranks]
+          ++ ["weight=100" | heavy]
           ++ ["ltail=" ++ quoted ("cluster_" ++ c) | Just c <- [tailCluster]]
           ++ ["lhead=" ++ quoted ("cluster_" ++ c) | Just c <- [headCluster]]
       )
     ++ ";"
 
--- | The lines of an edge of the graph: one between the pins that it joins, for each of them, or else one between its nodes,
+-- | The input pins that edges from two or more places end at, each with the diamond that they end at instead. No name is given by
+-- two places but by the ways out of a decision, so these are the pins that the branches of a decision that give the same name feed.
+mergesOf :: [Arc] -> [(Node, Node)]
+mergesOf arcs = zip pins ["merge" ++ show k | k <- [1 :: Int ..]]
+  where
+    pins = nub [pin | Arc Solid _ _ (Place pin Nothing) _ _ <- arcs, "__i_" `isInfixOf` pin, length (nub (fed pin)) > 1]
+    fed pin = [from | Arc Solid _ from (Place found Nothing) _ _ <- arcs, found == pin]
+
+-- | The edges, with those that end at a pin that merges ending at its diamond, and one edge from the diamond to the pin after the last
+-- of them.
+merged :: [(Node, Node)] -> [Arc] -> [Arc]
+merged merges arcs = concat (zipWith viaDiamond [0 :: Int ..] arcs)
+  where
+    viaDiamond k arc@(Arc style label from (Place pin cluster) ranks heavy) = case lookup pin merges of
+      Just diamond
+        | style == Solid && isNothing cluster ->
+            Arc style label from (Place diamond Nothing) (ranks - 1) heavy
+              : [Arc Solid Nothing (Place diamond Nothing) (Place pin Nothing) 1 True | k == lastInto pin]
+      _ -> [arc]
+    lastInto pin = maximum [k | (k, Arc Solid _ _ (Place found Nothing) _ _) <- zip [0 :: Int ..] arcs, found == pin]
+
+-- | The edges of an item of the graph: one between the pins that it joins, for each of them, or else one between its nodes,
 -- and the edge that leaves a flow is drawn from the result of the flow. An edge that has an end that is only the way that
 -- Mermaid draws a name, and no pin to be at, is not drawn, and nor is the edge from a case of a decision to a step that reads
--- a pin of the case: the edge from the pin says it.
-edgeLines :: Env -> Item -> [String]
-edgeLines env = \case
+-- a pin of the case: the edge from the pin says it. The edge from a start to the entry of a flow is not drawn: the start is not.
+arcsOf :: Env -> Item -> [Arc]
+arcsOf env = \case
+  Wire edge' | edgeStyle edge' == Entry && edgeFrom edge' `elem` envStarts env -> []
   Wire edge' -> case edgeVia edge' of
     Just result | isJust (lookup result (envResults env)) -> viaLines edge' result
     _ -> plainLines edge'
-  Result node name seats -> resultLines node name seats
+  Result node _ seats -> resultLines node seats
   _ -> []
   where
     plainLines edge' = case edgeSits edge' of
@@ -465,8 +570,8 @@ edgeLines env = \case
     targetOf edge' = case edgeSits edge' of
       Joined joins | seat : _ <- [seat | Join _ (Just seat) _ <- joins] -> seatPlace env False seat
       _ -> placeOf env False (edgeTo edge')
-    resultLines node name seats =
-      [ joined Solid Nothing source (resultPlace node name)
+    resultLines node seats =
+      [ joined Solid Nothing source (resultPlace node)
         | seat <- seats,
           Just source <- [seatPlace env True seat]
       ]
