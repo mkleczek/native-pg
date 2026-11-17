@@ -149,14 +149,14 @@ import Prelude hiding (id, (.))
 
 -- * Flows
 
--- | A flow: an arrow from the record that the flow reads its names from to that record with the outputs of the steps
--- that were named in front of it.
-newtype Flow arr x y = Flow (arr x y)
+-- | A flow: what it does with the record that the flow reads its names from, to give that record with the outputs of the
+-- steps that were named in front of it, followed by an arrow that is given what the lines after it are.
+newtype Flow arr x y = Flow (forall z. arr y z -> arr x z)
 
-instance (Category arr) => Category (Flow arr) where
-  id = Flow id
+instance Category (Flow arr) where
+  id = Flow (\rest -> rest)
   {-# INLINE id #-}
-  Flow after . Flow before = Flow (after . before)
+  Flow after . Flow before = Flow (\rest -> before (after rest))
   {-# INLINE (.) #-}
 
 -- | A step with the input that its bindings make, which is told, by what it is used as, what to do with its output.
@@ -178,7 +178,7 @@ class Lined t arr x o where
 
 -- | A step that gives nothing to keep: the record goes on as it was.
 instance {-# INCOHERENT #-} (Arrow arr, Annotate arr, arr' ~ arr, x' ~ x, y ~ x) => Lined (Flow arr' x' y) arr x o where
-  line texts p = Flow (alongside (flowStep Nothing texts p) >>^ snd)
+  line texts p = Flow (\rest -> (alongside (flowStep Nothing texts p) >>^ snd) >>> rest)
   {-# INLINE line #-}
 
 -- | A step whose output is to be named.
@@ -193,13 +193,13 @@ instance (Annotate arr, arr' ~ arr, x' ~ x, o' ~ o) => Lined (arr' x' o') arr x 
 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of
 -- the steps that have names in front of it.
-flow :: (Annotate arr) => Flow arr x y -> arr x y
-flow (Flow p) = flowScope Nothing p
+flow :: (Category arr, Annotate arr) => Flow arr x y -> arr x y
+flow (Flow p) = flowScope Nothing (p id)
 {-# INLINE flow #-}
 
 -- | The flow as an arrow that gives what its step of the name gave.
 result :: forall name -> forall arr x y a. (Arrow arr, Annotate arr, KnownSymbol name, HasField name y a) => Flow arr x y -> arr x a
-result name (Flow p) = flowScope (Just (symbolVal (Proxy @name))) p >>^ getField @name
+result name (Flow p) = flowScope (Just (symbolVal (Proxy @name))) (p id) >>^ getField @name
 {-# INLINE result #-}
 
 -- * Lines
@@ -253,7 +253,10 @@ instance
   Outs (out :: Symbol) x o y
   where
   outcome (Line texts p) =
-    Flow (alongside (flowStep (Just (describeEntry @(Parse out))) texts p) >>^ \(o, x) -> takeEntry @Root @(Parse out) o x)
+    Flow
+      ( \rest ->
+          (alongside (flowStep (Just (describeEntry @(Parse out))) texts p) >>^ \(o, x) -> takeEntry @Root @(Parse out) o x) >>> rest
+      )
   {-# INLINE outcome #-}
 
 -- | A list of patterns: the output is taken apart, and each name is a part of it.
@@ -267,8 +270,11 @@ instance
   where
   outcome (Line texts p) =
     Flow
-      ( alongside (flowStep (Just (Part Nothing Nothing (Just (listOf @(Parses entries))))) texts p)
-          >>^ \(o, x) -> level @(ShapeOf o) @Root @(Parses entries) o x
+      ( \rest ->
+          ( alongside (flowStep (Just (Part Nothing Nothing (Just (listOf @(Parses entries))))) texts p)
+              >>^ \(o, x) -> level @(ShapeOf o) @Root @(Parses entries) o x
+          )
+            >>> rest
       )
   {-# INLINE outcome #-}
 
