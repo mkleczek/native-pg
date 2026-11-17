@@ -12,7 +12,7 @@ module SyscallsSpec (spec) where
 import Control.Arrow (ArrowChoice, first, (>>>), (>>^), (^>>))
 import Control.Concurrent (forkIO, getNumCapabilities, rtsSupportsBoundThreads, setNumCapabilities, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (finally)
+import Control.Exception (bracket, finally)
 import Control.Monad (forM_, replicateM_, void, when)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef, writeIORef)
@@ -66,6 +66,18 @@ spec = describe "system calls" $ do
       countOf Armings counts `shouldBe` countOf DescriptorWaits counts
       countOf Sends counts `shouldBe` 20
       countOf Accepts counts `shouldBe` 0
+
+    it "tries the next gather batch without waiting when the socket took the whole offer" $
+      bracket newPair (\(mine, theirs) -> Socket.close mine `finally` Socket.close theirs) $ \(mine, theirs) -> do
+        let pieces = BS.empty : map BS.singleton [1 .. 34] <> [BS.empty]
+            receivedAll = do
+              bytes <- SocketBytes.recv theirs 64
+              if BS.null bytes then pure [] else (bytes :) <$> receivedAll
+        counts <- counting (run defaultTurn (const (mine, pieces) ^>> sendAll))
+        countOf Sends counts `shouldBe` 3
+        countOf DescriptorWaits counts `shouldBe` 0
+        Socket.shutdown mine Socket.ShutdownSend
+        bounded (BS.concat <$> receivedAll) `shouldReturn` Just (BS.concat pieces)
 
   forM_ releaseRunners $ \(Runner name _ run) -> describe name $
     it "counts nothing in Release, where the exchange that Debug counts leaves every count as it was" $ do
