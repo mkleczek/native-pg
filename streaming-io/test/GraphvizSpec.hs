@@ -26,11 +26,6 @@ import Skeletest
 quick :: (Effect arr) => arr a ()
 quick = now (const (pure ()))
 
--- | The code that draws a name or a tuple on the right of '-<' is not written yet: the cases that need it are expected to
--- fail, and the marks come off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: a name or a tuple on the right of -< is not written yet"
-
 spec :: Spec
 spec = describe "the DOT of a graph" $ do
   it "has a node for a step, with a pin for each port that reads a name and one for each name that it gives, and an edge from each name to the ports that read it" $ do
@@ -62,7 +57,7 @@ spec = describe "the DOT of a graph" $ do
           ("flow result", "", "end", "", "")
         ]
 
-  stubbed $ it "has the graph of a step that takes a name whole, and of a step that takes a tuple of names, as of the same steps that bind the names in lists" $ do
+  it "has the graph of a step that takes a name whole, and of a step that takes a tuple of names, as of the same steps that bind the names in lists" $ do
     listedDot <- dotOf listed
     pinsOf "gamma" listedDot `shouldBe` ["i_i", "i_a", "i_b", "o_c"]
     found <- dotOf wholes

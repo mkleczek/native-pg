@@ -48,11 +48,6 @@ together' = fst ^>> together [snd ^>> poster, fst ^>> collector]
 gear :: String
 gear = "\x2699\xFE0E "
 
--- | The code that draws a name or a tuple on the right of '-<' is not written yet: the cases that need it are expected to
--- fail, and the marks come off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: a name or a tuple on the right of -< is not written yet"
-
 spec :: Spec
 spec = describe "the chart" $ do
   it "has a store for the inbox, with an edge from its post and an edge to its collect, in the style of a message" $ do
@@ -326,7 +321,7 @@ spec = describe "the chart" $ do
           ("use", "end", "")
         ]
 
-  stubbed $ it "has the chart of a step that takes a name whole, and of a step that takes a tuple of names, as of the same steps that bind the names in lists" $ do
+  it "has the chart of a step that takes a name whole, and of a step that takes a tuple of names, as of the same steps that bind the names in lists" $ do
     listedChart <- chartOf listed
     -- "gamma" reads "i" from the start, and "a" and "b" from their boxes.
     edgesNamed listedChart

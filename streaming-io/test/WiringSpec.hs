@@ -39,11 +39,6 @@ runners =
     Runner "loop" (\program -> fst <$> runLoop program ())
   ]
 
--- | The stubs of a name and a tuple on the right of '-<' fail with 'NotImplemented': the cases that need them are expected to
--- fail, and the marks come off when the code is there.
-stubbed :: Spec -> Spec
-stubbed = xfail "Network.Streaming.Wiring has a stub: a name or a tuple on the right of -< is not written yet"
-
 spec :: Spec
 spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> describe name $ do
   it "wires three steps by bare names and by bindings of a port to a name, and gives what the last gave" $
@@ -170,32 +165,32 @@ spec = describe "steps wired by name" $ forM_ runners $ \(Runner name run) -> de
     run (outside 123) `shouldReturn` 34
     run (outside 5000) `shouldReturn` 10
 
-  stubbed $ it "gives a step that takes a plain value the value of a bare name, whole, whether the step keeps its output or not" $ do
+  it "gives a step that takes a plain value the value of a bare name, whole, whether the step keeps its output or not" $ do
     run (inputs >>> flow ("twice" <: doubler -< "a") >>^ \r -> (r.twice, r.a, r.b)) `shouldReturn` (6, 3, 4)
     noted <- newLog
     run (inputs >>> flow (writing noted -< "b") >>^ \r -> (r.a, r.b)) `shouldReturn` (3, 4)
     readLog noted `shouldReturn` ["4"]
 
-  stubbed $ it "gives the value that a bare path reaches: a field of what a step gave, and a field of a field" $
+  it "gives the value that a bare path reaches: a field of what a step gave, and a field of a field" $
     run (inputs >>> fromPaths) `shouldReturn` 88
 
   it "makes a record of the ports from a list of names, and nothing from the empty list, as it always did" $
     run (inputs >>> fromList) `shouldReturn` 4
 
-  stubbed $ it "gives a step that takes a pair the values of two names, and a step that takes pairs that nest to the right the values of three" $ do
+  it "gives a step that takes a pair the values of two names, and a step that takes pairs that nest to the right the values of three" $ do
     run (inputs >>> flow ("pair" <: tens -< ("a", "b") >>> "triple" <: hundreds -< ("a", "b", "pair")) >>^ \r -> (r.pair, r.triple))
       `shouldReturn` (34, 374)
     run (inputs >>> fromPathPair) `shouldReturn` 43
 
-  stubbed $ it "gives the values of three names in pairs that nest to the right, which the left of <: takes apart by position" $
+  it "gives the values of three names in pairs that nest to the right, which the left of <: takes apart by position" $
     run (inputs >>> flow (["x", "y", "z"] <: passing -< ("a", "b", "a")) >>^ \r -> (r.x, r.y, r.z)) `shouldReturn` (3, 4, 3)
 
-  stubbed $ it "runs the branch of a choice whose step takes the value of its case whole, and the branch whose step takes it in a pair" $ do
+  it "runs the branch of a choice whose step takes the value of its case whole, and the branch whose step takes it in a pair" $ do
     run (sized 3 >>> wholes) `shouldReturn` 6
     run (sized 20 >>> wholes) `shouldReturn` 204
     run (sized 500 >>> wholes) `shouldReturn` 540
 
-  stubbed $ it "reads a name and a tuple of the names of a record that is not known, for a flow that is a step of its own" $
+  it "reads a name and a tuple of the names of a record that is not known, for a flow that is a step of its own" $
     run (inputs >>> anyWhole) `shouldReturn` 68
 
   it "reads the names of a record that is not known, for a flow that is a step of its own" $ do

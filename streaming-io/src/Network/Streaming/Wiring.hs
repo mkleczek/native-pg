@@ -22,17 +22,22 @@
 --
 -- * @"out" <: p -< bindings@ runs the step @p@ and keeps what it gives in the record of the flow under @"out"@. A line
 --   without @"out" <:@ keeps nothing: the record goes on as it was.
--- * @p -< bindings@ makes the input of the step @p@ from the record of the flow. The input of a step is a record that
---   has a field for each binding, in the order written, and the step takes it as it takes any record, by the names of
---   the fields that it reads, as in @(HasField "i" r Int) => arr r Bool@. The left side of a binding is a port of the
---   step, which is a field of its input. The right side is a name in the flow: an input of the flow, the name of an
---   earlier step, or @"step.port"@ for the field @port@ of what a step gave, or a longer path such as @"a.b.c"@. A
---   bare name, @"cores"@, binds the port of that name to the name in the flow that is the same, and a binding that has
---   two sides is written @"port" =: "name"@.
+-- * @p -< bindings@ makes the input of the step @p@ from the record of the flow. What is on the right of @-<@ is a name, a
+--   list or a tuple, as what is on the left of '<:' is a name, which keeps the whole output, or a list, which takes it
+--   apart. A name in the flow is an input of the flow, the name of an earlier step, or a path: @"step.port"@ is the field
+--   @port@ of what a step gave, and @"a.b.c"@ is a field of a field.
+-- * @p -< "name"@ makes the input of the step @p@ the value that the name has in the flow, whole, as @borrow -< "loans"@
+--   gives @borrow@ the loans. A path works too: @p -< "head.parsed"@ gives the field @parsed@ of what @head@ is.
+-- * @p -< ["a", "b"]@ makes the input of the step @p@ a record that has a field for each binding, in the order written, and
+--   the step takes it as it takes any record, by the names of the fields that it reads, as in @(HasField "i" r Int) => arr
+--   r Bool@. The left side of a binding is a port of the step, which is a field of its input. The right side is a name in
+--   the flow. A bare name, @"cores"@, binds the port of that name to the name in the flow that is the same, and a binding
+--   that has two sides is written @"port" =: "name"@. The empty list, @[]@, gives the step @()@.
+-- * @p -< ("a", "b")@ makes the input of the step @p@ the pair of the values of the names, for a step that takes a pair.
+--   Three names, @("a", "b", "c")@, give pairs that nest to the right, @(a, (b, c))@, which is what a chain of @&&&@ makes
+--   and what the left of '<:' takes apart. Each name is a name of the flow, or a path.
+-- * A name and a tuple have no ports: @"port" =: "name"@ in either is a type error, as a pattern is.
 -- * A name that is bound to several ports, and a step whose ports are bound to several producers, are only bindings.
---
--- A step that takes a plain value for its input, and not a record, reads it from a port when it is made one that does:
--- @field "loans" >>> borrow@ takes the port @"loans"@.
 --
 -- A choice is a line of a flow too:
 --
@@ -71,10 +76,10 @@
 --
 -- These are type errors that say what they are: a name that the flow doesn't have, an output that a step doesn't give,
 -- a port that is not bound, a port that is bound twice, a step whose name is one that the flow has already, a binding that
--- is a pattern, and, for a pattern, a field that the output doesn't have, too many names for a pair, a name that the
--- pattern has twice, a field that is named for a pair, a field for the output of a step, and a value that is neither a
--- record nor a pair that a list takes apart. An error in a nested pattern says where it is, as in @in "socket": the
--- output of the step has no field "w"@.
+-- is a pattern, a port in a name or a tuple, and, for a pattern, a field that the output doesn't have, too many names for a
+-- pair, a name that the pattern has twice, a field that is named for a pair, a field for the output of a step, and a value
+-- that is neither a record nor a pair that a list takes apart. An error in a nested pattern says where it is, as in
+-- @in "socket": the output of the step has no field "w"@.
 --
 -- In diagrams each name is a box, nested as its pattern nests. The box of a step is titled with the name that keeps its output
 -- whole, if it has one, and holds the step and a box for each name of its pattern: a small node for a name, and a box titled
@@ -83,7 +88,8 @@
 -- which the box says, but the port if it is another name, as @→ i@, and the field of a path into a whole, as @x → i@. A name
 -- of the flow's input is an edge from where the flow is entered, which says the names, and the names of one producer that a
 -- step binds share one edge. A step that binds nothing from the step before it has a dotted edge from it, which says only the
--- order, in grey. A choice is drawn in the box of its line, with its question, and the edge from it to a branch says its case.
+-- order, in grey. A name that a step takes whole, and the names of a tuple, are drawn as the same names are in a list. A
+-- choice is drawn in the box of its line, with its question, and the edge from it to a branch says its case.
 module Network.Streaming.Wiring
   ( Flow,
     Line,
@@ -103,7 +109,6 @@ where
 import Control.Arrow (Arrow, (>>>), (>>^))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
-import Control.Exception (throw)
 import Data.Kind (Constraint, Type)
 import Data.Proxy (Proxy (..))
 import GHC.Records (HasField (..))
@@ -139,7 +144,6 @@ import Network.Streaming.Internal.Patterns
     (:=) (..),
   )
 import Network.Streaming.Named (CaseNames, DistinctCases, Distribute, cases)
-import Network.Streaming.NotImplemented (NotImplemented (..))
 import Network.Streaming.Plumbing (alongside)
 import Prelude hiding (id, (.))
 
@@ -396,15 +400,18 @@ instance
   {-# INLINE describe #-}
 
 -- | A name has the binding that it has in a list of that name.
-instance Describe (name :: Symbol) where
-  describe = throw (NotImplemented "the bindings of a name")
+instance (Describe '[name]) => Describe (name :: Symbol) where
+  describe = describe @'[name]
+  {-# INLINE describe #-}
 
 -- | Each name of a tuple has the binding that it has in a list.
-instance Describe ('(first, second) :: (Symbol, Symbol)) where
-  describe = throw (NotImplemented "the bindings of a tuple")
+instance (Describe '[first, second]) => Describe ('(first, second) :: (Symbol, Symbol)) where
+  describe = describe @'[first, second]
+  {-# INLINE describe #-}
 
-instance Describe ('(first, second, third) :: (Symbol, Symbol, Symbol)) where
-  describe = throw (NotImplemented "the bindings of a tuple")
+instance (Describe '[first, second, third]) => Describe ('(first, second, third) :: (Symbol, Symbol, Symbol)) where
+  describe = describe @'[first, second, third]
+  {-# INLINE describe #-}
 
 -- | The names of a path, as text.
 class Names (path :: [Symbol]) where
@@ -446,17 +453,20 @@ instance
 
 -- | A name: the step takes the value that the name has in the flow, whole.
 instance (Plain '[name], NoPort (Break '=' name), Fetch (Path name) x i) => Bind (name :: Symbol) x i where
-  bind _ = throw (NotImplemented "-< a name")
+  bind = fetch @(Path name)
+  {-# INLINE bind #-}
 
 -- | A tuple of names: the step takes the pair of their values, and pairs that nest to the right for three.
 instance (Bind first x a, Bind second x b) => Bind ('(first, second) :: (Symbol, Symbol)) x (a, b) where
-  bind _ = throw (NotImplemented "-< a tuple")
+  bind x = (bind @first x, bind @second x)
+  {-# INLINE bind #-}
 
 instance
   (Bind first x a, Bind second x b, Bind third x c) =>
   Bind ('(first, second, third) :: (Symbol, Symbol, Symbol)) x (a, (b, c))
   where
-  bind _ = throw (NotImplemented "-< a tuple")
+  bind x = (bind @first x, (bind @second x, bind @third x))
+  {-# INLINE bind #-}
 
 -- | What is said of a name that has a port, which a step that takes its input whole has none of.
 type family NoPort (split :: (Symbol, Maybe Symbol)) :: Constraint where
