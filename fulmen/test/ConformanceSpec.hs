@@ -133,8 +133,7 @@ queuedConnections (Runner _ runServer) =
 acceptBeside :: Spec
 acceptBeside = describe "accepting a queue of connections beside parts that spin" $ forM_ turnRunners $ \(Turned runnerName run) ->
   describe runnerName $
-    xfail "the core's loop waits for a round of the spinning parts between the rounds of the acceptor" $
-      it "takes the rounds after the first within a few turns of the spinning parts" (spinningBeside run)
+    it "takes the rounds after the first within a few turns of the spinning parts" (spinningBeside run)
 
 -- | A way to run a program of one core, in 'Debug' with turns of no length: an arrow's runner, given the program and the cores.
 data Turned = Turned String ((forall arr. (Runtime arr) => arr Cores ()) -> Cores -> IO ())

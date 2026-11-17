@@ -18,10 +18,11 @@
 -- between the cores by how many connection workers each has then, so that they have as many as one another afterwards, as
 -- far as their room allows. It gives each core its batch in one hand-over, and puts back the cores that have none:
 -- connections are shared out by what is true when they are accepted, and nothing is made for a connection before it is
--- there. The core counts its batch, and spawns a connection worker for each socket, giving way between them, and a
--- connection worker serves its connection, request after request, until it ends, and tells the core that it has room
--- again. While every core is full the acceptor accepts nothing, so that past the cap on connections they wait in the
--- listen backlog. A connection that waits for its next request for longer than the idle timeout is closed, so that the
+-- there. The core counts its batch and spawns a connection worker for each socket, giving way between them, itself if the
+-- batch is small, and by a starter, a part of its own, if it is not, so that the core waits for the next batch at once and the
+-- acceptor's next round doesn't wait for the starts. A connection worker serves its connection, request after request, until
+-- it ends, and tells the core that it has room again. While every core is full the acceptor accepts nothing, so that past the cap on connections they wait
+-- in the listen backlog. A connection that waits for its next request for longer than the idle timeout is closed, so that the
 -- connections that wait in the backlog are served though the ones that have a connection worker are idle: the connection
 -- has a watcher beside the part that serves its requests, which sleeps until the connection can have waited that long,
 -- and ends it if it has, unless a request is in the connection's socket by then: closing with the request unread would reset the
@@ -187,6 +188,11 @@ capacityOf settings r = case r.cores of
 acceptCap :: Int
 acceptCap = 32
 
+-- | The most sockets in a batch that the core's own loop spawns workers for, where a larger batch is given to a starter, which costs more
+-- than the give-ways of a few spawns.
+smallBatch :: Int
+smallBatch = 4
+
 -- | The batch of each core that is given sockets, and the cores that are given none, from how many connection workers each core has now.
 sharing ::
   (HasField "waiting" r [Waiting], HasField "sockets" r [Socket], HasField "cores" r Cores) =>
@@ -235,22 +241,24 @@ liveOf counts core = IntMap.findWithDefault 0 core counts
 countOf :: Shared -> Int -> IORef Count
 countOf shared core = sharedCounts shared IntMap.! core
 
--- | The connection workers of the core: while the core has room, it waits for a batch of connections, and spawns a
--- connection worker for each, for ever. When it is cancelled it waits for its connection workers to end.
+-- | The connection workers of the core: while the core has room, it waits for a batch of connections, and has a connection worker
+-- spawned for each, for ever. When it is cancelled it waits for its connection workers to end. The loop is in the fast lane, so that its
+-- waits, for room and for a batch, are inside it and the core is back in the pool of the cores that wait after at most one part of the
+-- normal lane, and the starters and the connection workers are not in it.
 connectionWorkers :: (Runtime arr) => Settings -> arr (Call, Request) () -> arr Cores ()
 connectionWorkers settings handler =
-  named (Label "connection workers" "Waits for the core to have room and then for a batch of connections, and spawns a connection worker for each, for ever.") $
-    group AwaitAll (foreverA (tap (spawning settings handler))) >>> done
+  named (Label "connection workers" "Waits for the core to have room and then for a batch of connections, and has a connection worker spawned for each, for ever.") $
+    group AwaitAll (fastLane (foreverA (tap (spawning settings handler)))) >>> done
 
 -- | A round of the core: it waits until it has room, waits for a batch of connections, counts the connection workers that the batch
--- will make, and spawns them.
+-- will make, and has them spawned: by the round itself for a small batch, and by a starter for a larger one.
 spawning ::
   (Runtime arr) =>
   Settings ->
   arr (Call, Request) () ->
   arr (Group arr s AwaitAll, Cores) ()
 spawning settings handler =
-  named (Label "spawning" "Waits for room and for a batch of connections, counts the batch, and spawns a connection worker for each socket.") $
+  named (Label "spawning" "Waits for room and for a batch of connections, counts the batch, and has a connection worker spawned for each socket.") $
     (\(!workers, !cores) -> newRecord ["group", "cores"] workers cores)
       ^>> flow
         ( untilRoom settings  -< "cores"                    >>>
@@ -261,7 +269,13 @@ spawning settings handler =
       >>> done
   where
     counting = step "count the connection workers" counted
-    started = starting settings handler
+    -- One value for both branches: two copies of the connection worker's code keep the compiler from specialising it to the arrow.
+    starter = starting settings handler
+    started =
+      decide "small batch?" (\r -> if length r.sockets <= smallBatch then Left r else Right (r.group, r))
+        >>> ( "yes" |- starter
+                ||| "no" |- named (Label "hand the batch to a starter" "Spawns a starter that gives each socket of the batch a connection worker, so that the core waits for the next batch at once.") (spawn starter)
+            )
     counted r = case r.cores of
       Cores core shared -> update (countOf shared core) (\(Count live waiter) -> (Count (live + length r.sockets) waiter, ()))
 
