@@ -1,2 +1,17 @@
 dist-newstyle/
 dist-o2/
+# Build outputs that a tool may write beside the sources, such as the .o that plain ghc writes next to each .c it is given.
+*.o
+*.hi
+*.dyn_o
+*.dyn_hi
+*.p_o
+*.p_hi
+*.a
+*.so
+*.dylib
+*.exe
+*.prof
+*.hp
+*.eventlog
+.ghc.environment.*

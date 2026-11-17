@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE RequiredTypeArguments #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -22,17 +23,22 @@
 --
 -- * @"out" <: p -< bindings@ runs the step @p@ and keeps what it gives in the record of the flow under @"out"@. A line
 --   without @"out" <:@ keeps nothing: the record goes on as it was.
--- * @p -< bindings@ makes the input of the step @p@ from the record of the flow. The input of a step is a record that
---   has a field for each binding, in the order written, and the step takes it as it takes any record, by the names of
---   the fields that it reads, as in @(HasField "i" r Int) => arr r Bool@. The left side of a binding is a port of the
---   step, which is a field of its input. The right side is a name in the flow: an input of the flow, the name of an
---   earlier step, or @"step.port"@ for the field @port@ of what a step gave, or a longer path such as @"a.b.c"@. A
---   bare name, @"cores"@, binds the port of that name to the name in the flow that is the same, and a binding that has
---   two sides is written @"port" =: "name"@.
+-- * @p -< bindings@ makes the input of the step @p@ from the record of the flow. What is on the right of @-<@ is a name, a
+--   list or a tuple, as what is on the left of '<:' is a name, which keeps the whole output, or a list, which takes it
+--   apart. A name in the flow is an input of the flow, the name of an earlier step, or a path: @"step.port"@ is the field
+--   @port@ of what a step gave, and @"a.b.c"@ is a field of a field.
+-- * @p -< "name"@ makes the input of the step @p@ the value that the name has in the flow, whole, as @borrow -< "loans"@
+--   gives @borrow@ the loans. A path works too: @p -< "head.parsed"@ gives the field @parsed@ of what @head@ is.
+-- * @p -< ["a", "b"]@ makes the input of the step @p@ a record that has a field for each binding, in the order written, and
+--   the step takes it as it takes any record, by the names of the fields that it reads, as in @(HasField "i" r Int) => arr
+--   r Bool@. The left side of a binding is a port of the step, which is a field of its input. The right side is a name in
+--   the flow. A bare name, @"cores"@, binds the port of that name to the name in the flow that is the same, and a binding
+--   that has two sides is written @"port" =: "name"@. The empty list, @[]@, gives the step @()@.
+-- * @p -< ("a", "b")@ makes the input of the step @p@ the pair of the values of the names, for a step that takes a pair.
+--   Three names, @("a", "b", "c")@, give pairs that nest to the right, @(a, (b, c))@, which is what a chain of @&&&@ makes
+--   and what the left of '<:' takes apart. Each name is a name of the flow, or a path.
+-- * A name and a tuple have no ports: @"port" =: "name"@ in either is a type error, as a pattern is.
 -- * A name that is bound to several ports, and a step whose ports are bound to several producers, are only bindings.
---
--- A step that takes a plain value for its input, and not a record, reads it from a port when it is made one that does:
--- @field "loans" >>> borrow@ takes the port @"loans"@.
 --
 -- A choice is a line of a flow too:
 --
@@ -47,6 +53,45 @@
 -- the names of the flow that the branch sees, in front of them. The input of the step of a branch has only the ports that
 -- it binds. The branches give the same type, which is what @"kept"@ has. The errors of '-<' are those of a branch, and a
 -- case that the sum doesn't have is the error of "Network.Streaming.Named".
+--
+-- A line can acquire something, and have it released after the rest of the flow, however that ends:
+--
+-- > "listener" <: openListener -< [] `releasedBy` closeListener -< "listener"
+-- >   >>> serving -< "listener"
+--
+-- * @"out" <: acquire -< bindings `releasedBy` release -< bindings'@ runs @acquire@ and keeps what it gives, as @"out" <: p
+--   -< bindings@ does, and runs @release@ after all the lines that follow it, to the end of the flow that the line is in. It
+--   runs however they end: when they are done, when one of them fails, which fails the flow after the release, and when they
+--   are cancelled. A cancellation doesn't reach the release, which may wait. A flow that has several of these lines releases
+--   them in the reverse order.
+-- * The bindings of the release read the names that the flow has at the line, the names that the line gives, and @"exit"@,
+--   which is how the lines after it ended: @Done@, @Failed e@ or @Cancelled'@. They are a name, a list or a tuple, as those of
+--   any step are. A flow that has the name @"exit"@ already is a type error at the release.
+-- * A line that has no @"out" <:@ keeps nothing, and its release reads the names that the flow has and @"exit"@.
+-- * The lines that the release follows are the lines after it in the flow. A shorter extent is a flow that is a step of
+--   another: in @"x" <: result "x" (...) -< bindings@ the release runs when the inner flow ends.
+--
+-- A release that has nothing to acquire is a line of its own, for what the flow has already:
+--
+-- > onExit (close -< "socket") >>> serving -< "socket"
+--
+-- @onExit (release -< bindings)@ is the line that @releasedBy@ makes without an acquire: the release reads the names that
+-- the flow has at the line, and @"exit"@, and runs after the lines that follow it.
+--
+-- A combinator that brackets its body can take the rest of the flow as its body:
+--
+-- > "loans" <: inside withRequestBuffers "buffer pool" >>> serving -< "loans"
+--
+-- * @"out" <: inside wrapper bindings@ gives the wrapper the rest of the flow as its body. The wrapper is a function from
+--   an arrow that takes the resource, beside the record of the flow, to an arrow that takes its input, beside the record, as
+--   @withRequestBuffers :: arr (Loans, a) b -> arr (BufferPool, a) b@ is. The bindings make the input of the wrapper, as they
+--   make that of a step, and the resource that it gives the body is kept under the names of the pattern.
+-- * The line is written @inside wrapper bindings@ and not @inside wrapper -< bindings@, because '-<' takes a step, and a
+--   wrapper is not an arrow.
+-- * A combinator whose result is not its body's, as @loaned@ is, is not a wrapper. It is a step whose body is a flow of its
+--   own.
+-- * @inside_ wrapper@ is a line for a wrapper that gives its body what it was given, as @shield@ and @grace d@ are, and it
+--   has no bindings.
 --
 -- The left of '<:' is a pattern for the output of the step, as @R { socket = S { fd, addr }, peer }@ is in Haskell:
 --
@@ -71,10 +116,12 @@
 --
 -- These are type errors that say what they are: a name that the flow doesn't have, an output that a step doesn't give,
 -- a port that is not bound, a port that is bound twice, a step whose name is one that the flow has already, a binding that
--- is a pattern, and, for a pattern, a field that the output doesn't have, too many names for a pair, a name that the
--- pattern has twice, a field that is named for a pair, a field for the output of a step, and a value that is neither a
--- record nor a pair that a list takes apart. An error in a nested pattern says where it is, as in @in "socket": the
--- output of the step has no field "w"@.
+-- is a pattern, a port in a name or a tuple, and, for a pattern, a field that the output doesn't have, too many names for a
+-- pair, a name that the pattern has twice, a field that is named for a pair, a field for the output of a step, and a value
+-- that is neither a record nor a pair that a list takes apart. An error in a nested pattern says where it is, as in
+-- @in "socket": the output of the step has no field "w"@. A release that binds a name that the flow doesn't have is the error
+-- of any binding, and so is a port in the name that a release takes whole. A flow that has the name @"exit"@ already, for a
+-- line that is released, is the error of a step whose name is one that the flow has already.
 --
 -- In diagrams each name is a box, nested as its pattern nests. The box of a step is titled with the name that keeps its output
 -- whole, if it has one, and holds the step and a box for each name of its pattern: a small node for a name, and a box titled
@@ -83,7 +130,12 @@
 -- which the box says, but the port if it is another name, as @→ i@, and the field of a path into a whole, as @x → i@. A name
 -- of the flow's input is an edge from where the flow is entered, which says the names, and the names of one producer that a
 -- step binds share one edge. A step that binds nothing from the step before it has a dotted edge from it, which says only the
--- order, in grey. A choice is drawn in the box of its line, with its question, and the edge from it to a branch says its case.
+-- order, in grey. A name that a step takes whole, and the names of a tuple, are drawn as the same names are in a list. A
+-- choice is drawn in the box of its line, with its question, and the edge from it to a branch says its case. A line that is
+-- released is drawn as a scope is: a box that holds the line, the lines after it and the release, which is the step that the
+-- dashed edge named "on exit" from the line leads to. The release has an edge from the box of each name that it binds, and
+-- none for @"exit"@, which the dashed edge says. A release only has the dashed edge from where the flow was, and a wrapper
+-- draws no node of its own: its lines are drawn as the lines of the flow.
 module Network.Streaming.Wiring
   ( Flow,
     Line,
@@ -91,6 +143,10 @@ module Network.Streaming.Wiring
     (-<),
     (<:),
     Outs,
+    releasedBy,
+    onExit,
+    inside,
+    inside_,
     choice,
     type (=:),
     type (@:),
@@ -100,7 +156,7 @@ module Network.Streaming.Wiring
   )
 where
 
-import Control.Arrow (Arrow, (>>>), (>>^))
+import Control.Arrow (Arrow, (>>>), (>>^), (^>>))
 import qualified Control.Arrow as Arrow
 import Control.Category (Category (..))
 import Data.Kind (Constraint, Type)
@@ -118,6 +174,7 @@ import GHC.TypeLits
     symbolVal,
   )
 import Network.Streaming.Annotate (Annotate (..), Binding (..), Part (..), (-|))
+import Network.Streaming.Classes (Exit, Scope (..))
 import Network.Streaming.Internal.Patterns
   ( AllFresh,
     Described (..),
@@ -125,6 +182,7 @@ import Network.Streaming.Internal.Patterns
     Dig (..),
     Distinct,
     Entry (..),
+    Fresh,
     Given,
     Level (..),
     Parse,
@@ -143,25 +201,34 @@ import Prelude hiding (id, (.))
 
 -- * Flows
 
--- | A flow: an arrow from the record that the flow reads its names from to that record with the outputs of the steps
--- that were named in front of it.
-newtype Flow arr x y = Flow (arr x y)
+-- | A flow: what it does with the record that the flow reads its names from, to give that record with the outputs of the
+-- steps that were named in front of it, followed by an arrow that is given what the lines after it are.
+newtype Flow arr x y = Flow (forall z. arr y z -> arr x z)
 
-instance (Category arr) => Category (Flow arr) where
-  id = Flow id
+instance Category (Flow arr) where
+  id = Flow (\rest -> rest)
   {-# INLINE id #-}
-  Flow after . Flow before = Flow (after . before)
+  Flow after . Flow before = Flow (\rest -> before (after rest))
   {-# INLINE (.) #-}
 
--- | A step with the input that its bindings make, which is told, by what it is used as, what to do with its output.
-data Line arr x o = Line [Binding] (arr x o)
+-- | What a line is besides its step: a step that is only run, a step that is released when the rest of the flow is done, which
+-- has the type of the record that its release reads, and a wrapper that the rest of the flow is the body of.
+data How = Plainly | Releasing Type | Wrapped
+
+-- | A step with the input that its bindings make, which is told, by what it is used as, what to do with its output. A line
+-- that is released after the rest of the flow has the step that releases it, with the input that its own bindings make, and
+-- a line that is a wrapper has the function that wraps the rest of the flow.
+data Line arr x o (how :: How) where
+  Line :: [Binding] -> arr x o -> Line arr x o 'Plainly
+  Held :: (Scope arr) => [Binding] -> arr x o -> [Binding] -> arr w () -> Line arr x o ('Releasing w)
+  Inside :: [Binding] -> (x -> i) -> (forall z. arr (o, x) z -> arr (i, x) z) -> Line arr x o 'Wrapped
 
 -- | The record of the flow that a line is a part of. It is a type family, and not only the functional dependency of
 -- 'Lined', because GHC solves equalities before it looks for instances, and the names of the flow are to be looked for
 -- in a record that is known.
 type family FlowIn (t :: Type) :: Type where
   FlowIn (Flow arr x y) = x
-  FlowIn (Line arr x o) = x
+  FlowIn (Line arr x o how) = x
   FlowIn (arr x o) = x
 
 -- | What a line can be: a step that keeps nothing, which is a flow whose record goes on as it was, a step that is given
@@ -172,11 +239,11 @@ class Lined t arr x o where
 
 -- | A step that gives nothing to keep: the record goes on as it was.
 instance {-# INCOHERENT #-} (Arrow arr, Annotate arr, arr' ~ arr, x' ~ x, y ~ x) => Lined (Flow arr' x' y) arr x o where
-  line texts p = Flow (alongside (flowStep Nothing texts p) >>^ snd)
+  line texts p = Flow (\rest -> (alongside (flowStep Nothing texts p) >>^ snd) >>> rest)
   {-# INLINE line #-}
 
 -- | A step whose output is to be named.
-instance {-# INCOHERENT #-} (arr' ~ arr, x' ~ x, o' ~ o) => Lined (Line arr' x' o') arr x o where
+instance {-# INCOHERENT #-} (arr' ~ arr, x' ~ x, o' ~ o, how ~ 'Plainly) => Lined (Line arr' x' o' how) arr x o where
   line = Line
   {-# INLINE line #-}
 
@@ -187,13 +254,13 @@ instance (Annotate arr, arr' ~ arr, x' ~ x, o' ~ o) => Lined (arr' x' o') arr x 
 
 -- | The flow as an arrow: it takes the record that its names are read from, and gives that record with the outputs of
 -- the steps that have names in front of it.
-flow :: (Annotate arr) => Flow arr x y -> arr x y
-flow (Flow p) = flowScope Nothing p
+flow :: (Category arr, Annotate arr) => Flow arr x y -> arr x y
+flow (Flow p) = flowScope Nothing (p id)
 {-# INLINE flow #-}
 
 -- | The flow as an arrow that gives what its step of the name gave.
 result :: forall name -> forall arr x y a. (Arrow arr, Annotate arr, KnownSymbol name, HasField name y a) => Flow arr x y -> arr x a
-result name (Flow p) = flowScope (Just (symbolVal (Proxy @name))) p >>^ getField @name
+result name (Flow p) = flowScope (Just (symbolVal (Proxy @name))) (p id) >>^ getField @name
 {-# INLINE result #-}
 
 -- * Lines
@@ -208,8 +275,9 @@ infix 7 -<
   forall arr i o x t.
   (Arrow arr) =>
   arr i o ->
-  forall (bindings :: [Symbol]) ->
-  (x ~ FlowIn t, Lined t arr x o, Unique (Ports bindings), Plain bindings, Describe bindings, Bind bindings x i) =>
+  forall k.
+  forall (bindings :: k) ->
+  (x ~ FlowIn t, Lined t arr x o, Describe bindings, Bind bindings x i) =>
   t
 (-<) p bindings = line (describe @bindings) (Arrow.arr (bind @bindings @x) >>> p)
 {-# INLINE (-<) #-}
@@ -219,20 +287,47 @@ infixr 2 <:
 -- | The line, whose output is kept in the record of the flow under the name, or taken apart into the names of a list, in
 -- front of the rest. The flow doesn't have the names already.
 (<:) ::
-  forall k.
+  forall arr x o how y k.
   forall (out :: k) ->
-  forall arr x o y.
-  (Arrow arr, Annotate arr, Outs out x o y) =>
-  Line arr x o ->
+  (Arrow arr, Annotate arr, Outs out x o y, Closing how y) =>
+  Line arr x o how ->
   Flow arr x y
-(<:) out bound = outcome @out bound
+(<:) out bound = case bound of
+  Line {} -> outcome @out bound
+  Held texts acquire releaseTexts release ->
+    Flow
+      ( \rest ->
+          scope
+            (alongside (flowStep (Just (entryOf @out @x @o @y)) texts acquire))
+            ((\((o, x), exit) -> (Is exit, takeOut @out @x @o @y o x)) ^>> flowStep Nothing releaseTexts release)
+            ((\((o, x), _) -> takeOut @out @x @o @y o x) ^>> rest)
+      )
+  Inside texts input wrapper ->
+    Flow
+      ( \rest ->
+          flowStep (Just (entryOf @out @x @o @y)) texts (Arrow.arr (\x -> (input x, x)))
+            >>> wrapper ((\(o, x) -> takeOut @out @x @o @y o x) ^>> rest)
+      )
 {-# INLINE (<:) #-}
+
+-- | What a line that is not a plain step needs of the record of the flow after it: a release reads that record, and the exit,
+-- which the flow doesn't have already.
+type family Closing (how :: How) (y :: Type) :: Constraint where
+  Closing 'Plainly y = ()
+  Closing ('Releasing w) y = (w ~ ("exit" := Exit, y), Fresh "exit" y)
+  Closing 'Wrapped y = ()
 
 -- | What a step gives the flow under what is on the left of '<:': a name keeps the whole output, and a list of names
 -- takes it apart.
 class Outs out x o y | out x o -> y where
+  -- | The pattern, as the diagrams are given it.
+  entryOf :: Part
+
+  -- | The record of the flow with the names of what a step gave in front of it.
+  takeOut :: o -> x -> y
+
   -- | The flow that runs the step, with the names of what it gave in front of the record.
-  outcome :: (Arrow arr, Annotate arr) => Line arr x o -> Flow arr x y
+  outcome :: (Arrow arr, Annotate arr) => Line arr x o 'Plainly -> Flow arr x y
 
 -- | A name, or a name that is kept and taken apart: the output is kept as it is, and its parts too if the pattern has
 -- them.
@@ -245,8 +340,15 @@ instance
   ) =>
   Outs (out :: Symbol) x o y
   where
+  entryOf = describeEntry @(Parse out)
+  {-# INLINE entryOf #-}
+  takeOut = takeEntry @Root @(Parse out)
+  {-# INLINE takeOut #-}
   outcome (Line texts p) =
-    Flow (alongside (flowStep (Just (describeEntry @(Parse out))) texts p) >>^ \(o, x) -> takeEntry @Root @(Parse out) o x)
+    Flow
+      ( \rest ->
+          (alongside (flowStep (Just (describeEntry @(Parse out))) texts p) >>^ \(o, x) -> takeEntry @Root @(Parse out) o x) >>> rest
+      )
   {-# INLINE outcome #-}
 
 -- | A list of patterns: the output is taken apart, and each name is a part of it.
@@ -258,10 +360,17 @@ instance
   ) =>
   Outs (entries :: [Symbol]) x o y
   where
+  entryOf = Part Nothing Nothing (Just (listOf @(Parses entries)))
+  {-# INLINE entryOf #-}
+  takeOut = level @(ShapeOf o) @Root @(Parses entries)
+  {-# INLINE takeOut #-}
   outcome (Line texts p) =
     Flow
-      ( alongside (flowStep (Just (Part Nothing Nothing (Just (listOf @(Parses entries))))) texts p)
-          >>^ \(o, x) -> level @(ShapeOf o) @Root @(Parses entries) o x
+      ( \rest ->
+          ( alongside (flowStep (Just (Part Nothing Nothing (Just (listOf @(Parses entries))))) texts p)
+              >>^ \(o, x) -> level @(ShapeOf o) @Root @(Parses entries) o x
+          )
+            >>> rest
       )
   {-# INLINE outcome #-}
 
@@ -270,6 +379,51 @@ type family NoField (entry :: Entry) :: Constraint where
   NoField ('Entry 'Nothing name parts) = ()
   NoField ('Entry ('Just field) name parts) =
     TypeError ('Text "The output of a step is not a field: " ':<>: 'ShowType field ':<>: 'Text " =: has nothing to take a field of")
+
+infix 6 `releasedBy`
+
+-- | What an acquire and its release can be: a line that '<:' names, or a line of the flow that keeps nothing.
+class Released t arr x r w where
+  -- | The step that acquires, which the rest of the flow follows, and the step that releases it however that ends, which
+  -- reads the record of the flow after the line, and the exit.
+  releasedBy :: Line arr x r 'Plainly -> Line arr w () 'Plainly -> t
+
+-- | A line that '<:' names: the acquire, and the release, which reads what the record has when the line is done.
+instance (Scope arr, arr' ~ arr, x' ~ x, r' ~ r, how ~ 'Releasing w) => Released (Line arr' x' r' how) arr x r w where
+  releasedBy (Line texts acquire) (Line releaseTexts release) = Held texts acquire releaseTexts release
+  {-# INLINE releasedBy #-}
+
+-- | A line that keeps nothing: the release reads the record of the flow, and the exit.
+instance
+  (Arrow arr, Annotate arr, Scope arr, arr' ~ arr, x' ~ x, y ~ x, w ~ ("exit" := Exit, x), Fresh "exit" x) =>
+  Released (Flow arr' x' y) arr x r w
+  where
+  releasedBy acquire release = (<:) "_" (releasedBy acquire release :: Line arr x r ('Releasing w))
+  {-# INLINE releasedBy #-}
+
+-- | A line that is a release only, for what the flow has already: the rest of the flow is its body, and the release reads
+-- the record of the flow, and the exit.
+onExit :: (Arrow arr, Annotate arr, Scope arr, w ~ ("exit" := Exit, x), Fresh "exit" x) => Line arr w () 'Plainly -> Flow arr x x
+onExit = releasedBy (Line [] (Arrow.arr (const ())))
+{-# INLINE onExit #-}
+
+-- | A line that has a combinator for a bracket take the rest of the flow as its body: the bindings make the input of the
+-- wrapper, and the rest of the flow sees what the wrapper gives the body under the names of the line.
+inside ::
+  forall arr x i o.
+  (forall z. arr (o, x) z -> arr (i, x) z) ->
+  forall k.
+  forall (bindings :: k) ->
+  (Describe bindings, Bind bindings x i) =>
+  Line arr x o 'Wrapped
+inside wrapper bindings = Inside (describe @bindings) (bind @bindings @x) wrapper
+{-# INLINE inside #-}
+
+-- | A line that has a combinator that wraps a step take the rest of the flow as its body, when the combinator gives the body
+-- what it takes, as @shield@ does.
+inside_ :: (forall z. arr x z -> arr x z) -> Flow arr x x
+inside_ = Flow
+{-# INLINE inside_ #-}
 
 -- | A choice that is a line of the flow: it decides on the sum that the flow has under the name of the field, as
 -- @decide question (cases field)@ does, and runs the branch of the case that it is. A branch is a step of its own,
@@ -378,15 +532,32 @@ type family NotIn (port :: Symbol) (ports :: [Symbol]) :: Constraint where
   NotIn port (other ': ports) = NotIn port ports
 
 -- | The bindings, for diagrams: the port of each, and the path that it reads.
-class Describe (bindings :: [Symbol]) where
+class Describe bindings where
   describe :: [Binding]
 
-instance Describe '[] where
+instance Describe ('[] :: [k]) where
   describe = []
   {-# INLINE describe #-}
 
-instance (KnownSymbol (Port binding), Names (Path (Source binding)), Describe bindings) => Describe (binding ': bindings) where
+instance
+  (KnownSymbol (Port binding), Names (Path (Source binding)), Describe bindings) =>
+  Describe ((binding :: Symbol) ': bindings)
+  where
   describe = Binding (symbolVal (Proxy @(Port binding))) (names @(Path (Source binding))) : describe @bindings
+  {-# INLINE describe #-}
+
+-- | A name has the binding that it has in a list of that name.
+instance (Describe '[name]) => Describe (name :: Symbol) where
+  describe = describe @'[name]
+  {-# INLINE describe #-}
+
+-- | Each name of a tuple has the binding that it has in a list.
+instance (Describe '[first, second]) => Describe ('(first, second) :: (Symbol, Symbol)) where
+  describe = describe @'[first, second]
+  {-# INLINE describe #-}
+
+instance (Describe '[first, second, third]) => Describe ('(first, second, third) :: (Symbol, Symbol, Symbol)) where
+  describe = describe @'[first, second, third]
   {-# INLINE describe #-}
 
 -- | The names of a path, as text.
@@ -409,18 +580,52 @@ instance (Dig 'Unbound name '[] r a) => HasField name (Inputs r) a where
   getField (Inputs r) = dig @'Unbound @name @'[] r
   {-# INLINE getField #-}
 
--- | The input of a step made from the bindings, by the record of the flow that the bindings are read from.
-class Bind (bindings :: [Symbol]) x i | bindings x -> i where
+-- | The input of a step made from the bindings, by the record of the flow that the bindings are read from: the bindings
+-- are a name, a list of bindings or a tuple of names.
+class Bind bindings x i | bindings x -> i where
   bind :: x -> i
 
 -- | A step that has no bindings takes nothing.
-instance Bind '[] x () where
+instance Bind ('[] :: [k]) x () where
   bind _ = ()
   {-# INLINE bind #-}
 
-instance (Record (binding ': bindings) x r) => Bind (binding ': bindings) x (Inputs r) where
+-- | A list of bindings: the step takes a record that has a field for each.
+instance
+  (Unique (Ports (binding ': bindings)), Plain (binding ': bindings), Record (binding ': bindings) x r) =>
+  Bind ((binding :: Symbol) ': bindings) x (Inputs r)
+  where
   bind = Inputs . record @(binding ': bindings)
   {-# INLINE bind #-}
+
+-- | A name: the step takes the value that the name has in the flow, whole.
+instance (Plain '[name], NoPort (Break '=' name), Fetch (Path name) x i) => Bind (name :: Symbol) x i where
+  bind = fetch @(Path name)
+  {-# INLINE bind #-}
+
+-- | A tuple of names: the step takes the pair of their values, and pairs that nest to the right for three.
+instance (Bind first x a, Bind second x b) => Bind ('(first, second) :: (Symbol, Symbol)) x (a, b) where
+  bind x = (bind @first x, bind @second x)
+  {-# INLINE bind #-}
+
+instance
+  (Bind first x a, Bind second x b, Bind third x c) =>
+  Bind ('(first, second, third) :: (Symbol, Symbol, Symbol)) x (a, (b, c))
+  where
+  bind x = (bind @first x, (bind @second x, bind @third x))
+  {-# INLINE bind #-}
+
+-- | What is said of a name that has a port, which a step that takes its input whole has none of.
+type family NoPort (split :: (Symbol, Maybe Symbol)) :: Constraint where
+  NoPort '(before, 'Nothing) = ()
+  NoPort '(before, 'Just after) =
+    TypeError
+      ( 'Text "A step that takes its input whole has no port: "
+          ':<>: 'ShowType before
+          ':<>: 'Text " =: "
+          ':<>: 'ShowType after
+          ':<>: 'Text " binds a port, which a list of bindings has"
+      )
 
 -- | The fields of the input of a step: a pair for each binding but the last, which is a field alone.
 class Record (bindings :: [Symbol]) x r | bindings x -> r where

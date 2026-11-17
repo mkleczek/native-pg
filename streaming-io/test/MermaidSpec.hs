@@ -17,7 +17,7 @@ import Network.Streaming.Diagram (Diagram)
 import Network.Streaming.Diagram.Mermaid (Page (..), pages)
 import Network.Streaming.Named (adding, at, cases, field, inj, is, newRecord, (:=), (?>))
 import Network.Streaming.Plumbing (each, prism)
-import Network.Streaming.Wiring (choice, result, type (=:), type (@:), (-<), (<:))
+import Network.Streaming.Wiring (choice, onExit, releasedBy, result, type (=:), type (@:), (-<), (<:))
 import Skeletest
 
 -- | A step that never waits.
@@ -253,6 +253,29 @@ spec = describe "the chart" $ do
           ("IO", "end", "")
         ]
 
+  it "has a box titled scope for a line that is released, which holds the lines after it and its release, with a dashed edge named on exit from the line to the release" $ do
+    chart <- chartOf bracketed
+    case subgraphTitled "scope" chart of
+      Nothing -> failTest "the chart has no box for the scope"
+      Just (_, inside) -> [length (nodesDeclared (gear ++ name) inside) | name <- ["open", "use", "close"]] `shouldBe` [1, 1, 1]
+    -- The release reads the name that the line gave from its box, and the exit from the edge on exit, which is dashed.
+    edgesNamed chart
+      `shouldBe` sort
+        [ ("start", "open", "i"),
+          ("start", "use", "j"),
+          ("kept", "use", ""),
+          ("kept", "close", ""),
+          ("use", "end", "")
+        ]
+    exitEdges chart `shouldBe` [("open", "close")]
+
+  it "has the edge on exit of a release that has no line to acquire from the flow's start, with the lines after it in a box titled scope" $ do
+    chart <- chartOf onExiting
+    case subgraphTitled "scope" chart of
+      Nothing -> failTest "the chart has no box for the scope"
+      Just (_, inside) -> [length (nodesDeclared (gear ++ name) inside) | name <- ["use", "close"]] `shouldBe` [1, 1]
+    exitEdges chart `shouldBe` [("start", "close")]
+
   it "has the names of a flow that is a step of another flow apart from the names of the other flow" $ do
     chart <- chartOf nesting
     -- The inner flow reads its own "n", which the outer step binds: it is drawn from the box of "n" to the start of the inner
@@ -324,6 +347,22 @@ spec = describe "the chart" $ do
           ("z", "use", ""),
           ("use", "end", "")
         ]
+
+  it "has the chart of a step that takes a name whole, and of a step that takes a tuple of names, as of the same steps that bind the names in lists" $ do
+    listedChart <- chartOf listed
+    -- "gamma" reads "i" from the start, and "a" and "b" from their boxes.
+    edgesNamed listedChart
+      `shouldBe` sort
+        [ ("start", "alpha", "i"),
+          ("start", "beta", "j"),
+          ("start", "gamma", "i"),
+          ("a", "beta", ""),
+          ("a", "gamma", ""),
+          ("b", "gamma", ""),
+          ("gamma", "end", "")
+        ]
+    chart <- chartOf wholes
+    chart `shouldBe` listedChart
 
   it "has the same edges for a flow with the plumbing as without it" $ do
     found <- pages fanning
@@ -516,6 +555,48 @@ nestedNames =
           -< ["a" =: "conn.peer", "b" =: "peer", "c" =: "addr", "d" =: "tuned"]
     )
 
+-- | A flow whose steps take a name whole, a pair of names and a triple of names.
+wholes :: Diagram ("i" := Int, "j" := Int) Int
+wholes =
+  result
+    "c"
+    ( "a" <: step "alpha" (\n -> pure (n + 1)) -< "i"
+        >>> "b" <: step "beta" (\(n, m) -> pure (n + m)) -< ("a", "j")
+        >>> "c" <: step "gamma" (\(n, (m, k)) -> pure (n + m + k)) -< ("i", "a", "b")
+    )
+
+-- | The same flow with the names in lists, whose steps read the ports.
+listed :: Diagram ("i" := Int, "j" := Int) Int
+listed =
+  result
+    "c"
+    ( "a" <: step "alpha" (\r -> pure (getField @"i" r + 1)) -< ["i"]
+        >>> "b" <: step "beta" (\r -> pure (getField @"a" r + getField @"j" r)) -< ["a", "j"]
+        >>> "c" <: step "gamma" (\r -> pure (getField @"i" r + getField @"a" r + getField @"b" r)) -< ["i", "a", "b"]
+    )
+
+-- | A flow whose first line acquires, and is released after the lines that follow it by a step that reads what it gave, and the
+-- exit.
+bracketed :: Diagram ("i" := Int, "j" := Int) ()
+bracketed =
+  result
+    "last"
+    ( "kept" <: step "open" (\r -> pure (getField @"i" r + 1)) -< ["i"]
+        `releasedBy` step "close" (\r -> pure (getField @"kept" r `seq` getField @"exit" r `seq` ())) -< ["kept", "exit"]
+        >>> "last" <: step "use" (\r -> pure (getField @"kept" r + getField @"j" r)) -< ["kept", "j"]
+    )
+    >>> done
+
+-- | A flow whose first line is a release only, which reads the port "j" and the exit.
+onExiting :: Diagram ("i" := Int, "j" := Int) ()
+onExiting =
+  result
+    "last"
+    ( onExit (step "close" (\r -> pure (getField @"j" r `seq` getField @"exit" r `seq` ())) -< ["j", "exit"])
+        >>> "last" <: step "use" (\r -> pure (getField @"i" r + getField @"j" r)) -< ["i", "j"]
+    )
+    >>> done
+
 -- | A flow whose second step is a flow of its own, which reads the port "n" of its step.
 nesting :: Diagram ("i" := Int, "j" := Int) Int
 nesting =
@@ -604,6 +685,15 @@ wiresNamed name = length . filter (("|\"" ++ name ++ "\"|") `isInfixOf`) . strip
 -- | The edges of the chart, each as the names of its two nodes and its label, which is empty if it has none.
 edgesNamed :: [String] -> [(String, String, String)]
 edgesNamed chart = sort [(nameOf chart from, nameOf chart to, label) | line <- stripped chart, Just (from, to, label) <- [edgeOf line]]
+
+-- | The edges of the chart that are named on exit, each as the names of its two nodes.
+exitEdges :: [String] -> [(String, String)]
+exitEdges chart =
+  sort
+    [ (nameOf chart (takeWhile isAlphaNum line), nameOf chart (last (words line)))
+      | line <- stripped chart,
+        " -.->|\"on exit\"| " `isInfixOf` line
+    ]
 
 -- | The edges of the chart that say only the order, each as the names of its two nodes: the dotted ones that have no label.
 orderEdges :: [String] -> [(String, String)]

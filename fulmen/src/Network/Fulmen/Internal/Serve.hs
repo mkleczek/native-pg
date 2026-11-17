@@ -92,9 +92,9 @@ import Network.Streaming.Combinators
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (Group, group, spawn))
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Loans (Loan, Loans, borrow, loanBuffer, release, withRequestBuffers)
-import Network.Streaming.Named (Inj, casesBy, field, inj, is, newRecord, type (=:), (:=), (?>))
+import Network.Streaming.Named (Inj, casesBy, inj, is, newRecord, type (=:), (:=), (?>))
 import Network.Streaming.Pool (checkoutIn, releaseNow, takeNow)
-import Network.Streaming.Wiring (choice, flow, result, (-<), (<:))
+import Network.Streaming.Wiring (choice, flow, onExit, releasedBy, result, (-<), (<:))
 import System.Posix.Types (CSsize (..))
 
 -- | The server: for each core, its connection workers, and for the first, the acceptor, which opens the listener. The whole acceptance is in
@@ -133,8 +133,13 @@ beginning event =
 acceptance :: (Runtime arr) => Settings -> Listen arr -> arr Cores ()
 acceptance settings Listen {openListener, closeListener} =
   named (Label "acceptance" "Opens the listener, and for ever takes the cores that wait for connections, accepts as many as they have room for, and gives each core its share.") $
-    scope (done >>> openListener -| "listener") (fst ^>> closeListener) $
-      tap (step "make listener non-blocking" (listening . fst)) >>> foreverA (tap (acceptRound settings))
+    newRecord ["cores"]
+      ^>> flow
+        ( "listener" <: openListener -< [] `releasedBy` closeListener -< "listener"
+            >>> step "make listener non-blocking" listening -< "listener"
+            >>> foreverA (tap (acceptRound settings)) -< ("listener", "cores")
+        )
+      >>> done
 
 -- | A round of the acceptor: it waits until some core waits for connections and takes all that wait, accepts as many connections
 -- as they have room for, in one step that takes none until one comes and no more than 'acceptCap', shares them out between the
@@ -248,15 +253,13 @@ spawning settings handler =
   named (Label "spawning" "Waits for room and for a batch of connections, counts the batch, and spawns a connection worker for each socket.") $
     (\(!workers, !cores) -> newRecord ["group", "cores"] workers cores)
       ^>> flow
-        ( roomed              -< ["cores"]                  >>>
-          "sockets" <: pulled -< ["cores"]                  >>>
+        ( untilRoom settings  -< "cores"                    >>>
+          "sockets" <: pull   -< "cores"                    >>>
           counting            -< ["sockets", "cores"]       >>>
           started             -< ["group", "sockets", "cores"]
         )
       >>> done
   where
-    roomed = field "cores" >>> untilRoom settings
-    pulled = field "cores" >>> pull
     counting = step "count the connection workers" counted
     started = starting settings handler
     counted r = case r.cores of
@@ -273,18 +276,23 @@ starting ::
   arr r ()
 starting settings handler =
   named (Label "start workers" "Spawns a connection worker for each socket of the batch, giving way before each, and closes the sockets that were not given one if it is cancelled.") $
-    scope
-      (step "keep the sockets" (\r -> (,) <$> (newIORef $! r.sockets) <*> pure r.cores))
-      (step "close the sockets that have no connection worker" unstarted)
-      (iterateWith (giveWay >>> step "take the next socket" takeNext -| "socket left?") (consume (spawn (connectionWorker settings handler))))
+    flow
+      ( "kept" <: step "keep the sockets" (\sockets -> newIORef $! sockets) -< "sockets"
+          `releasedBy` step "close the sockets that have no connection worker" unstarted -< ["kept", "cores"]
+          >>> spawnEach -< ["kept", "cores", "group"]
+      )
+      >>> done
   where
-    takeNext ((kept, cores@(Cores core shared)), r) =
-      atomicModifyIORef' kept (\sockets -> case sockets of [] -> ([], Nothing); socket : others -> (others, Just socket)) >>= \case
-        Nothing -> pure (Finish ())
-        Just socket -> let !workers = r.group in pure (Again ((workers, newRecord ["socket", "shared", "core"] socket shared core), ((kept, cores), r)))
-    unstarted ((kept, Cores core shared), _) = do
-      left <- readIORef kept
-      unless (null left) (closeAll left *> leaving (length left) shared core)
+    spawnEach = iterateWith (giveWay >>> step "take the next socket" takeNext -| "socket left?") (consume (spawn (connectionWorker settings handler)))
+    takeNext r = case r.cores of
+      Cores core shared ->
+        atomicModifyIORef' r.kept (\sockets -> case sockets of [] -> ([], Nothing); socket : others -> (others, Just socket)) >>= \case
+          Nothing -> pure (Finish ())
+          Just socket -> let !workers = r.group in pure (Again ((workers, newRecord ["socket", "shared", "core"] socket shared core), r))
+    unstarted r = case r.cores of
+      Cores core shared -> do
+        left <- readIORef r.kept
+        unless (null left) (closeAll left *> leaving (length left) shared core)
 
 -- | Waits until the core has room for another connection worker: fewer than its share of the cap. If it has none, the
 -- part leaves the promise of a ticket in the count of the core, which the end of one of its connection workers fulfils,
@@ -322,7 +330,11 @@ connectionWorker ::
   arr r ()
 connectionWorker settings handler =
   named (Label "connection worker" "Serves one connection, and when it ends, however it ends, tells its core that it has room for another.") $
-    scope returnA (fst ^>> step "tell the core that it has room" (\r -> leaving 1 r.shared r.core)) (snd ^>> connection settings handler)
+    flow
+      ( onExit (step "tell the core that it has room" (\r -> leaving 1 r.shared r.core) -< ["shared", "core"])
+          >>> connection settings handler -< ["shared", "socket"]
+      )
+      >>> done
 
 -- | Takes this many connection workers off the count of the core, and tells the part that waits for room, if one does.
 leaving :: Int -> Shared -> Int -> IO ()
@@ -361,13 +373,13 @@ connection ::
   arr r ()
 connection settings handler =
   named (Label "connection" "Serves the connection until it ends, and closes its socket however it ends.") $
-    scope (field "socket") (fst ^>> close) (snd ^>> serving)
+    flow
+      ( onExit (close -< "socket")
+          >>> "conn" <: step "make connection state" (\r -> Conn r.socket <$> newIORef B.empty <*> pure r.shared <*> peerOf r.socket <*> newIORef Busy) -< ["socket", "shared"]
+          >>> tryA watched -< "conn"
+      )
+      >>> done
   where
-    serving =
-      step "make connection state" (\r -> Conn r.socket <$> newIORef B.empty <*> pure r.shared <*> peerOf r.socket <*> newIORef Busy)
-        -| "Conn"
-        >>> tryA watched
-        >>> done
     -- With an idle timeout, the connection has a watcher besides the part that serves its requests, which ends the connection once it has
     -- waited for its next request for the timeout. The watcher's wait is a timer for the connection, which is armed again when it fires, and
     -- not a deadline for each wait for input: a request costs a mark of the connection, where a deadline costs a scope and a timer.
@@ -527,7 +539,7 @@ request settings handler =
     uncurry (newRecord ["loans", "conn"])
       ^>> result
         "kept"
-        ( "loan"     <: borrowed                         -< ["loans"]                     >>>
+        ( "loan"     <: borrow                           -< "loans"                       >>>
           "progress" <: step "copy carry-over" carryOver -< ["loan", "conn"]              >>>
           "head"     <: readHead settings                -< ["conn", "loan", "progress"]  >>>
           "kept"     <: choice "how did the head end?" "head"
@@ -536,7 +548,6 @@ request settings handler =
                            ||| "good" =: ["parsed", "consumed"] ?> answered settings handler -< ["parsed", "consumed", "conn", "loans", "loan", "progress"] )
         )
   where
-    borrowed = field "loans" >>> borrow
     refuse =
       step
         "render refusal"
