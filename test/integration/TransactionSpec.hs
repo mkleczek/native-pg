@@ -627,6 +627,21 @@ spec socketPath = describe "transactions" $ forM_ runners $ \runner@(Runner name
       -- Numbers 1 and 2, and the texts "a" and "bcd".
       readIORef calls `shouldReturn` 2
       readIORef other `shouldReturn` 2
+    it "keeps uncached statements between cached statements in the pipeline order" $ do
+      calls <- newIORef 0
+      other <- newIORef 0
+      withCache 256
+        ( overInputs
+            ( transactOn Tx.ReadCommitted Tx.Read Tx.Final
+                ((,,) <$> numbered calls <*> Tx.from (const ()) (Tx.statement (plain "SELECT 42" single)) <*> lengthOfText other)
+                (\(left, middle, right) -> Tx.single left &&& Tx.single middle &&& Tx.single right >>^ \(a, (b, c)) -> (a, b, c))
+            )
+            [(1 :: Int, "abc"), (1, "abc")]
+            `yields` [Right (101, 42 :: Int32, 3), Right (101, 42, 3)]
+        )
+        `shouldReturn` ()
+      readIORef calls `shouldReturn` 1
+      readIORef other `shouldReturn` 1
     it "finds in a pipeline the statement that an earlier statement of the same pipeline prepares, for the same key" $ do
       calls <- newIORef 0
       withCache 256
