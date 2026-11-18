@@ -514,9 +514,12 @@ answered tx tag = do
   case stPending s of
     [] -> throwIO (unexpected "an answer to a statement that wasn't sent")
     entry : others -> do
-      -- The tag is a view of the buffer: it is copied now, and not when it is asked for.
-      let !copied = maybe BS.empty BS.copy tag
-          kept = if entrySkippable entry then stTags s else (stIndex s, copied) : stTags s
+      let !kept
+            | entrySkippable entry = stTags s
+            | otherwise =
+                -- Copy the tag before the reader reuses the buffer it points into.
+                let !copied = maybe BS.empty BS.copy tag
+                 in (stIndex s, copied) : stTags s
       modify tx (const s {stPending = others, stIndex = stIndex s + 1, stRows = 0, stTags = kept})
       pure (Completed (stRows s))
 
@@ -684,17 +687,20 @@ nextRow (Result position reading) =
     arrived tx = \case
       Stepped -> pure (Again ())
       Rowed cursor -> do
-        s <- inspect tx
         case cardinality of
-          ExactlyOne | stRows s > 1 -> throwIO (UnexpectedAmountOfRows (stRows s))
-          AtMostOne | stRows s > 1 -> throwIO (UnexpectedAmountOfRows (stRows s))
-          NoRows -> throwIO (UnexpectedAmountOfRows (stRows s))
-          _ -> pure (Finish (Left cursor))
+          ExactlyOne -> checkSingleRow tx
+          AtMostOne -> checkSingleRow tx
+          NoRows -> inspect tx >>= throwIO . UnexpectedAmountOfRows . stRows
+          AnyNumber -> pure ()
+        pure (Finish (Left cursor))
       Completed rowsRead -> do
         when (cardinality == ExactlyOne && rowsRead /= 1) (throwIO (UnexpectedAmountOfRows rowsRead))
         pure (Finish (Right ()))
       Refused failure -> throwIO failure
       Synced -> throwIO (unexpected "the pipeline ended before the statement was answered")
+    checkSingleRow tx = do
+      rowsRead <- stRows <$> inspect tx
+      when (rowsRead > 1) (throwIO (UnexpectedAmountOfRows rowsRead))
 
 -- | The row of the cursor, read by the program's step, which has to take its columns, and no more.
 decodeRow :: (Runtime arr) => arr Columns row -> With Tx arr (At ('PayloadCounted16 'MaybeBytes32Atom) Carrier) row
