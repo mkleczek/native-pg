@@ -165,6 +165,7 @@ test-suite streaming-io-spec
                  UnwindSpec
                  WiringSpec
                  WithSpec
+                 ServerSpec
   -- -T counts the live heap that GroupCostSpec reads.
   ghc-options: -Wall -rtsopts "-with-rtsopts=-T" -fno-omit-yields -fspecialise-aggressively -F -pgmF=skeletest-preprocessor
   if flag(threaded)
