@@ -76,6 +76,7 @@ module Database.PostgreSQL.Transaction
     single,
     optional,
     foldRows,
+    foldRows',
 
     -- * Rows, read by cursors
     Columns,
@@ -772,6 +773,15 @@ foldRows :: (Runtime arr) => (s -> row -> s) -> s -> Result arr row -> With Tx a
 foldRows step start result = const start ^>> iterateA (keeping (nextRow result) >>^ folded)
   where
     folded (next', accumulated) = maybe (Finish accumulated) (Again . step accumulated) next'
+
+-- | Folds the rows from first to last, forcing the new accumulator to weak
+-- head normal form before reading another row.
+foldRows' :: (Runtime arr) => (s -> row -> s) -> s -> Result arr row -> With Tx arr () s
+foldRows' step start result = const start ^>> iterateA (keeping (nextRow result) >>^ folded)
+  where
+    folded (Nothing, accumulated) = Finish accumulated
+    folded (Just row, accumulated) = Again $! step accumulated row
+{-# INLINE foldRows' #-}
 
 -- * Sending
 

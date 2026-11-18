@@ -367,7 +367,7 @@ readAll result = Tx.foldRows (flip (:)) [] result >>^ reverse
 
 -- | How many rows the result has, taking them one at a time.
 countRows :: (Runtime arr) => Tx.Result arr row -> With Tx.Tx arr () Int
-countRows = Tx.foldRows (\count _ -> count + 1) 0
+countRows = Tx.foldRows' (\count _ -> count + 1) 0
 
 -- | The step, with the 'QueryError' it fails with as a value, so that the transaction goes on. Another failure
 -- goes on as it is.
