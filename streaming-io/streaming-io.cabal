@@ -46,6 +46,7 @@ library
                    Network.Streaming.Reader
                    Network.Streaming.With
                    Network.Streaming.Pool
+                   Network.Streaming.Server
                    Network.Streaming.Loans
                    Network.Streaming.NotImplemented
                    Network.Streaming.Named
@@ -62,6 +63,9 @@ library
                    Network.Streaming.Internal.Atomic
                    Network.Streaming.Internal.Descriptors
   other-modules: Network.Streaming.Internal.BufferPool
+                 Network.Streaming.Internal.Accept
+                 Network.Streaming.Internal.Listen
+                 Network.Streaming.Internal.Split
                  Network.Streaming.Internal.DescriptorWaiters
                  Network.Streaming.Internal.Inboxes
                  Network.Streaming.Internal.ListPrefix
@@ -113,6 +117,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Reader
                  Network.Streaming.With
                  Network.Streaming.Pool
+                 Network.Streaming.Server
                  Network.Streaming.Loans
                  Network.Streaming.NotImplemented
                  Network.Streaming.Named
@@ -128,6 +133,9 @@ test-suite streaming-io-spec
                  Network.Streaming.Internal.Cancel
                  Network.Streaming.Internal.Atomic
                  Network.Streaming.Internal.BufferPool
+                 Network.Streaming.Internal.Accept
+                 Network.Streaming.Internal.Listen
+                 Network.Streaming.Internal.Split
                  Network.Streaming.Internal.Descriptors
                  Network.Streaming.Internal.DescriptorWaiters
                  Network.Streaming.Internal.Inboxes
