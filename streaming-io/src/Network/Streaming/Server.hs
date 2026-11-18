@@ -46,7 +46,7 @@ import Network.Streaming.Combinators
     withTicket,
   )
 import Network.Streaming.Concurrent (AwaitAll (..), Concurrent (Group, group, spawn))
-import Network.Streaming.Internal.Accept (Batch (..), acceptor, listening)
+import Network.Streaming.Internal.Accept (acceptor, listening)
 import Network.Streaming.Internal.Atomic (update)
 import Network.Streaming.Internal.Listen (Listen (..), borrowed, inherited, tcp)
 import Network.Streaming.Internal.Split (shares)
@@ -63,7 +63,7 @@ data Dispatcher = Dispatcher
   }
 
 -- | A core waiting for its next batch of connections.
-data Waiting = Waiting !Int !(Promise 'Anywhere Batch)
+data Waiting = Waiting !Int !(Promise 'Anywhere [Socket])
 
 -- | The number of live or reserved workers and the promise of the core waiting for a slot, if any.
 data Count = Count !Int !(Maybe (Promise 'Anywhere ()))
@@ -165,16 +165,16 @@ smallBatch :: Int
 smallBatch = 4
 
 -- | The batch of each core that is given sockets, and the cores that are given none, from how many connection workers each core has now.
-sharing :: Int -> ([Waiting], (Batch, ServerCore)) -> IO ([(Waiting, Batch)], [Waiting])
-sharing limit (waiting, (Batch accepted sockets, ServerCore _ dispatcher)) = do
+sharing :: Int -> ([Waiting], ([Socket], ServerCore)) -> IO ([(Waiting, [Socket])], [Waiting])
+sharing limit (waiting, (sockets, ServerCore _ dispatcher)) = do
   counts <- readCounts dispatcher
   let loads = [(live, room) | Waiting core _ <- waiting, let !live = liveOf counts core, let !room = limit - live]
-  pure $! parcel [] [] waiting (shares accepted loads) sockets
+  pure $! parcel [] [] waiting (shares (length sockets) loads) sockets
   where
     parcel batches spare cores !given remaining = case (cores, given) of
       (core : others, count : counts)
         | count <= 0 -> parcel batches (core : spare) others counts remaining
-        | otherwise -> case splitAt count remaining of (mine, rest) -> parcel ((core, Batch count mine) : batches) spare others counts rest
+        | otherwise -> case splitAt count remaining of (mine, rest) -> parcel ((core, mine) : batches) spare others counts rest
       _ -> (reverse batches, reverse spare)
 
 -- | Puts the cores that were given no sockets back in the pool of the cores that wait, as they were.
@@ -184,14 +184,10 @@ putBack (idle, ServerCore _ dispatcher) =
 
 -- | Gives each core its batch, in one action that never waits, so that no socket is lost to a cancellation between two cores. A batch
 -- whose core has stopped waiting is closed, which is so when the server is shutting down.
-handOver :: [(Waiting, Batch)] -> IO ()
+handOver :: [(Waiting, [Socket])] -> IO ()
 handOver batches =
   forM_ batches $ \(Waiting _ promise, batch) ->
-    fulfilNow promise batch >>= \taken -> unless taken (closeBatch batch)
-
--- | Closes the sockets of the batch.
-closeBatch :: Batch -> IO ()
-closeBatch (Batch _ sockets) = closeAll sockets
+    fulfilNow promise batch >>= \taken -> unless taken (closeAll batch)
 
 -- | Closes the sockets.
 closeAll :: [Socket] -> IO ()
@@ -233,33 +229,32 @@ spawning limit worker =
       ^>> flow
         ( untilRoom limit     -< "cores" >>>
           "batch" <: pull    -< "cores" >>>
-          counting           -< ("batch", "cores") >>>
           started            -< ["group", "batch", "cores", "context"]
         ) >>>
       done
   where
-    counting = step "count the connection workers" counted
     -- One value for both branches: two copies of the connection worker's code keep the compiler from specialising it to the arrow.
     starter = starting worker
     started =
-      decide "small batch?" bySize >>>
-        ("yes" |- starter ||| "no" |- startInBackground)
-    bySize r = case r.batch of
-      Batch size _ -> if size <= smallBatch then Left r else Right (r.group, r)
+      step "reserve worker slots" reserveAndRoute -| "small batch?"
+        >>> ("yes" |- starter ||| "no" |- startInBackground)
+    reserveAndRoute r = case r.cores of
+      ServerCore core dispatcher -> do
+        let !size = length r.batch
+        update (countOf dispatcher core) (\(Count live waiter) -> (Count (live + size) waiter, ()))
+        pure $ if size <= smallBatch then Left r else Right (r.group, r)
     startInBackground = named starterLabel (spawn starter)
     starterLabel =
       Label
         "hand the batch to a starter"
         "Spawns a starter to give each socket a worker. The core can wait for the next batch immediately."
-    counted (Batch size _, ServerCore core dispatcher) =
-      update (countOf dispatcher core) (\(Count live waiter) -> (Count (live + size) waiter, ()))
 
 -- | Spawns a connection worker for each socket of the batch, one at a time, giving way before each, so that the other parts of the core
 -- run between them when the batch is large. The sockets that have no connection worker when this ends, which it does as it is cancelled,
 -- are closed and taken off the count.
 starting ::
   forall arr s r context.
-  (Runtime arr, HasField "group" r (Group arr s AwaitAll), HasField "batch" r Batch, HasField "cores" r ServerCore, HasField "context" r context) =>
+  (Runtime arr, HasField "group" r (Group arr s AwaitAll), HasField "batch" r [Socket], HasField "cores" r ServerCore, HasField "context" r context) =>
   arr (Socket, context) () ->
   arr r ()
 starting worker =
@@ -279,11 +274,11 @@ starting worker =
         Nothing -> pure (Finish ())
         Just socket -> let !workers = input.group in pure (Again ((workers, (input.cores, (socket, input.context))), input))
     takeSocket batch = case batch of
-      Batch size (socket : others) -> (Batch (size - 1) others, Just socket)
-      Batch _ [] -> (batch, Nothing)
+      socket : others -> (others, Just socket)
+      [] -> ([], Nothing)
     unstarted (pendingBatch, cores) = do
-      Batch size left <- readIORef pendingBatch
-      unless (size == 0) (closeAll left *> leaving size cores)
+      left <- readIORef pendingBatch
+      unless (null left) (closeAll left *> leaving (length left) cores)
 
 -- | Waits until the core has room for another connection worker: fewer than its share of the cap. If it has none, the
 -- part leaves the promise of a ticket in the count of the core, which the end of one of its connection workers fulfils,
@@ -306,10 +301,10 @@ untilRoom limit =
 
 -- | Puts the core in the pool of the cores that wait for connections, with the promise of a batch of sockets, and waits for the
 -- acceptor to give one. A batch that is given when the wait was cancelled is closed.
-pull :: (Runtime arr) => arr ServerCore Batch
+pull :: (Runtime arr) => arr ServerCore [Socket]
 pull =
   named (Label "pull" "Puts the core in the pool of the cores that wait for connections, and waits for the acceptor to give it a batch.") $
-    asking "connection" (withTicket (step "wait in the pool of cores" waiting) (fst ^>> step "close the sockets" closeBatch)) >>^ snd
+    asking "connection" (withTicket (step "wait in the pool of cores" waiting) (fst ^>> step "close the sockets" closeAll)) >>^ snd
   where
     waiting (promise, ServerCore core dispatcher) = releaseNow (waitingCores dispatcher) [Waiting core promise]
 
