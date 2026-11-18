@@ -9,23 +9,26 @@ module DescriptorsSpec (spec) where
 import Control.Arrow (ArrowChoice, arr, first, second, (&&&), (>>>), (>>^), (^>>))
 import Control.Concurrent (getNumCapabilities, setNumCapabilities)
 import Control.Exception (bracket)
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, void, when)
 import qualified Data.ByteString as BS
-import Data.IORef (IORef, atomicWriteIORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicWriteIORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
 import Data.Tuple (swap)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
+import qualified Network.Socket.ByteString as SocketBytes
 import Network.Streaming.Buffer (Buffer, newBuffer)
 import Network.Streaming.Classes hiding (within)
 import qualified Network.Streaming.Classes as Classes (within)
 import Network.Streaming.Combinators (pattern Again, pattern Finish, alongside, concurrently, consume, done, iterateWith, keeping, sleep, tap, untilJust)
 import Network.Streaming.Compiled
 import Network.Streaming.Delimited
-import Network.Streaming.Mode (Instrumented, ModeOf)
+import qualified Network.Streaming.Internal.Scheduler as Scheduler
+import Network.Streaming.Mode (Instrumented, Mode (Release), ModeOf)
 import Network.Streaming.PositiveInt (positiveInt)
 import Network.Streaming.Threads
 import Skeletest
+import System.Posix.Types (Fd (..))
 import System.Timeout (timeout)
 
 -- | An arrow that has everything the programs use.
@@ -52,6 +55,22 @@ onCompiled program = fst <$> runCompiled program ()
 
 spec :: Spec
 spec = describe "descriptors" $ do
+  it "puts immediate poll wakeups in registration order ahead of already ready work" $
+    bracket newPair closing $ \(reader, writer) -> do
+      observed <- newIORef []
+      result <- newIORef Nothing
+      event <- Readable . Fd <$> Socket.unsafeFdSocket reader
+      let note :: Int -> IO ()
+          note n = modifyIORef' observed (n :)
+          waiting n = pure (Scheduler.Suspended event n (\_ -> Scheduler.Ended <$ note n))
+          queued = Scheduler.Ended <$ (note 3 *> writeIORef result (Just ()))
+          signal = do
+            SocketBytes.sendAll writer (BS.singleton 7)
+            pure (Scheduler.Yielded queued)
+          start = pure (Scheduler.Forked [waiting 1, waiting 2, signal])
+      within (Scheduler.withRun (Scheduler.Turn 0) $ \run -> void (Scheduler.schedule @'Release run id result start)) `shouldReturn` Just ()
+      reverse <$> readIORef observed `shouldReturn` [1, 2, 3]
+
   forM_ runners $ \(Runner name run) -> describe name $ do
     it "are waited on when a closed socket's numbers are reused for another pair, in the same run" $ do
       within (run reusedNumber) `shouldReturn` Just (True, 1, 1)
