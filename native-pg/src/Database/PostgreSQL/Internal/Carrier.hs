@@ -43,7 +43,7 @@ import Network.Streaming.Classes
     named,
     receiveFirst,
     receiveWith,
-    sendAllWith,
+    sendAllWithSocket,
     tryReceive,
     trySend,
   )
@@ -82,7 +82,10 @@ instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Ins
   {-# INLINE receive #-}
   sendAll =
     named (Label "send" "Sends all of the pieces, and blocks while the socket takes no more.") $
-      sendAllWith (sendOn @(ModeOf arr)) flushCarrier writableCarrier
+      sendAllWithSocket @(ModeOf arr) plainSocket (sendOn @(ModeOf arr)) flushCarrier writableCarrier
+    where
+      plainSocket (Plain socket) = Just socket
+      plainSocket (Secure _ _) = Nothing
   {-# INLINE sendAll #-}
   -- What the wait finds is for the receive after it to read.
   awaitInput =

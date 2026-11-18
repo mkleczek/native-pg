@@ -70,8 +70,10 @@ data Phase
     Unanswered
   | -- | The head is held until the first piece of the body, or its end.
     Pending !Status !ResponseHeaders !Length
-  | -- | The head has gone, and this many bytes of the body.
-    Sending !Mode !Int
+  | -- | The head has gone, and there is no declared length to check.
+    Sending !Mode
+  | -- | The head has gone, and this many bytes of the declared body are left.
+    SendingFixed !Int
   | -- | The response is complete.
     Ended
 
@@ -125,9 +127,10 @@ plan (exchange, (given, final)) =
       -- A server that is shutting down ends the connection after this response.
       draining (exPulse exchange) >>= \shuttingDown -> when shuttingDown (writeIORef (exKeep exchange) False)
       keep <- readIORef (exKeep exchange)
-      body <- bodyOf exchange mode 0 given final
+      body <- bodyOf exchange mode given final
       pure (outcome (Just (headOutput exchange date status headers len keep)) body)
-    Sending mode sent -> outcome Nothing <$> bodyOf exchange mode sent given final
+    Sending mode -> outcome Nothing <$> bodyOf exchange mode given final
+    SendingFixed remaining -> outcome Nothing <$> fixedBodyOf exchange remaining given final
   where
     isUnframed = \case Unframed -> True; _ -> False
     outcome leading (leadingBody, pieces) =
@@ -152,30 +155,32 @@ modeOf exchange (Status code) = \case
 bodyless :: Int -> Bool
 bodyless code = code < 200 || code == 204 || code == 304
 
--- | The framing of the pieces: what is rendered before them, if anything, and what goes out of them. The state of the
--- response moves on, and a response that doesn't have the length that it declared, ends the connection.
-bodyOf :: Exchange -> Mode -> Int -> [ByteString] -> Bool -> IO (Output, [ByteString])
-bodyOf exchange mode sent given final = do
-  let pieces = filter (not . B.null) given
-      size = sum (map B.length pieces)
-      sent' = sent + size
-  framed <- case mode of
-    Bodyless -> pure (mempty, [])
-    Fixed declared -> do
-      when (sent' > declared) $ ioError (userError "the body of a response is longer than its declared length")
-      when (final && sent' /= declared) $ writeIORef (exKeep exchange) False
-      pure (mempty, pieces)
-    Unframed -> pure (mempty, pieces)
-    Chunking
-      | size > 0 -> pure (chunkSize size, pieces <> (if final then [lastChunkAfterData] else [endOfChunk]))
-      | final -> pure (mempty, [lastChunk])
-      | otherwise -> pure (mempty, [])
-  writeIORef (exPhase exchange) (if final then Ended else Sending mode sent')
-  pure framed
+-- | The framing for this write. The send loop drops empty pieces, and an
+-- empty chunk here is skipped unless it ends the response.
+bodyOf :: Exchange -> Mode -> [ByteString] -> Bool -> IO (Output, [ByteString])
+bodyOf exchange mode given final = case mode of
+  Bodyless -> framed mempty []
+  Fixed declared -> fixedBodyOf exchange declared given final
+  Unframed -> framed mempty given
+  Chunking
+    | size > 0 -> framed (chunkSize size) (given <> [if final then "\r\n0\r\n\r\n" else "\r\n"])
+    | final -> framed mempty ["0\r\n\r\n"]
+    | otherwise -> framed mempty []
   where
-    endOfChunk = "\r\n"
-    lastChunk = "0\r\n\r\n"
-    lastChunkAfterData = "\r\n0\r\n\r\n"
+    size = sum (map B.length given)
+    framed prefix pieces =
+      (prefix, pieces) <$ writeIORef (exPhase exchange) (if final then Ended else Sending mode)
+
+-- | Checks the fixed framing before writing. A short final body closes the
+-- connection so that the next response cannot be mistaken for its remainder.
+fixedBodyOf :: Exchange -> Int -> [ByteString] -> Bool -> IO (Output, [ByteString])
+fixedBodyOf exchange remaining given final = do
+  let size = sum (map B.length given)
+      remaining' = remaining - size
+  when (size > remaining) $ ioError (userError "the body of a response is longer than its declared length")
+  when (final && remaining' /= 0) $ writeIORef (exKeep exchange) False
+  writeIORef (exPhase exchange) (if final then Ended else SendingFixed remaining')
+  pure (mempty, given)
 
 -- | The line that gives the size of a chunk.
 chunkSize :: Int -> Output

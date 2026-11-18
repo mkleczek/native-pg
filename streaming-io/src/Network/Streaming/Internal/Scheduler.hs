@@ -1194,20 +1194,20 @@ schedule run enterPart result start = (observing @m run *> go [start] RoundQueue
           [] -> fastReady fast >>= \case
             [] -> idle
             fast' -> go [] RoundQueue.empty fast' True
-          others -> looking >>= \polled -> go (polled <> others) RoundQueue.empty fast fastTurn
+          others -> looking others >>= \ready' -> go ready' RoundQueue.empty fast fastTurn
     -- Polls without waiting, if 'pollTurns' turns have passed since the last poll or enough armings are waiting for one, and
-    -- gives the parts it woke. The armings are those of waits that were cancelled: they stay armed until a poll, and on kqueue
-    -- they are changes that the poll submits.
-    looking = do
+    -- puts the parts it woke ahead of the ready tail. The armings are those of waits that were cancelled: they stay armed until
+    -- a poll, and on kqueue they are changes that the poll submits.
+    looking readyTail = do
       descriptors <- counter run 4
       armed <- counter run 10
       if descriptors + armed == 0
-        then pure []
+        then pure readyTail
         else do
           -- Not the time of the round, which the clock arrow gives to the parts and which is read when it is first asked for.
           began <- clock
           polledAt <- counter run 12
-          if armed >= pendingArmings || began - polledAt >= pollTurns * runTurn run then pollNow else pure []
+          if armed >= pendingArmings || began - polledAt >= pollTurns * runTurn run then pollNow readyTail else pure readyTail
     idle = do
       remote <- counter run 3
       descriptors <- counter run 4
@@ -1261,11 +1261,12 @@ schedule run enterPart result start = (observing @m run *> go [start] RoundQueue
               mapM_ (\(Watching _ _ watch _, _) -> watchCancel watch) fired
               writeIORef (runWatching run) (map fst still)
               armed <- counter run 10
-              polled <- if descriptors + armed > 0 then pollNow else pure []
-              setCounter run 8 0
               let (firedFast, firedNormal) = partition (\(Watching _ inFast _ _, _) -> inFast) fired
+                  readyTail = map (\(Watching _ _ _ resume, _) -> resume (pure ())) firedNormal
+              ready <- if descriptors + armed > 0 then pollNow readyTail else pure readyTail
+              setCounter run 8 0
               modifyIORef' (runFastReady run) (\queued -> foldl (\newest (Watching _ _ _ resume, _) -> resume (pure ()) : newest) queued firedFast)
-              go (polled <> map (\(Watching _ _ _ resume, _) -> resume (pure ())) firedNormal) RoundQueue.empty [] True
+              go ready RoundQueue.empty [] True
     countWait = counter run 2 >>= setCounter run 2 . (+ 1)
     -- How long until the next timer is due, in nanoseconds.
     untilNextTimer =
@@ -1298,15 +1299,15 @@ schedule run enterPart result start = (observing @m run *> go [start] RoundQueue
     arm fd added waiting =
       c_pollerArm (runPoller run) fd added waiting >>= \calls ->
         if calls < 0 then throwErrno "streaming_io_poller_arm" else bumpBy @m ArmCalls (fromIntegral calls)
-    -- Asks the poller what became ready, without waiting.
-    pollNow = bump @m PollsImmediate *> rawPoll c_pollerPoll 0 >>= afterPoll
+    -- Asks the poller what became ready, without waiting, and prepends its normal parts to the ready tail.
+    pollNow readyTail = bump @m PollsImmediate *> rawPoll c_pollerPoll 0 >>= afterPoll readyTail
     -- Waits in the poller, which an asynchronous exception can interrupt: it begins a shutdown. No part runs
     -- while the scheduler waits, so it waits unmasked: a masked thread in an interruptible foreign call returns
     -- from it with the exception still to come.
     pollWait timeout =
       bump @m PollsBlocking *> capped timeout >>= \limit -> try (interruptible (rawPoll c_pollerWait limit)) >>= \case
         Left failure -> [] <$ shuttingDown failure
-        Right count -> afterPoll count >>= \ready -> ready <$ afterWait ready
+        Right count -> afterPoll [] count >>= \ready -> ready <$ afterWait ready
     -- How long the wait may last: as told on the threaded run time. On the non-threaded one, a millisecond while other
     -- threads need the OS thread, and else the cap that 'afterWait' has settled on.
     capped timeout
@@ -1332,18 +1333,18 @@ schedule run enterPart result start = (observing @m run *> go [start] RoundQueue
       unsafeWithForeignPtr (runReady run) $ \fds ->
         unsafeWithForeignPtr (runKinds run) $ \kinds ->
           call (runPoller run) fds kinds (fromIntegral batch) timeout
-    -- The parts that wait on what became ready.
-    afterPoll count
-      | count < 0 = getErrno >>= \errno -> if errno == eINTR then pure [] else throwErrno "streaming_io_poller_wait"
+    -- The parts that wait on what became ready, followed by the existing normal ready parts.
+    afterPoll readyTail count
+      | count < 0 = getErrno >>= \errno -> if errno == eINTR then pure readyTail else throwErrno "streaming_io_poller_wait"
       | otherwise = do
           setCounter run 10 0
           clock >>= setCounter run 12
           if count == 0
-            then pure []
+            then pure readyTail
             else
               unsafeWithForeignPtr (runReady run) $ \fds ->
                 unsafeWithForeignPtr (runKinds run) $ \kinds -> do
-                  (normal, fast, woken) <- collectReady fds kinds (fromIntegral count) 0
+                  (normal, fast, woken) <- collectReady fds kinds (fromIntegral count) readyTail 0
                   when (woken /= 0) (adjust run 4 (negate woken))
                   queueFastReady fast
                   pure normal
@@ -1351,13 +1352,13 @@ schedule run enterPart result start = (observing @m run *> go [start] RoundQueue
     queueFastReady fast = modifyIORef' (runFastReady run) (\queued -> List.foldl' (flip (:)) queued fast)
     -- Detach and rearm in poll order, even if a descriptor is reported twice.
     -- Prepend its waiters on unwind to preserve poll order and FIFO within a direction.
-    collectReady fds kinds count !index
-      | index == count = pure ([], [], 0)
+    collectReady fds kinds count readyTail !index
+      | index == count = pure (readyTail, [], 0)
       | otherwise = do
           fd <- peekElemOff fds index
           kind <- peekElemOff kinds index
           ready <- withWaiters (runWaiters run) (fromIntegral fd) (takeReady fd kind)
-          (normal, fast, woken) <- collectReady fds kinds count (index + 1)
+          (normal, fast, woken) <- collectReady fds kinds count readyTail (index + 1)
           case ready of
             NoWaiters -> pure (normal, fast, woken)
             OneReader entry -> routeEntry entry [] [] normal fast woken

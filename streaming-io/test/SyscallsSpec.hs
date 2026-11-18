@@ -69,13 +69,15 @@ spec = describe "system calls" $ do
 
     it "tries the next gather batch without waiting when the socket took the whole offer" $
       bracket newPair (\(mine, theirs) -> Socket.close mine `finally` Socket.close theirs) $ \(mine, theirs) -> do
-        let pieces = BS.empty : map BS.singleton [1 .. 34] <> [BS.empty]
+        let pieces = BS.empty : concatMap (\byte -> [BS.singleton byte, BS.empty]) [1 .. 34]
             receivedAll = do
               bytes <- SocketBytes.recv theirs 64
               if BS.null bytes then pure [] else (bytes :) <$> receivedAll
         counts <- counting (run defaultTurn (const (mine, pieces) ^>> sendAll))
         countOf Sends counts `shouldBe` 3
         countOf DescriptorWaits counts `shouldBe` 0
+        emptyCounts <- counting (run defaultTurn (const (mine, [BS.empty, BS.empty]) ^>> sendAll))
+        countOf Sends emptyCounts `shouldBe` 0
         Socket.shutdown mine Socket.ShutdownSend
         bounded (BS.concat <$> receivedAll) `shouldReturn` Just (BS.concat pieces)
 
