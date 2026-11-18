@@ -10,22 +10,17 @@ module Network.Fulmen.Internal
     Answering (..),
     Cores (..),
     Shared (..),
-    Batch (..),
-    Waiting (..),
-    Count (..),
   )
 where
 
-import Data.IORef (IORef)
 import Data.IntMap.Strict (IntMap)
 import Network.Fulmen.Internal.Body (Body (..))
 import Network.Fulmen.Internal.Date (Pulse)
 import Network.Fulmen.Internal.Response (Exchange)
-import Network.Socket (Socket)
 import Network.Streaming.BufferPool (BufferPool, BufferPoolSettings)
-import Network.Streaming.Classes (Duration, Event, Promise, Reach (..))
+import Network.Streaming.Classes (Duration, Event)
 import Network.Streaming.Loans (Loans)
-import Network.Streaming.Pool (Pool)
+import Network.Streaming.Server (ServerCore)
 
 -- | How the server is configured: the size of the pool of request buffers, how many connections it serves, and its
 -- limits and timeouts.
@@ -74,18 +69,12 @@ data Call = Call !Loans !Body !Exchange
 -- | A response whose head has been sent, or is held for the first of its body.
 newtype Answering = Answering Exchange
 
--- | The cores that a server runs on, and what its parts share across them. A value is one core's: the core it is for
--- is the one that runs the acceptor, if it is the first.
-data Cores = Cores !Int !Shared
+-- | The connection dispatcher and HTTP state for one core.
+data Cores = Cores !ServerCore !Shared
 
--- | What the cores share: the pool of the cores that wait for connections, which the acceptor gives batches of connections to,
--- how many connection workers each core has, the date that responses carry and whether the server is shutting down, and
--- the pools of the buffers that requests in flight work in, of which a value of one core has its own.
+-- | The HTTP state shared by the cores, with the request buffer pool of the current core selected.
 data Shared = Shared
-  { sharedWaiting :: !(Pool Waiting),
-    -- | The count of each core, by its number.
-    sharedCounts :: !(IntMap (IORef Count)),
-    sharedPulse :: !Pulse,
+  { sharedPulse :: !Pulse,
     -- | The pool of request buffers of the core that the value is for: a request is admitted from its own core's pool, so that
     -- the buffer that a request gives back goes to a request of the same core, and not to one that waits on another core while
     -- this core has none to run.
@@ -93,16 +82,3 @@ data Shared = Shared
     -- | The pools of request buffers of all the cores, by the number of the core.
     sharedCorePools :: !(IntMap BufferPool)
   }
-
--- | The sockets of a batch of connections, and how many there are, which whoever makes the batch knows, so that nobody counts them again.
-data Batch = Batch {-# UNPACK #-} !Int ![Socket]
-
--- | A core that waits for connections: its number, and the promise that the acceptor gives its batch of connections with.
-data Waiting = Waiting
-  { waitingCore :: !Int,
-    waitingPromise :: !(Promise 'Anywhere Batch)
-  }
-
--- | What a core has of its connection workers: how many are alive, and the promise of the part that waits for room, if
--- it does, which the end of a worker fulfils.
-data Count = Count !Int !(Maybe (Promise 'Anywhere ()))

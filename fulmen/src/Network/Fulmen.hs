@@ -39,10 +39,9 @@ where
 
 import Control.Arrow (Arrow, arr)
 import Control.Monad (replicateM)
-import Data.IORef (newIORef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe (fromMaybe)
-import Network.Fulmen.Internal (Call (..), Cores (..), Count (..), Settings (..), Shared (..))
+import Network.Fulmen.Internal (Call (..), Cores (..), Settings (..), Shared (..))
 import Network.Fulmen.Internal.Date (newPulse)
 import Network.Fulmen.Internal.Serve (serve)
 import Network.Fulmen.Listen
@@ -52,8 +51,8 @@ import Network.Fulmen.Shutdown
 import Network.Streaming.BufferPool (BufferPoolSettings (..), newBufferPool)
 import Network.Streaming.Classes (secs)
 import Network.Streaming.Loans (Loans)
-import Network.Streaming.Pool (newPool)
 import Network.Streaming.PositiveInt (mkPositiveInt, positiveInt, positiveIntValue)
+import Network.Streaming.Server (newServerCores, onServerCore)
 
 -- | A server of one connection worker at a time for each core, with a pool of 16 buffers of 16 KiB for requests in
 -- flight, 2 of them in reserve, and 2 for setup, a line limit and a head limit of 50 KiB, which are Warp's default for
@@ -72,22 +71,14 @@ defaultSettings =
     Nothing
     (Just (secs 30))
 
--- | The cores that a server runs on, from its settings and how many there are: what they share, the pool of the cores
--- that wait for a connection, the count of each core's connection workers, a pool of request buffers for each core that
--- has its share of the ordinary buffers that the settings size, and the first core's own value. The cores are numbered
--- from 0, and a core that is not counted here can't run the server.
+-- | Allocates the shared connection dispatcher and one request buffer pool per core, and returns the view for core zero.
 newCores :: Settings -> Int -> IO Cores
 newCores settings cores = do
   first <- newBufferPool share
   others <- replicateM (max 1 cores - 1) (newBufferPool share)
-  Cores 0
-    <$> ( Shared
-            <$> newPool []
-            <*> (IntMap.fromList <$> traverse (\core -> (core,) <$> newIORef (Count 0 Nothing)) [0 .. max 1 cores - 1])
-            <*> newPulse
-            <*> pure first
-            <*> pure (IntMap.fromList (zip [0 ..] (first : others)))
-        )
+  dispatcher <- newServerCores cores
+  pulse <- newPulse
+  pure (Cores dispatcher (Shared pulse first (IntMap.fromList (zip [0 ..] (first : others)))))
   where
     share = coreShare (max 1 cores) (bufferPool settings)
 
@@ -101,7 +92,8 @@ coreShare cores settings = settings {ordinaryBufferCount = fromMaybe (ordinaryBu
 -- | The value of the core of this number, for the program that runs on it: its own pool of request buffers. The first core
 -- runs the acceptor.
 onCore :: Cores -> Int -> Cores
-onCore (Cores _ shared) core = Cores core shared {sharedBuffers = IntMap.findWithDefault (sharedBuffers shared) core (sharedCorePools shared)}
+onCore (Cores dispatcher shared) core =
+  Cores (onServerCore dispatcher core) shared {sharedBuffers = IntMap.findWithDefault (sharedBuffers shared) core (sharedCorePools shared)}
 
 -- | The loans of the call, which native-pg takes, so that the replies of the
 -- database and the response share a buffer.

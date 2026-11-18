@@ -35,7 +35,6 @@ import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stats (allocated_bytes, getRTSStats)
 import Network.Fulmen (Call, Cores, Request (..))
 import qualified Network.Fulmen as Fulmen
-import Network.Fulmen.Internal.Serve (acceptCap)
 import Network.Socket (Socket)
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBytes
@@ -46,6 +45,7 @@ import Network.Streaming.Compiled (runCompiled, runCompiledM, runCompiledTurnM)
 import Network.Streaming.Delimited (runCores, runDelimited, runDelimitedM, runDelimitedTurnM)
 import Network.Streaming.Internal.Scheduler (Turn (..))
 import Network.Streaming.Mode (Mode (..))
+import Network.Streaming.Server (acceptCap)
 import Network.Streaming.Threads (runThreads, runThreadsM)
 import Skeletest
 import System.Environment (lookupEnv)
@@ -95,8 +95,7 @@ acceptBatches = describe "accepting a queue of connections" $ forM_ debugRunners
 -- room for all of them in its one core, so that only the cap of the accept step holds a round back. A round takes the cap while
 -- the queue holds that many, so that the rounds that take the queue are as many as the cap goes into it, and no fewer, which is
 -- how the test tells that no round took more. Each round of the acceptor gives way once, and so does one more that comes after
--- the last of them and finds the queue empty. The cap is 'acceptCap' of "Network.Fulmen.Internal.Serve", which the suite reaches
--- through the private library of the package.
+-- the last of them and finds the queue empty. The cap is 'acceptCap' of "Network.Streaming.Server".
 queuedConnections :: Runner -> IO ()
 queuedConnections (Runner _ runServer) =
   bracket (Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol) Socket.close $ \accepting -> do

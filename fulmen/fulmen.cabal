@@ -30,14 +30,12 @@ library internal
                    Network.Fulmen.Response
                    Network.Fulmen.Shutdown
                    Network.Fulmen.Internal
-                   Network.Fulmen.Internal.Accept
                    Network.Fulmen.Internal.Body
                    Network.Fulmen.Internal.Bytes
                    Network.Fulmen.Internal.Date
                    Network.Fulmen.Internal.Head
                    Network.Fulmen.Internal.Response
                    Network.Fulmen.Internal.Serve
-                   Network.Fulmen.Internal.Split
   c-sources: cbits/signals.c
   build-depends: base >=4.18 && <5, bytestring >=0.11 && <0.13, containers, network >=3.1 && <3.3, streaming-io
 
@@ -71,7 +69,7 @@ test-suite fulmen-conformance
   -- The server of the bench runs in a process of its own, under a small stack, for the case of a server of thousands of
   -- connection workers.
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5, fulmen:fulmen-bench
-  build-depends: base, bytestring, directory, fulmen, fulmen:internal, network, process, streaming-io, skeletest >=0.4.2 && <0.5, unix
+  build-depends: base, bytestring, directory, fulmen, network, process, streaming-io, skeletest >=0.4.2 && <0.5, unix
 
 -- The bytes that the head of a request is compared with, whose module the library doesn't expose: the suite compiles it from the
 -- sources, and nothing else of the library, so that what a comparison allocates can be measured.
@@ -87,19 +85,6 @@ test-suite fulmen-bytes
     ghc-options: -threaded
   build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
   build-depends: base, bytestring, skeletest >=0.4.2 && <0.5
-
--- How the connections that the acceptor took in one round are shared out between the cores that wait: the suite compiles the module
--- from the sources, and nothing else of the library.
-test-suite fulmen-split
-  type: exitcode-stdio-1.0
-  default-language: GHC2021
-  hs-source-dirs: test-split src
-  main-is: Main.hs
-  other-modules: SplitSpec
-                 Network.Fulmen.Internal.Split
-  ghc-options: -Wall -F -pgmF=skeletest-preprocessor
-  build-tool-depends: skeletest:skeletest-preprocessor >=0.4.2 && <0.5
-  build-depends: base, containers, skeletest >=0.4.2 && <0.5
 
 -- A quick measurement: a client of C keep-alive connections and a server that answers with a static body, run as two
 -- processes of this one program. Its numbers are for looking at, and nothing checks them.

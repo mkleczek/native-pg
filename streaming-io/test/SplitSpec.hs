@@ -3,7 +3,7 @@
 module SplitSpec (spec) where
 
 import Control.Monad (forM_)
-import Network.Fulmen.Internal.Split (shares)
+import Network.Streaming.Internal.Split (shares)
 import Skeletest
 
 spec :: Spec
