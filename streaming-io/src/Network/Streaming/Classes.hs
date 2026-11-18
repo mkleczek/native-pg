@@ -81,6 +81,7 @@ module Network.Streaming.Classes
     Local,
     receiveWith,
     sendAllWith,
+    sendAllWithSocket,
     -- A socket's own calls that never wait, for a link that is a socket among other things.
     tryReceive,
     trySend,
@@ -108,9 +109,9 @@ import Network.Streaming.Annotate (Annotate (..), Check (..), Label (..), box, g
 import Network.Streaming.Buffer (Buffer (..))
 import Network.Streaming.Concurrent (Concurrent (together))
 import Network.Streaming.Internal.Inboxes (Address)
-import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend)
+import Network.Streaming.Internal.Socket (receiveFirst, tryReceive, trySend, trySendBatch)
 import Network.Streaming.Mode (Instrumented, ModeOf)
-import Network.Streaming.Plumbing (pattern Again, pattern Finish, consume, iterateWith)
+import Network.Streaming.Plumbing (Step, pattern Again, pattern Finish, consume, iterateWith)
 import Network.Streaming.Internal.Tickets (Fulfilling (..), Promise, Reach (..))
 import Network.Streaming.Watch (Watch)
 import System.Posix.Types (Fd (..))
@@ -444,7 +445,7 @@ instance (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr, Ins
   {-# INLINE receive #-}
   sendAll =
     named (Label "send" "Sends all of the pieces, and blocks while the socket takes no more.") $
-      sendAllWith (trySend @(ModeOf arr)) (\_ -> pure True) writable
+      sendSocket @(ModeOf arr)
   {-# INLINE sendAll #-}
   -- What the wait finds is for the receive after it to read: it doesn't wait first because of a short read before the wait.
   awaitInput =
@@ -478,17 +479,52 @@ receiveWith try readyToReceive =
         Nothing -> (\event -> Again (event, (link, room))) <$> readyToReceive link
 {-# INLINE receiveWith #-}
 
+type SendStep link = Step (Either (Event, (link, [ByteString])) (link, [ByteString])) ()
+
+sendLoop :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => ((link, [ByteString]) -> (link, [ByteString])) -> ((link, [ByteString]) -> IO (SendStep link)) -> arr (link, [ByteString]) ()
+sendLoop prepare attempt =
+  giveWay
+    >>> prepare
+    ^>> iterateWith
+      (box "try send" (now attempt) -| "all sent?")
+      (("socket full" |- consume block) Arrow.||| ("more pieces" |- giveWay))
+{-# INLINE sendLoop #-}
+
+-- The plain socket prepares the offer and finds its suffix together.
+sendSocket :: forall m arr. (Instrumented m, ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => arr (Socket, [ByteString]) ()
+sendSocket = sendLoop id (\input@(socket, _) -> sendSocketStep @m socket writable input)
+{-# INLINE sendSocket #-}
+
+sendSocketStep :: forall m link. (Instrumented m) => Socket -> (link -> IO Event) -> (link, [ByteString]) -> IO (SendStep link)
+sendSocketStep socket readyToSend (link, pieces) =
+  trySendBatch @m socket pieces (pure (Finish ()))
+    (\rest -> pure (Again (Right (link, rest))))
+    (\rest -> (\event -> Again (Left (event, (link, rest)))) <$> readyToSend link)
+{-# INLINE sendSocketStep #-}
+
 -- | Sends and flushes the pieces using the link's non-blocking tries. A send
 -- offers at most 16 pieces. If it takes the whole offer and more pieces
 -- remain, the next offer has a point to give way at. A short send or a flush
 -- that has output left waits for the link's writable event before retrying.
 sendAllWith :: (ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => (link -> [ByteString] -> IO Int) -> (link -> IO Bool) -> (link -> IO Event) -> arr (link, [ByteString]) ()
-sendAllWith send flush readyToSend =
-  giveWay
-    >>> second (filter (not . BS.null))
-    ^>> iterateWith
-      (box "try send" (now attempt) -| "all sent?")
-      (("socket full" |- consume block) Arrow.||| ("more pieces" |- giveWay))
+sendAllWith send flush readyToSend = sendLoop (second (filter (not . BS.null))) (sendLinkStep send flush readyToSend)
+{-# INLINE sendAllWith #-}
+
+-- | As 'sendAllWith', using the direct socket offer when a link exposes its
+-- plain socket. The other links still use their own send and flush calls.
+sendAllWithSocket :: forall m arr link. (Instrumented m, ArrowChoice arr, Effect arr, GiveWay arr, Block arr, Annotate arr) => (link -> Maybe Socket) -> (link -> [ByteString] -> IO Int) -> (link -> IO Bool) -> (link -> IO Event) -> arr (link, [ByteString]) ()
+sendAllWithSocket socketOf send flush readyToSend = sendLoop prepare attempt
+  where
+    prepare input@(link, pieces) = case socketOf link of
+      Nothing -> (link, filter (not . BS.null) pieces)
+      Just _ -> input
+    attempt input@(link, _) = case socketOf link of
+      Nothing -> sendLinkStep send flush readyToSend input
+      Just socket -> sendSocketStep @m socket readyToSend input
+{-# INLINE sendAllWithSocket #-}
+
+sendLinkStep :: (link -> [ByteString] -> IO Int) -> (link -> IO Bool) -> (link -> IO Event) -> (link, [ByteString]) -> IO (SendStep link)
+sendLinkStep send flush readyToSend = attempt
   where
     offerLimit :: Int
     offerLimit = 16
@@ -514,7 +550,7 @@ sendAllWith send flush readyToSend =
 
     finish link = flush link >>= \flushed -> if flushed then pure (Finish ()) else blocked link []
     blocked link rest = (\event -> Again (Left (event, (link, rest)))) <$> readyToSend link
-{-# INLINE sendAllWith #-}
+{-# INLINE sendLinkStep #-}
 
 -- | Memory to receive into: a view of a buffer, from an offset and up to a
 -- length. The room owns nothing: the buffer is the memory.

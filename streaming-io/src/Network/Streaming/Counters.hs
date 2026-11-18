@@ -42,7 +42,7 @@ data Counter
     ReceivesEmpty
   | -- | Receives that waited without a @recv@, because the receive before them on the socket was short.
     ReceivesSkipped
-  | -- | @writev@ calls of a socket's send.
+  | -- | @send@ or @writev@ calls of a socket's send.
     Sends
   | -- | @accept@ calls that gave a connection.
     Accepts
