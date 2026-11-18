@@ -145,6 +145,7 @@ import Network.Streaming.Internal.Descriptors (armedBy, newRunNumber)
 import Network.Streaming.Internal.Atomic (Change, changeHere)
 import Network.Streaming.Internal.Inboxes (Looked (..), Shelf, collectedWrongly, lookOrWait, postNow, postOrQueue, stopWaiting, takeNow, takeWoken, withdraw)
 import Network.Streaming.Internal.Tickets
+import qualified Network.Streaming.Internal.RoundQueue as RoundQueue
 import Network.Streaming.Internal.Timers
 import Network.Streaming.Loop (Report (..))
 import Network.Streaming.Mode (Instrumented (bump, bumpBy, debugging))
@@ -1116,7 +1117,7 @@ takeEntry ident = go []
 -- fails with the exception. The exception of a part that no scope holds fails
 -- the run at once.
 schedule :: forall m b. (Instrumented m) => Run -> (IO Step -> IO Step) -> IORef (Maybe b) -> IO Step -> IO (b, Report)
-schedule run enterPart result start = (observing @m run *> go [start] [] [] True `catch` failed) `finally` closeInbox run
+schedule run enterPart result start = (observing @m run *> go [start] RoundQueue.empty [] True `catch` failed) `finally` closeInbox run
   where
     -- A shutdown fails the run with its exception, whatever the parts failed with, which is their cancellation.
     failed :: SomeException -> IO a
@@ -1145,9 +1146,9 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
           Timed -> go ready later fast (not fromFast)
           Parked -> adjust run 5 1 *> go ready later fast (not fromFast)
           ParkedRemote -> adjust run 3 1 *> go ready later fast (not fromFast)
-          Yielded part' -> go ready (part' : later) fast (not fromFast)
+          Yielded part' -> go ready (RoundQueue.push later part') fast (not fromFast)
           YieldedFast part' -> modifyIORef' (runFastReady run) (part' :) *> go ready later fast (not fromFast)
-          Forked parts -> go ready (foldl (flip (:)) later parts) fast (not fromFast)
+          Forked parts -> RoundQueue.pushBatch later parts $ \next -> go ready next fast (not fromFast)
           Suspended event ident resume -> suspended False fromFast step event ident resume ready later fast
           SuspendedFast event ident resume -> suspended True fromFast step event ident resume ready later fast
     -- A part that waits for the event, and the turn after it.
@@ -1182,7 +1183,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
         tickets <- readIORef (runTickets run)
         writeIORef (runTickets run) []
         remote <- takeInbox run
-        let local = List.foldl' (flip (:)) (reverse later) tickets
+        let local = List.foldl' (flip (:)) (RoundQueue.takeReady later) tickets
         -- Consume the local list directly on empty rounds so it need not be thunked for the drain.
         ready <- case remote of
           [] -> pure local
@@ -1192,8 +1193,8 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
           -- at once if a descriptor is ready.
           [] -> fastReady fast >>= \case
             [] -> idle
-            fast' -> go [] [] fast' True
-          others -> looking >>= \polled -> go (polled <> others) [] fast fastTurn
+            fast' -> go [] RoundQueue.empty fast' True
+          others -> looking >>= \polled -> go (polled <> others) RoundQueue.empty fast fastTurn
     -- Polls without waiting, if 'pollTurns' turns have passed since the last poll or enough armings are waiting for one, and
     -- gives the parts it woke. The armings are those of waits that were cancelled: they stay armed until a poll, and on kqueue
     -- they are changes that the poll submits.
@@ -1238,8 +1239,8 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
                   -- The time of the round was read before the wait, if a timer made the round expire its timers: the parts that the wait ended
                   -- read it again, as a round's first part does.
                   setCounter run 8 0
-                  go (polled <> given) [] [] True
-                else go early [] [] True
+                  go (polled <> given) RoundQueue.empty [] True
+                else go early RoundQueue.empty [] True
           | otherwise -> do
               countWait
               -- Watches, and descriptors too, and the mailbox: the watches for a
@@ -1264,7 +1265,7 @@ schedule run enterPart result start = (observing @m run *> go [start] [] [] True
               setCounter run 8 0
               let (firedFast, firedNormal) = partition (\(Watching _ inFast _ _, _) -> inFast) fired
               modifyIORef' (runFastReady run) (\queued -> foldl (\newest (Watching _ _ _ resume, _) -> resume (pure ()) : newest) queued firedFast)
-              go (polled <> map (\(Watching _ _ _ resume, _) -> resume (pure ())) firedNormal) [] [] True
+              go (polled <> map (\(Watching _ _ _ resume, _) -> resume (pure ())) firedNormal) RoundQueue.empty [] True
     countWait = counter run 2 >>= setCounter run 2 . (+ 1)
     -- How long until the next timer is due, in nanoseconds.
     untilNextTimer =

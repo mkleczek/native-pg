@@ -58,6 +58,7 @@ library
                    Network.Streaming.Structure
                    Network.Streaming.Lint
                    Network.Streaming.Internal.Scheduler
+                   Network.Streaming.Internal.RoundQueue
                    Network.Streaming.Internal.Timers
                    Network.Streaming.Internal.Cancel
                    Network.Streaming.Internal.Atomic
@@ -130,6 +131,7 @@ test-suite streaming-io-spec
                  Network.Streaming.Structure
                  Network.Streaming.Lint
                  Network.Streaming.Internal.Scheduler
+                 Network.Streaming.Internal.RoundQueue
                  Network.Streaming.Internal.Timers
                  Network.Streaming.Internal.Cancel
                  Network.Streaming.Internal.Atomic
