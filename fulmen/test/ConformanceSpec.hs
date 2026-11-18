@@ -600,7 +600,7 @@ quickOrSlow = Handling program
     program :: (Runtime arr) => arr (Call, Request) ()
     program =
       (\input@(_, request) -> if target request == "/slow" then Left input else Right input)
-        ^>> (streamedWith [pause 1000 >>> writing "one", pause 1000 >>> writing "two"] ||| ((, (Fulmen.Status 200, [], "ok")) . fst ^>> reply))
+        ^>> (streamedWith Fulmen.Unknown [pause 1000 >>> writing "one", pause 1000 >>> writing "two"] ||| ((, (Fulmen.Status 200, [], "ok")) . fst ^>> reply))
 
 -- | A handler that notes that it began, in a scope that notes how it was left, and waits for ever.
 hanging :: IORef [String] -> Handling
@@ -776,10 +776,11 @@ handling :: Handler -> Handling
 handling handler = case handler of
   Echo -> Handling echo
   Fixed status fields content -> Handling ((, (Fulmen.Status status, fields, content)) . fst ^>> reply)
-  Streamed chunks -> Handling (streamedWith [writing chunk | chunk <- chunks])
+  FixedStreamed chunks -> Handling (streamedWith (Fulmen.Known (sum (map B.length chunks))) (map writing chunks))
+  Streamed chunks -> Handling (streamedWith Fulmen.Unknown (map writing chunks))
   Headers -> Handling (second ((Fulmen.Status 200, [],) . headersOf) ^>> reply)
   Ignore -> Handling ((, (Fulmen.Status 200, [], ignoreBody)) . fst ^>> reply)
-  Slow delay chunks -> Handling (streamedWith [pause delay >>> writing chunk | chunk <- chunks])
+  Slow delay chunks -> Handling (streamedWith Fulmen.Unknown [pause delay >>> writing chunk | chunk <- chunks])
   EchoStreaming -> Handling echoStreaming
   Fail -> Handling (now (\_ -> throwIO (userError "the handler failed")))
   where
@@ -806,19 +807,17 @@ echo =
     >>> second (Fulmen.Status 200, [],) . swap
     ^>> reply
 
--- | A 200 of unknown length, whose body the steps send, one after the other.
-streamedWith :: (Runtime arr) => [arr Fulmen.Answering Fulmen.Answering] -> arr (Call, Request) ()
-streamedWith pieces =
-  (, (Fulmen.Status 200, [], Fulmen.Unknown)) . fst
+-- | A 200 whose body the steps send, one after the other.
+streamedWith :: (Runtime arr) => Fulmen.Length -> [arr Fulmen.Answering Fulmen.Answering] -> arr (Call, Request) ()
+streamedWith size pieces =
+  (, (Fulmen.Status 200, [], size)) . fst
     ^>> Fulmen.respond
     >>> foldr (>>>) returnA pieces
     >>> Fulmen.finish
 
 -- | Writes the chunk, flushed. A chunk that is nothing is written as nothing: it must not end a chunked body.
 writing :: (Runtime arr) => ByteString -> arr Fulmen.Answering Fulmen.Answering
-writing chunk
-  | B.null chunk = returnA
-  | otherwise = tap ((, [chunk]) ^>> Fulmen.send)
+writing chunk = tap ((, [chunk]) ^>> Fulmen.send)
 
 -- | Waits this many milliseconds, which is a wait of the arrow.
 pause :: (Runtime arr) => Int -> arr a a

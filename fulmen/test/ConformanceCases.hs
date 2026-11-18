@@ -170,6 +170,9 @@ data Handler
     -- drops the body where the status or method forbids it. A body whose
     -- length does not agree with a @Content-Length@ among the headers is not
     -- used by any case.
+  | FixedStreamed [ByteString]
+    -- ^ 200 with the combined length declared, whose body is sent in
+    -- separate writes.
   | Streamed [ByteString]
     -- ^ 200 with no @Content-Length@ and these chunks written in order, each
     -- flushed: a body of unknown length. Empty chunks are written as nothing
@@ -1427,10 +1430,9 @@ responseFramingCases =
       ]
   , mk AResponseFraming (runSpec "streaming response with length")
       "a response with a declared length of 20 bytes is not chunked"
-      (Fixed 200 [("Content-Length", "20")] "HelloHelloHelloHello")
-      [Send singleGet]
-      [stays [ok "HelloHelloHelloHello" `withHeaders` [headerIs "Content-Length" "20", HeaderAbsent "Transfer-Encoding"]]]
-      & note "Warp's test writes the body in four streamed writes; on the wire it is the same response."
+      (FixedStreamed ["Hello", "", "Hello", "Hello", "Hello"])
+      [Send (singleGet <> singleGet)]
+      [stays (replicate 2 (ok "HelloHelloHelloHello" `withHeaders` [headerIs "Content-Length" "20", HeaderAbsent "Transfer-Encoding"]))]
   , mk AResponseFraming (Warp "warp/streams-test/AnswerSpec.hs" "the header and the body / frames an answer without a length as chunks, and serves the next request after it")
       "a body of unknown length is chunked, and the next response follows it"
       (Streamed ["abc", B.replicate 4096 120])
