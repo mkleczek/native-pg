@@ -58,7 +58,6 @@ library
                    Network.Streaming.Structure
                    Network.Streaming.Lint
                    Network.Streaming.Internal.Scheduler
-                   Network.Streaming.Internal.RoundQueue
                    Network.Streaming.Internal.Timers
                    Network.Streaming.Internal.Cancel
                    Network.Streaming.Internal.Atomic
@@ -71,6 +70,7 @@ library
                  Network.Streaming.Internal.Inboxes
                  Network.Streaming.Internal.ListPrefix
                  Network.Streaming.Internal.Patterns
+                 Network.Streaming.Internal.RoundQueue
                  Network.Streaming.Internal.Socket
                  Network.Streaming.Internal.Tickets
   c-sources: cbits/poller.c
